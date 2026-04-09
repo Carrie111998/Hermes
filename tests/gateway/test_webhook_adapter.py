@@ -724,6 +724,17 @@ class TestWebhookSilenceSuppression:
         assert result.success is True
         target.send.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_report_ending_with_filtered_is_delivered(self):
+        adapter, target, chat_id = self._adapter_with_mock_target()
+
+        result = await adapter.send(
+            chat_id, "3 automated notifications were filtered"
+        )
+
+        assert result.success is True
+        target.send.assert_awaited_once()
+
 
 # ===================================================================
 # Delivery info cleanup

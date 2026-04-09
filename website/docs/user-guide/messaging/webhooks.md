@@ -209,6 +209,20 @@ If no `prompt` template is configured for a route, the entire payload is dumped 
 
 The same dot-notation templates work in `deliver_extra` values.
 
+#### Suppress quiet responses
+
+Tell the agent to respond with exactly `[SILENT]` if an event does not need a notification. Hermes records the response but does not deliver it.
+
+This example suppresses notifications for automated email:
+
+```yaml
+prompt: |
+  Summarize this email if it needs my attention: {__raw__}
+  If the email is automated or does not need attention, respond with exactly [SILENT].
+```
+
+Use a [supported silence token](./index.md#intentional-silence-tokens). Do not use an ordinary word as a suffix because that word can end a valid response.
+
 ### Forum Topic Delivery
 
 When delivering webhook responses to Telegram, you can target a specific forum topic by including `message_thread_id` (or `thread_id`) in `deliver_extra`:
