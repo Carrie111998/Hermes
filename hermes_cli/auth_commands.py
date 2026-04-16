@@ -234,6 +234,8 @@ def auth_add_command(args) -> None:
 
     if provider == "openai-codex":
         creds = auth_mod._codex_device_code_login()
+        # Persist tokens to providers section (used by runtime resolution)
+        auth_mod._save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
         label = (getattr(args, "label", None) or "").strip() or label_from_token(
             creds["tokens"]["access_token"],
             _oauth_default_label(provider, len(pool.entries()) + 1),
