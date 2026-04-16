@@ -56,6 +56,22 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
 
+# Event bus integration (lazy-loaded to avoid circular imports)
+_event_emitter = None
+
+def _get_event_emitter():
+    """Lazy-load the CronEventEmitter to avoid import-time side effects."""
+    global _event_emitter
+    if _event_emitter is None:
+        try:
+            from events.bus import EventBus
+            from events.producers.cron_emitter import CronEventEmitter
+            _event_emitter = CronEventEmitter(EventBus())
+        except Exception as e:
+            logger.debug("Event bus not available: %s", e)
+            _event_emitter = False  # sentinel: don't retry
+    return _event_emitter if _event_emitter else None
+
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
 
@@ -953,7 +969,22 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # One-shot jobs are left alone so they can retry on restart.
                 advance_next_run(job["id"])
 
+                # Emit cron_started event
+                emitter = _get_event_emitter()
+                if emitter:
+                    try:
+                        emitter.on_job_started(
+                            job_id=job["id"],
+                            job_name=job.get("name", job["id"]),
+                            schedule=job.get("schedule_display", ""),
+                        )
+                    except Exception as ee:
+                        logger.debug("Event emit failed: %s", ee)
+
+                import time as _time
+                _job_start = _time.monotonic()
                 success, output, final_response, error = run_job(job)
+                _job_duration = _time.monotonic() - _job_start
 
                 output_file = save_job_output(job["id"], output)
                 if verbose:
@@ -977,6 +1008,28 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         logger.error("Delivery failed for job %s: %s", job["id"], de)
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+
+                # Emit completion/failure event
+                if emitter:
+                    try:
+                        from cron.jobs import load_jobs
+                        current_job = next(
+                            (j for j in load_jobs() if j["id"] == job["id"]), None
+                        )
+                        consecutive = current_job.get("consecutive_errors", 0) if current_job else 0
+                        summary = (final_response or "")[:500] if success else None
+                        emitter.on_job_completed(
+                            job_id=job["id"],
+                            job_name=job.get("name", job["id"]),
+                            success=success,
+                            duration=round(_job_duration, 1),
+                            output_summary=summary,
+                            error=error,
+                            consecutive_errors=consecutive,
+                        )
+                    except Exception as ee:
+                        logger.debug("Event emit failed: %s", ee)
+
                 executed += 1
 
             except Exception as e:
