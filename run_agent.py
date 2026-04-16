@@ -1042,6 +1042,14 @@ class AIAgent:
 
             self.api_key = client_kwargs.get("api_key", "")
             self.base_url = client_kwargs.get("base_url", self.base_url)
+            # --- DIAGNOSTIC: log credentials at agent init ---
+            _init_key = client_kwargs.get("api_key", "")
+            logger.warning(
+                "DIAG agent_init: api_key_len=%d, api_key_prefix=%s, "
+                "base_url=%s, provider=%s, api_mode=%s",
+                len(_init_key), _init_key[:20] if _init_key else 'EMPTY',
+                client_kwargs.get("base_url", "?"), self.provider, self.api_mode)
+            # --- END DIAGNOSTIC ---
             try:
                 self.client = self._create_openai_client(client_kwargs, reason="agent_init", shared=True)
                 if not self.quiet_mode:
@@ -4575,6 +4583,16 @@ class AIAgent:
         import httpx as _httpx
 
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
+        # --- DIAGNOSTIC: log actual credentials at API call site ---
+        _diag_key = getattr(active_client, 'api_key', None) or ''
+        _diag_url = str(getattr(active_client, 'base_url', ''))
+        logger.warning(
+            "DIAG _run_codex_stream: api_key_len=%d, api_key_prefix=%s, "
+            "base_url=%s, model=%s, client_type=%s",
+            len(_diag_key), _diag_key[:20] if _diag_key else 'EMPTY',
+            _diag_url, api_kwargs.get('model', '?'),
+            type(active_client).__name__)
+        # --- END DIAGNOSTIC ---
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
@@ -10076,6 +10094,17 @@ class AIAgent:
                     ) and not is_context_length_error
 
                     if is_client_error:
+                        # --- DIAGNOSTIC: log what triggered the fallback ---
+                        _diag_key2 = getattr(getattr(self, 'client', None), 'api_key', None) or ''
+                        _diag_url2 = str(getattr(getattr(self, 'client', None), 'base_url', ''))
+                        logger.warning(
+                            "DIAG fallback triggered: status=%s, error=%s, "
+                            "current_api_key_len=%d, current_api_key_prefix=%s, "
+                            "current_base_url=%s, provider=%s, api_mode=%s",
+                            status_code, str(api_error)[:200],
+                            len(_diag_key2), _diag_key2[:20] if _diag_key2 else 'EMPTY',
+                            _diag_url2, self.provider, self.api_mode)
+                        # --- END DIAGNOSTIC ---
                         # Try fallback before aborting — a different provider
                         # may not have the same issue (rate limit, auth, etc.)
                         self._emit_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
