@@ -370,6 +370,46 @@ class TestBuildCallKwargsMaxTokens:
     """
 
 
+    def test_explicit_cap_can_be_preserved_for_openai_compatible(self):
+        kwargs = _build_call_kwargs(
+            provider="custom",
+            model="qwen",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=500,
+            preserve_max_tokens=True,
+            base_url="http://localhost:8080/v1",
+            task="vision",
+        )
+
+        assert kwargs["max_tokens"] == 500
+
+    @pytest.mark.asyncio
+    async def test_explicit_vision_cap_reaches_custom_client_request(self):
+        client = MagicMock()
+        client.base_url = "http://localhost:8080/v1"
+        response = MagicMock()
+        response.choices = [
+            MagicMock(message=MagicMock(content="A concise description."))
+        ]
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        with patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("custom", "qwen", client.base_url, "test-key", None),
+        ), patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            return_value=("custom", client, "qwen"),
+        ):
+            result = await async_call_llm(
+                task="vision",
+                messages=[{"role": "user", "content": "describe"}],
+                max_tokens=500,
+                preserve_max_tokens=True,
+            )
+
+        assert result is response
+        assert client.chat.completions.create.await_args.kwargs["max_tokens"] == 500
+
     @pytest.mark.parametrize(
         "provider,model,base_url",
         [
@@ -4354,6 +4394,7 @@ class TestAsynchronousFallbackCachePlans:
             ],
             temperature=None,
             max_tokens=None,
+            preserve_max_tokens=False,
             tools=tools,
             effective_timeout=30.0,
             effective_extra_body={},
@@ -4363,3 +4404,33 @@ class TestAsynchronousFallbackCachePlans:
         wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
         assert "cache_control" in wire_tools[-1]
         assert "cache_control" not in tools[-1]
+
+    @pytest.mark.asyncio
+    async def test_async_fallback_preserves_explicit_token_cap(self, monkeypatch):
+        """An opted-in cap must survive the asynchronous fallback boundary."""
+        from agent.auxiliary_client import _call_fallback_candidate_async
+
+        client = MagicMock()
+        client.base_url = "http://localhost:8080/v1"
+        client.chat.completions.create = AsyncMock(return_value=_DummyResponse())
+        monkeypatch.setattr(
+            "agent.auxiliary_client._replan_synchronous_cache_sections",
+            lambda messages, tools, **kwargs: (messages, tools),
+        )
+
+        await _call_fallback_candidate_async(
+            client,
+            "qwen",
+            "custom",
+            task="vision",
+            messages=[{"role": "user", "content": "describe"}],
+            temperature=None,
+            max_tokens=500,
+            preserve_max_tokens=True,
+            tools=None,
+            effective_timeout=30.0,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+
+        assert client.chat.completions.create.await_args.kwargs["max_tokens"] == 500
