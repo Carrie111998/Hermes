@@ -152,6 +152,38 @@ class TestCleanup:
         assert len(remaining) == 1
 
 
+class TestSubscriberLag:
+    """Lag = events emitted after a subscriber's current cursor position."""
+
+    def test_lag_is_zero_for_unknown_subscriber(self, bus):
+        # No cursor recorded yet → count from beginning
+        bus.emit(EventType.CRON_STARTED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        # With no cursor, lag == total event count
+        assert bus.subscriber_lag("never-seen") == 2
+
+    def test_lag_after_partial_processing(self, bus):
+        # Emit 5 events
+        ids = [bus.emit(EventType.CRON_STARTED, "scout", {"i": i}) for i in range(5)]
+        # Ack only the first 2
+        bus.ack("sub-1", ids[:2])
+        # 3 events should still be unread
+        assert bus.subscriber_lag("sub-1") == 3
+
+    def test_lag_after_full_processing(self, bus):
+        ids = [bus.emit(EventType.CRON_STARTED, "scout", {"i": i}) for i in range(3)]
+        bus.ack("sub-1", ids)
+        assert bus.subscriber_lag("sub-1") == 0
+
+    def test_lag_increases_as_new_events_emit(self, bus):
+        ids = [bus.emit(EventType.CRON_STARTED, "scout", {}) for _ in range(2)]
+        bus.ack("sub-1", ids)
+        assert bus.subscriber_lag("sub-1") == 0
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        assert bus.subscriber_lag("sub-1") == 2
+
+
 class TestSchemaMigration:
     def test_migrates_legacy_db_without_status_column(self, tmp_path):
         """EventBus must upgrade pre-0.9.1 databases that lack the status column."""

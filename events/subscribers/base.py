@@ -109,3 +109,19 @@ class SubscriberRegistry:
                 sub.shutdown()
             except Exception:
                 logger.exception("Subscriber %s shutdown failed", sub.subscriber_id)
+
+    def lag_report(self) -> Dict[str, int]:
+        """Return {subscriber_id: events_behind_head} for all registered subscribers.
+
+        A growing value for any subscriber indicates it's falling behind
+        (slow handlers, crashed process, or a bug in poll()).  Operators
+        should expect values near zero in a healthy system.
+        """
+        report: Dict[str, int] = {}
+        for sub in self.subscribers:
+            try:
+                report[sub.subscriber_id] = sub.bus.subscriber_lag(sub.subscriber_id)
+            except Exception:
+                logger.exception("Lag query failed for %s", sub.subscriber_id)
+                report[sub.subscriber_id] = -1  # sentinel for unknown
+        return report

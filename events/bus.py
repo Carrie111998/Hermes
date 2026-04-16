@@ -254,6 +254,26 @@ class EventBus:
             conn.close()
             self._local.conn = None
 
+    def subscriber_lag(self, subscriber_id: str) -> int:
+        """Return the count of events the subscriber hasn't processed yet.
+
+        Lag = (total events emitted) - (cursor position).  A subscriber
+        that has never polled returns the full event count.  Useful for
+        monitoring: a growing lag indicates a subscriber is falling
+        behind or has crashed.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            (subscriber_id,),
+        ).fetchone()
+        last_rowid = row["last_rowid"] if row else 0
+        row = conn.execute(
+            "SELECT COUNT(*) as n FROM events WHERE rowid > ?",
+            (last_rowid,),
+        ).fetchone()
+        return int(row["n"]) if row else 0
+
     def cleanup(self, retention_days: int = 30) -> int:
         """Remove events older than retention_days.  Returns count removed."""
         cursor = self._execute(

@@ -125,3 +125,109 @@ class TestSubscriberRegistry:
 
         results = registry.poll_all()
         assert results == {"stub-1": 1, "stub-2": 1}
+
+
+class TestLagAlertHelper:
+    """_check_subscriber_lag emits agent_error events when subscribers fall behind."""
+
+    def _setup(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        registry = SubscriberRegistry()
+        slow = StubSubscriber(bus)
+        slow.subscriber_id = "slow"
+        fast = StubSubscriber(bus)
+        fast.subscriber_id = "fast"
+        registry.register(slow)
+        registry.register(fast)
+        return bus, registry, slow, fast
+
+    def test_no_alert_when_all_under_threshold(self, tmp_path):
+        from events.gateway_integration import _check_subscriber_lag
+        bus, registry, slow, fast = self._setup(tmp_path)
+        # Emit just a few events
+        for _ in range(5):
+            bus.emit(EventType.CRON_STARTED, "test", {})
+        last_alerted = {}
+        _check_subscriber_lag(registry, bus, threshold=100,
+                              cooldown_seconds=900, last_alerted=last_alerted, now=1000.0)
+        # No alerts should have fired
+        assert last_alerted == {}
+        # No agent_error events in the bus
+        errors = bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(errors) == 0
+
+    def test_alert_emitted_when_lag_exceeds_threshold(self, tmp_path):
+        from events.gateway_integration import _check_subscriber_lag
+        bus, registry, slow, fast = self._setup(tmp_path)
+        # Emit more events than threshold so both subscribers are behind
+        for _ in range(150):
+            bus.emit(EventType.CRON_STARTED, "test", {})
+        # fast drains its cursor
+        fast.poll()
+        last_alerted = {}
+        _check_subscriber_lag(registry, bus, threshold=100,
+                              cooldown_seconds=900, last_alerted=last_alerted, now=1000.0)
+        # slow should have an alert, fast shouldn't
+        assert "slow" in last_alerted
+        assert "fast" not in last_alerted
+        # Exactly one agent_error event emitted
+        errors = bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(errors) == 1
+        assert errors[0].payload["subscriber_id"] == "slow"
+        assert errors[0].payload["lag"] > 100
+
+    def test_cooldown_suppresses_repeat_alerts(self, tmp_path):
+        from events.gateway_integration import _check_subscriber_lag
+        bus, registry, slow, fast = self._setup(tmp_path)
+        for _ in range(150):
+            bus.emit(EventType.CRON_STARTED, "test", {})
+        fast.poll()  # drain fast so only slow is a candidate
+        last_alerted = {"slow": 950.0}  # alerted 50s ago
+        _check_subscriber_lag(registry, bus, threshold=100,
+                              cooldown_seconds=900, last_alerted=last_alerted, now=1000.0)
+        # No new alert (still within 900s cooldown)
+        errors = bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(errors) == 0
+
+    def test_cooldown_expired_allows_realert(self, tmp_path):
+        from events.gateway_integration import _check_subscriber_lag
+        bus, registry, slow, fast = self._setup(tmp_path)
+        for _ in range(150):
+            bus.emit(EventType.CRON_STARTED, "test", {})
+        fast.poll()  # drain fast
+        last_alerted = {"slow": 0.0}  # alerted long ago
+        _check_subscriber_lag(registry, bus, threshold=100,
+                              cooldown_seconds=900, last_alerted=last_alerted, now=10000.0)
+        # Re-alert allowed
+        errors = bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(errors) == 1
+        assert last_alerted["slow"] == 10000.0
+
+
+class TestSubscriberLagReport:
+    """Registry-level lag visibility: how far behind each subscriber is."""
+
+    def test_lag_report_empty_registry(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        registry = SubscriberRegistry()
+        assert registry.lag_report() == {}
+
+    def test_lag_report_per_subscriber(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        registry = SubscriberRegistry()
+
+        a = StubSubscriber(bus)
+        a.subscriber_id = "sub-a"
+        b = StubSubscriber(bus)
+        b.subscriber_id = "sub-b"
+        registry.register(a)
+        registry.register(b)
+
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+
+        # sub-a processes, sub-b doesn't
+        a.poll()
+
+        report = registry.lag_report()
+        assert report == {"sub-a": 0, "sub-b": 2}

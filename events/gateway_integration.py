@@ -23,6 +23,13 @@ from events.subscribers.telegram_mirror import TelegramMirror
 
 logger = logging.getLogger(__name__)
 
+# Subscriber lag alert threshold — alert when any subscriber falls behind
+# by this many events.  Should be larger than normal burst sizes but small
+# enough that "silent failure" becomes visible quickly.
+LAG_ALERT_THRESHOLD = 100
+# Cooldown between successive agent_error emissions for the same subscriber.
+LAG_ALERT_COOLDOWN_SECONDS = 900  # 15 minutes
+
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
@@ -93,6 +100,50 @@ def get_health_monitor() -> Optional[GatewayHealthMonitor]:
     return _health_monitor
 
 
+def _check_subscriber_lag(
+    registry: SubscriberRegistry,
+    bus: EventBus,
+    threshold: int,
+    cooldown_seconds: int,
+    last_alerted: Dict[str, float],
+    now: float,
+) -> Dict[str, int]:
+    """Emit an agent_error event for each subscriber whose lag > threshold.
+
+    ``last_alerted`` is mutated in place to record the monotonic time of each
+    emission so we honour the cooldown on subsequent calls.  Returns the
+    current lag report (useful for tests and callers who want to log it).
+    """
+    report = registry.lag_report()
+    for subscriber_id, lag in report.items():
+        if lag <= threshold:
+            continue
+        prev = last_alerted.get(subscriber_id, 0.0)
+        if now - prev < cooldown_seconds:
+            continue
+        from events.schema import EventType, Priority
+        try:
+            bus.emit(
+                event_type=EventType.AGENT_ERROR,
+                source="event-bus",
+                payload={
+                    "subscriber_id": subscriber_id,
+                    "lag": lag,
+                    "threshold": threshold,
+                    "error": f"Subscriber '{subscriber_id}' is {lag} events behind head",
+                },
+                priority=Priority.HIGH,
+            )
+            last_alerted[subscriber_id] = now
+            logger.warning(
+                "EventBus lag alert: %s is %d events behind (>threshold=%d)",
+                subscriber_id, lag, threshold,
+            )
+        except Exception:
+            logger.exception("Failed to emit lag alert for %s", subscriber_id)
+    return report
+
+
 def _get_et_hour() -> int:
     """Get current hour in Eastern Time."""
     try:
@@ -108,9 +159,11 @@ def _subscriber_poll_loop() -> None:
     last_poll_times: Dict[str, float] = {}
     last_mailbox_scan: float = 0
     last_health_check: float = 0
+    last_lag_check: float = 0
     last_cleanup: float = 0
     last_digest_hour: int = -1
     last_flush_fired: bool = False
+    lag_alerts_sent: Dict[str, float] = {}  # subscriber_id -> monotonic timestamp
 
     while not _stop_event.is_set():
         now = time.monotonic()
@@ -157,6 +210,18 @@ def _subscriber_poll_loop() -> None:
                 last_flush_fired = True
             elif et_hour != 7:
                 last_flush_fired = False
+
+        # Subscriber lag check every 5 minutes
+        if _registry and _bus and now - last_lag_check >= 300:
+            try:
+                _check_subscriber_lag(
+                    _registry, _bus,
+                    LAG_ALERT_THRESHOLD, LAG_ALERT_COOLDOWN_SECONDS,
+                    lag_alerts_sent, now,
+                )
+            except Exception:
+                logger.exception("Lag check failed")
+            last_lag_check = now
 
         # Active health checks every 60 seconds
         if _health_monitor and now - last_health_check >= 60:
