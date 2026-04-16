@@ -152,6 +152,61 @@ class TestCleanup:
         assert len(remaining) == 1
 
 
+class TestSchemaMigration:
+    def test_migrates_legacy_db_without_status_column(self, tmp_path):
+        """EventBus must upgrade pre-0.9.1 databases that lack the status column."""
+        import sqlite3
+
+        db_path = tmp_path / "legacy" / "event_bus.db"
+        db_path.parent.mkdir(parents=True)
+
+        # Create a legacy DB with the old schema (no status column, old index)
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE events (
+                event_id     TEXT PRIMARY KEY,
+                event_type   TEXT NOT NULL,
+                source       TEXT NOT NULL,
+                timestamp    TEXT NOT NULL,
+                priority     TEXT NOT NULL,
+                payload      TEXT NOT NULL DEFAULT '{}',
+                correlation_id TEXT,
+                job_id       TEXT,
+                tags         TEXT NOT NULL DEFAULT '[]',
+                created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX idx_events_type_ts ON events (event_type, created_at);
+        """)
+        # Insert some legacy data
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, source, timestamp, priority) "
+            "VALUES ('legacy-1', 'cron_started', 'old', '2026-01-01T00:00:00Z', 'low')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening with the new EventBus should migrate the schema in place
+        bus = EventBus(db_path=db_path)
+
+        # Verify the status column now exists
+        conn = sqlite3.connect(str(db_path))
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+        assert "status" in cols
+        # Verify the new index was created
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(events)")}
+        assert "idx_events_type_status_ts" in indexes
+        # Legacy row is preserved
+        count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        assert count == 1
+        conn.close()
+
+        # New events can be emitted against the migrated DB
+        event_id = bus.emit(EventType.CRON_COMPLETED, "new", {"ok": True})
+        assert event_id
+        assert len(bus.query()) == 2  # legacy + new
+        bus.close()
+
+
 class TestThreadSafety:
     def test_concurrent_emits(self, bus):
         errors = []

@@ -80,8 +80,22 @@ class EventBus:
         return conn
 
     def _ensure_schema(self) -> None:
-        """Create tables if they don't exist."""
+        """Create tables if they don't exist, and migrate older schemas in-place."""
         conn = self._get_conn()
+
+        # Check if events table exists with legacy schema (no status column).
+        # If so, add status column BEFORE running the schema script so the new
+        # (event_type, status, timestamp) index can be created successfully.
+        try:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+            if cols and "status" not in cols:
+                logger.info("EventBus: migrating legacy schema (adding status column)")
+                conn.execute("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+                conn.commit()
+        except sqlite3.OperationalError:
+            # Table doesn't exist yet — schema script will create it fresh
+            pass
+
         conn.executescript(_SCHEMA_SQL)
         conn.commit()
 
