@@ -80,16 +80,6 @@ def classify_tier(event: Event) -> Optional[EscalationTier]:
     return _TIER_BY_EVENT.get(event.event_type)
 
 
-# Legacy set aliases kept for backwards compatibility with existing code/tests.
-ESCALATION_EVENTS = set(_TIER_BY_EVENT.keys()) | {
-    EventType.GATEWAY_HEALTH,
-    EventType.JOB_HIGH_SCORE,
-}
-BREAKTHROUGH_EVENTS = {
-    et for et, tier in _TIER_BY_EVENT.items() if tier == EscalationTier.IMMEDIATE
-}
-
-
 class WhatsAppEscalator(BaseSubscriber):
     subscriber_id = "whatsapp-escalator"
     poll_interval_seconds = 5
@@ -128,16 +118,32 @@ class WhatsAppEscalator(BaseSubscriber):
         self._daily_send_count: int = 0
         self._daily_reset_date: Optional[str] = None
 
+    # Sensible defaults used whenever the config file is missing or
+    # malformed.  Matching the spec: 23:00-07:00 ET, interview/offer
+    # signals break through.
+    _DEFAULT_QUIET_CONFIG: Dict[str, Any] = {
+        "enabled": True,
+        "start": "23:00",
+        "end": "07:00",
+        "timezone": "America/New_York",
+        "breakthrough_events": ["interview_signal", "offer_signal"],
+    }
+
     def _load_quiet_config(self) -> Dict[str, Any]:
-        if self._quiet_config_path.exists():
-            return json.loads(self._quiet_config_path.read_text(encoding="utf-8"))
-        return {
-            "enabled": True,
-            "start": "23:00",
-            "end": "07:00",
-            "timezone": "America/New_York",
-            "breakthrough_events": ["interview_signal", "offer_signal"],
-        }
+        """Load quiet_hours.json, falling back to defaults on any failure."""
+        if not self._quiet_config_path.exists():
+            return dict(self._DEFAULT_QUIET_CONFIG)
+        try:
+            data = json.loads(self._quiet_config_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"expected dict, got {type(data).__name__}")
+            return data
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.warning(
+                "WhatsAppEscalator: malformed quiet_hours.json at %s: %s — using defaults",
+                self._quiet_config_path, e,
+            )
+            return dict(self._DEFAULT_QUIET_CONFIG)
 
     def should_escalate(self, event: Event) -> bool:
         """Check if this event meets WhatsApp escalation criteria.
@@ -148,31 +154,62 @@ class WhatsAppEscalator(BaseSubscriber):
         return classify_tier(event) is not None
 
     def should_deliver_now(self, event: Event) -> bool:
-        """Check if event should be delivered now vs queued for morning."""
+        """Check if event should be delivered now vs queued for morning.
+
+        Breakthrough events (IMMEDIATE tier) deliver even during quiet
+        hours; everything else gets queued for the 7:01am flush.
+        """
         if not self._is_quiet_hours():
             return True
-        return event.event_type in BREAKTHROUGH_EVENTS
+        return classify_tier(event) == EscalationTier.IMMEDIATE
 
     def _is_quiet_hours(self) -> bool:
-        """Check if current time is within quiet hours."""
+        """Check if current time is within quiet hours.
+
+        Fail-safe: on any config parsing error (bad timezone, malformed
+        time, etc.), logs once and treats the time as quiet.  This is
+        the conservative fallback — a misconfigured system should err
+        on the side of NOT sending WhatsApp at 3am, rather than let
+        everything through.
+        """
         if not self._quiet_config.get("enabled", True):
             return False
+
         try:
             import zoneinfo
             tz = zoneinfo.ZoneInfo(self._quiet_config.get("timezone", "America/New_York"))
-            now = datetime.now(tz)
+        except Exception as e:
+            self._log_config_error_once(
+                f"invalid timezone {self._quiet_config.get('timezone')!r}: {e}"
+            )
+            return True  # fail-safe: treat as quiet
+
+        try:
             start_h, start_m = map(int, self._quiet_config["start"].split(":"))
             end_h, end_m = map(int, self._quiet_config["end"].split(":"))
+        except (KeyError, ValueError, AttributeError) as e:
+            self._log_config_error_once(f"invalid start/end time in quiet_hours: {e}")
+            return True  # fail-safe: treat as quiet
 
-            current_minutes = now.hour * 60 + now.minute
-            start_minutes = start_h * 60 + start_m
-            end_minutes = end_h * 60 + end_m
+        now = datetime.now(tz)
+        current_minutes = now.hour * 60 + now.minute
+        start_minutes = start_h * 60 + start_m
+        end_minutes = end_h * 60 + end_m
 
-            if start_minutes > end_minutes:  # crosses midnight (23:00-07:00)
-                return current_minutes >= start_minutes or current_minutes < end_minutes
-            return start_minutes <= current_minutes < end_minutes
-        except Exception:
-            return False
+        if start_minutes > end_minutes:  # crosses midnight (23:00-07:00)
+            return current_minutes >= start_minutes or current_minutes < end_minutes
+        return start_minutes <= current_minutes < end_minutes
+
+    def _log_config_error_once(self, msg: str) -> None:
+        """Log a config parse error the first time we encounter it per instance.
+
+        Avoids spamming the audit log with the same error every 5 seconds.
+        """
+        if getattr(self, "_config_error_logged", False):
+            return
+        logger.error("WhatsAppEscalator: quiet_hours config error — %s "
+                     "(failing safe: treating time as quiet)", msg)
+        self._config_error_logged = True
 
     def handle(self, event: Event) -> None:
         if not self.should_escalate(event):
@@ -191,7 +228,7 @@ class WhatsAppEscalator(BaseSubscriber):
             return
 
         # Breakthrough events always deliver immediately (bypass throttle)
-        if event.event_type in BREAKTHROUGH_EVENTS:
+        if classify_tier(event) == EscalationTier.IMMEDIATE:
             self._deliver(message)
             return
 

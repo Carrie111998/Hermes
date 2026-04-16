@@ -90,6 +90,63 @@ class TestEscalationTier:
         assert EscalationTier.IMPORTANT.priority > EscalationTier.DIGEST.priority
 
 
+class TestQuietHoursConfigHardening:
+    """Invalid quiet_hours.json must fail safe, not silently let WA through at 3am."""
+
+    def test_malformed_json_falls_back_to_defaults(self, bus, tmp_path):
+        """A corrupt config file shouldn't crash the subscriber on startup."""
+        config_path = tmp_path / "quiet_hours.json"
+        config_path.write_text("{not valid json", encoding="utf-8")
+
+        esc = WhatsAppEscalator(bus, quiet_config_path=config_path)
+        # Defaults: 23:00-07:00 ET, enabled
+        assert esc._quiet_config.get("enabled") is True
+        assert esc._quiet_config.get("start") == "23:00"
+        assert esc._quiet_config.get("end") == "07:00"
+
+    def test_invalid_timezone_does_not_cause_silent_delivery(self, bus, tmp_path):
+        """Bad timezone string should log and default to conservative quiet behavior."""
+        config = {
+            "enabled": True,
+            "start": "23:00",
+            "end": "07:00",
+            "timezone": "Mars/Olympus_Mons",  # invalid
+            "breakthrough_events": [],
+        }
+        config_path = tmp_path / "quiet_hours.json"
+        config_path.write_text(json.dumps(config))
+
+        esc = WhatsAppEscalator(bus, quiet_config_path=config_path)
+        # With bad tz, we must NOT silently return False (which would let
+        # WhatsApp through 24/7).  Conservative: treat as quiet hours.
+        assert esc._is_quiet_hours() is True
+
+    def test_invalid_time_format_falls_back_conservatively(self, bus, tmp_path):
+        """Non-HH:MM start/end strings shouldn't cause silent delivery."""
+        config = {
+            "enabled": True,
+            "start": "eleven pm",   # garbage
+            "end": "07:00",
+            "timezone": "America/New_York",
+        }
+        config_path = tmp_path / "quiet_hours.json"
+        config_path.write_text(json.dumps(config))
+
+        esc = WhatsAppEscalator(bus, quiet_config_path=config_path)
+        # Same as bad tz: conservative, treat as quiet
+        assert esc._is_quiet_hours() is True
+
+    def test_disabled_config_bypasses_quiet_hours(self, bus, tmp_path):
+        """Explicitly disabled quiet hours should always return False."""
+        config = {"enabled": False, "start": "23:00", "end": "07:00",
+                  "timezone": "America/New_York"}
+        config_path = tmp_path / "quiet_hours.json"
+        config_path.write_text(json.dumps(config))
+
+        esc = WhatsAppEscalator(bus, quiet_config_path=config_path)
+        assert esc._is_quiet_hours() is False
+
+
 class TestQueueFileConfig:
     """Spec Section 5: queue_file in quiet_hours.json is the configured queue path."""
 
