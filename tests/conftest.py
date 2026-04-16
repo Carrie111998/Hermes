@@ -40,6 +40,14 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     # Avoid making real calls during tests if this key is set in the env files
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # API server platform adapter reads these from the environment when the
+    # config dict is empty, so leaking them causes ~50 test_api_server.py
+    # failures in the full suite (but not in isolation, which is the tell).
+    # Tests that want specific values set them explicitly via monkeypatch.
+    monkeypatch.delenv("API_SERVER_HOST", raising=False)
+    monkeypatch.delenv("API_SERVER_PORT", raising=False)
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("API_SERVER_CORS_ORIGINS", raising=False)
 
 
 @pytest.fixture()
