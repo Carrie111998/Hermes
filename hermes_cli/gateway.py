@@ -201,17 +201,44 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
 
     try:
         if is_windows():
-            result = subprocess.run(
-                ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
-                capture_output=True, text=True, timeout=10
-            )
+            win_output = ""
+            try:
+                result = subprocess.run(
+                    ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
+                    capture_output=True, text=True, timeout=10
+                )
+                win_output = result.stdout
+            except (FileNotFoundError, OSError):
+                # wmic unavailable (modern Windows 11 / Git Bash) -- fall back to PowerShell
+                ps_cmd = (
+                    'Get-CimInstance Win32_Process'
+                    ' | Select-Object ProcessId,CommandLine'
+                    ' | Format-List'
+                )
+                result = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
+                    capture_output=True, text=True, timeout=15
+                )
+                win_output = result.stdout
             current_cmd = ""
-            for line in result.stdout.split('\n'):
+            for line in win_output.split('\n'):
                 line = line.strip()
                 if line.startswith("CommandLine="):
                     current_cmd = line[len("CommandLine="):]
+                elif line.startswith("CommandLine :"):
+                    current_cmd = line.split(":", 1)[1].strip()
                 elif line.startswith("ProcessId="):
                     pid_str = line[len("ProcessId="):]
+                    if any(p in current_cmd for p in patterns) and (all_profiles or _matches_current_profile(current_cmd)):
+                        try:
+                            pid = int(pid_str)
+                            if pid != os.getpid() and pid not in pids and pid not in _exclude:
+                                pids.append(pid)
+                        except ValueError:
+                            pass
+                    current_cmd = ""
+                elif line.startswith("ProcessId :"):
+                    pid_str = line.split(":", 1)[1].strip()
                     if any(p in current_cmd for p in patterns) and (all_profiles or _matches_current_profile(current_cmd)):
                         try:
                             pid = int(pid_str)
