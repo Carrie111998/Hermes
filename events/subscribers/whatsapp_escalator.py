@@ -6,8 +6,10 @@ and queues non-breakthrough events for morning flush.
 
 import json
 import logging
+import os
 import time
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -17,25 +19,75 @@ from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-# Events that escalate to WhatsApp
-ESCALATION_EVENTS = {
-    # Immediate (breakthrough during quiet hours)
-    EventType.INTERVIEW_SIGNAL,
-    EventType.OFFER_SIGNAL,
+
+class EscalationTier(Enum):
+    """4 WhatsApp escalation tiers per design spec Section 2.2.
+
+    - IMMEDIATE: breaks through quiet hours, delivered without throttle
+    - URGENT: queued during quiet hours, flushed at 7:01am
+    - IMPORTANT: queued during quiet hours, throttled to 15-min windows
+    - DIGEST: morning digest, sent at 7:01am by DigestComposer
+    """
+
+    IMMEDIATE = ("immediate", 40)
+    URGENT = ("urgent", 30)
+    IMPORTANT = ("important", 20)
+    DIGEST = ("digest", 10)
+
+    def __init__(self, label: str, priority: int):
+        self.label = label
+        self.priority = priority
+
+
+# Tier assignment per event type (static mapping)
+_TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
+    # Immediate
+    EventType.INTERVIEW_SIGNAL: EscalationTier.IMMEDIATE,
+    EventType.OFFER_SIGNAL: EscalationTier.IMMEDIATE,
     # Urgent
-    EventType.APPLICATION_BLOCKED,
-    EventType.APPLICATION_FAILED,
-    EventType.CRON_FAILED_CONSECUTIVE,
-    EventType.GATEWAY_HEALTH,
+    EventType.APPLICATION_BLOCKED: EscalationTier.URGENT,
+    EventType.APPLICATION_FAILED: EscalationTier.URGENT,
+    EventType.CRON_FAILED_CONSECUTIVE: EscalationTier.URGENT,
+    # GATEWAY_HEALTH is conditional (only down) — handled in classify_tier
     # Important
-    EventType.JOB_HIGH_SCORE,  # only if score >= 9.0
-    EventType.APPLICATION_READY,
-    EventType.FOLLOWUP_DUE,
+    EventType.APPLICATION_READY: EscalationTier.IMPORTANT,
+    EventType.FOLLOWUP_DUE: EscalationTier.IMPORTANT,
+    # JOB_HIGH_SCORE is conditional (>= 9.0) — handled in classify_tier
 }
 
-BREAKTHROUGH_EVENTS = {EventType.INTERVIEW_SIGNAL, EventType.OFFER_SIGNAL}
-
 HIGH_SCORE_WA_THRESHOLD = 9.0
+
+
+def classify_tier(event: Event) -> Optional[EscalationTier]:
+    """Classify an event into its WhatsApp escalation tier.
+
+    Returns None if the event should not be escalated to WhatsApp at all
+    (e.g. GATEWAY_HEALTH when status=up, or JOB_HIGH_SCORE below threshold).
+    """
+    # Conditional: GATEWAY_HEALTH only escalates on "down"
+    if event.event_type == EventType.GATEWAY_HEALTH:
+        if event.payload.get("status") == "down":
+            return EscalationTier.URGENT
+        return None
+
+    # Conditional: JOB_HIGH_SCORE only escalates above WhatsApp threshold
+    if event.event_type == EventType.JOB_HIGH_SCORE:
+        score = event.payload.get("score", 0)
+        if score >= HIGH_SCORE_WA_THRESHOLD:
+            return EscalationTier.IMPORTANT
+        return None
+
+    return _TIER_BY_EVENT.get(event.event_type)
+
+
+# Legacy set aliases kept for backwards compatibility with existing code/tests.
+ESCALATION_EVENTS = set(_TIER_BY_EVENT.keys()) | {
+    EventType.GATEWAY_HEALTH,
+    EventType.JOB_HIGH_SCORE,
+}
+BREAKTHROUGH_EVENTS = {
+    et for et, tier in _TIER_BY_EVENT.items() if tier == EscalationTier.IMMEDIATE
+}
 
 
 class WhatsAppEscalator(BaseSubscriber):
@@ -56,14 +108,19 @@ class WhatsAppEscalator(BaseSubscriber):
         if quiet_config_path is None:
             from hermes_constants import get_hermes_home
             quiet_config_path = get_hermes_home() / "notifications" / "quiet_hours.json"
-        if queue_path is None:
-            from hermes_constants import get_hermes_home
-            queue_path = get_hermes_home() / "notifications" / "quiet_queue.json"
 
         self._quiet_config_path = Path(quiet_config_path)
-        self._queue_path = Path(queue_path)
         self._send_fn = send_fn
         self._quiet_config = self._load_quiet_config()
+
+        # Queue path precedence: explicit argument > quiet_hours.json queue_file > default
+        if queue_path is not None:
+            self._queue_path = Path(queue_path)
+        elif self._quiet_config.get("queue_file"):
+            self._queue_path = Path(os.path.expanduser(self._quiet_config["queue_file"]))
+        else:
+            from hermes_constants import get_hermes_home
+            self._queue_path = get_hermes_home() / "notifications" / "quiet_queue.json"
 
         # Throttle state
         self._throttle_buffer: List[str] = []
@@ -83,20 +140,12 @@ class WhatsAppEscalator(BaseSubscriber):
         }
 
     def should_escalate(self, event: Event) -> bool:
-        """Check if this event meets WhatsApp escalation criteria."""
-        if event.event_type not in ESCALATION_EVENTS:
-            return False
+        """Check if this event meets WhatsApp escalation criteria.
 
-        # JOB_HIGH_SCORE only escalates if score >= 9.0
-        if event.event_type == EventType.JOB_HIGH_SCORE:
-            score = event.payload.get("score", 0)
-            return score >= HIGH_SCORE_WA_THRESHOLD
-
-        # GATEWAY_HEALTH only escalates on "down"
-        if event.event_type == EventType.GATEWAY_HEALTH:
-            return event.payload.get("status") == "down"
-
-        return True
+        Delegates to classify_tier() — an event escalates iff it maps to
+        a non-None tier (Immediate / Urgent / Important).
+        """
+        return classify_tier(event) is not None
 
     def should_deliver_now(self, event: Event) -> bool:
         """Check if event should be delivered now vs queued for morning."""

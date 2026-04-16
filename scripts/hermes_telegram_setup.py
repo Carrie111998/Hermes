@@ -129,6 +129,7 @@ def main():
         "end": "07:00",
         "timezone": "America/New_York",
         "breakthrough_events": ["interview_signal", "offer_signal"],
+        "queue_file": str(notifications_dir / "quiet_queue.json"),
     }
     quiet_path = notifications_dir / "quiet_hours.json"
     quiet_path.write_text(json.dumps(quiet_config, indent=2), encoding="utf-8")
@@ -147,6 +148,39 @@ def main():
             logger.info("  %s: OK", topic["name"])
         except RuntimeError as e:
             logger.error("  %s: FAILED — %s", topic["name"], e)
+
+    # Send + pin welcome message in the General topic (no message_thread_id
+    # targets the forum's General topic, visible to everyone who joins).
+    logger.info("\nPinning welcome message in General topic...")
+    welcome_text = (
+        "Hermes Event Bus\n\n"
+        "This group is Hermes's control room. Each forum topic receives "
+        "a class of events from the agent platform:\n\n"
+        "- Alerts & Actions: blockers, interviews, offers, gateway health\n"
+        "- Scout / Discoveries: new jobs found\n"
+        "- Matcher / Scores: scoring output (highlights when >= 8.75)\n"
+        "- Tailor & Applier: resume generation + submission lifecycle\n"
+        "- Tracker / Pipeline: stage transitions, follow-ups\n"
+        "- Digests & Summaries: 3x/day pipeline digests\n"
+        "- System Health: cron lifecycle, agent errors, memory writes\n"
+        "- Agent Comms: mirrored mailbox messages\n\n"
+        "WhatsApp only receives action-required escalations. Details land here."
+    )
+    try:
+        welcome = telegram_api(
+            token, "sendMessage",
+            chat_id=chat_id,
+            text=welcome_text,
+        )
+        telegram_api(
+            token, "pinChatMessage",
+            chat_id=chat_id,
+            message_id=welcome["message_id"],
+            disable_notification=True,
+        )
+        logger.info("  Pinned welcome message (id=%s)", welcome["message_id"])
+    except RuntimeError as e:
+        logger.warning("  Could not pin welcome message: %s", e)
 
     # Update .env with home channel
     env_path = Path.home() / ".hermes" / "profiles" / "main" / ".env"

@@ -9,7 +9,11 @@ import pytest
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
-from events.subscribers.whatsapp_escalator import WhatsAppEscalator
+from events.subscribers.whatsapp_escalator import (
+    WhatsAppEscalator,
+    EscalationTier,
+    classify_tier,
+)
 
 
 @pytest.fixture
@@ -35,6 +39,91 @@ def quiet_config(tmp_path):
 @pytest.fixture
 def queue_path(tmp_path):
     return tmp_path / "notifications" / "quiet_queue.json"
+
+
+class TestEscalationTier:
+    """Spec Section 2.2: 4 tiers (Immediate / Urgent / Important / Digest)."""
+
+    def _ev(self, event_type: EventType, payload=None) -> Event:
+        return Event(
+            event_id="t",
+            event_type=event_type,
+            source="test",
+            timestamp="2026-04-16T00:00:00Z",
+            priority=event_type.default_priority,
+            payload=payload or {},
+        )
+
+    def test_immediate_tier_breaks_through_quiet_hours(self):
+        assert classify_tier(self._ev(EventType.INTERVIEW_SIGNAL)) == EscalationTier.IMMEDIATE
+        assert classify_tier(self._ev(EventType.OFFER_SIGNAL)) == EscalationTier.IMMEDIATE
+
+    def test_urgent_tier_application_blocked_and_failed(self):
+        assert classify_tier(self._ev(EventType.APPLICATION_BLOCKED)) == EscalationTier.URGENT
+        assert classify_tier(self._ev(EventType.APPLICATION_FAILED)) == EscalationTier.URGENT
+        assert classify_tier(self._ev(EventType.CRON_FAILED_CONSECUTIVE)) == EscalationTier.URGENT
+
+    def test_urgent_tier_only_for_gateway_down(self):
+        assert classify_tier(self._ev(EventType.GATEWAY_HEALTH, {"status": "down"})) == EscalationTier.URGENT
+        # Gateway up is not urgent (not escalated at all)
+        assert classify_tier(self._ev(EventType.GATEWAY_HEALTH, {"status": "up"})) is None
+
+    def test_important_tier_requires_high_score_threshold(self):
+        # Score >= 9.0 is important
+        assert classify_tier(self._ev(EventType.JOB_HIGH_SCORE, {"score": 9.2})) == EscalationTier.IMPORTANT
+        # Below 9.0 is not escalated
+        assert classify_tier(self._ev(EventType.JOB_HIGH_SCORE, {"score": 8.9})) is None
+
+    def test_important_tier_application_ready_and_followup(self):
+        assert classify_tier(self._ev(EventType.APPLICATION_READY)) == EscalationTier.IMPORTANT
+        assert classify_tier(self._ev(EventType.FOLLOWUP_DUE)) == EscalationTier.IMPORTANT
+
+    def test_non_escalated_events_return_none(self):
+        assert classify_tier(self._ev(EventType.CRON_COMPLETED)) is None
+        assert classify_tier(self._ev(EventType.JOB_DISCOVERED)) is None
+        assert classify_tier(self._ev(EventType.MAILBOX_MESSAGE)) is None
+
+    def test_tier_ordering(self):
+        """Tiers are orderable — Immediate > Urgent > Important > Digest."""
+        assert EscalationTier.IMMEDIATE.priority > EscalationTier.URGENT.priority
+        assert EscalationTier.URGENT.priority > EscalationTier.IMPORTANT.priority
+        assert EscalationTier.IMPORTANT.priority > EscalationTier.DIGEST.priority
+
+
+class TestQueueFileConfig:
+    """Spec Section 5: queue_file in quiet_hours.json is the configured queue path."""
+
+    def test_queue_file_field_is_honored(self, bus, tmp_path):
+        """queue_file in quiet_hours.json overrides the default location."""
+        custom_queue = tmp_path / "custom" / "my_queue.json"
+        config = {
+            "enabled": True,
+            "start": "23:00",
+            "end": "07:00",
+            "timezone": "America/New_York",
+            "breakthrough_events": [],
+            "queue_file": str(custom_queue),
+        }
+        config_path = tmp_path / "quiet_hours.json"
+        config_path.write_text(json.dumps(config))
+
+        esc = WhatsAppEscalator(bus, quiet_config_path=config_path)
+        assert esc._queue_path == custom_queue
+
+    def test_explicit_queue_path_wins_over_config(self, bus, tmp_path):
+        """Constructor arg takes precedence over quiet_hours.json queue_file."""
+        config = {
+            "queue_file": str(tmp_path / "from_config.json"),
+            "enabled": True,
+            "start": "23:00", "end": "07:00",
+            "timezone": "America/New_York",
+        }
+        config_path = tmp_path / "quiet_hours.json"
+        config_path.write_text(json.dumps(config))
+        explicit = tmp_path / "explicit.json"
+
+        esc = WhatsAppEscalator(bus, quiet_config_path=config_path, queue_path=explicit)
+        assert esc._queue_path == explicit
 
 
 class TestEscalationCriteria:
