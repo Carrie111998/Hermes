@@ -1,10 +1,32 @@
 """Tests for events.subscribers.base -- BaseSubscriber and SubscriberRegistry."""
 
+import time
+
 import pytest
 
 from events.bus import EventBus
 from events.schema import EventType, Priority
 from events.subscribers.base import BaseSubscriber, SubscriberRegistry
+
+
+class FlakySubscriber(BaseSubscriber):
+    """Subscriber whose handle() can be made to throw on demand."""
+
+    subscriber_id = "flaky"
+    poll_interval_seconds = 1
+    # Tighten the breaker so tests don't need real cooldowns
+    CIRCUIT_BREAKER_ERROR_THRESHOLD = 3
+    CIRCUIT_BREAKER_COOLDOWN_SECONDS = 1
+
+    def __init__(self, bus: EventBus):
+        super().__init__(bus)
+        self.raise_error = False
+        self.handle_calls = 0
+
+    def handle(self, event):
+        self.handle_calls += 1
+        if self.raise_error:
+            raise RuntimeError("boom")
 
 
 class StubSubscriber(BaseSubscriber):
@@ -125,6 +147,117 @@ class TestSubscriberRegistry:
 
         results = registry.poll_all()
         assert results == {"stub-1": 1, "stub-2": 1}
+
+
+class TestCircuitBreaker:
+    """After N consecutive handle() errors, a subscriber is quarantined for a cooldown."""
+
+    def test_consecutive_errors_counter_increments(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+        assert sub._consecutive_errors == 1
+
+    def test_success_resets_consecutive_errors(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+
+        # First event fails
+        sub.raise_error = True
+        bus.emit(EventType.CRON_COMPLETED, "test", {"i": 1})
+        sub.poll()
+        assert sub._consecutive_errors == 1
+
+        # Next event succeeds
+        sub.raise_error = False
+        bus.emit(EventType.CRON_COMPLETED, "test", {"i": 2})
+        sub.poll()
+        assert sub._consecutive_errors == 0
+
+    def test_threshold_opens_circuit(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        # Emit exactly threshold events — after processing, circuit opens
+        for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
+            bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+        assert sub._is_quarantined()
+
+    def test_quarantined_subscriber_skips_handle(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        # Trip the breaker
+        for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
+            bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+        assert sub._is_quarantined()
+
+        # Emit more events — they should not be handled while quarantined
+        calls_before = sub.handle_calls
+        for _ in range(5):
+            bus.emit(EventType.CRON_STARTED, "test", {})
+        result = sub.poll()
+        assert result == 0
+        assert sub.handle_calls == calls_before
+
+    def test_cooldown_expiry_reopens_circuit(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
+            bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+        assert sub._is_quarantined()
+
+        # Fast-forward: pretend cooldown has elapsed
+        sub._quarantined_until = time.monotonic() - 1
+
+        # Now fix the handler and emit a new event
+        sub.raise_error = False
+        bus.emit(EventType.CRON_STARTED, "test", {})
+        processed = sub.poll()
+        # Cursor may include previously-queued events too; what matters is
+        # that we left quarantine and successfully processed something.
+        assert processed >= 1
+        assert not sub._is_quarantined()
+        assert sub._consecutive_errors == 0
+
+    def test_emits_agent_error_on_trip(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
+            bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        errors = bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(errors) == 1
+        assert errors[0].payload.get("subscriber_id") == "flaky"
+        assert "quarantined" in errors[0].payload.get("error", "").lower()
+
+    def test_agent_error_not_duplicated_while_quarantined(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        # Trip
+        for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
+            bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        # More polls while quarantined shouldn't produce more agent_errors
+        for _ in range(3):
+            sub.poll()
+        errors = bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(errors) == 1
 
 
 class TestLagAlertHelper:
