@@ -60,13 +60,17 @@ SILENT_MARKER = "[SILENT]"
 _event_emitter = None
 
 def _get_event_emitter():
-    """Lazy-load the CronEventEmitter to avoid import-time side effects."""
+    """Lazy-load the CronEventEmitter using the gateway's shared EventBus."""
     global _event_emitter
     if _event_emitter is None:
         try:
-            from events.bus import EventBus
+            from events.gateway_integration import get_bus
             from events.producers.cron_emitter import CronEventEmitter
-            _event_emitter = CronEventEmitter(EventBus())
+            bus = get_bus()
+            if bus:
+                _event_emitter = CronEventEmitter(bus)
+            else:
+                _event_emitter = False  # sentinel: gateway not started yet
         except Exception as e:
             logger.debug("Event bus not available: %s", e)
             _event_emitter = False  # sentinel: don't retry

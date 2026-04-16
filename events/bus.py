@@ -232,6 +232,13 @@ class EventBus:
 
         return [self._row_to_event(r) for r in rows]
 
+    def close(self) -> None:
+        """Close the thread-local SQLite connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn:
+            conn.close()
+            self._local.conn = None
+
     def cleanup(self, retention_days: int = 30) -> int:
         """Remove events older than retention_days.  Returns count removed."""
         cursor = self._execute(

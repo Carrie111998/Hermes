@@ -26,12 +26,17 @@ def migrate_hermes_jobs():
         return
 
     try:
-        jobs = json.loads(HERMES_CRON.read_text(encoding="utf-8"))
+        raw = json.loads(HERMES_CRON.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         print(f"ERROR: Could not parse {HERMES_CRON}: {exc}")
         return
-    if not isinstance(jobs, list):
-        print(f"ERROR: Expected list in {HERMES_CRON}, got {type(jobs).__name__}")
+    # Handle both {"jobs": [...]} wrapper and bare list formats
+    if isinstance(raw, dict):
+        jobs = raw.get("jobs", [])
+    elif isinstance(raw, list):
+        jobs = raw
+    else:
+        print(f"ERROR: Unexpected format in {HERMES_CRON}, got {type(raw).__name__}")
         return
 
     modified = False
@@ -91,7 +96,8 @@ def migrate_hermes_jobs():
         modified = True
 
     if modified:
-        HERMES_CRON.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
+        out = {"jobs": jobs, "updated_at": datetime.now(timezone.utc).isoformat()}
+        HERMES_CRON.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"\nHermes jobs updated: {len(jobs)} jobs")
     else:
         print("No Hermes changes needed")
@@ -104,12 +110,16 @@ def disable_openclaw_jobs():
         return
 
     try:
-        jobs = json.loads(OPENCLAW_CRON.read_text(encoding="utf-8"))
+        raw = json.loads(OPENCLAW_CRON.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         print(f"ERROR: Could not parse {OPENCLAW_CRON}: {exc}")
         return
-    if not isinstance(jobs, list):
-        print(f"ERROR: Expected list in {OPENCLAW_CRON}, got {type(jobs).__name__}")
+    if isinstance(raw, dict):
+        jobs = raw.get("jobs", [])
+    elif isinstance(raw, list):
+        jobs = raw
+    else:
+        print(f"ERROR: Unexpected format in {OPENCLAW_CRON}, got {type(raw).__name__}")
         return
 
     count = 0
