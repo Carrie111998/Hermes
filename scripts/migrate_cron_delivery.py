@@ -37,7 +37,7 @@ def migrate_hermes_jobs():
 
     # Set all deliver fields to "local"
     for job in jobs:
-        if job.get("deliver") not in ("local", None):
+        if job.get("deliver") != "local":
             old = job.get("deliver", "unset")
             job["deliver"] = "local"
             print(f"  {job.get('name', job['id'])}: deliver {old} → local")
@@ -104,8 +104,11 @@ def disable_openclaw_jobs():
             job["paused_reason"] = "Migrated to Hermes EventBus — disabled by migration script"
             count += 1
 
-    OPENCLAW_CRON.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nOpenClaw: disabled {count} jobs")
+    if count > 0:
+        OPENCLAW_CRON.write_text(json.dumps(jobs, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"\nOpenClaw: disabled {count} jobs")
+    else:
+        print("\nOpenClaw: no enabled jobs to disable")
 
 
 if __name__ == "__main__":
