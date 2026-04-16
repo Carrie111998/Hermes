@@ -75,6 +75,9 @@ class MemoryWriter(BaseSubscriber):
         self._rate_counters: Dict[str, List[float]] = defaultdict(list)
         self._seen_correlation_ids: Dict[str, float] = {}  # correlation_id → timestamp
         self._DEDUP_WINDOW = 86400  # 24 hours
+        # Cached MemPalace Chroma collection — None means "not loaded yet".
+        # False means "mempalace is not installed; don't try again".
+        self._mempalace_collection: Any = None
 
     def handle(self, event: Event) -> None:
         routing = MEMORY_ROUTING.get(event.event_type)
@@ -193,9 +196,65 @@ class MemoryWriter(BaseSubscriber):
             logger.warning("MemoryWriter: GBrain write failed: %s", e)
 
     def _write_mempalace(self, event: Event, content: str) -> None:
-        """Write to MemPalace via MCP tools (best-effort)."""
-        logger.info("MemoryWriter: would write to MemPalace: %s", content[:100])
-        # MemPalace writes will be integrated via MCP in the gateway context
+        """Store verbatim event evidence as a MemPalace drawer.
+
+        Uses the mempalace Python package directly (the same palace the
+        MCP server and CLI write to).  The collection is cached after
+        first use so subsequent writes don't re-open the ChromaDB handle.
+
+        Wing: ``hermes-events`` (isolates event-bus writes from other wings).
+        Room: the event type string (one room per event kind).
+        source_file: ``event-bus:<event_id>`` — unique identifier that
+            mempalace's dedup logic keys on.
+
+        Best-effort: if mempalace isn't installed, logs at debug and returns.
+        """
+        collection = self._get_mempalace_collection()
+        if collection is False:
+            return  # mempalace not available
+
+        try:
+            from mempalace.miner import add_drawer
+            add_drawer(
+                collection,
+                wing="hermes-events",
+                room=event.event_type.type_string,
+                content=content,
+                source_file=f"event-bus:{event.event_id}",
+                chunk_index=0,
+                agent="hermes-event-bus",
+            )
+            logger.info("MemoryWriter: filed MemPalace drawer for %s", event.event_type.type_string)
+        except Exception as e:
+            logger.warning("MemoryWriter: MemPalace write failed: %s", e)
+
+    def _get_mempalace_collection(self) -> Any:
+        """Return the cached MemPalace collection, or load it on first use.
+
+        Returns False if mempalace isn't installed — caller should bail.
+        Returns a ChromaCollection-like object on success.
+        """
+        if self._mempalace_collection is not None:
+            return self._mempalace_collection
+
+        try:
+            from mempalace.palace import get_collection
+            import os
+            from pathlib import Path
+
+            # Default palace path per mempalace convention; respects
+            # MEMPALACE_HOME override used by the CLI.
+            palace_root = os.environ.get("MEMPALACE_HOME") or str(Path.home() / ".mempalace" / "palace")
+            self._mempalace_collection = get_collection(palace_root)
+            return self._mempalace_collection
+        except ImportError:
+            logger.debug("MemoryWriter: mempalace not installed, skipping MemPalace writes")
+            self._mempalace_collection = False
+            return False
+        except Exception as e:
+            logger.warning("MemoryWriter: could not open MemPalace collection: %s", e)
+            # Don't cache the failure — transient errors (e.g. locked DB) may clear
+            return False
 
     def _write_memory_md(self, event: Event, content: str) -> None:
         """Append operational note to agent MEMORY.md."""
