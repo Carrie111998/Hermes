@@ -25,7 +25,15 @@ def migrate_hermes_jobs():
         print("Hermes cron/jobs.json not found, skipping")
         return
 
-    jobs = json.loads(HERMES_CRON.read_text(encoding="utf-8"))
+    try:
+        jobs = json.loads(HERMES_CRON.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: Could not parse {HERMES_CRON}: {exc}")
+        return
+    if not isinstance(jobs, list):
+        print(f"ERROR: Expected list in {HERMES_CRON}, got {type(jobs).__name__}")
+        return
+
     modified = False
 
     # Remove jaum-daytime-relay
@@ -40,7 +48,7 @@ def migrate_hermes_jobs():
         if job.get("deliver") != "local":
             old = job.get("deliver", "unset")
             job["deliver"] = "local"
-            print(f"  {job.get('name', job['id'])}: deliver {old} → local")
+            print(f"  {job.get('name', job.get('id', '<unknown>'))}: deliver {old} → local")
             modified = True
 
     # Add jobflow-archiver if not exists
@@ -95,7 +103,15 @@ def disable_openclaw_jobs():
         print("\nOpenClaw cron/jobs.json not found, skipping")
         return
 
-    jobs = json.loads(OPENCLAW_CRON.read_text(encoding="utf-8"))
+    try:
+        jobs = json.loads(OPENCLAW_CRON.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: Could not parse {OPENCLAW_CRON}: {exc}")
+        return
+    if not isinstance(jobs, list):
+        print(f"ERROR: Expected list in {OPENCLAW_CRON}, got {type(jobs).__name__}")
+        return
+
     count = 0
     for job in jobs:
         if job.get("enabled", False):
