@@ -1956,7 +1956,7 @@ class GatewayRunner:
         
         self._running = True
         self._update_runtime_status("running")
-        
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
@@ -1969,6 +1969,7 @@ class GatewayRunner:
         try:
             from events.gateway_integration import startup as eventbus_startup
             eventbus_startup(adapters=self.adapters)
+            logger.info("EventBus: started successfully")
         except Exception as e:
             logger.warning("EventBus initialization failed (non-fatal): %s", e)
 
