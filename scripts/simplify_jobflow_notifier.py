@@ -40,10 +40,17 @@ SIMPLIFIED_PROMPT = (
     "Act as the Notifier agent for JobFlow on Hermes. "
     f"Root: {_ROOT}. "
     f"Read {_ROOT}/profiles/notifier/workspace/AGENTS.md and SOUL.md first. "
-    "Generate a pipeline snapshot from tracker state: counts by stage, "
-    "pending approvals, follow-ups due, high-score jobs awaiting review. "
-    "Write the structured snapshot to workspace/digest-data.json for "
-    "DigestComposer to consume. "
+    "Generate a pipeline snapshot from tracker state and write it to "
+    "workspace/digest-data.json as a JSON object with this schema: "
+    '{"generated_at": "<ISO8601 UTC timestamp>", '
+    '"pipeline_snapshot": {"total_active": <int>, '
+    '"by_stage": {"discovered": <int>, "scored": <int>, "tailoring": <int>, '
+    '"submitted": <int>, "interviewing": <int>, "offer": <int>, '
+    '"rejected": <int>, "archived": <int>}}, '
+    '"action_items": [{"company": "<name>", "type": "<approve_dry_run|followup_due|blocked>", "detail": "<short text>"}], '
+    '"system_health": {"errors_24h": <int>}}. '
+    "DigestComposer reads this file at 8am/1pm/6pm ET to include the "
+    "snapshot in the digest. "
     "Do NOT write to any inbox. Do NOT send WhatsApp. Do NOT format "
     "user-facing text — DigestComposer handles delivery across Telegram "
     "and WhatsApp via the event bus. "

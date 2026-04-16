@@ -8,9 +8,9 @@ Posts to the Digests & Summaries Telegram topic and WhatsApp (morning only).
 import json
 import logging
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
@@ -25,16 +25,24 @@ class DigestComposer(BaseSubscriber):
     subscriber_id = "digest-composer"
     poll_interval_seconds = 60  # check every minute if digest is due
 
+    # The jobflow-notifier cron job writes pipeline snapshot data here
+    # on a 7am cron.  DigestComposer reads it to incorporate pipeline
+    # counts into the digest body (spec §7).
+    DEFAULT_SNAPSHOT_PATH = Path.home() / ".hermes" / "profiles" / "notifier" / "workspace" / "digest-data.json"
+    SNAPSHOT_STALE_AFTER_HOURS = 24
+
     def __init__(
         self,
         bus: EventBus,
         send_telegram_fn: Optional[Callable] = None,
         send_whatsapp_fn: Optional[Callable] = None,
+        notifier_snapshot_path: Optional[Path] = None,
     ):
         super().__init__(bus)
         self._send_telegram_fn = send_telegram_fn
         self._send_whatsapp_fn = send_whatsapp_fn
         self._last_digest_at: Optional[str] = None
+        self._snapshot_path = Path(notifier_snapshot_path) if notifier_snapshot_path else self.DEFAULT_SNAPSHOT_PATH
 
     def handle(self, event: Event) -> None:
         # DigestComposer doesn't process individual events via handle().
@@ -51,10 +59,12 @@ class DigestComposer(BaseSubscriber):
         events = self.bus.query(since=query_since) if query_since else self.bus.query()
         self._last_digest_at = datetime.now(timezone.utc).isoformat()
 
+        snapshot = self._load_notifier_snapshot()
+
         if not events:
-            digest = self._format_empty_digest()
+            digest = self._format_empty_digest(snapshot)
         else:
-            digest = self._format_digest(events)
+            digest = self._format_digest(events, snapshot)
 
         # Deliver to Telegram Digests topic
         self._deliver_telegram(digest)
@@ -72,6 +82,74 @@ class DigestComposer(BaseSubscriber):
         )
 
         return digest
+
+    def _load_notifier_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Load the notifier's latest pipeline snapshot, if fresh.
+
+        Expected format (written by the jobflow-notifier cron job):
+            {
+                "generated_at": "<ISO8601 UTC>",
+                "pipeline_snapshot": {
+                    "total_active": int,
+                    "by_stage": {<stage>: int, ...}
+                },
+                "action_items": [...],         # optional, used by composer
+                "system_health": {...}         # optional
+            }
+
+        Returns None when the file is missing, unreadable, malformed,
+        or older than SNAPSHOT_STALE_AFTER_HOURS — so compose() always
+        falls back to event-bus-only digests.
+        """
+        if not self._snapshot_path.exists():
+            return None
+        try:
+            data = json.loads(self._snapshot_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("DigestComposer: ignoring malformed notifier snapshot: %s", e)
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        # Reject stale snapshots so we don't report yesterday's pipeline as current
+        generated_at = data.get("generated_at")
+        if generated_at:
+            try:
+                # Strip trailing Z which fromisoformat pre-3.11 rejects
+                ts = generated_at.rstrip("Z")
+                gen = datetime.fromisoformat(ts)
+                if gen.tzinfo is None:
+                    gen = gen.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - gen
+                if age > timedelta(hours=self.SNAPSHOT_STALE_AFTER_HOURS):
+                    logger.info(
+                        "DigestComposer: notifier snapshot is stale (%.1fh old), skipping",
+                        age.total_seconds() / 3600,
+                    )
+                    return None
+            except ValueError:
+                # Bad timestamp — treat as unknown freshness, still skip
+                return None
+
+        return data
+
+    def _format_pipeline_block(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Format the pipeline snapshot block from notifier data."""
+        ps = snapshot.get("pipeline_snapshot", {})
+        if not isinstance(ps, dict):
+            return []
+        lines: List[str] = []
+        total = ps.get("total_active")
+        by_stage = ps.get("by_stage", {}) if isinstance(ps.get("by_stage"), dict) else {}
+        if total is None and not by_stage:
+            return []
+        lines.append("")
+        lines.append("PIPELINE SNAPSHOT")
+        if total is not None:
+            lines.append(f"  Total active: {total}")
+        for stage, count in by_stage.items():
+            lines.append(f"  {stage}: {count}")
+        return lines
 
     def _is_morning(self) -> bool:
         """Check if current ET hour is in the morning window."""
@@ -146,7 +224,7 @@ class DigestComposer(BaseSubscriber):
         except Exception as e:
             logger.error("DigestComposer: WhatsApp delivery failed: %s", e)
 
-    def _format_digest(self, events: List[Event]) -> str:
+    def _format_digest(self, events: List[Event], snapshot: Optional[Dict[str, Any]] = None) -> str:
         """Format a list of events into a structured digest."""
         now_str = datetime.now(timezone.utc).strftime("%b %d %Y %H:%M UTC")
         period = self._get_period_label()
@@ -193,6 +271,12 @@ class DigestComposer(BaseSubscriber):
 
         # Build digest
         lines = [f"HERMES DIGEST — {period} / {now_str}", ""]
+
+        # Pipeline snapshot from notifier (if fresh)
+        if snapshot:
+            lines.extend(self._format_pipeline_block(snapshot))
+            if lines[-1] != "":
+                lines.append("")
 
         # Event summary by source
         lines.append("SINCE LAST DIGEST")
@@ -244,10 +328,15 @@ class DigestComposer(BaseSubscriber):
 
         return "\n".join(lines)
 
-    def _format_empty_digest(self) -> str:
+    def _format_empty_digest(self, snapshot: Optional[Dict[str, Any]] = None) -> str:
         now_str = datetime.now(timezone.utc).strftime("%b %d %Y %H:%M UTC")
         period = self._get_period_label()
-        return f"HERMES DIGEST — {period} / {now_str}\n\nNo activity since last digest."
+        lines = [f"HERMES DIGEST — {period} / {now_str}"]
+        if snapshot:
+            lines.extend(self._format_pipeline_block(snapshot))
+        lines.append("")
+        lines.append("No activity since last digest.")
+        return "\n".join(lines)
 
     def _get_period_label(self) -> str:
         try:
