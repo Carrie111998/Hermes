@@ -46,6 +46,15 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms.miniapp_agents import MiniAppAgentRegistry
+from gateway.platforms.miniapp_commands import command_catalog, execute_command
+from gateway.platforms.miniapp_vision import inject_attachment_hints
+import gateway.platforms.miniapp_status as miniapp_status
+from gateway.platforms.telegram_miniapp_auth import (
+    MiniAppAuthError,
+    validate_telegram_init_data,
+)
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +243,11 @@ class ResponseStore:
 # ---------------------------------------------------------------------------
 
 _CORS_HEADERS = {
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS, PATCH",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Hermes-Session-Id, X-Telegram-Init-Data"
+    ),
 }
 
 
@@ -395,6 +407,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Creation timestamps for orphaned-run TTL sweep
         self._run_streams_created: Dict[str, float] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._miniapp_agent_registry: Optional[MiniAppAgentRegistry] = None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -487,6 +500,25 @@ class APIServerAdapter(BasePlatformAdapter):
             status=401,
         )
 
+    def _check_api_auth(self, request: "web.Request") -> Optional["web.Response"]:
+        """Validate Telegram init data or fall back to Bearer token auth."""
+        init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
+        if init_data:
+            try:
+                validate_telegram_init_data(init_data)
+                return None
+            except MiniAppAuthError:
+                bearer_err = self._check_auth(request)
+                if bearer_err is None:
+                    return None
+                return bearer_err
+        return self._check_auth(request)
+
+    def _get_miniapp_agent_registry(self) -> MiniAppAgentRegistry:
+        if self._miniapp_agent_registry is None:
+            self._miniapp_agent_registry = MiniAppAgentRegistry()
+        return self._miniapp_agent_registry
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -569,6 +601,143 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent"})
+
+    # ------------------------------------------------------------------
+    # MiniApp Handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_miniapp_index(self, request: "web.Request") -> "web.StreamResponse":
+        """GET /miniapp — serve the MiniApp SPA."""
+        from pathlib import Path
+        path = Path.home() / ".hermes" / "miniapp" / "index.html"
+        if not path.exists():
+            return web.json_response({"error": "Mini App asset missing"}, status=404)
+        return web.FileResponse(path)
+
+    async def _handle_model_info(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(miniapp_status.resolve_runtime_model_info())
+
+    async def _handle_session_usage(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        return web.json_response(miniapp_status.build_session_usage(session_id, {}))
+
+    async def _handle_processes(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(miniapp_status.list_process_rows())
+
+    async def _handle_commands(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response({"commands": command_catalog()})
+
+    async def _handle_command(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+        raw_command = body.get("command", "")
+        if not isinstance(raw_command, str):
+            return web.json_response({"error": "Command must be a string"}, status=400)
+        command = raw_command.strip()
+        if not command.startswith("/"):
+            return web.json_response({"error": "Command must start with /"}, status=400)
+        args = body.get("args", "")
+        if not isinstance(args, str):
+            return web.json_response({"error": "Args must be a string"}, status=400)
+        session_id = request.headers.get("X-Hermes-Session-Id", "").strip() or None
+        result = execute_command(self, command=command, args=args, session_id=session_id)
+        return web.json_response(result)
+
+    async def _handle_list_agents(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            return web.json_response({"agents": self._get_miniapp_agent_registry().list_agents()})
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+
+    async def _handle_spawn_agent(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+        try:
+            agent = self._get_miniapp_agent_registry().spawn(
+                prompt=body.get("prompt", ""),
+                name=body.get("name"),
+                mode=(body.get("mode") or "interactive"),
+                worktree=bool(body.get("worktree")),
+            )
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except RuntimeError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(agent)
+
+    async def _handle_get_agent(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            agent = self._get_miniapp_agent_registry().get_agent(request.match_info["name"])
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        return web.json_response(agent)
+
+    async def _handle_send_agent_message(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Request body must be a JSON object"}, status=400)
+        try:
+            result = self._get_miniapp_agent_registry().send_message(
+                request.match_info["name"],
+                body.get("message", ""),
+            )
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except RuntimeError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(result)
+
+    async def _handle_delete_agent(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_api_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            result = self._get_miniapp_agent_registry().delete(request.match_info["name"])
+        except KeyError as exc:
+            return web.json_response({"error": str(exc)}, status=404)
+        except RuntimeError as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(result)
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
         """GET /health/detailed — rich status for cross-container dashboard probing.
@@ -2330,6 +2499,30 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            # MiniApp routes
+            self._app.router.add_get("/api/model-info", self._handle_model_info)
+            self._app.router.add_get("/api/session-usage", self._handle_session_usage)
+            self._app.router.add_get("/api/processes", self._handle_processes)
+            self._app.router.add_get("/api/commands", self._handle_commands)
+            self._app.router.add_post("/api/command", self._handle_command)
+            self._app.router.add_get("/api/agents", self._handle_list_agents)
+            self._app.router.add_post("/api/agents", self._handle_spawn_agent)
+            self._app.router.add_get("/api/agents/{name}", self._handle_get_agent)
+            self._app.router.add_post("/api/agents/{name}/message", self._handle_send_agent_message)
+            self._app.router.add_delete("/api/agents/{name}", self._handle_delete_agent)
+            self._app.router.add_get("/miniapp", self._handle_miniapp_index)
+            self._app.router.add_get("/miniapp/index.html", self._handle_miniapp_index)
+            # Static assets for MiniApp SPA — always at ~/.hermes/miniapp/
+            # (not profile-scoped, since assets are shared across profiles)
+            from pathlib import Path as _Path
+            miniapp_dir = _Path.home() / ".hermes" / "miniapp"
+            if miniapp_dir.is_dir():
+                self._app.router.add_static("/assets", str(miniapp_dir / "assets"), follow_symlinks=False)
+                if (miniapp_dir / "fonts").is_dir():
+                    self._app.router.add_static("/fonts", str(miniapp_dir / "fonts"), follow_symlinks=False)
+                favicon = miniapp_dir / "favicon.ico"
+                if favicon.is_file():
+                    self._app.router.add_get("/favicon.ico", lambda r, p=favicon: web.FileResponse(p))
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
