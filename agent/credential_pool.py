@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import OPENROUTER_BASE_URL
+from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -1393,7 +1393,35 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+# ---------------------------------------------------------------------------
+# load_pool TTL cache
+#
+# load_pool() is called on every call_llm via auxiliary_client._select_pool_entry.
+# The uncached implementation reads auth.json, re-imports Codex CLI tokens, and
+# re-seeds from singletons + env — all on disk — once per invocation.  In a
+# typical session that's 1000+ disk round-trips, which dominates tool-call latency.
+#
+# Cache contract:
+#   - Results live for _POOL_CACHE_TTL_SECONDS (60 s).
+#   - External writes to ~/.hermes/auth.json invalidate the entry via mtime check.
+#   - Explicit invalidate_pool_cache(provider) forces a re-read on next load_pool.
+# ---------------------------------------------------------------------------
+_POOL_CACHE: Dict[str, Tuple[float, float, "CredentialPool"]] = {}
+_POOL_CACHE_LOCK = threading.Lock()
+_POOL_CACHE_TTL_SECONDS = 60.0
+
+
+def _auth_json_mtime() -> float:
+    """Return mtime of ~/.hermes/auth.json, or 0.0 if it does not exist."""
+    try:
+        return (get_hermes_home() / "auth.json").stat().st_mtime
+    except FileNotFoundError:
+        return 0.0
+    except OSError:
+        return 0.0
+
+
+def _load_pool_uncached(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
@@ -1416,3 +1444,43 @@ def load_pool(provider: str) -> CredentialPool:
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
         )
     return CredentialPool(provider, entries)
+
+
+def load_pool(provider: str) -> CredentialPool:
+    """Cached wrapper around _load_pool_uncached.
+
+    See _POOL_CACHE comment above for cache semantics.
+    """
+    key = (provider or "").strip().lower()
+    now = time.time()
+    mtime = _auth_json_mtime()
+
+    with _POOL_CACHE_LOCK:
+        cached = _POOL_CACHE.get(key)
+        if cached is not None:
+            cached_at, cached_mtime, cached_pool = cached
+            if cached_mtime == mtime and (now - cached_at) < _POOL_CACHE_TTL_SECONDS:
+                return cached_pool
+
+    # Miss — load outside the lock to avoid serialising disk I/O
+    pool = _load_pool_uncached(key)
+
+    with _POOL_CACHE_LOCK:
+        # Re-read mtime after the load to capture any write _load_pool_uncached
+        # itself performed (via write_credential_pool), so subsequent hits are
+        # considered in-sync with disk.
+        _POOL_CACHE[key] = (time.time(), _auth_json_mtime(), pool)
+    return pool
+
+
+def invalidate_pool_cache(provider: Optional[str] = None) -> None:
+    """Drop cached pool(s).
+
+    Call this after any code path that mutates auth.json outside load_pool
+    itself (e.g. after `hermes_cli.auth_commands` adds/removes a credential).
+    """
+    with _POOL_CACHE_LOCK:
+        if provider is None:
+            _POOL_CACHE.clear()
+        else:
+            _POOL_CACHE.pop(provider.strip().lower(), None)
