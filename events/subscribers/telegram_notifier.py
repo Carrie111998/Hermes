@@ -7,6 +7,7 @@ the gateway's Telegram adapter send() method.
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -85,6 +86,8 @@ class TelegramNotifier(BaseSubscriber):
         self.topics: Dict[str, Dict[str, Any]] = {}
         self._verbosity: Dict[str, Dict[str, str]] = {}
         self._batch_buffer: Dict[str, List[str]] = {}  # topic_key → messages
+        self._batch_timestamps: Dict[str, float] = {}  # topic_key → first batch time
+        self._verbosity_mtime: float = 0.0  # mtime of verbosity.json for hot-reload
 
         self._load_config()
 
@@ -94,10 +97,24 @@ class TelegramNotifier(BaseSubscriber):
             data = json.loads(self._topics_path.read_text(encoding="utf-8"))
             self.group_chat_id = data.get("group_chat_id", "")
             self.topics = data.get("topics", {})
-        if self._verbosity_path.exists():
-            self._verbosity = json.loads(self._verbosity_path.read_text(encoding="utf-8"))
+        self._reload_verbosity()
+
+    def _reload_verbosity(self) -> None:
+        """Hot-reload verbosity.json if it changed on disk (mtime-based)."""
+        if not self._verbosity_path.exists():
+            return
+        try:
+            mtime = self._verbosity_path.stat().st_mtime
+            if mtime != self._verbosity_mtime:
+                self._verbosity = json.loads(self._verbosity_path.read_text(encoding="utf-8"))
+                self._verbosity_mtime = mtime
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("TelegramNotifier: failed to reload verbosity.json: %s", e)
 
     def handle(self, event: Event) -> None:
+        # Hot-reload verbosity config on each cycle (spec: hot-reloadable)
+        self._reload_verbosity()
+
         if not self.group_chat_id or not self.topics:
             self._load_config()
             if not self.group_chat_id:
@@ -118,7 +135,18 @@ class TelegramNotifier(BaseSubscriber):
             if verbosity == "digest_only" and event.priority.level < Priority.HIGH.level:
                 continue
 
-            self._deliver(chat_id, thread_id, message)
+            # Low-priority events are batched for up to 5 minutes
+            if event.priority == Priority.LOW:
+                key = f"{chat_id}:{thread_id}"
+                if key not in self._batch_buffer:
+                    self._batch_buffer[key] = []
+                    self._batch_timestamps[key] = time.monotonic()
+                self._batch_buffer[key].append(message)
+            else:
+                self._deliver(chat_id, thread_id, message)
+
+        # Flush any batches older than 5 minutes
+        self._flush_stale_batches()
 
     def resolve_target(self, event: Event) -> Tuple[str, str, str]:
         """Resolve the primary Telegram target for an event."""
@@ -199,6 +227,27 @@ class TelegramNotifier(BaseSubscriber):
             )
         except Exception as e:
             logger.error("TelegramNotifier delivery failed: %s", e)
+
+    def _flush_stale_batches(self, max_age: float = 300.0) -> None:
+        """Flush batched low-priority messages older than max_age seconds."""
+        now = time.monotonic()
+        keys_to_flush = [
+            k for k, ts in self._batch_timestamps.items()
+            if now - ts >= max_age
+        ]
+        for key in keys_to_flush:
+            messages = self._batch_buffer.pop(key, [])
+            self._batch_timestamps.pop(key, None)
+            if not messages:
+                continue
+            parts = key.split(":", 1)
+            chat_id, thread_id = parts[0], parts[1] if len(parts) > 1 else ""
+            combined = f"Batched ({len(messages)} events):\n\n" + "\n---\n".join(messages)
+            self._deliver(chat_id, thread_id, combined)
+
+    def shutdown(self) -> None:
+        """Flush all pending batches on shutdown."""
+        self._flush_stale_batches(max_age=0)
 
     def _thread_id_to_key(self, thread_id: str) -> str:
         """Reverse lookup: thread_id → topic key."""

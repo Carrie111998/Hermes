@@ -68,16 +68,32 @@ RATE_LIMITS = {
 
 class MemoryWriter(BaseSubscriber):
     subscriber_id = "memory-writer"
-    poll_interval_seconds = 10
+    poll_interval_seconds = 60
 
     def __init__(self, bus: EventBus):
         super().__init__(bus)
         self._rate_counters: Dict[str, List[float]] = defaultdict(list)
+        self._seen_correlation_ids: Dict[str, float] = {}  # correlation_id → timestamp
+        self._DEDUP_WINDOW = 86400  # 24 hours
 
     def handle(self, event: Event) -> None:
         routing = MEMORY_ROUTING.get(event.event_type)
         if not routing:
             return
+
+        # Dedup via correlation_id to avoid duplicate memory writes
+        if event.correlation_id:
+            now = time.monotonic()
+            # Clean stale entries
+            self._seen_correlation_ids = {
+                cid: ts for cid, ts in self._seen_correlation_ids.items()
+                if now - ts < self._DEDUP_WINDOW
+            }
+            if event.correlation_id in self._seen_correlation_ids:
+                logger.debug("MemoryWriter: skipping duplicate correlation_id %s",
+                             event.correlation_id)
+                return
+            self._seen_correlation_ids[event.correlation_id] = now
 
         for target in routing["targets"]:
             if not self._check_rate_limit(target):

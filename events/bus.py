@@ -27,11 +27,12 @@ CREATE TABLE IF NOT EXISTS events (
     correlation_id TEXT,
     job_id       TEXT,
     tags         TEXT NOT NULL DEFAULT '[]',
+    status       TEXT NOT NULL DEFAULT 'pending',
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_type_ts
-    ON events (event_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_type_status_ts
+    ON events (event_type, status, timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_source
     ON events (source, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_correlation

@@ -45,3 +45,60 @@ class TestMemoryWriter:
         content = writer._build_content(event, "gbrain")
         assert "Acme" in content
         assert "VP Finance" in content
+
+
+class TestCorrelationIdDedup:
+    """Tests for correlation_id deduplication in MemoryWriter."""
+
+    def test_same_correlation_id_processed_once(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        writer = MemoryWriter(bus)
+
+        event1 = Event.create(
+            EventType.APPLICATION_SUBMITTED, "applier",
+            {"company": "Acme", "title": "VP Finance", "platform": "Workday"},
+            correlation_id="corr-abc-123",
+        )
+        event2 = Event.create(
+            EventType.APPLICATION_SUBMITTED, "applier",
+            {"company": "Acme", "title": "VP Finance", "platform": "Workday"},
+            correlation_id="corr-abc-123",
+        )
+
+        # First call should process
+        writer.handle(event1)
+        assert "corr-abc-123" in writer._seen_correlation_ids
+
+        # Second call with same correlation_id should be skipped
+        # We verify by checking rate counters: only one write should have been attempted
+        gbrain_count_before = len(writer._rate_counters.get("gbrain", []))
+
+        writer.handle(event2)
+
+        gbrain_count_after = len(writer._rate_counters.get("gbrain", []))
+        assert gbrain_count_after == gbrain_count_before  # no new write
+
+    def test_different_correlation_ids_both_processed(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        writer = MemoryWriter(bus)
+
+        event1 = Event.create(
+            EventType.APPLICATION_SUBMITTED, "applier",
+            {"company": "Acme", "title": "VP Finance", "platform": "Workday"},
+            correlation_id="corr-111",
+        )
+        event2 = Event.create(
+            EventType.APPLICATION_SUBMITTED, "applier",
+            {"company": "Beta Inc", "title": "Engineer", "platform": "Lever"},
+            correlation_id="corr-222",
+        )
+
+        writer.handle(event1)
+        writer.handle(event2)
+
+        # Both correlation_ids should be recorded as seen
+        assert "corr-111" in writer._seen_correlation_ids
+        assert "corr-222" in writer._seen_correlation_ids
+
+        # Both should have triggered writes (2 gbrain entries in rate counters)
+        assert len(writer._rate_counters.get("gbrain", [])) == 2

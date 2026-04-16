@@ -44,9 +44,11 @@ class TestEndToEnd:
         audit.poll()
 
         lines = audit_path.read_text().strip().split("\n")
-        assert len(lines) == 2
+        # 3 events: cron_started, cron_completed, + job_discovered parsed from output
+        assert len(lines) == 3
         assert json.loads(lines[0])["event_type"] == "cron_started"
         assert json.loads(lines[1])["event_type"] == "cron_completed"
+        assert json.loads(lines[2])["event_type"] == "job_discovered"
 
     def test_health_state_change_flow(self, setup):
         bus = setup["bus"]

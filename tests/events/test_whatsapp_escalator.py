@@ -103,3 +103,68 @@ class TestMessageFormat:
         assert "**" not in msg  # no markdown bold
         assert "Acme" in msg
         assert "Details in Telegram" in msg
+
+
+class TestThrottleBuffer:
+    """Tests for the 15-minute throttle window on non-breakthrough events."""
+
+    def test_breakthrough_events_bypass_throttle(self, bus, quiet_config, queue_path):
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+
+        event = Event.create(
+            EventType.INTERVIEW_SIGNAL, "tracker", {"company": "Google"},
+        )
+
+        with patch.object(escalator, '_is_quiet_hours', return_value=False):
+            escalator.handle(event)
+
+        # Breakthrough should deliver immediately, not buffer
+        assert len(sent) == 1
+        assert "Google" in sent[0]
+        assert len(escalator._throttle_buffer) == 0
+
+    def test_non_breakthrough_events_are_buffered(self, bus, quiet_config, queue_path):
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "Visa?"},
+        )
+
+        with patch.object(escalator, '_is_quiet_hours', return_value=False):
+            escalator.handle(event)
+
+        # Non-breakthrough should be added to throttle buffer, not sent yet
+        assert len(sent) == 0
+        assert len(escalator._throttle_buffer) == 1
+
+    def test_shutdown_flushes_throttle_buffer(self, bus, quiet_config, queue_path):
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+
+        # Buffer a non-breakthrough event
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "Visa?"},
+        )
+
+        with patch.object(escalator, '_is_quiet_hours', return_value=False):
+            escalator.handle(event)
+
+        assert len(sent) == 0
+
+        escalator.shutdown()
+
+        assert len(sent) == 1
+        assert "Acme" in sent[0]

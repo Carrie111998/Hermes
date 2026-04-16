@@ -6,6 +6,7 @@ and queues non-breakthrough events for morning flush.
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -39,7 +40,10 @@ HIGH_SCORE_WA_THRESHOLD = 9.0
 
 class WhatsAppEscalator(BaseSubscriber):
     subscriber_id = "whatsapp-escalator"
-    poll_interval_seconds = 10
+    poll_interval_seconds = 5
+
+    # Throttle: combine events within a 15-minute window into one message
+    THROTTLE_WINDOW_SECONDS = 900  # 15 minutes
 
     def __init__(
         self,
@@ -60,6 +64,12 @@ class WhatsAppEscalator(BaseSubscriber):
         self._queue_path = Path(queue_path)
         self._send_fn = send_fn
         self._quiet_config = self._load_quiet_config()
+
+        # Throttle state
+        self._throttle_buffer: List[str] = []
+        self._throttle_start: Optional[float] = None
+        self._daily_send_count: int = 0
+        self._daily_reset_date: Optional[str] = None
 
     def _load_quiet_config(self) -> Dict[str, Any]:
         if self._quiet_config_path.exists():
@@ -119,12 +129,32 @@ class WhatsAppEscalator(BaseSubscriber):
         if not self.should_escalate(event):
             return
 
+        # Reset daily counter at midnight
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._daily_reset_date != today:
+            self._daily_send_count = 0
+            self._daily_reset_date = today
+
         message = self.format_message(event)
 
-        if self.should_deliver_now(event):
-            self._deliver(message)
-        else:
+        if not self.should_deliver_now(event):
             self._queue_message(message)
+            return
+
+        # Breakthrough events always deliver immediately (bypass throttle)
+        if event.event_type in BREAKTHROUGH_EVENTS:
+            self._deliver(message)
+            return
+
+        # Throttle: buffer events within 15-minute windows
+        now = time.monotonic()
+        if self._throttle_start is None:
+            self._throttle_start = now
+
+        self._throttle_buffer.append(message.split("\n\nDetails in Telegram")[0])
+
+        if now - self._throttle_start >= self.THROTTLE_WINDOW_SECONDS:
+            self._flush_throttle_buffer()
 
     def format_message(self, event: Event) -> str:
         """Format event as plain-text WhatsApp message."""
@@ -153,6 +183,25 @@ class WhatsAppEscalator(BaseSubscriber):
             text = f"{et.type_string}: {json.dumps(p)[:200]}"
 
         return f"{text.strip()}\n\nDetails in Telegram"
+
+    def _flush_throttle_buffer(self) -> None:
+        """Flush accumulated throttle buffer into a single WhatsApp message."""
+        if not self._throttle_buffer:
+            self._throttle_start = None
+            return
+        if len(self._throttle_buffer) == 1:
+            text = self._throttle_buffer[0] + "\n\nDetails in Telegram"
+        else:
+            text = f"{len(self._throttle_buffer)} updates:\n\n"
+            text += "\n\n".join(f"- {m}" for m in self._throttle_buffer)
+            text += "\n\nDetails in Telegram"
+        self._deliver(text)
+        self._throttle_buffer.clear()
+        self._throttle_start = None
+
+    def shutdown(self) -> None:
+        """Flush pending throttle buffer and queue on shutdown."""
+        self._flush_throttle_buffer()
 
     def _deliver(self, message: str) -> None:
         """Send message via WhatsApp."""

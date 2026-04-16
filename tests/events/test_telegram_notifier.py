@@ -107,3 +107,108 @@ class TestTelegramNotifier:
         )
         assert notifier.group_chat_id == "-1001234567890"
         assert notifier.topics["scout"]["thread_id"] == 101
+
+
+class TestLowPriorityBatching:
+    """Tests for low-priority event batching and flush behavior.
+
+    Uses event types that route to topics with 'all' verbosity mode
+    (scout, matcher) to avoid verbosity filtering interference.
+    """
+
+    def test_low_priority_event_is_buffered(self, bus, topics_config, verbosity_config):
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+
+        # job_discovered routes to "scout" topic which has mode="all"
+        event = Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        )
+        notifier.handle(event)
+
+        # Low-priority should be buffered, not delivered yet
+        assert len(sent) == 0
+        assert len(notifier._batch_buffer) > 0
+
+    def test_normal_priority_event_delivered_immediately(self, bus, topics_config, verbosity_config):
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+
+        # job_scored routes to "matcher" topic which has mode="all"
+        event = Event.create(
+            EventType.JOB_SCORED, "matcher",
+            {"score": 7.5, "title": "Engineer", "company": "Beta"},
+            priority=Priority.NORMAL,
+        )
+        notifier.handle(event)
+
+        assert len(sent) == 1
+
+    def test_high_priority_event_delivered_immediately(self, bus, topics_config, verbosity_config):
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "Visa status?"},
+            priority=Priority.CRITICAL,
+        )
+        notifier.handle(event)
+
+        assert len(sent) >= 1
+
+    def test_flush_delivers_batched_messages(self, bus, topics_config, verbosity_config):
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+
+        # Buffer two low-priority events on the "scout" topic (mode=all)
+        for i in range(2):
+            event = Event.create(
+                EventType.JOB_DISCOVERED, "scout",
+                {"title": f"Job {i}", "company": "Acme", "source": "Indeed"},
+                priority=Priority.LOW,
+            )
+            notifier.handle(event)
+
+        assert len(sent) == 0  # still buffered
+
+        # Force flush with max_age=0 (flush all)
+        notifier._flush_stale_batches(max_age=0)
+
+        assert len(sent) == 1
+        assert "Batched (2 events)" in sent[0]
+
+    def test_shutdown_flushes_all_batches(self, bus, topics_config, verbosity_config):
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+
+        # Use scout topic (mode=all) with low priority to ensure buffering
+        event = Event.create(
+            EventType.JOB_DISCOVERED, "scout",
+            {"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        )
+        notifier.handle(event)
+
+        assert len(sent) == 0
+
+        notifier.shutdown()
+
+        assert len(sent) == 1

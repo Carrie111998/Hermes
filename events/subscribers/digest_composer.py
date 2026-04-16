@@ -43,15 +43,108 @@ class DigestComposer(BaseSubscriber):
         pass
 
     def compose(self, since: Optional[str] = None) -> str:
-        """Compose a digest from events since the given timestamp (or last digest)."""
+        """Compose a digest from events since the given timestamp (or last digest).
+
+        After formatting, delivers to Telegram (always) and WhatsApp (morning only).
+        """
         query_since = since or self._last_digest_at
         events = self.bus.query(since=query_since) if query_since else self.bus.query()
         self._last_digest_at = datetime.now(timezone.utc).isoformat()
 
         if not events:
-            return self._format_empty_digest()
+            digest = self._format_empty_digest()
+        else:
+            digest = self._format_digest(events)
 
-        return self._format_digest(events)
+        # Deliver to Telegram Digests topic
+        self._deliver_telegram(digest)
+
+        # Morning digest also goes to WhatsApp (condensed)
+        if self._is_morning():
+            self._deliver_whatsapp(digest, events)
+
+        # Emit digest_generated event for audit trail
+        from events.schema import EventType
+        self.bus.emit(
+            event_type=EventType.DIGEST_GENERATED,
+            source="digest-composer",
+            payload={"period": self._get_period_label(), "event_count": len(events)},
+        )
+
+        return digest
+
+    def _is_morning(self) -> bool:
+        """Check if current ET hour is in the morning window."""
+        try:
+            import zoneinfo
+            tz = zoneinfo.ZoneInfo("America/New_York")
+            return datetime.now(tz).hour < 12
+        except Exception:
+            return datetime.now().hour < 12
+
+    def _deliver_telegram(self, digest: str) -> None:
+        """Post digest to the Digests & Summaries Telegram topic."""
+        if self._send_telegram_fn:
+            try:
+                self._send_telegram_fn(digest)
+            except Exception as e:
+                logger.error("DigestComposer: Telegram delivery failed: %s", e)
+            return
+        # Production: use gateway delivery
+        try:
+            from cron.scheduler import _deliver_result
+            import json as _json
+            from hermes_constants import get_hermes_home
+            topics_path = get_hermes_home() / "telegram" / "topics.json"
+            if topics_path.exists():
+                data = _json.loads(topics_path.read_text(encoding="utf-8"))
+                chat_id = data.get("group_chat_id", "")
+                thread_id = data.get("topics", {}).get("digests", {}).get("thread_id", "")
+                if chat_id and thread_id:
+                    target = f"telegram:{chat_id}:{thread_id}"
+                    _deliver_result(
+                        {"deliver": target, "id": "digest-composer", "name": "digest-composer"},
+                        digest,
+                    )
+        except Exception as e:
+            logger.error("DigestComposer: Telegram delivery failed: %s", e)
+
+    def _deliver_whatsapp(self, digest: str, events: List[Event]) -> None:
+        """Deliver condensed morning digest to WhatsApp."""
+        # Build condensed version: highlights + action items only
+        action_items = []
+        highlights = []
+        for e in events:
+            if e.event_type == EventType.APPLICATION_READY:
+                action_items.append(f"Approve: {e.payload.get('company', '?')}")
+            elif e.event_type == EventType.FOLLOWUP_DUE:
+                action_items.append(f"Follow up: {e.payload.get('company', '?')}")
+            elif e.event_type == EventType.JOB_HIGH_SCORE:
+                highlights.append(f"{e.payload.get('title', '?')} @ {e.payload.get('company', '?')} ({e.payload.get('score', '?')})")
+
+        lines = [f"Morning Digest — {len(events)} events overnight"]
+        if highlights:
+            lines.append("\nHigh scores: " + "; ".join(highlights[:3]))
+        if action_items:
+            lines.append("\nAction needed: " + "; ".join(action_items[:3]))
+        lines.append("\nFull details in Telegram")
+
+        condensed = "\n".join(lines)
+
+        if self._send_whatsapp_fn:
+            try:
+                self._send_whatsapp_fn(condensed)
+            except Exception as e:
+                logger.error("DigestComposer: WhatsApp delivery failed: %s", e)
+            return
+        try:
+            from cron.scheduler import _deliver_result
+            _deliver_result(
+                {"deliver": "whatsapp", "id": "digest-composer", "name": "digest-composer"},
+                condensed,
+            )
+        except Exception as e:
+            logger.error("DigestComposer: WhatsApp delivery failed: %s", e)
 
     def _format_digest(self, events: List[Event]) -> str:
         """Format a list of events into a structured digest."""

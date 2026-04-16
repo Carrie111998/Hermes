@@ -107,6 +107,7 @@ def _subscriber_poll_loop() -> None:
     """Background thread that polls all subscribers at their configured intervals."""
     last_poll_times: Dict[str, float] = {}
     last_mailbox_scan: float = 0
+    last_health_check: float = 0
     last_cleanup: float = 0
     last_digest_hour: int = -1
     last_flush_fired: bool = False
@@ -156,6 +157,14 @@ def _subscriber_poll_loop() -> None:
                 last_flush_fired = True
             elif et_hour != 7:
                 last_flush_fired = False
+
+        # Active health checks every 60 seconds
+        if _health_monitor and now - last_health_check >= 60:
+            try:
+                _health_monitor.check()
+            except Exception:
+                logger.exception("Health check failed")
+            last_health_check = now
 
         # Scan mailbox every 60 seconds
         if _mailbox_watcher and now - last_mailbox_scan >= 60:
