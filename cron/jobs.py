@@ -601,6 +601,11 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
             job["last_run_at"] = now
             job["last_status"] = "ok" if success else "error"
             job["last_error"] = error if not success else None
+            # Track consecutive errors for alerting
+            if success:
+                job["consecutive_errors"] = 0
+            else:
+                job["consecutive_errors"] = job.get("consecutive_errors", 0) + 1
             # Track delivery failures separately — cleared on successful delivery
             job["last_delivery_error"] = delivery_error
             

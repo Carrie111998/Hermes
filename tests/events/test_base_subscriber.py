@@ -1,0 +1,127 @@
+"""Tests for events.subscribers.base -- BaseSubscriber and SubscriberRegistry."""
+
+import pytest
+
+from events.bus import EventBus
+from events.schema import EventType, Priority
+from events.subscribers.base import BaseSubscriber, SubscriberRegistry
+
+
+class StubSubscriber(BaseSubscriber):
+    """Concrete subscriber for testing."""
+
+    subscriber_id = "stub"
+    poll_interval_seconds = 5
+
+    def __init__(self, bus: EventBus):
+        super().__init__(bus)
+        self.processed = []
+
+    def handle(self, event):
+        self.processed.append(event)
+
+
+class FilteredSubscriber(BaseSubscriber):
+    subscriber_id = "filtered"
+    poll_interval_seconds = 10
+    event_types = [EventType.JOB_HIGH_SCORE, EventType.INTERVIEW_SIGNAL]
+    min_priority = Priority.HIGH
+
+    def __init__(self, bus: EventBus):
+        super().__init__(bus)
+        self.processed = []
+
+    def handle(self, event):
+        self.processed.append(event)
+
+
+class TestBaseSubscriber:
+    def test_poll_processes_events(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        bus.emit(EventType.CRON_COMPLETED, "scout", {"a": 1})
+        bus.emit(EventType.CRON_STARTED, "matcher", {"b": 2})
+
+        processed = sub.poll()
+        assert processed == 2
+        assert len(sub.processed) == 2
+
+    def test_poll_advances_cursor(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        sub.poll()
+        assert len(sub.processed) == 1
+
+        bus.emit(EventType.CRON_COMPLETED, "matcher", {})
+        sub.poll()
+        assert len(sub.processed) == 2  # only the new one
+
+    def test_filtered_subscriber(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FilteredSubscriber(bus)
+
+        bus.emit(EventType.CRON_STARTED, "scout", {})        # LOW -- filtered
+        bus.emit(EventType.JOB_HIGH_SCORE, "matcher", {})     # HIGH -- passes
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})       # NORMAL -- filtered
+        bus.emit(EventType.INTERVIEW_SIGNAL, "tracker", {})   # CRITICAL -- passes
+
+        processed = sub.poll()
+        assert processed == 2
+        assert sub.processed[0].event_type == EventType.JOB_HIGH_SCORE
+        assert sub.processed[1].event_type == EventType.INTERVIEW_SIGNAL
+
+    def test_handle_error_does_not_stop_processing(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+
+        class FailingSubscriber(BaseSubscriber):
+            subscriber_id = "failing"
+            poll_interval_seconds = 5
+
+            def __init__(self, bus):
+                super().__init__(bus)
+                self.calls = 0
+
+            def handle(self, event):
+                self.calls += 1
+                if self.calls == 1:
+                    raise ValueError("boom")
+
+        sub = FailingSubscriber(bus)
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "matcher", {})
+
+        processed = sub.poll()
+        assert processed == 2  # both processed despite first error
+        assert sub.calls == 2
+
+
+class TestSubscriberRegistry:
+    def test_register_and_list(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        registry = SubscriberRegistry()
+
+        sub = StubSubscriber(bus)
+        registry.register(sub)
+
+        assert len(registry.subscribers) == 1
+        assert registry.subscribers[0] is sub
+
+    def test_poll_all(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        registry = SubscriberRegistry()
+
+        sub1 = StubSubscriber(bus)
+        sub1.subscriber_id = "stub-1"
+        sub2 = StubSubscriber(bus)
+        sub2.subscriber_id = "stub-2"
+
+        registry.register(sub1)
+        registry.register(sub2)
+
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+
+        results = registry.poll_all()
+        assert results == {"stub-1": 1, "stub-2": 1}

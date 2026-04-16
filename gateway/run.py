@@ -1981,7 +1981,7 @@ class GatewayRunner:
         
         self._running = True
         self._update_runtime_status("running")
-        
+
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
         if hook_count:
@@ -1989,7 +1989,15 @@ class GatewayRunner:
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
-        
+
+        # Initialize Event Bus communication layer
+        try:
+            from events.gateway_integration import startup as eventbus_startup
+            eventbus_startup(adapters=self.adapters)
+            logger.info("EventBus: started successfully")
+        except Exception as e:
+            logger.warning("EventBus initialization failed (non-fatal): %s", e)
+
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
         
@@ -9829,6 +9837,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Stop cron ticker cleanly
     cron_stop.set()
     cron_thread.join(timeout=5)
+
+    # Shutdown Event Bus
+    try:
+        from events.gateway_integration import shutdown as eventbus_shutdown
+        eventbus_shutdown()
+    except Exception:
+        pass
 
     # Close MCP server connections
     try:
