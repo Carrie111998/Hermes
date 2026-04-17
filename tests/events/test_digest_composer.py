@@ -107,3 +107,28 @@ class TestNotifierSnapshotHandshake:
 
         # Should NOT surface the stale count as current truth
         assert "99" not in digest or "stale" in digest.lower()
+
+
+def test_digest_composer_persists_last_digest_at(tmp_path, monkeypatch):
+    from unittest.mock import patch
+    from events.bus import EventBus
+    from events.subscribers.digest_composer import DigestComposer
+    from events.state import load_state
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = tmp_path / "db.sqlite"
+    bus = EventBus(db_path=db)
+    try:
+        with patch("events.subscribers.digest_composer.digest_state_path",
+                   return_value=tmp_path / "digest_state.json"):
+            d = DigestComposer(bus, send_telegram_fn=lambda m: None)
+            d.compose()
+            state = load_state(tmp_path / "digest_state.json", default={})
+            assert "last_digest_at" in state
+            assert state["last_digest_at"] is not None
+
+            # New instance reads persisted state
+            d2 = DigestComposer(bus, send_telegram_fn=lambda m: None)
+            assert d2._last_digest_at == state["last_digest_at"]
+    finally:
+        bus.close()

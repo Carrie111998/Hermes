@@ -231,3 +231,24 @@ class TestLowPriorityBatching:
         notifier.shutdown()
 
         assert len(sent) == 1
+
+
+def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "telegram").mkdir()
+    (tmp_path / "telegram" / "topics.json").write_text(
+        '{"group_chat_id": "-1", "topics": {"system": {"thread_id": 15}}}')
+    (tmp_path / "telegram" / "verbosity.json").write_text(
+        '{"system": {"mode": "all"}}')
+    from events.bus import EventBus
+    from events.subscribers.telegram_notifier import TelegramNotifier
+    bus = EventBus(db_path=tmp_path / "db.sqlite")
+    try:
+        n1 = TelegramNotifier(bus, send_fn=lambda *a, **k: None)
+        n1._batch_buffer["-1:15"] = ["pending msg 1", "pending msg 2"]
+        n1._persist_batch_buffer()
+
+        n2 = TelegramNotifier(bus, send_fn=lambda *a, **k: None)
+        assert n2._batch_buffer.get("-1:15") == ["pending msg 1", "pending msg 2"]
+    finally:
+        bus.close()

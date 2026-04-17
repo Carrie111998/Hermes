@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
+from events.paths import notifier_batch_path
 from events.schema import Event, EventType, Priority
+from events.state import load_state, save_state
 from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
@@ -86,7 +88,12 @@ class TelegramNotifier(BaseSubscriber):
         self.topics: Dict[str, Dict[str, Any]] = {}
         self._verbosity: Dict[str, Dict[str, str]] = {}
         self._batch_buffer: Dict[str, List[str]] = {}  # topic_key → messages
-        self._batch_timestamps: Dict[str, float] = {}  # topic_key → first batch time
+        saved = load_state(notifier_batch_path(), default={})
+        if isinstance(saved.get("buffer"), dict):
+            self._batch_buffer = {k: list(v) for k, v in saved["buffer"].items()}
+        import time
+        now = time.monotonic()
+        self._batch_timestamps: Dict[str, float] = {k: now for k in self._batch_buffer}  # topic_key → first batch time
         self._verbosity_mtime: float = 0.0  # mtime of verbosity.json for hot-reload
 
         self._load_config()
@@ -142,6 +149,7 @@ class TelegramNotifier(BaseSubscriber):
                     self._batch_buffer[key] = []
                     self._batch_timestamps[key] = time.monotonic()
                 self._batch_buffer[key].append(message)
+                self._persist_batch_buffer()
             else:
                 self._deliver(chat_id, thread_id, message)
 
@@ -244,6 +252,17 @@ class TelegramNotifier(BaseSubscriber):
             chat_id, thread_id = parts[0], parts[1] if len(parts) > 1 else ""
             combined = f"Batched ({len(messages)} events):\n\n" + "\n---\n".join(messages)
             self._deliver(chat_id, thread_id, combined)
+        if keys_to_flush:
+            self._persist_batch_buffer()
+
+    def _persist_batch_buffer(self) -> None:
+        """Write current batch state to disk so it survives restart."""
+        try:
+            save_state(notifier_batch_path(), {
+                "buffer": {k: list(v) for k, v in self._batch_buffer.items()},
+            })
+        except Exception:
+            logger.exception("TelegramNotifier: failed to persist batch buffer")
 
     def shutdown(self) -> None:
         """Flush all pending batches on shutdown."""
