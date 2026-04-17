@@ -133,14 +133,34 @@ class MailboxWatcher:
         msg_type = msg.get("type", "")
 
         if msg_type == "SCORE_BATCH_SUMMARY":
-            jobs = payload.get("scored_jobs", [])
+            jobs = payload.get("results") or payload.get("scored_jobs", [])
             return f"{len(jobs)} jobs scored"
+        if msg_type == "SCORE_RESULT":
+            score = payload.get("score", "?")
+            company = payload.get("company", "?")
+            title = payload.get("title", "")
+            return f"score {score} for {company} ({title})"
         if msg_type == "SCOUT_DISCOVERY":
             jobs = payload.get("jobs", [])
             return f"{len(jobs)} jobs discovered"
         if msg_type in ("TAILOR_REQUEST", "TAILOR_COMPLETE"):
-            return payload.get("job_title", msg_type)
+            return payload.get("job_title") or payload.get("title") or msg_type
+        if msg_type == "SUBMIT_REQUEST" or msg_type == "SUBMIT_CONFIRM":
+            company = payload.get("company", "?")
+            title = payload.get("title", "?")
+            return f"{msg_type.lower().replace('_', ' ')}: {company} / {title}"
+        if msg_type == "BLOCKED_QUESTION":
+            return (payload.get("question") or "Blocked question")[:200]
+        if msg_type == "PIPELINE_UPDATE":
+            return f"{payload.get('previous_stage', '?')} -> {payload.get('new_stage', '?')} ({payload.get('job_key', '?')})"
+        if msg_type == "FOLLOWUP_ALERT":
+            days = payload.get("days_since_application", "?")
+            company = payload.get("company", "?")
+            return f"follow up with {company} ({days} days since application)"
+        if msg_type == "NOTIFICATION":
+            # Notifications often carry their own summary/body
+            return (payload.get("summary") or payload.get("body") or "Notification")[:200]
         if msg_type == "ERROR":
-            return payload.get("message", "Error")[:200]
+            return (payload.get("message") or "Error")[:200]
 
         return msg_type

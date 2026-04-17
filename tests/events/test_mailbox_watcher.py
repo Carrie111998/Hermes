@@ -109,3 +109,26 @@ def test_mailbox_watcher_forwards_inner_payload(tmp_path):
     assert len(events) == 1
     assert events[0].payload.get("inner_payload") == {"score": 8.8, "company": "X"}
     bus.close()
+
+
+def test_summarize_covers_key_message_types(tmp_path):
+    from events.bus import EventBus
+    from events.producers.mailbox_watcher import MailboxWatcher
+    bus = EventBus(db_path=tmp_path / "db.sqlite")
+    try:
+        w = MailboxWatcher(bus, mailbox_root=tmp_path / "mailbox")
+
+        assert w._summarize({"type": "NOTIFICATION",
+                             "payload": {"summary": "New interview offer"}}) == "New interview offer"
+        assert w._summarize({"type": "NOTIFICATION",
+                             "payload": {"body": "Body text here", "summary": ""}}) == "Body text here"
+        assert w._summarize({"type": "SCORE_RESULT",
+                             "payload": {"score": 8.9, "company": "Acme", "title": "VP Fin"}}) == "score 8.9 for Acme (VP Fin)"
+        assert "pending -> scored" in w._summarize({"type": "PIPELINE_UPDATE",
+                             "payload": {"previous_stage": "pending", "new_stage": "scored", "job_key": "j1"}})
+        assert "3 days" in w._summarize({"type": "FOLLOWUP_ALERT",
+                             "payload": {"days_since_application": 3, "company": "X"}})
+        assert "Acme / VP" in w._summarize({"type": "SUBMIT_CONFIRM",
+                             "payload": {"company": "Acme", "title": "VP"}})
+    finally:
+        bus.close()

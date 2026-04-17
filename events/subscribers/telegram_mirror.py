@@ -66,6 +66,7 @@ class TelegramMirror(BaseSubscriber):
             _deliver_result(
                 {"deliver": f"telegram:{chat_id}:{thread_id}", "id": "event-bus", "name": "event-bus"},
                 message,
+                skip_cron_framing=True,
             )
         except Exception as e:
             logger.error("TelegramMirror delivery failed: %s", e)

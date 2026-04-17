@@ -188,6 +188,7 @@ class DigestComposer(BaseSubscriber):
                     _deliver_result(
                         {"deliver": target, "id": "digest-composer", "name": "digest-composer"},
                         digest,
+                        skip_cron_framing=True,
                     )
         except Exception as e:
             logger.error("DigestComposer: Telegram delivery failed: %s", e)
@@ -225,6 +226,7 @@ class DigestComposer(BaseSubscriber):
             _deliver_result(
                 {"deliver": "whatsapp", "id": "digest-composer", "name": "digest-composer"},
                 condensed,
+                skip_cron_framing=True,
             )
         except Exception as e:
             logger.error("DigestComposer: WhatsApp delivery failed: %s", e)
