@@ -244,6 +244,8 @@ class WhatsAppEscalator(BaseSubscriber):
 
     def format_message(self, event: Event) -> str:
         """Format event as plain-text WhatsApp message."""
+        from events.formatting import format_whatsapp_message
+
         p = event.payload
         et = event.event_type
 
@@ -268,7 +270,8 @@ class WhatsAppEscalator(BaseSubscriber):
         else:
             text = f"{et.type_string}: {json.dumps(p)[:200]}"
 
-        return f"{text.strip()}\n\nDetails in Telegram"
+        formatted = format_whatsapp_message(event, text.strip())
+        return f"{formatted}\n\nDetails in Telegram"
 
     def _flush_throttle_buffer(self) -> None:
         """Flush accumulated throttle buffer into a single WhatsApp message."""

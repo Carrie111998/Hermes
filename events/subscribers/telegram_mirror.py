@@ -40,14 +40,11 @@ class TelegramMirror(BaseSubscriber):
 
     def format_mirror_message(self, event: Event) -> str:
         """Format a mailbox message event for the Agent Comms topic."""
-        p = event.payload
-        sender = p.get("from", "?")
-        recipient = p.get("to", "?")
-        msg_type = p.get("message_type", "?")
+        from events.formatting import format_event_message
+        p = event.payload or {}
         summary = p.get("summary", "")
-
-        header = f"{sender} -> {recipient}: {msg_type}"
-        return f"{header}\n{summary}" if summary else header
+        body = summary or p.get("message_type", "")
+        return format_event_message(event, body)
 
     def _deliver_to_agent_comms(self, message: str) -> None:
         """Send to the Agent Comms topic."""
