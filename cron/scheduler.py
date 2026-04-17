@@ -218,7 +218,7 @@ def _send_media_via_adapter(adapter, chat_id: str, media_files: list, metadata: 
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron_framing: bool = False) -> Optional[str]:
     """
     Deliver job output to the configured target (origin chat, specific platform, etc.).
 
@@ -226,6 +226,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
+
+    When ``skip_cron_framing`` is True, the "Cronjob Response" header/footer
+    wrapper is omitted. Use this for event-bus subscribers where the cron
+    framing is misleading.
 
     Returns None on success, or an error string on failure.
     """
@@ -299,13 +303,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # in config.yaml for clean output. Event-bus subscribers pass
+    # skip_cron_framing=True to bypass the wrapper entirely.
     wrap_response = True
     try:
         user_cfg = load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    if skip_cron_framing:
+        wrap_response = False
 
     if wrap_response:
         task_name = job.get("name", job["id"])

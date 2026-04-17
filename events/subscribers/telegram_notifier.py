@@ -232,6 +232,7 @@ class TelegramNotifier(BaseSubscriber):
             _deliver_result(
                 {"deliver": target_str, "id": "event-bus", "name": "event-bus"},
                 message,
+                skip_cron_framing=True,
             )
         except Exception as e:
             logger.error("TelegramNotifier delivery failed: %s", e)

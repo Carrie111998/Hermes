@@ -299,6 +299,7 @@ class WhatsAppEscalator(BaseSubscriber):
             _deliver_result(
                 {"deliver": "whatsapp", "id": "event-bus", "name": "event-bus"},
                 message,
+                skip_cron_framing=True,
             )
         except Exception as e:
             logger.error("WhatsApp delivery failed: %s", e)
