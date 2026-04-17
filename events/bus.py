@@ -56,8 +56,8 @@ class EventBus:
 
     def __init__(self, db_path: Optional[Path] = None):
         if db_path is None:
-            from hermes_constants import get_hermes_home
-            db_path = get_hermes_home() / "events" / "event_bus.db"
+            from events.paths import events_db_path
+            db_path = events_db_path()
         self.db_path = Path(db_path)
         self._lock = threading.Lock()
         self._local = threading.local()
@@ -246,6 +246,14 @@ class EventBus:
         ).fetchall()
 
         return [self._row_to_event(r) for r in rows]
+
+    def checkpoint(self) -> None:
+        """Run a passive WAL checkpoint so external readers see recent data."""
+        with self._lock:
+            try:
+                self._get_conn().execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error as e:
+                logger.warning("WAL checkpoint failed: %s", e)
 
     def close(self) -> None:
         """Close the thread-local SQLite connection."""

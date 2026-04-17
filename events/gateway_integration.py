@@ -11,8 +11,10 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from events.bus import EventBus
+from events.paths import digest_state_path, whatsapp_flush_state_path
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
+from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
 from events.subscribers.telegram_notifier import TelegramNotifier
@@ -20,6 +22,7 @@ from events.subscribers.whatsapp_escalator import WhatsAppEscalator
 from events.subscribers.digest_composer import DigestComposer, DIGEST_SCHEDULE_HOURS
 from events.subscribers.memory_writer import MemoryWriter
 from events.subscribers.telegram_mirror import TelegramMirror
+from events.subscribers.mailbox_translator import MailboxTranslator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(DigestComposer(_bus))
     _registry.register(MemoryWriter(_bus))
     _registry.register(TelegramMirror(_bus))
+    _registry.register(MailboxTranslator(_bus))
 
     _registry.startup_all()
 
@@ -161,8 +165,11 @@ def _subscriber_poll_loop() -> None:
     last_health_check: float = 0
     last_lag_check: float = 0
     last_cleanup: float = 0
-    last_digest_hour: int = -1
-    last_flush_fired: bool = False
+    last_checkpoint: float = 0
+    _state = load_state(digest_state_path(), default={})
+    last_digest_hour: int = _state.get("last_digest_hour", -1)
+    _flush_state = load_state(whatsapp_flush_state_path(), default={})
+    last_flush_date: str = _flush_state.get("last_flush_date", "")
     lag_alerts_sent: Dict[str, float] = {}  # subscriber_id -> monotonic timestamp
 
     while not _stop_event.is_set():
@@ -194,11 +201,24 @@ def _subscriber_poll_loop() -> None:
                         except Exception:
                             logger.exception("Digest compose failed")
                 last_digest_hour = et_hour
+                _state["last_digest_hour"] = et_hour
+                save_state(digest_state_path(), _state)
             elif et_hour not in DIGEST_SCHEDULE_HOURS:
-                last_digest_hour = -1
+                if last_digest_hour != -1:
+                    last_digest_hour = -1
+                    _state["last_digest_hour"] = -1
+                    save_state(digest_state_path(), _state)
 
-            # WhatsApp morning flush: deliver queued messages when quiet hours end (7am ET)
-            if et_hour == 7 and not last_flush_fired:
+            # WhatsApp morning flush — one-per-day by ET date
+            import zoneinfo
+            from datetime import datetime as _dt
+            try:
+                tz = zoneinfo.ZoneInfo("America/New_York")
+                today_et = _dt.now(tz).date().isoformat()
+            except Exception:
+                today_et = _dt.utcnow().date().isoformat()
+
+            if et_hour == 7 and last_flush_date != today_et:
                 for sub in _registry.subscribers:
                     if isinstance(sub, WhatsAppEscalator):
                         try:
@@ -207,9 +227,8 @@ def _subscriber_poll_loop() -> None:
                                 logger.info("WhatsApp morning flush: %d messages", count)
                         except Exception:
                             logger.exception("WhatsApp flush failed")
-                last_flush_fired = True
-            elif et_hour != 7:
-                last_flush_fired = False
+                last_flush_date = today_et
+                save_state(whatsapp_flush_state_path(), {"last_flush_date": today_et})
 
         # Subscriber lag check every 5 minutes
         if _registry and _bus and now - last_lag_check >= 300:
@@ -246,5 +265,13 @@ def _subscriber_poll_loop() -> None:
             except Exception:
                 logger.exception("Event cleanup failed")
             last_cleanup = now
+
+        # WAL checkpoint every 60 seconds
+        if _bus and now - last_checkpoint >= 60:
+            try:
+                _bus.checkpoint()
+            except Exception:
+                logger.exception("WAL checkpoint failed")
+            last_checkpoint = now
 
         _stop_event.wait(timeout=1)  # tick every 1 second

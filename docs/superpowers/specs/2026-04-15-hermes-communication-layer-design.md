@@ -422,3 +422,21 @@ All components run within the existing gateway process. No new daemons, ports, o
 - [Event-Driven Architecture for AI Agent Systems](https://zylos.ai/research/2026-03-02-event-driven-architecture-ai-agent-systems) — Zylos Research
 - [Multi-Agent Observability Reference Architecture](https://microsoft.github.io/multi-agent-reference-architecture/docs/observability/Observability.html) — Microsoft
 - [Building Multi-Agent AI Systems in 2026: A2A, Observability, and Verifiable Execution](https://dev.to/chunxiaoxx/building-multi-agent-ai-systems-in-2026-a2a-observability-and-verifiable-execution-10gn) — DEV Community
+
+---
+
+## 2026-04-16 Post-Silence-Fix Addendum
+
+After initial rollout on 2026-04-15, six compounding silences prevented all user-facing notifications.  Diagnosis and fix plan in `docs/superpowers/plans/2026-04-16-hermes-comms-layer-fixes.md`.  Key architectural updates:
+
+- **Canonical paths (Option A):** All notification/event state lives at the single root resolved by `events.paths.*` (wrapping `hermes_constants.get_default_hermes_root()`).  Profile-scoped directories hold only per-agent state (memory, sessions, workspace, config.yaml).
+
+- **MailboxTranslator subscriber (Option B):** Structured mailbox messages are the source of truth for domain events.  A new subscriber reads `mailbox_message` events and emits typed domain events.  The regex output parser in `CronEventEmitter` is retired.
+
+- **Persistent subscriber state:** `DigestComposer._last_digest_at`, `TelegramNotifier._batch_buffer`, gateway loop `last_digest_hour`, and WhatsApp `last_flush_date` all persist via `events/state.py` atomic JSON helpers.
+
+- **Periodic WAL checkpoint:** Every 60s, for external observability.
+
+- **Telegram fallback transport:** Under NordVPN / restricted networks, set `HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1`.  Sticky-IP logic now resets after 5 consecutive failures.
+
+- **CLI diagnostic:** `python -m hermes_cli.events_doctor` validates path canonicality, bus schema, subscriber cursors, recent event flow, and optional live Telegram connectivity.

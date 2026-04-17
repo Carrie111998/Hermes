@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from events.bus import EventBus
+from events.paths import digest_state_path
 from events.schema import Event, EventType, Priority
+from events.state import load_state, save_state
 from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
@@ -42,6 +44,8 @@ class DigestComposer(BaseSubscriber):
         self._send_telegram_fn = send_telegram_fn
         self._send_whatsapp_fn = send_whatsapp_fn
         self._last_digest_at: Optional[str] = None
+        state = load_state(digest_state_path(), default={})
+        self._last_digest_at = state.get("last_digest_at")
         self._snapshot_path = Path(notifier_snapshot_path) if notifier_snapshot_path else self.DEFAULT_SNAPSHOT_PATH
 
     def handle(self, event: Event) -> None:
@@ -58,6 +62,7 @@ class DigestComposer(BaseSubscriber):
         query_since = since or self._last_digest_at
         events = self.bus.query(since=query_since) if query_since else self.bus.query()
         self._last_digest_at = datetime.now(timezone.utc).isoformat()
+        save_state(digest_state_path(), {"last_digest_at": self._last_digest_at})
 
         snapshot = self._load_notifier_snapshot()
 
@@ -172,8 +177,8 @@ class DigestComposer(BaseSubscriber):
         try:
             from cron.scheduler import _deliver_result
             import json as _json
-            from hermes_constants import get_hermes_home
-            topics_path = get_hermes_home() / "telegram" / "topics.json"
+            from events.paths import telegram_topics_path
+            topics_path = telegram_topics_path()
             if topics_path.exists():
                 data = _json.loads(topics_path.read_text(encoding="utf-8"))
                 chat_id = data.get("group_chat_id", "")

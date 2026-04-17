@@ -44,11 +44,12 @@ class TestEndToEnd:
         audit.poll()
 
         lines = audit_path.read_text().strip().split("\n")
-        # 3 events: cron_started, cron_completed, + job_discovered parsed from output
-        assert len(lines) == 3
+        # 2 lifecycle events: cron_started, cron_completed.
+        # Domain events (job_discovered, etc.) now come from MailboxTranslator
+        # consuming mailbox_message events, not from regex-parsing agent output.
+        assert len(lines) == 2
         assert json.loads(lines[0])["event_type"] == "cron_started"
         assert json.loads(lines[1])["event_type"] == "cron_completed"
-        assert json.loads(lines[2])["event_type"] == "job_discovered"
 
     def test_health_state_change_flow(self, setup):
         bus = setup["bus"]

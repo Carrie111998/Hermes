@@ -1,0 +1,123 @@
+{
+  "type": "SCORE_RESULT",
+  "from": "matcher",
+  "to": "main",
+  "job_id": "fake-job-1",
+  "timestamp": "2026-04-16T18:37:42Z",
+  "correlation_id": "fake-correlation-1",
+  "payload": {
+    "job_id": "fake-job-1",
+    "title": "Test Role",
+    "company": "TestCompany",
+    "location": "Test City, TS",
+    "score": 7.4,
+    "recommendation": "PROCEED",
+    "dimensions": {
+      "title_match": 9.0,
+      "skills_overlap": 9.0,
+      "industry_fit": 10.0,
+      "location": 4.0,
+      "comp_alignment": 5.0,
+      "growth": 9.0,
+      "culture": 8.0
+    },
+    "strengths": [
+      "[scrubbed]"
+    ],
+    "gaps": [
+      "[scrubbed]"
+    ],
+    "reasoning": "[scrubbed]",
+    "penalties_applied": [
+      "[scrubbed]"
+    ],
+    "gating_reasons": [],
+    "source_file": "[scrubbed]",
+    "source_message": "[scrubbed]",
+    "source_correlation_id": null,
+    "data_quality": {
+      "description_complete": true,
+      "salary_available": true,
+      "ats_resolved": true,
+      "apply_url_valid": true
+    },
+    "ats_status": {
+      "ats_url": null,
+      "apply_url": "fake-url-1",
+      "ats_platform": null,
+      "ats_resolution_error": null,
+      "ats_attempted": true
+    },
+    "job_data": {
+      "job_id": "fake-job-1",
+      "title": "Test Role",
+      "company": "TestCompany",
+      "location": "Test City, TS",
+      "url": "fake-url-1",
+      "source": "test_source",
+      "stage": "discovered",
+      "discovered_at": "2026-04-16T13:36:30.971Z",
+      "stage_updated_at": "2026-04-16T13:36:30.971Z",
+      "added_at": "2026-04-16T13:36:30.971Z",
+      "history": [
+        {
+          "stage": "discovered",
+          "at": "2026-04-16T13:36:30.971Z",
+          "agent": "sentinel"
+        }
+      ],
+      "company_info": {
+        "size": null,
+        "industry": null,
+        "glassdoor_rating": null
+      },
+      "data_quality": {
+        "description_complete": true,
+        "salary_available": true,
+        "ats_resolved": true,
+        "apply_url_valid": true
+      },
+      "posted_date": null,
+      "captured_date": "2026-04-16T13:36:30.971Z",
+      "salary_source": null,
+      "source_board": "test_board",
+      "source_url": "fake-url-1",
+      "apply_url": "fake-url-1",
+      "ats_url": null,
+      "ats_platform": null,
+      "ats_resolution_error": null,
+      "ats_resolution_method": null,
+      "ats_resolved_at": null,
+      "closing_date": null,
+      "employment_type": null,
+      "seniority_level": null,
+      "followup_last_checked_at": "2026-04-16T14:21:40.284780Z",
+      "followup_active": false,
+      "followup_needed": false,
+      "followup_days_since_applied": null,
+      "followup_due_at": null,
+      "followup_flagged_at": null,
+      "salary_range": {
+        "min": 200.0,
+        "max": 200.0,
+        "currency": "USD",
+        "period": null,
+        "source": "posted_text"
+      },
+      "salary_range_text": "$200",
+      "description_raw": "[scrubbed]",
+      "requirements": [
+        "[scrubbed]"
+      ],
+      "vip": {
+        "is_vip": true,
+        "source": "test_source",
+        "added_by": "sentinel",
+        "added_at": "2026-04-16T13:36:30.971Z",
+        "original_score": null,
+        "promoted_from": null,
+        "promotion_type": "new"
+      }
+    }
+  }
+}
