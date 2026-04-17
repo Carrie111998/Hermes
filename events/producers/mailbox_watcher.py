@@ -106,6 +106,7 @@ class MailboxWatcher:
                             "to": msg.get("to", profile_dir.name),
                             "file": file_key,
                             "summary": self._summarize(msg),
+                            "inner_payload": msg.get("payload", {}),
                         },
                         correlation_id=msg.get("correlation_id"),
                         job_id=msg.get("job_id"),

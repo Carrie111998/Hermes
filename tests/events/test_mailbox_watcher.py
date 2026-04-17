@@ -88,3 +88,24 @@ class TestMailboxWatcher:
         _write_message(mailbox_root / "main" / "inbox", "TAILOR_REQUEST", "main", {})
 
         assert watcher2.scan() == 1  # only the new message
+
+
+def test_mailbox_watcher_forwards_inner_payload(tmp_path):
+    import json
+    from events.bus import EventBus
+    from events.producers.mailbox_watcher import MailboxWatcher
+    inbox = tmp_path / "mailbox" / "main" / "inbox"
+    inbox.mkdir(parents=True)
+    msg = {
+        "type": "SCORE_RESULT",
+        "from": "matcher", "to": "main",
+        "correlation_id": "abc",
+        "payload": {"score": 8.8, "company": "X"},
+    }
+    (inbox / "20260416T1_SCORE_RESULT_matcher.json").write_text(json.dumps(msg))
+    bus = EventBus(db_path=tmp_path / "db.sqlite")
+    MailboxWatcher(bus, mailbox_root=tmp_path / "mailbox").scan()
+    events = bus.query()
+    assert len(events) == 1
+    assert events[0].payload.get("inner_payload") == {"score": 8.8, "company": "X"}
+    bus.close()

@@ -20,6 +20,7 @@ from events.subscribers.whatsapp_escalator import WhatsAppEscalator
 from events.subscribers.digest_composer import DigestComposer, DIGEST_SCHEDULE_HOURS
 from events.subscribers.memory_writer import MemoryWriter
 from events.subscribers.telegram_mirror import TelegramMirror
+from events.subscribers.mailbox_translator import MailboxTranslator
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(DigestComposer(_bus))
     _registry.register(MemoryWriter(_bus))
     _registry.register(TelegramMirror(_bus))
+    _registry.register(MailboxTranslator(_bus))
 
     _registry.startup_all()
 
