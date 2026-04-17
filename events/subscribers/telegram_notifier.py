@@ -180,12 +180,10 @@ class TelegramNotifier(BaseSubscriber):
 
     def format_message(self, event: Event) -> str:
         """Format an event into a human-readable Telegram message."""
-        ts = event.timestamp[:19].replace("T", " ")
-        priority_label = event.priority.label.upper()
-        header = f"[{priority_label}] {event.event_type.type_string} from {event.source} @ {ts} UTC"
+        from events.formatting import format_event_message
 
         body = self._format_payload(event)
-        return f"{header}\n{body}" if body else header
+        return format_event_message(event, body)
 
     def _format_payload(self, event: Event) -> str:
         """Format event payload into readable text."""

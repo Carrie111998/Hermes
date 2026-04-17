@@ -1,0 +1,134 @@
+"""Emoji + visual formatting helpers for event-bus notifications.
+
+Provides priority dots, event-type icons, and header/body builders used by
+TelegramNotifier, TelegramMirror, WhatsAppEscalator, and DigestComposer.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from events.schema import Event, EventType, Priority
+
+# Priority -> colored dot (matches severity)
+PRIORITY_EMOJI = {
+    Priority.CRITICAL: "🔴",
+    Priority.HIGH:     "🟠",
+    Priority.NORMAL:   "🟡",
+    Priority.LOW:      "🟢",
+}
+
+# Event type -> icon
+EVENT_TYPE_EMOJI = {
+    EventType.CRON_STARTED:             "▶️",
+    EventType.CRON_COMPLETED:           "✔️",
+    EventType.CRON_FAILED:              "💥",
+    EventType.CRON_FAILED_CONSECUTIVE:  "🔥",
+    EventType.JOB_DISCOVERED:           "🎯",
+    EventType.JOB_SCORED:               "📊",
+    EventType.JOB_HIGH_SCORE:           "⭐",
+    EventType.JOB_VIP_DISCOVERED:       "💎",
+    EventType.TAILOR_COMPLETED:         "✍️",
+    EventType.APPLICATION_READY:        "📋",
+    EventType.APPLICATION_SUBMITTED:    "✅",
+    EventType.APPLICATION_FAILED:       "❌",
+    EventType.APPLICATION_BLOCKED:      "🚧",
+    EventType.INTERVIEW_SIGNAL:         "🗓️",
+    EventType.OFFER_SIGNAL:             "💰",
+    EventType.STAGE_TRANSITION:         "➡️",
+    EventType.FOLLOWUP_DUE:             "⏰",
+    EventType.DIGEST_GENERATED:         "📝",
+    EventType.GATEWAY_HEALTH:           "🛰️",
+    EventType.AGENT_ERROR:              "⚠️",
+    EventType.MEMORY_CONSOLIDATED:      "🧠",
+    EventType.SKILL_EVOLVED:            "🚀",
+    EventType.MAILBOX_MESSAGE:          "📨",
+}
+
+# Inner mailbox-message type -> icon (overrides generic mailbox icon when known)
+MAILBOX_INNER_EMOJI = {
+    "SCORE_RESULT":        "📊",
+    "SCORE_BATCH_SUMMARY": "📊",
+    "SCOUT_DISCOVERY":     "🎯",
+    "TAILOR_COMPLETE":     "✍️",
+    "TAILOR_REQUEST":      "✍️",
+    "SUBMIT_REQUEST":      "📋",
+    "DRY_RUN_COMPLETE":    "📋",
+    "SUBMIT_CONFIRM":      "✅",
+    "BLOCKED_QUESTION":    "🚧",
+    "PIPELINE_UPDATE":     "➡️",
+    "FOLLOWUP_ALERT":      "⏰",
+    "NOTIFICATION":        "📨",
+    "ERROR":               "⚠️",
+    "VIP_DISCOVERY":       "💎",
+    "STATUS_RESPONSE":     "📨",
+    "HIGH_SCORE_ALERT":    "⭐",
+}
+
+# 15 box-drawing dashes -- renders cleanly on both Telegram and WhatsApp
+SEPARATOR = "───────────────"
+
+
+def priority_dot(priority: Priority) -> str:
+    return PRIORITY_EMOJI.get(priority, "")
+
+
+def event_icon(event: Event) -> str:
+    """Return the icon for an event.
+
+    For mailbox_message, use inner message_type when available.
+    """
+    if event.event_type == EventType.MAILBOX_MESSAGE:
+        inner_type = (event.payload or {}).get("message_type", "")
+        return MAILBOX_INNER_EMOJI.get(inner_type, EVENT_TYPE_EMOJI[EventType.MAILBOX_MESSAGE])
+    return EVENT_TYPE_EMOJI.get(event.event_type, "")
+
+
+def _short_time(iso_ts: str) -> str:
+    """Format ISO timestamp as HH:MM UTC. Falls back to raw on parse error."""
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M UTC")
+    except Exception:
+        return iso_ts
+
+
+def format_header(event: Event) -> str:
+    """Top-line header: '🟠 ⚠️ AGENT_ERROR — source · 05:02 UTC'.
+
+    For mailbox_message events, surfaces the inner message_type and includes
+    sender -> recipient: '🟡 📊 SCORE_RESULT — matcher → main · 14:37 UTC'.
+    """
+    dot = priority_dot(event.priority)
+    icon = event_icon(event)
+    ts = _short_time(event.timestamp)
+
+    if event.event_type == EventType.MAILBOX_MESSAGE:
+        p = event.payload or {}
+        inner_type = p.get("message_type", "MAILBOX_MESSAGE")
+        sender = p.get("from", "?")
+        recipient = p.get("to", "?")
+        return f"{dot} {icon} {inner_type} — {sender} → {recipient} · {ts}"
+
+    return f"{dot} {icon} {event.event_type.type_string.upper()} — {event.source} · {ts}"
+
+
+def format_event_message(event: Event, body: str) -> str:
+    """Full formatted message for Telegram: header + separator + body."""
+    header = format_header(event)
+    if body:
+        return f"{header}\n{SEPARATOR}\n{body}"
+    return header
+
+
+def format_whatsapp_message(event: Event, body: str) -> str:
+    """Compact formatted message for WhatsApp: header + body, no separator.
+
+    WhatsApp is a scanning medium; body should already be concise. Caller
+    decides whether to append 'Details in Telegram.'
+    """
+    header = format_header(event)
+    if body:
+        return f"{header}\n{body}"
+    return header
