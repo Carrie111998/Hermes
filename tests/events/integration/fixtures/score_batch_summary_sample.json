@@ -1,0 +1,39 @@
+{
+  "type": "SCORE_BATCH_SUMMARY",
+  "from": "matcher",
+  "to": "main",
+  "job_id": null,
+  "timestamp": "2026-04-16T18:37:42Z",
+  "correlation_id": "fake-correlation-batch-1",
+  "payload": {
+    "batch_id": "fake-correlation-batch-1",
+    "count": 3,
+    "results": [
+      {
+        "job_id": "fake-job-1",
+        "score": 7.4,
+        "recommendation": "PROCEED",
+        "title": "Test Role",
+        "company": "TestCompany"
+      },
+      {
+        "job_id": "fake-job-2",
+        "score": 9.15,
+        "recommendation": "PROCEED",
+        "title": "Test Role",
+        "company": "TestCompany"
+      },
+      {
+        "job_id": "fake-job-3",
+        "score": 4.95,
+        "recommendation": "ARCHIVE",
+        "title": "Test Role",
+        "company": "TestCompany"
+      }
+    ],
+    "source_message": "[scrubbed]",
+    "notes": [
+      "[scrubbed]"
+    ]
+  }
+}

@@ -66,6 +66,25 @@ class TestTopicRouting:
         assert TOPIC_ROUTING["interview_signal"] == "alerts"
         assert TOPIC_ROUTING["offer_signal"] == "alerts"
 
+    def test_topic_routing_covers_all_domain_events(self):
+        from events.subscribers.telegram_notifier import TOPIC_ROUTING
+        from events.schema import EventType
+        required = {
+            EventType.JOB_DISCOVERED, EventType.JOB_VIP_DISCOVERED,
+            EventType.JOB_SCORED, EventType.JOB_HIGH_SCORE,
+            EventType.TAILOR_COMPLETED, EventType.APPLICATION_READY,
+            EventType.APPLICATION_SUBMITTED, EventType.APPLICATION_FAILED,
+            EventType.APPLICATION_BLOCKED, EventType.INTERVIEW_SIGNAL,
+            EventType.OFFER_SIGNAL, EventType.STAGE_TRANSITION,
+            EventType.FOLLOWUP_DUE, EventType.AGENT_ERROR,
+            EventType.CRON_FAILED_CONSECUTIVE, EventType.GATEWAY_HEALTH,
+        }
+        # TOPIC_ROUTING is a flat {event_string: topic_string} mapping;
+        # an event is "covered" if its type_string is a key.
+        covered = {et for et in EventType if et.type_string in TOPIC_ROUTING}
+        missing = required - covered
+        assert not missing, f"TOPIC_ROUTING missing: {missing}"
+
 
 class TestTelegramNotifier:
     def test_formats_message(self, bus, topics_config, verbosity_config):
