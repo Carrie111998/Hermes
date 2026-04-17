@@ -247,6 +247,14 @@ class EventBus:
 
         return [self._row_to_event(r) for r in rows]
 
+    def checkpoint(self) -> None:
+        """Run a passive WAL checkpoint so external readers see recent data."""
+        with self._lock:
+            try:
+                self._get_conn().execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error as e:
+                logger.warning("WAL checkpoint failed: %s", e)
+
     def close(self) -> None:
         """Close the thread-local SQLite connection."""
         conn = getattr(self._local, "conn", None)

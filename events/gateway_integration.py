@@ -165,6 +165,7 @@ def _subscriber_poll_loop() -> None:
     last_health_check: float = 0
     last_lag_check: float = 0
     last_cleanup: float = 0
+    last_checkpoint: float = 0
     _state = load_state(digest_state_path(), default={})
     last_digest_hour: int = _state.get("last_digest_hour", -1)
     _flush_state = load_state(whatsapp_flush_state_path(), default={})
@@ -264,5 +265,13 @@ def _subscriber_poll_loop() -> None:
             except Exception:
                 logger.exception("Event cleanup failed")
             last_cleanup = now
+
+        # WAL checkpoint every 60 seconds
+        if _bus and now - last_checkpoint >= 60:
+            try:
+                _bus.checkpoint()
+            except Exception:
+                logger.exception("WAL checkpoint failed")
+            last_checkpoint = now
 
         _stop_event.wait(timeout=1)  # tick every 1 second

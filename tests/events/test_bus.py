@@ -259,3 +259,22 @@ class TestThreadSafety:
         assert not errors
         all_events = bus.query()
         assert len(all_events) == 80  # 4 threads * 20 events
+
+
+def test_checkpoint_exposes_wal_data_to_other_connections(tmp_path):
+    import sqlite3
+    from events.bus import EventBus
+    from events.schema import EventType
+
+    db = tmp_path / "bus.db"
+    bus = EventBus(db_path=db)
+    try:
+        bus.emit(EventType.CRON_STARTED, "test", {})
+        bus.checkpoint()
+
+        other = sqlite3.connect(str(db))
+        count = other.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        other.close()
+        assert count == 1
+    finally:
+        bus.close()
