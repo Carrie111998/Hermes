@@ -227,10 +227,9 @@ async function startSocket() {
         if (!isSelfChat) continue;
       }
 
-      // Check allowlist for messages from others (resolve LID ↔ phone aliases)
-      if (!msg.key.fromMe && !matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
-        continue;
-      }
+      // Check allowlist — non-allowed users are queued as readOnly (for CRM ingest)
+      const isAllowedUser = msg.key.fromMe || matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
+      const readOnly = !isAllowedUser;
 
       const messageContent = getMessageContent(msg);
       const contextInfo = getContextInfo(messageContent);
@@ -350,6 +349,7 @@ async function startSocket() {
         quotedParticipant,
         botIds,
         timestamp: msg.messageTimestamp,
+        readOnly,
       };
 
       messageQueue.push(event);
@@ -379,6 +379,14 @@ app.post('/send', async (req, res) => {
   const { chatId, message, replyTo } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
+  }
+
+  // Block replies to non-allowed users (read-only protection)
+  if (ALLOWED_USERS.length > 0) {
+    const targetNumber = chatId.replace(/@.*/, '');
+    if (!matchesAllowedUser(targetNumber, ALLOWED_USERS, SESSION_DIR)) {
+      return res.status(403).json({ error: 'Recipient not in allowlist (read-only)' });
+    }
   }
 
   try {
