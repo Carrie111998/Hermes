@@ -9,6 +9,7 @@ CronEventEmitter that was never producing domain events.
 """
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
@@ -18,6 +19,17 @@ from events.subscribers.base import BaseSubscriber
 logger = logging.getLogger(__name__)
 
 HIGH_SCORE_THRESHOLD = 8.75
+
+_INTERVIEW_PATTERNS = [
+    re.compile(r"\binterview\s+(?:scheduled|invitation|request|invite)", re.I),
+    re.compile(r"\bphone\s+screen", re.I),
+    re.compile(r"\b(?:schedule|set up)\s+an?\s+interview", re.I),
+]
+_OFFER_PATTERNS = [
+    re.compile(r"\b(?:pleased|delighted|happy)\s+to\s+offer", re.I),
+    re.compile(r"\boffer\s+(?:letter|of\s+employment)", re.I),
+    re.compile(r"\bextended\s+an?\s+offer", re.I),
+]
 
 
 class MailboxTranslator(BaseSubscriber):
@@ -111,6 +123,15 @@ class MailboxTranslator(BaseSubscriber):
         elif message_type == "ERROR":
             results.append((EventType.AGENT_ERROR, _copy_fields(
                 inner, ["message", "source_agent", "traceback"]), None))
+
+        elif message_type == "NOTIFICATION":
+            body = str(inner.get("body", "")) + " " + str(inner.get("summary", ""))
+            if any(p.search(body) for p in _INTERVIEW_PATTERNS):
+                results.append((EventType.INTERVIEW_SIGNAL, _copy_fields(
+                    inner, ["company", "title", "job_key", "body"]), None))
+            elif any(p.search(body) for p in _OFFER_PATTERNS):
+                results.append((EventType.OFFER_SIGNAL, _copy_fields(
+                    inner, ["company", "title", "job_key", "body"]), None))
 
         return results
 

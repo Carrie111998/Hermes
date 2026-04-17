@@ -143,3 +143,34 @@ def test_cursor_advances_after_poll(bus):
     t.poll()
     post_events = len(bus.query())
     assert post_events == pre_events
+
+
+def test_notification_interview_keyword_emits_interview_signal(bus):
+    _mailbox_event(bus, "NOTIFICATION", {
+        "body": "Interview scheduled with Acme next Tuesday",
+        "company": "Acme",
+    })
+    MailboxTranslator(bus).poll()
+    events = _recent_domain_events(bus)
+    assert any(et == EventType.INTERVIEW_SIGNAL for et, _ in events)
+
+
+def test_notification_offer_keyword_emits_offer_signal(bus):
+    _mailbox_event(bus, "NOTIFICATION", {
+        "body": "We are pleased to offer you the Director of Finance role",
+        "company": "BigCo",
+    })
+    MailboxTranslator(bus).poll()
+    events = _recent_domain_events(bus)
+    assert any(et == EventType.OFFER_SIGNAL for et, _ in events)
+
+
+def test_notification_without_keyword_emits_nothing(bus):
+    _mailbox_event(bus, "NOTIFICATION", {
+        "body": "Weekly pipeline update: 12 jobs discovered",
+    })
+    MailboxTranslator(bus).poll()
+    events = _recent_domain_events(bus)
+    types = [et for et, _ in events]
+    assert EventType.INTERVIEW_SIGNAL not in types
+    assert EventType.OFFER_SIGNAL not in types
