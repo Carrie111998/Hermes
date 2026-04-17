@@ -121,6 +121,18 @@ def test_pipeline_update_emits_stage_transition_only_if_different(bus):
     assert transitions[0]["job_key"] == "j1"
 
 
+def test_pipeline_update_emits_on_first_stage_assignment(bus):
+    """First assignment has previous_stage=None but IS a real transition."""
+    _mailbox_event(bus, "PIPELINE_UPDATE",
+                   {"job_key": "j3", "previous_stage": None, "new_stage": "discovered"})
+    MailboxTranslator(bus).poll()
+    events = _recent_domain_events(bus)
+    transitions = [p for et, p in events if et == EventType.STAGE_TRANSITION]
+    assert len(transitions) == 1
+    assert transitions[0]["job_key"] == "j3"
+    assert transitions[0]["new_stage"] == "discovered"
+
+
 def test_error_message_emits_agent_error(bus):
     _mailbox_event(bus, "ERROR",
                    {"message": "scout failed", "source_agent": "scout"})

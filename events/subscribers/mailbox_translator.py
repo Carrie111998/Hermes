@@ -104,7 +104,8 @@ class MailboxTranslator(BaseSubscriber):
         elif message_type == "PIPELINE_UPDATE":
             prev = inner.get("previous_stage")
             new = inner.get("new_stage")
-            if new and prev and new != prev:
+            # Emit on any real transition — including first assignment where prev is None.
+            if new and new != prev:
                 results.append((EventType.STAGE_TRANSITION, _copy_fields(
                     inner, ["job_key", "previous_stage", "new_stage", "company"]), None))
 
