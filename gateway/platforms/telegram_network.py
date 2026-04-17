@@ -58,6 +58,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     ``curl --resolve api.telegram.org:443:<ip>``.
     """
 
+    STICKY_FAILURE_RESET_THRESHOLD = 5
+
     def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
         self._fallback_ips = [ip for ip in dict.fromkeys(_normalize_fallback_ips(fallback_ips))]
         proxy_url = _resolve_proxy_url()
@@ -69,6 +71,20 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         }
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
+        self._sticky_failures: int = 0
+
+    def _record_sticky_failure(self) -> None:
+        self._sticky_failures += 1
+        if self._sticky_failures >= self.STICKY_FAILURE_RESET_THRESHOLD:
+            logger.warning(
+                "TelegramFallbackTransport: sticky IP %s failed %d times, resetting",
+                self._sticky_ip, self._sticky_failures,
+            )
+            self._sticky_ip = None
+            self._sticky_failures = 0
+
+    def _record_sticky_success(self) -> None:
+        self._sticky_failures = 0
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if request.url.host != _TELEGRAM_API_HOST or not self._fallback_ips:
@@ -94,6 +110,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                                 "[Telegram] Primary api.telegram.org path unreachable; using sticky fallback IP %s",
                                 ip,
                             )
+                if ip is not None and ip == self._sticky_ip:
+                    self._record_sticky_success()
                 return response
             except Exception as exc:
                 last_error = exc
@@ -106,6 +124,8 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                         ", ".join(self._fallback_ips),
                     )
                     continue
+                if ip == sticky_ip:
+                    self._record_sticky_failure()
                 logger.warning("[Telegram] Fallback IP %s failed: %s", ip, exc)
                 continue
 
