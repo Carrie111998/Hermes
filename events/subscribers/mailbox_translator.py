@@ -60,7 +60,9 @@ class MailboxTranslator(BaseSubscriber):
                 results.append((EventType.JOB_HIGH_SCORE, p, None))
 
         elif message_type == "SCORE_BATCH_SUMMARY":
-            for job in inner.get("scored_jobs", []):
+            # Real protocol field is `results`; tolerate `scored_jobs` as alias.
+            batch = inner.get("results") or inner.get("scored_jobs", [])
+            for job in batch:
                 p = _score_payload(job)
                 results.append((EventType.JOB_SCORED, p, None))
                 if p.get("score", 0) >= HIGH_SCORE_THRESHOLD:

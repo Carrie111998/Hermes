@@ -76,6 +76,23 @@ def test_batch_summary_expands_to_per_job_events(bus):
     assert high[0]["company"] == "B"
 
 
+def test_batch_summary_real_protocol_field_results(bus):
+    """Real matcher agent emits SCORE_BATCH_SUMMARY with payload.results."""
+    _mailbox_event(bus, "SCORE_BATCH_SUMMARY", {
+        "results": [
+            {"score": 6.0, "company": "Alpha", "title": "Dir"},
+            {"score": 9.2, "company": "Beta",  "title": "VP"},
+        ],
+    })
+    MailboxTranslator(bus).poll()
+    events = _recent_domain_events(bus)
+    scored = [p for et, p in events if et == EventType.JOB_SCORED]
+    high = [p for et, p in events if et == EventType.JOB_HIGH_SCORE]
+    assert len(scored) == 2
+    assert len(high) == 1
+    assert high[0]["company"] == "Beta"
+
+
 def test_submit_confirm_emits_application_submitted(bus):
     _mailbox_event(bus, "SUBMIT_CONFIRM",
                    {"company": "Acme", "title": "Director", "submission_id": "s1"})
