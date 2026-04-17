@@ -72,11 +72,11 @@ class TelegramNotifier(BaseSubscriber):
     ):
         super().__init__(bus)
         if topics_path is None:
-            from hermes_constants import get_hermes_home
-            topics_path = get_hermes_home() / "telegram" / "topics.json"
+            from events.paths import telegram_topics_path
+            topics_path = telegram_topics_path()
         if verbosity_path is None:
-            from hermes_constants import get_hermes_home
-            verbosity_path = get_hermes_home() / "telegram" / "verbosity.json"
+            from events.paths import telegram_verbosity_path
+            verbosity_path = telegram_verbosity_path()
 
         self._topics_path = Path(topics_path)
         self._verbosity_path = Path(verbosity_path)

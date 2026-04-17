@@ -172,8 +172,8 @@ class DigestComposer(BaseSubscriber):
         try:
             from cron.scheduler import _deliver_result
             import json as _json
-            from hermes_constants import get_hermes_home
-            topics_path = get_hermes_home() / "telegram" / "topics.json"
+            from events.paths import telegram_topics_path
+            topics_path = telegram_topics_path()
             if topics_path.exists():
                 data = _json.loads(topics_path.read_text(encoding="utf-8"))
                 chat_id = data.get("group_chat_id", "")

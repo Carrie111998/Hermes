@@ -96,8 +96,8 @@ class WhatsAppEscalator(BaseSubscriber):
     ):
         super().__init__(bus)
         if quiet_config_path is None:
-            from hermes_constants import get_hermes_home
-            quiet_config_path = get_hermes_home() / "notifications" / "quiet_hours.json"
+            from events.paths import quiet_hours_path
+            quiet_config_path = quiet_hours_path()
 
         self._quiet_config_path = Path(quiet_config_path)
         self._send_fn = send_fn
@@ -109,8 +109,8 @@ class WhatsAppEscalator(BaseSubscriber):
         elif self._quiet_config.get("queue_file"):
             self._queue_path = Path(os.path.expanduser(self._quiet_config["queue_file"]))
         else:
-            from hermes_constants import get_hermes_home
-            self._queue_path = get_hermes_home() / "notifications" / "quiet_queue.json"
+            from events.paths import quiet_queue_path
+            self._queue_path = quiet_queue_path()
 
         # Throttle state
         self._throttle_buffer: List[str] = []

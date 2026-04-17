@@ -56,8 +56,8 @@ class EventBus:
 
     def __init__(self, db_path: Optional[Path] = None):
         if db_path is None:
-            from hermes_constants import get_hermes_home
-            db_path = get_hermes_home() / "events" / "event_bus.db"
+            from events.paths import events_db_path
+            db_path = events_db_path()
         self.db_path = Path(db_path)
         self._lock = threading.Lock()
         self._local = threading.local()

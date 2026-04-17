@@ -29,8 +29,8 @@ class TelegramMirror(BaseSubscriber):
     ):
         super().__init__(bus)
         if topics_path is None:
-            from hermes_constants import get_hermes_home
-            topics_path = get_hermes_home() / "telegram" / "topics.json"
+            from events.paths import telegram_topics_path
+            topics_path = telegram_topics_path()
         self._topics_path = Path(topics_path)
         self._send_fn = send_fn
 

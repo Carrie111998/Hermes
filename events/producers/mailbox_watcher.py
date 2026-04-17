@@ -38,8 +38,8 @@ class MailboxWatcher:
     ):
         self.bus = bus
         if mailbox_root is None:
-            from hermes_constants import get_hermes_home
-            mailbox_root = get_hermes_home() / "mailbox"
+            from events.paths import mailbox_root as _default_mailbox_root
+            mailbox_root = _default_mailbox_root()
         self.mailbox_root = Path(mailbox_root)
         self._watermark_path = self.mailbox_root / ".event_watermark.json"
         self._seen: Set[str] = self._load_watermark()

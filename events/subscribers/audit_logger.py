@@ -28,8 +28,8 @@ class AuditLogger(BaseSubscriber):
     def __init__(self, bus: EventBus, audit_path: Optional[Path] = None):
         super().__init__(bus)
         if audit_path is None:
-            from hermes_constants import get_hermes_home
-            audit_path = get_hermes_home() / "events" / "audit.jsonl"
+            from events.paths import audit_log_path
+            audit_path = audit_log_path()
         self.audit_path = Path(audit_path)
         self._archive_dir = self.audit_path.parent / "audit"
         self._last_rotation_check: float = 0
