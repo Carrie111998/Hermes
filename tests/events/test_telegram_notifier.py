@@ -127,6 +127,144 @@ class TestTelegramNotifier:
         assert notifier.group_chat_id == "-1001234567890"
         assert notifier.topics["scout"]["thread_id"] == 101
 
+    def test_cron_completed_long_summary_is_trimmed_for_mission_control(self, bus, topics_config, verbosity_config):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        summary = "Learning-loop maintenance pass complete.\n\n" + "\n".join(
+            f"- detail line {i}" for i in range(1, 80)
+        )
+        event = Event.create(
+            EventType.CRON_COMPLETED,
+            "learning-loop",
+            {"duration": 705.2, "output_summary": summary},
+            priority=Priority.HIGH,
+        )
+
+        msg = notifier.format_message(event)
+
+        assert "Duration: 705.2s" in msg
+        assert "Mission Control trimmed the rest" in msg
+        assert "- detail line 79" not in msg
+
+
+class TestSecretDetectedFormatting:
+    """SR-408 regression (2026-04-19) — SECRET_DETECTED must render as a
+    compact, human-readable Telegram message, not a generic key:value dump
+    of the full payload.
+
+    Root cause of the 2026-04-19 flood's cryptic appearance:
+    `_format_payload` had no branch for SECRET_DETECTED, so the generic
+    fallback (`f"{k}: {v}" for k, v in p.items()`) emitted six lines
+    including `match_preview: ****************************` walls (the
+    `matched_string` of a LevelDB binary chunk, up to 2000+ chars of
+    asterisks) and noise like `finding_hash: sha256:…` /
+    `gitleaks_version: v8.30.1` that operators cannot act on.
+
+    Payload contract comes from scanner.py::emit_event() — keys:
+        rule_id, file_path, line_no, match_preview, finding_hash,
+        gitleaks_version.
+    """
+
+    def test_secret_detected_body_shows_rule_path_line_preview(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Body must contain the four operator-relevant fields."""
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.SECRET_DETECTED, "sr-001-secret-scanner",
+            {
+                "rule_id": "aws-access-token",
+                "file_path": "C:/Users/diego/.env",
+                "line_no": 5,
+                "match_preview": "AKIA****XYZ1234",
+                "finding_hash": "sha256:abc123",
+                "gitleaks_version": "v8.30.1",
+            },
+        )
+        body = notifier._format_payload(event)
+        assert "aws-access-token" in body, "rule_id must appear"
+        assert "C:/Users/diego/.env" in body, "file_path must appear"
+        assert "5" in body, "line_no must appear"
+        assert "AKIA" in body, "masked preview must appear"
+
+    def test_secret_detected_body_omits_internal_fields(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """finding_hash and gitleaks_version are internal — must not leak
+        into the user-facing Telegram body. finding_hash shows up as
+        ``sha256:…`` and adds no actionable info (dedup identity only).
+        gitleaks_version is audit metadata; it belongs in the event, not
+        the message.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.SECRET_DETECTED, "sr-001-secret-scanner",
+            {
+                "rule_id": "aws-access-token",
+                "file_path": "C:/Users/diego/.env",
+                "line_no": 5,
+                "match_preview": "AKIA****",
+                "finding_hash": "sha256:abc123def456",
+                "gitleaks_version": "v8.30.1",
+            },
+        )
+        body = notifier._format_payload(event)
+        assert "sha256:" not in body, "finding_hash must be suppressed"
+        assert "gitleaks_version" not in body, "gitleaks_version label must be suppressed"
+        assert "v8.30.1" not in body, "gitleaks version value must be suppressed"
+        assert "finding_hash" not in body, "finding_hash label must be suppressed"
+
+    def test_secret_detected_body_is_compact(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Body must be at most 3 short lines. A generic fallback that
+        enumerates 6 payload fields produced the 'asterisk wall' the user
+        called out as 'very cryptic and weird messages I have no clue
+        what the fuck they mean' on 2026-04-19.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.SECRET_DETECTED, "sr-001-secret-scanner",
+            {
+                "rule_id": "aws-access-token",
+                "file_path": "C:/Users/diego/.env",
+                "line_no": 5,
+                "match_preview": "AKIA****XYZ1234",
+                "finding_hash": "sha256:abc123",
+                "gitleaks_version": "v8.30.1",
+            },
+        )
+        body = notifier._format_payload(event)
+        lines = body.splitlines()
+        assert 0 < len(lines) <= 3, (
+            f"SECRET_DETECTED body must be ≤3 lines; got {len(lines)}: {body!r}"
+        )
+
+    def test_secret_detected_tolerates_missing_fields(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Scanner payload should always be complete, but missing fields
+        must not raise — fallback to '?' placeholders. A KeyError here
+        would bubble up through the subscriber loop and stall the cursor.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.SECRET_DETECTED, "sr-001-secret-scanner",
+            {},  # empty payload
+        )
+        body = notifier._format_payload(event)
+        # Should not raise; should produce a well-formed (if placeholder-heavy) body.
+        assert body, "empty payload must still yield a non-empty body"
+
 
 class TestLowPriorityBatching:
     """Tests for low-priority event batching and flush behavior.

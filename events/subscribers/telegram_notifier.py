@@ -53,12 +53,20 @@ TOPIC_ROUTING: Dict[str, str] = {
     "skill_evolved": "system",
     # Agent Comms
     "mailbox_message": "agent_comms",
+    # Security (SR-001 secret scanner — fork-patch, see tests/test_topic_routing_patch.py)
+    "secret_detected": "security",
 }
 
 # Events that cross-post to alerts when high/critical
 CROSS_POST_TO_ALERTS = {
     "job_high_score", "application_ready", "followup_due",
 }
+
+CRON_SUMMARY_MAX_LINES = 24
+CRON_SUMMARY_MAX_CHARS = 1500
+CRON_SUMMARY_TRUNCATION_NOTE = (
+    "[Mission Control trimmed the rest; full run output remains in cron history/artifacts.]"
+)
 
 
 class TelegramNotifier(BaseSubscriber):
@@ -191,7 +199,7 @@ class TelegramNotifier(BaseSubscriber):
         et = event.event_type
 
         if et == EventType.CRON_COMPLETED:
-            summary = p.get("output_summary", "")
+            summary = self._trim_cron_summary(p.get("output_summary", ""))
             duration = p.get("duration", "?")
             return f"Duration: {duration}s\n{summary}" if summary else f"Duration: {duration}s"
 
@@ -213,9 +221,57 @@ class TelegramNotifier(BaseSubscriber):
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
 
+        if et == EventType.SECRET_DETECTED:
+            # SR-408 post-flood fix (2026-04-19). Before this branch the
+            # generic fallback dumped all 6 payload fields — including the
+            # multi-kilobyte `match_preview` asterisk walls from LevelDB
+            # binary chunks and internal `finding_hash` / `gitleaks_version`
+            # operators cannot act on. Keep the body to the 3 operator-
+            # actionable fields: rule, location, masked preview. The
+            # finding_hash still flows to the event bus as correlation_id
+            # (see scanner.py::_publish_to_hermes) — not lost, just out of
+            # the user's face.
+            return (
+                f"Rule: {p.get('rule_id', '?')}\n"
+                f"File: {p.get('file_path', '?')}:{p.get('line_no', '?')}\n"
+                f"Preview: {p.get('match_preview', '?')}"
+            )
+
         # Generic fallback
         lines = [f"{k}: {v}" for k, v in p.items() if v]
         return "\n".join(lines[:10])
+
+    def _trim_cron_summary(self, summary: str) -> str:
+        """Keep Mission Control cron updates readable inside a chat topic."""
+        summary = str(summary or "").strip()
+        if not summary:
+            return ""
+
+        lines = summary.splitlines()
+        if len(lines) <= CRON_SUMMARY_MAX_LINES and len(summary) <= CRON_SUMMARY_MAX_CHARS:
+            return summary
+
+        budget = max(80, CRON_SUMMARY_MAX_CHARS - len(CRON_SUMMARY_TRUNCATION_NOTE) - 2)
+        kept: List[str] = []
+        used = 0
+
+        for line in lines:
+            normalized = line.rstrip()
+            addition = normalized if not kept else f"\n{normalized}"
+            if len(kept) >= CRON_SUMMARY_MAX_LINES or used + len(addition) > budget:
+                break
+            kept.append(normalized)
+            used += len(addition)
+
+        if not kept:
+            clipped = summary[: max(0, budget - 3)].rstrip()
+            if len(clipped) < len(summary):
+                clipped += "..."
+            kept_text = clipped
+        else:
+            kept_text = "\n".join(kept).rstrip()
+
+        return f"{kept_text}\n\n{CRON_SUMMARY_TRUNCATION_NOTE}"
 
     def _deliver(self, chat_id: str, thread_id: str, message: str) -> None:
         """Send a message to a Telegram chat/thread."""
