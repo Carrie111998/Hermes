@@ -4724,8 +4724,19 @@ def cmd_dashboard(args):
         print("Install them with:  pip install hermes-agent[web]")
         sys.exit(1)
 
-    if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
-        sys.exit(1)
+    # 2026-04-17: skip rebuild if the web UI is already built. This avoids the
+    # failure mode where subprocess.run([npm, "install"]) returns nonzero on
+    # Windows even when the build is already present and valid. Re-run
+    # `npm run build` in hermes_cli/web/ manually if you need to refresh.
+    from hermes_cli.web_server import WEB_DIST as _WEB_DIST_CHECK
+    _already_built = (
+        _WEB_DIST_CHECK.exists()
+        and (_WEB_DIST_CHECK / "index.html").exists()
+        and any((_WEB_DIST_CHECK / "assets").glob("*")) if (_WEB_DIST_CHECK / "assets").exists() else False
+    )
+    if not _already_built:
+        if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
+            sys.exit(1)
 
     from hermes_cli.web_server import start_server
     start_server(
