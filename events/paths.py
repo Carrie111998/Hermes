@@ -64,6 +64,15 @@ def whatsapp_flush_state_path() -> Path:
     return notifications_home() / "whatsapp_flush_state.json"
 
 
+def cron_stale_thresholds_path() -> Path:
+    """Optional per-job stale-threshold overrides (CronStaleMonitor).
+
+    JSON shape: {"default_seconds": 1200, "per_job": {"jaum-skill-evolution": 3600}}
+    Missing file = use built-in defaults (no overrides).
+    """
+    return notifications_home() / "cron_stale_thresholds.json"
+
+
 def mailbox_root() -> Path:
     return _root() / "mailbox"
 

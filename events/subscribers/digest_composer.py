@@ -298,7 +298,19 @@ class DigestComposer(BaseSubscriber):
                     if lag > eventbus_worst_lag.get(sub_id, 0):
                         eventbus_worst_lag[sub_id] = lag
                     continue
-                key = f"{e.source}: {(e.payload.get('error') or 'unknown')[:100]}"
+                # Payload key varies across emitters: base.py / gateway_integration
+                # use 'error', but mailbox-* AGENT_ERRORs use 'message', and some
+                # cron_failed payloads use 'reason' or 'summary'.  Falling back in
+                # priority order stops the "unknown" rendering we saw for
+                # mailbox:sentinel and similar sources.
+                error_text = (
+                    e.payload.get("error")
+                    or e.payload.get("message")
+                    or e.payload.get("reason")
+                    or e.payload.get("summary")
+                    or "unknown"
+                )
+                key = f"{e.source}: {str(error_text)[:100]}"
                 error_groups[key] += 1
 
         # Build digest

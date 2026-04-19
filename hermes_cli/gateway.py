@@ -1639,15 +1639,20 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
                  hasn't fully exited yet.
     """
     sys.path.insert(0, str(PROJECT_ROOT))
-    
+
     from gateway.run import start_gateway
-    
-    print("┌─────────────────────────────────────────────────────────┐")
-    print("│           ⚕ Hermes Gateway Starting...                 │")
-    print("├─────────────────────────────────────────────────────────┤")
-    print("│  Messaging platforms + cron scheduler                    │")
-    print("│  Press Ctrl+C to stop                                   │")
-    print("└─────────────────────────────────────────────────────────┘")
+
+    # ASCII-only banner: the previous Unicode box-drawing version
+    # (┌─┐│└─┘) crashed on Windows consoles running cp1252 with a
+    # UnicodeEncodeError on the very first startup line, which made
+    # stderr logs noisy and, under some launch paths, killed the
+    # process before the gateway thread started.
+    print("+---------------------------------------------------------+")
+    print("|           Hermes Gateway Starting...                    |")
+    print("+---------------------------------------------------------+")
+    print("|  Messaging platforms + cron scheduler                   |")
+    print("|  Press Ctrl+C to stop                                   |")
+    print("+---------------------------------------------------------+")
     print()
     
     # Exit with code 1 if gateway fails to connect any platform,

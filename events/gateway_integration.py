@@ -14,7 +14,12 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from events.bus import EventBus
-from events.paths import digest_state_path, gateway_heartbeat_path, whatsapp_flush_state_path
+from events.paths import (
+    cron_stale_thresholds_path,
+    digest_state_path,
+    gateway_heartbeat_path,
+    whatsapp_flush_state_path,
+)
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.state import load_state, save_state
@@ -76,7 +81,31 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(MemoryWriter(_bus))
     _registry.register(TelegramMirror(_bus))
     _registry.register(MailboxTranslator(_bus))
-    _registry.register(CronStaleMonitor(_bus))
+
+    # CronStaleMonitor: load optional per-job threshold overrides.  Missing
+    # file = built-in defaults.  Malformed file = log + fall back to defaults
+    # (never crash the gateway over a config typo).
+    _stale_default: Optional[int] = None
+    _stale_overrides: Dict[str, int] = {}
+    try:
+        _stale_cfg_path = cron_stale_thresholds_path()
+        if _stale_cfg_path.exists():
+            with open(_stale_cfg_path, "r", encoding="utf-8") as f:
+                _stale_cfg = json.load(f)
+            if isinstance(_stale_cfg.get("default_seconds"), int):
+                _stale_default = _stale_cfg["default_seconds"]
+            if isinstance(_stale_cfg.get("per_job"), dict):
+                _stale_overrides = {
+                    str(k): int(v) for k, v in _stale_cfg["per_job"].items()
+                    if isinstance(v, int) or (isinstance(v, str) and v.isdigit())
+                }
+    except Exception:
+        logger.exception("Failed to load cron_stale_thresholds.json — using defaults")
+    _registry.register(CronStaleMonitor(
+        _bus,
+        default_threshold_seconds=_stale_default,
+        per_job_thresholds=_stale_overrides,
+    ))
 
     _registry.startup_all()
 

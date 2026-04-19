@@ -14,7 +14,7 @@ event never arrives.  This subscriber closes that observability gap.
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
@@ -32,12 +32,34 @@ class CronStaleMonitor(BaseSubscriber):
         EventType.CRON_FAILED,
     ]
 
-    STALE_THRESHOLD_SECONDS: int = 600
+    # Default threshold raised from 600 → 1200 after the 2026-04-19 flood
+    # revealed that 10 minutes is tight for ML-training / skill-evolution
+    # jobs that routinely run 15–30 minutes.  Per-job overrides live in
+    # ~/.hermes/notifications/cron_stale_thresholds.json and are injected
+    # via the constructor by gateway_integration.
+    STALE_THRESHOLD_SECONDS: int = 1200
 
-    def __init__(self, bus: EventBus):
+    def __init__(
+        self,
+        bus: EventBus,
+        default_threshold_seconds: Optional[int] = None,
+        per_job_thresholds: Optional[Dict[str, int]] = None,
+    ):
         super().__init__(bus)
-        self._open_jobs: Dict[str, datetime] = {}
+        # (started_at, job_name) — job_name is the key for override lookup
+        self._open_jobs: Dict[str, Tuple[datetime, str]] = {}
         self._alerted: Set[str] = set()
+        self._default_threshold = (
+            default_threshold_seconds
+            if default_threshold_seconds is not None
+            else self.STALE_THRESHOLD_SECONDS
+        )
+        self._per_job_thresholds = dict(per_job_thresholds or {})
+
+    def _threshold_for(self, job_name: str) -> int:
+        if job_name and job_name in self._per_job_thresholds:
+            return self._per_job_thresholds[job_name]
+        return self._default_threshold
 
     def handle(self, event: Event) -> None:
         job_id = event.payload.get("job_id")
@@ -53,7 +75,8 @@ class CronStaleMonitor(BaseSubscriber):
                     event.timestamp, event.event_id,
                 )
                 return
-            self._open_jobs[job_id] = started_at
+            job_name = event.payload.get("job_name") or event.source or job_id
+            self._open_jobs[job_id] = (started_at, job_name)
             self._alerted.discard(job_id)
         elif event.event_type in (EventType.CRON_COMPLETED, EventType.CRON_FAILED):
             self._open_jobs.pop(job_id, None)
@@ -66,11 +89,12 @@ class CronStaleMonitor(BaseSubscriber):
 
     def _check_stale(self) -> None:
         now = datetime.now(timezone.utc)
-        for job_id, started_at in list(self._open_jobs.items()):
+        for job_id, (started_at, job_name) in list(self._open_jobs.items()):
             if job_id in self._alerted:
                 continue
             age = (now - started_at).total_seconds()
-            if age < self.STALE_THRESHOLD_SECONDS:
+            threshold = self._threshold_for(job_name)
+            if age < threshold:
                 continue
             try:
                 self.bus.emit(
@@ -78,8 +102,9 @@ class CronStaleMonitor(BaseSubscriber):
                     source="cron-stale-monitor",
                     payload={
                         "job_id": job_id,
+                        "job_name": job_name,
                         "age_seconds": int(age),
-                        "threshold_seconds": self.STALE_THRESHOLD_SECONDS,
+                        "threshold_seconds": threshold,
                     },
                     priority=Priority.HIGH,
                 )
