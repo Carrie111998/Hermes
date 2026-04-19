@@ -241,6 +241,34 @@ def _emit_poll_loop_error(consecutive_errors: int) -> None:
         logger.exception("Failed to emit poll-loop error event")
 
 
+def _pick_digest_target(
+    et_hour: int,
+    today_et: str,
+    last_digest_key: str,
+    schedule_hours=None,
+) -> Optional[str]:
+    """Return the YYYY-MM-DD-HH digest key to fire now, or None.
+
+    Catch-up semantics: picks the *latest* scheduled hour that is ``<=``
+    ``et_hour`` today, and fires if its date-qualified key differs from
+    ``last_digest_key``.  Returns None when no scheduled hour has yet
+    arrived today, or when the picked hour's key was already fired.
+
+    Why latest-only rather than every-missed-hour: back-to-back catch-up
+    after a long outage would dump multiple near-identical digests into
+    the feed.  The user prefers a single current summary — the missed
+    events are already durable in the event bus for retrospection.
+    """
+    hours = schedule_hours if schedule_hours is not None else DIGEST_SCHEDULE_HOURS
+    applicable = [h for h in hours if h <= et_hour]
+    if not applicable:
+        return None
+    target_key = f"{today_et}-{max(applicable):02d}"
+    if target_key == last_digest_key:
+        return None
+    return target_key
+
+
 def _subscriber_poll_loop() -> None:
     """Background thread that polls all subscribers at their configured intervals.
 
@@ -259,7 +287,12 @@ def _subscriber_poll_loop() -> None:
     last_checkpoint: float = 0
     last_heartbeat: float = 0
     _state = load_state(digest_state_path(), default={})
-    last_digest_hour: int = _state.get("last_digest_hour", -1)
+    # last_digest_key encodes "YYYY-MM-DD-HH" of the most-recent digest fired.
+    # Replaces the legacy int-hour key so we can catch up after a missed
+    # window (e.g., gateway offline during the entire 8am hour).  The old
+    # "last_digest_hour" key is ignored on migration — worst case we fire one
+    # duplicate digest on first post-upgrade startup.
+    last_digest_key: str = _state.get("last_digest_key", "")
     _flush_state = load_state(whatsapp_flush_state_path(), default={})
     last_flush_date: str = _flush_state.get("last_flush_date", "")
     lag_alerts_sent: Dict[str, float] = {}  # subscriber_id -> monotonic timestamp
@@ -281,45 +314,46 @@ def _subscriber_poll_loop() -> None:
                             logger.exception("Subscriber poll failed: %s", sub.subscriber_id)
                         last_poll_times[sub.subscriber_id] = now
 
-            # Timed triggers for DigestComposer and WhatsAppEscalator
+            # Timed triggers for DigestComposer and WhatsAppEscalator.
+            # Uses catch-up semantics (>= rather than ==) so a gateway that
+            # was offline during a scheduled hour still fires on startup.
             if _registry:
-                et_hour = _get_et_hour()
-
-                # Digest: fire at 8am, 1pm, 6pm ET (once per hour)
-                if et_hour in DIGEST_SCHEDULE_HOURS and et_hour != last_digest_hour:
-                    for sub in _registry.subscribers:
-                        if isinstance(sub, DigestComposer):
-                            try:
-                                digest = sub.compose()
-                                logger.info("Digest composed at hour %d ET (%d chars)",
-                                            et_hour, len(digest))
-                            except Exception:
-                                logger.exception("Digest compose failed")
-                    last_digest_hour = et_hour
-                    _state["last_digest_hour"] = et_hour
-                    try:
-                        save_state(digest_state_path(), _state)
-                    except Exception:
-                        logger.exception("Failed to save digest state")
-                elif et_hour not in DIGEST_SCHEDULE_HOURS:
-                    if last_digest_hour != -1:
-                        last_digest_hour = -1
-                        _state["last_digest_hour"] = -1
-                        try:
-                            save_state(digest_state_path(), _state)
-                        except Exception:
-                            logger.exception("Failed to save digest state")
-
-                # WhatsApp morning flush — one-per-day by ET date
                 import zoneinfo
                 from datetime import datetime as _dt
                 try:
                     tz = zoneinfo.ZoneInfo("America/New_York")
-                    today_et = _dt.now(tz).date().isoformat()
+                    _now_et = _dt.now(tz)
                 except Exception:
-                    today_et = _dt.utcnow().date().isoformat()
+                    _now_et = _dt.utcnow()
+                et_hour = _now_et.hour
+                today_et = _now_et.date().isoformat()
 
-                if et_hour == 7 and last_flush_date != today_et:
+                # Digest catch-up: fire once per scheduled hour per day.
+                # See _pick_digest_target() for the semantics (latest missed
+                # hour only, date-qualified key so same-hour-next-day still
+                # fires, worst case one duplicate on first post-upgrade run).
+                target_key = _pick_digest_target(et_hour, today_et, last_digest_key)
+                if target_key is not None:
+                    for sub in _registry.subscribers:
+                        if isinstance(sub, DigestComposer):
+                            try:
+                                digest = sub.compose()
+                                logger.info(
+                                    "Digest composed (key=%s, %d chars)",
+                                    target_key, len(digest),
+                                )
+                            except Exception:
+                                logger.exception("Digest compose failed")
+                    last_digest_key = target_key
+                    _state["last_digest_key"] = target_key
+                    try:
+                        save_state(digest_state_path(), _state)
+                    except Exception:
+                        logger.exception("Failed to save digest state")
+
+                # WhatsApp morning flush — one per ET date, any time >= 7am.
+                # Catches up if gateway was offline during the 7am tick.
+                if et_hour >= 7 and last_flush_date != today_et:
                     for sub in _registry.subscribers:
                         if isinstance(sub, WhatsAppEscalator):
                             try:
