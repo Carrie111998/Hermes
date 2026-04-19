@@ -330,20 +330,29 @@ class WhatsAppEscalator(BaseSubscriber):
         """Flush pending throttle buffer and queue on shutdown."""
         self._flush_throttle_buffer()
 
-    def _deliver(self, message: str) -> None:
-        """Send message via WhatsApp."""
+    def _deliver(self, message: str) -> bool:
+        """Send message via WhatsApp.  Returns True on success, False on failure."""
         if self._send_fn:
-            self._send_fn(message)
-            return
+            try:
+                self._send_fn(message)
+                return True
+            except Exception as e:
+                logger.error("WhatsApp delivery failed (send_fn): %s", e)
+                return False
         try:
             from cron.scheduler import _deliver_result
-            _deliver_result(
+            err = _deliver_result(
                 {"deliver": "whatsapp", "id": "event-bus", "name": "event-bus"},
                 message,
                 skip_cron_framing=True,
             )
+            if err:
+                logger.warning("WhatsApp delivery failed: %s", err)
+                return False
+            return True
         except Exception as e:
             logger.error("WhatsApp delivery failed: %s", e)
+            return False
 
     def _queue_message(self, message: str) -> None:
         """Queue message for morning flush."""
@@ -361,7 +370,13 @@ class WhatsAppEscalator(BaseSubscriber):
         self._queue_path.write_text(json.dumps(queue, indent=2), encoding="utf-8")
 
     def flush_queue(self) -> int:
-        """Flush queued messages as overnight summary.  Returns count flushed."""
+        """Flush queued messages as overnight summary.  Returns count flushed.
+
+        Only clears the queue when delivery succeeds.  If the bridge is
+        unreachable or the target cannot be resolved (e.g. missing
+        WHATSAPP_HOME_CHANNEL), the queue is preserved so the next flush
+        attempt can retry — otherwise queued alerts would be silently lost.
+        """
         if not self._queue_path.exists():
             return 0
         try:
@@ -376,6 +391,12 @@ class WhatsAppEscalator(BaseSubscriber):
         summary += "\n\n".join(f"- {m}" for m in messages)
         summary += "\n\nDetails in Telegram"
 
-        self._deliver(summary)
+        delivered = self._deliver(summary)
+        if not delivered:
+            logger.warning(
+                "WhatsApp flush_queue: delivery failed, preserving %d queued messages",
+                len(queue),
+            )
+            return 0
         self._queue_path.write_text("[]", encoding="utf-8")
         return len(queue)
