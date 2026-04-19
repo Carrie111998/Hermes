@@ -44,6 +44,7 @@ class EventType(Enum):
     CRON_COMPLETED = ("cron_completed", Priority.NORMAL)
     CRON_FAILED = ("cron_failed", Priority.HIGH)
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL)
+    CRON_STALE = ("cron_stale", Priority.HIGH)
 
     # Job discovery & scoring
     JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)
@@ -71,6 +72,9 @@ class EventType(Enum):
     MEMORY_CONSOLIDATED = ("memory_consolidated", Priority.LOW)
     SKILL_EVOLVED = ("skill_evolved", Priority.LOW)
     MAILBOX_MESSAGE = ("mailbox_message", Priority.LOW)
+
+    # Security
+    SECRET_DETECTED = ("secret_detected", Priority.HIGH)
 
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string

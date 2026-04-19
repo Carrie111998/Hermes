@@ -26,6 +26,7 @@ from events.subscribers.digest_composer import DigestComposer, DIGEST_SCHEDULE_H
 from events.subscribers.memory_writer import MemoryWriter
 from events.subscribers.telegram_mirror import TelegramMirror
 from events.subscribers.mailbox_translator import MailboxTranslator
+from events.subscribers.cron_stale_monitor import CronStaleMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(MemoryWriter(_bus))
     _registry.register(TelegramMirror(_bus))
     _registry.register(MailboxTranslator(_bus))
+    _registry.register(CronStaleMonitor(_bus))
 
     _registry.startup_all()
 

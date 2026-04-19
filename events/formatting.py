@@ -25,6 +25,7 @@ EVENT_TYPE_EMOJI = {
     EventType.CRON_COMPLETED:           "✔️",
     EventType.CRON_FAILED:              "💥",
     EventType.CRON_FAILED_CONSECUTIVE:  "🔥",
+    EventType.CRON_STALE:               "⌛",
     EventType.JOB_DISCOVERED:           "🎯",
     EventType.JOB_SCORED:               "📊",
     EventType.JOB_HIGH_SCORE:           "⭐",

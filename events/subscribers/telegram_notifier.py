@@ -28,6 +28,7 @@ TOPIC_ROUTING: Dict[str, str] = {
     "interview_signal": "alerts",
     "offer_signal": "alerts",
     "cron_failed_consecutive": "alerts",
+    "cron_stale": "alerts",
     "gateway_health": "alerts",
     # Scout
     "job_discovered": "scout",
