@@ -246,3 +246,21 @@ class TestScopedLocks:
 
         status.release_scoped_lock("telegram-bot-token", "secret")
         assert not lock_path.exists()
+
+
+class TestPidExists:
+    """Covers the cross-platform liveness probe.  On Windows this MUST NOT
+    go through os.kill(pid, 0), which Python routes to TerminateProcess and
+    would silently kill the target rather than probe it."""
+
+    def test_returns_true_for_own_pid(self):
+        assert status.pid_exists(os.getpid()) is True
+
+    def test_returns_false_for_unused_high_pid(self):
+        # PIDs above 2**22 are effectively never allocated on POSIX/Windows.
+        assert status.pid_exists(2**30 - 1) is False
+
+    def test_legacy_underscore_alias_still_works(self):
+        # gateway/status.py:460 and callers in this repo still use the
+        # leading-underscore name; the alias keeps them working.
+        assert status._pid_exists is status.pid_exists

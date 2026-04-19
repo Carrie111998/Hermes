@@ -29,11 +29,15 @@ _IS_WINDOWS = sys.platform == "win32"
 _UNSET = object()
 
 
-def _pid_exists(pid: int) -> bool:
+def pid_exists(pid: int) -> bool:
     """Check whether a process with the given PID is alive.
 
-    On Windows, ``os.kill(pid, 0)`` is unreliable (raises SystemError on
-    some Python builds).  Use ``tasklist`` as a robust fallback.
+    Cross-platform.  On POSIX uses ``os.kill(pid, 0)`` (the standard
+    existence probe).  On Windows ``os.kill(pid, 0)`` is actively dangerous
+    — Python's Windows implementation of ``os.kill`` routes any signal other
+    than ``CTRL_C_EVENT`` / ``CTRL_BREAK_EVENT`` through ``TerminateProcess``,
+    so passing ``0`` would kill the target process with exit code 0 rather
+    than probe it.  Use ``tasklist`` as a robust Windows fallback.
     """
     if _IS_WINDOWS:
         try:
@@ -49,6 +53,9 @@ def _pid_exists(pid: int) -> bool:
         return True
     except (ProcessLookupError, PermissionError, OSError):
         return False
+
+
+_pid_exists = pid_exists  # internal alias kept for backward compatibility
 
 
 def _get_pid_path() -> Path:

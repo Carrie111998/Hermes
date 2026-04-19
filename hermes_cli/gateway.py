@@ -14,7 +14,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
-from gateway.status import terminate_pid
+from gateway.status import pid_exists, terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
@@ -341,14 +341,14 @@ def stop_profile_gateway() -> bool:
         print(f"⚠ Permission denied to kill PID {pid}")
         return False
 
-    # Wait briefly for it to exit
+    # Wait briefly for it to exit.  Must use pid_exists() rather than
+    # os.kill(pid, 0): on Windows the latter calls TerminateProcess and
+    # would nuke any live process that happens to sit at this PID.
     import time as _time
     for _ in range(20):
-        try:
-            os.kill(pid, 0)
-            _time.sleep(0.5)
-        except (ProcessLookupError, PermissionError):
+        if not pid_exists(pid):
             break
+        _time.sleep(0.5)
 
     remove_pid_file()
     return True
@@ -1179,11 +1179,9 @@ def systemd_restart(system: bool = False):
         print(f"⏳ {scope_label} service draining active work...")
         deadline = time.time() + 90
         while time.time() < deadline:
-            try:
-                os.kill(pid, 0)
-                time.sleep(1)
-            except (ProcessLookupError, PermissionError):
+            if not pid_exists(pid):
                 break  # old process is gone
+            time.sleep(1)
         else:
             print(f"⚠ Old process (PID {pid}) still alive after 90s")
 
