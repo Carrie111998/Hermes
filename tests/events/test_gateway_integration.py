@@ -13,42 +13,78 @@ SCHEDULE = [8, 13, 18]
 
 class TestPickDigestTarget:
     """Covers the digest-hour catch-up decision used by the subscriber poll
-    loop.  Regression shield against the 2026-04-19 ``et_hour == 7``
-    equality check that silently skipped any digest whose scheduled hour
-    the gateway happened to be offline for."""
+    loop.
+
+    First-and-latest semantics (2026-04-19): returns ONE key per call,
+    preferring the first missed scheduled hour of today so the morning
+    overnight summary never gets lost after an outage, then the latest
+    missed hour on the next tick once the first has fired.  Middle hours
+    are skipped by design.
+
+    Regression shield against two distinct bugs:
+      1. The legacy ``et_hour == 7`` equality check that silently skipped
+         any digest whose scheduled hour the gateway was offline for.
+      2. The 2026-04-19 "latest-only" rule that permanently dropped the
+         morning overnight summary after a mid-day restart.
+    """
 
     def test_no_applicable_hour_returns_none(self):
         # 5am ET — before the first scheduled hour today
-        assert gi._pick_digest_target(5, "2026-04-19", "", SCHEDULE) is None
+        assert gi._pick_digest_target(5, "2026-04-19", set(), SCHEDULE) is None
 
-    def test_first_fire_of_the_day_returns_key(self):
-        assert gi._pick_digest_target(8, "2026-04-19", "", SCHEDULE) == "2026-04-19-08"
+    def test_first_fire_of_the_day_returns_first_key(self):
+        assert gi._pick_digest_target(8, "2026-04-19", set(), SCHEDULE) == "2026-04-19-08"
 
     def test_same_hour_already_fired_returns_none(self):
-        assert gi._pick_digest_target(8, "2026-04-19", "2026-04-19-08", SCHEDULE) is None
+        assert gi._pick_digest_target(8, "2026-04-19", {"2026-04-19-08"}, SCHEDULE) is None
 
-    def test_later_hour_catchup_fires_latest_only(self):
-        # 1pm ET, gateway just came up, never fired today — fire 13 only,
-        # NOT 8 too.  Back-to-back catch-up digests would be noise.
-        assert gi._pick_digest_target(13, "2026-04-19", "", SCHEDULE) == "2026-04-19-13"
+    def test_first_unfired_preferred_over_latest(self):
+        # 1pm ET, none fired today.  First-and-latest: fire the first (8am)
+        # FIRST so the morning overnight summary is preserved — NOT the
+        # latest (13h).  The next tick will fire the latest once this one
+        # has landed in fired_keys.
+        assert gi._pick_digest_target(13, "2026-04-19", set(), SCHEDULE) == "2026-04-19-08"
+
+    def test_after_first_fired_latest_is_returned(self):
+        # Previous tick caught up the 8am digest; this tick fires the latest.
+        assert gi._pick_digest_target(
+            13, "2026-04-19", {"2026-04-19-08"}, SCHEDULE,
+        ) == "2026-04-19-13"
+
+    def test_first_and_latest_both_fired_returns_none(self):
+        # Both done for today — nothing to fire until tomorrow.
+        assert gi._pick_digest_target(
+            18, "2026-04-19", {"2026-04-19-08", "2026-04-19-18"}, SCHEDULE,
+        ) is None
+
+    def test_middle_hour_is_skipped_when_first_fired(self):
+        # At 20h with only 8 fired, fire 18 next — NOT 13.  The middle hour
+        # is permanently skipped: the latest digest's pipeline snapshot
+        # covers current state better than a stale middle-of-day replay.
+        assert gi._pick_digest_target(
+            20, "2026-04-19", {"2026-04-19-08"}, SCHEDULE,
+        ) == "2026-04-19-18"
 
     def test_next_day_same_hour_re_fires(self):
-        # Yesterday's 8am key must not suppress today's 8am.  This is why
-        # the key is date-qualified, not a bare int hour.
-        assert gi._pick_digest_target(8, "2026-04-20", "2026-04-19-08", SCHEDULE) == "2026-04-20-08"
+        # Yesterday's 8am key must not suppress today's 8am.  Caller prunes
+        # fired_keys to today-only before passing in; this asserts that if
+        # the set is empty for today, we fire normally.
+        assert gi._pick_digest_target(8, "2026-04-20", set(), SCHEDULE) == "2026-04-20-08"
 
-    def test_gateway_offline_all_day_fires_latest_at_night(self):
-        # Came up at 20h — latest applicable is 18h.  This is the canonical
-        # catch-up scenario from the 2026-04-19 incident.
-        assert gi._pick_digest_target(20, "2026-04-19", "", SCHEDULE) == "2026-04-19-18"
+    def test_gateway_offline_all_day_catchup_fires_first_first(self):
+        # Came up at 20h with nothing fired — fire 8 first (morning overnight
+        # summary).  The next tick will fire 18 (latest).  The middle 13 is
+        # permanently skipped.  This is the canonical catch-up scenario from
+        # the 2026-04-19 morning-digest-loss incident.
+        assert gi._pick_digest_target(20, "2026-04-19", set(), SCHEDULE) == "2026-04-19-08"
 
     def test_uses_module_default_schedule_when_arg_omitted(self):
         # Sanity: confirm the helper wires DIGEST_SCHEDULE_HOURS when the
         # caller doesn't pass schedule_hours — the poll loop relies on this.
         from events.subscribers.digest_composer import DIGEST_SCHEDULE_HOURS
-        latest_scheduled = max(DIGEST_SCHEDULE_HOURS)
-        assert gi._pick_digest_target(latest_scheduled, "2026-04-19", "") == \
-            f"2026-04-19-{latest_scheduled:02d}"
+        first_scheduled = sorted(DIGEST_SCHEDULE_HOURS)[0]
+        assert gi._pick_digest_target(first_scheduled, "2026-04-19", set()) == \
+            f"2026-04-19-{first_scheduled:02d}"
 
 
 def test_mailbox_translator_registered_at_startup():

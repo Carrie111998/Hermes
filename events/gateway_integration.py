@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from events.bus import EventBus
 from events.paths import (
@@ -273,29 +273,43 @@ def _emit_poll_loop_error(consecutive_errors: int) -> None:
 def _pick_digest_target(
     et_hour: int,
     today_et: str,
-    last_digest_key: str,
+    fired_keys: Set[str],
     schedule_hours=None,
 ) -> Optional[str]:
-    """Return the YYYY-MM-DD-HH digest key to fire now, or None.
+    """Return the next digest key to fire, or None.
 
-    Catch-up semantics: picks the *latest* scheduled hour that is ``<=``
-    ``et_hour`` today, and fires if its date-qualified key differs from
-    ``last_digest_key``.  Returns None when no scheduled hour has yet
-    arrived today, or when the picked hour's key was already fired.
+    **First-and-latest semantics (2026-04-19 fix):** return the *first*
+    missed scheduled hour of today if it hasn't fired yet, otherwise the
+    *latest* missed scheduled hour.  Middle hours are skipped — the
+    latest digest's pipeline snapshot already covers current state, and
+    the first digest preserves the unique overnight-summary content.
 
-    Why latest-only rather than every-missed-hour: back-to-back catch-up
-    after a long outage would dump multiple near-identical digests into
-    the feed.  The user prefers a single current summary — the missed
-    events are already durable in the event bus for retrospection.
+    One key per call — the poll loop's sub-second cadence naturally
+    sequences first-then-latest across successive ticks.  Firing both in
+    the same tick would produce an empty second digest because
+    ``DigestComposer.compose()`` advances ``self._last_digest_at`` after
+    every call and uses it as the window's lower bound.
+
+    Regression shield against the 2026-04-19 morning-digest loss: the
+    previous "latest-only" rule silently skipped the 7:00 ET overnight
+    summary when the gateway happened to be offline during that hour.
     """
-    hours = schedule_hours if schedule_hours is not None else DIGEST_SCHEDULE_HOURS
+    hours = sorted(schedule_hours if schedule_hours is not None else DIGEST_SCHEDULE_HOURS)
     applicable = [h for h in hours if h <= et_hour]
     if not applicable:
         return None
-    target_key = f"{today_et}-{max(applicable):02d}"
-    if target_key == last_digest_key:
-        return None
-    return target_key
+
+    first_hour = applicable[0]
+    latest_hour = applicable[-1]
+
+    first_key = f"{today_et}-{first_hour:02d}"
+    latest_key = f"{today_et}-{latest_hour:02d}"
+
+    if first_key not in fired_keys:
+        return first_key
+    if latest_key != first_key and latest_key not in fired_keys:
+        return latest_key
+    return None
 
 
 def _subscriber_poll_loop() -> None:
@@ -317,12 +331,16 @@ def _subscriber_poll_loop() -> None:
     last_heartbeat: float = 0
     last_batch_flush: float = 0
     _state = load_state(digest_state_path(), default={})
-    # last_digest_key encodes "YYYY-MM-DD-HH" of the most-recent digest fired.
-    # Replaces the legacy int-hour key so we can catch up after a missed
-    # window (e.g., gateway offline during the entire 8am hour).  The old
-    # "last_digest_hour" key is ignored on migration — worst case we fire one
-    # duplicate digest on first post-upgrade startup.
-    last_digest_key: str = _state.get("last_digest_key", "")
+    # ``fired_digest_keys`` is a list of YYYY-MM-DD-HH keys fired today.
+    # Migrated from the legacy scalar ``last_digest_key`` on first post-
+    # upgrade start: the legacy value is seeded into the set so we don't
+    # re-fire the most recent digest.  Worst case if legacy_key was from a
+    # prior day: one duplicate digest, auto-pruned on the next tick when
+    # we filter to today's date prefix.
+    _legacy_digest_key = _state.get("last_digest_key", "")
+    fired_digest_keys: List[str] = list(_state.get("fired_digest_keys", []))
+    if _legacy_digest_key and _legacy_digest_key not in fired_digest_keys:
+        fired_digest_keys.append(_legacy_digest_key)
     _flush_state = load_state(whatsapp_flush_state_path(), default={})
     last_flush_date: str = _flush_state.get("last_flush_date", "")
     lag_alerts_sent: Dict[str, float] = {}  # subscriber_id -> monotonic timestamp
@@ -358,11 +376,17 @@ def _subscriber_poll_loop() -> None:
                 et_hour = _now_et.hour
                 today_et = _now_et.date().isoformat()
 
-                # Digest catch-up: fire once per scheduled hour per day.
-                # See _pick_digest_target() for the semantics (latest missed
-                # hour only, date-qualified key so same-hour-next-day still
-                # fires, worst case one duplicate on first post-upgrade run).
-                target_key = _pick_digest_target(et_hour, today_et, last_digest_key)
+                # Digest catch-up: fire one digest per tick using first-and-
+                # latest semantics — if the first scheduled hour of today
+                # hasn't fired yet, fire it now (preserves the morning
+                # overnight summary); otherwise fire the latest scheduled
+                # hour that hasn't fired (current state).  Middle hours are
+                # skipped.  See ``_pick_digest_target`` for why this returns
+                # one key per call rather than a list.
+                # Prune fired_digest_keys to today-only so yesterday's keys
+                # cannot block today's first/latest fires.
+                fired_digest_keys = [k for k in fired_digest_keys if k.startswith(today_et)]
+                target_key = _pick_digest_target(et_hour, today_et, set(fired_digest_keys))
                 if target_key is not None:
                     for sub in _registry.subscribers:
                         if isinstance(sub, DigestComposer):
@@ -374,8 +398,12 @@ def _subscriber_poll_loop() -> None:
                                 )
                             except Exception:
                                 logger.exception("Digest compose failed")
-                    last_digest_key = target_key
-                    _state["last_digest_key"] = target_key
+                    fired_digest_keys.append(target_key)
+                    _state["fired_digest_keys"] = fired_digest_keys
+                    # Retire the legacy single-key field once we've committed
+                    # to the new multi-key format.  Safe: the migration on
+                    # startup already copied it into fired_digest_keys.
+                    _state.pop("last_digest_key", None)
                     try:
                         save_state(digest_state_path(), _state)
                     except Exception:
