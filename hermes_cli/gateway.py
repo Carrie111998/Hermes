@@ -171,6 +171,16 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
     """
     _exclude = exclude_pids or set()
     pids = [pid for pid in _get_service_pids() if pid not in _exclude]
+
+    if not all_profiles:
+        try:
+            from gateway.status import get_running_pid, pid_exists
+            _pid_from_file = get_running_pid()
+            if _pid_from_file and pid_exists(_pid_from_file) and _pid_from_file not in _exclude and _pid_from_file not in pids:
+                pids.append(_pid_from_file)
+        except ImportError:
+            pass
+
     patterns = [
         "hermes_cli.main gateway",
         "hermes_cli.main --profile",
@@ -179,6 +189,8 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
         "hermes_cli/main.py --profile",
         "hermes_cli/main.py -p",
         "hermes gateway",
+        "hermes.exe\" gateway",
+        "hermes.exe gateway",
         "gateway/run.py",
     ]
     current_home = str(get_hermes_home().resolve())
