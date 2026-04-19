@@ -44,6 +44,13 @@ EVENT_TYPE_EMOJI = {
     EventType.MEMORY_CONSOLIDATED:      "🧠",
     EventType.SKILL_EVOLVED:            "🚀",
     EventType.MAILBOX_MESSAGE:          "📨",
+    # SR-001 secret scanner (fork-patch carried alongside SECRET_DETECTED enum +
+    # TOPIC_ROUTING entry). Padlock chosen because (a) no existing icon conflicts,
+    # (b) operators scanning the Security topic need a distinct visual hook
+    # separate from the generic HIGH dot. Added 2026-04-19 per SR-408 post-
+    # flood remediation — without this entry event_icon() returned "" and the
+    # header rendered with a double-space gap that swam in a noisy feed.
+    EventType.SECRET_DETECTED:          "🔐",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

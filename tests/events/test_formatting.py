@@ -39,6 +39,21 @@ def test_event_icon_falls_back_to_mailbox_generic_for_unknown_inner():
     assert event_icon(e) == "📨"
 
 
+def test_event_icon_for_secret_detected_is_padlock():
+    """SR-408 regression (2026-04-19): SECRET_DETECTED must have a distinct
+    icon. Before the fix, the missing EVENT_TYPE_EMOJI entry made event_icon()
+    return "" — headers rendered as "🟠  SECRET_DETECTED — …" (double space,
+    no visual hook) which operators scanning a chat flood could not
+    disambiguate from generic HIGH events. The padlock 🔐 is the scan token.
+    """
+    e = _make_event(EventType.SECRET_DETECTED,
+                    payload={"rule_id": "aws-access-token",
+                             "file_path": "C:/Users/diego/.env",
+                             "line_no": 5,
+                             "match_preview": "AKIA****XYZ1234"})
+    assert event_icon(e) == "🔐"
+
+
 def test_format_header_for_agent_error():
     e = _make_event(EventType.AGENT_ERROR, source="mailbox:sentinel")
     assert format_header(e) == "🟠 ⚠️ AGENT_ERROR — mailbox:sentinel · 05:02 UTC"
