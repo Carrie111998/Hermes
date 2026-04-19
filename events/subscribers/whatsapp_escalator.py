@@ -8,10 +8,11 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
@@ -48,7 +49,9 @@ _TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
     EventType.APPLICATION_BLOCKED: EscalationTier.URGENT,
     EventType.APPLICATION_FAILED: EscalationTier.URGENT,
     EventType.CRON_FAILED_CONSECUTIVE: EscalationTier.URGENT,
+    EventType.AGENT_ERROR: EscalationTier.URGENT,
     # GATEWAY_HEALTH is conditional (only down) — handled in classify_tier
+    # AGENT_ERROR escalation is gated by cluster threshold — see should_escalate()
     # Important
     EventType.APPLICATION_READY: EscalationTier.IMPORTANT,
     EventType.FOLLOWUP_DUE: EscalationTier.IMPORTANT,
@@ -56,6 +59,12 @@ _TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
 }
 
 HIGH_SCORE_WA_THRESHOLD = 9.0
+
+# Sustained-failure window for agent_error events. Isolated agent_errors stay
+# digest-only (avoids flooding WhatsApp); only a cluster (>= threshold in window)
+# escalates as URGENT so the user sees a real outage.
+AGENT_ERROR_WINDOW_SECONDS = 900
+AGENT_ERROR_CLUSTER_THRESHOLD = 3
 
 
 def classify_tier(event: Event) -> Optional[EscalationTier]:
@@ -118,6 +127,9 @@ class WhatsAppEscalator(BaseSubscriber):
         self._daily_send_count: int = 0
         self._daily_reset_date: Optional[str] = None
 
+        # Sustained-failure tracking for agent_error clustering
+        self._agent_error_times: Deque[float] = deque()
+
     # Sensible defaults used whenever the config file is missing or
     # malformed.  Matching the spec: 23:00-07:00 ET, interview/offer
     # signals break through.
@@ -150,8 +162,26 @@ class WhatsAppEscalator(BaseSubscriber):
 
         Delegates to classify_tier() — an event escalates iff it maps to
         a non-None tier (Immediate / Urgent / Important).
+
+        agent_error has cluster-aware logic: a single isolated error is
+        noise (stays digest-only), but a burst (>= threshold within the
+        window) is a real outage and escalates as URGENT.
         """
+        if event.event_type == EventType.AGENT_ERROR:
+            return self._agent_error_cluster_triggered()
         return classify_tier(event) is not None
+
+    def _agent_error_cluster_triggered(self) -> bool:
+        """Track agent_error timestamps and decide whether a cluster
+        threshold has been crossed. Called on each agent_error arrival.
+        """
+        now = time.monotonic()
+        self._agent_error_times.append(now)
+        # Drop entries outside the window
+        cutoff = now - AGENT_ERROR_WINDOW_SECONDS
+        while self._agent_error_times and self._agent_error_times[0] < cutoff:
+            self._agent_error_times.popleft()
+        return len(self._agent_error_times) >= AGENT_ERROR_CLUSTER_THRESHOLD
 
     def should_deliver_now(self, event: Event) -> bool:
         """Check if event should be delivered now vs queued for morning.
@@ -267,6 +297,14 @@ class WhatsAppEscalator(BaseSubscriber):
             text = f"Gateway {p.get('platform', '?')} is DOWN. {p.get('detail', '')}"
         elif et == EventType.FOLLOWUP_DUE:
             text = f"Follow-up due for {p.get('company', '?')} — {p.get('days', 14)}+ days no response"
+        elif et == EventType.AGENT_ERROR:
+            count = len(self._agent_error_times)
+            source_agent = p.get("source_agent") or p.get("source", "?")
+            msg = p.get("message") or p.get("error", "agent error")
+            text = (
+                f"{count} agent errors in last 15 min. Latest: {source_agent}: "
+                f"{str(msg)[:140]}"
+            )
         else:
             text = f"{et.type_string}: {json.dumps(p)[:200]}"
 

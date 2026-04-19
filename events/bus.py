@@ -209,8 +209,10 @@ class EventBus:
             params.extend(valid)
 
         where = " AND ".join(conditions)
+        # Cap per-poll batch so a flood can be drained incrementally instead of
+        # failing outright. Anything beyond this is picked up on the next poll.
         rows = conn.execute(
-            f"SELECT * FROM events WHERE {where} ORDER BY rowid ASC",
+            f"SELECT * FROM events WHERE {where} ORDER BY rowid ASC LIMIT 2000",
             params,
         ).fetchall()
 
@@ -223,20 +225,29 @@ class EventBus:
         """
         if not event_ids:
             return
+        # SQLite caps parameters at 32766 (SQLITE_LIMIT_VARIABLE_NUMBER). Chunk
+        # conservatively so a backlog drain never raises "too many SQL variables".
+        CHUNK = 500
         conn = self._get_conn()
-        placeholders = ",".join("?" for _ in event_ids)
-        row = conn.execute(
-            f"SELECT MAX(rowid) as max_rowid FROM events WHERE event_id IN ({placeholders})",
-            event_ids,
-        ).fetchone()
-        if row and row["max_rowid"] is not None:
+        max_rowid: Optional[int] = None
+        for start in range(0, len(event_ids), CHUNK):
+            batch = event_ids[start:start + CHUNK]
+            placeholders = ",".join("?" for _ in batch)
+            row = conn.execute(
+                f"SELECT MAX(rowid) as max_rowid FROM events WHERE event_id IN ({placeholders})",
+                batch,
+            ).fetchone()
+            if row and row["max_rowid"] is not None:
+                if max_rowid is None or row["max_rowid"] > max_rowid:
+                    max_rowid = row["max_rowid"]
+        if max_rowid is not None:
             self._execute(
                 """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
                    VALUES (?, ?, datetime('now'))
                    ON CONFLICT(subscriber_id)
                    DO UPDATE SET last_rowid = excluded.last_rowid,
                                 updated_at = excluded.updated_at""",
-                (subscriber_id, row["max_rowid"]),
+                (subscriber_id, max_rowid),
             )
 
     def query(

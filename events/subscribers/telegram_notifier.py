@@ -131,6 +131,18 @@ class TelegramNotifier(BaseSubscriber):
         # Hot-reload verbosity config on each cycle (spec: hot-reloadable)
         self._reload_verbosity()
 
+        # Infrastructure noise: lag alerts about the bus itself become a feedback
+        # loop (digest -> agent_error -> digest). Suppress them from chat; they
+        # remain in the bus for audit-logger and the gateway log.
+        if (event.event_type == EventType.AGENT_ERROR
+                and event.source == "event-bus"):
+            return
+
+        # secret_detected volume is unbounded when the scanner runs; route via
+        # audit-logger only. A daily rollup is handled by the digest.
+        if event.event_type.type_string == "secret_detected":
+            return
+
         if not self.group_chat_id or not self.topics:
             self._load_config()
             if not self.group_chat_id:

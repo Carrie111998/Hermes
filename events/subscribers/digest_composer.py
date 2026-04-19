@@ -194,7 +194,9 @@ class DigestComposer(BaseSubscriber):
             logger.error("DigestComposer: Telegram delivery failed: %s", e)
 
     def _deliver_whatsapp(self, digest: str, events: List[Event]) -> None:
-        """Deliver condensed morning digest to WhatsApp."""
+        """Deliver condensed morning digest to WhatsApp using the shared
+        event protocol (priority dot + 📝 icon + source + timestamp header).
+        """
         # Build condensed version: highlights + action items only
         action_items = []
         highlights = []
@@ -206,14 +208,27 @@ class DigestComposer(BaseSubscriber):
             elif e.event_type == EventType.JOB_HIGH_SCORE:
                 highlights.append(f"{e.payload.get('title', '?')} @ {e.payload.get('company', '?')} ({e.payload.get('score', '?')})")
 
-        lines = [f"Morning Digest — {len(events)} events overnight"]
+        body_lines = [f"{len(events)} events overnight"]
         if highlights:
-            lines.append("\nHigh scores: " + "; ".join(highlights[:3]))
+            body_lines.append("High scores: " + "; ".join(highlights[:3]))
         if action_items:
-            lines.append("\nAction needed: " + "; ".join(action_items[:3]))
-        lines.append("\nFull details in Telegram")
+            body_lines.append("Action needed: " + "; ".join(action_items[:3]))
+        body_lines.append("Full details in Telegram")
+        body = "\n".join(body_lines)
 
-        condensed = "\n".join(lines)
+        # Wrap with the shared protocol header so WhatsApp matches Telegram.
+        # Build a lightweight DIGEST_GENERATED pseudo-event for formatting.
+        from events.formatting import format_whatsapp_message
+        from datetime import datetime, timezone
+        pseudo_event = Event(
+            event_id="digest",
+            event_type=EventType.DIGEST_GENERATED,
+            source="digest-composer",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            priority=Priority.LOW,
+            payload={"period": self._get_period_label(), "event_count": len(events)},
+        )
+        condensed = format_whatsapp_message(pseudo_event, body)
 
         if self._send_whatsapp_fn:
             try:
@@ -241,7 +256,8 @@ class DigestComposer(BaseSubscriber):
         source_counts: Counter = Counter()
         action_items: List[str] = []
         highlights: List[str] = []
-        errors: List[str] = []
+        error_groups: Counter = Counter()
+        eventbus_worst_lag: Dict[str, int] = {}
 
         for e in events:
             type_counts[e.event_type] += 1
@@ -274,7 +290,16 @@ class DigestComposer(BaseSubscriber):
                 )
 
             if e.event_type in (EventType.CRON_FAILED, EventType.CRON_FAILED_CONSECUTIVE, EventType.AGENT_ERROR):
-                errors.append(f"{e.source}: {e.payload.get('error', 'unknown')[:100]}")
+                # Dedupe event-bus lag alerts: track max lag per subscriber,
+                # drop the row-by-row "Subscriber X is N behind" spam.
+                if e.source == "event-bus" and e.event_type == EventType.AGENT_ERROR:
+                    sub_id = e.payload.get("subscriber_id", "?")
+                    lag = e.payload.get("lag", 0)
+                    if lag > eventbus_worst_lag.get(sub_id, 0):
+                        eventbus_worst_lag[sub_id] = lag
+                    continue
+                key = f"{e.source}: {(e.payload.get('error') or 'unknown')[:100]}"
+                error_groups[key] += 1
 
         # Build digest
         lines = [f"HERMES DIGEST — {period} / {now_str}", ""]
@@ -322,14 +347,25 @@ class DigestComposer(BaseSubscriber):
                 lines.append(f"  -> {item}")
 
         # Errors
-        if errors:
-            lines.append("")
-            lines.append("SYSTEM HEALTH")
-            for err in errors:
-                lines.append(f"  ! {err}")
-        else:
-            lines.append("")
-            lines.append("SYSTEM HEALTH")
+        lines.append("")
+        lines.append("SYSTEM HEALTH")
+        if eventbus_worst_lag:
+            worst_sub = max(eventbus_worst_lag, key=eventbus_worst_lag.get)
+            worst_lag = eventbus_worst_lag[worst_sub]
+            n_subs = len(eventbus_worst_lag)
+            lines.append(
+                f"  ! event-bus: {n_subs} subscribers fell behind "
+                f"(worst: {worst_sub} {worst_lag} events)"
+            )
+        if error_groups:
+            # Show at most 5 distinct errors, collapsed by (source, error-prefix)
+            for (key, count) in error_groups.most_common(5):
+                suffix = f" (x{count})" if count > 1 else ""
+                lines.append(f"  ! {key}{suffix}")
+            extra = len(error_groups) - 5
+            if extra > 0:
+                lines.append(f"  ! (+{extra} other distinct errors)")
+        if not eventbus_worst_lag and not error_groups:
             cron_ok = type_counts.get(EventType.CRON_COMPLETED, 0)
             lines.append(f"  {cron_ok} cron jobs completed OK")
 
