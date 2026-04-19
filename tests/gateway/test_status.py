@@ -19,6 +19,37 @@ class TestGatewayPidState:
         assert isinstance(payload["argv"], list)
         assert payload["argv"]
 
+    def test_verify_pid_file_matches_self_true_after_write(self, tmp_path, monkeypatch):
+        """After write_pid_file(), verify should confirm the file matches self."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status.write_pid_file()
+        assert status.verify_pid_file_matches_self() is True
+
+    def test_verify_pid_file_matches_self_false_when_file_missing(self, tmp_path, monkeypatch):
+        """No file → verify returns False (nothing to match against)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert status.verify_pid_file_matches_self() is False
+
+    def test_verify_pid_file_matches_self_false_when_pid_mismatch(self, tmp_path, monkeypatch):
+        """File contains a different PID → verify returns False (the core
+        diagnostic case — lets the gateway self-heal after the observed
+        2026-04-19 bug where some intermediate process wrote a stray PID)."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway.pid").write_text(json.dumps({
+            "pid": os.getpid() + 1,  # intentionally NOT self
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+            "start_time": None,
+        }))
+        assert status.verify_pid_file_matches_self() is False
+
+    def test_verify_pid_file_matches_self_false_on_malformed_file(self, tmp_path, monkeypatch):
+        """Malformed PID file → verify returns False (treated as mismatch,
+        so the caller can re-assert by calling write_pid_file()."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "gateway.pid").write_text("not-json-at-all")
+        assert status.verify_pid_file_matches_self() is False
+
     def test_get_running_pid_rejects_live_non_gateway_pid(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         pid_path = tmp_path / "gateway.pid"

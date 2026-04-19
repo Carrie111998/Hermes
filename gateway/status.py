@@ -13,6 +13,7 @@ concurrently under distinct configurations).
 
 import hashlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -21,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
@@ -243,7 +246,41 @@ def _read_pid_record() -> Optional[dict]:
 
 def write_pid_file() -> None:
     """Write the current process PID and metadata to the gateway PID file."""
-    _write_json_file(_get_pid_path(), _build_pid_record())
+    record = _build_pid_record()
+    _write_json_file(_get_pid_path(), record)
+    # 2026-04-19 diagnostic: observed case where the file ended up with a
+    # PID different from the live gateway (bound to the gateway port).
+    # Logging the written PID on every call lets us correlate with process
+    # creation events next time the bug reproduces.  Root cause suspected
+    # to be an import side-effect in a cron-worker subprocess, unconfirmed.
+    logger.info(
+        "gateway.pid written: pid=%d argv=%r path=%s",
+        record["pid"], record["argv"], _get_pid_path(),
+    )
+
+
+def verify_pid_file_matches_self() -> bool:
+    """Return True if the PID file contains this process's PID.
+
+    Defensive check added 2026-04-19 after observing a mismatch (PID file
+    held a dead PID while the real gateway was a different live PID).
+    Callers can use this to detect and self-heal:
+
+        if not verify_pid_file_matches_self():
+            write_pid_file()  # re-assert
+
+    Intentionally returns a bool rather than auto-rewriting so callers
+    can decide whether a mismatch is expected (e.g. during --replace
+    handoff) or a bug.
+    """
+    record = _read_pid_record()
+    if record is None:
+        return False
+    try:
+        file_pid = int(record["pid"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return file_pid == os.getpid()
 
 
 def write_runtime_status(
