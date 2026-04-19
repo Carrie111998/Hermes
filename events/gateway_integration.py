@@ -315,6 +315,7 @@ def _subscriber_poll_loop() -> None:
     last_cleanup: float = 0
     last_checkpoint: float = 0
     last_heartbeat: float = 0
+    last_batch_flush: float = 0
     _state = load_state(digest_state_path(), default={})
     # last_digest_key encodes "YYYY-MM-DD-HH" of the most-recent digest fired.
     # Replaces the legacy int-hour key so we can catch up after a missed
@@ -451,6 +452,26 @@ def _subscriber_poll_loop() -> None:
                 except Exception:
                     logger.exception("Heartbeat write failed")
                 last_heartbeat = now
+
+            # TelegramNotifier LOW-priority batch flush every 60 s.  The
+            # subscriber's internal flush is normally triggered from inside
+            # ``handle()`` on the next incoming event — which means on a mostly-
+            # quiet bus, a batched LOW message can sit well past its 300 s
+            # threshold waiting for any other event to arrive.  Driving the
+            # flush from the poll loop here bounds delivery latency at roughly
+            # ``max_age + 60 s`` regardless of bus traffic.  Safe to call
+            # repeatedly: ``_flush_stale_batches`` is a no-op when every
+            # buffered key is younger than ``max_age``.
+            if _registry and now - last_batch_flush >= 60:
+                for sub in _registry.subscribers:
+                    if isinstance(sub, TelegramNotifier):
+                        try:
+                            sub._flush_stale_batches()
+                        except Exception:
+                            logger.exception(
+                                "Batch flush failed for %s", sub.subscriber_id,
+                            )
+                last_batch_flush = now
 
             # Reset consecutive counter after a fully successful tick
             consecutive_outer_errors = 0

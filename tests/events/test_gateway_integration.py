@@ -95,6 +95,44 @@ def test_poll_loop_survives_unexpected_exception_in_body():
         gi.shutdown()
 
 
+def test_poll_loop_flushes_telegram_notifier_batches():
+    """The LOW-priority batch flush must be driven from the poll loop's timer,
+    not only from inside ``TelegramNotifier.handle()``.
+
+    Regression guard against the 2026-04-19 observation that a batched LOW
+    mailbox_message (the smoke-test NOTIFICATION) sat in ``notifier_batch.json``
+    for 10+ minutes past its 300s threshold because no other events arrived to
+    trigger an inner-``handle()`` flush.  On a mostly-quiet bus, users would
+    wait indefinitely for a message the notifier believes is already "batched
+    for up to 5 minutes".
+    """
+    from unittest.mock import MagicMock
+    from events.subscribers.telegram_notifier import TelegramNotifier
+
+    gi.startup()
+    try:
+        notifier = next(
+            s for s in gi._registry.subscribers
+            if isinstance(s, TelegramNotifier)
+        )
+        flush_mock = MagicMock()
+        notifier._flush_stale_batches = flush_mock
+
+        # The first poll-loop tick satisfies ``now - last_batch_flush >= 60``
+        # (last_batch_flush starts at 0, time.monotonic() is always larger),
+        # so the flush fires within the first 1s iteration.  Give it 2s to
+        # absorb scheduling jitter on slow runners.
+        time.sleep(2.0)
+
+        assert flush_mock.called, (
+            "Poll loop did not invoke TelegramNotifier._flush_stale_batches — "
+            "LOW-priority batched messages will sit past their 300s threshold "
+            "until the next incoming event arrives."
+        )
+    finally:
+        gi.shutdown()
+
+
 def test_poll_loop_writes_heartbeat_file():
     """The poll loop must write a heartbeat file so external watchers can
     detect gateway death.
