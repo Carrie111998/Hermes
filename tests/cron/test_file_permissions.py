@@ -3,12 +3,23 @@
 import json
 import os
 import stat
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# POSIX file-mode bits (0700/0600) aren't representable on NTFS — os.stat()
+# returns Windows-translated modes that never match the Unix constants these
+# tests assert.  Skip the whole permission-assertion classes on Windows; the
+# secure_file / secure_dir behavioural tests below remain cross-platform.
+_POSIX_PERMS_ONLY = unittest.skipIf(
+    sys.platform == "win32",
+    "POSIX file-mode bits (0700/0600) not representable on NTFS",
+)
 
+
+@_POSIX_PERMS_ONLY
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""
 
@@ -75,6 +86,7 @@ class TestCronFilePermissions(unittest.TestCase):
             self.assertEqual(dir_mode, 0o700)
 
 
+@_POSIX_PERMS_ONLY
 class TestConfigFilePermissions(unittest.TestCase):
     """Verify config files get secure permissions."""
 
