@@ -1,6 +1,7 @@
 """Tests for events.subscribers.digest_composer — 3x/day structured digests."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -72,7 +73,7 @@ class TestNotifierSnapshotHandshake:
         """When the snapshot has pipeline counts, they appear in the digest body."""
         snap = tmp_path / "digest-data.json"
         snap.write_text(json.dumps({
-            "generated_at": "2026-04-16T11:55:00Z",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "pipeline_snapshot": {
                 "total_active": 42,
                 "by_stage": {
@@ -96,9 +97,9 @@ class TestNotifierSnapshotHandshake:
     def test_snapshot_stale_is_flagged(self, bus, tmp_path):
         """A snapshot older than 24 hours should be noted, not silently used."""
         snap = tmp_path / "digest-data.json"
-        # generated 2 days ago
+        stale_ts = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
         snap.write_text(json.dumps({
-            "generated_at": "2026-04-14T12:00:00Z",
+            "generated_at": stale_ts,
             "pipeline_snapshot": {"total_active": 99},
         }), encoding="utf-8")
 
