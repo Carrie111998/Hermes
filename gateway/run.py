@@ -1755,6 +1755,24 @@ class GatewayRunner:
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        # Record who triggered this start so a mysterious restart is traceable.
+        # Captures parent PID + its name + argv so we can distinguish CLI
+        # invocations (`hermes gateway run`), scheduled tasks, watchdog scripts,
+        # and auto-restart loops.  Best-effort: psutil is optional, fall back
+        # to ``os.getppid()`` alone if it isn't available or fails.
+        try:
+            import psutil as _ps
+            _pp = _ps.Process(os.getppid())
+            _cmdline = " ".join(_pp.cmdline())
+            logger.info(
+                "Gateway triggered by: parent_pid=%s parent_name=%s parent_cmdline=%r",
+                _pp.pid, _pp.name(), _cmdline[:300],
+            )
+        except Exception:
+            logger.info(
+                "Gateway triggered by: parent_pid=%s (psutil unavailable or inspection failed)",
+                os.getppid(),
+            )
         logger.info("Session storage: %s", self.config.sessions_dir)
         try:
             from hermes_cli.profiles import get_active_profile_name
