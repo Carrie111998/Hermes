@@ -364,3 +364,164 @@ class TestSubscriberLagReport:
 
         report = registry.lag_report()
         assert report == {"sub-a": 0, "sub-b": 2}
+
+    def test_lag_report_respects_subscriber_filters(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        registry = SubscriberRegistry()
+
+        filtered = FilteredSubscriber(bus)
+        registry.register(filtered)
+
+        for _ in range(150):
+            bus.emit(EventType.CRON_STARTED, "scout", {})
+
+        assert registry.lag_report() == {"filtered": 0}
+
+        bus.emit(EventType.JOB_HIGH_SCORE, "matcher", {}, priority=Priority.HIGH)
+
+        assert registry.lag_report() == {"filtered": 1}
+
+
+class TestDeadLetterRecording:
+    """SR-109: failed handler invocations must leave a dead-letter row."""
+
+    def test_handler_exception_records_dead_letter(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        rows = bus.get_dead_letters()
+        assert len(rows) == 1
+        assert rows[0]["event_id"] == eid
+        assert rows[0]["subscriber_id"] == "flaky"
+        assert "RuntimeError" in rows[0]["error"]
+        assert "boom" in rows[0]["error"]
+
+    def test_successful_handler_records_no_dead_letter(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        assert bus.get_dead_letters() == []
+
+    def test_repeat_failure_increments_attempts(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        # Two events both fail in separate polls so the cursor advances each time.
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+        # Same event cannot be re-polled (cursor advanced past it), but manual
+        # re-insertion simulates a second subscriber failure on the same event_id.
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {"retry": True})
+        bus.record_dead_letter("flaky", eid, "boom")
+        bus.record_dead_letter("flaky", eid, "boom again")
+
+        rows = bus.get_dead_letters(subscriber_id="flaky")
+        # There should be one entry per (event_id, subscriber) pair.
+        by_event = {r["event_id"]: r for r in rows}
+        assert by_event[eid]["attempts"] == 2
+        assert by_event[eid]["error"] == "boom again"
+
+    def test_dead_letter_recording_is_safe_when_bus_fails(self, tmp_path, monkeypatch):
+        """A bus-level failure in record_dead_letter must not cascade into the subscriber."""
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("dead-letter table is broken")
+
+        monkeypatch.setattr(bus, "record_dead_letter", boom)
+
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        # Poll must not raise even though both handle() and record_dead_letter() fail.
+        sub.poll()
+
+
+class TestAtLeastOnceDedup:
+    """SR-101: handled_events redelivery check — subscribers must not double-fire."""
+
+    def test_successful_handle_marks_handled(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        assert bus.is_handled("stub", eid)
+
+    def test_already_handled_event_skips_handle(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+        # Simulate an earlier successful handle (e.g., from before a crash).
+        bus.mark_handled("stub", eid)
+
+        sub.poll()
+        # handle() was NOT called this time — the event was skipped as redelivery.
+        assert sub.processed == []
+        # But the cursor must still advance (otherwise we'd re-fetch forever).
+        assert sub.poll() == 0
+
+    def test_failed_handle_does_not_mark_handled(self, tmp_path):
+        """A handler that raises must leave no handled_events row so operators can retry."""
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = FlakySubscriber(bus)
+        sub.raise_error = True
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        assert bus.is_handled("flaky", eid) is False
+
+    def test_mixed_batch_marks_only_successes(self, tmp_path):
+        """Batch with one failure: only the good event gets a handled_events row."""
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+
+        class SelectiveFailure(BaseSubscriber):
+            subscriber_id = "selective"
+            poll_interval_seconds = 1
+            CIRCUIT_BREAKER_ERROR_THRESHOLD = 99  # never trip
+
+            def __init__(self, bus):
+                super().__init__(bus)
+                self.processed = []
+
+            def handle(self, event):
+                if event.payload.get("bad"):
+                    raise RuntimeError("no")
+                self.processed.append(event)
+
+        sub = SelectiveFailure(bus)
+        good = bus.emit(EventType.CRON_COMPLETED, "test", {"bad": False})
+        bad = bus.emit(EventType.CRON_COMPLETED, "test", {"bad": True})
+
+        sub.poll()
+
+        assert bus.is_handled("selective", good) is True
+        assert bus.is_handled("selective", bad) is False
+        assert len(sub.processed) == 1
+
+    def test_mark_handled_failure_does_not_cascade(self, tmp_path, monkeypatch):
+        """A bus-level failure in mark_handled must not cascade into the subscriber."""
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("handled_events table broken")
+
+        monkeypatch.setattr(bus, "mark_handled", boom)
+
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        # Poll must complete cleanly — handle() ran, mark_handled() failed, subscriber continues.
+        count = sub.poll()
+        assert count == 1
+        assert len(sub.processed) == 1

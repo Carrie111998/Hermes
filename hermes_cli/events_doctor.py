@@ -9,6 +9,7 @@ import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 from events.paths import (
     audit_log_path, events_db_path, quiet_hours_path,
@@ -100,11 +101,85 @@ def run_doctor(check_telegram_api: bool = True) -> int:
     return 0
 
 
+def print_dead_letters(
+    limit: int = 20,
+    since_hours: Optional[int] = None,
+    db_path: Optional[Path] = None,
+) -> int:
+    """Print the most recent dead-letter rows. Returns exit code."""
+    db = db_path or events_db_path()
+    if not db.exists():
+        print(f"events db not found: {db}", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        conditions: list = []
+        params: list = []
+        if since_hours is not None:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=since_hours)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            conditions.append("dl.failed_at >= ?")
+            params.append(cutoff)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(int(limit))
+
+        try:
+            rows = conn.execute(
+                f"""SELECT dl.event_id, dl.subscriber_id, dl.error, dl.attempts,
+                           dl.first_failed_at, dl.failed_at,
+                           e.event_type, e.source
+                    FROM dead_letters dl
+                    LEFT JOIN events e ON e.event_id = dl.event_id
+                    {where}
+                    ORDER BY dl.failed_at DESC, dl.event_id DESC
+                    LIMIT ?""",
+                params,
+            ).fetchall()
+        except sqlite3.OperationalError as e:
+            # Old DB without the table — schema gets created on next EventBus
+            # instantiation. Surface the diagnosis without crashing.
+            print(f"dead_letters table missing ({e}); start the gateway once to migrate schema.")
+            return 0
+
+        if not rows:
+            where_desc = f" in last {since_hours}h" if since_hours else ""
+            print(f"No dead-letter events{where_desc}.")
+            return 0
+
+        print(f"Recent dead-letters (showing {len(rows)}):")
+        print()
+        print(f"  {'failed_at':<20} {'subscriber':<20} {'event_type':<22} {'att':>3}  error")
+        print(f"  {'-'*20} {'-'*20} {'-'*22} {'-'*3}  {'-'*40}")
+        for r in rows:
+            err = (r["error"] or "").replace("\n", " ")
+            if len(err) > 60:
+                err = err[:57] + "..."
+            print(
+                f"  {str(r['failed_at'])[:19]:<20} "
+                f"{(r['subscriber_id'] or '?')[:20]:<20} "
+                f"{(r['event_type'] or '<purged>')[:22]:<22} "
+                f"{int(r['attempts']):>3}  {err}"
+            )
+        return 0
+    finally:
+        conn.close()
+
+
 def _cli() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--no-telegram-api", action="store_true",
                     help="Skip live getMe check")
+    ap.add_argument("--dead-letters", action="store_true",
+                    help="List recent dead-lettered events instead of running checks")
+    ap.add_argument("--limit", type=int, default=20,
+                    help="With --dead-letters: max rows to show (default 20)")
+    ap.add_argument("--since-hours", type=int, default=None,
+                    help="With --dead-letters: only show failures newer than N hours")
     ns = ap.parse_args()
+    if ns.dead_letters:
+        sys.exit(print_dead_letters(limit=ns.limit, since_hours=ns.since_hours))
     sys.exit(run_doctor(check_telegram_api=not ns.no_telegram_api))
 
 

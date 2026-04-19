@@ -44,6 +44,31 @@ CREATE TABLE IF NOT EXISTS subscriber_cursors (
     last_rowid    INTEGER NOT NULL DEFAULT 0,
     updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS dead_letters (
+    event_id       TEXT NOT NULL,
+    subscriber_id  TEXT NOT NULL,
+    error          TEXT NOT NULL,
+    attempts       INTEGER NOT NULL DEFAULT 1,
+    first_failed_at TEXT NOT NULL DEFAULT (datetime('now')),
+    failed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (event_id, subscriber_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dead_letters_failed_at
+    ON dead_letters (failed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_subscriber
+    ON dead_letters (subscriber_id, failed_at DESC);
+
+CREATE TABLE IF NOT EXISTS handled_events (
+    subscriber_id TEXT NOT NULL,
+    event_id      TEXT NOT NULL,
+    handled_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (subscriber_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_handled_events_event_id
+    ON handled_events (event_id);
 """
 
 
@@ -262,7 +287,12 @@ class EventBus:
             conn.close()
             self._local.conn = None
 
-    def subscriber_lag(self, subscriber_id: str) -> int:
+    def subscriber_lag(
+        self,
+        subscriber_id: str,
+        event_types: Optional[List[EventType]] = None,
+        min_priority: Optional[Priority] = None,
+    ) -> int:
         """Return the count of events the subscriber hasn't processed yet.
 
         Lag = (total events emitted) - (cursor position).  A subscriber
@@ -276,11 +306,116 @@ class EventBus:
             (subscriber_id,),
         ).fetchone()
         last_rowid = row["last_rowid"] if row else 0
+
+        conditions = ["rowid > ?"]
+        params: list = [last_rowid]
+
+        if event_types:
+            placeholders = ",".join("?" for _ in event_types)
+            conditions.append(f"event_type IN ({placeholders})")
+            params.extend(et.type_string for et in event_types)
+
+        if min_priority:
+            valid = [p.label for p in Priority if p.level >= min_priority.level]
+            placeholders = ",".join("?" for _ in valid)
+            conditions.append(f"priority IN ({placeholders})")
+            params.extend(valid)
+
+        where = " AND ".join(conditions)
         row = conn.execute(
-            "SELECT COUNT(*) as n FROM events WHERE rowid > ?",
-            (last_rowid,),
+            f"SELECT COUNT(*) as n FROM events WHERE {where}",
+            params,
         ).fetchone()
         return int(row["n"]) if row else 0
+
+    def record_dead_letter(
+        self, subscriber_id: str, event_id: str, error: str
+    ) -> None:
+        """Record that a subscriber's handler failed on a specific event.
+
+        UPSERT semantics: on repeat failures for the same (event, subscriber),
+        the row's ``attempts`` counter is incremented, ``error`` is overwritten
+        with the latest message, and ``failed_at`` is refreshed. The original
+        ``first_failed_at`` is preserved. Safe to call from subscriber
+        exception handlers — failures in this call should NOT cascade, so the
+        caller should wrap in its own try/except.
+        """
+        self._execute(
+            """INSERT INTO dead_letters
+                (event_id, subscriber_id, error, attempts, first_failed_at, failed_at)
+               VALUES (?, ?, ?, 1, datetime('now'), datetime('now'))
+               ON CONFLICT(event_id, subscriber_id)
+               DO UPDATE SET
+                    attempts  = attempts + 1,
+                    error     = excluded.error,
+                    failed_at = excluded.failed_at""",
+            (event_id, subscriber_id, error),
+        )
+
+    def get_dead_letters(
+        self,
+        subscriber_id: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """List dead-lettered events, newest first.
+
+        Returns dicts with: event_id, subscriber_id, error, attempts,
+        first_failed_at, failed_at, event_type, event_source, event_timestamp.
+        The event_* fields come from a LEFT JOIN on events so that cleaned-up
+        events (purged via cleanup()) still surface in the report.
+        """
+        conn = self._get_conn()
+        conditions: List[str] = []
+        params: List[Any] = []
+        if subscriber_id:
+            conditions.append("dl.subscriber_id = ?")
+            params.append(subscriber_id)
+        if since:
+            conditions.append("dl.failed_at >= ?")
+            params.append(since)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(int(limit))
+
+        rows = conn.execute(
+            f"""SELECT dl.event_id, dl.subscriber_id, dl.error, dl.attempts,
+                       dl.first_failed_at, dl.failed_at,
+                       e.event_type AS event_type, e.source AS event_source,
+                       e.timestamp AS event_timestamp
+                FROM dead_letters dl
+                LEFT JOIN events e ON e.event_id = dl.event_id
+                {where}
+                ORDER BY dl.failed_at DESC, dl.event_id DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def is_handled(self, subscriber_id: str, event_id: str) -> bool:
+        """Return True iff this subscriber has already processed this event.
+
+        Part of the SR-101 at-least-once delivery contract: subscribers call
+        ``is_handled`` before invoking ``handle()`` to detect redelivery (e.g.,
+        after a crash between handle and ack) and avoid duplicate side effects.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM handled_events WHERE subscriber_id = ? AND event_id = ? LIMIT 1",
+            (subscriber_id, event_id),
+        ).fetchone()
+        return row is not None
+
+    def mark_handled(self, subscriber_id: str, event_id: str) -> None:
+        """Record that a subscriber has finished processing an event.
+
+        INSERT OR IGNORE so repeat marks (e.g., after a race on the UNIQUE
+        PK) are silently tolerated — this is effectively idempotent.
+        """
+        self._execute(
+            """INSERT OR IGNORE INTO handled_events (subscriber_id, event_id)
+               VALUES (?, ?)""",
+            (subscriber_id, event_id),
+        )
 
     def cleanup(self, retention_days: int = 30) -> int:
         """Remove events older than retention_days.  Returns count removed."""

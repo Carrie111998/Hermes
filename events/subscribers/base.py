@@ -83,15 +83,37 @@ class BaseSubscriber(ABC):
 
         processed_ids = []
         for event in events:
+            # SR-101: at-least-once redelivery dedup. If a prior poll already
+            # processed this event successfully, skip handle() but still ack
+            # the cursor so the event doesn't re-appear forever.
+            if self.bus.is_handled(self.subscriber_id, event.event_id):
+                processed_ids.append(event.event_id)
+                continue
             try:
                 self.handle(event)
                 self._consecutive_errors = 0  # any success resets the counter
-            except Exception:
+                # SR-101: mark handled AFTER success. Wrapped so a bus-level
+                # failure doesn't cascade into the subscriber.
+                try:
+                    self.bus.mark_handled(self.subscriber_id, event.event_id)
+                except Exception:
+                    logger.exception("Failed to mark handled for %s", event.event_id)
+            except Exception as exc:
                 logger.exception(
                     "Subscriber %s failed to handle event %s (%s)",
                     self.subscriber_id, event.event_id, event.event_type.type_string,
                 )
                 self._consecutive_errors += 1
+                # SR-109: record per-(event, subscriber) dead-letter for
+                # observability. Never cascade a bus error into the subscriber.
+                try:
+                    self.bus.record_dead_letter(
+                        self.subscriber_id,
+                        event.event_id,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    logger.exception("Failed to record dead-letter for %s", event.event_id)
                 if self._consecutive_errors >= self.CIRCUIT_BREAKER_ERROR_THRESHOLD:
                     # Trip the breaker.  Ack what we successfully processed
                     # so those events don't re-appear in lag, then bail out.
@@ -198,7 +220,11 @@ class SubscriberRegistry:
         report: Dict[str, int] = {}
         for sub in self.subscribers:
             try:
-                report[sub.subscriber_id] = sub.bus.subscriber_lag(sub.subscriber_id)
+                report[sub.subscriber_id] = sub.bus.subscriber_lag(
+                    sub.subscriber_id,
+                    event_types=sub.event_types,
+                    min_priority=sub.min_priority,
+                )
             except Exception:
                 logger.exception("Lag query failed for %s", sub.subscriber_id)
                 report[sub.subscriber_id] = -1  # sentinel for unknown

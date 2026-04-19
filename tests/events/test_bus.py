@@ -278,3 +278,107 @@ def test_checkpoint_exposes_wal_data_to_other_connections(tmp_path):
         assert count == 1
     finally:
         bus.close()
+
+
+class TestDeadLetters:
+    """SR-109 dead-letter table — records per-(event, subscriber) handler failures."""
+
+    def test_record_dead_letter_stores_row(self, bus):
+        eid = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.record_dead_letter("digest-composer", eid, "KeyError: 'score'")
+
+        rows = bus.get_dead_letters()
+        assert len(rows) == 1
+        assert rows[0]["event_id"] == eid
+        assert rows[0]["subscriber_id"] == "digest-composer"
+        assert "KeyError" in rows[0]["error"]
+        assert rows[0]["failed_at"]
+
+    def test_record_dead_letter_upserts_on_repeat(self, bus):
+        eid = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.record_dead_letter("digest-composer", eid, "first error")
+        bus.record_dead_letter("digest-composer", eid, "second error")
+
+        rows = bus.get_dead_letters()
+        assert len(rows) == 1
+        assert rows[0]["error"] == "second error"
+        assert rows[0]["attempts"] == 2
+
+    def test_record_dead_letter_separate_subscribers(self, bus):
+        eid = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.record_dead_letter("digest-composer", eid, "boom")
+        bus.record_dead_letter("whatsapp-escalator", eid, "ouch")
+
+        rows = bus.get_dead_letters()
+        assert len(rows) == 2
+
+    def test_get_dead_letters_filters_by_subscriber(self, bus):
+        e1 = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        e2 = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.record_dead_letter("digest-composer", e1, "a")
+        bus.record_dead_letter("telegram-notifier", e2, "b")
+
+        digest = bus.get_dead_letters(subscriber_id="digest-composer")
+        assert len(digest) == 1
+        assert digest[0]["event_id"] == e1
+
+    def test_get_dead_letters_orders_newest_first(self, bus):
+        e1 = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        e2 = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.record_dead_letter("sub", e1, "first")
+        bus.record_dead_letter("sub", e2, "second")
+        # SQLite datetime('now') has second resolution and test timing can
+        # straddle second boundaries. Use absolute timestamps to guarantee
+        # e1 is strictly older than e2.
+        bus._execute(
+            "UPDATE dead_letters SET failed_at = '2020-01-01 00:00:00' "
+            "WHERE event_id = ?", (e1,),
+        )
+        bus._execute(
+            "UPDATE dead_letters SET failed_at = '2030-01-01 00:00:00' "
+            "WHERE event_id = ?", (e2,),
+        )
+
+        rows = bus.get_dead_letters()
+        assert [r["event_id"] for r in rows] == [e2, e1]
+
+    def test_get_dead_letters_limit(self, bus):
+        for i in range(5):
+            eid = bus.emit(EventType.CRON_COMPLETED, "scout", {"i": i})
+            bus.record_dead_letter("sub", eid, f"err-{i}")
+
+        rows = bus.get_dead_letters(limit=3)
+        assert len(rows) == 3
+
+    def test_get_dead_letters_joins_event_type(self, bus):
+        """Returned rows include event_type for display in doctor."""
+        eid = bus.emit(EventType.JOB_HIGH_SCORE, "matcher", {})
+        bus.record_dead_letter("digest-composer", eid, "boom")
+
+        rows = bus.get_dead_letters()
+        assert rows[0]["event_type"] == EventType.JOB_HIGH_SCORE.type_string
+
+
+class TestHandledEvents:
+    """SR-101 handled_events table — per-(subscriber, event) dedup for at-least-once delivery."""
+
+    def test_is_handled_false_for_unknown(self, bus):
+        assert bus.is_handled("sub-a", "nonexistent-event-id") is False
+
+    def test_mark_and_check_handled(self, bus):
+        eid = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.mark_handled("sub-a", eid)
+        assert bus.is_handled("sub-a", eid) is True
+
+    def test_handled_is_per_subscriber(self, bus):
+        eid = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.mark_handled("sub-a", eid)
+        assert bus.is_handled("sub-a", eid) is True
+        assert bus.is_handled("sub-b", eid) is False
+
+    def test_mark_handled_is_idempotent(self, bus):
+        eid = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus.mark_handled("sub-a", eid)
+        # A second call must not raise (UNIQUE constraint is handled via OR IGNORE).
+        bus.mark_handled("sub-a", eid)
+        assert bus.is_handled("sub-a", eid) is True
