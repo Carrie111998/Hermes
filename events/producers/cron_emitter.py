@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 CONSECUTIVE_FAILURE_THRESHOLD = 3
 
+# Minimum chars for cron_completed output_summary to be considered
+# substantive. Below this (or "[SILENT]"), keep default NORMAL priority so
+# the event is batched / digest_only-gated. Above it, boost to HIGH so the
+# content surfaces in Mission Control's system topic instead of being dropped.
+MEANINGFUL_OUTPUT_CHAR_THRESHOLD = 120
+
 
 class CronEventEmitter:
     """Emits cron lifecycle events into the EventBus."""
@@ -61,9 +67,18 @@ class CronEventEmitter:
         cron_failed_consecutive as a separate critical event.
         """
         if success:
+            # Boost priority when the output is substantive so it isn't
+            # silently gated by system-topic digest_only verbosity. Keeps
+            # [SILENT] and short heartbeat outputs at NORMAL (batched).
+            summary = (output_summary or "").strip()
+            if summary and summary != "[SILENT]" and len(summary) >= MEANINGFUL_OUTPUT_CHAR_THRESHOLD:
+                completed_priority = Priority.HIGH
+            else:
+                completed_priority = None  # default NORMAL
             event_id = self.bus.emit(
                 event_type=EventType.CRON_COMPLETED,
                 source=job_name,
+                priority=completed_priority,
                 payload={
                     "job_id": job_id,
                     "job_name": job_name,

@@ -55,6 +55,7 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+CRON_EVENT_SUMMARY_MAX_CHARS = 4000
 
 # Event bus integration (lazy-loaded to avoid circular imports)
 _event_emitter = None
@@ -82,6 +83,20 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+
+def _summarize_for_event_bus(final_response: str) -> str:
+    """Preserve normal cron reports while capping truly huge event payloads."""
+    summary = final_response or ""
+    if len(summary) <= CRON_EVENT_SUMMARY_MAX_CHARS:
+        return summary
+
+    budget = max(1, CRON_EVENT_SUMMARY_MAX_CHARS - 3)
+    clipped = summary[:budget]
+    split_at = max(clipped.rfind("\n"), clipped.rfind(" "))
+    if split_at >= budget // 2:
+        clipped = clipped[:split_at]
+    return clipped.rstrip() + "..."
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -304,13 +319,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output. Event-bus subscribers pass
-    # skip_cron_framing=True to bypass the wrapper entirely.
+    # skip_cron_framing=True to bypass the wrapper entirely. Per-job
+    # wrap_response:false in jobs.json disables framing for that job only.
     wrap_response = True
     try:
         user_cfg = load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
     except Exception:
         pass
+
+    if "wrap_response" in job:
+        wrap_response = bool(job["wrap_response"])
 
     if skip_cron_framing:
         wrap_response = False
@@ -1039,7 +1058,7 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                             (j for j in load_jobs() if j["id"] == job["id"]), None
                         )
                         consecutive = current_job.get("consecutive_errors", 0) if current_job else 0
-                        summary = (final_response or "")[:500] if success else None
+                        summary = _summarize_for_event_bus(final_response) if success else None
                         emitter.on_job_completed(
                             job_id=job["id"],
                             job_name=job.get("name", job["id"]),

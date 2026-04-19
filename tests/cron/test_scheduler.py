@@ -1206,6 +1206,43 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
 
 
+class TestEventEmitterSummary:
+    def _make_job(self):
+        return {
+            "id": "learning-loop",
+            "name": "learning-loop",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    def test_tick_preserves_moderately_long_summary_for_event_bus(self):
+        """Cron event summaries should not be hard-cut at 500 chars."""
+        response = (
+            "Learning-loop review complete.\n\n"
+            "- No `reasoning_effort` changes were justified. Effective live map still holds: "
+            "main/sentinel/devflow `high`, matcher/tailor `xhigh`, tracker/applier/cv-handler "
+            "`medium`, scout `low`, notifier `minimal`.\n"
+            "- No `nudge.interval` changes were needed. Consolidated cadence is still correct: "
+            "main/tracker/sentinel `14400`, scout/tailor/cv-handler/devflow `21600`, applier "
+            "`10800`, matcher `7200`, notifier `43200`. "
+            "`nudge.consolidate_memory: true` is still enabled everywhere."
+        )
+        assert len(response) > 500
+
+        emitter = MagicMock()
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[{"id": "learning-loop", "consecutive_errors": 0}]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert emitter.on_job_completed.call_args.kwargs["output_summary"] == response
+
+
 class TestBuildJobPromptSilentHint:
     """Verify _build_job_prompt always injects [SILENT] guidance."""
 
