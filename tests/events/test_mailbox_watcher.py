@@ -126,6 +126,16 @@ def test_summarize_covers_key_message_types(tmp_path):
                              "payload": {"score": 8.9, "company": "Acme", "title": "VP Fin"}}) == "score 8.9 for Acme (VP Fin)"
         assert "pending -> scored" in w._summarize({"type": "PIPELINE_UPDATE",
                              "payload": {"previous_stage": "pending", "new_stage": "scored", "job_key": "j1"}})
+        alias_summary = w._summarize({
+            "type": "PIPELINE_UPDATE",
+            "payload": {
+                "from_stage": "approved_for_tailor",
+                "to_stage": "materials_ready",
+                "job_id": "job-48",
+            },
+        })
+        assert "approved_for_tailor -> materials_ready" in alias_summary
+        assert "job-48" in alias_summary
         assert "3 days" in w._summarize({"type": "FOLLOWUP_ALERT",
                              "payload": {"days_since_application": 3, "company": "X"}})
         assert "Acme / VP" in w._summarize({"type": "SUBMIT_CONFIRM",

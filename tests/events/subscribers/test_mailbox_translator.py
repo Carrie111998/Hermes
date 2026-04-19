@@ -133,6 +133,28 @@ def test_pipeline_update_emits_on_first_stage_assignment(bus):
     assert transitions[0]["new_stage"] == "discovered"
 
 
+def test_pipeline_update_accepts_tailor_alias_fields(bus):
+    _mailbox_event(bus, "PIPELINE_UPDATE", {
+        "job_id": "48f36c8d-ad38-4bf4-aaf5-d38be28a97e3",
+        "from_stage": "approved_for_tailor",
+        "to_stage": "materials_ready",
+        "metadata": {
+            "company": "Citi",
+            "title": "LMS Deposit Strategy & Analytics - NAM and LATAM Balance Sheet Lead - Director",
+        },
+    })
+    MailboxTranslator(bus).poll()
+    events = _recent_domain_events(bus)
+    transitions = [p for et, p in events if et == EventType.STAGE_TRANSITION]
+    assert len(transitions) == 1
+    assert transitions[0]["job_key"] == "48f36c8d-ad38-4bf4-aaf5-d38be28a97e3"
+    assert transitions[0]["job_id"] == "48f36c8d-ad38-4bf4-aaf5-d38be28a97e3"
+    assert transitions[0]["previous_stage"] == "approved_for_tailor"
+    assert transitions[0]["new_stage"] == "materials_ready"
+    assert transitions[0]["company"] == "Citi"
+    assert transitions[0]["title"].startswith("LMS Deposit Strategy")
+
+
 def test_error_message_emits_agent_error(bus):
     _mailbox_event(bus, "ERROR",
                    {"message": "scout failed", "source_agent": "scout"})

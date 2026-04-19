@@ -32,6 +32,36 @@ _OFFER_PATTERNS = [
 ]
 
 
+def _stage_transition_payload(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize PIPELINE_UPDATE payloads from tracker/tailor mailbox messages."""
+    metadata = d.get("metadata") or {}
+    job_id = d.get("job_id")
+    job_key = d.get("job_key") or job_id
+    previous_stage = d.get("previous_stage")
+    if previous_stage is None:
+        previous_stage = d.get("from_stage")
+    new_stage = d.get("new_stage")
+    if new_stage is None:
+        new_stage = d.get("to_stage")
+    company = d.get("company") or metadata.get("company")
+    title = d.get("title") or metadata.get("title")
+
+    out: Dict[str, Any] = {}
+    if job_key is not None:
+        out["job_key"] = job_key
+    if job_id is not None:
+        out["job_id"] = job_id
+    if previous_stage is not None:
+        out["previous_stage"] = previous_stage
+    if new_stage is not None:
+        out["new_stage"] = new_stage
+    if company is not None:
+        out["company"] = company
+    if title is not None:
+        out["title"] = title
+    return out
+
+
 class MailboxTranslator(BaseSubscriber):
     subscriber_id = "mailbox-translator"
     poll_interval_seconds = 5
@@ -102,12 +132,12 @@ class MailboxTranslator(BaseSubscriber):
                 inner, ["company", "title", "job_key", "question"]), None))
 
         elif message_type == "PIPELINE_UPDATE":
-            prev = inner.get("previous_stage")
-            new = inner.get("new_stage")
+            transition = _stage_transition_payload(inner)
+            prev = transition.get("previous_stage")
+            new = transition.get("new_stage")
             # Emit on any real transition — including first assignment where prev is None.
             if new and new != prev:
-                results.append((EventType.STAGE_TRANSITION, _copy_fields(
-                    inner, ["job_key", "previous_stage", "new_stage", "company"]), None))
+                results.append((EventType.STAGE_TRANSITION, transition, None))
 
         elif message_type == "FOLLOWUP_ALERT":
             results.append((EventType.FOLLOWUP_DUE, _copy_fields(

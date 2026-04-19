@@ -28,6 +28,23 @@ MIRRORED_MESSAGE_TYPES = {
 }
 
 
+def _pipeline_update_aliases(payload: dict) -> tuple[str, str, str]:
+    """Normalize PIPELINE_UPDATE field aliases from real mailbox payloads."""
+    metadata = payload.get("metadata") or {}
+    previous_stage = payload.get("previous_stage") or payload.get("from_stage") or "?"
+    new_stage = payload.get("new_stage") or payload.get("to_stage") or "?"
+    job_ref = (
+        payload.get("company")
+        or metadata.get("company")
+        or payload.get("job_key")
+        or payload.get("job_id")
+        or payload.get("title")
+        or metadata.get("title")
+        or "?"
+    )
+    return str(previous_stage), str(new_stage), str(job_ref)
+
+
 class MailboxWatcher:
     """Polls inter-agent mailbox directories for new protocol messages."""
 
@@ -152,7 +169,8 @@ class MailboxWatcher:
         if msg_type == "BLOCKED_QUESTION":
             return (payload.get("question") or "Blocked question")[:200]
         if msg_type == "PIPELINE_UPDATE":
-            return f"{payload.get('previous_stage', '?')} -> {payload.get('new_stage', '?')} ({payload.get('job_key', '?')})"
+            previous_stage, new_stage, job_ref = _pipeline_update_aliases(payload)
+            return f"{previous_stage} -> {new_stage} ({job_ref})"
         if msg_type == "FOLLOWUP_ALERT":
             days = payload.get("days_since_application", "?")
             company = payload.get("company", "?")
