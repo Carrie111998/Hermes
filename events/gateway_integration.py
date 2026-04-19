@@ -399,6 +399,17 @@ def _subscriber_poll_loop() -> None:
                             except Exception:
                                 logger.exception("Digest compose failed")
                     fired_digest_keys.append(target_key)
+                    # Reload state here to merge with whatever ``compose()``
+                    # wrote during this tick — notably ``last_digest_at``.
+                    # Without this re-read, our save below would clobber the
+                    # time-window lower bound DigestComposer needs to keep
+                    # successive digests non-overlapping.  Regression guard
+                    # against a 2026-04-19 bug I introduced in the initial
+                    # first-and-latest implementation.
+                    try:
+                        _state = load_state(digest_state_path(), default={})
+                    except Exception:
+                        logger.exception("Failed to reload digest state before merge")
                     _state["fired_digest_keys"] = fired_digest_keys
                     # Retire the legacy single-key field once we've committed
                     # to the new multi-key format.  Safe: the migration on
