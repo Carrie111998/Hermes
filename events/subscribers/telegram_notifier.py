@@ -180,6 +180,20 @@ class TelegramNotifier(BaseSubscriber):
     def resolve_target(self, event: Event) -> Tuple[str, str, str]:
         """Resolve the primary Telegram target for an event."""
         topic_key = TOPIC_ROUTING.get(event.event_type.type_string, "system")
+
+        # User-facing NOTIFICATION messages (morning digest, follow-up alerts,
+        # etc.) belong in the ``digests`` topic where verbosity defaults to
+        # ``all`` — NOT in ``agent_comms`` (the default for mailbox_message)
+        # where the ``significant_only`` filter drops the default LOW priority
+        # and the user never sees them.
+        #
+        # Regression: 2026-04-19 — the Sunday morning digest sat in the bus
+        # (rowid 219957, priority=low) but telegram-notifier silently skipped
+        # it because agent_comms verbosity=significant_only requires HIGH+.
+        if (event.event_type == EventType.MAILBOX_MESSAGE
+                and event.payload.get("message_type") == "NOTIFICATION"):
+            topic_key = "digests"
+
         topic = self.topics.get(topic_key, {})
         thread_id = str(topic.get("thread_id", ""))
         return ("telegram", self.group_chat_id, thread_id)

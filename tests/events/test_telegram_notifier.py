@@ -107,6 +107,54 @@ class TestTelegramNotifier:
         target = notifier.resolve_target(event)
         assert target == ("telegram", "-1001234567890", "101")
 
+    def test_notification_mailbox_message_routes_to_digests(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """NOTIFICATION mailbox messages (morning digest, user-facing content)
+        must route to the ``digests`` topic — NOT to ``agent_comms`` (the
+        default mailbox_message topic) where ``significant_only`` drops the
+        default LOW priority.
+
+        Regression: 2026-04-19 — the Sunday morning digest was emitted to the
+        bus but silently dropped at the filter before reaching the user.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.MAILBOX_MESSAGE, "notifier",
+            {
+                "message_type": "NOTIFICATION",
+                "from": "notifier",
+                "to": "main",
+                "summary": "🌅 JobFlow Morning Digest — Sun Apr 19",
+            },
+        )
+        target = notifier.resolve_target(event)
+        assert target == ("telegram", "-1001234567890", "105")  # digests thread
+
+    def test_non_notification_mailbox_message_still_routes_to_agent_comms(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Agent-to-agent mailbox messages (SCORE_RESULT, TAILOR_REQUEST, etc.)
+        still route to ``agent_comms`` — only the NOTIFICATION message_type
+        gets the ``digests`` override.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.MAILBOX_MESSAGE, "matcher",
+            {
+                "message_type": "SCORE_RESULT",
+                "from": "matcher",
+                "to": "main",
+                "summary": "score 9.0 for Acme",
+            },
+        )
+        target = notifier.resolve_target(event)
+        assert target == ("telegram", "-1001234567890", "107")  # agent_comms thread
+
     def test_cross_posts_critical_to_alerts(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,

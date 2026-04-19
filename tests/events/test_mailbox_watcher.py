@@ -89,6 +89,88 @@ class TestMailboxWatcher:
 
         assert watcher2.scan() == 1  # only the new message
 
+    def test_recovers_files_swept_to_processed_before_scan(self, bus, mailbox_root):
+        """Simulate the jaum-inbox-sweeper race: a file arrives in inbox/ and is
+        moved to processed/ before MailboxWatcher scans.  The file must still
+        produce a mailbox_message event via the processed/ recovery pass,
+        tagged with recovered_from=processed.
+        """
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+
+        processed = mailbox_root / "main" / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+
+        # Write the message directly to processed/ — as if the sweeper had
+        # already moved it from inbox/ before MailboxWatcher's first poll.
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        filename = f"{ts}_NOTIFICATION_notifier.json"
+        msg = {
+            "type": "NOTIFICATION",
+            "from": "notifier",
+            "to": "main",
+            "payload": {"summary": "Morning digest body"},
+        }
+        (processed / filename).write_text(json.dumps(msg), encoding="utf-8")
+
+        count = watcher.scan()
+        assert count == 1
+
+        events = bus.query(event_type=EventType.MAILBOX_MESSAGE)
+        assert len(events) == 1
+        assert events[0].payload["message_type"] == "NOTIFICATION"
+        assert events[0].payload.get("recovered_from") == "processed"
+
+        # A second scan must not re-emit the same file
+        assert watcher.scan() == 0
+
+    def test_dedup_inbox_and_processed_by_basename(self, bus, mailbox_root):
+        """A file scanned from inbox/ then moved to processed/ between polls
+        must not be emitted twice when the next scan sees it in processed/.
+        """
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+
+        msg_path = _write_message(
+            mailbox_root / "main" / "inbox",
+            "SCORE_RESULT", "matcher",
+            {"score": 9.0, "company": "Acme", "title": "VP Fin"},
+        )
+        assert watcher.scan() == 1
+
+        # Simulate the sweeper moving the file to processed/
+        processed = mailbox_root / "main" / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        msg_path.rename(processed / msg_path.name)
+
+        # Processed recovery scan must skip this file (already emitted)
+        assert watcher.scan() == 0
+
+        events = bus.query(event_type=EventType.MAILBOX_MESSAGE)
+        assert len(events) == 1  # still just one emission
+
+    def test_processed_recovery_respects_time_window(self, bus, mailbox_root):
+        """Old files in processed/ (beyond the recovery window) must not be
+        emitted — the window bounds per-poll work and prevents replaying ancient
+        archives after watermark loss."""
+        import os
+        from events.producers.mailbox_watcher import PROCESSED_RECOVERY_WINDOW_SECONDS
+
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+
+        processed = mailbox_root / "scout" / "processed"
+        processed.mkdir(parents=True, exist_ok=True)
+        old_file = processed / "20240101T000000Z_SCOUT_DISCOVERY_scout.json"
+        old_file.write_text(json.dumps({
+            "type": "SCOUT_DISCOVERY", "from": "scout", "to": "tracker",
+            "payload": {"jobs": []},
+        }), encoding="utf-8")
+
+        # Push mtime well beyond the recovery window
+        old_ts = __import__("time").time() - (PROCESSED_RECOVERY_WINDOW_SECONDS * 2)
+        os.utime(old_file, (old_ts, old_ts))
+
+        assert watcher.scan() == 0  # skipped by mtime cutoff
+
 
 def test_mailbox_watcher_forwards_inner_payload(tmp_path):
     import json
