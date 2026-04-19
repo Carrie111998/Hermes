@@ -4,14 +4,17 @@ Called from gateway/run.py during startup and shutdown.  All components
 run within the gateway process — no new daemons or threads.
 """
 
+import json
 import logging
+import os
+import tempfile
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from events.bus import EventBus
-from events.paths import digest_state_path, whatsapp_flush_state_path
+from events.paths import digest_state_path, gateway_heartbeat_path, whatsapp_flush_state_path
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.state import load_state, save_state
@@ -35,6 +38,10 @@ LAG_ALERT_COOLDOWN_SECONDS = 900  # 15 minutes
 # Cooldown for outer poll-loop exception alerts — prevents alert storms if
 # the loop catches on every tick.  Separate from lag cooldown so we can tune.
 POLL_LOOP_ERROR_COOLDOWN_SECONDS = 900
+# Heartbeat write interval — external watchers stat gateway_heartbeat_path()
+# and alert on staleness > a few minutes, so this cadence must be tight
+# enough that a single missed write stays under the alert threshold.
+HEARTBEAT_INTERVAL_SECONDS = 60
 
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
@@ -42,17 +49,19 @@ _health_monitor: Optional[GatewayHealthMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
+_startup_monotonic: float = 0.0
 
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _mailbox_watcher, _subscriber_thread
+    global _bus, _registry, _health_monitor, _mailbox_watcher, _subscriber_thread, _startup_monotonic
 
     if _bus is not None:
         shutdown()
 
     logger.info("EventBus: initializing communication layer...")
 
+    _startup_monotonic = time.monotonic()
     _bus = EventBus()
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
@@ -161,6 +170,51 @@ def _get_et_hour() -> int:
         return datetime.utcnow().hour  # fallback
 
 
+def _write_heartbeat(consecutive_outer_errors: int) -> None:
+    """Atomically write a liveness signal file for external watchers.
+
+    Payload keys:
+      - ts: current UTC time (ISO8601)
+      - pid: gateway process PID
+      - subscriber_count: number of registered subscribers
+      - uptime_seconds: monotonic time since startup()
+      - consecutive_outer_errors: current value of the poll-loop error counter
+
+    External watchers (mission-control frontend, cron probes) stat this
+    file's mtime and alert when it exceeds a staleness threshold; reading
+    the JSON gives them richer diagnostic context for why the loop is
+    degraded even if still writing.
+    """
+    path = gateway_heartbeat_path()
+    subscriber_count = len(_registry.subscribers) if _registry is not None else 0
+    uptime = time.monotonic() - _startup_monotonic if _startup_monotonic else 0.0
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "pid": os.getpid(),
+        "subscriber_count": subscriber_count,
+        "uptime_seconds": round(uptime, 3),
+        "consecutive_outer_errors": consecutive_outer_errors,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Atomic replace via tempfile in the same directory.
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".gateway-heartbeat-",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp_path, path)
+    except Exception:
+        # Best-effort cleanup of the tempfile; os.replace consumed it on success.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def _emit_poll_loop_error(consecutive_errors: int) -> None:
     """Emit an AGENT_ERROR event so a crashing poll loop becomes visible.
 
@@ -201,6 +255,7 @@ def _subscriber_poll_loop() -> None:
     last_lag_check: float = 0
     last_cleanup: float = 0
     last_checkpoint: float = 0
+    last_heartbeat: float = 0
     _state = load_state(digest_state_path(), default={})
     last_digest_hour: int = _state.get("last_digest_hour", -1)
     _flush_state = load_state(whatsapp_flush_state_path(), default={})
@@ -320,6 +375,17 @@ def _subscriber_poll_loop() -> None:
                 except Exception:
                     logger.exception("WAL checkpoint failed")
                 last_checkpoint = now
+
+            # Liveness heartbeat file — external watchers stat mtime and alert
+            # on staleness, so we must always attempt to write even when other
+            # blocks have partially failed.  _write_heartbeat itself is wrapped
+            # because a stuck filesystem must not kill the loop.
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                try:
+                    _write_heartbeat(consecutive_outer_errors)
+                except Exception:
+                    logger.exception("Heartbeat write failed")
+                last_heartbeat = now
 
             # Reset consecutive counter after a fully successful tick
             consecutive_outer_errors = 0

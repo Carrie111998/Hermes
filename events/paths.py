@@ -66,3 +66,12 @@ def whatsapp_flush_state_path() -> Path:
 
 def mailbox_root() -> Path:
     return _root() / "mailbox"
+
+
+def gateway_heartbeat_path() -> Path:
+    """Liveness signal file written by the gateway's subscriber poll loop.
+
+    External watchers stat this file and alert on staleness (> a few minutes
+    old means the gateway polling thread has stopped or the process died).
+    """
+    return _root() / "gateway.heartbeat"
