@@ -69,7 +69,14 @@ def validate_copilot_token(token: str) -> tuple[bool, str]:
             "  → `gh auth login` with the default device code flow (produces gho_* tokens)"
         )
 
-    return True, "OK"
+    if any(token.startswith(prefix) for prefix in _SUPPORTED_PREFIXES):
+        return True, "OK"
+
+    supported = ", ".join(_SUPPORTED_PREFIXES)
+    return False, (
+        "Unsupported GitHub token format for the Copilot API. "
+        f"Supported token prefixes: {supported}."
+    )
 
 
 def resolve_copilot_token() -> tuple[str, str]:
