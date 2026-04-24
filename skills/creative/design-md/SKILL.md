@@ -141,7 +141,22 @@ if the value type is valid. Unknown component properties produce a warning.
 5. **If the user has an existing project**, also write Tailwind or DTCG
    exports next to the file (`tailwind.theme.json`, `tokens.json`).
 
+## Workflow exceptions and fallbacks
+
+If `npx` fails (network/offline):
+→ Check if `@google/design.md` is already cached: `ls ~/.npm/_npx/*/node_modules/@google/design.md`
+→ If cached, run directly: `node ~/.npm/_npx/*/node_modules/@google/design.md/bin/design.md.js lint DESIGN.md`
+→ If not cached, inform user and offer to write DESIGN.md manually without CLI validation
+
+If `DESIGN.md` does not exist when user asks to lint/diff/export:
+→ Inform user the file doesn't exist and ask if they want to create one first
+
+If the file path contains spaces or special characters:
+→ Always quote paths in CLI commands
+
 ## Workflow: lint / diff / export
+
+**Before running any CLI command, ask the user to confirm the file path** if not explicitly provided in the conversation.
 
 The CLI is `@google/design.md` (Node). Use `npx` — no global install needed.
 
