@@ -100,6 +100,21 @@ class EventBus:
             )
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=5000")
+            # SR-446 / ADR-0018 — explicit WAL-tuning PRAGMAs. Rationale:
+            # SR-409 flood on 2026-04-19 left event_bus.db-wal at 69 MB.
+            # Root cause: PASSIVE checkpoints silently skip under reader
+            # contention × 8 subscribers polling × stdlib sqlite3 implicit
+            # transactions. Fix is three explicit PRAGMAs per connection:
+            #   synchronous=NORMAL         — FULL is overkill with WAL
+            #   journal_size_limit=32MiB   — was unbounded (-1)
+            #   wal_autocheckpoint=1000    — was implicit default, now explicit
+            # Do NOT lower wal_autocheckpoint below 1000 — it increases
+            # skipped checkpoints under reader contention (anti-pattern per
+            # research 12 / ADR-0018). Pinned by tests/events/test_bus.py
+            # TestWalPragmas.
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA journal_size_limit=33554432")
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn

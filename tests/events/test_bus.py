@@ -280,6 +280,60 @@ def test_checkpoint_exposes_wal_data_to_other_connections(tmp_path):
         bus.close()
 
 
+class TestWalPragmas:
+    """SR-446 / ADR-0018 — explicit WAL-tuning PRAGMAs on every connection.
+
+    Rationale: SR-409 flood on 2026-04-19 left event_bus.db-wal at 69 MB.
+    Root cause per research 12 + ADR-0018: PASSIVE checkpoints silently skip
+    under reader contention × 8 subscribers polling at 1 Hz × stdlib sqlite3
+    implicit-transaction semantics. Fix is three explicit PRAGMAs on every
+    connection:
+
+      synchronous=NORMAL          (safe with WAL; FULL is overkill)
+      journal_size_limit=32MB     (previously -1 / unbounded)
+      wal_autocheckpoint=1000     (was the implicit default; now explicit)
+
+    These tests pin the PRAGMAs at connection time. A regression would mean
+    the live DB returns to unbounded WAL growth. Trade-off: lowering below
+    1000 is an anti-pattern (more skipped checkpoints, not fewer) — if a
+    future contributor tries `wal_autocheckpoint=100`, they'll notice this
+    test and hopefully read ADR-0018 before flipping it.
+    """
+
+    def test_synchronous_is_normal(self, bus):
+        """PRAGMA synchronous returns 1 (NORMAL)."""
+        result = bus._get_conn().execute("PRAGMA synchronous").fetchone()
+        assert result[0] == 1, (
+            f"Expected synchronous=NORMAL (1); got {result[0]}. "
+            f"FULL (2) is overkill with WAL + our durability model."
+        )
+
+    def test_journal_size_limit_is_32mb(self, bus):
+        """PRAGMA journal_size_limit returns 32 MiB in bytes (33554432)."""
+        result = bus._get_conn().execute("PRAGMA journal_size_limit").fetchone()
+        assert result[0] == 33554432, (
+            f"Expected journal_size_limit=33554432 (32 MiB); got {result[0]}. "
+            f"Unbounded (-1) allowed the SR-409 69 MB WAL growth."
+        )
+
+    def test_wal_autocheckpoint_is_1000(self, bus):
+        """PRAGMA wal_autocheckpoint returns 1000 pages (explicit)."""
+        result = bus._get_conn().execute("PRAGMA wal_autocheckpoint").fetchone()
+        assert result[0] == 1000, (
+            f"Expected wal_autocheckpoint=1000 pages; got {result[0]}. "
+            f"Lowering below 1000 is an anti-pattern per ADR-0018 — it "
+            f"increases skipped checkpoints under reader contention."
+        )
+
+    def test_journal_mode_still_wal(self, bus):
+        """Guard against a regression that drops WAL mode while tuning PRAGMAs."""
+        result = bus._get_conn().execute("PRAGMA journal_mode").fetchone()
+        assert result[0].lower() == "wal", (
+            f"journal_mode must remain WAL; got {result[0]}. "
+            f"Dropping WAL would lose at-least-once delivery semantics."
+        )
+
+
 class TestDeadLetters:
     """SR-109 dead-letter table — records per-(event, subscriber) handler failures."""
 
