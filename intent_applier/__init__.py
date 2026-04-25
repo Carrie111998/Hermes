@@ -8,6 +8,7 @@ from .jobops_client import (
 )
 from .circuit_breaker import CircuitBreakerOpen, SimpleCircuitBreaker
 from .dead_letter import write_dead_letter
+from .applier import IntentApplier, PROTECTED_STAGES
 
 __all__ = [
     "IntentMessage", "IntentParseError", "parse_intent_file", "VALID_INTENT_TYPES",
@@ -16,4 +17,5 @@ __all__ = [
     "JobOpsClientPermanentError", "JobOpsClientTransientError",
     "CircuitBreakerOpen", "SimpleCircuitBreaker",
     "write_dead_letter",
+    "IntentApplier", "PROTECTED_STAGES",
 ]
