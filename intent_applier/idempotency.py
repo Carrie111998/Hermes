@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,23 +31,30 @@ class IdempotencyTracker:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), isolation_level=None)
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        self._lock = threading.Lock()
         self._conn.executescript(_SCHEMA)
 
     def is_applied(self, idempotency_key: str) -> bool:
-        cur = self._conn.execute(
-            "SELECT 1 FROM applied_intents WHERE idempotency_key = ?",
-            (idempotency_key,),
-        )
-        return cur.fetchone() is not None
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT 1 FROM applied_intents WHERE idempotency_key = ?",
+                (idempotency_key,),
+            )
+            return cur.fetchone() is not None
 
     def mark_applied(self, idempotency_key: str, *, message_id: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
-        self._conn.execute(
-            "INSERT OR IGNORE INTO applied_intents (idempotency_key, message_id, applied_at) "
-            "VALUES (?, ?, ?)",
-            (idempotency_key, message_id, now),
-        )
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO applied_intents (idempotency_key, message_id, applied_at) "
+                "VALUES (?, ?, ?)",
+                (idempotency_key, message_id, now),
+            )
 
     def rehydrate_from_processed(self, processed_dir: Path) -> int:
         """Scan processed_dir for *.json files; mark each one's idempotency_key as applied.
@@ -73,4 +81,5 @@ class IdempotencyTracker:
         return count
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
