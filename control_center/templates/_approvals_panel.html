@@ -1,0 +1,52 @@
+{% if not approvals %}
+<div class="text-xs text-zinc-400">No pending approvals 🎉</div>
+{% else %}
+<ul class="divide-y divide-zinc-100">
+  {% for a in approvals %}
+  <li class="py-3 first:pt-0 last:pb-0">
+    <div class="flex items-baseline justify-between gap-2 mb-1">
+      <div class="font-medium text-sm truncate">{{ a.job_title or '?' }}</div>
+      <span class="text-xs text-zinc-400 whitespace-nowrap">{{ a.age }}</span>
+    </div>
+    <div class="text-xs text-zinc-600 mb-2">
+      {{ a.job_company or '?' }}
+      · score <span class="font-semibold">{{ a.score }}</span>
+      · thread <code class="text-[10px] bg-zinc-100 px-1 rounded">{{ a.thread_id }}</code>
+    </div>
+    {% if a.primary_angle %}
+    <div class="text-xs italic text-zinc-700 mb-1">"{{ a.primary_angle }}"</div>
+    {% endif %}
+    {% if a.cover_preview %}
+    <details class="mb-2">
+      <summary class="text-xs text-zinc-500 cursor-pointer">Cover preview</summary>
+      <div class="text-xs text-zinc-700 mt-1 bg-zinc-50 p-2 rounded">{{ a.cover_preview }}</div>
+    </details>
+    {% endif %}
+    <form class="flex items-center gap-2 mt-2" id="form-{{ a.thread_id }}">
+      <input type="hidden" name="thread_id" value="{{ a.thread_id }}">
+      <input
+        type="text"
+        name="reason"
+        placeholder="(optional reason)"
+        class="text-xs flex-1 px-2 py-1 border border-zinc-300 rounded"
+      >
+      <button
+        type="button"
+        class="text-xs px-3 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700"
+        hx-post="/api/approve"
+        hx-include="#form-{{ a.thread_id }}"
+        hx-target="#result-{{ a.thread_id }}"
+      >approve</button>
+      <button
+        type="button"
+        class="text-xs px-3 py-1 bg-zinc-100 text-zinc-700 border border-zinc-300 rounded hover:bg-zinc-200"
+        hx-post="/api/reject"
+        hx-include="#form-{{ a.thread_id }}"
+        hx-target="#result-{{ a.thread_id }}"
+      >reject</button>
+    </form>
+    <div id="result-{{ a.thread_id }}" class="mt-1"></div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}

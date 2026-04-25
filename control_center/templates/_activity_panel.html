@@ -1,0 +1,83 @@
+<form
+  class="flex flex-wrap items-center gap-2 mb-3 text-xs"
+  id="activity-filter"
+  hx-get="/partials/activity"
+  hx-target="div[hx-get='/partials/activity']"
+  hx-trigger="change, keyup delay:400ms from:input[name='source']"
+  hx-include="this"
+>
+  <select name="event_type" class="px-2 py-1 border border-zinc-300 rounded">
+    <option value="" {% if not filter_type %}selected{% endif %}>any type</option>
+    {% for t in ['job_discovered','job_vip_discovered','job_scored','job_high_score','tailor_completed','application_ready','application_submitted','approval_request','apply_packet','stage_transition','critic_proposal','interview_signal','offer_signal','agent_error','cron_failed','cron_failed_consecutive','gateway_health','secret_detected'] %}
+    <option value="{{ t }}" {% if filter_type == t %}selected{% endif %}>{{ t }}</option>
+    {% endfor %}
+  </select>
+  <input
+    type="text"
+    name="source"
+    placeholder="source contains…"
+    value="{{ filter_source or '' }}"
+    class="px-2 py-1 border border-zinc-300 rounded w-48"
+  >
+  <select name="since" class="px-2 py-1 border border-zinc-300 rounded">
+    <option value="" {% if not filter_since %}selected{% endif %}>any time</option>
+    <option value="5m" {% if filter_since == '5m' %}selected{% endif %}>5 min</option>
+    <option value="30m" {% if filter_since == '30m' %}selected{% endif %}>30 min</option>
+    <option value="1h" {% if filter_since == '1h' %}selected{% endif %}>1 hr</option>
+    <option value="6h" {% if filter_since == '6h' %}selected{% endif %}>6 hrs</option>
+    <option value="24h" {% if filter_since == '24h' %}selected{% endif %}>24 hrs</option>
+  </select>
+  <span class="text-zinc-400">{{ events | length }} events</span>
+</form>
+
+{% if not events %}
+<div class="text-xs text-zinc-400">No events match the current filter.</div>
+{% else %}
+<table class="text-xs w-full">
+  <thead class="text-left text-zinc-500 border-b border-zinc-100">
+    <tr>
+      <th class="py-2 pr-3 font-medium">when</th>
+      <th class="py-2 pr-3 font-medium">type</th>
+      <th class="py-2 pr-3 font-medium">source</th>
+      <th class="py-2 pr-3 font-medium">prio</th>
+      <th class="py-2 font-medium">summary</th>
+    </tr>
+  </thead>
+  <tbody class="divide-y divide-zinc-50">
+  {% for e in events %}
+    <tr class="hover:bg-zinc-50">
+      <td class="py-1.5 pr-3 text-zinc-500 whitespace-nowrap">{{ e.age }}</td>
+      <td class="py-1.5 pr-3"><code class="text-[10px] bg-zinc-100 px-1 rounded">{{ e.event_type }}</code></td>
+      <td class="py-1.5 pr-3 text-zinc-600">{{ e.source }}</td>
+      <td class="py-1.5 pr-3">
+        {% set p = e.priority or 'normal' %}
+        {% if p == 'critical' %}<span class="text-rose-600">●●●</span>
+        {% elif p == 'high' %}<span class="text-amber-600">●●</span>
+        {% elif p == 'low' %}<span class="text-zinc-300">●</span>
+        {% else %}<span class="text-zinc-500">●</span>
+        {% endif %}
+      </td>
+      <td class="py-1.5 text-zinc-700 truncate max-w-md">
+        {% if e.event_type == 'job_scored' or e.event_type == 'job_high_score' %}
+          {{ e.payload.title or '?' }} @ {{ e.payload.company or '?' }} · score {{ e.payload.score or '?' }}
+        {% elif e.event_type == 'stage_transition' %}
+          {{ e.payload.job_title or e.payload.job_id or '?' }} → {{ e.payload.new_stage or '?' }}
+        {% elif e.event_type == 'approval_request' %}
+          ⚠ {{ e.payload.job_title or '?' }} @ {{ e.payload.job_company or '?' }} (score {{ e.payload.score }})
+        {% elif e.event_type == 'apply_packet' %}
+          📦 {{ e.payload.title or '?' }} @ {{ e.payload.company or '?' }}
+        {% elif e.event_type == 'critic_proposal' %}
+          🧠 {{ e.payload.proposal_id or '?' }} ({{ e.payload.kind or '?' }})
+        {% elif e.event_type == 'agent_error' %}
+          ✗ {{ e.payload.subscriber_id or e.payload.error or '?' }}
+        {% elif e.event_type == 'gateway_health' %}
+          {{ e.payload.platform or '?' }} {{ e.payload.status or '?' }}
+        {% else %}
+          {{ e.payload | tojson | truncate(160, True) }}
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}

@@ -1,0 +1,40 @@
+{% if error %}
+<div class="text-red-600 text-sm">Health source error: {{ error }}</div>
+{% else %}
+<div class="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center mb-4">
+  <div class="rounded-md bg-emerald-50 border border-emerald-200 p-3">
+    <div class="text-2xl font-semibold text-emerald-700">{{ summary.healthy or 0 }}</div>
+    <div class="text-xs text-emerald-700/70 uppercase tracking-wide">healthy</div>
+  </div>
+  <div class="rounded-md bg-rose-50 border border-rose-200 p-3">
+    <div class="text-2xl font-semibold text-rose-700">{{ summary.down or 0 }}</div>
+    <div class="text-xs text-rose-700/70 uppercase tracking-wide">down</div>
+  </div>
+  <div class="rounded-md bg-amber-50 border border-amber-200 p-3">
+    <div class="text-2xl font-semibold text-amber-700">{{ summary.error or 0 }}</div>
+    <div class="text-xs text-amber-700/70 uppercase tracking-wide">error</div>
+  </div>
+  <div class="rounded-md bg-zinc-50 border border-zinc-200 p-3">
+    <div class="text-2xl font-semibold text-zinc-700">{{ summary.total or 0 }}</div>
+    <div class="text-xs text-zinc-500 uppercase tracking-wide">total · age {{ ts_age }}</div>
+  </div>
+</div>
+{% if by_state.down or by_state.error %}
+<div class="border-t border-zinc-100 pt-3">
+  <div class="text-xs font-medium uppercase tracking-wide text-zinc-500 mb-2">
+    Components needing attention ({{ (by_state.down + by_state.error) | length }})
+  </div>
+  <ul class="text-xs space-y-1">
+    {% for c in (by_state.error + by_state.down) %}
+    <li class="flex items-baseline gap-2">
+      <span class="font-mono shrink-0 {{ 'text-rose-700' if c.state == 'down' else 'text-amber-700' }}">[{{ c.state[:4] }}]</span>
+      <span class="font-medium truncate">{{ c.name }}</span>
+      <span class="text-zinc-500 truncate">— {{ c.detail }}</span>
+    </li>
+    {% endfor %}
+  </ul>
+</div>
+{% else %}
+<div class="text-xs text-emerald-700">All probes green ✓</div>
+{% endif %}
+{% endif %}

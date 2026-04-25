@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Hermes Control Center</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    .pulse-fresh { animation: pulse-fresh 1s ease-out 1; }
+    @keyframes pulse-fresh {
+      0% { background-color: #fef3c7; }
+      100% { background-color: transparent; }
+    }
+    .htmx-indicator { display: none; }
+    .htmx-request .htmx-indicator { display: inline; }
+  </style>
+</head>
+<body class="bg-zinc-50 text-zinc-900">
+  <header class="bg-white border-b border-zinc-200 px-6 py-3 flex items-center justify-between sticky top-0 z-10">
+    <div class="flex items-center gap-3">
+      <div class="text-2xl">🪽</div>
+      <div>
+        <h1 class="text-lg font-semibold leading-tight">Hermes Control Center</h1>
+        <p class="text-xs text-zinc-500">Phase D · :9120 · last refresh {{ now }}</p>
+      </div>
+    </div>
+    <nav class="flex items-center gap-3 text-sm">
+      <a class="text-zinc-600 hover:text-zinc-900" href="http://localhost:9119/" target="_blank">Hermes Admin :9119 ↗</a>
+      <a class="text-zinc-600 hover:text-zinc-900" href="http://localhost:3050/" target="_blank">Langfuse :3050 ↗</a>
+      <a class="text-zinc-600 hover:text-zinc-900" href="http://localhost:3040/" target="_blank">DevFlow MC :3040 ↗</a>
+      <a class="text-zinc-600 hover:text-zinc-900" href="https://t.me/+rHk32iVGoIoxZTlh" target="_blank">Telegram ↗</a>
+    </nav>
+  </header>
+
+  <main class="max-w-7xl mx-auto p-6 grid grid-cols-12 gap-6">
+
+    <!-- Quick actions row -->
+    <section class="col-span-12 bg-white rounded-lg shadow-sm border border-zinc-200 px-4 py-3 flex items-center gap-3 text-sm">
+      <span class="font-semibold text-sm tracking-tight">Quick actions:</span>
+      <button
+        type="button"
+        class="text-xs px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700"
+        hx-post="/api/apply_packet/next"
+        hx-target="#apply-result"
+        hx-indicator="#apply-spinner"
+      >📦 Open next APPLY_PACKET in browser</button>
+      <span id="apply-spinner" class="htmx-indicator text-xs text-blue-600">⏳ navigating browser-harness…</span>
+      <span id="apply-result" class="text-xs"></span>
+      <span class="text-xs text-zinc-400 ml-auto">Triggers bin/apply_packet_operator.py for the oldest unprocessed packet.</span>
+    </section>
+
+    <!-- Top: health summary (full width) -->
+    <section class="col-span-12 bg-white rounded-lg shadow-sm border border-zinc-200">
+      <div class="px-4 py-3 border-b border-zinc-100 flex items-center justify-between">
+        <h2 class="font-semibold text-sm tracking-tight">Platform Health</h2>
+        <span class="text-xs text-zinc-400">auto-refresh 30s · architecture-map/status.json</span>
+      </div>
+      <div hx-get="/partials/health" hx-trigger="load, every 30s" hx-swap="innerHTML" class="p-4">
+        <div class="text-xs text-zinc-400">Loading…</div>
+      </div>
+    </section>
+
+    <!-- Approval queue -->
+    <section class="col-span-12 lg:col-span-6 bg-white rounded-lg shadow-sm border border-zinc-200">
+      <div class="px-4 py-3 border-b border-zinc-100 flex items-center justify-between">
+        <h2 class="font-semibold text-sm tracking-tight">Pending HITL Approvals</h2>
+        <span class="text-xs text-zinc-400">graphs/approval-log.jsonl</span>
+      </div>
+      <div hx-get="/partials/approvals" hx-trigger="load, every 30s" hx-swap="innerHTML" class="p-4 max-h-[28rem] overflow-y-auto">
+        <div class="text-xs text-zinc-400">Loading…</div>
+      </div>
+    </section>
+
+    <!-- Critic proposals -->
+    <section class="col-span-12 lg:col-span-6 bg-white rounded-lg shadow-sm border border-zinc-200">
+      <div class="px-4 py-3 border-b border-zinc-100 flex items-center justify-between">
+        <h2 class="font-semibold text-sm tracking-tight">Critic Proposals</h2>
+        <span class="text-xs text-zinc-400">critic/workspace/whatsapp_queue.jsonl</span>
+      </div>
+      <div hx-get="/partials/proposals" hx-trigger="load, every 30s" hx-swap="innerHTML" class="p-4 max-h-[28rem] overflow-y-auto">
+        <div class="text-xs text-zinc-400">Loading…</div>
+      </div>
+    </section>
+
+    <!-- Activity feed (full width) -->
+    <section class="col-span-12 bg-white rounded-lg shadow-sm border border-zinc-200">
+      <div class="px-4 py-3 border-b border-zinc-100 flex items-center justify-between">
+        <h2 class="font-semibold text-sm tracking-tight">Recent Activity</h2>
+        <span class="text-xs text-zinc-400">events/event_bus.db · last 40 events</span>
+      </div>
+      <div hx-get="/partials/activity" hx-trigger="load, every 30s" hx-swap="innerHTML" class="p-4 max-h-[24rem] overflow-y-auto">
+        <div class="text-xs text-zinc-400">Loading…</div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="text-center text-xs text-zinc-400 py-6">
+    Hermes Control Center · Phase D iter2 · 2026-04-24
+    · <span id="ws-status" class="text-zinc-500">connecting…</span>
+  </footer>
+
+  <script>
+    // Phase D iter2: live event stream via WebSocket. Each "event" frame
+    // triggers an HTMX refresh of the affected panel. Heartbeats keep the
+    // connection warm. On disconnect we exponential-backoff reconnect.
+    (function() {
+      let ws = null;
+      let backoff = 1000;
+      const statusEl = document.getElementById('ws-status');
+
+      function setStatus(t, color) {
+        if (!statusEl) return;
+        statusEl.textContent = t;
+        statusEl.className = color;
+      }
+
+      function refreshPanel(panel) {
+        // Map panel key -> div selector. We trigger HTMX to refresh just that one.
+        const targets = {
+          'health': 'div[hx-get="/partials/health"]',
+          'approvals': 'div[hx-get="/partials/approvals"]',
+          'proposals': 'div[hx-get="/partials/proposals"]',
+          'activity': 'div[hx-get="/partials/activity"]',
+        };
+        const sel = targets[panel];
+        if (!sel || !window.htmx) return;
+        const el = document.querySelector(sel);
+        if (el) htmx.trigger(el, 'refresh-now');
+      }
+
+      function connect() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const url = `${proto}//${location.host}/ws`;
+        try {
+          ws = new WebSocket(url);
+        } catch (e) {
+          setStatus('ws error', 'text-rose-600');
+          setTimeout(connect, backoff);
+          return;
+        }
+        ws.onopen = () => {
+          backoff = 1000;
+          setStatus('● live', 'text-emerald-600');
+        };
+        ws.onmessage = (msg) => {
+          try {
+            const f = JSON.parse(msg.data);
+            if (f.kind === 'event' && f.panel) {
+              refreshPanel(f.panel);
+              // Activity panel always refreshes too (since every event lands there).
+              if (f.panel !== 'activity') refreshPanel('activity');
+            }
+            // heartbeat & hello are no-ops (status pulse below)
+            setStatus('● live', 'text-emerald-600');
+          } catch (e) { /* ignore malformed frames */ }
+        };
+        ws.onclose = () => {
+          setStatus('● disconnected, retrying…', 'text-amber-600');
+          setTimeout(connect, backoff);
+          backoff = Math.min(backoff * 2, 30000);
+        };
+        ws.onerror = () => { /* onclose will follow */ };
+      }
+
+      // Wire HTMX 'refresh-now' as an additional trigger on each panel,
+      // alongside their existing 'load, every 30s'. (HTMX will accept any
+      // event name here.)
+      document.querySelectorAll('div[hx-trigger]').forEach(el => {
+        const trig = el.getAttribute('hx-trigger');
+        if (trig && !trig.includes('refresh-now')) {
+          el.setAttribute('hx-trigger', `${trig}, refresh-now`);
+        }
+      });
+
+      connect();
+    })();
+  </script>
+</body>
+</html>

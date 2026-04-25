@@ -1,0 +1,90 @@
+{% if not proposals %}
+<div class="text-xs text-zinc-400">No pending proposals 🎉</div>
+{% else %}
+<div class="flex items-center gap-2 mb-3 text-xs">
+  <span class="text-zinc-500">{{ proposals | length }} pending</span>
+  <button
+    type="button"
+    class="ml-auto px-2 py-1 bg-zinc-100 text-zinc-700 border border-zinc-300 rounded hover:bg-zinc-200"
+    hx-post="/api/proposals/bulk-skip-low-risk"
+    hx-target="#bulk-result"
+    hx-confirm="Skip ALL low-risk proposals? They'll disappear from the queue."
+  >⊘ skip all low-risk</button>
+  <button
+    type="button"
+    class="px-2 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded hover:bg-blue-100"
+    hx-post="/api/proposals/bulk-snooze-all"
+    hx-target="#bulk-result"
+    hx-confirm="Snooze EVERY pending proposal?"
+  >⏱ snooze all</button>
+</div>
+<div id="bulk-result" class="mb-2"></div>
+{% endif %}
+{% if proposals %}
+<ul class="divide-y divide-zinc-100">
+  {% for p in proposals %}
+  <li class="py-3 first:pt-0 last:pb-0">
+    <div class="flex items-baseline justify-between gap-2 mb-1">
+      <div class="font-medium text-sm truncate">{{ p.proposal_id }}</div>
+      <span class="text-xs text-zinc-400 whitespace-nowrap">
+        {{ p.age }}
+        · risk <span class="{{ 'text-rose-600' if p.risk == 'high' else ('text-amber-600' if p.risk == 'medium' else 'text-zinc-500') }}">{{ p.risk }}</span>
+      </span>
+    </div>
+    <div class="text-xs text-zinc-600 mb-2">
+      <code class="text-[10px] bg-zinc-100 px-1 rounded">{{ p.kind }}</code>
+    </div>
+    <div class="text-xs text-zinc-800 mb-2">{{ p.summary }}</div>
+    {% if p.specific_change %}
+    <details class="mb-2">
+      <summary class="text-xs text-zinc-500 cursor-pointer">Specific change</summary>
+      <pre class="text-[11px] text-zinc-700 mt-1 bg-zinc-50 p-2 rounded whitespace-pre-wrap">{{ p.specific_change }}</pre>
+    </details>
+    {% endif %}
+    {% if p.rationale %}
+    <details class="mb-2">
+      <summary class="text-xs text-zinc-500 cursor-pointer">Rationale</summary>
+      <div class="text-xs text-zinc-700 mt-1">{{ p.rationale }}</div>
+    </details>
+    {% endif %}
+    {% if p.replay and p.replay.status %}
+    <div class="text-xs mb-2">
+      <span class="text-zinc-500">replay:</span>
+      <span class="font-medium {{ 'text-rose-700' if p.replay.status == 'contradiction_detected' else 'text-zinc-700' }}">{{ p.replay.status }}</span>
+      {% if p.replay.notes %}<span class="text-zinc-500"> — {{ p.replay.notes }}</span>{% endif %}
+    </div>
+    {% endif %}
+    <form class="flex items-center gap-2 mt-2" id="pform-{{ p.proposal_id }}">
+      <input
+        type="text"
+        name="reason"
+        placeholder="(optional note)"
+        class="text-xs flex-1 px-2 py-1 border border-zinc-300 rounded"
+      >
+      <button
+        type="button"
+        class="text-xs px-3 py-1 bg-emerald-600 text-white rounded hover:bg-emerald-700"
+        hx-post="/api/proposal/{{ p.proposal_id }}/applied"
+        hx-include="#pform-{{ p.proposal_id }}"
+        hx-target="#presult-{{ p.proposal_id }}"
+      >applied</button>
+      <button
+        type="button"
+        class="text-xs px-3 py-1 bg-zinc-100 text-zinc-700 border border-zinc-300 rounded hover:bg-zinc-200"
+        hx-post="/api/proposal/{{ p.proposal_id }}/skipped"
+        hx-include="#pform-{{ p.proposal_id }}"
+        hx-target="#presult-{{ p.proposal_id }}"
+      >skip</button>
+      <button
+        type="button"
+        class="text-xs px-3 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded hover:bg-blue-100"
+        hx-post="/api/proposal/{{ p.proposal_id }}/snoozed"
+        hx-include="#pform-{{ p.proposal_id }}"
+        hx-target="#presult-{{ p.proposal_id }}"
+      >snooze</button>
+    </form>
+    <div id="presult-{{ p.proposal_id }}" class="mt-1"></div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
