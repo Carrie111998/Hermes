@@ -119,6 +119,10 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
         """
         return None
 
+    def lag_report(self) -> int:
+        # Filesystem-driven subscriber; doesn't consume bus events. Always 0.
+        return 0
+
     def poll(self) -> int:  # override BaseSubscriber.poll
         """Drain the inbox once. Returns count of files processed.
 

@@ -214,6 +214,22 @@ class BaseSubscriber(ABC):
         except Exception:
             logger.exception("Failed to emit circuit-breaker agent_error")
 
+    def lag_report(self) -> int:
+        """Return how many bus events this subscriber is behind head.
+
+        Default implementation queries the bus using the subscriber's own
+        ``event_types`` / ``min_priority`` filters. Filesystem-driven
+        subscribers (which never consume bus events) should override this
+        to return 0 — otherwise their cursor sits at 0 forever and the
+        registry-level lag check reports the full event count as backlog,
+        triggering false HIGH-priority lag alerts every check interval.
+        """
+        return self.bus.subscriber_lag(
+            self.subscriber_id,
+            event_types=self.event_types,
+            min_priority=self.min_priority,
+        )
+
     def startup(self) -> None:
         """Called once when the subscriber is registered.  Override for init logic."""
 
@@ -270,11 +286,7 @@ class SubscriberRegistry:
         report: Dict[str, int] = {}
         for sub in self.subscribers:
             try:
-                report[sub.subscriber_id] = sub.bus.subscriber_lag(
-                    sub.subscriber_id,
-                    event_types=sub.event_types,
-                    min_priority=sub.min_priority,
-                )
+                report[sub.subscriber_id] = sub.lag_report()
             except Exception:
                 logger.exception("Lag query failed for %s", sub.subscriber_id)
                 report[sub.subscriber_id] = -1  # sentinel for unknown
