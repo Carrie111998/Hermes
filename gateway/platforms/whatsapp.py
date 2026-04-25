@@ -79,6 +79,12 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
+from reply_handlers import (
+    parse as parse_reply_command,
+    execute as execute_reply_command,
+    is_authorized_whatsapp,
+    ParseError,
+)
 
 
 def check_whatsapp_requirements() -> bool:
@@ -947,11 +953,61 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 await asyncio.sleep(5)
             
             await asyncio.sleep(1)  # Poll interval
-    
+
+    async def _maybe_handle_reply_command(self, data: Dict[str, Any]) -> bool:
+        """If the inbound message is a pipeline reply command, route it and return True.
+
+        Returns True if the message was handled (caller should short-circuit normal
+        dispatch). Returns False if it was not a recognised command.
+        """
+        text = str(data.get("body") or "").strip()
+        if not text.startswith("/"):
+            return False
+        first_token = text.split(maxsplit=1)[0].lower()
+        if first_token not in ("/approve", "/reject", "/archive"):
+            return False
+
+        sender_jid = str(data.get("senderId") or data.get("chatId") or "")
+
+        if os.getenv("HERMES_REPLY_HANDLERS_ENABLED", "0") != "1":
+            await self.send(sender_jid, "Reply handlers are disabled.")
+            return True
+
+        if not is_authorized_whatsapp(sender_jid):
+            await self.send(sender_jid, "Not authorized.")
+            return True
+
+        try:
+            intent = parse_reply_command(text)
+        except ParseError as exc:
+            await self.send(sender_jid, str(exc))
+            return True
+        if intent is None:
+            return False
+
+        try:
+            from graphs.jobflow import resume_full as _resume_full
+        except ImportError:
+            _resume_full = None
+
+        result = execute_reply_command(
+            intent,
+            actor=sender_jid.split("@", 1)[0],
+            source="whatsapp",
+            resume_full=_resume_full,
+        )
+        await self.send(sender_jid, result.message)
+        return True
+
     async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
             if not self._should_process_message(data):
+                return None
+
+            # Pipeline reply commands (/approve, /reject, /archive) — handle and
+            # short-circuit before building the LLM-routable MessageEvent.
+            if await self._maybe_handle_reply_command(data):
                 return None
 
             # Determine message type
