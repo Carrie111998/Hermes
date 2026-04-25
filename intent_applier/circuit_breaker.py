@@ -1,8 +1,15 @@
 """Minimal circuit breaker for the JobOps client.
 
-Trips open after N consecutive failures. After `reset_timeout_seconds` of being
-open, the next call enters a half-open state — if it succeeds, the breaker
-fully closes; if it fails, the breaker stays open for another timeout window.
+Trips open after N consecutive failures. After `reset_timeout_seconds` of
+being open, the breaker auto-closes and the failure counter resets — the
+next call passes through unchallenged. If JobOps is still failing, the
+breaker re-trips only after another `failure_threshold` consecutive
+failures (not on the first failure after timeout). This is intentional
+for our use case: IntentApplier falls back to pipeline.json-only writes
+during JobOps outages, so the marginal cost of a few extra probes per
+outage cycle is acceptable in exchange for simpler state machine.
+
+Not thread-safe (assumes single-threaded IntentApplier loop).
 """
 from __future__ import annotations
 
@@ -27,7 +34,7 @@ class SimpleCircuitBreaker:
         if self._opened_at is None:
             return False
         if time.monotonic() - self._opened_at >= self.reset_timeout_seconds:
-            # Half-open: allow next call through
+            # Auto-close after reset window: zero counters, allow next call through.
             self._opened_at = None
             self._consecutive_failures = 0
             logger.info("circuit-breaker: reset timeout elapsed, entering half-open")
