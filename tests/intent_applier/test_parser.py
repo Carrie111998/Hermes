@@ -122,3 +122,10 @@ class TestParseErrors:
         p.write_text("{not valid json", encoding="utf-8")
         with pytest.raises(IntentParseError, match="JSON"):
             parse_intent_file(p)
+
+    def test_top_level_non_dict_raises(self, tmp_path):
+        for value, name in [("42", "int"), ("null", "NoneType"), ("true", "bool"), ("3.14", "float")]:
+            p = tmp_path / f"intent_{name}.json"
+            p.write_text(value, encoding="utf-8")
+            with pytest.raises(IntentParseError, match="must be a dict"):
+                parse_intent_file(p)

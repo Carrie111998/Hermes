@@ -5,7 +5,7 @@ Spec: docs/superpowers/specs/2026-04-25-tracker-intent-applier-design.md
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,11 @@ def parse_intent_file(path: Path) -> IntentMessage:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise IntentParseError(f"intent file {path} contains invalid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise IntentParseError(
+            f"intent file {path} top-level JSON must be a dict, got {type(data).__name__}"
+        )
 
     def require(d: dict, key: str, ctx: str = "") -> Any:
         if key not in d:
