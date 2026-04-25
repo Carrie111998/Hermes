@@ -42,6 +42,18 @@ PROTECTED_STAGES = {"approved", "final_submission", "applied"}
 
 
 class IntentApplier:
+    """Single-writer orchestrator for tracker intent messages.
+
+    Composes parser, idempotency tracker, JobOps client, circuit breaker, and
+    dead-letter helper into the canonical-first dual-write flow.
+
+    Concurrency: single-threaded by design. The intent that the inbox is drained
+    sequentially by one caller (a gateway subscriber poll loop or a one-off
+    `scan_inbox()` call). If concurrent invocation is ever needed, add a Lock
+    around `apply_one` -- currently `is_applied`/`mark_applied` is not race-free
+    against concurrent callers, and `_move_to` would race on the same file.
+    """
+
     def __init__(
         self,
         *,

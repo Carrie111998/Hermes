@@ -147,6 +147,23 @@ class TestApplierFailures:
         assert outcome == "dead_lettered"
         assert (mailbox["dead_letter"] / "bad.json").exists()
 
+    def test_pipeline_write_failure_goes_to_dead_letter(self, mailbox, applier):
+        """If PipelineManager.update_stage raises (e.g. lock timeout, disk full),
+        the intent is treated as a permanent failure and dead-lettered."""
+        a, _jobops, mgr = applier
+        # Replace update_stage with one that always raises
+        from unittest.mock import patch
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        with patch.object(mgr, "update_stage", side_effect=RuntimeError("simulated lock timeout")):
+            outcome = a.apply_one(f)
+        assert outcome == "dead_lettered"
+        assert (mailbox["dead_letter"] / "intent.json").exists()
+        sidecar = mailbox["dead_letter"] / "intent.json.error.json"
+        assert sidecar.exists()
+        info = json.loads(sidecar.read_text())
+        assert info["error_class"] == "RuntimeError"
+        assert "simulated lock timeout" in info["error_message"]
+
     def test_circuit_breaker_open_only_writes_pipeline(self, mailbox, applier):
         a, jobops, _mgr = applier
         # Trip the breaker
