@@ -1,11 +1,23 @@
-"""Execute parsed reply commands: write to PipelineManager, optionally resume HITL graph."""
+"""Execute parsed reply commands by recording an intent in the JobOps API.
+
+Migration note (2026-04-25, Phase 2 → tracker-intent-applier):
+  Earlier this module called PipelineManager.update_stage directly. It now
+  records intents through JobOps API; the tracker-intent-applier subscriber
+  consumes the intent message and writes both pipeline.json and Postgres
+  in canonical-first order. See spec at
+  docs/superpowers/specs/2026-04-25-tracker-intent-applier-design.md.
+"""
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Optional
 
-from pipeline_state import PipelineManager
+from intent_applier import (
+    JobOpsClient,
+    JobOpsClientPermanentError,
+    JobOpsClientTransientError,
+)
 
 from .parser import CommandIntent
 
@@ -38,70 +50,60 @@ def execute(
     *,
     actor: str,
     source: str,
-    manager: Optional[PipelineManager] = None,
-    resume_full: Optional[Callable[[str, dict], object]] = None,
+    jobops_client: Optional[JobOpsClient] = None,
+    thread_id: Optional[str] = None,
 ) -> CommandResult:
-    """Apply a CommandIntent: update pipeline.json, optionally resume LangGraph thread.
-
-    Args:
-        intent: parsed command (verb + job_id + reason)
-        actor: human/agent identifier ("diego", or sender JID/user_id)
-        source: 'telegram' or 'whatsapp' (must be in pipeline_state.KNOWN_SOURCES)
-        manager: optional injected PipelineManager (default: new instance reading
-                 the canonical workspace path)
-        resume_full: optional callable; if given, called as
-                     resume_full(thread_id, {"approval": ...}) after a successful
-                     stage write. Failures are logged but do not affect the
-                     CommandResult — the pipeline write is the source of truth.
+    """Record an intent for the given verb. The tracker-intent-applier inside
+    the gateway will eventually write pipeline.json + Postgres.
     """
     new_stage = VERB_TO_STAGE.get(intent.verb)
     if new_stage is None:
         return CommandResult(ok=False, message=f"Unknown command: /{intent.verb}")
 
-    mgr = manager or PipelineManager()
+    client = jobops_client or JobOpsClient()
+    metadata = {"original_source": source}
+    if thread_id:
+        metadata["thread_id"] = thread_id
 
-    job = mgr.get_job(intent.job_id)
-    if job is None:
+    if intent.reason:
+        notes = f"{source}: {actor} {intent.verb} — {intent.reason}"
+    else:
+        notes = f"{source}: {actor} {intent.verb}"
+
+    try:
+        client.post_intent(
+            job_id=intent.job_id,
+            stage=new_stage,
+            actor_id=actor,
+            source=source,
+            notes=notes,
+            metadata=metadata,
+        )
+    except JobOpsClientPermanentError as exc:
+        logger.warning("reply-handler intent rejected: %s", exc)
+        msg = str(exc)
+        if "404" in msg or "not found" in msg.lower():
+            return CommandResult(
+                ok=False,
+                message=f"Job {intent.job_id} not found in pipeline.",
+                job_id=intent.job_id,
+            )
+        return CommandResult(ok=False, message=f"Intent rejected: {msg}")
+    except JobOpsClientTransientError as exc:
+        logger.warning("reply-handler intent transient failure: %s", exc)
         return CommandResult(
             ok=False,
-            message=f"Job {intent.job_id} not found in pipeline.",
+            message="Pipeline service is unreachable; please try again in a moment.",
             job_id=intent.job_id,
         )
 
-    notes = f"{source}: {actor} {intent.verb}"
-    if intent.reason:
-        notes += f" — {intent.reason}"
-
-    mgr.update_stage(
-        job_id=intent.job_id,
-        new_stage=new_stage,
-        actor=actor,
-        source=source,
-        notes=notes,
-    )
     logger.info(
-        "reply_handlers: %s %s -> %s (actor=%s source=%s)",
+        "reply-handler: queued intent verb=%s job=%s stage=%s actor=%s source=%s",
         intent.verb, intent.job_id, new_stage, actor, source,
     )
-
-    if resume_full is not None:
-        thread_id = f"job-{intent.job_id}"
-        approval = VERB_TO_APPROVAL[intent.verb]
-        try:
-            resume_full(thread_id, {"approval": approval})
-            logger.info(
-                "reply_handlers: resumed thread %s with approval=%s",
-                thread_id, approval,
-            )
-        except Exception as exc:
-            logger.info(
-                "reply_handlers: resume_full(%s) skipped (%s: %s)",
-                thread_id, exc.__class__.__name__, exc,
-            )
-
     return CommandResult(
         ok=True,
-        message=f"Job {intent.job_id} → {new_stage}.",
+        message=f"Job {intent.job_id} → {new_stage} (queued).",
         job_id=intent.job_id,
         new_stage=new_stage,
     )

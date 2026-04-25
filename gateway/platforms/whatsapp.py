@@ -1019,16 +1019,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if intent is None:
             return False
 
-        try:
-            from graphs.jobflow import resume_full as _resume_full
-        except ImportError:
-            _resume_full = None
-
         result = execute_reply_command(
             intent,
             actor=sender_jid.split("@", 1)[0],
             source="whatsapp",
-            resume_full=_resume_full,
         )
         await self.send(sender_jid, result.message)
         return True

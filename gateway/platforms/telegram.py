@@ -2301,17 +2301,10 @@ class TelegramAdapter(BasePlatformAdapter):
             await update.message.reply_text(f"Could not parse /{verb} command.")
             return
 
-        # Lazy import resume_full to avoid pulling the graph stack at module load
-        try:
-            from graphs.jobflow import resume_full as _resume_full
-        except ImportError:
-            _resume_full = None
-
         result = execute_reply_command(
             intent,
             actor=str(user.id),
             source="telegram",
-            resume_full=_resume_full,
         )
         await update.message.reply_text(result.message)
 
