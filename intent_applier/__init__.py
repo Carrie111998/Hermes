@@ -1,10 +1,15 @@
 from .parser import IntentMessage, IntentParseError, parse_intent_file, VALID_INTENT_TYPES
 from .idempotency import IdempotencyTracker
+from .jobops_client import (
+    JobOpsClient,
+    JobOpsClientError,
+    JobOpsClientPermanentError,
+    JobOpsClientTransientError,
+)
 
 __all__ = [
-    "IntentMessage",
-    "IntentParseError",
-    "parse_intent_file",
-    "VALID_INTENT_TYPES",
+    "IntentMessage", "IntentParseError", "parse_intent_file", "VALID_INTENT_TYPES",
     "IdempotencyTracker",
+    "JobOpsClient", "JobOpsClientError",
+    "JobOpsClientPermanentError", "JobOpsClientTransientError",
 ]
