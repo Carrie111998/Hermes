@@ -411,6 +411,79 @@ async def api_proposals_bulk_snooze_all():
 
 
 # ---------------------------------------------------------------------------
+# Pipeline state JSON API (v1) — for the legacy :3002 dashboard server.js
+# and any other process-local client that needs a write-through into
+# pipeline.json. Replaces the pattern of foreign processes doing
+# read-modify-writeFile on pipeline.json directly (which races with
+# PipelineManager and produces history entries without source attribution).
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/v1/pipeline/jobs/{job_id}/stage")
+async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONResponse:
+    """Update a job's stage via PipelineManager.
+
+    Request body (JSON):
+        {
+            "stage": "approved",                 # required, in VALID_STAGES
+            "actor": "diego",                     # optional, default "diego"
+            "source": "legacy_dashboard",         # optional, default "legacy_dashboard"
+            "notes": "...",                       # optional
+            "metadata": {...}                     # optional, merged non-destructively
+        }
+
+    Returns: {"ok": True, "job_id": "...", "stage": "..."} on success.
+
+    Errors:
+        400 if stage missing
+        404 if job_id not in pipeline.json (no upsert from this endpoint —
+            unknown jobs are surfaced as errors so callers don't accidentally
+            create stray records via typos)
+        500 on PipelineManager exception
+    """
+    from pipeline_state import PipelineManager
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+
+    stage = (payload.get("stage") or "").strip()
+    if not stage:
+        return JSONResponse({"ok": False, "error": "stage is required"}, status_code=400)
+
+    actor = (payload.get("actor") or "diego").strip()
+    source = (payload.get("source") or "legacy_dashboard").strip()
+    notes = payload.get("notes") or ""
+    metadata = payload.get("metadata") or None
+
+    mgr = PipelineManager()
+    if mgr.get_job(job_id) is None:
+        return JSONResponse(
+            {"ok": False, "error": f"job {job_id} not found in pipeline"},
+            status_code=404,
+        )
+
+    try:
+        mgr.update_stage(
+            job_id=job_id,
+            new_stage=stage,
+            actor=actor,
+            source=source,
+            notes=notes,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.exception("api_v1_pipeline_jobs_stage failed for %s", job_id)
+        return JSONResponse(
+            {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"},
+            status_code=500,
+        )
+
+    return JSONResponse({"ok": True, "job_id": job_id, "stage": stage})
+
+
+# ---------------------------------------------------------------------------
 # Health (for laptop-monitor probe)
 # ---------------------------------------------------------------------------
 
