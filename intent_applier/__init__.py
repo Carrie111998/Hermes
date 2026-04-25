@@ -6,10 +6,12 @@ from .jobops_client import (
     JobOpsClientPermanentError,
     JobOpsClientTransientError,
 )
+from .circuit_breaker import CircuitBreakerOpen, SimpleCircuitBreaker
 
 __all__ = [
     "IntentMessage", "IntentParseError", "parse_intent_file", "VALID_INTENT_TYPES",
     "IdempotencyTracker",
     "JobOpsClient", "JobOpsClientError",
     "JobOpsClientPermanentError", "JobOpsClientTransientError",
+    "CircuitBreakerOpen", "SimpleCircuitBreaker",
 ]
