@@ -81,6 +81,12 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from reply_handlers import (
+    parse as parse_reply_command,
+    execute as execute_reply_command,
+    is_authorized_telegram,
+    ParseError,
+)
 
 
 def check_telegram_requirements() -> bool:
@@ -646,6 +652,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.TEXT & ~filters.COMMAND,
                 self._handle_text_message
             ))
+            # Pipeline reply commands (/approve, /reject, /archive) — register
+            # specific CommandHandlers BEFORE the generic command handler so
+            # python-telegram-bot's dispatcher picks them first. The closure
+            # default-arg `v=_verb` is required to capture the loop variable.
+            for _verb in ("approve", "reject", "archive"):
+                self._app.add_handler(CommandHandler(
+                    _verb,
+                    lambda u, c, v=_verb: self._handle_reply_command(u, c, v),
+                ))
             self._app.add_handler(TelegramMessageHandler(
                 filters.COMMAND,
                 self._handle_command
@@ -2252,10 +2267,54 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(update.message, is_command=True):
             return
-        
+
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
-    
+
+    async def _handle_reply_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        verb: str,
+    ) -> None:
+        """Handle /approve, /reject, /archive — route through reply_handlers.execute."""
+        if os.getenv("HERMES_REPLY_HANDLERS_ENABLED", "0") != "1":
+            await update.message.reply_text(
+                "Reply handlers are disabled. Set HERMES_REPLY_HANDLERS_ENABLED=1 to enable."
+            )
+            return
+
+        user = update.effective_user
+        if user is None or update.message is None:
+            return
+        if not is_authorized_telegram(user.id):
+            await update.message.reply_text("Not authorized.")
+            return
+
+        text = (update.message.text or "").strip()
+        try:
+            intent = parse_reply_command(text)
+        except ParseError as exc:
+            await update.message.reply_text(str(exc))
+            return
+        if intent is None or intent.verb != verb:
+            await update.message.reply_text(f"Could not parse /{verb} command.")
+            return
+
+        # Lazy import resume_full to avoid pulling the graph stack at module load
+        try:
+            from graphs.jobflow import resume_full as _resume_full
+        except ImportError:
+            _resume_full = None
+
+        result = execute_reply_command(
+            intent,
+            actor=str(user.id),
+            source="telegram",
+            resume_full=_resume_full,
+        )
+        await update.message.reply_text(result.message)
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:
