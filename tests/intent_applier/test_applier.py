@@ -102,7 +102,7 @@ class TestApplierHappyPath:
         jobops.post_legacy_stage.assert_called_once()
         call = jobops.post_legacy_stage.call_args
         assert call.kwargs["stage"] == "approved"
-        assert call.kwargs["actor_id"] == "tracker"
+        assert call.kwargs["actor_id"] == "diego"
         assert call.kwargs["source"] == "tracker_mailbox"
 
     def test_idempotency_skip(self, mailbox, applier):

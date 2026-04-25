@@ -140,7 +140,7 @@ class TestIntentFlowE2E:
         assert len(jobops_stub["calls"].legacy_calls) == 1
         call = jobops_stub["calls"].legacy_calls[0]
         assert "linkedin-1" in call["path"]
-        assert call["body"]["actorId"] == "tracker"
+        assert call["body"]["actorId"] == "diego"
         assert call["body"]["source"] == "tracker_mailbox"
 
     def test_partial_path_when_jobops_5xx(self, applier, jobops_stub, pipeline_path):

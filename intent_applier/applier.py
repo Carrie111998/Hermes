@@ -143,7 +143,7 @@ class IntentApplier:
             self.jobops_client.post_legacy_stage(
                 job_id=msg.job_id,
                 stage=msg.requested_stage,
-                actor_id="tracker",
+                actor_id=msg.actor_id,
                 source="tracker_mailbox",
                 notes=msg.notes,
             )
