@@ -54,6 +54,51 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
 
+// Outbound strict mode: refuse to send messages to any chatId that isn't
+// an allowed user (or an allow-listed group). On 2026-04-19 a pairing code
+// leaked into a WhatsApp group; this guard is the final backstop in the
+// data path. Default: ON when ALLOWED_USERS is configured without '*',
+// OFF otherwise (backward-compatible). Override explicitly with
+// WHATSAPP_OUTBOUND_STRICT=0|1.
+function resolveOutboundStrict() {
+  const raw = (process.env.WHATSAPP_OUTBOUND_STRICT || '').trim().toLowerCase();
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false;
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
+  // Default: auto — strict when we have a concrete allowlist
+  return ALLOWED_USERS.size > 0 && !ALLOWED_USERS.has('*');
+}
+const OUTBOUND_STRICT = resolveOutboundStrict();
+const OUTBOUND_ALLOWED_CHATS = new Set(
+  String(process.env.WHATSAPP_OUTBOUND_ALLOWED_CHATS || '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+);
+
+function isOutboundChatAllowed(chatId) {
+  if (!OUTBOUND_STRICT) return true;
+  if (!chatId) return false;
+  // Explicit per-chat allowlist (e.g. specific group JIDs the user opted in)
+  if (OUTBOUND_ALLOWED_CHATS.has(chatId)) return true;
+  // Never send to groups/broadcasts in strict mode unless explicitly allow-listed above
+  if (chatId.endsWith('@g.us') || chatId.endsWith('@broadcast')) return false;
+  // DMs: only allowed if the target expands to a user in WHATSAPP_ALLOWED_USERS
+  return matchesAllowedUser(chatId, ALLOWED_USERS, SESSION_DIR);
+}
+
+const recentOutboundRejections = new Set();
+function logOutboundRejection(endpoint, chatId, reason) {
+  const key = `${endpoint}|${chatId}`;
+  if (recentOutboundRejections.has(key)) return;
+  recentOutboundRejections.add(key);
+  if (recentOutboundRejections.size > 200) {
+    // Bound the cache so it doesn't grow unbounded in adversarial cases
+    const first = recentOutboundRejections.values().next().value;
+    recentOutboundRejections.delete(first);
+  }
+  console.warn(`[bridge] OUTBOUND REJECTED ${endpoint} chatId=${chatId} reason=${reason}`);
+}
+
 function formatOutgoingMessage(message) {
   // In bot mode, messages come from a different number so the prefix is
   // redundant — the sender identity is already clear.  Only prepend in
@@ -381,6 +426,14 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
+  if (!isOutboundChatAllowed(chatId)) {
+    logOutboundRejection('/send', chatId, 'strict-allowlist');
+    return res.status(403).json({
+      error: 'chatId not permitted by WHATSAPP_OUTBOUND_STRICT allowlist',
+      chatId,
+    });
+  }
+
   try {
     const sent = await sock.sendMessage(chatId, { text: formatOutgoingMessage(message) });
 
@@ -407,6 +460,14 @@ app.post('/edit', async (req, res) => {
   const { chatId, messageId, message } = req.body;
   if (!chatId || !messageId || !message) {
     return res.status(400).json({ error: 'chatId, messageId, and message are required' });
+  }
+
+  if (!isOutboundChatAllowed(chatId)) {
+    logOutboundRejection('/edit', chatId, 'strict-allowlist');
+    return res.status(403).json({
+      error: 'chatId not permitted by WHATSAPP_OUTBOUND_STRICT allowlist',
+      chatId,
+    });
   }
 
   try {
@@ -446,6 +507,14 @@ app.post('/send-media', async (req, res) => {
   const { chatId, filePath, mediaType, caption, fileName } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+
+  if (!isOutboundChatAllowed(chatId)) {
+    logOutboundRejection('/send-media', chatId, 'strict-allowlist');
+    return res.status(403).json({
+      error: 'chatId not permitted by WHATSAPP_OUTBOUND_STRICT allowlist',
+      chatId,
+    });
   }
 
   try {
@@ -506,6 +575,12 @@ app.post('/typing', async (req, res) => {
   const { chatId } = req.body;
   if (!chatId) return res.status(400).json({ error: 'chatId required' });
 
+  if (!isOutboundChatAllowed(chatId)) {
+    // Silently drop typing indicators for disallowed targets — don't leak
+    // presence to groups or strangers.
+    return res.json({ success: false });
+  }
+
   try {
     await sock.sendPresenceUpdate('composing', chatId);
     res.json({ success: true });
@@ -563,6 +638,14 @@ if (PAIR_ONLY) {
       console.log(`🔒 Allowed users: ${Array.from(ALLOWED_USERS).join(', ')}`);
     } else {
       console.log(`⚠️  No WHATSAPP_ALLOWED_USERS set — all messages will be processed`);
+    }
+    if (OUTBOUND_STRICT) {
+      const extra = OUTBOUND_ALLOWED_CHATS.size
+        ? ` (+ ${OUTBOUND_ALLOWED_CHATS.size} explicit chatIds)`
+        : '';
+      console.log(`🔐 Outbound strict mode: ON — /send refuses non-allowlist targets${extra}`);
+    } else {
+      console.log(`🔓 Outbound strict mode: OFF — all send targets permitted`);
     }
     console.log();
     startSocket();

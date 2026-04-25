@@ -2746,8 +2746,26 @@ class GatewayRunner:
             logger.debug("Ignoring message with no user_id from %s", source.platform.value)
             return None
         elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
+            logger.warning(
+                "Unauthorized user: %s (%s) on %s chat_type=%s chat_id=%s",
+                source.user_id, source.user_name, source.platform.value,
+                source.chat_type, source.chat_id,
+            )
+            # HARD STOP: never send any auto-response to group chats. On
+            # 2026-04-19 a pairing code leaked into the "Ted" WhatsApp group;
+            # the downstream DM guard wasn't enough — this early-return is the
+            # load-bearing invariant. Do not replace with an elif below.
+            if source.chat_type == "group":
+                return None
+            # WhatsApp-specific: even in DMs, never send pairing unless the
+            # user explicitly opts in via HERMES_WHATSAPP_ALLOW_PAIRING=1.
+            # Default is silent so unknown DMs (e.g. strangers who guessed
+            # the number) get no response at all.
+            if source.platform == Platform.WHATSAPP and os.getenv(
+                "HERMES_WHATSAPP_ALLOW_PAIRING", ""
+            ).lower() not in ("true", "1", "yes"):
+                return None
+            # In DMs: offer pairing code. In groups: silently ignore (handled above).
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
@@ -2761,6 +2779,10 @@ class GatewayRunner:
                 if code:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
+                        logger.info(
+                            "Sending pairing code to unauthorized %s DM: chat_id=%s user_id=%s",
+                            platform_name, source.chat_id, source.user_id,
+                        )
                         await adapter.send(
                             source.chat_id,
                             f"Hi~ I don't recognize you yet!\n\n"
@@ -2771,6 +2793,10 @@ class GatewayRunner:
                 else:
                     adapter = self.adapters.get(source.platform)
                     if adapter:
+                        logger.info(
+                            "Sending pairing rate-limit notice to %s DM: chat_id=%s user_id=%s",
+                            platform_name, source.chat_id, source.user_id,
+                        )
                         await adapter.send(
                             source.chat_id,
                             "Too many pairing requests right now~ "

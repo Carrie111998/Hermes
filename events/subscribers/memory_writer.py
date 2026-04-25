@@ -69,6 +69,16 @@ RATE_LIMITS = {
 class MemoryWriter(BaseSubscriber):
     subscriber_id = "memory-writer"
     poll_interval_seconds = 60
+    # Bus-level filter: only fetch events that MEMORY_ROUTING actually cares
+    # about. Before this fix (2026-04-24, Weekend 3), MemoryWriter pulled
+    # every event on the bus (default event_types=None = all) and discarded
+    # ~99% of them in handle() via the MEMORY_ROUTING dict lookup. With the
+    # secret-scanner emitting ~647K events/month, cursor lag grew to ~73K
+    # events behind head — surfaced by the first Critic historical retro on
+    # 2026-04-24. Filtering at the bus subscribe() layer drops per-poll work
+    # from O(all) to O(routed) and lets the cursor drain. See
+    # events/subscribers/base.py::poll for where this is consumed.
+    event_types = list(MEMORY_ROUTING.keys())
 
     def __init__(self, bus: EventBus):
         super().__init__(bus)

@@ -270,6 +270,95 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if self._message_mentions_bot(data):
             return True
         return self._message_matches_mention_patterns(data)
+
+    @staticmethod
+    def _normalize_whatsapp_strict_identifier(value: Any) -> str:
+        """Reduce a WhatsApp JID/LID/phone to its bare numeric form."""
+        return (
+            str(value or "")
+            .strip()
+            .replace("+", "", 1)
+            .split(":", 1)[0]
+            .split("@", 1)[0]
+        )
+
+    def _expand_whatsapp_strict_aliases(self, identifier: str) -> set[str]:
+        """Resolve phone↔LID aliases using this adapter's session dir."""
+        normalized = self._normalize_whatsapp_strict_identifier(identifier)
+        if not normalized:
+            return set()
+        resolved: set[str] = set()
+        queue = [normalized]
+        while queue:
+            current = queue.pop(0)
+            if not current or current in resolved:
+                continue
+            resolved.add(current)
+            for suffix in ("", "_reverse"):
+                mapping_path = self._session_path / f"lid-mapping-{current}{suffix}.json"
+                if not mapping_path.exists():
+                    continue
+                try:
+                    mapped = self._normalize_whatsapp_strict_identifier(
+                        json.loads(mapping_path.read_text(encoding="utf-8"))
+                    )
+                except Exception:
+                    continue
+                if mapped and mapped not in resolved:
+                    queue.append(mapped)
+        return resolved
+
+    def _is_sender_blocked_by_strict_allowlist(
+        self, data: Dict[str, Any], chat_id_value: str
+    ) -> bool:
+        """Drop messages whose sender is outside WHATSAPP_ALLOWED_USERS.
+
+        This is a platform-level backstop so that if the Node bridge's
+        allowlist ever leaks (as happened on 2026-04-19), unauthorized
+        traffic is still rejected before building the MessageEvent.
+        Returns True if the message must be dropped.
+        """
+        allowlist_raw = os.getenv("WHATSAPP_ALLOWED_USERS", "").strip()
+        if not allowlist_raw:
+            return False
+        allowed_tokens = {tok.strip() for tok in allowlist_raw.split(",") if tok.strip()}
+        if not allowed_tokens or "*" in allowed_tokens:
+            return False
+
+        sender_id = str(data.get("senderId") or "")
+        if not sender_id:
+            logger.warning(
+                "[%s] Dropping WhatsApp message with empty senderId (chat_id=%s)",
+                self.name, chat_id_value,
+            )
+            return True
+
+        sender_aliases = self._expand_whatsapp_strict_aliases(sender_id)
+        allowed_aliases: set[str] = set()
+        for token in allowed_tokens:
+            allowed_aliases.update(self._expand_whatsapp_strict_aliases(token))
+            allowed_aliases.add(self._normalize_whatsapp_strict_identifier(token))
+
+        if sender_aliases & allowed_aliases:
+            return False
+
+        # Not allowed. Log with full context so leaks are debuggable, but
+        # cap verbosity: log once per sender per adapter lifetime so a
+        # persistent spammer doesn't flood the log.
+        cache = getattr(self, "_strict_allowlist_logged", None)
+        if cache is None:
+            cache = set()
+            self._strict_allowlist_logged = cache
+        cache_key = f"{sender_id}|{chat_id_value}"
+        if cache_key not in cache:
+            cache.add(cache_key)
+            logger.warning(
+                "[%s] Strict allowlist drop: sender=%s chat_id=%s is_group=%s sender_name=%r",
+                self.name, sender_id, chat_id_value,
+                bool(data.get("isGroup")) or chat_id_value.endswith("@g.us"),
+                data.get("senderName"),
+            )
+        return True
     
     async def connect(self) -> bool:
         """
@@ -878,13 +967,26 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 else:
                     msg_type = MessageType.DOCUMENT
             
-            # Determine chat type
-            is_group = data.get("isGroup", False)
+            # Determine chat type. Defense-in-depth: if the bridge ever
+            # forgets to set `isGroup`, derive it from the @g.us suffix so
+            # the pairing flow's `chat_type == "group"` hard-stop still fires.
+            chat_id_value = str(data.get("chatId") or "")
+            is_group = bool(data.get("isGroup")) or chat_id_value.endswith("@g.us")
             chat_type = "group" if is_group else "dm"
-            
+
+            # Strict allowlist backstop: the Node bridge already filters on
+            # WHATSAPP_ALLOWED_USERS, but on 2026-04-19 an unauthorized user
+            # (JAYUSA / 24881232134201@lid) still reached this handler and
+            # triggered the pairing flow. Re-check here so that even if the
+            # bridge filter regresses, unauthorized WhatsApp traffic is
+            # dropped at the platform boundary before any handler path can
+            # run. Controlled by env so behavior remains opt-in per platform.
+            if self._is_sender_blocked_by_strict_allowlist(data, chat_id_value):
+                return None
+
             # Build source
             source = self.build_source(
-                chat_id=data.get("chatId", ""),
+                chat_id=chat_id_value,
                 chat_name=data.get("chatName"),
                 chat_type=chat_type,
                 user_id=data.get("senderId"),

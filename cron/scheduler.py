@@ -40,6 +40,31 @@ from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
+# OTel — defensive; if obs/ or opentelemetry isn't installed, cron still runs.
+try:
+    from obs import get_tracer as _obs_get_tracer  # noqa: E402
+    _CRON_TRACER = _obs_get_tracer("hermes.cron")
+except Exception:  # pragma: no cover
+    _CRON_TRACER = None
+
+
+class _NoopCronSpan:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def set_attribute(self, *a, **kw): pass
+    def record_exception(self, *a, **kw): pass
+    def set_status(self, *a, **kw): pass
+    def add_event(self, *a, **kw): pass
+
+
+def _start_cron_span(name: str):
+    if _CRON_TRACER is None:
+        return _NoopCronSpan()
+    try:
+        return _CRON_TRACER.start_as_current_span(name)
+    except Exception:
+        return _NoopCronSpan()
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -1016,6 +1041,19 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         logger.debug("Event emit failed: %s", ee)
 
                 import time as _time
+                _cron_job_name = job.get("name", job["id"])
+                # OTel: one span per cron fire. Covers run_job + delivery + event emission.
+                # start_as_current_span returns a context manager; __enter__ returns the
+                # actual Span object that carries set_attribute etc. We must call attribute
+                # methods on the Span (not the cm) or they silently no-op.
+                _cron_cm = _start_cron_span(f"cron.run_job:{_cron_job_name}")
+                _cron_span = _cron_cm.__enter__()  # real Span (or _NoopCronSpan)
+                try:
+                    _cron_span.set_attribute("cron.job_id", job["id"])
+                    _cron_span.set_attribute("cron.job_name", _cron_job_name)
+                    _cron_span.set_attribute("cron.schedule", str(job.get("schedule_display", "")))
+                except Exception:
+                    pass
                 _job_start = _time.monotonic()
                 success, output, final_response, error = run_job(job)
                 _job_duration = _time.monotonic() - _job_start
@@ -1071,9 +1109,40 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     except Exception as ee:
                         logger.debug("Event emit failed: %s", ee)
 
+                # OTel: finalize cron span with execution results + exit ctx.
+                try:
+                    _cron_span.set_attribute("cron.success", bool(success))
+                    _cron_span.set_attribute("cron.duration_s", round(_job_duration, 3))
+                    _cron_span.set_attribute("cron.output_chars", len(output or ""))
+                    if not success:
+                        _cron_span.set_attribute("cron.error", (error or "")[:500])
+                        try:
+                            from opentelemetry.trace import Status, StatusCode
+                            _cron_span.set_status(Status(StatusCode.ERROR, (error or "unknown")[:200]))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    _cron_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+
                 executed += 1
 
             except Exception as e:
+                # OTel: record unexpected exception on the cron span if one is open.
+                try:
+                    if '_cron_span' in locals() and '_cron_cm' in locals():
+                        _cron_span.record_exception(e)
+                        try:
+                            from opentelemetry.trace import Status, StatusCode
+                            _cron_span.set_status(Status(StatusCode.ERROR, str(e)[:200]))
+                        except Exception:
+                            pass
+                        _cron_cm.__exit__(type(e), e, e.__traceback__)
+                except Exception:
+                    pass
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
 

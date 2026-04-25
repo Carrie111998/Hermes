@@ -76,6 +76,27 @@ class EventType(Enum):
     # Security
     SECRET_DETECTED = ("secret_detected", Priority.HIGH)
 
+    # Phase B Stage-3 iter2 (HITL + apply + tracker -> Postgres)
+    APPROVAL_REQUEST = ("approval_request", Priority.HIGH)
+    APPLY_PACKET = ("apply_packet", Priority.NORMAL)
+
+    # Phase C iter2 (Critic proposals routed to WhatsApp/Telegram)
+    CRITIC_PROPOSAL = ("critic_proposal", Priority.NORMAL)
+
+    # Watchdog signals — added 2026-04-25 (iter5).
+    # Previously these were emitted via _emit_event()'s AGENT_ERROR fallback
+    # when the requested EventType didn't exist, with the real type stuffed
+    # into payload.watchdog_type. That caused the 2026-04-24 cluster-feedback
+    # flood (watchdog detected its own AGENT_ERROR emissions as a cluster ->
+    # emitted more AGENT_ERRORs -> next sweep saw a bigger cluster -> ...).
+    # Promoting them to first-class EventType members removes the
+    # source=watchdog hack downstream.
+    WATCHDOG_TICK = ("watchdog_tick", Priority.LOW)
+    WATCHDOG_PROBE_TRANSITION = ("watchdog_probe_transition", Priority.HIGH)
+    WATCHDOG_SILENCE_ALERT = ("watchdog_silence_alert", Priority.HIGH)
+    WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
+    AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

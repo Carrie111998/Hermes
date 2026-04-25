@@ -21,6 +21,32 @@ from events.schema import Event, EventType, Priority
 
 logger = logging.getLogger(__name__)
 
+# OTel tracing — defensive import so subscribers still work if obs/ or
+# opentelemetry isn't installed (e.g. tests, CI).
+try:
+    from obs import get_tracer  # noqa: E402
+    _TRACER = get_tracer("hermes.subscribers")
+except Exception:  # pragma: no cover
+    _TRACER = None
+
+
+class _NoopSpan:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def set_attribute(self, *a, **kw): pass
+    def record_exception(self, *a, **kw): pass
+    def set_status(self, *a, **kw): pass
+    def add_event(self, *a, **kw): pass
+
+
+def _start_span(name: str):
+    if _TRACER is None:
+        return _NoopSpan()
+    try:
+        return _TRACER.start_as_current_span(name)
+    except Exception:
+        return _NoopSpan()
+
 
 class BaseSubscriber(ABC):
     """Abstract base class for event bus subscribers.
@@ -89,38 +115,62 @@ class BaseSubscriber(ABC):
             if self.bus.is_handled(self.subscriber_id, event.event_id):
                 processed_ids.append(event.event_id)
                 continue
-            try:
-                self.handle(event)
-                self._consecutive_errors = 0  # any success resets the counter
-                # SR-101: mark handled AFTER success. Wrapped so a bus-level
-                # failure doesn't cascade into the subscriber.
+            # OTel: wrap handle() in a span. One span per subscriber-event
+            # invocation. Breaker + dead-letter logic lives inside the span's
+            # except block so a failure is recorded on the span AND drives the
+            # breaker. Span attributes + exception are safe for any tracer.
+            with _start_span(f"subscriber.handle:{self.subscriber_id}") as _span:
+                _span.set_attribute("subscriber.id", self.subscriber_id)
+                _span.set_attribute("event.id", event.event_id)
                 try:
-                    self.bus.mark_handled(self.subscriber_id, event.event_id)
-                except Exception:
-                    logger.exception("Failed to mark handled for %s", event.event_id)
-            except Exception as exc:
-                logger.exception(
-                    "Subscriber %s failed to handle event %s (%s)",
-                    self.subscriber_id, event.event_id, event.event_type.type_string,
-                )
-                self._consecutive_errors += 1
-                # SR-109: record per-(event, subscriber) dead-letter for
-                # observability. Never cascade a bus error into the subscriber.
-                try:
-                    self.bus.record_dead_letter(
-                        self.subscriber_id,
-                        event.event_id,
-                        f"{type(exc).__name__}: {exc}",
+                    _span.set_attribute(
+                        "event.type",
+                        event.event_type.type_string
+                        if hasattr(event.event_type, "type_string")
+                        else str(event.event_type),
                     )
+                    _span.set_attribute("event.source", str(getattr(event, "source", "")))
+                    _span.set_attribute("event.priority", str(getattr(event, "priority", "")))
                 except Exception:
-                    logger.exception("Failed to record dead-letter for %s", event.event_id)
-                if self._consecutive_errors >= self.CIRCUIT_BREAKER_ERROR_THRESHOLD:
-                    # Trip the breaker.  Ack what we successfully processed
-                    # so those events don't re-appear in lag, then bail out.
-                    self._trip_circuit_breaker()
-                    processed_ids.append(event.event_id)
-                    self.bus.ack(self.subscriber_id, processed_ids)
-                    return len(processed_ids)
+                    pass
+                try:
+                    self.handle(event)
+                    self._consecutive_errors = 0  # any success resets the counter
+                    # SR-101: mark handled AFTER success. Wrapped so a bus-level
+                    # failure doesn't cascade into the subscriber.
+                    try:
+                        self.bus.mark_handled(self.subscriber_id, event.event_id)
+                    except Exception:
+                        logger.exception("Failed to mark handled for %s", event.event_id)
+                except Exception as exc:
+                    _span.record_exception(exc)
+                    try:
+                        from opentelemetry.trace import Status, StatusCode
+                        _span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    except Exception:
+                        pass
+                    logger.exception(
+                        "Subscriber %s failed to handle event %s (%s)",
+                        self.subscriber_id, event.event_id, event.event_type.type_string,
+                    )
+                    self._consecutive_errors += 1
+                    # SR-109: record per-(event, subscriber) dead-letter for
+                    # observability. Never cascade a bus error into the subscriber.
+                    try:
+                        self.bus.record_dead_letter(
+                            self.subscriber_id,
+                            event.event_id,
+                            f"{type(exc).__name__}: {exc}",
+                        )
+                    except Exception:
+                        logger.exception("Failed to record dead-letter for %s", event.event_id)
+                    if self._consecutive_errors >= self.CIRCUIT_BREAKER_ERROR_THRESHOLD:
+                        # Trip the breaker.  Ack what we successfully processed
+                        # so those events don't re-appear in lag, then bail out.
+                        self._trip_circuit_breaker()
+                        processed_ids.append(event.event_id)
+                        self.bus.ack(self.subscriber_id, processed_ids)
+                        return len(processed_ids)
             processed_ids.append(event.event_id)
 
         self.bus.ack(self.subscriber_id, processed_ids)

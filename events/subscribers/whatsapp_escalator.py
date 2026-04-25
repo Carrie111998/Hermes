@@ -50,11 +50,35 @@ _TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
     EventType.APPLICATION_FAILED: EscalationTier.URGENT,
     EventType.CRON_FAILED_CONSECUTIVE: EscalationTier.URGENT,
     EventType.AGENT_ERROR: EscalationTier.URGENT,
+    # Phase B Stage-3 iter2: approval requests interrupt the LangGraph until
+    # Diego replies. Treat as URGENT so they queue during quiet hours and
+    # flush at 7:01am rather than wake him up at 3am.
+    EventType.APPROVAL_REQUEST: EscalationTier.URGENT,
     # GATEWAY_HEALTH is conditional (only down) — handled in classify_tier
     # AGENT_ERROR escalation is gated by cluster threshold — see should_escalate()
     # Important
     EventType.APPLICATION_READY: EscalationTier.IMPORTANT,
     EventType.FOLLOWUP_DUE: EscalationTier.IMPORTANT,
+    # Phase B Stage-3 iter2: APPLY_PACKET hands materials to Diego for the
+    # final manual click. Important but not urgent.
+    EventType.APPLY_PACKET: EscalationTier.IMPORTANT,
+    # Phase C iter2: Critic proposals are advisory; daily flush is enough.
+    EventType.CRITIC_PROPOSAL: EscalationTier.IMPORTANT,
+    # iter5: proper watchdog signals (replacing AGENT_ERROR-fallback hack).
+    # WATCHDOG_PROBE_TRANSITION at HIGH = real probe state flip (gateway down,
+    # API server :8642 down, etc.). Treat as URGENT so it queues during quiet
+    # hours and flushes at 7:01am. Routine probe ticks aren't routed here.
+    EventType.WATCHDOG_PROBE_TRANSITION: EscalationTier.URGENT,
+    # WATCHDOG_SILENCE_ALERT at HIGH = an agent missed its expected cadence
+    # (e.g. jaum-inbox-sweeper silent for 1042s vs expected 600s). Important,
+    # not urgent — operator can act in next digest window.
+    EventType.WATCHDOG_SILENCE_ALERT: EscalationTier.IMPORTANT,
+    # AGENT_FAILURE_CLUSTER at HIGH = >=3 consecutive failures from the same
+    # source. Real ones (NOT watchdog self-emissions thanks to the
+    # source=watchdog skip in watchdog_sweep.py) escalate as URGENT.
+    EventType.AGENT_FAILURE_CLUSTER: EscalationTier.URGENT,
+    # WATCHDOG_TICK + WATCHDOG_RECOVERED intentionally NOT in tier map ->
+    # bus-only, no WhatsApp escalation.
     # JOB_HIGH_SCORE is conditional (>= 9.0) — handled in classify_tier
 }
 

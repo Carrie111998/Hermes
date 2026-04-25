@@ -22,45 +22,66 @@ logger = logging.getLogger(__name__)
 
 # Maps event_type string → topic key
 TOPIC_ROUTING: Dict[str, str] = {
-    # Alerts & Actions
-    "application_blocked": "alerts",
-    "application_failed": "alerts",
-    "interview_signal": "alerts",
-    "offer_signal": "alerts",
-    "cron_failed_consecutive": "alerts",
-    "cron_stale": "alerts",
-    "gateway_health": "alerts",
-    # Scout
-    "job_discovered": "scout",
-    "job_vip_discovered": "scout",
-    # Matcher
-    "job_scored": "matcher",
-    "job_high_score": "matcher",
-    # Tailor & Applier
-    "tailor_completed": "tailor_applier",
-    "application_ready": "tailor_applier",
-    "application_submitted": "tailor_applier",
-    # Tracker
-    "stage_transition": "tracker",
-    "followup_due": "tracker",
-    # Digests
-    "digest_generated": "digests",
-    # System Health
-    "cron_started": "system",
-    "cron_completed": "system",
-    "cron_failed": "system",
-    "agent_error": "system",
-    "memory_consolidated": "system",
-    "skill_evolved": "system",
-    # Agent Comms
-    "mailbox_message": "agent_comms",
-    # Security (SR-001 secret scanner — fork-patch, see tests/test_topic_routing_patch.py)
-    "secret_detected": "security",
+    # === Hermes Telegram v2 (cutover 20260424T233627Z) ===
+    # -> jobflow_firehose
+    'job_discovered': 'jobflow_firehose',
+    'job_vip_discovered': 'jobflow_firehose',
+    'job_scored': 'jobflow_firehose',
+    'tailor_completed': 'jobflow_firehose',
+    'application_submitted': 'jobflow_firehose',
+    'stage_transition': 'jobflow_firehose',
+    'followup_due': 'jobflow_firehose',
+    # -> jobflow_decisions
+    'job_high_score': 'jobflow_decisions',
+    'application_ready': 'jobflow_decisions',
+    'interview_signal': 'jobflow_decisions',
+    'offer_signal': 'jobflow_decisions',
+    'approval_request': 'jobflow_decisions',
+    'apply_packet': 'jobflow_decisions',
+    # -> devflow_firehose
+    'run_started': 'devflow_firehose',
+    'run_completed': 'devflow_firehose',
+    'trace_snapshot': 'devflow_firehose',
+    # -> devflow_decisions
+    'approval_requested': 'devflow_decisions',
+    # -> watchdog_alerts
+    'gateway_health': 'watchdog_alerts',
+    'agent_error': 'watchdog_alerts',
+    'cron_failed': 'watchdog_alerts',
+    'cron_failed_consecutive': 'watchdog_alerts',
+    'cron_stale': 'watchdog_alerts',
+    'application_blocked': 'watchdog_alerts',
+    'application_failed': 'watchdog_alerts',
+    # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)
+    'watchdog_tick': 'watchdog_alerts',
+    'watchdog_probe_transition': 'watchdog_alerts',
+    'watchdog_silence_alert': 'watchdog_alerts',
+    'watchdog_recovered': 'watchdog_alerts',
+    'agent_failure_cluster': 'watchdog_alerts',
+    # -> critic_proposals
+    'critic_proposal': 'critic_proposals',
+    'critic_auto_applied': 'critic_proposals',
+    'critic_self_degraded': 'critic_proposals',
+    'agent_failure_cluster': 'critic_proposals',
+    # -> curator_digest
+    'curator_daily': 'curator_digest',
+    'memory_consolidated': 'curator_digest',
+    'skill_evolved': 'curator_digest',
+    # -> scribe_daily
+    'scribe_digest': 'scribe_daily',
+    'digest_generated': 'scribe_daily',
+    'mailbox_message': 'scribe_daily',
+    # -> security_and_system
+    'secret_detected': 'security_and_system',
 }
 
 # Events that cross-post to alerts when high/critical
 CROSS_POST_TO_ALERTS = {
-    "job_high_score", "application_ready", "followup_due",
+    'application_ready',
+    'followup_due',
+    'interview_signal',
+    'job_high_score',
+    'offer_signal',
 }
 
 CRON_SUMMARY_MAX_LINES = 24
@@ -138,6 +159,20 @@ class TelegramNotifier(BaseSubscriber):
                 and event.source == "event-bus"):
             return
 
+        # FIX 2026-04-25: watchdog feedback flood. The watchdog emits its own
+        # signals (probe_transition, silence_alert, tick, agent_failure_cluster)
+        # but they fall back to EventType.AGENT_ERROR because no explicit enum
+        # member exists. They carry a `watchdog_type` field. They also get
+        # detected by the cluster detector as part of its OWN cluster — fixed
+        # in watchdog_sweep.py. Telegram-side gate: only HIGH+ watchdog
+        # signals come through; routine LOW/NORMAL watchdog noise is bus-only.
+        if (event.event_type == EventType.AGENT_ERROR
+                and event.source == "watchdog"
+                and isinstance(event.payload, dict)
+                and event.payload.get("watchdog_type")
+                and event.priority.level < Priority.HIGH.level):
+            return
+
         # secret_detected volume is unbounded when the scanner runs; route via
         # audit-logger only. A daily rollup is handled by the digest.
         if event.event_type.type_string == "secret_detected":
@@ -192,7 +227,7 @@ class TelegramNotifier(BaseSubscriber):
         # it because agent_comms verbosity=significant_only requires HIGH+.
         if (event.event_type == EventType.MAILBOX_MESSAGE
                 and event.payload.get("message_type") == "NOTIFICATION"):
-            topic_key = "digests"
+            topic_key = "scribe_daily"
 
         topic = self.topics.get(topic_key, {})
         thread_id = str(topic.get("thread_id", ""))
