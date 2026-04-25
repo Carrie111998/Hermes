@@ -1023,6 +1023,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             intent,
             actor=sender_jid.split("@", 1)[0],
             source="whatsapp",
+            thread_id=f"job-{intent.job_id}",
         )
         await self.send(sender_jid, result.message)
         return True

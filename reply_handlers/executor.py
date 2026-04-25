@@ -10,6 +10,7 @@ Migration note (2026-04-25, Phase 2 → tracker-intent-applier):
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -60,7 +61,9 @@ def execute(
     if new_stage is None:
         return CommandResult(ok=False, message=f"Unknown command: /{intent.verb}")
 
-    client = jobops_client or JobOpsClient()
+    client = jobops_client or JobOpsClient(
+        base_url=os.environ.get("HERMES_JOBOPS_URL", "http://127.0.0.1:4100"),
+    )
     metadata = {"original_source": source}
     if thread_id:
         metadata["thread_id"] = thread_id

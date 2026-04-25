@@ -65,6 +65,13 @@ class TestExecutorMetadata:
         meta = mock_jobops.post_intent.call_args.kwargs["metadata"]
         assert meta["thread_id"] == "job-j-1"
 
+    def test_thread_id_omitted_when_not_provided(self, mock_jobops):
+        """Bare execute() call with no thread_id leaves it absent from metadata."""
+        intent = CommandIntent(verb="approve", job_id="j-1")
+        execute(intent, actor="diego", source="telegram", jobops_client=mock_jobops)
+        meta = mock_jobops.post_intent.call_args.kwargs["metadata"]
+        assert "thread_id" not in meta
+
 
 class TestExecutorErrors:
     def test_jobops_404_returns_not_ok(self, mock_jobops):

@@ -2305,6 +2305,7 @@ class TelegramAdapter(BasePlatformAdapter):
             intent,
             actor=str(user.id),
             source="telegram",
+            thread_id=f"job-{intent.job_id}",
         )
         await update.message.reply_text(result.message)
 
