@@ -82,7 +82,6 @@ from gateway.platforms.base import (
 from reply_handlers import (
     parse as parse_reply_command,
     execute as execute_reply_command,
-    is_authorized_whatsapp,
     ParseError,
 )
 
@@ -954,6 +953,34 @@ class WhatsAppAdapter(BasePlatformAdapter):
             
             await asyncio.sleep(1)  # Poll interval
 
+    def _is_sender_authorized_for_reply(self, data: Dict[str, Any]) -> bool:
+        """True if WHATSAPP_ALLOWED_USERS authorizes this sender (LID-aware).
+
+        Mirrors _is_sender_blocked_by_strict_allowlist's alias expansion (so a
+        @lid sender resolves to its phone alias and vice versa), but fails
+        closed: missing or empty allowlist = unauthorized.
+        """
+        allowlist_raw = os.getenv("WHATSAPP_ALLOWED_USERS", "").strip()
+        if not allowlist_raw:
+            return False
+        allowed_tokens = {tok.strip() for tok in allowlist_raw.split(",") if tok.strip()}
+        if not allowed_tokens:
+            return False
+        if "*" in allowed_tokens:
+            return True
+
+        sender_id = str(data.get("senderId") or "")
+        if not sender_id:
+            return False
+
+        sender_aliases = self._expand_whatsapp_strict_aliases(sender_id)
+        allowed_aliases: set[str] = set()
+        for token in allowed_tokens:
+            allowed_aliases.update(self._expand_whatsapp_strict_aliases(token))
+            allowed_aliases.add(self._normalize_whatsapp_strict_identifier(token))
+
+        return bool(sender_aliases & allowed_aliases)
+
     async def _maybe_handle_reply_command(self, data: Dict[str, Any]) -> bool:
         """If the inbound message is a pipeline reply command, route it and return True.
 
@@ -968,12 +995,19 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return False
 
         sender_jid = str(data.get("senderId") or data.get("chatId") or "")
+        logger.info(
+            "[Whatsapp] reply command received: cmd=%s sender_jid=%s chat_id=%s",
+            first_token, sender_jid, data.get("chatId"),
+        )
 
         if os.getenv("HERMES_REPLY_HANDLERS_ENABLED", "0") != "1":
             await self.send(sender_jid, "Reply handlers are disabled.")
             return True
 
-        if not is_authorized_whatsapp(sender_jid):
+        # LID-aware authorization: WhatsApp may deliver messages with @lid
+        # senders that don't directly match the phone-number allowlist; the
+        # strict-allowlist alias expansion resolves both sides.
+        if not self._is_sender_authorized_for_reply(data):
             await self.send(sender_jid, "Not authorized.")
             return True
 
