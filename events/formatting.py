@@ -52,6 +52,24 @@ EVENT_TYPE_EMOJI = {
     # flood remediation — without this entry event_icon() returned "" and the
     # header rendered with a double-space gap that swam in a noisy feed.
     EventType.SECRET_DETECTED:          "🔐",
+    # Phase B Stage-3 iter2 — HITL approvals + apply packet
+    EventType.APPROVAL_REQUEST:         "🙋",
+    EventType.APPLY_PACKET:             "📦",
+    # Phase C iter2 — Critic proposals
+    EventType.CRITIC_PROPOSAL:          "🧐",
+    # Watchdog signals (iter5, 2026-04-25) — promoted from AGENT_ERROR fallback
+    EventType.WATCHDOG_TICK:            "💓",
+    EventType.WATCHDOG_PROBE_TRANSITION:"🔄",
+    EventType.WATCHDOG_SILENCE_ALERT:   "🔕",
+    EventType.WATCHDOG_RECOVERED:       "💚",
+    EventType.AGENT_FAILURE_CLUSTER:    "🌪️",
+    # Curator nightly consolidation (2026-04-26)
+    EventType.CURATOR_DAILY:            "📚",
+    # DevFlow bridge (2026-04-26)
+    EventType.DEVFLOW_RUN_STARTED:      "🏃",
+    EventType.DEVFLOW_RUN_COMPLETED:    "🏁",
+    EventType.DEVFLOW_APPROVAL_REQUESTED:"🗳️",
+    EventType.DEVFLOW_TRACE_SNAPSHOT:   "📷",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

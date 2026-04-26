@@ -42,11 +42,17 @@ TOPIC_ROUTING: Dict[str, str] = {
     'run_started': 'devflow_firehose',
     'run_completed': 'devflow_firehose',
     'trace_snapshot': 'devflow_firehose',
+    'devflow.run_started': 'devflow_firehose',
+    'devflow.run_completed': 'devflow_firehose',
+    'devflow.trace_snapshot': 'devflow_firehose',
     # -> devflow_decisions
     'approval_requested': 'devflow_decisions',
+    'devflow.approval_requested': 'devflow_decisions',
     # -> watchdog_alerts
     'gateway_health': 'watchdog_alerts',
     'agent_error': 'watchdog_alerts',
+    'cron_started': 'watchdog_alerts',
+    'cron_completed': 'watchdog_alerts',
     'cron_failed': 'watchdog_alerts',
     'cron_failed_consecutive': 'watchdog_alerts',
     'cron_stale': 'watchdog_alerts',
