@@ -1,0 +1,203 @@
+"""Unit tests for curator.orchestrator."""
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from curator import orchestrator
+from curator.orchestrator import (
+    AGENTS,
+    BackfillResult,
+    run_backfill,
+)
+
+
+class _FakeBus:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+
+def _stub_search_fn(_query, _params):
+    return {"results": []}
+
+
+def test_orchestrator_dispatches_over_all_ten_agents(tmp_path):
+    """All 10 agents are visited during backfill."""
+    visited = []
+
+    def fake_render(agent, *_args, **_kwargs):
+        visited.append(agent)
+        return f"# MEMORY — {agent}\n\n## Operating Stats\nrendered.\n"
+
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")  # empty
+    # Build minimal profiles tree so writes succeed.
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    result = run_backfill(
+        window_days=30,
+        dry_run=True,
+        emit_event=False,
+        audit_path=audit_path,
+        search_fn=_stub_search_fn,
+        bus=None,
+        hermes_root=tmp_path,
+        render_fn=fake_render,
+    )
+    assert sorted(visited) == sorted(AGENTS)
+    assert result.mode == "backfill"
+
+
+def test_orchestrator_writes_to_correct_path(tmp_path):
+    """Each output lands at profiles/<agent>/memories/MEMORY.md."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    def render_fn(agent, *_a, **_k):
+        return f"# MEMORY — {agent}\n\nrendered\n"
+
+    run_backfill(
+        window_days=30, dry_run=False, emit_event=False,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=None,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+
+    for agent in AGENTS:
+        target = tmp_path / "profiles" / agent / "memories" / "MEMORY.md"
+        assert target.exists()
+        assert agent in target.read_text(encoding="utf-8")
+
+
+def test_orchestrator_main_uses_append_mode(tmp_path):
+    """For agent='main', renderer mode='append' and existing content preserved."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    main_path = tmp_path / "profiles" / "main" / "memories" / "MEMORY.md"
+    sentinel_text = "# Diego original 174KB content\n" + ("Original line.\n" * 200)
+    main_path.write_text(sentinel_text, encoding="utf-8")
+    pre_size = main_path.stat().st_size
+
+    captured_modes: dict = {}
+
+    def render_fn(agent, *_a, **kwargs):
+        captured_modes[agent] = kwargs.get("mode")
+        existing = kwargs.get("existing_content", "")
+        if kwargs.get("mode") == "append":
+            return existing + "\n\n---\n\n# Curator-Bootstrapped\n## Operating Stats\nx\n"
+        return f"# MEMORY — {agent}\n\n## Operating Stats\nx\n"
+
+    run_backfill(
+        window_days=30, dry_run=False, emit_event=False,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=None,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+
+    assert captured_modes["main"] == "append"
+    post_text = main_path.read_text(encoding="utf-8")
+    assert post_text.startswith(sentinel_text)
+    assert main_path.stat().st_size > pre_size
+
+
+def test_orchestrator_other_agents_use_preserve_with_prior(tmp_path):
+    """For non-main agents with >30 lines existing, mode='preserve_with_prior'."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    scout_path = tmp_path / "profiles" / "scout" / "memories" / "MEMORY.md"
+    scout_path.write_text("\n".join(f"line {i}" for i in range(50)), encoding="utf-8")
+
+    captured: dict = {}
+
+    def render_fn(agent, *_a, **kwargs):
+        captured[agent] = kwargs.get("mode")
+        return f"# MEMORY — {agent}\n## Operating Stats\nx\n"
+
+    run_backfill(
+        window_days=30, dry_run=False, emit_event=False,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=None,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+    assert captured["scout"] == "preserve_with_prior"
+
+
+def test_orchestrator_dry_run_writes_nothing(tmp_path):
+    """When dry_run=True, no MEMORY.md is modified."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        d = tmp_path / "profiles" / agent / "memories"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "MEMORY.md").write_text("ORIGINAL", encoding="utf-8")
+
+    def render_fn(agent, *_a, **_k):
+        return f"# MEMORY — {agent}\nNEW\n"
+
+    result = run_backfill(
+        window_days=30, dry_run=True, emit_event=False,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=None,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+
+    for agent in AGENTS:
+        target = tmp_path / "profiles" / agent / "memories" / "MEMORY.md"
+        assert target.read_text(encoding="utf-8") == "ORIGINAL"
+    assert result.bytes_written == 0
+
+
+def test_orchestrator_continues_on_per_agent_failure(tmp_path):
+    """One agent's renderer raises; others still complete."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    def render_fn(agent, *_a, **_k):
+        if agent == "tailor":
+            raise RuntimeError("simulated failure")
+        return f"# MEMORY — {agent}\n## Operating Stats\nx\n"
+
+    result = run_backfill(
+        window_days=30, dry_run=False, emit_event=False,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=None,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+
+    failed_agents = [a for a, _ in result.agents_failed]
+    assert "tailor" in failed_agents
+    assert len(result.agents_updated) == len(AGENTS) - 1
+
+
+def test_orchestrator_emits_curator_daily_event(tmp_path):
+    """When emit_event=True with a bus, exactly one curator_daily event lands."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    def render_fn(agent, *_a, **_k):
+        return f"# MEMORY — {agent}\n## Operating Stats\nx\n"
+
+    bus = _FakeBus()
+    run_backfill(
+        window_days=30, dry_run=False, emit_event=True,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=bus,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+    assert len(bus.events) == 1
+    ev = bus.events[0]
+    # Accept either a dict-like Event or a real Event with attributes
+    et = getattr(ev, "event_type", None) or (ev.get("event_type") if isinstance(ev, dict) else None)
+    assert et == "curator_daily", ev
