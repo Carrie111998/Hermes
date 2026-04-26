@@ -227,11 +227,24 @@ class EventBus:
         # Cap per-poll batch so a flood can be drained incrementally instead of
         # failing outright. Anything beyond this is picked up on the next poll.
         rows = conn.execute(
-            f"SELECT * FROM events WHERE {where} ORDER BY rowid ASC LIMIT 2000",
+            f"SELECT rowid, * FROM events WHERE {where} ORDER BY rowid ASC LIMIT 2000",
             params,
         ).fetchall()
 
-        return [self._row_to_event(r) for r in rows]
+        events: List[Event] = []
+        for r in rows:
+            try:
+                events.append(self._row_to_event(r))
+            except ValueError as e:
+                # Cross-version code skew: a producer using newer code can write
+                # event_types the gateway hasn't loaded yet. Skip the row so the
+                # subscriber poll loop doesn't crash; ack of any valid event in
+                # this batch (or later batches) advances the cursor past it.
+                logger.warning(
+                    "subscribe(%s): skipping unparseable event %s (rowid=%s): %s",
+                    subscriber_id, r["event_id"], r["rowid"], e,
+                )
+        return events
 
     def ack(self, subscriber_id: str, event_ids: List[str]) -> None:
         """Advance subscriber cursor past the given events.

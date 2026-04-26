@@ -436,3 +436,73 @@ class TestHandledEvents:
         # A second call must not raise (UNIQUE constraint is handled via OR IGNORE).
         bus.mark_handled("sub-a", eid)
         assert bus.is_handled("sub-a", eid) is True
+
+
+class TestSubscribeUnknownEventType:
+    """Cross-version code skew: a producer using newer code can write event_types
+    that the consumer doesn't know yet. Subscribe must skip them, not crash.
+    Production incident 2026-04-26: a `curator_daily` row inserted by the curator
+    (post-Phase-3.1 code) crashed every gateway subscriber poll because the
+    running gateway was started before that EventType was added to schema.py.
+    """
+
+    def _insert_unknown_row(self, bus, event_id: str = "poison-1",
+                            event_type: str = "unknown_future_type"):
+        conn = bus._get_conn()
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, source, timestamp, "
+            "priority, payload, tags) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event_id, event_type, "curator", "2026-04-26T22:31:47Z",
+             "NORMAL", "{}", "[]"),
+        )
+        conn.commit()
+
+    def test_subscribe_does_not_raise_on_unknown_event_type(self, bus):
+        self._insert_unknown_row(bus)
+        # Pre-fix: ValueError("Unknown event type in DB: unknown_future_type")
+        events = bus.subscribe("test-sub")
+        assert events == []
+
+    def test_subscribe_returns_valid_events_alongside_unknowns(self, bus):
+        valid_id_1 = bus.emit(EventType.CRON_STARTED, "scout", {})
+        self._insert_unknown_row(bus, event_id="poison-mid")
+        valid_id_2 = bus.emit(EventType.CRON_COMPLETED, "matcher", {})
+
+        events = bus.subscribe("test-sub")
+        ids = [e.event_id for e in events]
+        assert valid_id_1 in ids
+        assert valid_id_2 in ids
+        assert "poison-mid" not in ids
+        assert len(events) == 2
+
+    def test_subscribe_does_not_redeliver_unknown_when_valid_events_advance_cursor(
+        self, bus
+    ):
+        """When the unknown row precedes a valid event in the same batch, the
+        subscriber's ack of the valid event will advance the cursor past the
+        unknown row, so it never re-appears."""
+        self._insert_unknown_row(bus, event_id="poison-before-valid")
+        valid_id = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+
+        events1 = bus.subscribe("test-sub")
+        assert len(events1) == 1
+        assert events1[0].event_id == valid_id
+
+        # Subscriber acks the valid event — cursor advances past poison rowid
+        bus.ack("test-sub", [valid_id])
+
+        # Next subscribe must not re-read the poison row
+        events2 = bus.subscribe("test-sub")
+        assert events2 == []
+
+    def test_subscribe_logs_warning_for_unknown_event_type(self, bus, caplog):
+        import logging
+        caplog.set_level(logging.WARNING, logger="events.bus")
+        self._insert_unknown_row(bus, event_type="some_future_type")
+        bus.subscribe("test-sub")
+        # The unknown event_type string and event_id should appear in logs so
+        # operators can correlate to the producer.
+        warning_msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any("some_future_type" in m for m in warning_msgs), (
+            f"Expected warning mentioning unknown event_type; got: {warning_msgs}"
+        )
