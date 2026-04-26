@@ -85,6 +85,27 @@ class TestTopicRouting:
         missing = required - covered
         assert not missing, f"TOPIC_ROUTING missing: {missing}"
 
+    def test_agent_failure_cluster_routes_to_watchdog_alerts(self):
+        """agent_failure_cluster fires from the watchdog detector and is
+        an operational alert (cluster of failures across agents). It routes
+        to watchdog_alerts.
+
+        Regression: 2026-04-26 — TOPIC_ROUTING contained two entries for
+        'agent_failure_cluster' (one mapping to watchdog_alerts, one to
+        critic_proposals). Python dict literals are last-write-wins, so the
+        cluster events silently went only to critic_proposals; watchdog_alerts
+        never received them.
+
+        Why watchdog_alerts is the right primary topic: the event source is
+        the watchdog detector and the existing watchdog flood gate in
+        TelegramNotifier.handle() lists agent_failure_cluster alongside the
+        other watchdog signals. The Critic also consumes the cluster (Phase
+        3.1, agent-failure-cluster branch) but produces critic_proposal
+        events as its output — and those already route to critic_proposals.
+        Trigger and proposal are separate events with separate topics.
+        """
+        assert TOPIC_ROUTING["agent_failure_cluster"] == "watchdog_alerts"
+
 
 class TestTelegramNotifier:
     def test_formats_message(self, bus, topics_config, verbosity_config):

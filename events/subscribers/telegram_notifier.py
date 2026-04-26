@@ -62,7 +62,10 @@ TOPIC_ROUTING: Dict[str, str] = {
     'critic_proposal': 'critic_proposals',
     'critic_auto_applied': 'critic_proposals',
     'critic_self_degraded': 'critic_proposals',
-    'agent_failure_cluster': 'critic_proposals',
+    # NOTE: 'agent_failure_cluster' is the Critic's TRIGGER, not its proposal.
+    # It routes to watchdog_alerts (line ~60, with the other watchdog signals).
+    # The Critic still consumes it via the bus and emits critic_proposal events
+    # which DO route here.
     # -> curator_digest
     'curator_daily': 'curator_digest',
     'memory_consolidated': 'curator_digest',
