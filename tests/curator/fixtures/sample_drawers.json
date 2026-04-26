@@ -1,0 +1,100 @@
+{
+  "results": [
+    {
+      "drawer_id": "drawer_openclaw_scout_001",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout source linkedin returned 0 results",
+      "body": "Scout source linkedin returned 0 results during cycle 2026-04-15. Possible cause: rate-limit or login expired. Will retry tomorrow.",
+      "created_at": "2026-04-15T10:30:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_002",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout source linkedin returned 0 results again",
+      "body": "Scout source linkedin returned 0 results during cycle 2026-04-16. Same root cause as previous day.",
+      "created_at": "2026-04-16T10:30:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_003",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout source linkedin returned 0 results third time",
+      "body": "Scout source linkedin returned 0 results, three sessions in a row. Pattern emerging.",
+      "created_at": "2026-04-17T10:30:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_004",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout discovered new source hiring.cafe",
+      "body": "Scout source hiring.cafe added; 30 new roles in first run.",
+      "created_at": "2026-04-12T08:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_005",
+      "wing": ".openclaw",
+      "room": "skills",
+      "title": "Workday boilerplate filter triggered",
+      "body": "Boilerplate filter activated against Workday postings; 5 of 12 flagged.",
+      "created_at": "2026-04-10T14:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_hermes_scout_006",
+      "wing": "hermes",
+      "room": "agents",
+      "title": "Scout debug session — proxy retry",
+      "body": "Investigated 5xx responses from glassdoor; rotated to fresh IPRoyal residential proxy.",
+      "created_at": "2026-04-08T16:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_007",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout long body sample",
+      "body": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "created_at": "2026-04-09T12:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_008",
+      "wing": ".openclaw",
+      "room": "diary",
+      "title": "Scout daily diary 2026-04-20",
+      "body": "Standard scout shift.",
+      "created_at": "2026-04-20T08:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_009",
+      "wing": ".openclaw",
+      "room": "diary",
+      "title": "Scout daily diary 2026-04-21",
+      "body": "Another quiet shift.",
+      "created_at": "2026-04-21T08:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_010",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout API change indeed",
+      "body": "Indeed introduced new query format.",
+      "created_at": "2026-04-22T14:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_011",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Old scout note 60 days ago",
+      "body": "This drawer is older than the 30-day window and should be excluded.",
+      "created_at": "2026-02-25T10:00:00+00:00"
+    },
+    {
+      "drawer_id": "drawer_openclaw_scout_012",
+      "wing": ".openclaw",
+      "room": "agents",
+      "title": "Scout retired source craigslist",
+      "body": "Retired craigslist as a discovery source; quality too low.",
+      "created_at": "2026-04-05T11:00:00+00:00"
+    }
+  ]
+}
