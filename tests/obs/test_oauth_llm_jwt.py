@@ -59,3 +59,29 @@ def test_two_segments_returns_true():
 def test_unparseable_payload_returns_true():
     """Three segments but middle isn't valid base64-JSON."""
     assert _jwt_is_expired("a.b.c") is True
+
+
+def _make_jwt_with_payload(payload: dict) -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    return f"{header}.{body}.deadbeef"
+
+
+def test_string_exp_returns_true():
+    """Defensive: if a malformed token sets exp to a string, int() would
+    accept it but the value isn't trustworthy. Reject as expired."""
+    tok = _make_jwt_with_payload({"exp": "9999999999"})
+    assert _jwt_is_expired(tok) is True
+
+
+def test_missing_exp_returns_true():
+    tok = _make_jwt_with_payload({"sub": "abc"})
+    assert _jwt_is_expired(tok) is True
+
+
+def test_null_payload_returns_true():
+    """Three segments but middle decodes to JSON null, not a dict."""
+    header = base64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    body = base64.urlsafe_b64encode(b'null').rstrip(b"=").decode()
+    tok = f"{header}.{body}.deadbeef"
+    assert _jwt_is_expired(tok) is True

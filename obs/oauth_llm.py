@@ -175,7 +175,10 @@ def _jwt_is_expired(token: str, skew_seconds: int = 60) -> bool:
         body = parts[1]
         body += "=" * (-len(body) % 4)
         payload = _json.loads(_b64.urlsafe_b64decode(body))
-        exp = int(payload.get("exp", 0))
+        exp_raw = payload.get("exp") if isinstance(payload, dict) else None
+        if not isinstance(exp_raw, (int, float)):
+            return True
+        exp = int(exp_raw)
         if exp <= 0:
             return True
         return time.time() + skew_seconds >= exp
