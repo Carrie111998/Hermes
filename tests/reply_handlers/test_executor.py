@@ -35,12 +35,15 @@ class TestExecutorHappyPath:
         assert call.kwargs["actor_id"] == "diego"
         assert call.kwargs["source"] == "telegram"
 
-    def test_reject_posts_intent_with_rejected_by_user(self, mock_jobops):
+    def test_reject_posts_intent_with_rejected(self, mock_jobops):
+        """Reject maps to 'rejected' (in JobOps LEGACY_PIPELINE_STAGES), not
+        'rejected_by_user' which is PipelineManager-internal and would be 400'd
+        by JobOps's stage validator."""
         intent = CommandIntent(verb="reject", job_id="j-1", reason="too junior")
         result = execute(intent, actor="diego", source="whatsapp", jobops_client=mock_jobops)
         assert result.ok is True
-        assert result.new_stage == "rejected_by_user"
-        assert mock_jobops.post_intent.call_args.kwargs["stage"] == "rejected_by_user"
+        assert result.new_stage == "rejected"
+        assert mock_jobops.post_intent.call_args.kwargs["stage"] == "rejected"
 
     def test_archive_posts_intent(self, mock_jobops):
         intent = CommandIntent(verb="archive", job_id="j-1")

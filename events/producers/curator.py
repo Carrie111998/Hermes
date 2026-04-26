@@ -43,11 +43,12 @@ def emit_curator_daily(bus: EventBus, payload: Dict[str, Any]) -> str:
         logger.warning("CURATOR_DAILY EventType not registered; falling back to AGENT_ERROR")
         et = EventType.AGENT_ERROR
 
-    event = Event.create(
-        event_type=et,
-        source="curator",
+    # EventBus.emit signature: (event_type, source, payload, priority=, ...).
+    # Passing an Event object is the wrong shape (caller of test_orchestrator
+    # uses a fake bus that only stores whatever it receives).
+    return bus.emit(
+        et,
+        "curator",
+        dict(payload),
         priority=Priority.NORMAL,
-        payload=dict(payload),
     )
-    bus.emit(event)
-    return event.event_id

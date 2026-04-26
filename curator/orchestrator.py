@@ -133,13 +133,20 @@ def _emit_event(bus, mode: str, result: BackfillResult, generated_at: datetime) 
         "bytes_written": result.bytes_written,
         "generated_at": generated_at.isoformat(),
     }
+    # Try the real producer first (production path with real EventBus).
     try:
-        from .producers.curator import emit_curator_daily
+        # Local import so test envs without events/ on PYTHONPATH can fall through.
+        import sys as _sys
+        agent_src = Path(r"C:/Users/diego/.hermes/agent-src")
+        if str(agent_src) not in _sys.path:
+            _sys.path.insert(0, str(agent_src))
+        from events.producers.curator import emit_curator_daily  # type: ignore
         emit_curator_daily(bus, payload)
         return
     except Exception as exc:
-        logger.warning("producer import failed (%s); falling back to dict event", exc)
+        logger.warning("producer import/emit failed (%s); falling back to dict event", exc)
     # Fallback dict event so tests / degraded environments still record.
+    # The fake bus in tests stores whatever is passed.
     try:
         bus.emit({
             "event_type": "curator_daily",

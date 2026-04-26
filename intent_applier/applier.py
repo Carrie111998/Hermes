@@ -82,9 +82,15 @@ class IntentApplier:
             d.mkdir(parents=True, exist_ok=True)
 
     def scan_inbox(self) -> dict[str, str]:
-        """Process every *.json file in the inbox once. Returns {filename: outcome}."""
+        """Process every intent JSON file in the inbox once. Returns {filename: outcome}.
+
+        Filename pattern is `*_INTENT_*.json` (matches both STATE_TRANSITION_INTENT
+        and APPROVAL_INTENT). The tracker inbox is shared with other producers
+        (sentinel VIP_DISCOVERY, scout job_discovery, etc.) so we must NOT consume
+        non-intent files — they belong to the tracker LLM cron.
+        """
         results: dict[str, str] = {}
-        for path in sorted(self.inbox_dir.glob("*.json")):
+        for path in sorted(self.inbox_dir.glob("*_INTENT_*.json")):
             results[path.name] = self.apply_one(path)
         return results
 

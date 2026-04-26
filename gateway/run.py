@@ -9920,23 +9920,69 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 def main():
     """CLI entry point for the gateway."""
     import argparse
-    
+    import traceback
+
     parser = argparse.ArgumentParser(description="Hermes Gateway - Multi-platform messaging")
     parser.add_argument("--config", "-c", help="Path to gateway config file")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-    
+
     args = parser.parse_args()
-    
+
     config = None
     if args.config:
         import yaml
         with open(args.config, encoding="utf-8") as f:
             data = yaml.safe_load(f)
             config = GatewayConfig.from_dict(data)
-    
-    # Run the gateway - exit with code 1 if no platforms connected,
-    # so systemd Restart=on-failure will retry on transient errors (e.g. DNS)
-    success = asyncio.run(start_gateway(config))
+
+    # Top-level FATAL handler — writes a clearly-marked traceback to gateway.log
+    # AND a sidecar marker file before exit. The sidecar is a single-line file
+    # with the exit reason, used by `gateway_watchdog.py` to distinguish a
+    # caught crash (don't auto-restart loop) from a SIGKILL/sleep death (auto-
+    # restart fine). Without this, asyncio.run()'s default behavior buries the
+    # traceback in stderr — captured to gateway.log via nohup 2>&1, but with no
+    # FATAL marker the operator can grep for.
+    #
+    # 2026-04-25 silent-death incident (11:42-11:57 EDT, no FATAL line, no
+    # traceback) is what motivated this addition. The most likely root cause
+    # was a Windows sleep/suspend that froze the gateway thread; this handler
+    # would not fire for that path (no Python exception was raised), but it
+    # closes the smaller gap of unhandled-exception deaths.
+    success = False
+    try:
+        success = asyncio.run(start_gateway(config))
+    except KeyboardInterrupt:
+        # Ctrl-C / SIGINT — clean shutdown path, not a fatal error
+        success = True
+    except SystemExit:
+        # Re-raise: start_gateway uses raise SystemExit(code) for explicit codes
+        raise
+    except BaseException as exc:
+        tb = traceback.format_exc()
+        try:
+            logger.critical("Gateway FATAL — uncaught %s: %s\n%s",
+                            exc.__class__.__name__, exc, tb)
+        except Exception:
+            # Logging itself failed; fall through to sidecar
+            pass
+        # Sidecar marker so the watchdog and the operator can see this happened
+        # even if logging is broken. Located next to the PID file so the same
+        # cleanup path picks it up.
+        try:
+            from gateway.status import _get_pid_path
+            sidecar = _get_pid_path().with_suffix(".fatal")
+            sidecar.write_text(
+                f"{exc.__class__.__name__}: {exc}\n\n{tb}",
+                encoding="utf-8",
+            )
+        except Exception:
+            # Last resort: stderr (already captured to gateway.log via nohup)
+            print(
+                f"FATAL: gateway exited with uncaught {exc.__class__.__name__}: {exc}\n{tb}",
+                file=sys.stderr, flush=True,
+            )
+        sys.exit(1)
+
     if not success:
         sys.exit(1)
 

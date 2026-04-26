@@ -191,7 +191,8 @@ class TestScanInbox:
     def test_scan_inbox_processes_all_files(self, mailbox, applier):
         a, jobops, _mgr = applier
         for i in range(3):
-            write_intent(mailbox["inbox"], f"int-{i}.json",
+            # Filename pattern matches what JobOps writes: <ts>_<TYPE>_main.json
+            write_intent(mailbox["inbox"], f"20260425T1000{i:02d}_APPROVAL_INTENT_main.json",
                          {**VALID_INTENT_PAYLOAD,
                           "message_id": f"m-{i}",
                           "idempotency_key": f"key-{i}",
@@ -200,3 +201,34 @@ class TestScanInbox:
         outcomes = a.scan_inbox()
         assert len(outcomes) == 3
         assert all(o in {"applied", "partial", "dead_lettered"} for o in outcomes.values())
+
+    def test_scan_inbox_ignores_non_intent_files(self, mailbox, applier):
+        """Tracker inbox is shared with sentinel VIP_DISCOVERY, scout job_discovery,
+        etc. The applier must NOT consume those — they belong to the tracker LLM
+        cron. Bug discovered 2026-04-25: VIP_DISCOVERY messages were being
+        dead-lettered because the glob pattern was too broad.
+        """
+        a, jobops, _mgr = applier
+        # An intent file (should be processed)
+        write_intent(
+            mailbox["inbox"], "20260425T100000_STATE_TRANSITION_INTENT_main.json",
+            VALID_INTENT_PAYLOAD,
+        )
+        # A VIP_DISCOVERY file from sentinel (should be left alone)
+        vip_path = mailbox["inbox"] / "20260425T100100Z_VIP_DISCOVERY_sentinel_xyz.json"
+        vip_path.write_text(json.dumps({"type": "VIP_DISCOVERY", "from": "sentinel"}), encoding="utf-8")
+        # A scout discovery file (should be left alone)
+        scout_path = mailbox["inbox"] / "test-discovery.json"
+        scout_path.write_text(json.dumps({"type": "job_discovery", "jobs": []}), encoding="utf-8")
+
+        outcomes = a.scan_inbox()
+
+        # Only the intent file got processed
+        assert len(outcomes) == 1
+        assert "20260425T100000_STATE_TRANSITION_INTENT_main.json" in outcomes
+        # Non-intent files are still in inbox (not moved to dead-letter or processed)
+        assert vip_path.exists()
+        assert scout_path.exists()
+        # Dead-letter dir should be empty (no false positives)
+        if mailbox["dead_letter"].exists():
+            assert list(mailbox["dead_letter"].iterdir()) == []

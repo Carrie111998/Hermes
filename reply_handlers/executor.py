@@ -35,7 +35,10 @@ class CommandResult:
 
 VERB_TO_STAGE = {
     "approve": "approved",
-    "reject": "rejected_by_user",
+    # Use 'rejected' (in JobOps's LEGACY_PIPELINE_STAGES); 'rejected_by_user'
+    # is in PipelineManager's VALID_STAGES but NOT in JobOps's contract, so
+    # post_intent would get a 400. Aligns with dashboard's skipJob target.
+    "reject": "rejected",
     "archive": "archived",
 }
 
