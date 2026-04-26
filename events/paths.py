@@ -84,3 +84,14 @@ def gateway_heartbeat_path() -> Path:
     old means the gateway polling thread has stopped or the process died).
     """
     return _root() / "gateway.heartbeat"
+
+
+def failure_cluster_state_path() -> Path:
+    """Persistent state file for FailureClusterDetector.
+
+    Holds per-source rolling windows of (timestamp, failure_type) tuples so
+    the detector survives gateway/scheduler restarts and so cluster
+    detection works across the gateway/cron-worker process boundary.
+    Cross-profile (every agent's failures funnel here), so canonical root.
+    """
+    return events_dir() / "failure_cluster_state.json"
