@@ -5,6 +5,8 @@ Hooks into the cron scheduler's tick()/run_job() cycle to emit:
   - cron_completed: after successful execution
   - cron_failed: after failed execution
   - cron_failed_consecutive: when consecutive failures reach threshold
+  - agent_failure_cluster: when 3 consecutive same-type failures occur
+    for a single source (Hermes Revival §6 post-hoc Critic trigger)
 
 Domain events (job_discovered, job_scored, etc.) come from MailboxTranslator
 consuming mailbox_message events — see events/subscribers/mailbox_translator.py.
@@ -15,6 +17,8 @@ import logging
 from typing import Optional
 
 from events.bus import EventBus
+from events.cluster_detector import FailureClusterDetector
+from events.paths import failure_cluster_state_path
 from events.schema import EventType, Priority
 
 logger = logging.getLogger(__name__)
@@ -33,6 +37,9 @@ class CronEventEmitter:
 
     def __init__(self, bus: EventBus):
         self.bus = bus
+        self._cluster_detector = FailureClusterDetector(
+            state_path=failure_cluster_state_path(),
+        )
 
     def on_job_started(
         self,
@@ -110,5 +117,30 @@ class CronEventEmitter:
                         "error": error or "Unknown error",
                     },
                 )
+
+        # Feed the detector with every outcome (including successes — those
+        # clear the per-source window).  Emit a focused cluster event when
+        # the detector reports a same-type 3-in-a-row.  Wrapped so a
+        # detector failure (e.g. corrupt state file) cannot break the emitter.
+        try:
+            cluster = self._cluster_detector.record(
+                source=job_name,
+                success=success,
+                error_text=error,
+            )
+            if cluster is not None:
+                self.bus.emit(
+                    event_type=EventType.AGENT_FAILURE_CLUSTER,
+                    source=cluster.source,
+                    payload={
+                        "source": cluster.source,
+                        "failure_type": cluster.failure_type,
+                        "count": cluster.count,
+                        "first_seen": cluster.first_seen,
+                        "last_seen": cluster.last_seen,
+                    },
+                )
+        except Exception:
+            logger.exception("FailureClusterDetector record failed for %s", job_name)
 
         return event_id
