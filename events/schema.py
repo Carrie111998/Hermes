@@ -97,6 +97,16 @@ class EventType(Enum):
     WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
 
+    # DevFlow bridge -- added 2026-04-26.
+    # Emitted by the devflow profile (see ~/.hermes/profiles/devflow/SOUL.md
+    # emit-hooks section) and consumed by ~/.hermes/bridges/hermes_to_devflow.py
+    # which projects them into DevFlow Postgres so Mission Control UI :3040
+    # reflects live agent activity.
+    DEVFLOW_RUN_STARTED = ("devflow.run_started", Priority.NORMAL)
+    DEVFLOW_RUN_COMPLETED = ("devflow.run_completed", Priority.NORMAL)
+    DEVFLOW_APPROVAL_REQUESTED = ("devflow.approval_requested", Priority.HIGH)
+    DEVFLOW_TRACE_SNAPSHOT = ("devflow.trace_snapshot", Priority.LOW)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

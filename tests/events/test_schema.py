@@ -95,3 +95,30 @@ class TestEvent:
         )
         json_str = json.dumps(event.to_dict())
         assert json_str  # No serialization error
+
+
+"""Tests for the EventType catalog -- added 2026-04-26 for the DevFlow bridge."""
+
+
+def test_devflow_event_types_exist():
+    assert EventType.DEVFLOW_RUN_STARTED.type_string == "devflow.run_started"
+    assert EventType.DEVFLOW_RUN_COMPLETED.type_string == "devflow.run_completed"
+    assert EventType.DEVFLOW_APPROVAL_REQUESTED.type_string == "devflow.approval_requested"
+    assert EventType.DEVFLOW_TRACE_SNAPSHOT.type_string == "devflow.trace_snapshot"
+
+
+def test_devflow_event_types_default_priorities():
+    assert EventType.DEVFLOW_RUN_STARTED.default_priority == Priority.NORMAL
+    assert EventType.DEVFLOW_RUN_COMPLETED.default_priority == Priority.NORMAL
+    assert EventType.DEVFLOW_APPROVAL_REQUESTED.default_priority == Priority.HIGH
+    assert EventType.DEVFLOW_TRACE_SNAPSHOT.default_priority == Priority.LOW
+
+
+def test_devflow_event_types_round_trip_via_from_string():
+    for et in (
+        EventType.DEVFLOW_RUN_STARTED,
+        EventType.DEVFLOW_RUN_COMPLETED,
+        EventType.DEVFLOW_APPROVAL_REQUESTED,
+        EventType.DEVFLOW_TRACE_SNAPSHOT,
+    ):
+        assert EventType.from_string(et.type_string) is et
