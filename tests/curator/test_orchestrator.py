@@ -198,6 +198,44 @@ def test_orchestrator_emits_curator_daily_event(tmp_path):
     )
     assert len(bus.events) == 1
     ev = bus.events[0]
-    # Accept either a dict-like Event or a real Event with attributes
-    et = getattr(ev, "event_type", None) or (ev.get("event_type") if isinstance(ev, dict) else None)
-    assert et == "curator_daily", ev
+    # Accept real Event (EventType enum), dict-style fallback, or string
+    et_attr = getattr(ev, "event_type", None)
+    if et_attr is not None:
+        et_str = getattr(et_attr, "type_string", str(et_attr))
+    else:
+        et_str = ev.get("event_type") if isinstance(ev, dict) else None
+    assert et_str == "curator_daily", (et_str, ev)
+
+
+def test_curator_daily_payload_schema(tmp_path):
+    """The emitted event payload includes all spec'd keys (Task 7)."""
+    audit_path = tmp_path / "audit.jsonl"
+    audit_path.write_text("")
+    for agent in AGENTS:
+        (tmp_path / "profiles" / agent / "memories").mkdir(parents=True, exist_ok=True)
+
+    def render_fn(agent, *_a, **_k):
+        return f"# MEMORY — {agent}\n## Operating Stats\nx\n"
+
+    bus = _FakeBus()
+    run_backfill(
+        window_days=30, dry_run=False, emit_event=True,
+        audit_path=audit_path, search_fn=_stub_search_fn, bus=bus,
+        hermes_root=tmp_path, render_fn=render_fn,
+    )
+    assert len(bus.events) == 1
+    ev = bus.events[0]
+    payload = getattr(ev, "payload", None)
+    if payload is None and isinstance(ev, dict):
+        payload = ev.get("payload")
+    assert payload is not None
+    for key in (
+        "mode", "agents_updated", "patterns_seeded",
+        "skills_observed", "drawers_scanned", "degraded", "duration_s",
+    ):
+        assert key in payload, f"missing payload key {key}: {payload}"
+    assert isinstance(payload["agents_updated"], list)
+    assert isinstance(payload["patterns_seeded"], int)
+    assert isinstance(payload["drawers_scanned"], int)
+    assert isinstance(payload["degraded"], bool)
+    assert isinstance(payload["duration_s"], (int, float))

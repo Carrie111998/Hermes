@@ -97,6 +97,12 @@ class EventType(Enum):
     WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
 
+    # Curator nightly consolidation -- added 2026-04-26.
+    # Emitted by curator.orchestrator after backfill / nightly delta
+    # passes. Consumed by Scribe (morning digest) and the memory-writer
+    # subscriber for cursor advance.
+    CURATOR_DAILY = ("curator_daily", Priority.NORMAL)
+
     # DevFlow bridge -- added 2026-04-26.
     # Emitted by the devflow profile (see ~/.hermes/profiles/devflow/SOUL.md
     # emit-hooks section) and consumed by ~/.hermes/bridges/hermes_to_devflow.py

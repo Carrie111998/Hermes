@@ -48,11 +48,26 @@ APPEND_ONLY_AGENTS = {"main"}
 # Curator default Constitutional Principles (one entry per agent) —
 # imported from the legacy bootstrap module so we maintain a single
 # source of truth. Same for the seed Learned Patterns.
-try:
-    from profiles.curator.workspace.memory_bootstrap import CONSTITUTIONAL, PATTERNS_SEED
-except Exception:  # pragma: no cover — legacy module path may not import
-    CONSTITUTIONAL: Dict[str, List[str]] = {}
-    PATTERNS_SEED: Dict[str, List[str]] = {}
+def _load_legacy_seeds() -> tuple:
+    import importlib.util
+    bootstrap_path = Path(r"C:/Users/diego/.hermes/profiles/curator/workspace/memory_bootstrap.py")
+    if not bootstrap_path.exists():
+        return ({}, {})
+    spec = importlib.util.spec_from_file_location("memory_bootstrap", str(bootstrap_path))
+    if spec is None or spec.loader is None:
+        return ({}, {})
+    try:
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return (
+            getattr(mod, "CONSTITUTIONAL", {}) or {},
+            getattr(mod, "PATTERNS_SEED", {}) or {},
+        )
+    except Exception:  # pragma: no cover — legacy script may import live deps
+        return ({}, {})
+
+
+CONSTITUTIONAL, PATTERNS_SEED = _load_legacy_seeds()
 
 
 RenderFn = Callable[..., str]
