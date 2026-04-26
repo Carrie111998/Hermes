@@ -6,6 +6,13 @@ etc. based on the message_type + inner payload.
 
 This subscriber replaces the dead regex-based output parser in
 CronEventEmitter that was never producing domain events.
+
+Failure-cluster wiring (Hermes Revival §6 post-hoc Critic trigger):
+the ERROR-message branch also feeds FailureClusterDetector so that
+agents reporting failures via structured mailbox messages (not via a
+non-zero cron exit code) still trigger AGENT_FAILURE_CLUSTER.  This
+closes a gap from the cron-emitter wiring (events/producers/cron_emitter.py)
+which only saw failures that surfaced as cron exit codes.
 """
 
 import logging
@@ -13,6 +20,8 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from events.bus import EventBus
+from events.cluster_detector import FailureClusterDetector
+from events.paths import failure_cluster_state_path
 from events.schema import Event, EventType, Priority
 from events.subscribers.base import BaseSubscriber
 
@@ -67,6 +76,16 @@ class MailboxTranslator(BaseSubscriber):
     poll_interval_seconds = 5
     event_types = [EventType.MAILBOX_MESSAGE]
 
+    def __init__(self, bus: EventBus):
+        super().__init__(bus)
+        # Shares the same canonical state file as CronEventEmitter — both
+        # producers funnel into one detector window so a mix of cron-exit-
+        # code failures and structured ERROR mailbox messages from the same
+        # agent still cluster correctly.
+        self._cluster_detector = FailureClusterDetector(
+            state_path=failure_cluster_state_path(),
+        )
+
     def handle(self, event: Event) -> None:
         payload = event.payload or {}
         message_type = payload.get("message_type", "")
@@ -86,6 +105,56 @@ class MailboxTranslator(BaseSubscriber):
                 )
             except Exception:
                 logger.exception("MailboxTranslator: failed to emit %s", et.type_string)
+
+        # ERROR branch: feed the cluster detector so structured mailbox
+        # error messages contribute to the same cluster signal as cron-
+        # exit-code failures.  Source attribution = the failing agent
+        # (inner.source_agent or the mailbox 'from'), NOT the bus-event
+        # 'source' (which is the transport label).
+        if message_type == "ERROR":
+            self._record_error_for_clustering(payload, inner, correlation_id)
+
+    def _record_error_for_clustering(
+        self,
+        outer_payload: Dict[str, Any],
+        inner: Dict[str, Any],
+        correlation_id: Optional[str],
+    ) -> None:
+        """Record an ERROR mailbox message into the FailureClusterDetector
+        and emit AGENT_FAILURE_CLUSTER if the threshold is crossed.
+
+        Wrapped in a broad try/except so a corrupt state file or detector
+        bug never blocks AGENT_ERROR emission or the rest of the poll loop.
+        """
+        try:
+            source_agent = (
+                inner.get("source_agent")
+                or outer_payload.get("from")
+                or "unknown"
+            )
+            error_text = inner.get("message") or ""
+            cluster = self._cluster_detector.record(
+                source=source_agent,
+                success=False,
+                error_text=error_text,
+            )
+            if cluster is not None:
+                self.bus.emit(
+                    event_type=EventType.AGENT_FAILURE_CLUSTER,
+                    source=cluster.source,
+                    payload={
+                        "source": cluster.source,
+                        "failure_type": cluster.failure_type,
+                        "count": cluster.count,
+                        "first_seen": cluster.first_seen,
+                        "last_seen": cluster.last_seen,
+                    },
+                    correlation_id=correlation_id,
+                )
+        except Exception:
+            logger.exception(
+                "MailboxTranslator: cluster detector record failed"
+            )
 
     def _translate(
         self,

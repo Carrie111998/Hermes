@@ -163,6 +163,97 @@ def test_error_message_emits_agent_error(bus):
     assert any(et == EventType.AGENT_ERROR for et, _ in events)
 
 
+class TestMailboxErrorFeedsClusterDetector:
+    """ERROR mailbox messages must feed the FailureClusterDetector so that
+    agents reporting failures via structured mailbox messages (rather than
+    failing the cron exit code) still trigger AGENT_FAILURE_CLUSTER and the
+    Critic post-hoc retro.
+
+    Closes the gap identified in 2026-04-26-agent-failure-cluster-wiring:
+    the cron-emitter path was already wired (Task 3) but the mailbox path
+    was not, so any agent that swallowed its own exception and emitted a
+    structured ERROR mailbox message was invisible to the cluster signal.
+    """
+
+    @pytest.fixture
+    def isolated_bus(self, tmp_path, monkeypatch):
+        """Bus with an isolated detector state path (not the live ~/.hermes one)."""
+        state_path = tmp_path / "events" / "failure_cluster_state.json"
+        monkeypatch.setattr(
+            "events.subscribers.mailbox_translator.failure_cluster_state_path",
+            lambda: state_path,
+        )
+        b = EventBus(db_path=tmp_path / "event_bus.db")
+        yield b
+        b.close()
+
+    def _emit_error(self, bus, source_agent, message):
+        bus.emit(
+            event_type=EventType.MAILBOX_MESSAGE,
+            source="test",
+            payload={
+                "message_type": "ERROR",
+                "from": source_agent,
+                "to": "main",
+                "file": f"fake_error_{source_agent}.json",
+                "summary": "",
+                "inner_payload": {
+                    "message": message,
+                    "source_agent": source_agent,
+                },
+            },
+        )
+
+    def test_three_same_type_error_messages_emit_cluster(self, isolated_bus):
+        for _ in range(3):
+            self._emit_error(isolated_bus, "scout", "Bailing: CAPTCHA detected")
+        MailboxTranslator(isolated_bus).poll()
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1, (
+            f"Expected 1 cluster from 3 same-type mailbox ERRORs; got {len(clusters)}"
+        )
+        evt = clusters[0]
+        assert evt.payload["failure_type"] == "captcha"
+        assert evt.payload["count"] == 3
+        # source attribution: cluster source must be the failing agent,
+        # not "mailbox:scout" (which is the bus 'source' on the AGENT_ERROR
+        # emission).  The cluster signal is *about the agent*, not the
+        # transport.
+        assert evt.source == "scout"
+        assert evt.payload["source"] == "scout"
+
+    def test_two_same_type_errors_no_cluster(self, isolated_bus):
+        for _ in range(2):
+            self._emit_error(isolated_bus, "scout", "Bailing: CAPTCHA detected")
+        MailboxTranslator(isolated_bus).poll()
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert clusters == []
+
+    def test_three_different_types_no_cluster(self, isolated_bus):
+        self._emit_error(isolated_bus, "scout", "captcha")
+        self._emit_error(isolated_bus, "scout", "HTTP 401 Unauthorized")
+        self._emit_error(isolated_bus, "scout", "Request timed out")
+        MailboxTranslator(isolated_bus).poll()
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert clusters == []
+
+    def test_different_sources_dont_cluster_together(self, isolated_bus):
+        self._emit_error(isolated_bus, "scout", "captcha")
+        self._emit_error(isolated_bus, "matcher", "captcha")
+        self._emit_error(isolated_bus, "applier", "captcha")
+        MailboxTranslator(isolated_bus).poll()
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        # No single source crossed the threshold of 3.
+        assert clusters == []
+
+    def test_existing_agent_error_still_emits(self, isolated_bus):
+        """Adding the cluster wiring must not regress the existing AGENT_ERROR."""
+        self._emit_error(isolated_bus, "scout", "captcha")
+        MailboxTranslator(isolated_bus).poll()
+        agent_errors = isolated_bus.query(event_type=EventType.AGENT_ERROR)
+        assert len(agent_errors) == 1
+
+
 def test_unknown_message_type_produces_no_domain_event(bus):
     _mailbox_event(bus, "SOME_RANDOM_TYPE", {"foo": "bar"})
     MailboxTranslator(bus).poll()
