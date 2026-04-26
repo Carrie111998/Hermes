@@ -156,18 +156,31 @@ def _get_oauth_token() -> str:
 
 
 def _jwt_is_expired(token: str, skew_seconds: int = 60) -> bool:
-    """True if the JWT exp claim has passed (+ optional safety skew)."""
+    """True if the JWT exp claim has passed, OR the token is malformed.
+
+    Malformed tokens are treated as expired so callers fall through to the
+    credential_pool fallback (Step 2 of `_get_oauth_token`). Letting them
+    through caused the 2026-04-25 shadow-coverage outage when a failed token
+    refresh left `~/.codex/auth.json` with the placeholder string `access-new`.
+    """
+    if not token or not isinstance(token, str):
+        return True
     try:
         import base64 as _b64
         import json as _json
 
-        body = token.split(".")[1]
+        parts = token.split(".")
+        if len(parts) != 3:
+            return True
+        body = parts[1]
         body += "=" * (-len(body) % 4)
         payload = _json.loads(_b64.urlsafe_b64decode(body))
         exp = int(payload.get("exp", 0))
+        if exp <= 0:
+            return True
         return time.time() + skew_seconds >= exp
     except Exception:
-        return False  # if we can't parse, assume usable; let server reject
+        return True
 
 
 def get_codex_chat_model(
