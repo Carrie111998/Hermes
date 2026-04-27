@@ -260,9 +260,10 @@ class MailboxWatcher:
             company = payload.get("company", "?")
             return f"follow up with {company} ({days} days since application)"
         if msg_type == "NOTIFICATION":
-            # Notifications often carry their own summary/body
-            return (payload.get("summary") or payload.get("body") or "Notification")[:200]
+            # Notifications often carry their own summary/body. Coerce to str
+            # because some producers send dict/list payloads.
+            return str(payload.get("summary") or payload.get("body") or "Notification")[:200]
         if msg_type == "ERROR":
-            return (payload.get("message") or "Error")[:200]
+            return str(payload.get("message") or "Error")[:200]
 
         return msg_type
