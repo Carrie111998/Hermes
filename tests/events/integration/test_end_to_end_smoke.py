@@ -22,19 +22,27 @@ def test_full_stack_score_result_reaches_telegram(tmp_path, monkeypatch):
     }))
 
     (tmp_path / "telegram").mkdir()
+    # v2 topic keys (Hermes Telegram cutover 20260424T233627Z). Thread IDs
+    # chosen so the JOB_SCORED → jobflow_firehose delivery lands at thread 11
+    # (the existing assertion below). JOB_HIGH_SCORE (score 8.9 ≥ 8.75
+    # threshold) routes to jobflow_decisions; mailbox_message defaults to
+    # scribe_daily.
     (tmp_path / "telegram" / "topics.json").write_text(json.dumps({
         "group_chat_id": "-100xxx",
         "topics": {
-            "matcher": {"thread_id": 11, "name": "Matcher / Scores"},
-            "alerts": {"thread_id": 9, "name": "Alerts"},
-            "system": {"thread_id": 15, "name": "System"},
-            "scout": {"thread_id": 10}, "tailor_applier": {"thread_id": 12},
-            "tracker": {"thread_id": 13}, "digests": {"thread_id": 14},
-            "agent_comms": {"thread_id": 16},
+            "jobflow_firehose": {"thread_id": 11, "name": "JobFlow Firehose"},
+            "jobflow_decisions": {"thread_id": 12, "name": "JobFlow Decisions"},
+            "watchdog_alerts": {"thread_id": 9, "name": "Watchdog Alerts"},
+            "security_and_system": {"thread_id": 15, "name": "Security & System"},
+            "scribe_daily": {"thread_id": 14, "name": "Scribe Daily"},
+            "devflow_firehose": {"thread_id": 10},
+            "devflow_decisions": {"thread_id": 13},
+            "curator_digest": {"thread_id": 16},
+            "critic_proposals": {"thread_id": 17},
         }
     }))
     (tmp_path / "telegram" / "verbosity.json").write_text(json.dumps({
-        "matcher": {"mode": "all"}, "alerts": {"mode": "all"},
+        "jobflow_firehose": {"mode": "all"}, "watchdog_alerts": {"mode": "all"},
     }))
 
     bus = EventBus(db_path=tmp_path / "events" / "event_bus.db")
@@ -52,9 +60,9 @@ def test_full_stack_score_result_reaches_telegram(tmp_path, monkeypatch):
         notifier.poll()
 
         assert len(delivered) >= 1, f"expected at least one delivery, got: {delivered}"
-        matcher_deliveries = [d for d in delivered if str(d[1]) == "11"]
-        assert len(matcher_deliveries) >= 1, (
-            f"expected matcher topic delivery, got: {delivered}"
+        firehose_deliveries = [d for d in delivered if str(d[1]) == "11"]
+        assert len(firehose_deliveries) >= 1, (
+            f"expected jobflow_firehose topic delivery, got: {delivered}"
         )
     finally:
         bus.close()

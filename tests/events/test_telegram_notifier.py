@@ -18,17 +18,24 @@ def bus(tmp_path):
 
 @pytest.fixture
 def topics_config(tmp_path):
+    # v2 topic keys (Hermes Telegram cutover 20260424T233627Z) — match the
+    # post-cutover production ~/.hermes/telegram/topics.json. Thread IDs are
+    # chosen so existing test assertions (101 = jobflow_firehose primary,
+    # 105 = scribe_daily for mailbox/digest, 100 = watchdog_alerts for
+    # application_failed) continue to hold without churn.
     config = {
         "group_chat_id": "-1001234567890",
         "topics": {
-            "alerts": {"thread_id": 100, "name": "Alerts & Actions"},
-            "scout": {"thread_id": 101, "name": "Scout / Discoveries"},
-            "matcher": {"thread_id": 102, "name": "Matcher / Scores"},
-            "tailor_applier": {"thread_id": 103, "name": "Tailor & Applier"},
-            "tracker": {"thread_id": 104, "name": "Tracker / Pipeline"},
-            "digests": {"thread_id": 105, "name": "Digests & Summaries"},
-            "system": {"thread_id": 106, "name": "System Health"},
-            "agent_comms": {"thread_id": 107, "name": "Agent Comms"},
+            "watchdog_alerts": {"thread_id": 100, "name": "Watchdog Alerts"},
+            "jobflow_firehose": {"thread_id": 101, "name": "JobFlow Firehose"},
+            "jobflow_decisions": {"thread_id": 102, "name": "JobFlow Decisions"},
+            "devflow_firehose": {"thread_id": 103, "name": "DevFlow Firehose"},
+            "devflow_decisions": {"thread_id": 104, "name": "DevFlow Decisions"},
+            "scribe_daily": {"thread_id": 105, "name": "Scribe Daily"},
+            "security_and_system": {"thread_id": 106, "name": "Security & System"},
+            "curator_digest": {"thread_id": 107, "name": "Curator Digest"},
+            "critic_proposals": {"thread_id": 108, "name": "Critic Proposals"},
+            "hermes_milestones": {"thread_id": 109, "name": "Hermes Milestones"},
         },
     }
     path = tmp_path / "telegram" / "topics.json"
@@ -40,10 +47,11 @@ def topics_config(tmp_path):
 @pytest.fixture
 def verbosity_config(tmp_path):
     config = {
-        "scout": {"mode": "all"},
-        "matcher": {"mode": "all"},
-        "system": {"mode": "digest_only"},
-        "agent_comms": {"mode": "significant_only"},
+        "jobflow_firehose": {"mode": "all"},
+        "jobflow_decisions": {"mode": "all"},
+        "watchdog_alerts": {"mode": "all"},
+        "security_and_system": {"mode": "digest_only"},
+        "curator_digest": {"mode": "significant_only"},
     }
     path = tmp_path / "telegram" / "verbosity.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,13 +66,18 @@ class TestTopicRouting:
                 f"EventType {et.type_string} missing from TOPIC_ROUTING"
 
     def test_scout_events_route_to_scout(self):
-        assert TOPIC_ROUTING["job_discovered"] == "scout"
-        assert TOPIC_ROUTING["job_vip_discovered"] == "scout"
+        # v2 cutover 20260424T233627Z: scout-domain firehose absorbed into
+        # jobflow_firehose (formerly the standalone "scout" topic).
+        assert TOPIC_ROUTING["job_discovered"] == "jobflow_firehose"
+        assert TOPIC_ROUTING["job_vip_discovered"] == "jobflow_firehose"
 
     def test_critical_events_route_to_alerts(self):
-        assert TOPIC_ROUTING["application_blocked"] == "alerts"
-        assert TOPIC_ROUTING["interview_signal"] == "alerts"
-        assert TOPIC_ROUTING["offer_signal"] == "alerts"
+        # v2 cutover split the v1 "alerts" topic into two:
+        #   - watchdog_alerts: system/applier failures
+        #   - jobflow_decisions: human-action signals (interviews, offers)
+        assert TOPIC_ROUTING["application_blocked"] == "watchdog_alerts"
+        assert TOPIC_ROUTING["interview_signal"] == "jobflow_decisions"
+        assert TOPIC_ROUTING["offer_signal"] == "jobflow_decisions"
 
     def test_topic_routing_covers_all_domain_events(self):
         from events.subscribers.telegram_notifier import TOPIC_ROUTING
@@ -154,12 +167,19 @@ class TestTelegramNotifier:
         target = notifier.resolve_target(event)
         assert target == ("telegram", "-1001234567890", "105")  # digests thread
 
-    def test_non_notification_mailbox_message_still_routes_to_agent_comms(
+    def test_non_notification_mailbox_message_falls_through_to_default(
         self, bus, topics_config, verbosity_config,
     ):
         """Agent-to-agent mailbox messages (SCORE_RESULT, TAILOR_REQUEST, etc.)
-        still route to ``agent_comms`` — only the NOTIFICATION message_type
-        gets the ``digests`` override.
+        fall through to the default mailbox routing — TOPIC_ROUTING
+        ``mailbox_message`` → ``scribe_daily`` post v2 cutover. Only
+        NOTIFICATION message_type triggers the explicit override branch in
+        resolve_target(); the override target is also ``scribe_daily`` in
+        v2 (the v1 ``digests`` vs ``agent_comms`` distinction collapsed at
+        the cutover, 20260424T233627Z), so both paths produce the same
+        thread_id. This test guards against the override branch firing
+        for non-NOTIFICATION messages or against TOPIC_ROUTING regressing
+        on the default.
         """
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
@@ -174,7 +194,7 @@ class TestTelegramNotifier:
             },
         )
         target = notifier.resolve_target(event)
-        assert target == ("telegram", "-1001234567890", "107")  # agent_comms thread
+        assert target == ("telegram", "-1001234567890", "105")  # scribe_daily thread
 
     def test_cross_posts_critical_to_alerts(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
@@ -194,7 +214,7 @@ class TestTelegramNotifier:
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
         )
         assert notifier.group_chat_id == "-1001234567890"
-        assert notifier.topics["scout"]["thread_id"] == 101
+        assert notifier.topics["jobflow_firehose"]["thread_id"] == 101
 
     def test_cron_completed_long_summary_is_trimmed_for_mission_control(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
@@ -339,7 +359,8 @@ class TestLowPriorityBatching:
     """Tests for low-priority event batching and flush behavior.
 
     Uses event types that route to topics with 'all' verbosity mode
-    (scout, matcher) to avoid verbosity filtering interference.
+    (jobflow_firehose, jobflow_decisions in v2) to avoid verbosity
+    filtering interference.
     """
 
     def test_low_priority_event_is_buffered(self, bus, topics_config, verbosity_config):
@@ -349,7 +370,7 @@ class TestLowPriorityBatching:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
 
-        # job_discovered routes to "scout" topic which has mode="all"
+        # job_discovered routes to "jobflow_firehose" topic (v2) with mode="all"
         event = Event.create(
             EventType.JOB_DISCOVERED, "scout",
             {"title": "Analyst", "company": "Acme", "source": "Indeed"},
@@ -368,7 +389,7 @@ class TestLowPriorityBatching:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
 
-        # job_scored routes to "matcher" topic which has mode="all"
+        # job_scored routes to "jobflow_firehose" topic (v2) with mode="all"
         event = Event.create(
             EventType.JOB_SCORED, "matcher",
             {"score": 7.5, "title": "Engineer", "company": "Beta"},
@@ -401,7 +422,7 @@ class TestLowPriorityBatching:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
 
-        # Buffer two low-priority events on the "scout" topic (mode=all)
+        # Buffer two low-priority events on the "jobflow_firehose" topic (mode=all)
         for i in range(2):
             event = Event.create(
                 EventType.JOB_DISCOVERED, "scout",
@@ -425,7 +446,7 @@ class TestLowPriorityBatching:
             send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
         )
 
-        # Use scout topic (mode=all) with low priority to ensure buffering
+        # Use jobflow_firehose topic (v2, mode=all) with low priority to ensure buffering
         event = Event.create(
             EventType.JOB_DISCOVERED, "scout",
             {"title": "Analyst", "company": "Acme", "source": "Indeed"},
