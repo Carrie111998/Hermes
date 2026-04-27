@@ -209,6 +209,46 @@ class TestTelegramNotifier:
         # application_failed routes to alerts directly
         assert "100" in topic_ids  # alerts
 
+    def test_cross_posts_high_priority_event_to_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """CROSS_POST_TO_ALERTS events at HIGH+ priority must hit BOTH the
+        primary topic AND watchdog_alerts.
+
+        Regression: 2026-04-27 — the v2 cutover (20260424T233627Z) renamed
+        the catch-all ``alerts`` topic to ``watchdog_alerts``, but
+        resolve_all_targets() kept reading ``self.topics.get("alerts", {})``.
+        Post-cutover topics.json has no ``alerts`` key, so the lookup
+        returned ``{}``, ``alerts_thread`` became ``""``, the guard
+        ``if alerts_thread and alerts_thread != primary_thread`` failed,
+        and CROSS_POST_TO_ALERTS events (application_ready, followup_due,
+        interview_signal, job_high_score, offer_signal) at HIGH+ silently
+        went ONLY to their primary firehose topic — exactly the noisy
+        stream a busy operator needs them surfaced OUT of.
+
+        JOB_HIGH_SCORE is a clean witness: its primary topic is
+        ``jobflow_decisions`` (thread 102), so a working cross-post must
+        ADD watchdog_alerts (thread 100). With the bug, only 102 appears.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.JOB_HIGH_SCORE, "matcher",
+            {"job_id": "abc-123", "score": 9.4, "title": "VP Finance"},
+            priority=Priority.HIGH,
+        )
+        targets = notifier.resolve_all_targets(event)
+        topic_ids = [t[2] for t in targets]
+        assert "102" in topic_ids, (
+            f"primary jobflow_decisions thread missing from {topic_ids}"
+        )
+        assert "100" in topic_ids, (
+            f"watchdog_alerts cross-post missing from {topic_ids} "
+            f"— resolve_all_targets() likely still reading the dead 'alerts' "
+            f"key instead of 'watchdog_alerts'"
+        )
+
     def test_loads_topics_config(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,

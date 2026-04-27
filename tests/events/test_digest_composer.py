@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -133,3 +134,58 @@ def test_digest_composer_persists_last_digest_at(tmp_path, monkeypatch):
             assert d2._last_digest_at == state["last_digest_at"]
     finally:
         bus.close()
+
+
+class TestDeliveryTopicLookup:
+    """Regression tests for v2 topic-key cutover (20260424T233627Z).
+
+    DigestComposer._deliver_telegram, when no send_telegram_fn is injected
+    (production gateway path — see events/gateway_integration.py), reads
+    ~/.hermes/telegram/topics.json and resolves the target thread_id from
+    a topic key. Pre-cutover the key was ``digests``; post-cutover it
+    must be ``scribe_daily`` (the v2 destination for digest_generated /
+    morning JobFlow digests, per TOPIC_ROUTING in telegram_notifier).
+
+    With the dead key, the lookup returns ``{}``, ``thread_id`` becomes
+    ``""``, and the ``if chat_id and thread_id:`` guard fails — the
+    digest is silently dropped instead of being delivered.
+    """
+
+    def test_deliver_telegram_resolves_v2_scribe_daily_thread(
+        self, bus, tmp_path,
+    ):
+        topics_path = tmp_path / "telegram" / "topics.json"
+        topics_path.parent.mkdir(parents=True)
+        topics_path.write_text(json.dumps({
+            "group_chat_id": "-1001234567890",
+            "topics": {
+                # v2 keys (cutover 20260424T233627Z) — same fixture shape
+                # as tests/events/test_telegram_notifier.py
+                "watchdog_alerts": {"thread_id": 100},
+                "jobflow_firehose": {"thread_id": 101},
+                "jobflow_decisions": {"thread_id": 102},
+                "scribe_daily": {"thread_id": 105},
+                "curator_digest": {"thread_id": 107},
+            },
+        }))
+
+        captured = {}
+        def fake_deliver(job, body, skip_cron_framing=False):
+            captured["target"] = job.get("deliver")
+            captured["body"] = body
+
+        composer = DigestComposer(bus)  # no send_telegram_fn → production branch
+        with patch(
+            "events.paths.telegram_topics_path",
+            return_value=topics_path,
+        ), patch(
+            "cron.scheduler._deliver_result",
+            side_effect=fake_deliver,
+        ):
+            composer._deliver_telegram("morning digest body")
+
+        assert captured.get("target") == "telegram:-1001234567890:105", (
+            f"expected target ending in :105 (scribe_daily), got "
+            f"{captured.get('target')!r} — _deliver_telegram likely still "
+            f"reading the dead v1 'digests' key"
+        )

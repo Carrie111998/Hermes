@@ -246,10 +246,13 @@ class TelegramNotifier(BaseSubscriber):
         """Resolve all targets including cross-posts."""
         targets = [self.resolve_target(event)]
 
-        # Cross-post action-required high/critical events to alerts
+        # Cross-post action-required high/critical events to watchdog_alerts.
+        # v2 cutover (20260424T233627Z) renamed the catch-all ``alerts`` topic
+        # to ``watchdog_alerts``; the constant name CROSS_POST_TO_ALERTS is
+        # kept as a generic descriptor of intent.
         if (event.event_type.type_string in CROSS_POST_TO_ALERTS
                 and event.priority.level >= Priority.HIGH.level):
-            alerts_topic = self.topics.get("alerts", {})
+            alerts_topic = self.topics.get("watchdog_alerts", {})
             alerts_thread = str(alerts_topic.get("thread_id", ""))
             primary_thread = targets[0][2]
             if alerts_thread and alerts_thread != primary_thread:

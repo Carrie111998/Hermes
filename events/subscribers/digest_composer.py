@@ -182,7 +182,10 @@ class DigestComposer(BaseSubscriber):
             if topics_path.exists():
                 data = _json.loads(topics_path.read_text(encoding="utf-8"))
                 chat_id = data.get("group_chat_id", "")
-                thread_id = data.get("topics", {}).get("digests", {}).get("thread_id", "")
+                # v2 cutover (20260424T233627Z) renamed v1 'digests' to
+                # 'scribe_daily' (the destination for digest_generated /
+                # morning JobFlow digests per telegram_notifier.TOPIC_ROUTING).
+                thread_id = data.get("topics", {}).get("scribe_daily", {}).get("thread_id", "")
                 if chat_id and thread_id:
                     target = f"telegram:{chat_id}:{thread_id}"
                     _deliver_result(

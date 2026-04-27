@@ -55,7 +55,10 @@ class TelegramMirror(BaseSubscriber):
         try:
             config = json.loads(self._topics_path.read_text(encoding="utf-8"))
             chat_id = config.get("group_chat_id", "")
-            thread_id = str(config.get("topics", {}).get("agent_comms", {}).get("thread_id", ""))
+            # v2 cutover (20260424T233627Z) collapsed the v1 'agent_comms'
+            # vs 'digests' split into a single 'scribe_daily' topic — the
+            # destination for mailbox_message per telegram_notifier.TOPIC_ROUTING.
+            thread_id = str(config.get("topics", {}).get("scribe_daily", {}).get("thread_id", ""))
             if not chat_id or not thread_id:
                 return
 
