@@ -82,6 +82,15 @@ class BaseSubscriber(ABC):
         self.bus = bus
         self._consecutive_errors: int = 0
         self._quarantined_until: Optional[float] = None  # monotonic timestamp
+        # SR-XXX (2026-04-28): in-process dedup set. Prevents handle() re-firing
+        # for an event already processed in this process even if the bus-level
+        # `handled_events` row failed to write (WAL lock, disk full, etc.).
+        # Cleared on process restart — the SQLite-level `is_handled` check
+        # provides cross-restart durability when it can.
+        self._handled_this_process: set = set()
+        # Tracks consecutive mark_handled failures per event so we can dead-letter
+        # and advance past an event whose handle() succeeds but whose mark fails.
+        self._mark_handled_failures: Dict[str, int] = {}
 
     @abstractmethod
     def handle(self, event: Event) -> None:
@@ -117,10 +126,19 @@ class BaseSubscriber(ABC):
 
         processed_ids = []
         for event in events:
-            # SR-101: at-least-once redelivery dedup. If a prior poll already
-            # processed this event successfully, skip handle() but still ack
-            # the cursor so the event doesn't re-appear forever.
-            if self.bus.is_handled(self.subscriber_id, event.event_id):
+            # SR-XXX dedup: check in-process set first (fast, can't fail), then
+            # bus-level handled_events table (cross-restart durable but can fail
+            # under WAL lock). Either short-circuits the handle() call.
+            if event.event_id in self._handled_this_process:
+                processed_ids.append(event.event_id)
+                continue
+            try:
+                already_handled = self.bus.is_handled(self.subscriber_id, event.event_id)
+            except Exception:
+                logger.exception("Failed to query is_handled for %s", event.event_id)
+                already_handled = False
+            if already_handled:
+                self._handled_this_process.add(event.event_id)
                 processed_ids.append(event.event_id)
                 continue
             # OTel: wrap handle() in a span. One span per subscriber-event
@@ -144,12 +162,20 @@ class BaseSubscriber(ABC):
                 try:
                     self.handle(event)
                     self._consecutive_errors = 0  # any success resets the counter
+                    # In-process dedup recorded BEFORE the bus call so even if
+                    # mark_handled fails (WAL lock, disk full), this process
+                    # cannot re-fire handle() for the same event.
+                    self._handled_this_process.add(event.event_id)
                     # SR-101: mark handled AFTER success. Wrapped so a bus-level
                     # failure doesn't cascade into the subscriber.
                     try:
                         self.bus.mark_handled(self.subscriber_id, event.event_id)
-                    except Exception:
+                        # Success: clear any prior failure counter.
+                        self._mark_handled_failures.pop(event.event_id, None)
+                    except Exception as _mh_exc:
                         logger.exception("Failed to mark handled for %s", event.event_id)
+                        # See Task 7 for the dead-letter escalation logic.
+                        self._on_mark_handled_failure(event.event_id, _mh_exc)
                 except Exception as exc:
                     _span.record_exception(exc)
                     try:
@@ -183,6 +209,17 @@ class BaseSubscriber(ABC):
 
         self.bus.ack(self.subscriber_id, processed_ids)
         return len(events)
+
+    def _on_mark_handled_failure(self, event_id: str, exc: Exception) -> None:
+        """Hook for dead-letter escalation on repeated mark_handled failures.
+
+        Default: no-op. Task 7 fills in the dead-letter escalation logic.
+        """
+        # Minimal counter increment so Task 7's tests can rely on the field
+        # existing without pulling in the full escalation path.
+        self._mark_handled_failures[event_id] = (
+            self._mark_handled_failures.get(event_id, 0) + 1
+        )
 
     def _is_quarantined(self) -> bool:
         """Return True iff the circuit breaker is currently open."""

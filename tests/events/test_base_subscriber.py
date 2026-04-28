@@ -525,3 +525,46 @@ class TestAtLeastOnceDedup:
         count = sub.poll()
         assert count == 1
         assert len(sub.processed) == 1
+
+    def test_in_process_dedup_when_mark_handled_fails(self, tmp_path, monkeypatch):
+        """If mark_handled fails, the in-memory dedup set must still prevent re-handle within the process."""
+        from events.subscribers.base import BaseSubscriber
+
+        class CountingSubscriber(BaseSubscriber):
+            subscriber_id = "counter"
+            poll_interval_seconds = 1
+            CIRCUIT_BREAKER_ERROR_THRESHOLD = 99  # never trip
+
+            def __init__(self, bus):
+                super().__init__(bus)
+                self.calls = 0
+
+            def handle(self, event):
+                self.calls += 1
+
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = CountingSubscriber(bus)
+
+        # Make mark_handled silently broken — it raises every time.
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated WAL lock")
+        monkeypatch.setattr(bus, "mark_handled", boom)
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+
+        # First poll: handle() runs, mark_handled fails, in-process set records it.
+        sub.poll()
+        assert sub.calls == 1
+
+        # Force re-fetch of the same event by rewinding the cursor.
+        bus.ack(sub.subscriber_id, [])  # no-op; cursor stays put if ack also failed
+        # Manually rewind to simulate ack failing too:
+        bus._execute(
+            "UPDATE subscriber_cursors SET last_rowid = 0 WHERE subscriber_id = ?",
+            (sub.subscriber_id,),
+        )
+
+        # Second poll: same event re-fetched. Without the in-process set, handle()
+        # would run again. WITH it, handle() is skipped.
+        sub.poll()
+        assert sub.calls == 1, "handle() must not re-fire for an event already handled in this process"
