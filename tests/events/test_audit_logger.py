@@ -151,29 +151,44 @@ class TestRotation:
         entry = json.loads(lines[0])
         assert entry["event_type"] == "job_high_score"
 
+    def test_size_cap_triggers_rotation_before_age(self, bus, audit_path):
+        """If audit.jsonl exceeds SIZE_CAP_BYTES, rotate even if age < 7 days."""
+        from events.subscribers.audit_logger import SIZE_CAP_BYTES
 
-def test_size_cap_triggers_rotation_before_age(tmp_path):
-    """If audit.jsonl exceeds SIZE_CAP_BYTES, rotate even if age < 7 days."""
-    from events.bus import EventBus
-    from events.schema import EventType
-    from events.subscribers.audit_logger import AuditLogger, SIZE_CAP_BYTES
+        sub = AuditLogger(bus, audit_path=audit_path)
 
-    bus = EventBus(db_path=tmp_path / "events" / "test.db")
-    audit = tmp_path / "audit.jsonl"
-    sub = AuditLogger(bus, audit_path=audit)
+        # Write enough bytes to exceed the cap.
+        audit_path.write_text("x" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
 
-    # Write enough bytes to exceed the cap.
-    audit.write_text("x" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
+        # Force a rotation check.
+        sub._last_rotation_check = 0
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
 
-    # Force a rotation check.
-    sub._last_rotation_check = 0
-    bus.emit(EventType.CRON_COMPLETED, "test", {})
-    sub.poll()
+        # The rotated file should be in audit/ subdir; the live audit.jsonl is now
+        # the small one written by the most recent handle() call.
+        archive_dir = audit_path.parent / "audit"
+        assert archive_dir.exists(), "audit/ archive dir should be created"
+        rotated = list(archive_dir.glob("audit-*.jsonl"))
+        assert len(rotated) == 1, f"expected exactly one rotated file, got {rotated}"
+        assert rotated[0].stat().st_size > SIZE_CAP_BYTES, "rotated file should be the oversized one"
 
-    # The rotated file should be in audit/ subdir; the live audit.jsonl is now
-    # the small one written by the most recent handle() call.
-    archive_dir = audit.parent / "audit"
-    assert archive_dir.exists(), "audit/ archive dir should be created"
-    rotated = list(archive_dir.glob("audit-*.jsonl"))
-    assert len(rotated) == 1, f"expected exactly one rotated file, got {rotated}"
-    assert rotated[0].stat().st_size > SIZE_CAP_BYTES, "rotated file should be the oversized one"
+        # M4: same-day second oversized rotation must land as audit-{date}-1.jsonl
+        # rather than overwriting the first archive file. Verifies the existing
+        # collision-counter logic in _rotate_if_needed still works under the
+        # new size-cap-triggered rotation cadence.
+        audit_path.write_text("y" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
+        sub._last_rotation_check = 0
+        bus.emit(EventType.CRON_COMPLETED, "test", {})
+        sub.poll()
+
+        rotated = sorted(archive_dir.glob("audit-*.jsonl"))
+        assert len(rotated) == 2, f"expected 2 rotated files after second oversized rotation, got {rotated}"
+        # Both files should be sized > SIZE_CAP_BYTES (the live audit.jsonl
+        # was huge in both rotations).
+        for f in rotated:
+            assert f.stat().st_size > SIZE_CAP_BYTES, \
+                f"{f.name} should be above size cap"
+        # The second file's name should have the collision suffix.
+        assert "-1.jsonl" in rotated[1].name or "-1.jsonl" in rotated[0].name, \
+            f"one file should have collision suffix, got {[r.name for r in rotated]}"
