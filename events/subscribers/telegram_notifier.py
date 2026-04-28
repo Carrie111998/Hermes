@@ -77,8 +77,12 @@ TOPIC_ROUTING: Dict[str, str] = {
     'memory_consolidated': 'curator_digest',
     'skill_evolved': 'curator_digest',
     # -> scribe_daily
+    # digest_generated is an observability event (Watchdog/Critic cadence
+    # tracking) — NOT delivered to Telegram. The actual digest content
+    # arrives via the special-case mailbox_message + NOTIFICATION path
+    # below (search "message_type") so Diego sees one digest per fire,
+    # not two.
     'scribe_digest': 'scribe_daily',
-    'digest_generated': 'scribe_daily',
     'mailbox_message': 'scribe_daily',
     # -> security_and_system
     'secret_detected': 'security_and_system',
