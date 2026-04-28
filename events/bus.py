@@ -200,12 +200,27 @@ class EventBus:
         """
         conn = self._get_conn()
 
-        # Get subscriber's cursor (last processed rowid)
+        # Get subscriber's cursor (last processed rowid).
+        #
+        # First-registration default: when no cursor row exists for this
+        # subscriber_id, default to the CURRENT bus head — NOT zero. This
+        # prevents a backlog flood the first time a new subscriber polls.
+        # Surfaced twice on 2026-04-28: scribe-realtime (2D-1) and
+        # scribe-action-telemetry (2D-2/2D-4) each emitted a burst of
+        # historical narrations on initial registration before manual
+        # cursor-skip mitigations took effect.
+        #
+        # If you genuinely want backfill, manually set last_rowid in
+        # subscriber_cursors BEFORE the subscriber's first poll.
         row = conn.execute(
             "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
             (subscriber_id,),
         ).fetchone()
-        last_rowid = row["last_rowid"] if row else 0
+        if row:
+            last_rowid = row["last_rowid"]
+        else:
+            head = conn.execute("SELECT MAX(rowid) FROM events").fetchone()
+            last_rowid = head[0] if head and head[0] is not None else 0
 
         # Build query with optional filters
         conditions = ["rowid > ?"]
@@ -344,7 +359,14 @@ class EventBus:
             "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
             (subscriber_id,),
         ).fetchone()
-        last_rowid = row["last_rowid"] if row else 0
+        # First-registration default: bus head, matching subscribe() above so
+        # a new subscriber's lag reads 0 (consistent with what it will
+        # actually process on first poll).
+        if row:
+            last_rowid = row["last_rowid"]
+        else:
+            head = conn.execute("SELECT MAX(rowid) FROM events").fetchone()
+            last_rowid = head[0] if head and head[0] is not None else 0
 
         conditions = ["rowid > ?"]
         params: list = [last_rowid]
