@@ -34,6 +34,7 @@ from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.cron_stale_monitor import CronStaleMonitor
 from events.subscribers.tracker_intent_applier import TrackerIntentApplierSubscriber
 from events.subscribers.critic_trigger import CriticSubscriber
+from events.subscribers.scribe_realtime import ScribeRealtime
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(MailboxTranslator(_bus))
     _registry.register(TrackerIntentApplierSubscriber(_bus))
     _registry.register(CriticSubscriber(_bus))
+    _registry.register(ScribeRealtime(_bus))
 
     # CronStaleMonitor: load optional per-job threshold overrides.  Missing
     # file = built-in defaults.  Malformed file = log + fall back to defaults
