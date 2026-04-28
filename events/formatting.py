@@ -67,7 +67,7 @@ EVENT_TYPE_EMOJI = {
     EventType.WATCHDOG_SILENCE_ALERT:   "🔕",
     EventType.WATCHDOG_RECOVERED:       "💚",
     EventType.AGENT_FAILURE_CLUSTER:    "🌪️",
-    EventType.WATCHDOG_BURST:           "🟠",
+    EventType.WATCHDOG_BURST:           "🌀",
     # Curator nightly consolidation (2026-04-26)
     EventType.CURATOR_DAILY:            "📚",
     # DevFlow bridge (2026-04-26)

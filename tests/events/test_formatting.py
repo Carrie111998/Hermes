@@ -92,7 +92,7 @@ def test_format_whatsapp_message_has_no_separator():
 
 
 def test_watchdog_burst_renders_with_burst_icon():
-    """WATCHDOG_BURST gets a distinct icon (🟠) so operators can scan for it."""
+    """WATCHDOG_BURST gets a distinct icon (🌀) so operators can scan for it."""
     e = Event.create(
         event_type=EventType.WATCHDOG_BURST,
         source="watchdog",
@@ -111,3 +111,9 @@ def test_watchdog_burst_renders_with_burst_icon():
     # Sanity: it must NOT be the same as the single-probe icon (🔄), so a
     # human scanning Telegram can tell a burst apart from a single transition.
     assert EVENT_TYPE_EMOJI[EventType.WATCHDOG_BURST] != EVENT_TYPE_EMOJI[EventType.WATCHDOG_PROBE_TRANSITION]
+    # Regression guard: never let the burst icon collide with a priority dot.
+    # WATCHDOG_BURST is HIGH-priority by default, so a 🟠 icon would render
+    # adjacent to a 🟠 priority dot in format_header() output. Generalizes
+    # the convention SECRET_DETECTED's docstring articulates.
+    from events.formatting import PRIORITY_EMOJI
+    assert EVENT_TYPE_EMOJI[EventType.WATCHDOG_BURST] not in PRIORITY_EMOJI.values()
