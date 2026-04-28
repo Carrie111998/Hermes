@@ -240,7 +240,16 @@ class TelegramNotifier(BaseSubscriber):
         # it because agent_comms verbosity=significant_only requires HIGH+.
         if (event.event_type == EventType.MAILBOX_MESSAGE
                 and event.payload.get("message_type") == "NOTIFICATION"):
-            topic_key = "scribe_daily"
+            requested_to = event.payload.get("to", "")
+            # Honor explicit `to:` when it's a known v2 topic_key (e.g.
+            # scribe-realtime emits to: jobflow_decisions / hermes_milestones / etc).
+            # Legacy batch-digest payloads use `to: "telegram_digests"` (v1
+            # label) which is NOT a v2 key — they fall through to scribe_daily,
+            # preserving 2B behavior.
+            if requested_to in self.topics:
+                topic_key = requested_to
+            else:
+                topic_key = "scribe_daily"
 
         topic = self.topics.get(topic_key, {})
         thread_id = str(topic.get("thread_id", ""))
