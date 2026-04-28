@@ -72,6 +72,7 @@ class EventType(Enum):
     MEMORY_CONSOLIDATED = ("memory_consolidated", Priority.LOW)
     SKILL_EVOLVED = ("skill_evolved", Priority.LOW)
     MAILBOX_MESSAGE = ("mailbox_message", Priority.LOW)
+    USER_INBOUND_MESSAGE = ("user_inbound_message", Priority.NORMAL)
 
     # Security
     SECRET_DETECTED = ("secret_detected", Priority.HIGH)
