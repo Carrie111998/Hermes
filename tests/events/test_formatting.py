@@ -89,3 +89,25 @@ def test_format_whatsapp_message_has_no_separator():
     assert SEPARATOR not in msg
     assert "OFFER_SIGNAL" in msg
     assert "You have an offer from Acme" in msg
+
+
+def test_watchdog_burst_renders_with_burst_icon():
+    """WATCHDOG_BURST gets a distinct icon (🟠) so operators can scan for it."""
+    e = Event.create(
+        event_type=EventType.WATCHDOG_BURST,
+        source="watchdog",
+        payload={
+            "count": 22,
+            "trigger": "burst_threshold",
+            "transitions": [
+                {"probe": "docker", "tier": "critical", "before": "up", "after": "down"},
+                {"probe": "postgres", "tier": "critical", "before": "up", "after": "down"},
+            ],
+        },
+        priority=Priority.HIGH,
+    )
+    icon = event_icon(e)
+    assert icon != ""
+    # Sanity: it must NOT be the same as the single-probe icon (🔄), so a
+    # human scanning Telegram can tell a burst apart from a single transition.
+    assert EVENT_TYPE_EMOJI[EventType.WATCHDOG_BURST] != EVENT_TYPE_EMOJI[EventType.WATCHDOG_PROBE_TRANSITION]
