@@ -150,3 +150,30 @@ class TestRotation:
         assert len(lines) == 1
         entry = json.loads(lines[0])
         assert entry["event_type"] == "job_high_score"
+
+
+def test_size_cap_triggers_rotation_before_age(tmp_path):
+    """If audit.jsonl exceeds SIZE_CAP_BYTES, rotate even if age < 7 days."""
+    from events.bus import EventBus
+    from events.schema import EventType
+    from events.subscribers.audit_logger import AuditLogger, SIZE_CAP_BYTES
+
+    bus = EventBus(db_path=tmp_path / "events" / "test.db")
+    audit = tmp_path / "audit.jsonl"
+    sub = AuditLogger(bus, audit_path=audit)
+
+    # Write enough bytes to exceed the cap.
+    audit.write_text("x" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
+
+    # Force a rotation check.
+    sub._last_rotation_check = 0
+    bus.emit(EventType.CRON_COMPLETED, "test", {})
+    sub.poll()
+
+    # The rotated file should be in audit/ subdir; the live audit.jsonl is now
+    # the small one written by the most recent handle() call.
+    archive_dir = audit.parent / "audit"
+    assert archive_dir.exists(), "audit/ archive dir should be created"
+    rotated = list(archive_dir.glob("audit-*.jsonl"))
+    assert len(rotated) == 1, f"expected exactly one rotated file, got {rotated}"
+    assert rotated[0].stat().st_size > SIZE_CAP_BYTES, "rotated file should be the oversized one"

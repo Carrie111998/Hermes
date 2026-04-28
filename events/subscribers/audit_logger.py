@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 ROTATION_INTERVAL = 604800  # 7 days in seconds
 RETENTION_DAYS = 90
+# Force rotation if the live audit.jsonl exceeds this size, regardless of age.
+# Set to 256 MiB after the 2026-04-28 incident produced a 459 MB file inside
+# the 7-day age window. Operators can scan a 256 MB rotated file in a reasonable
+# time; anything larger is a sign of a flood that should be visible per-day.
+SIZE_CAP_BYTES = 256 * 1024 * 1024  # 256 MiB
 
 
 class AuditLogger(BaseSubscriber):
@@ -54,7 +59,10 @@ class AuditLogger(BaseSubscriber):
         try:
             stat = self.audit_path.stat()
             age = time.time() - stat.st_mtime
-            if age < ROTATION_INTERVAL:
+            # Rotate when EITHER (a) age exceeds the weekly interval OR (b) size
+            # exceeds the safety cap. The size cap was added 2026-04-28 after a
+            # subscriber re-fire loop produced 459 MB inside the 7-day window.
+            if age < ROTATION_INTERVAL and stat.st_size < SIZE_CAP_BYTES:
                 return
             if stat.st_size == 0:
                 return
