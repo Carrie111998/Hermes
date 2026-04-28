@@ -1119,6 +1119,35 @@ class WhatsAppAdapter(BasePlatformAdapter):
             if not self._should_process_message(data):
                 return None
 
+            # Layer 1 (2D-2/2D-4): emit USER_INBOUND_MESSAGE so downstream
+            # subscribers (scribe-action-telemetry, scribe-voice-tuning) can
+            # react to user feedback. Captures all inbound text — both
+            # structured slash commands (handled below) and free-form text.
+            try:
+                from events.bus import EventBus
+                from events.schema import EventType, Priority
+                _bus = EventBus()
+                try:
+                    _bus.emit(
+                        event_type=EventType.USER_INBOUND_MESSAGE,
+                        source="whatsapp",
+                        payload={
+                            "platform": "whatsapp",
+                            "text": str(data.get("body") or ""),
+                            "user_id": str(data.get("senderId") or data.get("from") or ""),
+                            "chat_id": str(data.get("chatId") or ""),
+                            "thread_id": None,  # WhatsApp has no topics
+                            "message_id": str(data.get("id") or ""),
+                            "in_reply_to": (str(data.get("quotedId"))
+                                            if data.get("quotedId") else None),
+                        },
+                        priority=Priority.NORMAL,
+                    )
+                finally:
+                    _bus.close()
+            except Exception as exc:
+                logger.warning("[%s] user_inbound_message emit failed: %s", self.name, exc)
+
             # Pipeline reply commands (/approve, /reject, /archive) — handle and
             # short-circuit before building the LLM-routable MessageEvent.
             if await self._maybe_handle_reply_command(data):
