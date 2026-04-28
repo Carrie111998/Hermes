@@ -81,7 +81,13 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(WhatsAppEscalator(_bus))
     _registry.register(DigestComposer(_bus))
     _registry.register(MemoryWriter(_bus))
-    _registry.register(TelegramMirror(_bus))
+    # TelegramMirror retired 2026-04-28: it was a v1-era shadow-copy of
+    # mailbox_message events to the Agent Comms topic. The v2 cutover
+    # (20260424T233627Z) collapsed Agent Comms and Digests into a single
+    # scribe_daily topic, which TelegramNotifier already routes mailbox_message
+    # events to via TOPIC_ROUTING + the NOTIFICATION special case. Keeping
+    # TelegramMirror registered duplicated every mailbox_message delivery.
+    # _registry.register(TelegramMirror(_bus))
     _registry.register(MailboxTranslator(_bus))
     _registry.register(TrackerIntentApplierSubscriber(_bus))
     _registry.register(CriticSubscriber(_bus))
