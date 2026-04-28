@@ -36,6 +36,7 @@ from events.subscribers.tracker_intent_applier import TrackerIntentApplierSubscr
 from events.subscribers.critic_trigger import CriticSubscriber
 from events.subscribers.scribe_realtime import ScribeRealtime
 from events.subscribers.scribe_action_telemetry import ScribeActionTelemetry
+from events.subscribers.scribe_voice_tuning import ScribeVoiceTuning
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry.register(CriticSubscriber(_bus))
     _registry.register(ScribeRealtime(_bus))
     _registry.register(ScribeActionTelemetry(_bus))
+    _registry.register(ScribeVoiceTuning(_bus))
 
     # CronStaleMonitor: load optional per-job threshold overrides.  Missing
     # file = built-in defaults.  Malformed file = log + fall back to defaults
