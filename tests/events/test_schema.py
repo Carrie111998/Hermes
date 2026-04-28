@@ -246,3 +246,18 @@ def test_gateway_lifecycle_event_types_default_priorities():
 def test_gateway_lifecycle_event_types_round_trip_via_from_string():
     for et in (EventType.GATEWAY_STARTED, EventType.GATEWAY_STOPPED):
         assert EventType.from_string(et.type_string) is et
+
+
+def test_watchdog_burst_event_type_exists():
+    """WATCHDOG_BURST is the coalesced form of N>=5 probe transitions."""
+    from events.schema import EventType, Priority
+
+    et = EventType.WATCHDOG_BURST
+    assert et.type_string == "watchdog_burst"
+    assert et.default_priority == Priority.HIGH
+
+
+def test_watchdog_burst_event_type_round_trips_via_from_string():
+    from events.schema import EventType
+
+    assert EventType.from_string("watchdog_burst") is EventType.WATCHDOG_BURST

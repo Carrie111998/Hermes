@@ -189,6 +189,17 @@ class EventType(Enum):
     WATCHDOG_DAILY = ("watchdog_daily", Priority.NORMAL)
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
 
+    # Coalesced form of N>=5 simultaneous probe transitions emitted by the
+    # watchdog sweep. Payload schema:
+    #   {
+    #     "transitions": [ {probe, tier, category, before, after, detail}, ... ],
+    #     "count": int,
+    #     "trigger": "burst_threshold" | "future-other-trigger",
+    #   }
+    # Added 2026-04-28 after Docker-crash -> 22-event WAL-lock flood incident.
+    # See docs/superpowers/plans/2026-04-28-watchdog-burst-coalesce-and-ack-dead-letter.md
+    WATCHDOG_BURST = ("watchdog_burst", Priority.HIGH)
+
     # Curator nightly consolidation -- added 2026-04-26.
     # Emitted by curator.orchestrator after backfill / nightly delta
     # passes. Consumed by Scribe (morning digest) and the memory-writer
