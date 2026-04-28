@@ -21,6 +21,14 @@ from events.subscribers.base import BaseSubscriber
 logger = logging.getLogger(__name__)
 
 # Maps event_type string → topic key
+# 7 trigger event types (job_high_score, application_submitted/ready,
+# interview_signal, offer_signal, critic_proposal, curator_daily) are
+# DELIBERATELY ABSENT from this dict as of 2026-04-28 — they are routed
+# to Telegram via the scribe-realtime subscriber, which formats each
+# event as a Scribe-styled one-liner before emitting a mailbox_message
+# NOTIFICATION with the explicit `to:` field. CROSS_POST_TO_ALERTS still
+# fires for the 4 high-priority types where it applies (preserved).
+# See: docs/superpowers/specs/2026-04-28-scribe-realtime-narration-design.md
 TOPIC_ROUTING: Dict[str, str] = {
     # === Hermes Telegram v2 (cutover 20260424T233627Z) ===
     # -> jobflow_firehose
@@ -28,14 +36,9 @@ TOPIC_ROUTING: Dict[str, str] = {
     'job_vip_discovered': 'jobflow_firehose',
     'job_scored': 'jobflow_firehose',
     'tailor_completed': 'jobflow_firehose',
-    'application_submitted': 'jobflow_firehose',
     'stage_transition': 'jobflow_firehose',
     'followup_due': 'jobflow_firehose',
     # -> jobflow_decisions
-    'job_high_score': 'jobflow_decisions',
-    'application_ready': 'jobflow_decisions',
-    'interview_signal': 'jobflow_decisions',
-    'offer_signal': 'jobflow_decisions',
     'approval_request': 'jobflow_decisions',
     'apply_packet': 'jobflow_decisions',
     # -> devflow_firehose
@@ -65,7 +68,6 @@ TOPIC_ROUTING: Dict[str, str] = {
     'watchdog_recovered': 'watchdog_alerts',
     'agent_failure_cluster': 'watchdog_alerts',
     # -> critic_proposals
-    'critic_proposal': 'critic_proposals',
     'critic_auto_applied': 'critic_proposals',
     'critic_self_degraded': 'critic_proposals',
     # NOTE: 'agent_failure_cluster' is the Critic's TRIGGER, not its proposal.
@@ -73,7 +75,6 @@ TOPIC_ROUTING: Dict[str, str] = {
     # The Critic still consumes it via the bus and emits critic_proposal events
     # which DO route here.
     # -> curator_digest
-    'curator_daily': 'curator_digest',
     'memory_consolidated': 'curator_digest',
     'skill_evolved': 'curator_digest',
     # -> scribe_daily
