@@ -107,6 +107,7 @@ TOPIC_ROUTING: Dict[str, str] = {
     'application_failed': 'watchdog_alerts',
     # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)
     'watchdog_tick': 'watchdog_alerts',
+    'watchdog_burst':            'watchdog_alerts',
     'watchdog_probe_transition': 'watchdog_alerts',
     'watchdog_silence_alert': 'watchdog_alerts',
     'watchdog_recovered': 'watchdog_alerts',

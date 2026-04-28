@@ -1131,6 +1131,13 @@ class TestWatchdogDailySummary:
         )
 
 
+def test_watchdog_burst_routes_to_watchdog_alerts_topic():
+    """Coalesced burst events go to the same topic as single-probe transitions."""
+    from events.subscribers.telegram_notifier import TOPIC_ROUTING
+
+    assert TOPIC_ROUTING.get("watchdog_burst") == "watchdog_alerts"
+
+
 def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "telegram").mkdir()
