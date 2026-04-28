@@ -557,7 +557,7 @@ class TestAtLeastOnceDedup:
         assert sub.calls == 1
 
         # Force re-fetch of the same event by rewinding the cursor.
-        bus.ack(sub.subscriber_id, [])  # no-op; cursor stays put if ack also failed
+        bus.ack(sub.subscriber_id, [])  # ack([]) is unconditionally a no-op; below we manually rewind to simulate ack failing too
         # Manually rewind to simulate ack failing too:
         bus._execute(
             "UPDATE subscriber_cursors SET last_rowid = 0 WHERE subscriber_id = ?",

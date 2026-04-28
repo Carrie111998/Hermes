@@ -22,7 +22,7 @@ Spec: docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
@@ -82,12 +82,12 @@ class BaseSubscriber(ABC):
         self.bus = bus
         self._consecutive_errors: int = 0
         self._quarantined_until: Optional[float] = None  # monotonic timestamp
-        # SR-XXX (2026-04-28): in-process dedup set. Prevents handle() re-firing
+        # 2026-04-28 incident: in-process dedup set. Prevents handle() re-firing
         # for an event already processed in this process even if the bus-level
         # `handled_events` row failed to write (WAL lock, disk full, etc.).
         # Cleared on process restart — the SQLite-level `is_handled` check
         # provides cross-restart durability when it can.
-        self._handled_this_process: set = set()
+        self._handled_this_process: Set[str] = set()
         # Tracks consecutive mark_handled failures per event so we can dead-letter
         # and advance past an event whose handle() succeeds but whose mark fails.
         self._mark_handled_failures: Dict[str, int] = {}
@@ -126,12 +126,16 @@ class BaseSubscriber(ABC):
 
         processed_ids = []
         for event in events:
-            # SR-XXX dedup: check in-process set first (fast, can't fail), then
+            # 2026-04-28 dedup: check in-process set first (fast, can't fail), then
             # bus-level handled_events table (cross-restart durable but can fail
             # under WAL lock). Either short-circuits the handle() call.
             if event.event_id in self._handled_this_process:
                 processed_ids.append(event.event_id)
                 continue
+            # Fail-open: if is_handled() raises (WAL lock, corrupt handled_events),
+            # proceed to handle the event. Better to re-fire an idempotent handler
+            # than to strand the cursor — and Task 7's dead-letter escalation
+            # breaks the loop if mark_handled keeps failing.
             try:
                 already_handled = self.bus.is_handled(self.subscriber_id, event.event_id)
             except Exception:
