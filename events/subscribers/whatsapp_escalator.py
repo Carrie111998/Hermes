@@ -68,6 +68,9 @@ _TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
     # WATCHDOG_PROBE_TRANSITION at HIGH = real probe state flip (gateway down,
     # API server :8642 down, etc.). Treat as URGENT so it queues during quiet
     # hours and flushes at 7:01am. Routine probe ticks aren't routed here.
+    # WATCHDOG_BURST = coalesced multi-probe failure burst; at least as urgent
+    # as a single probe transition — same URGENT tier.
+    EventType.WATCHDOG_BURST: EscalationTier.URGENT,
     EventType.WATCHDOG_PROBE_TRANSITION: EscalationTier.URGENT,
     # WATCHDOG_SILENCE_ALERT at HIGH = an agent missed its expected cadence
     # (e.g. jaum-inbox-sweeper silent for 1042s vs expected 600s). Important,

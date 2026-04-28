@@ -624,3 +624,11 @@ class TestNotificationDeliveredReverseSignal:
         assert len(escalator._throttle_buffer) == 1
         # No reverse signal until the throttle window closes
         assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+
+def test_watchdog_burst_maps_to_urgent_tier():
+    """A coalesced burst is at least as urgent as a single transition."""
+    from events.subscribers.whatsapp_escalator import _TIER_BY_EVENT, EscalationTier
+    from events.schema import EventType
+
+    assert _TIER_BY_EVENT[EventType.WATCHDOG_BURST] == EscalationTier.URGENT
