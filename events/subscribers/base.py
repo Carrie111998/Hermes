@@ -22,7 +22,8 @@ Spec: docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Set
+from collections import OrderedDict
+from typing import Dict, List, Optional
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
@@ -68,6 +69,47 @@ def _start_span(name: str):
 # long poll intervals (>30s) should consider overriding to a higher value.
 MARK_HANDLED_DEAD_LETTER_THRESHOLD: int = 3
 
+# Cap for the in-process dedup set per subscriber. ~165 bytes per UUID4 entry
+# would otherwise grow unbounded across the gateway's process lifetime
+# (~1 GB / 30 days across 7 subscribers). 50k is far past any realistic
+# single-poll-cycle dedup window — even a 50k-event flood would only
+# evict entries from the *previous* flood, not the current batch.
+HANDLED_THIS_PROCESS_MAXSIZE: int = 50_000
+
+
+class _LRUEventIDSet:
+    """Bounded LRU set of event_ids for in-process dedup.
+
+    Wraps an OrderedDict so membership checks promote the entry to
+    most-recent, and overflowing insertions evict the least-recently-used.
+    Exposes the minimum surface area needed by BaseSubscriber.poll():
+    ``in``, ``add``, ``clear``, and ``len()``.
+    """
+
+    def __init__(self, maxsize: int = HANDLED_THIS_PROCESS_MAXSIZE):
+        self._od: "OrderedDict[str, None]" = OrderedDict()
+        self._maxsize = maxsize
+
+    def __contains__(self, event_id: str) -> bool:
+        if event_id in self._od:
+            self._od.move_to_end(event_id)
+            return True
+        return False
+
+    def add(self, event_id: str) -> None:
+        if event_id in self._od:
+            self._od.move_to_end(event_id)
+            return
+        self._od[event_id] = None
+        if len(self._od) > self._maxsize:
+            self._od.popitem(last=False)
+
+    def clear(self) -> None:
+        self._od.clear()
+
+    def __len__(self) -> int:
+        return len(self._od)
+
 
 class BaseSubscriber(ABC):
     """Abstract base class for event bus subscribers.
@@ -100,7 +142,8 @@ class BaseSubscriber(ABC):
         # `handled_events` row failed to write (WAL lock, disk full, etc.).
         # Cleared on process restart — the SQLite-level `is_handled` check
         # provides cross-restart durability when it can.
-        self._handled_this_process: Set[str] = set()
+        # LRU-bounded so memory stays flat over long gateway uptimes.
+        self._handled_this_process: _LRUEventIDSet = _LRUEventIDSet()
         # Tracks consecutive mark_handled failures per event so we can dead-letter
         # and advance past an event whose handle() succeeds but whose mark fails.
         self._mark_handled_failures: Dict[str, int] = {}

@@ -696,3 +696,46 @@ class TestAtLeastOnceDedup:
         rows = bus.get_dead_letters(subscriber_id=sub.subscriber_id)
         assert not any("mark_handled_lock_failure" in r["error"] for r in rows), \
             f"unexpected dead-letter rows: {rows}"
+
+    def test_dedup_set_bounded_evicts_oldest(self, tmp_path):
+        """LRU bound: when maxsize is exceeded, the oldest event_id is evicted.
+
+        Without a bound, _handled_this_process grows unbounded over a long
+        gateway uptime (~1GB / month across 7 subscribers). With LRU eviction,
+        the oldest entries fall out and a re-fetch of an evicted event_id
+        would re-fire handle() — acceptable, since the bus-level
+        handled_events check still provides cross-restart durability.
+        """
+        from events.subscribers.base import _LRUEventIDSet
+
+        s = _LRUEventIDSet(maxsize=2)
+        s.add("evicted-id")
+        s.add("kept-id-1")
+        s.add("kept-id-2")
+
+        assert "evicted-id" not in s
+        assert "kept-id-1" in s
+        assert "kept-id-2" in s
+
+    def test_dedup_set_does_not_evict_recent_active_ids(self, tmp_path):
+        """LRU recency: membership check moves an id to most-recent position.
+
+        Re-touching an id (via `event_id in self._handled_this_process`)
+        must mark it as recently-used so a subsequent add() evicts a
+        genuinely older id instead.
+        """
+        from events.subscribers.base import _LRUEventIDSet
+
+        s = _LRUEventIDSet(maxsize=2)
+        s.add("oldest")
+        s.add("middle")
+
+        # Touch "oldest" via membership check — should move it to most-recent.
+        assert "oldest" in s
+
+        # Adding a third entry now evicts "middle" (the true LRU), not "oldest".
+        s.add("newest")
+
+        assert "oldest" in s
+        assert "newest" in s
+        assert "middle" not in s
