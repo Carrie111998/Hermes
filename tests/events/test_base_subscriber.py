@@ -568,3 +568,86 @@ class TestAtLeastOnceDedup:
         # would run again. WITH it, handle() is skipped.
         sub.poll()
         assert sub.calls == 1, "handle() must not re-fire for an event already handled in this process"
+
+    def test_repeated_mark_handled_failure_triggers_dead_letter(self, tmp_path, monkeypatch):
+        """After 3 consecutive mark_handled failures for the same event, dead-letter and advance."""
+        from events.subscribers.base import (
+            BaseSubscriber,
+            MARK_HANDLED_DEAD_LETTER_THRESHOLD,
+        )
+
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+
+        class CountingSub(BaseSubscriber):
+            subscriber_id = "ml-flake"
+            poll_interval_seconds = 1
+            CIRCUIT_BREAKER_ERROR_THRESHOLD = 99
+
+            def __init__(self, bus):
+                super().__init__(bus)
+                self.calls = 0
+
+            def handle(self, event):
+                self.calls += 1
+
+        sub = CountingSub(bus)
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+
+        # mark_handled raises; in-process set is also disabled to force the
+        # full escalation path.
+        def boom(*args, **kwargs):
+            raise RuntimeError("WAL lock")
+        monkeypatch.setattr(bus, "mark_handled", boom)
+
+        # Force re-fetch on every poll by clearing the in-process set + cursor.
+        for _ in range(MARK_HANDLED_DEAD_LETTER_THRESHOLD):
+            sub._handled_this_process.clear()
+            bus._execute(
+                "UPDATE subscriber_cursors SET last_rowid = 0 WHERE subscriber_id = ?",
+                (sub.subscriber_id,),
+            )
+            sub.poll()
+
+        # On the THRESHOLD-th failure, dead-letter row exists.
+        rows = bus.get_dead_letters(subscriber_id=sub.subscriber_id)
+        assert any(r["event_id"] == eid and "mark_handled_lock_failure" in r["error"] for r in rows), \
+            f"expected dead-letter for {eid} with mark_handled_lock_failure, got: {rows}"
+
+    def test_threshold_below_does_not_dead_letter(self, tmp_path, monkeypatch):
+        """Fewer than N failures must NOT dead-letter (boundary case)."""
+        from events.subscribers.base import (
+            BaseSubscriber,
+            MARK_HANDLED_DEAD_LETTER_THRESHOLD,
+        )
+
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+
+        class CountingSub(BaseSubscriber):
+            subscriber_id = "below-thresh"
+            poll_interval_seconds = 1
+            CIRCUIT_BREAKER_ERROR_THRESHOLD = 99
+
+            def handle(self, event):
+                pass
+
+        sub = CountingSub(bus)
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("WAL lock")
+        monkeypatch.setattr(bus, "mark_handled", boom)
+
+        # Run THRESHOLD - 1 polls. None should dead-letter yet.
+        for _ in range(MARK_HANDLED_DEAD_LETTER_THRESHOLD - 1):
+            sub._handled_this_process.clear()
+            bus._execute(
+                "UPDATE subscriber_cursors SET last_rowid = 0 WHERE subscriber_id = ?",
+                (sub.subscriber_id,),
+            )
+            sub.poll()
+
+        rows = bus.get_dead_letters(subscriber_id=sub.subscriber_id)
+        assert not any(
+            r["event_id"] == eid and "mark_handled_lock_failure" in r["error"] for r in rows
+        ), "must not dead-letter before threshold"

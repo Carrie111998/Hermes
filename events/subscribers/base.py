@@ -56,6 +56,15 @@ def _start_span(name: str):
         return _NoopSpan()
 
 
+# Number of consecutive mark_handled failures for the same event before we
+# dead-letter and force-advance the cursor past it. Set to 3 because:
+#   - 1 or 2 failures could be transient WAL contention (auto-recovers)
+#   - 3 in a row indicates persistent contention or a corrupt handled_events
+#     table; better to lose at-least-once for one event than to flood the
+#     downstream with the same event forever (2026-04-28 incident pattern).
+MARK_HANDLED_DEAD_LETTER_THRESHOLD: int = 3
+
+
 class BaseSubscriber(ABC):
     """Abstract base class for event bus subscribers.
 
@@ -215,15 +224,39 @@ class BaseSubscriber(ABC):
         return len(events)
 
     def _on_mark_handled_failure(self, event_id: str, exc: Exception) -> None:
-        """Hook for dead-letter escalation on repeated mark_handled failures.
+        """Track repeated mark_handled failures and dead-letter past the threshold.
 
-        Default: no-op. Task 7 fills in the dead-letter escalation logic.
+        At MARK_HANDLED_DEAD_LETTER_THRESHOLD consecutive failures for the same
+        event, write a dead-letter row with reason ``mark_handled_lock_failure``.
+        The caller (poll()) is responsible for adding event_id to processed_ids
+        so the cursor advances past it on the next ack(). The at-least-once
+        delivery contract is technically violated for this one event — but the
+        alternative is the 2026-04-28-style infinite re-handle loop.
         """
-        # Minimal counter increment so Task 7's tests can rely on the field
-        # existing without pulling in the full escalation path.
-        self._mark_handled_failures[event_id] = (
-            self._mark_handled_failures.get(event_id, 0) + 1
-        )
+        count = self._mark_handled_failures.get(event_id, 0) + 1
+        self._mark_handled_failures[event_id] = count
+
+        if count >= MARK_HANDLED_DEAD_LETTER_THRESHOLD:
+            try:
+                self.bus.record_dead_letter(
+                    self.subscriber_id,
+                    event_id,
+                    f"mark_handled_lock_failure (after {count} attempts): "
+                    f"{type(exc).__name__}: {exc}",
+                )
+                logger.error(
+                    "Subscriber %s: dead-lettered event %s after %d consecutive "
+                    "mark_handled failures (last error: %s)",
+                    self.subscriber_id, event_id, count, exc,
+                )
+            except Exception:
+                logger.exception(
+                    "Subscriber %s: failed to record mark_handled dead-letter for %s",
+                    self.subscriber_id, event_id,
+                )
+            # Reset the counter so a future re-emit of the same event_id (very
+            # unlikely — UUIDs collide ~never) gets a fresh window.
+            self._mark_handled_failures.pop(event_id, None)
 
     def _is_quarantined(self) -> bool:
         """Return True iff the circuit breaker is currently open."""
