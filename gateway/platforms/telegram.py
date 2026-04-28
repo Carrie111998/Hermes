@@ -2410,6 +2410,36 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(update.message):
             return
 
+        # Layer 1 (2D-2/2D-4): emit USER_INBOUND_MESSAGE so downstream subscribers
+        # (scribe-action-telemetry, scribe-voice-tuning) can react to user feedback.
+        # Captures all inbound text — both structured slash commands and free-form.
+        try:
+            from events.bus import EventBus
+            from events.schema import EventType, Priority
+            _bus = EventBus()
+            try:
+                _bus.emit(
+                    event_type=EventType.USER_INBOUND_MESSAGE,
+                    source="telegram",
+                    payload={
+                        "platform": "telegram",
+                        "text": update.message.text or "",
+                        "user_id": (str(update.message.from_user.id)
+                                    if update.message.from_user else ""),
+                        "chat_id": str(update.message.chat.id),
+                        "thread_id": (str(update.message.message_thread_id)
+                                      if update.message.message_thread_id else None),
+                        "message_id": str(update.message.message_id),
+                        "in_reply_to": (str(update.message.reply_to_message.message_id)
+                                        if update.message.reply_to_message else None),
+                    },
+                    priority=Priority.NORMAL,
+                )
+            finally:
+                _bus.close()
+        except Exception as exc:
+            logger.warning("[%s] user_inbound_message emit failed: %s", self.name, exc)
+
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
@@ -2420,6 +2450,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(update.message, is_command=True):
             return
+
+        # Layer 1 emit (same as _handle_text_message) — captures slash commands
+        # /approve, /reject, /archive, etc. so action telemetry can correlate
+        # them with prior digests.
+        try:
+            from events.bus import EventBus
+            from events.schema import EventType, Priority
+            _bus = EventBus()
+            try:
+                _bus.emit(
+                    event_type=EventType.USER_INBOUND_MESSAGE,
+                    source="telegram",
+                    payload={
+                        "platform": "telegram",
+                        "text": update.message.text or "",
+                        "user_id": (str(update.message.from_user.id)
+                                    if update.message.from_user else ""),
+                        "chat_id": str(update.message.chat.id),
+                        "thread_id": (str(update.message.message_thread_id)
+                                      if update.message.message_thread_id else None),
+                        "message_id": str(update.message.message_id),
+                        "in_reply_to": (str(update.message.reply_to_message.message_id)
+                                        if update.message.reply_to_message else None),
+                    },
+                    priority=Priority.NORMAL,
+                )
+            finally:
+                _bus.close()
+        except Exception as exc:
+            logger.warning("[%s] user_inbound_message emit failed: %s", self.name, exc)
 
         event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
         await self.handle_message(event)
