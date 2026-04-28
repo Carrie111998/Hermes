@@ -651,3 +651,48 @@ class TestAtLeastOnceDedup:
         assert not any(
             r["event_id"] == eid and "mark_handled_lock_failure" in r["error"] for r in rows
         ), "must not dead-letter before threshold"
+
+    def test_transient_mark_handled_recovery_resets_counter(self, tmp_path, monkeypatch):
+        """After N-1 mark_handled failures, a success must clear the counter."""
+        from events.subscribers.base import MARK_HANDLED_DEAD_LETTER_THRESHOLD
+
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+
+        eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
+
+        # Fail mark_handled (THRESHOLD - 1) times, then let it succeed.
+        fail_calls = [0]
+        real_mark = bus.mark_handled
+
+        def flaky_mark(*args, **kwargs):
+            fail_calls[0] += 1
+            if fail_calls[0] <= MARK_HANDLED_DEAD_LETTER_THRESHOLD - 1:
+                raise RuntimeError("WAL lock")
+            return real_mark(*args, **kwargs)
+
+        monkeypatch.setattr(bus, "mark_handled", flaky_mark)
+
+        # First N-1 polls fail mark_handled; counter must reach N-1.
+        for _ in range(MARK_HANDLED_DEAD_LETTER_THRESHOLD - 1):
+            sub._handled_this_process.clear()
+            bus._execute(
+                "UPDATE subscriber_cursors SET last_rowid = 0 WHERE subscriber_id = ?",
+                (sub.subscriber_id,),
+            )
+            sub.poll()
+        assert sub._mark_handled_failures.get(eid) == MARK_HANDLED_DEAD_LETTER_THRESHOLD - 1
+
+        # Final poll: mark_handled succeeds → counter must be cleared.
+        sub._handled_this_process.clear()
+        bus._execute(
+            "UPDATE subscriber_cursors SET last_rowid = 0 WHERE subscriber_id = ?",
+            (sub.subscriber_id,),
+        )
+        sub.poll()
+        assert eid not in sub._mark_handled_failures, \
+            "counter must clear after successful mark_handled"
+        # And no dead-letter row should have been written.
+        rows = bus.get_dead_letters(subscriber_id=sub.subscriber_id)
+        assert not any("mark_handled_lock_failure" in r["error"] for r in rows), \
+            f"unexpected dead-letter rows: {rows}"

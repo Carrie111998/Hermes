@@ -62,6 +62,10 @@ def _start_span(name: str):
 #   - 3 in a row indicates persistent contention or a corrupt handled_events
 #     table; better to lose at-least-once for one event than to flood the
 #     downstream with the same event forever (2026-04-28 incident pattern).
+# Note: this threshold is in *poll iterations*, not wall-clock time. With
+# Hermes subscribers' typical poll_interval_seconds of 1-30, three iterations
+# covers 3-90s — past SQLite's busy_timeout of 5000ms. Subscribers with very
+# long poll intervals (>30s) should consider overriding to a higher value.
 MARK_HANDLED_DEAD_LETTER_THRESHOLD: int = 3
 
 
