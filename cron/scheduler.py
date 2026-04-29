@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 
@@ -149,6 +150,171 @@ def _summarize_for_event_bus(final_response: str) -> str:
     if split_at >= budget // 2:
         clipped = clipped[:split_at]
     return clipped.rstrip() + "..."
+
+
+# === Tailor structured iteration event (2026-04-29) =========================
+#
+# Plan: docs/superpowers/plans/2026-04-29-tailor-structured-iteration-event.md
+# Design: docs/superpowers/specs/2026-04-29-tailor-structured-iteration-event-design.md
+#
+# Tailor's [SILENT] response is by-design (it suppresses Telegram delivery)
+# but carries zero diagnostic info. The Critic cluster triage on 2026-04-29
+# could not distinguish "47 eligible packets, all already terminal"
+# (legitimate) from "0 eligible because Applier is stuck" (real bug).
+#
+# Solution: Tailor's SOUL.md now requires it to emit a JSON-marker block on
+# every cron run. The cron-wrapper extracts it and emits a structured
+# `tailor_iteration` event. `[SILENT]` is preserved unchanged — the new
+# event runs ALONGSIDE it, not in place of it.
+#
+# Failure modes are explicit AGENT_ERROR events (rather than silent drops)
+# so the failure is observable on the bus.
+TAILOR_ITERATION_MARKER_RE = re.compile(
+    r"<TAILOR_ITERATION_JSON>(.*?)</TAILOR_ITERATION_JSON>",
+    re.DOTALL,
+)
+TAILOR_ITERATION_REQUIRED_FIELDS = (
+    "eligible_count",
+    "tailored_count",
+    "skipped_terminal_count",
+    "skipped_other_count",
+    "reason",
+)
+TAILOR_ITERATION_REASON_ENUM = frozenset({
+    "all_already_terminal",
+    "no_eligible_packets",
+    "tailored_some",
+    "mixed",
+    "error",
+    "other",
+})
+TAILOR_ITERATION_JOB_NAME = "jobflow-tailor"
+
+# Reason strings emitted on AGENT_ERROR for parser failures.
+TAILOR_ITERATION_REASON_MISSING = "tailor_iteration_missing"
+TAILOR_ITERATION_REASON_PARSE_FAILED = "tailor_iteration_parse_failed"
+TAILOR_ITERATION_REASON_SCHEMA_MISMATCH = "tailor_iteration_schema_mismatch"
+
+
+def _extract_tailor_iteration(final_response: str):
+    """Extract the structured iteration block from Tailor's cron output.
+
+    Returns ``(parsed_payload, error_reason, raw_block)``:
+      - ``parsed_payload`` is a dict on the happy path (marker found, JSON
+        parses, schema conforms); otherwise ``None``.
+      - ``error_reason`` is one of TAILOR_ITERATION_REASON_* constants on
+        failure; otherwise ``None``.
+      - ``raw_block`` is the matched block contents (str) when the marker
+        was present, even on parse/schema failure (None when missing).
+
+    Exactly one of ``parsed_payload`` / ``error_reason`` is non-None.
+
+    Schema validation:
+      - All four count fields must be ints with value >= 0.
+      - ``reason`` must be a string. Unknown values are accepted (passed
+        through to the bus); the Critic flags drift later.
+    """
+    text = final_response or ""
+    match = TAILOR_ITERATION_MARKER_RE.search(text)
+    if not match:
+        return None, TAILOR_ITERATION_REASON_MISSING, None
+
+    raw_block = match.group(1).strip()
+    try:
+        parsed = json.loads(raw_block)
+    except (json.JSONDecodeError, ValueError):
+        return None, TAILOR_ITERATION_REASON_PARSE_FAILED, raw_block
+
+    if not isinstance(parsed, dict):
+        return None, TAILOR_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    # Required fields presence + types.
+    for field_name in TAILOR_ITERATION_REQUIRED_FIELDS:
+        if field_name not in parsed:
+            return None, TAILOR_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    for count_field in (
+        "eligible_count",
+        "tailored_count",
+        "skipped_terminal_count",
+        "skipped_other_count",
+    ):
+        value = parsed.get(count_field)
+        # bool is a subclass of int — exclude explicitly so ``True`` doesn't
+        # masquerade as a count.
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None, TAILOR_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    if not isinstance(parsed.get("reason"), str) or not parsed["reason"]:
+        return None, TAILOR_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    return parsed, None, raw_block
+
+
+def _emit_tailor_iteration_event(emitter, job: dict, final_response: str) -> None:
+    """Hook called from _process_job after a jobflow-tailor run completes.
+
+    Gated by job_name == TAILOR_ITERATION_JOB_NAME — other crons short-circuit.
+
+    Emits exactly one of:
+      - EventType.TAILOR_ITERATION (happy path)
+      - EventType.AGENT_ERROR with payload.reason in TAILOR_ITERATION_REASON_*
+        (any of the 3 failure modes)
+
+    Wrapped in a broad try/except so a parser bug never crashes the
+    cron tick — emit failures degrade gracefully to a debug log.
+    """
+    if not emitter:
+        return
+    if job.get("name") != TAILOR_ITERATION_JOB_NAME:
+        return
+    try:
+        from events.schema import EventType
+
+        bus = getattr(emitter, "bus", None)
+        if bus is None:
+            return
+
+        job_id = job.get("id") or ""
+        job_name = job.get("name", TAILOR_ITERATION_JOB_NAME)
+
+        parsed, error_reason, raw_block = _extract_tailor_iteration(final_response)
+
+        if error_reason is None and parsed is not None:
+            payload = dict(parsed)  # copy so we can add metadata fields
+            payload["job_id"] = job_id
+            payload["job_name"] = job_name
+            bus.emit(
+                event_type=EventType.TAILOR_ITERATION,
+                source="tailor",
+                payload=payload,
+                correlation_id=job_id or None,
+                job_id=job_id or None,
+            )
+            return
+
+        # Failure path — emit AGENT_ERROR with explicit reason so the
+        # Critic + operators can discriminate prompt regression from a
+        # silent run.
+        err_payload = {
+            "reason": error_reason,
+            "job_id": job_id,
+            "job_name": job_name,
+        }
+        if raw_block is not None:
+            # Keep a bounded copy of the offending block so audit log doesn't
+            # blow up if the agent emitted a multi-MB payload between markers.
+            err_payload["detail"] = raw_block[:2000]
+        bus.emit(
+            event_type=EventType.AGENT_ERROR,
+            source="tailor",
+            payload=err_payload,
+            correlation_id=job_id or None,
+            job_id=job_id or None,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("tailor_iteration emit failed: %s", e)
+# ============================================================================
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1317,6 +1483,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                         )
                     except Exception as ee:
                         logger.debug("Event emit failed: %s", ee)
+
+                # Tailor structured iteration event (2026-04-29).
+                # Gated by job name inside the helper; runs ALONGSIDE the
+                # existing [SILENT] / on_job_completed pathway, not in place
+                # of it. See _emit_tailor_iteration_event docstring + the
+                # design doc spec/2026-04-29-tailor-structured-iteration-
+                # event-design.md for failure-mode handling.
+                if success and emitter:
+                    _emit_tailor_iteration_event(emitter, job, final_response or "")
 
                 # OTel: finalize cron span with execution results + exit ctx.
                 try:
