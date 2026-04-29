@@ -1827,3 +1827,338 @@ class TestSendMediaTimeoutCancelsFuture:
         # 2. Second file still got dispatched — one timeout doesn't abort the batch
         adapter.send_video.assert_called_once()
         assert adapter.send_video.call_args[1]["video_path"] == "/tmp/fast.mp4"
+
+
+# ============================================================================
+# Tailor structured iteration event (2026-04-29)
+# Plan: docs/superpowers/plans/2026-04-29-tailor-structured-iteration-event.md
+# ============================================================================
+
+
+class TestExtractTailorIteration:
+    """Unit tests for _extract_tailor_iteration — pure function, no side effects."""
+
+    def _valid_payload_json(self) -> str:
+        return (
+            '{"eligible_count": 47, "tailored_count": 0, '
+            '"skipped_terminal_count": 47, "skipped_other_count": 0, '
+            '"reason": "all_already_terminal"}'
+        )
+
+    def test_happy_path_returns_parsed_payload(self):
+        from cron.scheduler import _extract_tailor_iteration
+        text = (
+            "Some preamble.\n\n"
+            f"<TAILOR_ITERATION_JSON>\n{self._valid_payload_json()}\n</TAILOR_ITERATION_JSON>\n\n"
+            "[SILENT]"
+        )
+        parsed, err, raw = _extract_tailor_iteration(text)
+        assert err is None
+        assert parsed is not None
+        assert parsed["eligible_count"] == 47
+        assert parsed["tailored_count"] == 0
+        assert parsed["reason"] == "all_already_terminal"
+        assert raw is not None and "all_already_terminal" in raw
+
+    def test_happy_path_block_anywhere_in_response(self):
+        """Block can appear before or after free-text — order-insensitive."""
+        from cron.scheduler import _extract_tailor_iteration
+        text = (
+            "Tailored 0 of 47 packets.\n\n"
+            "All 47 were already terminal (already-applied).\n\n"
+            f"<TAILOR_ITERATION_JSON>{self._valid_payload_json()}</TAILOR_ITERATION_JSON>"
+        )
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err is None
+        assert parsed["eligible_count"] == 47
+
+    def test_missing_marker_returns_missing_reason(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_MISSING,
+        )
+        parsed, err, raw = _extract_tailor_iteration("Tailored zero packets. [SILENT]")
+        assert parsed is None
+        assert err == TAILOR_ITERATION_REASON_MISSING
+        assert raw is None
+
+    def test_empty_input_returns_missing(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_MISSING,
+        )
+        parsed, err, _ = _extract_tailor_iteration("")
+        assert err == TAILOR_ITERATION_REASON_MISSING
+        parsed, err, _ = _extract_tailor_iteration(None)
+        assert err == TAILOR_ITERATION_REASON_MISSING
+
+    def test_malformed_json_returns_parse_failed(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_PARSE_FAILED,
+        )
+        text = "<TAILOR_ITERATION_JSON>this is not json {[ </TAILOR_ITERATION_JSON>"
+        parsed, err, raw = _extract_tailor_iteration(text)
+        assert parsed is None
+        assert err == TAILOR_ITERATION_REASON_PARSE_FAILED
+        # raw_block must be present so the AGENT_ERROR payload can include it.
+        assert raw and "this is not json" in raw
+
+    def test_schema_mismatch_missing_field(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        # Missing reason
+        text = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": 1, "tailored_count": 0, '
+            '"skipped_terminal_count": 1, "skipped_other_count": 0}'
+            "</TAILOR_ITERATION_JSON>"
+        )
+        parsed, err, raw = _extract_tailor_iteration(text)
+        assert parsed is None
+        assert err == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+        assert raw is not None  # raw block kept for AGENT_ERROR detail
+
+    def test_schema_mismatch_negative_count(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": -1, "tailored_count": 0, '
+            '"skipped_terminal_count": 0, "skipped_other_count": 0, '
+            '"reason": "no_eligible_packets"}</TAILOR_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_schema_mismatch_count_is_string(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": "47", "tailored_count": 0, '
+            '"skipped_terminal_count": 0, "skipped_other_count": 0, '
+            '"reason": "tailored_some"}</TAILOR_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_schema_mismatch_count_is_bool(self):
+        """bool subclasses int but masquerading as count is unhelpful."""
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": true, "tailored_count": 0, '
+            '"skipped_terminal_count": 0, "skipped_other_count": 0, '
+            '"reason": "other"}</TAILOR_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_schema_mismatch_reason_empty(self):
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": 0, "tailored_count": 0, '
+            '"skipped_terminal_count": 0, "skipped_other_count": 0, '
+            '"reason": ""}</TAILOR_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_schema_mismatch_non_dict_payload(self):
+        """JSON parses but is a list — must be flagged as schema mismatch."""
+        from cron.scheduler import (
+            _extract_tailor_iteration,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = "<TAILOR_ITERATION_JSON>[1, 2, 3]</TAILOR_ITERATION_JSON>"
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_unknown_reason_is_passed_through(self):
+        """Unknown enum values are not the parser's concern — Critic flags drift."""
+        from cron.scheduler import _extract_tailor_iteration
+        text = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": 1, "tailored_count": 1, '
+            '"skipped_terminal_count": 0, "skipped_other_count": 0, '
+            '"reason": "bizarre_new_reason"}</TAILOR_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err is None
+        assert parsed["reason"] == "bizarre_new_reason"
+
+    def test_marker_with_surrounding_whitespace(self):
+        """Multiline JSON between markers, common LLM output shape."""
+        from cron.scheduler import _extract_tailor_iteration
+        text = """\
+Tailoring run complete.
+
+<TAILOR_ITERATION_JSON>
+{
+  "eligible_count": 4,
+  "tailored_count": 2,
+  "skipped_terminal_count": 1,
+  "skipped_other_count": 1,
+  "reason": "mixed"
+}
+</TAILOR_ITERATION_JSON>
+
+Tailored 2 of 4 packets. Diego, see applications/.
+"""
+        parsed, err, _ = _extract_tailor_iteration(text)
+        assert err is None
+        assert parsed["tailored_count"] == 2
+
+
+class TestEmitTailorIterationEvent:
+    """Behavior tests for _emit_tailor_iteration_event — mocked EventBus.
+
+    Verifies the gating, event-type selection, and payload shape on each
+    of the 4 cases from the design doc.
+    """
+
+    def _make_emitter_with_bus(self):
+        emitter = MagicMock()
+        emitter.bus = MagicMock()
+        return emitter
+
+    def _tailor_job(self):
+        return {"id": "jobflow-tailor-123", "name": "jobflow-tailor"}
+
+    def test_gated_to_jobflow_tailor_only(self):
+        """Other crons must not fire any tailor_iteration / AGENT_ERROR emit."""
+        from cron.scheduler import _emit_tailor_iteration_event
+        emitter = self._make_emitter_with_bus()
+        not_tailor = {"id": "matcher-shadow", "name": "matcher-shadow"}
+        _emit_tailor_iteration_event(emitter, not_tailor, "no marker, but not gated")
+        assert emitter.bus.emit.call_count == 0
+
+    def test_no_emitter_short_circuits(self):
+        """None emitter must not raise (cron is in early-startup state)."""
+        from cron.scheduler import _emit_tailor_iteration_event
+        # Should not raise
+        _emit_tailor_iteration_event(None, self._tailor_job(), "")
+
+    def test_happy_path_emits_tailor_iteration_event(self):
+        from cron.scheduler import _emit_tailor_iteration_event
+        from events.schema import EventType
+        emitter = self._make_emitter_with_bus()
+        response = (
+            'Tailored 2 of 4 packets.\n'
+            '<TAILOR_ITERATION_JSON>'
+            '{"eligible_count": 4, "tailored_count": 2, '
+            '"skipped_terminal_count": 1, "skipped_other_count": 1, '
+            '"reason": "mixed"}'
+            '</TAILOR_ITERATION_JSON>'
+        )
+        _emit_tailor_iteration_event(emitter, self._tailor_job(), response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.TAILOR_ITERATION
+        assert kwargs["source"] == "tailor"
+        assert kwargs["correlation_id"] == "jobflow-tailor-123"
+        assert kwargs["job_id"] == "jobflow-tailor-123"
+        payload = kwargs["payload"]
+        assert payload["eligible_count"] == 4
+        assert payload["tailored_count"] == 2
+        assert payload["reason"] == "mixed"
+        # Plus the metadata we add in the wrapper
+        assert payload["job_name"] == "jobflow-tailor"
+        assert payload["job_id"] == "jobflow-tailor-123"
+
+    def test_missing_marker_emits_agent_error_with_reason(self):
+        from cron.scheduler import (
+            _emit_tailor_iteration_event,
+            TAILOR_ITERATION_REASON_MISSING,
+        )
+        from events.schema import EventType
+        emitter = self._make_emitter_with_bus()
+        _emit_tailor_iteration_event(emitter, self._tailor_job(), "Tailored 0 packets. [SILENT]")
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ERROR
+        assert kwargs["source"] == "tailor"
+        assert kwargs["payload"]["reason"] == TAILOR_ITERATION_REASON_MISSING
+        # No raw block kept for the missing case (nothing to keep)
+        assert "detail" not in kwargs["payload"]
+
+    def test_malformed_json_emits_agent_error_parse_failed(self):
+        from cron.scheduler import (
+            _emit_tailor_iteration_event,
+            TAILOR_ITERATION_REASON_PARSE_FAILED,
+        )
+        from events.schema import EventType
+        emitter = self._make_emitter_with_bus()
+        response = (
+            "<TAILOR_ITERATION_JSON>this is not json {[ </TAILOR_ITERATION_JSON>"
+        )
+        _emit_tailor_iteration_event(emitter, self._tailor_job(), response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ERROR
+        assert kwargs["payload"]["reason"] == TAILOR_ITERATION_REASON_PARSE_FAILED
+        # Malformed block kept (bounded) so operators can see it
+        assert "detail" in kwargs["payload"]
+        assert "this is not json" in kwargs["payload"]["detail"]
+
+    def test_schema_mismatch_emits_agent_error(self):
+        from cron.scheduler import (
+            _emit_tailor_iteration_event,
+            TAILOR_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        from events.schema import EventType
+        emitter = self._make_emitter_with_bus()
+        # Missing required field
+        response = (
+            '<TAILOR_ITERATION_JSON>{"eligible_count": 1}</TAILOR_ITERATION_JSON>'
+        )
+        _emit_tailor_iteration_event(emitter, self._tailor_job(), response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ERROR
+        assert kwargs["payload"]["reason"] == TAILOR_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_emit_failure_does_not_propagate(self):
+        """A bus.emit() exception must degrade to debug log, not crash tick."""
+        from cron.scheduler import _emit_tailor_iteration_event
+        emitter = MagicMock()
+        emitter.bus = MagicMock()
+        emitter.bus.emit.side_effect = RuntimeError("simulated DB lock")
+        # Must not raise
+        _emit_tailor_iteration_event(emitter, self._tailor_job(), "anything")
+
+    def test_detail_block_truncated_at_2000_chars(self):
+        """Bounded detail prevents multi-MB payload blowing up audit log."""
+        from cron.scheduler import _emit_tailor_iteration_event
+        emitter = self._make_emitter_with_bus()
+        big = "x" * 5000
+        response = f"<TAILOR_ITERATION_JSON>{big}</TAILOR_ITERATION_JSON>"
+        _emit_tailor_iteration_event(emitter, self._tailor_job(), response)
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert len(kwargs["payload"]["detail"]) == 2000
+
+    def test_correlation_id_falls_back_to_none_when_no_job_id(self):
+        """Defensive: a malformed job dict should not crash the emit."""
+        from cron.scheduler import _emit_tailor_iteration_event
+        emitter = self._make_emitter_with_bus()
+        bad_job = {"name": "jobflow-tailor"}  # no id
+        response = (
+            '<TAILOR_ITERATION_JSON>'
+            '{"eligible_count": 0, "tailored_count": 0, '
+            '"skipped_terminal_count": 0, "skipped_other_count": 0, '
+            '"reason": "no_eligible_packets"}'
+            '</TAILOR_ITERATION_JSON>'
+        )
+        _emit_tailor_iteration_event(emitter, bad_job, response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["correlation_id"] is None
+        assert kwargs["job_id"] is None
