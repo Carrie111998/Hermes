@@ -83,6 +83,12 @@ class EventType(Enum):
 
     # Phase C iter2 (Critic proposals routed to WhatsApp/Telegram)
     CRITIC_PROPOSAL = ("critic_proposal", Priority.NORMAL)
+    # Critic auto-apply event — added 2026-04-29 (consolidation phase C).
+    # Emitted by auto_applier.apply_decision after a successful mutation +
+    # changelog write. Existing TOPIC_ROUTING in telegram_notifier.py already
+    # routes critic_auto_applied -> critic_proposals topic; this enum entry
+    # makes the event actually emittable via EventType.from_string().
+    CRITIC_AUTO_APPLIED = ("critic_auto_applied", Priority.NORMAL)
 
     # Watchdog signals — added 2026-04-25 (iter5).
     # Previously these were emitted via _emit_event()'s AGENT_ERROR fallback
