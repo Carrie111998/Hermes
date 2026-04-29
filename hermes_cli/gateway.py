@@ -281,9 +281,9 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
             try:
                 result = subprocess.run(
                     ["wmic", "process", "get", "ProcessId,CommandLine", "/FORMAT:LIST"],
-                    capture_output=True, text=True, timeout=10
+                    capture_output=True, timeout=10
                 )
-                win_output = result.stdout
+                win_output = (result.stdout or b"").decode("utf-8", errors="replace")
             except (FileNotFoundError, OSError):
                 # wmic unavailable (modern Windows 11 / Git Bash) -- fall back to PowerShell
                 ps_cmd = (
@@ -293,9 +293,9 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                 )
                 result = subprocess.run(
                     ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
-                    capture_output=True, text=True, timeout=15
+                    capture_output=True, timeout=15
                 )
-                win_output = result.stdout
+                win_output = (result.stdout or b"").decode("utf-8", errors="replace")
             current_cmd = ""
             for line in win_output.split('\n'):
                 line = line.strip()
