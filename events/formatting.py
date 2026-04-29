@@ -76,6 +76,9 @@ EVENT_TYPE_EMOJI = {
     EventType.CRITIC_AUTO_APPLIED:      "✅",
     EventType.WATCHDOG_BURST:           "🌊",
     EventType.WATCHDOG_SELF_DEGRADED:   "🤕",
+    # Tailor structured iteration (2026-04-29) — counts + reason so the
+    # Critic can distinguish "nothing to do" from "something is broken"
+    EventType.TAILOR_ITERATION:         "✂️",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

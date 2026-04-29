@@ -81,6 +81,15 @@ class EventType(Enum):
     APPROVAL_REQUEST = ("approval_request", Priority.HIGH)
     APPLY_PACKET = ("apply_packet", Priority.NORMAL)
 
+    # Tailor structured iteration event — added 2026-04-29 (plan
+    # 2026-04-29-tailor-structured-iteration-event). Emitted by the
+    # cron-wrapper after `jobflow-tailor` runs, carrying counts +
+    # categorical reason so the Critic + Watchdog can distinguish
+    # "nothing to do" from "something is broken" — a discrimination
+    # the existing `[SILENT]` marker cannot make. Bus-only metadata;
+    # the human-readable Telegram pathway is unchanged.
+    TAILOR_ITERATION = ("tailor_iteration", Priority.LOW)
+
     # Phase C iter2 (Critic proposals routed to WhatsApp/Telegram)
     CRITIC_PROPOSAL = ("critic_proposal", Priority.NORMAL)
     # Critic auto-apply event — added 2026-04-29 (consolidation phase C).
