@@ -146,6 +146,12 @@ class TestShouldExclude:
         # The live DB is still backed up.
         assert not _should_exclude(Path("state.db"))
 
+    def test_excludes_browser_cdp_profile(self):
+        """Live browser profiles contain sockets and locked SQLite DBs."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("browser-cdp-profile/SingletonSocket"))
+        assert _should_exclude(Path("browser-cdp-profile/Default/History"))
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state
@@ -282,6 +288,16 @@ class TestBackup:
         assert not any(n.startswith(_QUICK_SNAPSHOTS_DIR + "/") for n in names), names
         # Exactly one state.db in the archive: the live one.
         assert [n for n in names if n == "state.db" or n.endswith("/state.db")] == ["state.db"]
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="mkfifo unavailable")
+    def test_rejects_special_files(self, tmp_path):
+        """Backup file filter rejects FIFOs and other special files."""
+        from hermes_cli.backup import _is_backupable_file
+
+        fifo = tmp_path / "pipe"
+        os.mkfifo(fifo)
+
+        assert not _is_backupable_file(fifo)
 
 
 # ---------------------------------------------------------------------------
