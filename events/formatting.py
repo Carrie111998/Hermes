@@ -70,6 +70,12 @@ EVENT_TYPE_EMOJI = {
     EventType.DEVFLOW_RUN_COMPLETED:    "🏁",
     EventType.DEVFLOW_APPROVAL_REQUESTED:"🗳️",
     EventType.DEVFLOW_TRACE_SNAPSHOT:   "📷",
+    # Scribe action telemetry (2026-04-28)
+    EventType.USER_INBOUND_MESSAGE:     "💬",
+    # Critic auto-apply (2026-04-29) + Watchdog burst-coalesce + self-degraded
+    EventType.CRITIC_AUTO_APPLIED:      "✅",
+    EventType.WATCHDOG_BURST:           "🌊",
+    EventType.WATCHDOG_SELF_DEGRADED:   "🤕",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

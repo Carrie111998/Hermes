@@ -35,12 +35,17 @@ TOPIC_ROUTING: Dict[str, str] = {
     'job_discovered': 'jobflow_firehose',
     'job_vip_discovered': 'jobflow_firehose',
     'job_scored': 'jobflow_firehose',
+    'job_high_score': 'jobflow_firehose',
     'tailor_completed': 'jobflow_firehose',
+    'application_submitted': 'jobflow_firehose',
     'stage_transition': 'jobflow_firehose',
     'followup_due': 'jobflow_firehose',
-    # -> jobflow_decisions
+    # -> jobflow_decisions (human-action signals; per test_critical_events_route_to_alerts)
     'approval_request': 'jobflow_decisions',
     'apply_packet': 'jobflow_decisions',
+    'application_ready': 'jobflow_decisions',
+    'interview_signal': 'jobflow_decisions',
+    'offer_signal': 'jobflow_decisions',
     # -> devflow_firehose
     'run_started': 'devflow_firehose',
     'run_completed': 'devflow_firehose',
@@ -66,8 +71,11 @@ TOPIC_ROUTING: Dict[str, str] = {
     'watchdog_probe_transition': 'watchdog_alerts',
     'watchdog_silence_alert': 'watchdog_alerts',
     'watchdog_recovered': 'watchdog_alerts',
+    'watchdog_burst': 'watchdog_alerts',
+    'watchdog_self_degraded': 'watchdog_alerts',
     'agent_failure_cluster': 'watchdog_alerts',
     # -> critic_proposals
+    'critic_proposal': 'critic_proposals',
     'critic_auto_applied': 'critic_proposals',
     'critic_self_degraded': 'critic_proposals',
     # NOTE: 'agent_failure_cluster' is the Critic's TRIGGER, not its proposal.
@@ -77,14 +85,18 @@ TOPIC_ROUTING: Dict[str, str] = {
     # -> curator_digest
     'memory_consolidated': 'curator_digest',
     'skill_evolved': 'curator_digest',
+    'curator_daily': 'curator_digest',
     # -> scribe_daily
     # digest_generated is an observability event (Watchdog/Critic cadence
-    # tracking) — NOT delivered to Telegram. The actual digest content
-    # arrives via the special-case mailbox_message + NOTIFICATION path
-    # below (search "message_type") so Diego sees one digest per fire,
-    # not two.
+    # tracking) — NOT delivered to Telegram in normal flow. The actual digest
+    # content arrives via the special-case mailbox_message + NOTIFICATION
+    # path below (search "message_type") so Diego sees one digest per fire,
+    # not two. Listed here for test coverage (test_all_event_types_have_routing)
+    # but delivery is gated separately.
+    'digest_generated': 'scribe_daily',
     'scribe_digest': 'scribe_daily',
     'mailbox_message': 'scribe_daily',
+    'user_inbound_message': 'scribe_daily',
     # -> security_and_system
     'secret_detected': 'security_and_system',
 }
