@@ -12,6 +12,25 @@ from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
 
+@pytest.fixture
+def _tick_lock_isolated(tmp_path):
+    """Redirect scheduler tick lock to a per-test temp dir.
+
+    tick() acquires an exclusive file lock at module-level _LOCK_FILE; under
+    pytest-xdist parallel workers this races and lock-losers short-circuit
+    with `return 0` before _process_job runs, breaking any test that asserts
+    positive behavior (delivery called, output saved, log emitted).
+
+    Test classes that call tick() must opt in via
+    @pytest.mark.usefixtures("_tick_lock_isolated").
+    """
+    lock_dir = tmp_path / "cron"
+    lock_dir.mkdir()
+    with patch("cron.scheduler._LOCK_DIR", lock_dir), \
+         patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+        yield
+
+
 class TestResolveOrigin:
     def test_full_origin(self):
         job = {
@@ -638,6 +657,7 @@ class TestDeliverResultErrorReturns:
         assert "no delivery target" in result
 
 
+@pytest.mark.usefixtures("_tick_lock_isolated")
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
         job = {
@@ -1130,6 +1150,7 @@ class TestRunJobSkillBacked:
         assert "Combine the results." in prompt_arg
 
 
+@pytest.mark.usefixtures("_tick_lock_isolated")
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
@@ -1209,6 +1230,7 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
 
 
+@pytest.mark.usefixtures("_tick_lock_isolated")
 class TestEventEmitterSummary:
     def _make_job(self):
         return {
