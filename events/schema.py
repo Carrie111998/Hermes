@@ -94,6 +94,7 @@ class EventType(Enum):
     # source=watchdog hack downstream.
     WATCHDOG_TICK = ("watchdog_tick", Priority.LOW)
     WATCHDOG_PROBE_TRANSITION = ("watchdog_probe_transition", Priority.HIGH)
+    WATCHDOG_BURST = ("watchdog_burst", Priority.HIGH)
     WATCHDOG_SILENCE_ALERT = ("watchdog_silence_alert", Priority.HIGH)
     WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
