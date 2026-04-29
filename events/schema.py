@@ -97,6 +97,7 @@ class EventType(Enum):
     WATCHDOG_BURST = ("watchdog_burst", Priority.HIGH)
     WATCHDOG_SILENCE_ALERT = ("watchdog_silence_alert", Priority.HIGH)
     WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
+    WATCHDOG_SELF_DEGRADED = ("watchdog_self_degraded", Priority.HIGH)
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
 
     # Curator nightly consolidation -- added 2026-04-26.
