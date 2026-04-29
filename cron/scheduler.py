@@ -154,7 +154,10 @@ def _summarize_for_event_bus(final_response: str) -> str:
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata."""
     origin = job.get("origin")
-    if not origin:
+    # Defensive: jobs.json has historically been seeded with non-dict values
+    # (e.g. a bare provenance string), which would crash every cron tick when
+    # we called `.get()` on it. Treat any non-dict shape as "no origin".
+    if not isinstance(origin, dict) or not origin:
         return None
     platform = origin.get("platform")
     chat_id = origin.get("chat_id")

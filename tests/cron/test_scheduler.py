@@ -46,6 +46,15 @@ class TestResolveOrigin:
         job = {"origin": {}}
         assert _resolve_origin(job) is None
 
+    def test_string_origin_returns_none(self):
+        # Regression: jobs.json entries created by the 2026-04-26 matcher-shadow
+        # recovery plan stored a provenance tag in the `origin` field as a bare
+        # string. The scheduler treated the field as a dict and crashed every
+        # tick with `'str' object has no attribute 'get'`. Non-dict origins
+        # must be coerced to None like any other malformed routing metadata.
+        job = {"origin": "matcher-shadow-coverage-recovery-2026-04-26"}
+        assert _resolve_origin(job) is None
+
 
 class TestResolveDeliveryTarget:
     def test_origin_delivery_preserves_thread_id(self):
