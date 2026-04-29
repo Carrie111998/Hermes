@@ -565,6 +565,92 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job("oneshot-stale")["next_run_at"] is None
 
+    def test_broken_interval_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        """Regression: interval jobs with valid schedule but null next_run_at
+        used to be silently skipped forever (jobs.py:702-710 only recovered
+        kind=once). Real incident: 2026-04-29 critic-skill-review zombie.
+        """
+        now = datetime(2026, 4, 29, 5, 19, 41, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "interval-zombie",
+                "name": "critic-skill-review",
+                "prompt": "do work",
+                "schedule": {"kind": "interval", "minutes": 480, "display": "every 480m"},
+                "schedule_display": "every 480m",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-04-26T17:15:15+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        # Interval job is not yet due (next run = now + 480m), so it
+        # shouldn't appear in the due list — but next_run_at MUST be
+        # populated and persisted so the next tick after its window picks
+        # it up instead of skipping forever.
+        assert get_due_jobs() == []
+        recovered = get_job("interval-zombie")["next_run_at"]
+        assert recovered is not None
+        recovered_dt = datetime.fromisoformat(recovered)
+        if recovered_dt.tzinfo is None:
+            recovered_dt = recovered_dt.replace(tzinfo=timezone.utc)
+        expected = now + timedelta(minutes=480)
+        assert abs((recovered_dt - expected).total_seconds()) < 5
+
+    def test_broken_cron_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        """Regression: cron-expression jobs with valid schedule but null
+        next_run_at used to be silently skipped forever. Real incident:
+        2026-04-29 curator-nightly + Pipeline Drift Audit zombies.
+        """
+        now = datetime(2026, 4, 29, 5, 19, 41, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "cron-zombie",
+                "name": "curator-nightly",
+                "prompt": "do work",
+                "schedule": {"kind": "cron", "expr": "0 7 * * *", "display": "0 7 * * *"},
+                "schedule_display": "0 7 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-04-26T18:30:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        # Next 07:00 UTC after 2026-04-29 05:19 is 2026-04-29 07:00.
+        assert get_due_jobs() == []
+        recovered = get_job("cron-zombie")["next_run_at"]
+        assert recovered is not None
+        recovered_dt = datetime.fromisoformat(recovered)
+        if recovered_dt.tzinfo is None:
+            recovered_dt = recovered_dt.replace(tzinfo=timezone.utc)
+        assert recovered_dt > now
+        # Must be the same day at 07:00, not silently skipped to a
+        # past time or the next day.
+        assert recovered_dt.hour == 7 and recovered_dt.minute == 0
+        assert recovered_dt.date() == now.date()
+
 
 class TestEnabledToolsets:
     def test_enabled_toolsets_stored(self, tmp_cron_dir):

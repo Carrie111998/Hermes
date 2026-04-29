@@ -701,19 +701,35 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
         next_run = job.get("next_run_at")
         if not next_run:
-            recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
-                now,
-                last_run_at=job.get("last_run_at"),
-            )
+            schedule = job.get("schedule", {})
+            kind = schedule.get("kind")
+            if kind == "once":
+                recovered_next = _recoverable_oneshot_run_at(
+                    schedule,
+                    now,
+                    last_run_at=job.get("last_run_at"),
+                )
+            elif kind in ("cron", "interval"):
+                # Bootstrap recovery for recurring jobs: a job with a valid
+                # schedule but null next_run_at would otherwise be silently
+                # skipped on every tick forever. Compute next_run_at from
+                # *now* (not last_run_at) so we don't fire a stale missed
+                # run; the grace-window check below already handles fast-
+                # forwarding for jobs whose next_run_at is populated but in
+                # the past.
+                recovered_next = compute_next_run(schedule)
+            else:
+                recovered_next = None
+
             if not recovered_next:
                 continue
 
             job["next_run_at"] = recovered_next
             next_run = recovered_next
             logger.info(
-                "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                "Job '%s' had no next_run_at (kind=%s); recovering scheduled run at %s",
                 job.get("name", job["id"]),
+                kind,
                 recovered_next,
             )
             for rj in raw_jobs:
