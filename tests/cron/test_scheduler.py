@@ -2606,3 +2606,286 @@ class TestEmitAgentIterationEvent:
         tailor_job = {"id": "tailor-1", "name": "jobflow-tailor"}
         _emit_agent_iteration_event(emitter, tailor_job, "Done with no marker.")
         assert emitter.bus.emit.call_count == 0
+
+
+# Cron same-job concurrency guard -- added 2026-04-30. Closes the
+# 2026-04-30 sentinel-vip-morning triple-fire (canonical case
+# event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). The third fire
+# at 14:49 hung in Anthropic and was killed only when the gateway
+# restarted at 14:56. Two concurrent sentinel fires would also
+# collide on the browser-harness per-process lock.
+@pytest.mark.usefixtures("_tick_lock_isolated")
+class TestDuplicateFireGuard:
+    @pytest.fixture(autouse=True)
+    def _reset_in_flight(self):
+        """Clear _in_flight before AND after each test to keep tests independent."""
+        from cron import scheduler as sch
+        sch._in_flight.clear()
+        yield
+        sch._in_flight.clear()
+
+    def _job(self, job_id="092f4ed7657c", name="sentinel-vip-morning"):
+        return {"id": job_id, "name": name, "deliver": "local"}
+
+    def test_concurrent_duplicate_fire_emits_skip_and_blocks_second_run_job(self):
+        """Canonical 2026-04-30 sentinel triple-fire scenario.
+
+        Two _process_job calls land for the same job_id; the first wins the
+        in-flight slot and proceeds, the second emits CRON_SKIPPED_DUPLICATE
+        and never reaches run_job (which is what would have collided on the
+        Chrome browser-harness lock).
+        """
+        import threading
+        import time
+        from events.schema import EventType
+
+        release = threading.Event()
+        run_job_call_count = 0
+        run_job_lock = threading.Lock()
+
+        def blocking_run_job(job):
+            nonlocal run_job_call_count
+            with run_job_lock:
+                run_job_call_count += 1
+            # Hold the slot long enough that the parallel second fire's
+            # _process_job is guaranteed to have crossed the guard.
+            release.wait(timeout=5)
+            return (True, "# output", "response", None)
+
+        emitter = MagicMock()
+        # Give on_job_started a deterministic event_id so we can assert it
+        # propagates into prior_cron_started_event_id on the skip event.
+        emitter.on_job_started.return_value = "4edcb4b1-aa07-4dbb-b799-8af167d4f92e"
+
+        skip_calls = []
+
+        def capture_skip(**kwargs):
+            skip_calls.append(kwargs)
+            return "skip-evt-id"
+        emitter.on_job_skipped_duplicate.side_effect = capture_skip
+
+        # Schedule release once both fires have had a chance to enter
+        # _process_job. The second fire returns False quickly via the
+        # guard; the first is then released to complete normally.
+        def release_after_delay():
+            time.sleep(0.4)
+            release.set()
+        threading.Thread(target=release_after_delay, daemon=True).start()
+
+        # Two due-job entries with the SAME job_id reproduce the
+        # trigger_job race observed in production (mirroring trigger_job
+        # firing twice within one tick window).
+        job = self._job()
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[dict(job), dict(job)]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job", side_effect=blocking_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        # Exactly one fire reached run_job -- the second was blocked.
+        assert run_job_call_count == 1, (
+            f"Expected exactly one run_job invocation; got {run_job_call_count}"
+        )
+        # Exactly one cron_started -- the duplicate must NOT have emitted one.
+        assert emitter.on_job_started.call_count == 1, (
+            f"on_job_started called {emitter.on_job_started.call_count}x; "
+            "duplicate fire emitted cron_started anyway"
+        )
+        # Exactly one CRON_SKIPPED_DUPLICATE.
+        assert len(skip_calls) == 1, f"skip_calls={skip_calls!r}"
+
+        skip = skip_calls[0]
+        assert skip["job_id"] == "092f4ed7657c"
+        assert skip["job_name"] == "sentinel-vip-morning"
+        assert skip["reason"] == "concurrent_fire_blocked"
+        # The skip event references the live in-flight cron_started.
+        assert (
+            skip["prior_cron_started_event_id"]
+            == "4edcb4b1-aa07-4dbb-b799-8af167d4f92e"
+        )
+        assert skip["prior_elapsed_seconds"] >= 0
+        # Sanity: the EventType identifier is also stable.
+        assert EventType.CRON_SKIPPED_DUPLICATE.type_string == "cron_skipped_duplicate"
+
+    def test_in_flight_cleared_after_successful_run(self):
+        """After a job completes, the same job_id must be allowed to fire again."""
+        from cron import scheduler as sch
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._job()]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert "092f4ed7657c" not in sch._in_flight, (
+            "_in_flight must be cleared after a successful run; "
+            f"still holds {sch._in_flight!r}"
+        )
+
+    def test_in_flight_cleared_after_run_job_exception(self):
+        """An exception inside run_job must still release the in-flight slot."""
+        from cron import scheduler as sch
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        def boom(job):
+            raise RuntimeError("simulated agent crash")
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._job()]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job", side_effect=boom), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert "092f4ed7657c" not in sch._in_flight, (
+            "_in_flight must be cleared even when run_job raises"
+        )
+
+    def test_different_job_ids_do_not_collide(self):
+        """The guard is keyed by job_id; unrelated jobs run in parallel."""
+        import threading
+
+        emitter = MagicMock()
+        emitter.on_job_started.side_effect = ["evt-a", "evt-b"]
+
+        skip_calls = []
+        emitter.on_job_skipped_duplicate.side_effect = (
+            lambda **kw: skip_calls.append(kw)
+        )
+
+        run_count = 0
+        run_lock = threading.Lock()
+
+        def mock_run(job):
+            nonlocal run_count
+            with run_lock:
+                run_count += 1
+            return (True, "# output", "response", None)
+
+        jobs = [
+            {"id": "job-a", "name": "a", "deliver": "local"},
+            {"id": "job-b", "name": "b", "deliver": "local"},
+        ]
+
+        with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job", side_effect=mock_run), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "job-a", "consecutive_errors": 0},
+                 {"id": "job-b", "consecutive_errors": 0},
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert run_count == 2
+        assert emitter.on_job_started.call_count == 2
+        assert skip_calls == [], (
+            "Distinct job_ids must not be flagged as duplicates; "
+            f"got skip_calls={skip_calls!r}"
+        )
+
+    def test_prior_fire_exceeded_timeout_reason(self, monkeypatch):
+        """When the prior fire has been registered for longer than the
+        configured hard-timeout, the reason switches to
+        'prior_fire_exceeded_timeout' and the new fire is still rejected."""
+        import time
+        from cron import scheduler as sch
+
+        # Force the guard's effective timeout down to 1 second so we can
+        # seed an "old" in-flight record without sleeping past the
+        # production default.
+        monkeypatch.setenv("HERMES_CRON_HARD_TIMEOUT", "1")
+
+        # Seed an in-flight record that pre-dates the timeout window.
+        sch._in_flight["092f4ed7657c"] = sch._InFlightRecord(
+            start_monotonic=time.monotonic() - 9999.0,
+            job_name="sentinel-vip-morning",
+            cron_started_event_id="prior-evt-id",
+        )
+
+        emitter = MagicMock()
+        skip_calls = []
+        emitter.on_job_skipped_duplicate.side_effect = (
+            lambda **kw: skip_calls.append(kw)
+        )
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[self._job()]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job") as mock_run, \
+             patch("cron.scheduler.save_job_output"), \
+             patch("cron.scheduler._deliver_result"), \
+             patch("cron.scheduler.mark_job_run"):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        # run_job NEVER invoked (declined to start on top of wedged prior).
+        mock_run.assert_not_called()
+        # cron_started NOT emitted for this fire.
+        assert emitter.on_job_started.call_count == 0
+
+        assert len(skip_calls) == 1
+        skip = skip_calls[0]
+        assert skip["reason"] == "prior_fire_exceeded_timeout"
+        assert skip["prior_cron_started_event_id"] == "prior-evt-id"
+        assert skip["prior_elapsed_seconds"] >= 9999.0
+
+
+class TestInFlightRegistryShape:
+    """Document the _in_flight registry contract for Guard #1 (cron_aborted
+    on shutdown), which builds on the same registry."""
+
+    def test_registry_is_module_level_dict(self):
+        """_in_flight is a module-level dict keyed by job_id."""
+        from cron import scheduler as sch
+        assert isinstance(sch._in_flight, dict)
+
+    def test_record_has_documented_fields(self):
+        from cron.scheduler import _InFlightRecord
+        rec = _InFlightRecord(
+            start_monotonic=42.0,
+            job_name="any",
+            cron_started_event_id=None,
+        )
+        assert rec.start_monotonic == 42.0
+        assert rec.job_name == "any"
+        assert rec.cron_started_event_id is None
+
+    def test_lock_is_module_level(self):
+        """_in_flight_lock serializes registry mutations across threads."""
+        import threading
+        from cron import scheduler as sch
+        # threading.Lock is a factory; the underlying type is exposed via
+        # type(threading.Lock()) — this checks we have a real lock object.
+        assert isinstance(sch._in_flight_lock, type(threading.Lock()))

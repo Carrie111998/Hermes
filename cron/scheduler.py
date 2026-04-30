@@ -17,6 +17,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -28,7 +31,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -137,6 +140,99 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+
+# === Same-job concurrency guard (Guard #3, added 2026-04-30) ================
+#
+# Closes the 2026-04-30 sentinel-vip-morning triple-fire (canonical case
+# event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). The cron tick path is
+# protected by `advance_next_run` so duplicates from the recurring schedule
+# cannot land within a single tick window — but `trigger_job(job_id)` in
+# cron/jobs.py:571 sets next_run_at = NOW and bypasses that guard. When a
+# user-initiated trigger races a tick-scheduled fire (or a fire that is
+# wedged), two `_process_job` calls can land for the same job_id. For
+# Sentinel that means two Chrome browser-harness processes colliding on
+# the per-process lock; for any cron it means duplicate LLM credits, mailbox
+# writes, and AGENT_ITERATION events.
+#
+# Registry shape (also intended to support Guard #1, cron_aborted on
+# shutdown, which needs to enumerate currently-running jobs):
+#   _in_flight[job_id] = _InFlightRecord(
+#       start_monotonic=...,           # time.monotonic() at registration
+#       job_name="...",                 # for event payloads
+#       cron_started_event_id=...       # populated after on_job_started succeeds
+#   )
+# All mutations go through `_in_flight_lock`. Any future branch that adds
+# fields here must update the dataclass below AND the helpers used by
+# _process_job (`_register_in_flight`, `_release_in_flight`).
+@dataclass
+class _InFlightRecord:
+    start_monotonic: float
+    job_name: str
+    cron_started_event_id: Optional[str] = None
+
+
+_in_flight: Dict[str, _InFlightRecord] = {}
+_in_flight_lock = threading.Lock()
+
+# Default guard threshold (seconds) used when HERMES_CRON_HARD_TIMEOUT is
+# unset.  This is the duplicate-guard's view of "how long before we treat
+# the prior fire as wedged"; it is intentionally separate from the
+# scheduler's wall-clock timeout (which defaults to unlimited) so that
+# the dedup guard works correctly even in environments that have not
+# opted into a wall-clock timeout.
+_DEFAULT_DUP_GUARD_TIMEOUT_S = 1800.0
+
+
+def _dup_guard_timeout_seconds() -> float:
+    """Effective elapsed-time threshold the dedup guard uses to decide
+    whether the prior fire is healthy (concurrent_fire_blocked) or
+    wedged-but-tracked (prior_fire_exceeded_timeout)."""
+    raw = os.getenv("HERMES_CRON_HARD_TIMEOUT", "").strip()
+    try:
+        val = float(raw) if raw else 0.0
+    except (TypeError, ValueError):
+        val = 0.0
+    return val if val > 0 else _DEFAULT_DUP_GUARD_TIMEOUT_S
+
+
+def _try_register_in_flight(job_id: str, job_name: str) -> Optional[_InFlightRecord]:
+    """Attempt to register a job as in-flight.
+
+    Returns ``None`` if the slot was acquired (caller may proceed).
+    Returns the existing ``_InFlightRecord`` if a duplicate fire is
+    already running (caller must reject and emit cron_skipped_duplicate).
+    """
+    with _in_flight_lock:
+        prior = _in_flight.get(job_id)
+        if prior is not None:
+            return prior
+        _in_flight[job_id] = _InFlightRecord(
+            start_monotonic=time.monotonic(),
+            job_name=job_name,
+            cron_started_event_id=None,
+        )
+        return None
+
+
+def _attach_started_event_id(job_id: str, event_id: Optional[str]) -> None:
+    """Record the cron_started event_id on an existing in-flight slot.
+
+    Called after on_job_started returns so future duplicate-skip events
+    can reference the live cron_started for cross-event correlation.
+    """
+    if not event_id:
+        return
+    with _in_flight_lock:
+        rec = _in_flight.get(job_id)
+        if rec is not None:
+            rec.cron_started_event_id = event_id
+
+
+def _release_in_flight(job_id: str) -> None:
+    """Release the in-flight slot for ``job_id`` (idempotent)."""
+    with _in_flight_lock:
+        _in_flight.pop(job_id, None)
 
 
 def _summarize_for_event_bus(final_response: str) -> str:
@@ -1642,20 +1738,63 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
-            # Emit cron_started event
+            _job_id = job["id"]
+            _cron_job_name = job.get("name", _job_id)
             emitter = _get_event_emitter()
+
+            # Same-job concurrency guard (Guard #3, 2026-04-30) -----------
+            # Reject a second fire while a prior fire for this job_id is
+            # still in-flight. Both reasons reject the new fire; the
+            # difference is operator-visible only.  Canonical case:
+            # event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e.
+            prior = _try_register_in_flight(_job_id, _cron_job_name)
+            if prior is not None:
+                elapsed = max(0.0, time.monotonic() - prior.start_monotonic)
+                timeout_s = _dup_guard_timeout_seconds()
+                reason = (
+                    "concurrent_fire_blocked"
+                    if elapsed < timeout_s
+                    else "prior_fire_exceeded_timeout"
+                )
+                logger.warning(
+                    "Cron duplicate fire blocked: job_id=%s job_name=%s "
+                    "elapsed=%.1fs reason=%s prior_event=%s",
+                    _job_id, _cron_job_name, elapsed, reason,
+                    prior.cron_started_event_id,
+                )
+                if emitter:
+                    try:
+                        emitter.on_job_skipped_duplicate(
+                            job_id=_job_id,
+                            job_name=_cron_job_name,
+                            prior_cron_started_event_id=prior.cron_started_event_id,
+                            prior_elapsed_seconds=round(elapsed, 1),
+                            reason=reason,
+                        )
+                    except Exception as ee:
+                        logger.debug(
+                            "Event emit failed for cron_skipped_duplicate: %s", ee
+                        )
+                return False
+
+            # We hold the in-flight slot for _job_id from here; release it
+            # on every exit path (the existing inner try/except below was
+            # extended with a `finally: _release_in_flight(_job_id)`).
+
+            # Emit cron_started event.  Capture the event_id so the next
+            # duplicate-skip event can reference it for cross-event correlation.
             if emitter:
                 try:
-                    emitter.on_job_started(
-                        job_id=job["id"],
-                        job_name=job.get("name", job["id"]),
+                    _started_event_id = emitter.on_job_started(
+                        job_id=_job_id,
+                        job_name=_cron_job_name,
                         schedule=job.get("schedule_display", ""),
                     )
+                    _attach_started_event_id(_job_id, _started_event_id)
                 except Exception as ee:
                     logger.debug("Event emit failed: %s", ee)
 
             import time as _time
-            _cron_job_name = job.get("name", job["id"])
             # OTel: one span per cron fire. Covers run_job + delivery + event emission.
             _cron_cm = _start_cron_span(f"cron.run_job:{_cron_job_name}")
             _cron_span = _cron_cm.__enter__()  # real Span (or _NoopCronSpan)
@@ -1773,6 +1912,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
                 return False
+
+            finally:
+                # Release the same-job concurrency slot regardless of how
+                # the run exited (success, agent failure, raised exception).
+                # See `_in_flight` registry block at module top — Guard #3.
+                _release_in_flight(_job_id)
 
         # Run all due jobs concurrently, each in its own ContextVar copy
         # so session/delivery state stays isolated per-thread.
