@@ -100,6 +100,62 @@ class TestEmitterClusterEmission:
         }
 
 
+class TestEmitterCanonicalSource:
+    """The cron emitter feeds the FailureClusterDetector with the canonical
+    agent identity (not the raw cron job name) so that the parallel
+    MailboxTranslator path -- which uses canonical short names -- shares
+    the same per-source window state and emits dedupable events.
+
+    Background: profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md
+    Option A.  Without canonical mapping, 'jobflow-applier' (cron) and
+    'applier' (mailbox) report into separate detector buckets and surface
+    as two near-simultaneous AGENT_FAILURE_CLUSTER events for the same
+    underlying failure -- doubling Telegram noise on #watchdog_alerts.
+    """
+
+    def test_jobflow_prefix_emits_canonical_source(self, bus, emitter):
+        _fail(emitter, "jobflow-applier", "timeout", 1)
+        _fail(emitter, "jobflow-applier", "timeout", 2)
+        _fail(emitter, "jobflow-applier", "timeout", 3)
+        clusters = bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "applier"
+        assert clusters[0].payload["source"] == "applier"
+
+    def test_sentinel_vip_collapses_to_sentinel(self, bus, emitter):
+        _fail(emitter, "sentinel-vip-evening", "timeout", 1)
+        _fail(emitter, "sentinel-vip-evening", "timeout", 2)
+        _fail(emitter, "sentinel-vip-evening", "timeout", 3)
+        clusters = bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "sentinel"
+
+    def test_three_failures_across_sentinel_vip_variants_still_cluster(
+        self, bus, emitter,
+    ):
+        """sentinel-vip-evening, sentinel-vip-midday, sentinel-vip-morning
+        are three different cron jobs that all represent the same agent.
+        After canonicalisation, three failures across the variants must
+        still cluster into ONE event with source='sentinel'."""
+        _fail(emitter, "sentinel-vip-evening", "timeout", 1)
+        _fail(emitter, "sentinel-vip-midday", "timeout", 2)
+        _fail(emitter, "sentinel-vip-morning", "timeout", 3)
+        clusters = bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "sentinel"
+
+    def test_unknown_cron_name_passes_through_verbatim(self, bus, emitter):
+        """Unknown shapes ('Pipeline Drift Audit', ad-hoc names) must NOT
+        get collapsed onto a canonical agent.  Verbatim is the safe
+        default."""
+        _fail(emitter, "Pipeline Drift Audit", "timeout", 1)
+        _fail(emitter, "Pipeline Drift Audit", "timeout", 2)
+        _fail(emitter, "Pipeline Drift Audit", "timeout", 3)
+        clusters = bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "Pipeline Drift Audit"
+
+
 class TestPerAgentSmoke:
     """Parameterized smoke test — every Hermes agent source must be able
     to trigger a cluster.  Closes the brief's per-agent wiring requirement

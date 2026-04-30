@@ -19,6 +19,7 @@ from typing import Optional
 from events.bus import EventBus
 from events.cluster_detector import FailureClusterDetector
 from events.paths import failure_cluster_state_path
+from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import EventType, Priority
 
 logger = logging.getLogger(__name__)
@@ -122,9 +123,17 @@ class CronEventEmitter:
         # clear the per-source window).  Emit a focused cluster event when
         # the detector reports a same-type 3-in-a-row.  Wrapped so a
         # detector failure (e.g. corrupt state file) cannot break the emitter.
+        #
+        # Canonicalise the source BEFORE recording so the per-source window
+        # state is shared with the parallel mailbox-translator path
+        # (events/subscribers/mailbox_translator.py).  Without this, the
+        # cron path keys windows under 'jobflow-applier' while the mailbox
+        # path keys under 'applier' — same agent, two windows, two cluster
+        # emissions.  See profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md.
         try:
+            canonical_source = canonical_agent_source(job_name)
             cluster = self._cluster_detector.record(
-                source=job_name,
+                source=canonical_source,
                 success=success,
                 error_text=error,
             )
