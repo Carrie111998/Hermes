@@ -103,7 +103,13 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    advance_next_run,
+    get_due_and_skipped_jobs,
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1558,7 +1564,27 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
         return 0
 
     try:
-        due_jobs = get_due_jobs()
+        due_jobs, skipped_jobs = get_due_and_skipped_jobs()
+
+        # Emit CRON_SKIPPED for any job whose missed fire was fast-forwarded.
+        # Done before due-job processing so visibility is immediate even if
+        # this tick has 0 due jobs. Lazy-load the emitter (matches existing
+        # pattern). Failures emitting events must NOT block tick progress.
+        if skipped_jobs:
+            try:
+                emitter = _get_event_emitter()
+                if emitter is not None:
+                    for s in skipped_jobs:
+                        emitter.on_job_skipped(
+                            job_id=s["job_id"],
+                            job_name=s["name"],
+                            missed_at=s["missed_at"],
+                            missed_seconds=s["missed_seconds"],
+                            schedule_kind=s["schedule_kind"],
+                            reason=s["reason"],
+                        )
+            except Exception:
+                logger.exception("Failed to emit cron_skipped events")
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
