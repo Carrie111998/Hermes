@@ -723,18 +723,25 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
-def get_due_jobs() -> List[Dict[str, Any]]:
-    """Get all jobs that are due to run now.
+def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Return (due, skipped) lists.
+
+    `due` — jobs to execute on this tick.
+    `skipped` — jobs whose next_run_at was fast-forwarded past a missed
+                fire window. Each entry is a dict with keys:
+                  job_id, name, missed_at (iso str), missed_seconds (int),
+                  schedule_kind (str), reason (str).
 
     For recurring jobs (cron/interval), if the scheduled time is stale
     (more than one period in the past, e.g. because the gateway was down),
     the job is fast-forwarded to the next future run instead of firing
-    immediately.  This prevents a burst of missed jobs on gateway restart.
+    immediately. This prevents a burst of missed jobs on gateway restart.
     """
     now = _hermes_now()
     raw_jobs = load_jobs()
     jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    due = []
+    due: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     needs_save = False
 
     for job in jobs:
@@ -808,6 +815,8 @@ def get_due_jobs() -> List[Dict[str, Any]]:
                             rj["next_run_at"] = new_next
                             needs_save = True
                             break
+                    # Behavior unchanged in this task — Task 4 will append
+                    # to `skipped` here and decide fire-once eligibility.
                     continue  # Skip this run
 
             due.append(job)
@@ -815,6 +824,17 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     if needs_save:
         save_jobs(raw_jobs)
 
+    return due, skipped
+
+
+def get_due_jobs() -> List[Dict[str, Any]]:
+    """Backward-compatible wrapper — returns only the due list.
+
+    Existing call sites (15+ tests + scheduler.tick()) continue to work
+    unchanged. New call sites that need skipped events should use
+    get_due_and_skipped_jobs() directly.
+    """
+    due, _ = get_due_and_skipped_jobs()
     return due
 
 
