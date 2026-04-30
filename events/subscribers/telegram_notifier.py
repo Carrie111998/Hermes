@@ -8,6 +8,7 @@ the gateway's Telegram adapter send() method.
 import json
 import logging
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -117,6 +118,15 @@ CRON_SUMMARY_TRUNCATION_NOTE = (
     "[Mission Control trimmed the rest; full run output remains in cron history/artifacts.]"
 )
 
+# Receiver-side LRU dedup for AGENT_FAILURE_CLUSTER (Option C in the
+# 2026-04-29 watchdog-dedup proposal). Caches (source, 30-min bucket)
+# pairs that have already been delivered to Telegram so a near-duplicate
+# cluster event for the same agent in the same window is suppressed at
+# the chat layer. The bus event itself flows through unchanged so
+# downstream consumers (Critic substrate, audit logger) still see both.
+CLUSTER_DEDUP_BUCKET_SECONDS = 30 * 60
+CLUSTER_DEDUP_LRU_SIZE = 256
+
 
 class TelegramNotifier(BaseSubscriber):
     subscriber_id = "telegram-notifier"
@@ -153,6 +163,13 @@ class TelegramNotifier(BaseSubscriber):
         self._batch_timestamps: Dict[str, float] = {k: now for k in self._batch_buffer}  # topic_key → first batch time
         self._verbosity_mtime: float = 0.0  # mtime of verbosity.json for hot-reload
 
+        # AGENT_FAILURE_CLUSTER dedup cache (source, 30-min bucket) -> True.
+        # In-memory only; a notifier restart clears it (acceptable per the
+        # proposal: the Option A producer-side canonicalisation is the
+        # primary fix; this LRU is belt-and-braces for timing skew between
+        # the two cluster producers within a single notifier lifetime).
+        self._cluster_dedup_lru: "OrderedDict[Tuple[str, int], bool]" = OrderedDict()
+
         self._load_config()
 
     def _load_config(self) -> None:
@@ -184,6 +201,17 @@ class TelegramNotifier(BaseSubscriber):
         # remain in the bus for audit-logger and the gateway log.
         if (event.event_type == EventType.AGENT_ERROR
                 and event.source == "event-bus"):
+            return
+
+        # Receiver-side dedup for AGENT_FAILURE_CLUSTER. Belt-and-braces
+        # over the producer-side canonical-source mapping (Option A): if
+        # both the cron-emitter and the mailbox-translator paths fire a
+        # cluster for the same agent within the same 30-minute window,
+        # only the first delivery hits Telegram. The bus event continues
+        # flowing so the Critic substrate and the audit logger still see
+        # it. See profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md.
+        if (event.event_type == EventType.AGENT_FAILURE_CLUSTER
+                and self._is_duplicate_cluster(event)):
             return
 
         # FIX 2026-04-25: watchdog feedback flood. The watchdog emits its own
@@ -430,3 +458,30 @@ class TelegramNotifier(BaseSubscriber):
             if str(topic.get("thread_id", "")) == thread_id:
                 return key
         return "system"
+
+    def _is_duplicate_cluster(self, event: Event) -> bool:
+        """Return True iff this AGENT_FAILURE_CLUSTER event has already
+        been delivered for the same (source, 30-min bucket) within the
+        notifier's LRU window. Records the key on miss before returning
+        False, so subsequent calls with the same key suppress.
+
+        Bucket: integer floor of event.timestamp / CLUSTER_DEDUP_BUCKET_SECONDS.
+        Falls back to wall clock if event.timestamp is unparseable so the
+        dedup never silently passes through on bad input.
+        """
+        source = event.source or "unknown"
+        try:
+            ts = datetime.fromisoformat(event.timestamp).timestamp()
+        except (TypeError, ValueError):
+            ts = time.time()
+        bucket = int(ts // CLUSTER_DEDUP_BUCKET_SECONDS)
+        key = (source, bucket)
+
+        if key in self._cluster_dedup_lru:
+            self._cluster_dedup_lru.move_to_end(key)
+            return True
+
+        self._cluster_dedup_lru[key] = True
+        while len(self._cluster_dedup_lru) > CLUSTER_DEDUP_LRU_SIZE:
+            self._cluster_dedup_lru.popitem(last=False)
+        return False

@@ -501,6 +501,208 @@ class TestLowPriorityBatching:
         assert len(sent) == 1
 
 
+class TestAgentFailureClusterDedup:
+    """Receiver-side LRU dedup for AGENT_FAILURE_CLUSTER (Option C in
+    profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md).
+
+    Even with canonical-source emission at the producer side (Option A
+    via canonical_agent_source), timing skew between the cron-emitter and
+    mailbox-translator paths can fire two cluster events for the same
+    canonical agent in the same 30-minute window before the shared
+    detector state has converged. The receiver-side LRU is the
+    belt-and-braces insurance: it suppresses Telegram delivery for
+    ``(source, 30-min bucket)`` keys it has already sent, while leaving
+    the bus event itself untouched (downstream consumers like the Critic
+    substrate and audit logger still receive both copies).
+    """
+
+    def _cluster_event(self, source, timestamp):
+        evt = Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, source,
+            {
+                "source": source, "failure_type": "captcha", "count": 3,
+                "first_seen": timestamp,
+                "last_seen": timestamp,
+            },
+        )
+        evt.timestamp = timestamp
+        return evt
+
+    def test_duplicate_cluster_same_bucket_is_suppressed(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Two cluster events for the same source within the same 30-min
+        bucket: the FIRST hits Telegram, the SECOND is suppressed.
+
+        Without this dedup the cron-emitter and mailbox-translator paths
+        each fire a cluster event for the same Applier exit-126 incident
+        and the user sees two ``#watchdog_alerts`` messages back-to-back.
+        """
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        evt1 = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        evt2 = self._cluster_event("applier", "2026-04-29T10:05:00+00:00")
+
+        notifier.handle(evt1)
+        notifier.handle(evt2)
+
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 1, (
+            f"second cluster for same source in same 30-min bucket must "
+            f"be suppressed; got {len(watchdog_deliveries)} deliveries: "
+            f"{sent!r}"
+        )
+
+    def test_cluster_in_next_bucket_re_delivers(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """A cluster for the same agent in the NEXT 30-min bucket must
+        deliver again — the dedup is rate-limit, not permanent
+        suppression. Without this, an Applier failure that recurs the
+        next morning would silently never re-alert."""
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        evt1 = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        evt2 = self._cluster_event("applier", "2026-04-29T10:31:00+00:00")
+
+        notifier.handle(evt1)
+        notifier.handle(evt2)
+
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 2, (
+            f"expected 2 deliveries across 2 buckets; got "
+            f"{len(watchdog_deliveries)}: {sent!r}"
+        )
+
+    def test_different_sources_same_bucket_both_deliver(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Dedup keys on (source, bucket). Different agents in the same
+        time window are independent incidents; both must deliver."""
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        evt_a = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        evt_b = self._cluster_event("scout", "2026-04-29T10:05:00+00:00")
+
+        notifier.handle(evt_a)
+        notifier.handle(evt_b)
+
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 2, (
+            f"different sources must both deliver; got {sent!r}"
+        )
+
+    def test_dedup_does_not_affect_other_event_types(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """LRU dedup is scoped to AGENT_FAILURE_CLUSTER only. A CRON_FAILED
+        event from the same source in the same window MUST still deliver —
+        the dedup must not bleed across event types."""
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        cluster = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        cron_failed = Event.create(
+            EventType.CRON_FAILED, "applier",
+            {"job_id": "j", "job_name": "applier", "duration": 1.0,
+             "error": "captcha", "consecutive_errors": 1},
+        )
+
+        notifier.handle(cluster)
+        notifier.handle(cron_failed)
+
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 2, (
+            f"cron_failed must deliver after a cluster from same source; "
+            f"got {sent!r}"
+        )
+
+    def test_lru_evicts_oldest_when_capacity_exceeded(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """LRU is bounded at CLUSTER_DEDUP_LRU_SIZE entries. After
+        SIZE+1 unique (source, bucket) pairs, the oldest must have been
+        evicted; re-emitting it should deliver again because the cache
+        lost that key. Guards against unbounded memory growth in a
+        long-running notifier."""
+        from events.subscribers.telegram_notifier import CLUSTER_DEDUP_LRU_SIZE
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        first = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        notifier.handle(first)
+
+        # Fill the LRU with SIZE distinct (source, bucket) keys so the
+        # 'applier@bucket0' key gets evicted.
+        for i in range(CLUSTER_DEDUP_LRU_SIZE):
+            evt = self._cluster_event(
+                f"agent-{i}", "2026-04-29T10:00:00+00:00",
+            )
+            notifier.handle(evt)
+
+        # Re-emit the original key — should deliver again because evicted.
+        replay = self._cluster_event("applier", "2026-04-29T10:00:00+00:00")
+        notifier.handle(replay)
+
+        applier_lines = [
+            s for s in sent
+            if s[0] == "100" and "applier" in s[1] and "agent-" not in s[1]
+        ]
+        assert len(applier_lines) == 2, (
+            f"after LRU eviction, replay must deliver again; "
+            f"applier deliveries: {applier_lines!r}"
+        )
+
+    def test_bus_event_query_still_records_duplicate(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """The dedup gate suppresses Telegram delivery only — the event
+        bus history must still record both copies so downstream
+        consumers (Critic substrate, audit-logger) can act on them. This
+        guards the proposal's explicit "bus events stay distinct"
+        requirement."""
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        # Emit through the bus (not just via notifier.handle) so query() finds them.
+        bus.emit(
+            event_type=EventType.AGENT_FAILURE_CLUSTER, source="applier",
+            payload={"source": "applier", "failure_type": "captcha", "count": 3,
+                     "first_seen": "2026-04-29T10:00:00+00:00",
+                     "last_seen": "2026-04-29T10:00:00+00:00"},
+        )
+        bus.emit(
+            event_type=EventType.AGENT_FAILURE_CLUSTER, source="applier",
+            payload={"source": "applier", "failure_type": "captcha", "count": 3,
+                     "first_seen": "2026-04-29T10:05:00+00:00",
+                     "last_seen": "2026-04-29T10:05:00+00:00"},
+        )
+        # Drive both events through the notifier so it can dedup.
+        for evt in bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER):
+            notifier.handle(evt)
+
+        # Bus retains both copies (audit / Critic still see the duplicate).
+        assert len(bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)) == 2
+        # Telegram side: only the first one delivers.
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 1
+
+
 def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "telegram").mkdir()
