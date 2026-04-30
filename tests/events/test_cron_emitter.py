@@ -86,6 +86,28 @@ class TestCronLifecycle:
         consecutive = bus.query(event_type=EventType.CRON_FAILED_CONSECUTIVE)
         assert len(consecutive) == 0
 
+    def test_emit_skipped(self, emitter, bus):
+        emitter.on_job_skipped(
+            job_id="job-1",
+            job_name="sentinel-vip-evening",
+            missed_at="2026-04-29T23:00:00+00:00",
+            missed_seconds=14400,
+            schedule_kind="cron",
+            reason="default_period_cap",
+        )
+
+        events = bus.query(event_type=EventType.CRON_SKIPPED)
+        assert len(events) == 1
+        assert events[0].source == "sentinel-vip-evening"
+        assert events[0].priority == Priority.HIGH
+        payload = events[0].payload
+        assert payload["job_id"] == "job-1"
+        assert payload["job_name"] == "sentinel-vip-evening"
+        assert payload["missed_at"] == "2026-04-29T23:00:00+00:00"
+        assert payload["missed_seconds"] == 14400
+        assert payload["schedule_kind"] == "cron"
+        assert payload["reason"] == "default_period_cap"
+
 
 def test_cron_emitter_has_no_regex_domain_parser():
     import events.producers.cron_emitter as ce

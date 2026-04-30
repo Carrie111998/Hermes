@@ -59,6 +59,37 @@ class CronEventEmitter:
             },
         )
 
+    def on_job_skipped(
+        self,
+        job_id: str,
+        job_name: str,
+        missed_at: str,
+        missed_seconds: int,
+        schedule_kind: str,
+        reason: str,
+    ) -> str:
+        """Emit cron_skipped when a recurring job's missed fire was fast-forwarded.
+
+        Reasons:
+          - "default_period_cap"   — weekly or unknown-period cron; never fires stale
+          - "miss_exceeded_24h_cap" — daily cron missed for >24h
+          - "skip_only"            — explicit recovery_policy="skip_only" opt-out
+
+        Routed to the watchdog_alerts Telegram topic.
+        """
+        return self.bus.emit(
+            event_type=EventType.CRON_SKIPPED,
+            source=job_name,
+            payload={
+                "job_id": job_id,
+                "job_name": job_name,
+                "missed_at": missed_at,
+                "missed_seconds": missed_seconds,
+                "schedule_kind": schedule_kind,
+                "reason": reason,
+            },
+        )
+
     def on_job_completed(
         self,
         job_id: str,
