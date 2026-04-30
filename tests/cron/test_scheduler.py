@@ -2382,12 +2382,15 @@ class TestEmitAgentIterationEvent:
         # Should not raise
         _emit_agent_iteration_event(None, self._scout_job(), "")
 
-    def test_missing_marker_is_silent_no_error(self):
-        """Opt-in semantics: legacy jobs without the marker do NOT emit
-        AGENT_ERROR (unlike TAILOR_ITERATION which is contracted)."""
+    def test_unknown_job_missing_marker_is_silent(self):
+        """Non-canonical / ad-hoc jobs that omit the marker emit nothing —
+        we only synthesize for known canonical agents (see fallback below).
+        This preserves the original opt-in semantics for legacy/ad-hoc crons
+        that never opted into AGENT_ITERATION."""
         from cron.scheduler import _emit_agent_iteration_event
         emitter = self._emitter_with_bus()
-        _emit_agent_iteration_event(emitter, self._scout_job(), "Done.")
+        adhoc_job = {"id": "adhoc-1", "name": "ad-hoc-cron-foo"}
+        _emit_agent_iteration_event(emitter, adhoc_job, "Done.")
         assert emitter.bus.emit.call_count == 0
 
     def test_happy_path_emits_agent_iteration(self):
@@ -2539,3 +2542,67 @@ class TestEmitAgentIterationEvent:
         payload = kwargs["payload"]
         assert payload["agent"] == "devflow"
         assert payload["agent_llm_supplied"] == "devflow"
+
+    # ------------------------------------------------------------------
+    # Deterministic marker-missing fallback (2026-04-30) — when a known
+    # canonical agent's job omits the AGENT_ITERATION_JSON marker, we
+    # synthesize a placeholder event so 100% of canonical-agent runs
+    # produce an AGENT_ITERATION trail.  Non-canonical jobs still
+    # silently no-op so we don't spam ad-hoc crons.  See
+    # docs/superpowers/specs/2026-04-30-agent-iteration-marker-fallback.md
+    # ------------------------------------------------------------------
+
+    def test_devflow_bridge_missing_marker_synthesizes_event(self):
+        """devflow-bridge intermittently (~46% of runs) omits the
+        AGENT_ITERATION_JSON marker entirely.  The fallback synthesizes
+        a stand-in event so devflow_firehose still gets a heartbeat."""
+        from cron.scheduler import _emit_agent_iteration_event
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        bridge_job = {"id": "bridge-77", "name": "devflow-bridge"}
+        _emit_agent_iteration_event(emitter, bridge_job, "Done with no marker.")
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ITERATION
+        assert kwargs["source"] == "devflow"
+        assert kwargs["correlation_id"] == "bridge-77"
+        payload = kwargs["payload"]
+        assert payload["agent"] == "devflow"
+        assert payload["synthesized"] is True
+        assert "synthesized" in payload["summary"]
+        assert "AGENT_ITERATION_JSON" in payload["summary"]
+        assert payload["summary"].startswith("devflow")
+        assert payload["job_name"] == "devflow-bridge"
+        assert payload["job_id"] == "bridge-77"
+        # No LLM was consulted, so no agent_llm_supplied field.
+        assert "agent_llm_supplied" not in payload
+
+    def test_jobflow_applier_missing_marker_synthesizes_event(self):
+        """jobflow-applier maps to canonical 'applier' — fallback fires
+        for any canonical agent, not just devflow."""
+        from cron.scheduler import _emit_agent_iteration_event
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        applier_job = {"id": "applier-9", "name": "jobflow-applier"}
+        _emit_agent_iteration_event(emitter, applier_job, "")
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ITERATION
+        assert kwargs["source"] == "applier"
+        payload = kwargs["payload"]
+        assert payload["agent"] == "applier"
+        assert payload["synthesized"] is True
+        assert payload["summary"].startswith("applier")
+        assert payload["job_name"] == "jobflow-applier"
+        assert payload["job_id"] == "applier-9"
+
+    def test_jobflow_tailor_missing_marker_stays_silent(self):
+        """jobflow-tailor short-circuits before extraction (its dedicated
+        TAILOR_ITERATION emit hook handles its lifecycle).  The fallback
+        must NOT synthesize a generic AGENT_ITERATION for tailor — that
+        would double-emit alongside the tailor-specific event."""
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = self._emitter_with_bus()
+        tailor_job = {"id": "tailor-1", "name": "jobflow-tailor"}
+        _emit_agent_iteration_event(emitter, tailor_job, "Done with no marker.")
+        assert emitter.bus.emit.call_count == 0

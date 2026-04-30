@@ -350,6 +350,17 @@ def _emit_tailor_iteration_event(emitter, job: dict, final_response: str) -> Non
 # ``agent_llm_supplied`` for audit/debugging.  Jobs without a canonical
 # mapping fall back to the LLM-supplied name.  See
 # docs/superpowers/specs/2026-04-30-agent-iteration-canonical-name.md.
+#
+# Marker-missing fallback (2026-04-30): when a known canonical agent's
+# job omits the ``<AGENT_ITERATION_JSON>`` marker entirely, a placeholder
+# event is synthesized so 100% of canonical-agent runs leave an audit
+# trail (devflow-bridge was observed dropping the marker on ~46% of
+# runs).  Synthesized payloads carry ``synthesized: True`` so downstream
+# consumers (Critic, dashboards) can filter or weight them differently
+# from real LLM-emitted iterations.  Jobs without a canonical mapping
+# remain silent — we do not synthesize for ad-hoc / one-off crons that
+# never opted into the schema.  See
+# docs/superpowers/specs/2026-04-30-agent-iteration-marker-fallback.md.
 # ============================================================================
 AGENT_ITERATION_MARKER_RE = re.compile(
     r"<AGENT_ITERATION_JSON>(.*?)</AGENT_ITERATION_JSON>",
@@ -459,8 +470,42 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
 
         parsed, error_reason, raw_block = _extract_agent_iteration(final_response)
 
+        # Lazy import — kept inside the function to avoid bootstrapping
+        # events.producers at scheduler import time (matches the
+        # EventType import pattern above).
+        from events.producers.agent_source_mapping import (
+            canonical_agent_source,
+            is_canonical_agent,
+        )
+
         if error_reason == AGENT_ITERATION_REASON_MISSING:
-            # Opt-in: no marker means legacy job; silent no-op.
+            # Marker absent.  Synthesize a placeholder AGENT_ITERATION for
+            # known canonical agents so 100% of canonical-agent runs leave
+            # an audit trail, even when the LLM forgets the marker (post-
+            # 2026-04-30 telemetry showed devflow-bridge omitting it on
+            # ~46% of runs).  Non-canonical / ad-hoc crons stay silent —
+            # they never opted into the schema and we don't want to spam
+            # AGENT_ITERATION events for arbitrary one-off jobs.
+            canonical_name = canonical_agent_source(job_name)
+            if not is_canonical_agent(canonical_name):
+                return
+            synth_payload = {
+                "agent": canonical_name,
+                "summary": (
+                    f"{canonical_name} completed (synthesized — "
+                    f"agent did not emit AGENT_ITERATION_JSON)"
+                ),
+                "synthesized": True,
+                "job_id": job_id,
+                "job_name": job_name,
+            }
+            bus.emit(
+                event_type=EventType.AGENT_ITERATION,
+                source=canonical_name,
+                payload=synth_payload,
+                correlation_id=job_id or None,
+                job_id=job_id or None,
+            )
             return
 
         if error_reason is None and parsed is not None:
@@ -475,10 +520,6 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
             # watchdog|hermes_to_devflow_watchdog).  When the job name has
             # a known canonical agent, force it; preserve the LLM choice
             # as agent_llm_supplied for audit.
-            from events.producers.agent_source_mapping import (
-                canonical_agent_source,
-                is_canonical_agent,
-            )
             canonical_name = canonical_agent_source(job_name)
             if is_canonical_agent(canonical_name):
                 payload["agent_llm_supplied"] = parsed.get("agent")
