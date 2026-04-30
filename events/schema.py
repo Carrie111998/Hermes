@@ -131,6 +131,18 @@ class EventType(Enum):
     WATCHDOG_SILENCE_ALERT = ("watchdog_silence_alert", Priority.HIGH)
     WATCHDOG_RECOVERED = ("watchdog_recovered", Priority.NORMAL)
     WATCHDOG_SELF_DEGRADED = ("watchdog_self_degraded", Priority.HIGH)
+    # Once-per-day aggregate health heartbeat — added 2026-04-30. Diego's
+    # B9 visibility-restoration ask: per-failure events already cover "fire
+    # when something breaks"; the missing half is a 7am ET heartbeat with
+    # aggregate probe health (probes_total / healthy / degraded / down /
+    # escalations_24h / stale_probes) so a quiet feed reads as "Watchdog
+    # alive, all green" instead of "Watchdog might be dead." NORMAL priority
+    # (not HIGH) keeps the heartbeat out of WhatsApp escalation tiers; the
+    # ``digest_only`` verbosity mode in TelegramNotifier passes it through
+    # alongside HIGH+ failure-fires for operators who want both without LOW
+    # chatter. Emit logic lives in ~/.hermes/profiles/watchdog/workspace/
+    # watchdog_sweep.py (snapshot-anchored to last_daily_summary_emitted).
+    WATCHDOG_DAILY = ("watchdog_daily", Priority.NORMAL)
     AGENT_FAILURE_CLUSTER = ("agent_failure_cluster", Priority.HIGH)
 
     # Curator nightly consolidation -- added 2026-04-26.
@@ -148,6 +160,21 @@ class EventType(Enum):
     DEVFLOW_RUN_COMPLETED = ("devflow.run_completed", Priority.NORMAL)
     DEVFLOW_APPROVAL_REQUESTED = ("devflow.approval_requested", Priority.HIGH)
     DEVFLOW_TRACE_SNAPSHOT = ("devflow.trace_snapshot", Priority.LOW)
+
+    # DevFlow PR + build telemetry -- added 2026-04-30 (visibility-restoration
+    # B11 item 2-3). Surfaces SDLC activity in the devflow_firehose and
+    # devflow_decisions Telegram topics so Mission Control reflects the
+    # software-delivery side of Hermes, not just bridge ticks. Producers
+    # are deferred -- see events/producers/devflow_pr_build.py for emitter
+    # helpers any future poller / webhook receiver / manual trigger can
+    # call. Spec at docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
+    DEVFLOW_PR_OPENED = ("devflow.pr_opened", Priority.NORMAL)
+    DEVFLOW_PR_MERGED = ("devflow.pr_merged", Priority.HIGH)
+    DEVFLOW_PR_CLOSED = ("devflow.pr_closed", Priority.NORMAL)
+    DEVFLOW_PR_REVIEW_REQUESTED = ("devflow.pr_review_requested", Priority.HIGH)
+    DEVFLOW_BUILD_STARTED = ("devflow.build_started", Priority.LOW)
+    DEVFLOW_BUILD_SUCCEEDED = ("devflow.build_succeeded", Priority.NORMAL)
+    DEVFLOW_BUILD_FAILED = ("devflow.build_failed", Priority.HIGH)
 
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string

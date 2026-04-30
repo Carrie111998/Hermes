@@ -82,6 +82,21 @@ EVENT_TYPE_EMOJI = {
     # Generic agent iteration (2026-04-30) — per-agent run summary
     # extending TAILOR_ITERATION pattern across all cron-driven agents.
     EventType.AGENT_ITERATION:          "🔁",
+    # Watchdog daily heartbeat (2026-04-30) — once-per-day aggregate health
+    # summary. Stethoscope picks up on the existing health-theme set (💓
+    # tick, 🤕 self-degraded, 💚 recovered) while staying visually distinct
+    # from the per-failure signals so an operator scanning watchdog_alerts
+    # can spot the once-a-day summary at a glance.
+    EventType.WATCHDOG_DAILY:           "🩺",
+    # DevFlow PR + build telemetry (2026-04-30) — visibility-restoration
+    # B11 item 2-3. Spec docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
+    EventType.DEVFLOW_PR_OPENED:        "🔃",
+    EventType.DEVFLOW_PR_MERGED:        "🟣",
+    EventType.DEVFLOW_PR_CLOSED:        "🚫",
+    EventType.DEVFLOW_PR_REVIEW_REQUESTED:"👀",
+    EventType.DEVFLOW_BUILD_STARTED:    "🔨",
+    EventType.DEVFLOW_BUILD_SUCCEEDED:  "🟢",
+    EventType.DEVFLOW_BUILD_FAILED:     "🧨",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

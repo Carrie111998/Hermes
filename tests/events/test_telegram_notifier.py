@@ -183,6 +183,46 @@ class TestAgentIterationRouting:
         missing = required - covered
         assert not missing, f"TOPIC_ROUTING missing: {missing}"
 
+    def test_devflow_pr_events_route_to_devflow_firehose(self):
+        """DevFlow PR activity (opened, closed, merged) belongs in the
+        devflow_firehose topic alongside the existing devflow.run_*
+        events. Added 2026-04-30 — spec
+        docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
+        Without this routing, PR events would fall through to ``system``
+        and disappear from the user's SDLC monitoring stream.
+        """
+        assert TOPIC_ROUTING["devflow.pr_opened"] == "devflow_firehose"
+        assert TOPIC_ROUTING["devflow.pr_merged"] == "devflow_firehose"
+        assert TOPIC_ROUTING["devflow.pr_closed"] == "devflow_firehose"
+
+    def test_devflow_pr_review_requested_routes_to_devflow_decisions(self):
+        """PR ready-for-review is a human-action signal (someone needs
+        to review the PR) — pair it with devflow_decisions, NOT firehose.
+        Mirrors how jobflow_decisions carries human-action signals
+        (interview_signal, offer_signal) while jobflow_firehose carries
+        ambient activity. The Critic and Watchdog can also subscribe to
+        devflow_decisions for proposal triage.
+        """
+        assert TOPIC_ROUTING["devflow.pr_review_requested"] == "devflow_decisions"
+
+    def test_devflow_build_events_route_to_devflow_firehose(self):
+        """Build started/succeeded land in firehose (ambient SDLC stream).
+        Build LOW-priority started events get batched per the existing
+        low-priority batching path; succeeded events at NORMAL deliver
+        immediately.
+        """
+        assert TOPIC_ROUTING["devflow.build_started"] == "devflow_firehose"
+        assert TOPIC_ROUTING["devflow.build_succeeded"] == "devflow_firehose"
+
+    def test_devflow_build_failed_routes_to_devflow_decisions(self):
+        """Build failures are decisions (someone needs to investigate).
+        Routes to devflow_decisions like pr_review_requested. CROSS_POST_
+        TO_ALERTS is intentionally NOT enabled for build_failed — DevFlow
+        has its own decision topic and we don't want every red CI to
+        leak into watchdog_alerts (already noisy with cron failures).
+        """
+        assert TOPIC_ROUTING["devflow.build_failed"] == "devflow_decisions"
+
     def test_agent_failure_cluster_routes_to_watchdog_alerts(self):
         """agent_failure_cluster fires from the watchdog detector and is
         an operational alert (cluster of failures across agents). It routes
@@ -867,6 +907,228 @@ class TestAgentFailureClusterDedup:
         # Telegram side: only the first one delivers.
         watchdog_deliveries = [s for s in sent if s[0] == "100"]
         assert len(watchdog_deliveries) == 1
+
+
+class TestWatchdogDailySummary:
+    """WATCHDOG_DAILY — once-per-day aggregate health heartbeat (2026-04-30).
+
+    Diego's request (visibility-restoration session B9): "Watchdog: daily
+    digest and also firing when something breaks." The per-failure events
+    (watchdog_silence_alert, watchdog_burst, watchdog_self_degraded,
+    watchdog_recovered, watchdog_probe_transition) already carry the "fire
+    when something breaks" half. WATCHDOG_DAILY is the missing 7am ET
+    heartbeat that surfaces aggregate health (probes_total, healthy,
+    degraded, down, escalations_24h, stale_probes) so a quiet feed means
+    "Watchdog is alive and reports green," not "Watchdog might be dead."
+
+    Routing + verbosity contract:
+      - Routes to watchdog_alerts (alongside the other watchdog signals).
+      - Default priority NORMAL — failure-fires (HIGH+) keep their own
+        gate; the daily heartbeat must NOT be NORMAL-batched as low-prio
+        chatter and must NOT impersonate a HIGH alert.
+      - Verbosity ``significant_only`` (the existing watchdog_alerts mode)
+        drops it — by design; that mode is for incidents only.
+      - Verbosity ``digest_only`` passes it — that mode is the existing
+        symmetric option for users who want HIGH+ failure-fires AND the
+        daily heartbeat without LOW/NORMAL chatter. Pre-2026-04-30 the
+        ``digest_only`` branch was a code-level duplicate of
+        ``significant_only``; this test suite pins the digest-class
+        pass-through that gives ``digest_only`` distinct semantics.
+    """
+
+    def _daily_event(self, payload=None):
+        return Event.create(
+            EventType.WATCHDOG_DAILY, "watchdog",
+            payload or {
+                "probes_total": 67, "healthy": 66, "degraded": 0, "down": 1,
+                "escalations_24h": 5, "stale_probes": ["postgres-sync"],
+            },
+        )
+
+    def test_event_type_exists_with_normal_priority(self):
+        """WATCHDOG_DAILY must be a first-class EventType at NORMAL priority.
+
+        NORMAL (not HIGH) so the heartbeat doesn't impersonate an incident
+        and trigger downstream WhatsApp escalation tiers. NOT LOW so it
+        doesn't get swept into the 5-minute batched-chatter buffer where a
+        once-a-day heartbeat would be paired with unrelated low-prio
+        events.
+        """
+        et = EventType.WATCHDOG_DAILY
+        assert et.type_string == "watchdog_daily"
+        assert et.default_priority == Priority.NORMAL
+
+    def test_routes_to_watchdog_alerts(self):
+        """TOPIC_ROUTING must place WATCHDOG_DAILY in watchdog_alerts.
+
+        Pin the routing alongside the other watchdog signals so a future
+        cutover that splits watchdog topics has to update one obvious place.
+        """
+        assert TOPIC_ROUTING["watchdog_daily"] == "watchdog_alerts"
+
+    def test_has_emoji(self):
+        """WATCHDOG_DAILY must have a distinct EVENT_TYPE_EMOJI entry.
+
+        A missing entry makes event_icon() return "" and the header
+        renders with a double-space gap (SR-408 regression pattern,
+        2026-04-19). Operators scanning watchdog_alerts need a visual
+        token that distinguishes the daily heartbeat from the per-failure
+        signals (💓 tick, 🔄 transition, 🌊 burst, 🔕 silence, 🤕 degraded,
+        💚 recovered).
+        """
+        from events.formatting import EVENT_TYPE_EMOJI
+        icon = EVENT_TYPE_EMOJI.get(EventType.WATCHDOG_DAILY, "")
+        assert icon, "WATCHDOG_DAILY missing from EVENT_TYPE_EMOJI"
+
+    def test_passes_under_all_verbosity(self, bus, topics_config, tmp_path):
+        """verbosity=all: NORMAL daily digest passes through unfiltered."""
+        verbosity_path = tmp_path / "telegram" / "verbosity.json"
+        verbosity_path.parent.mkdir(parents=True, exist_ok=True)
+        verbosity_path.write_text(json.dumps(
+            {"watchdog_alerts": {"mode": "all"}}
+        ))
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_path,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        notifier.handle(self._daily_event())
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 1, (
+            f"verbosity=all must pass NORMAL WATCHDOG_DAILY; got {sent!r}"
+        )
+
+    def test_dropped_under_significant_only_verbosity(
+        self, bus, topics_config, tmp_path,
+    ):
+        """verbosity=significant_only: NORMAL daily digest is dropped.
+
+        This is by design — significant_only is the "incidents only" mode.
+        The daily heartbeat is not an incident.
+        """
+        verbosity_path = tmp_path / "telegram" / "verbosity.json"
+        verbosity_path.parent.mkdir(parents=True, exist_ok=True)
+        verbosity_path.write_text(json.dumps(
+            {"watchdog_alerts": {"mode": "significant_only"}}
+        ))
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_path,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        notifier.handle(self._daily_event())
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 0, (
+            f"verbosity=significant_only must drop NORMAL WATCHDOG_DAILY; "
+            f"got {sent!r}"
+        )
+
+    def test_passes_under_digest_only_verbosity(
+        self, bus, topics_config, tmp_path,
+    ):
+        """verbosity=digest_only: WATCHDOG_DAILY passes regardless of priority.
+
+        Pre-2026-04-30 the ``digest_only`` branch was a code-level
+        duplicate of ``significant_only`` (both gated NORMAL/LOW out and
+        both let HIGH+ through). That made ``digest_only`` indistinguishable
+        from ``significant_only`` for a topic, so an operator who set their
+        watchdog_alerts to ``digest_only`` got the same incident stream and
+        no daily summary.
+
+        Post-2026-04-30 ``digest_only`` is the symmetric "HIGH+ AND
+        digest-class events" mode: failure-fires still pass (HIGH+) AND
+        the daily heartbeat passes (digest-class), but routine NORMAL/LOW
+        chatter still drops.
+        """
+        verbosity_path = tmp_path / "telegram" / "verbosity.json"
+        verbosity_path.parent.mkdir(parents=True, exist_ok=True)
+        verbosity_path.write_text(json.dumps(
+            {"watchdog_alerts": {"mode": "digest_only"}}
+        ))
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_path,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        notifier.handle(self._daily_event())
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 1, (
+            f"verbosity=digest_only must pass WATCHDOG_DAILY; got {sent!r}"
+        )
+
+    def test_digest_only_still_passes_high_priority_failure_fires(
+        self, bus, topics_config, tmp_path,
+    ):
+        """verbosity=digest_only: HIGH+ failure-fires must still pass.
+
+        The new digest_only semantics are additive — they let digest-class
+        events through in addition to HIGH+. They must not regress the
+        existing HIGH+ pass-through; otherwise an operator switching from
+        significant_only to digest_only would silently lose all incident
+        alerts.
+        """
+        verbosity_path = tmp_path / "telegram" / "verbosity.json"
+        verbosity_path.parent.mkdir(parents=True, exist_ok=True)
+        verbosity_path.write_text(json.dumps(
+            {"watchdog_alerts": {"mode": "digest_only"}}
+        ))
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_path,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        # WATCHDOG_BURST is HIGH-priority (failure-fire archetype)
+        burst = Event.create(
+            EventType.WATCHDOG_BURST, "watchdog",
+            {"count": 3, "trigger": "burst_threshold", "transitions": []},
+            priority=Priority.HIGH,
+        )
+        notifier.handle(burst)
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 1, (
+            f"verbosity=digest_only must keep HIGH+ failure-fires passing; "
+            f"got {sent!r}"
+        )
+
+    def test_digest_only_drops_unrelated_normal_priority_event(
+        self, bus, topics_config, tmp_path,
+    ):
+        """verbosity=digest_only: NORMAL events that aren't digest-class
+        still drop.
+
+        digest_only is permissive for digest-class events ONLY (curator_daily,
+        watchdog_daily, digest_generated). A generic NORMAL event must
+        still be filtered, otherwise digest_only collapses into ``all``
+        and the "no LOW/NORMAL chatter" promise is broken.
+
+        We use STAGE_TRANSITION (NORMAL priority by default) routed
+        elsewhere, but emit it through a topic configured digest_only and
+        verify it drops. To test this cleanly we need an event whose
+        primary topic is set to digest_only; we route through a synthetic
+        digest_only setting on jobflow_firehose.
+        """
+        verbosity_path = tmp_path / "telegram" / "verbosity.json"
+        verbosity_path.parent.mkdir(parents=True, exist_ok=True)
+        verbosity_path.write_text(json.dumps(
+            {"jobflow_firehose": {"mode": "digest_only"}}
+        ))
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_path,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        # STAGE_TRANSITION → jobflow_firehose, NORMAL, not digest-class
+        evt = Event.create(
+            EventType.STAGE_TRANSITION, "tracker",
+            {"prior_stage": "discovered", "new_stage": "applied"},
+            priority=Priority.NORMAL,
+        )
+        notifier.handle(evt)
+        firehose_deliveries = [s for s in sent if s[0] == "101"]
+        assert len(firehose_deliveries) == 0, (
+            f"verbosity=digest_only must drop non-digest NORMAL events; "
+            f"got {sent!r}"
+        )
 
 
 def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):

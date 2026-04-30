@@ -63,9 +63,23 @@ TOPIC_ROUTING: Dict[str, str] = {
     'devflow.run_started': 'devflow_firehose',
     'devflow.run_completed': 'devflow_firehose',
     'devflow.trace_snapshot': 'devflow_firehose',
+    # PR + build telemetry -- added 2026-04-30 so SDLC activity surfaces
+    # in the devflow_firehose stream alongside the run.* lifecycle events.
+    # Spec: docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
+    'devflow.pr_opened': 'devflow_firehose',
+    'devflow.pr_merged': 'devflow_firehose',
+    'devflow.pr_closed': 'devflow_firehose',
+    'devflow.build_started': 'devflow_firehose',
+    'devflow.build_succeeded': 'devflow_firehose',
     # -> devflow_decisions
     'approval_requested': 'devflow_decisions',
     'devflow.approval_requested': 'devflow_decisions',
+    # PR ready-for-review and build failures are decisions (someone needs
+    # to act). Routes to devflow_decisions, NOT cross-posted to
+    # watchdog_alerts (DevFlow has its own decision topic and we don't
+    # want every red CI leaking into the operator alert stream).
+    'devflow.pr_review_requested': 'devflow_decisions',
+    'devflow.build_failed': 'devflow_decisions',
     # -> watchdog_alerts
     'gateway_health': 'watchdog_alerts',
     'agent_error': 'watchdog_alerts',
@@ -83,6 +97,11 @@ TOPIC_ROUTING: Dict[str, str] = {
     'watchdog_recovered': 'watchdog_alerts',
     'watchdog_burst': 'watchdog_alerts',
     'watchdog_self_degraded': 'watchdog_alerts',
+    # Once-per-day aggregate health heartbeat (2026-04-30) — see
+    # EventType.WATCHDOG_DAILY docstring for the visibility-restoration
+    # backstory. Routes alongside the other watchdog signals so a topic
+    # cutover only has to update one block.
+    'watchdog_daily': 'watchdog_alerts',
     'agent_failure_cluster': 'watchdog_alerts',
     # -> critic_proposals
     'critic_proposal': 'critic_proposals',
@@ -156,6 +175,19 @@ CROSS_POST_TO_ALERTS = {
     'job_high_score',
     'offer_signal',
 }
+
+# Event types treated as "digest-class" — once-a-day aggregate summaries
+# that carry no incident urgency on their own but whose absence is meaningful
+# (a missing daily heartbeat = the producer might be dead). Used by the
+# ``digest_only`` verbosity branch to let these pass at NORMAL priority
+# alongside HIGH+ failure-fires, while still dropping routine NORMAL/LOW
+# chatter. See WATCHDOG_DAILY's schema docstring (2026-04-30) and the
+# verbosity gate inside handle().
+DIGEST_EVENT_TYPES = frozenset({
+    EventType.CURATOR_DAILY,
+    EventType.WATCHDOG_DAILY,
+    EventType.DIGEST_GENERATED,
+})
 
 CRON_SUMMARY_MAX_LINES = 24
 CRON_SUMMARY_MAX_CHARS = 1500
@@ -296,8 +328,21 @@ class TelegramNotifier(BaseSubscriber):
                 continue
             if verbosity == "significant_only" and event.priority.level < Priority.HIGH.level:
                 continue
-            if verbosity == "digest_only" and event.priority.level < Priority.HIGH.level:
-                continue
+            if verbosity == "digest_only":
+                # 2026-04-30: previously this branch was a code-level
+                # duplicate of ``significant_only`` (both gated on HIGH+).
+                # That made ``digest_only`` indistinguishable from
+                # ``significant_only`` for any topic, so an operator who
+                # set their watchdog_alerts to ``digest_only`` got the
+                # same incident-only stream and never saw the new
+                # WATCHDOG_DAILY heartbeat. Distinct semantics now: the
+                # mode passes HIGH+ failure-fires AND digest-class events
+                # (CURATOR_DAILY, WATCHDOG_DAILY, DIGEST_GENERATED) at any
+                # priority, but still drops routine NORMAL/LOW chatter.
+                is_high = event.priority.level >= Priority.HIGH.level
+                is_digest = event.event_type in DIGEST_EVENT_TYPES
+                if not (is_high or is_digest):
+                    continue
 
             # Low-priority events are batched for up to 5 minutes
             if event.priority == Priority.LOW:
