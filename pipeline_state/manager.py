@@ -398,7 +398,7 @@ class PipelineManager:
             bus = _get_event_bus()
             if bus is None:
                 return
-            from events.schema import EventType
+            from events.schema import EventType, Priority
             payload = {
                 "job_id": job_id,
                 "prior_stage": prior_stage,
@@ -411,10 +411,43 @@ class PipelineManager:
             for k, v in (metadata or {}).items():
                 if v is not None and k not in payload:
                     payload[k] = v
+
+            # Priority bump: dashboard-originated transitions (Diego
+            # explicitly clicked approve/reject/stage) and protected-
+            # stage transitions are HIGH so they pass significant_only
+            # verbosity filters in jobflow_firehose. Agent-driven
+            # transitions (matcher → tailor → applier) stay NORMAL so
+            # the firehose doesn't drown the human signal.
+            human_surfaces = {
+                "control_center",
+                "legacy_dashboard",
+                "dashboard",
+                "telegram",
+                "whatsapp",
+                "manual_submission",
+            }
+            protected_terminal_stages = {
+                "approved",
+                "rejected_by_user",
+                "submitted",
+                "applied",
+                "final_submission",
+                "interview",
+                "offer",
+                "responded",
+            }
+            priority = (
+                Priority.HIGH
+                if (source in human_surfaces or actor == "diego"
+                    or new_stage in protected_terminal_stages)
+                else None  # use EventType default (NORMAL)
+            )
+
             bus.emit(
                 event_type=EventType.STAGE_TRANSITION,
                 source=f"pipeline:{source}",
                 payload=payload,
+                priority=priority,
                 correlation_id=job_id,
                 job_id=job_id,
             )

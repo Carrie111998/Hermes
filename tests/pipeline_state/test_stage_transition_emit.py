@@ -139,6 +139,54 @@ class TestStageTransitionEmit:
         assert payload["score"] == 9.2
         assert payload["title"] == "VP Finance"  # unchanged
 
+    def test_dashboard_source_bumps_priority_to_high(self, pipeline_with_one_job):
+        """Stage transitions from human surfaces (control_center,
+        legacy_dashboard, etc.) must emit at HIGH priority so they pass
+        the jobflow_firehose verbosity=significant_only filter."""
+        from events.schema import Priority
+        mock_bus = MagicMock()
+        with patch("pipeline_state.manager._get_event_bus", return_value=mock_bus):
+            pipeline_with_one_job.update_stage(
+                job_id="linkedin-test-1",
+                new_stage="approved",
+                actor="diego",
+                source="control_center",
+            )
+        kwargs = mock_bus.emit.call_args.kwargs
+        assert kwargs["priority"] == Priority.HIGH
+
+    def test_agent_source_keeps_priority_default(self, pipeline_with_one_job):
+        """Agent-driven transitions (matcher → tailor) stay at default
+        (NORMAL) priority so they don't drown the human signal in the
+        firehose."""
+        mock_bus = MagicMock()
+        with patch("pipeline_state.manager._get_event_bus", return_value=mock_bus):
+            pipeline_with_one_job.update_stage(
+                job_id="linkedin-test-1",
+                new_stage="tailoring",
+                actor="tailor",
+                source="tailor",
+            )
+        kwargs = mock_bus.emit.call_args.kwargs
+        # priority=None tells emit() to use EventType default
+        assert kwargs["priority"] is None
+
+    def test_protected_terminal_stage_bumps_priority(self, pipeline_with_one_job):
+        """Even an agent-driven transition to a protected terminal stage
+        (submitted, applied, interview, offer) deserves HIGH priority —
+        these are signals Diego always wants to see."""
+        from events.schema import Priority
+        mock_bus = MagicMock()
+        with patch("pipeline_state.manager._get_event_bus", return_value=mock_bus):
+            pipeline_with_one_job.update_stage(
+                job_id="linkedin-test-1",
+                new_stage="submitted",
+                actor="applier",
+                source="applier",
+            )
+        kwargs = mock_bus.emit.call_args.kwargs
+        assert kwargs["priority"] == Priority.HIGH
+
     def test_unknown_job_upsert_still_emits(self, pipeline_with_one_job):
         """An unknown job_id (upsert path) should still emit — the dashboard
         can drive new jobs into the pipeline. Prior_stage will be None."""
