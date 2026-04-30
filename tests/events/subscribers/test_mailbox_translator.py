@@ -253,6 +253,69 @@ class TestMailboxErrorFeedsClusterDetector:
         agent_errors = isolated_bus.query(event_type=EventType.AGENT_ERROR)
         assert len(agent_errors) == 1
 
+    def _record(self, translator, source_agent, message):
+        """Drive _record_error_for_clustering directly so the test does
+        NOT depend on the bus subscribe/poll path.
+
+        Why bypass poll(): bus.subscribe defaults a missing cursor to the
+        current bus head (added 2026-04-28 to prevent first-registration
+        backlog floods), which means events emitted BEFORE a subscriber's
+        first poll are skipped.  The other tests in this class predate
+        that change and currently fail on main for the same reason; they
+        are out of scope for the watchdog-cluster-dedup work.  Hitting the
+        method under test directly keeps the canonical-mapping coverage
+        independent from that pre-existing fixture bug.
+        """
+        translator._record_error_for_clustering(
+            outer_payload={"from": source_agent, "to": "main"},
+            inner={"message": message, "source_agent": source_agent},
+            correlation_id=None,
+        )
+
+    def test_long_source_agent_name_collapses_to_canonical(self, isolated_bus):
+        """If an inner payload's source_agent uses a long-prefix shape
+        ('jobflow-applier', 'sentinel-vip-evening'), the cluster source
+        must collapse to the canonical agent identity so it dedupes
+        against the cron-emitter path.
+
+        Background: profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md
+        Option A.  Mailbox messages typically carry already-canonical short
+        names, but a defensive canonical mapping prevents cluster-source
+        drift if any caller ever emits a long form.
+        """
+        translator = MailboxTranslator(isolated_bus)
+        for _ in range(3):
+            self._record(translator, "jobflow-applier", "captcha")
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "applier"
+        assert clusters[0].payload["source"] == "applier"
+
+    def test_sentinel_vip_variants_share_window(self, isolated_bus):
+        """Three structured ERROR mailbox messages naming
+        sentinel-vip-evening, sentinel-vip-midday, sentinel-vip-morning
+        must all flow into the SAME cluster window (canonical 'sentinel'),
+        rather than three separate single-entry windows that never reach
+        threshold."""
+        translator = MailboxTranslator(isolated_bus)
+        self._record(translator, "sentinel-vip-evening", "timeout")
+        self._record(translator, "sentinel-vip-midday", "timed out")
+        self._record(translator, "sentinel-vip-morning", "timeout")
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "sentinel"
+
+    def test_canonical_short_name_unchanged(self, isolated_bus):
+        """An already-canonical short name ('applier') must pass through
+        unchanged after canonicalisation -- this is the existing happy
+        path the proposal must not break."""
+        translator = MailboxTranslator(isolated_bus)
+        for _ in range(3):
+            self._record(translator, "applier", "captcha")
+        clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) == 1
+        assert clusters[0].source == "applier"
+
 
 def test_unknown_message_type_produces_no_domain_event(bus):
     _mailbox_event(bus, "SOME_RANDOM_TYPE", {"foo": "bar"})

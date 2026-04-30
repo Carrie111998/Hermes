@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from events.bus import EventBus
 from events.cluster_detector import FailureClusterDetector
 from events.paths import failure_cluster_state_path
+from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
 from events.subscribers.base import BaseSubscriber
 
@@ -127,11 +128,19 @@ class MailboxTranslator(BaseSubscriber):
         bug never blocks AGENT_ERROR emission or the rest of the poll loop.
         """
         try:
-            source_agent = (
+            raw_source_agent = (
                 inner.get("source_agent")
                 or outer_payload.get("from")
                 or "unknown"
             )
+            # Canonicalise BEFORE recording so the per-source window state
+            # is shared with the parallel cron-emitter path
+            # (events/producers/cron_emitter.py).  Without this, an inner
+            # payload reporting 'jobflow-applier' would key into a
+            # separate window from the cron path's already-canonical
+            # 'applier', defeating dedup.  See
+            # profiles/critic/workspace/watchdog-dedup-proposal-2026-04-29.md.
+            source_agent = canonical_agent_source(raw_source_agent)
             error_text = inner.get("message") or ""
             cluster = self._cluster_detector.record(
                 source=source_agent,
