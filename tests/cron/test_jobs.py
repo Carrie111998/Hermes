@@ -22,6 +22,7 @@ from cron.jobs import (
     mark_job_run,
     advance_next_run,
     get_due_jobs,
+    get_due_and_skipped_jobs,
     save_job_output,
 )
 
@@ -471,9 +472,13 @@ class TestGetDueJobs:
         assert due[0]["id"] == job["id"]
 
     def test_stale_past_due_skipped(self, tmp_cron_dir):
-        """Recurring jobs past their dynamic grace window are fast-forwarded, not fired.
+        """Recurring jobs past grace fire-once-on-recovery (daily-or-shorter, miss<=24h).
 
-        For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
+        Per cron-restart-catchup-gap design (2026-04-30): an hourly cron missed
+        by 35 min (period=3600s <= 86400s, missed <= 86400s, no skip_only opt-out)
+        is fire-once-eligible. The job is returned in `due`; the scheduler's
+        advance_next_run() (called before each run) advances next_run_at so the
+        same miss is not re-fired on subsequent ticks.
         """
         job = create_job(prompt="Stale", schedule="every 1h")
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
@@ -482,12 +487,15 @@ class TestGetDueJobs:
         save_jobs(jobs)
 
         due = get_due_jobs()
-        assert len(due) == 0
-        # next_run_at should be fast-forwarded to the future
+        # Hourly past grace is now fire-once-eligible — appears in due.
+        assert len(due) == 1
+        assert due[0]["id"] == job["id"]
+        # next_run_at is left intact for the scheduler to advance pre-run.
         updated = get_job(job["id"])
         from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
-        assert next_dt > _hermes_now()
+        assert next_dt < _hermes_now(), \
+            "fire-once leaves next_run_at in the past; scheduler advances pre-run"
 
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
@@ -722,3 +730,125 @@ class TestComputePeriodSeconds:
 
     def test_invalid_cron_expr_returns_none(self):
         assert _compute_period_seconds({"kind": "cron", "expr": "not a cron"}) is None
+
+
+def _set_next_run(job_id: str, iso: str) -> None:
+    """Test helper — directly mutate next_run_at for a job."""
+    jobs = load_jobs()
+    for j in jobs:
+        if j["id"] == job_id:
+            j["next_run_at"] = iso
+    save_jobs(jobs)
+
+
+def _set_recovery_policy(job_id: str, policy: str) -> None:
+    """Test helper — set top-level recovery_policy field."""
+    jobs = load_jobs()
+    for j in jobs:
+        if j["id"] == job_id:
+            j["recovery_policy"] = policy
+    save_jobs(jobs)
+
+
+class TestRecoveryPolicy:
+    """Fire-once-on-recovery + skip-only-emit behavior for missed crons."""
+
+    def test_daily_cron_missed_within_24h_fires_once(self, tmp_cron_dir, monkeypatch):
+        """Daily cron missed by 4h, no recovery_policy → fire once."""
+        # Freeze time
+        now = datetime(2026, 4, 30, 3, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="daily check", schedule="0 23 * * *")
+        # Set next_run_at 4h ago (yesterday's 23:00 UTC fire)
+        _set_next_run(job["id"], "2026-04-29T23:00:00+00:00")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert any(j["id"] == job["id"] for j in due), "fire-once-eligible cron should be in due list"
+        assert not any(s["job_id"] == job["id"] for s in skipped), "fire-once-eligible should NOT be in skipped"
+
+    def test_daily_cron_missed_over_24h_skip_only(self, tmp_cron_dir, monkeypatch):
+        """Daily cron missed by 30h → exceeds 24h cap → skip + emit."""
+        now = datetime(2026, 4, 30, 5, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="daily check", schedule="0 23 * * *")
+        _set_next_run(job["id"], "2026-04-28T23:00:00+00:00")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert not any(j["id"] == job["id"] for j in due), "missed >24h should NOT fire"
+        skip_entries = [s for s in skipped if s["job_id"] == job["id"]]
+        assert len(skip_entries) == 1
+        entry = skip_entries[0]
+        assert entry["reason"] == "miss_exceeded_24h_cap"
+        assert entry["missed_seconds"] >= 24 * 3600
+        assert entry["schedule_kind"] == "cron"
+
+    def test_skip_only_recovery_policy_blocks_fire_once(self, tmp_cron_dir, monkeypatch):
+        """Daily cron missed by 1h with recovery_policy=skip_only → skip + emit."""
+        now = datetime(2026, 4, 30, 0, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="anchored daily", schedule="0 23 * * *")
+        _set_next_run(job["id"], "2026-04-29T23:00:00+00:00")
+        _set_recovery_policy(job["id"], "skip_only")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert not any(j["id"] == job["id"] for j in due), "skip_only must block fire-once"
+        skip_entries = [s for s in skipped if s["job_id"] == job["id"]]
+        assert len(skip_entries) == 1
+        assert skip_entries[0]["reason"] == "skip_only"
+
+    def test_weekly_cron_default_skip(self, tmp_cron_dir, monkeypatch):
+        """Weekly cron (period >86400s) missed by 1h → never fire-once → skip + emit."""
+        now = datetime(2026, 4, 27, 10, 0, 0, tzinfo=timezone.utc)  # Monday
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="weekly retro", schedule="0 9 * * 1")
+        _set_next_run(job["id"], "2026-04-27T09:00:00+00:00")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert not any(j["id"] == job["id"] for j in due), "weekly cron must not fire stale"
+        skip_entries = [s for s in skipped if s["job_id"] == job["id"]]
+        assert len(skip_entries) == 1
+        assert skip_entries[0]["reason"] == "default_period_cap"
+
+    def test_short_period_within_grace_unchanged(self, tmp_cron_dir, monkeypatch):
+        """10-min interval missed by 4 min stays in due (existing path), no skip emit."""
+        now = datetime(2026, 4, 30, 12, 4, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="frequent poll", schedule="every 10m")
+        _set_next_run(job["id"], "2026-04-30T12:00:00+00:00")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert any(j["id"] == job["id"] for j in due), "within-grace miss should fire normally"
+        assert not any(s["job_id"] == job["id"] for s in skipped)
+
+    def test_fire_once_advances_next_run_at_no_redundant_fire(self, tmp_cron_dir, monkeypatch):
+        """After a fire-once tick, advance_next_run keeps the job out of due on second tick."""
+        from cron.jobs import advance_next_run
+
+        now = datetime(2026, 4, 30, 3, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="daily", schedule="0 23 * * *")
+        _set_next_run(job["id"], "2026-04-29T23:00:00+00:00")
+
+        # First tick — job is fire-once eligible
+        due_1, _ = get_due_and_skipped_jobs()
+        assert any(j["id"] == job["id"] for j in due_1)
+
+        # Scheduler.tick() advances next_run_at before running — simulate that
+        for j in due_1:
+            advance_next_run(j["id"])
+
+        # Second tick at the same `now` — job must NOT reappear
+        due_2, _ = get_due_and_skipped_jobs()
+        assert not any(j["id"] == job["id"] for j in due_2), \
+            "advance_next_run must move past the missed time so we don't re-fire"

@@ -796,28 +796,77 @@ def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any
             # (gateway was down and missed the window). Fast-forward to
             # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
-            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
-                if new_next:
+            missed_seconds = int((now - next_run_dt).total_seconds())
+            if kind in ("cron", "interval"):
+                # Eligibility decision tree for missed recurring jobs.
+                # Compute reason/skip-decision FIRST so that opt-outs
+                # (skip_only) and non-fire-once-eligible periods (weekly,
+                # missed >24h) are honored regardless of the grace window.
+                # Short-period fire-once-eligible jobs that are still WITHIN
+                # grace fall through to the existing `due.append` path with
+                # no log line and no skipped emission.
+                period_seconds = _compute_period_seconds(schedule)
+                recovery_policy = job.get("recovery_policy")
+
+                if recovery_policy == "skip_only":
+                    reason = "skip_only"
+                    eligible_for_fire_once = False
+                elif period_seconds is None or period_seconds > 86400:
+                    # Weekly or unknown-period cron — always skip
+                    reason = "default_period_cap"
+                    eligible_for_fire_once = False
+                elif missed_seconds > 86400:
+                    # Daily cron missed for more than a full period
+                    reason = "miss_exceeded_24h_cap"
+                    eligible_for_fire_once = False
+                else:
+                    # Daily-or-shorter, missed within 24h, no opt-out → fire once
+                    reason = None
+                    eligible_for_fire_once = True
+
+                if not eligible_for_fire_once:
+                    # Skip + emit. Always advance next_run_at so we don't
+                    # repeat this decision on the next tick.
+                    new_next = compute_next_run(schedule, now.isoformat())
+                    if new_next:
+                        logger.info(
+                            "Job '%s' missed at %s (by %ds, reason=%s) — skipping; "
+                            "advanced next_run_at to %s",
+                            job.get("name", job["id"]),
+                            next_run,
+                            missed_seconds,
+                            reason,
+                            new_next,
+                        )
+                        for rj in raw_jobs:
+                            if rj["id"] == job["id"]:
+                                rj["next_run_at"] = new_next
+                                needs_save = True
+                                break
+                        skipped.append({
+                            "job_id": job["id"],
+                            "name": job.get("name", job["id"]),
+                            "missed_at": next_run,
+                            "missed_seconds": missed_seconds,
+                            "schedule_kind": kind,
+                            "reason": reason,
+                        })
+                    continue  # Don't fall through to due.append
+
+                # Fire-once eligible. If past grace, log explicitly so the
+                # gateway-restart catch-up is visible. If within grace, this
+                # is the existing fire-on-next-tick behavior — stay silent.
+                # In BOTH cases we leave next_run_at alone so the scheduler's
+                # advance_next_run() (called before each run) handles
+                # advancement and prevents double-firing.
+                if missed_seconds > grace:
                     logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
+                        "Job '%s' missed at %s (by %ds) — firing once on recovery; "
+                        "scheduler will advance next_run_at before run.",
                         job.get("name", job["id"]),
                         next_run,
-                        grace,
-                        new_next,
+                        missed_seconds,
                     )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    # Behavior unchanged in this task — Task 4 will append
-                    # to `skipped` here and decide fire-once eligibility.
-                    continue  # Skip this run
 
             due.append(job)
 
