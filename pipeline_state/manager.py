@@ -21,6 +21,36 @@ logger = logging.getLogger(__name__)
 
 PIPELINE_PATH = Path.home() / ".hermes" / "workspaces" / "tracker" / "pipeline.json"
 
+
+# Lazy-cached EventBus singleton — loaded once per process. Used by
+# update_stage() to emit STAGE_TRANSITION events without forcing every
+# caller to plumb a bus instance through. False sentinel marks "tried
+# and failed" so we don't retry on every call.
+_event_bus_cache: Any = None
+
+
+def _get_event_bus() -> Optional[Any]:
+    """Return a process-wide EventBus, or None if unavailable.
+
+    PipelineManager is invoked from CLI scripts, agent prompts, and the
+    gateway alike; the events package may not be importable in all those
+    contexts (e.g. detached CLI without HERMES_HOME). Lazy-import + cache
+    keeps the cost amortized and the failure mode silent.
+    """
+    global _event_bus_cache
+    if _event_bus_cache is False:
+        return None
+    if _event_bus_cache is not None:
+        return _event_bus_cache
+    try:
+        from events.bus import EventBus
+        _event_bus_cache = EventBus()
+        return _event_bus_cache
+    except Exception as exc:
+        logger.debug("PipelineManager: EventBus unavailable (%s); stage emit disabled", exc)
+        _event_bus_cache = False
+        return None
+
 # Canonical stages — matches the dashboard's PROTECTED_STAGES + settings.stages
 # in pipeline.json. Additional stages may appear in history but these are the
 # ones we validate on update_stage() calls.
@@ -319,7 +349,77 @@ class PipelineManager:
                 "pipeline_state: %s %s -> %s (actor=%s source=%s)",
                 job_id, prior_stage, new_stage, actor, source,
             )
+
+            # Emit STAGE_TRANSITION event for downstream subscribers
+            # (Telegram, WhatsApp, dashboard live-sync, Tracker Intent
+            # Applier). Wrapped in try/except so a bus failure never
+            # blocks the pipeline write — pipeline.json IS canonical.
+            # Dashboard ↔ comms wiring (Phase 4 of 2026-04-30 plan):
+            # this emit covers BOTH Control Center (port 9120) and
+            # JobFlow Dashboard (port 3001/3002) because they both
+            # ultimately call update_stage().
+            self._emit_stage_transition(
+                job_id=job_id,
+                prior_stage=prior_stage,
+                new_stage=new_stage,
+                actor=actor,
+                source=source,
+                notes=notes,
+                metadata={
+                    "title": found.get("title"),
+                    "company": found.get("company"),
+                    "score": found.get("score"),
+                    "url": found.get("url"),
+                },
+            )
+
             return dict(found)  # defensive copy
+
+    def _emit_stage_transition(
+        self,
+        *,
+        job_id: str,
+        prior_stage: Optional[str],
+        new_stage: str,
+        actor: str,
+        source: str,
+        notes: str,
+        metadata: dict,
+    ) -> None:
+        """Best-effort STAGE_TRANSITION event emission.
+
+        Lazy-imports EventBus to avoid a startup dependency on the events
+        package (PipelineManager is also called from contexts where the bus
+        is not initialized — e.g. CLI scripts). All failures degrade to a
+        debug log; the canonical pipeline.json write has already succeeded
+        when this runs, so observability loss is safe.
+        """
+        try:
+            bus = _get_event_bus()
+            if bus is None:
+                return
+            from events.schema import EventType
+            payload = {
+                "job_id": job_id,
+                "prior_stage": prior_stage,
+                "new_stage": new_stage,
+                "actor": actor,
+                "source_surface": source,
+            }
+            if notes:
+                payload["notes"] = notes
+            for k, v in (metadata or {}).items():
+                if v is not None and k not in payload:
+                    payload[k] = v
+            bus.emit(
+                event_type=EventType.STAGE_TRANSITION,
+                source=f"pipeline:{source}",
+                payload=payload,
+                correlation_id=job_id,
+                job_id=job_id,
+            )
+        except Exception as exc:
+            logger.debug("PipelineManager: stage_transition emit failed: %s", exc)
 
     def upsert_metadata(
         self,

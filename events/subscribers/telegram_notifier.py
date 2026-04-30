@@ -408,6 +408,26 @@ class TelegramNotifier(BaseSubscriber):
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
 
+        if et == EventType.STAGE_TRANSITION:
+            # Dashboard ↔ comms wiring (2026-04-30 Phase 4). Render
+            # transitions readable: "<title> at <company> → new_stage
+            # (by actor via source)". Backwards-compatible: payload may
+            # come from cron/legacy producers without metadata.
+            title = p.get("title") or p.get("job_title") or ""
+            company = p.get("company") or ""
+            prior = p.get("prior_stage") or "?"
+            new = p.get("new_stage") or p.get("stage") or "?"
+            actor = p.get("actor") or "?"
+            src = p.get("source_surface") or p.get("source") or ""
+            head_parts = []
+            if title:
+                head_parts.append(title)
+            if company:
+                head_parts.append(f"at {company}")
+            head = " ".join(head_parts) or p.get("job_id") or "?"
+            via = f" (by {actor}" + (f" via {src})" if src else ")")
+            return f"{head}\n{prior} → {new}{via}"
+
         if et == EventType.AGENT_ITERATION:
             # Per-agent run summary (2026-04-30). Lead with agent name +
             # the human-readable summary line. Counters are compactly
