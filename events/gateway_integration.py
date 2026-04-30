@@ -25,6 +25,7 @@ from events.producers.mailbox_watcher import MailboxWatcher
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
+from events.subscribers.cron_trigger_log import CronTriggerLog
 from events.subscribers.telegram_notifier import TelegramNotifier
 from events.subscribers.whatsapp_escalator import WhatsAppEscalator
 from events.subscribers.digest_composer import DigestComposer, DIGEST_SCHEDULE_HOURS
@@ -80,6 +81,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
 
     # Register subscribers
     _registry.register(AuditLogger(_bus))
+    _registry.register(CronTriggerLog(_bus))
     _registry.register(TelegramNotifier(_bus))
     _registry.register(WhatsAppEscalator(_bus))
     _registry.register(DigestComposer(_bus))
