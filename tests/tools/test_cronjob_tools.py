@@ -231,3 +231,52 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         assert updated["job"]["skills"] == []
         assert updated["job"]["skill"] is None
+
+
+class TestCronjobRunCallerTraceability:
+    """The `run` action must emit a CRON_TRIGGERED event whose payload
+    captures who triggered the off-schedule fire. See plan
+    docs/superpowers/plans/2026-04-30-cron-trigger-traceability.md."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+        self._tmp_path = tmp_path
+
+    def test_run_action_defaults_caller_to_llm(self, monkeypatch):
+        from cron.jobs import create_job
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=self._tmp_path / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = json.loads(cronjob(action="run", job_id=job["id"]))
+        assert result["success"] is True
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        assert events[0].payload["caller"] == "llm:cronjob_tool"
+
+    def test_run_action_accepts_explicit_caller(self, monkeypatch):
+        from cron.jobs import create_job
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=self._tmp_path / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        cronjob(
+            action="run",
+            job_id=job["id"],
+            caller="hermes_cli:cron_run",
+            reason="manual investigation",
+        )
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert events[0].payload["caller"] == "hermes_cli:cron_run"
+        assert events[0].payload["reason"] == "manual investigation"
