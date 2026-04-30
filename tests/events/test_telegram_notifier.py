@@ -666,6 +666,87 @@ class TestAgentFailureClusterDedup:
             f"applier deliveries: {applier_lines!r}"
         )
 
+    def test_canonical_source_dedups_cron_and_mailbox_paths(
+        self, bus, topics_config, verbosity_config, tmp_path, monkeypatch,
+    ):
+        """End-to-end Option A + C check: when the cron-emitter path
+        ('jobflow-applier' → canonical 'applier') and the
+        mailbox-translator path ('applier') BOTH manage to push a
+        cluster event into the bus before the shared detector state
+        converges, the receiver-side LRU collapses them so the user
+        sees ONE Telegram alert instead of two.
+
+        This is the failure mode the proposal exists to close. Without
+        canonicalisation (Option A), the cron path's source ON the bus
+        event is 'applier' (post-mapping) and the mailbox path's source
+        is also 'applier', so the LRU key collides cleanly. Without the
+        LRU (Option C), simultaneous emission across the two paths still
+        produces two cluster events and two Telegram alerts, defeating
+        the dedup.
+        """
+        from events.producers.cron_emitter import CronEventEmitter
+        from events.subscribers.mailbox_translator import MailboxTranslator
+
+        # Shared detector state path so the two producers genuinely share
+        # the same window (the production gateway wires both to
+        # events.paths.failure_cluster_state_path).
+        state_path = tmp_path / "events" / "failure_cluster_state.json"
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(
+            "events.producers.cron_emitter.failure_cluster_state_path",
+            lambda: state_path,
+        )
+        monkeypatch.setattr(
+            "events.subscribers.mailbox_translator.failure_cluster_state_path",
+            lambda: state_path,
+        )
+
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append((thread_id, msg)),
+        )
+        emitter = CronEventEmitter(bus)
+        translator = MailboxTranslator(bus)
+
+        # Push the count above threshold from BOTH paths so each
+        # invocation of record() returns ClusterInfo (the third entry
+        # crosses 3, the fourth still satisfies "last 3 same type").
+        for i in range(3):
+            emitter.on_job_completed(
+                job_id=f"j{i}", job_name="jobflow-applier",
+                success=False, duration=1.0, error="captcha",
+                consecutive_errors=i + 1,
+            )
+        translator._record_error_for_clustering(
+            outer_payload={"from": "applier", "to": "main"},
+            inner={"message": "captcha", "source_agent": "applier"},
+            correlation_id=None,
+        )
+
+        # All cluster events on the bus carry the canonical source
+        # 'applier' (Option A). The 4-record sequence above produces 2
+        # cluster events: one when the cron path crossed 3, one when
+        # the mailbox path added a 4th still-same-type entry.
+        clusters = bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
+        assert len(clusters) >= 2, (
+            f"expected >=2 bus cluster events across cron+mailbox paths; "
+            f"got {len(clusters)}: {[c.source for c in clusters]}"
+        )
+        assert all(c.source == "applier" for c in clusters), (
+            f"all cluster events must carry canonical source 'applier'; "
+            f"got {[c.source for c in clusters]}"
+        )
+
+        for evt in clusters:
+            notifier.handle(evt)
+
+        watchdog_deliveries = [s for s in sent if s[0] == "100"]
+        assert len(watchdog_deliveries) == 1, (
+            f"Option A+C must deliver exactly 1 cluster Telegram alert "
+            f"despite {len(clusters)} bus events; got {sent!r}"
+        )
+
     def test_bus_event_query_still_records_duplicate(
         self, bus, topics_config, verbosity_config,
     ):
