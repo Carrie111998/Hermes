@@ -162,12 +162,36 @@ async def partial_health(request: Request):
 
 
 @app.get("/partials/approvals", response_class=HTMLResponse)
-async def partial_approvals(request: Request):
-    pending = storage.list_pending_approvals()
+async def partial_approvals(request: Request, since_h: int = 24):
+    effective = since_h if since_h and since_h > 0 else None
+    pending = storage.list_pending_approvals(window_h=effective)
     for r in pending:
         r["age"] = _humanize_age(r.get("requested_at"))
     return templates.TemplateResponse(
         request, "_approvals_panel.html", {"approvals": pending}
+    )
+
+
+@app.get("/api/v1/pending-approvals")
+async def api_v1_pending_approvals(window_h: int = 24):
+    """JSON endpoint for cross-process consumers (JobFlow Dashboard,
+    laptop-monitor, future CLI dashboards).
+
+    Query params:
+        window_h: max age in hours of approval requests to include (default 24).
+                  Set to 0 / negative to disable the window filter (returns all
+                  unresolved entries).
+
+    Response: {"pending": [...], "count": N, "window_h": <echo>}
+    """
+    effective = window_h if window_h and window_h > 0 else None
+    pending = storage.list_pending_approvals(window_h=effective)
+    return JSONResponse(
+        {
+            "pending": pending,
+            "count": len(pending),
+            "window_h": effective,
+        }
     )
 
 

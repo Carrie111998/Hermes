@@ -5,7 +5,10 @@
   {% for a in approvals %}
   <li class="py-3 first:pt-0 last:pb-0">
     <div class="flex items-baseline justify-between gap-2 mb-1">
-      <div class="font-medium text-sm truncate">{{ a.job_title or '?' }}</div>
+      <div class="font-medium text-sm truncate flex items-center gap-1.5">
+        <span class="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-amber-100 text-amber-900 ring-1 ring-amber-300 shrink-0" title="Awaiting Diego — graphs/approval-log.jsonl">🔔 Pending Diego</span>
+        <span class="truncate">{{ a.job_title or '?' }}</span>
+      </div>
       <span class="text-xs text-zinc-400 whitespace-nowrap">{{ a.age }}</span>
     </div>
     <div class="text-xs text-zinc-600 mb-2">
