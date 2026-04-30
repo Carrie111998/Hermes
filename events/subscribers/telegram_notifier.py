@@ -84,6 +84,7 @@ TOPIC_ROUTING: Dict[str, str] = {
     'gateway_health': 'watchdog_alerts',
     'agent_error': 'watchdog_alerts',
     'cron_started': 'watchdog_alerts',
+    'cron_triggered': 'watchdog_alerts',
     'cron_completed': 'watchdog_alerts',
     'cron_failed': 'watchdog_alerts',
     'cron_failed_consecutive': 'watchdog_alerts',

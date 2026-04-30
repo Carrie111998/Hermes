@@ -22,6 +22,7 @@ PRIORITY_EMOJI = {
 # Event type -> icon
 EVENT_TYPE_EMOJI = {
     EventType.CRON_STARTED:             "▶️",
+    EventType.CRON_TRIGGERED:           "👆",
     EventType.CRON_COMPLETED:           "✔️",
     EventType.CRON_FAILED:              "💥",
     EventType.CRON_FAILED_CONSECUTIVE:  "🔥",
