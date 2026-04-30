@@ -122,3 +122,47 @@ def test_devflow_event_types_round_trip_via_from_string():
         EventType.DEVFLOW_TRACE_SNAPSHOT,
     ):
         assert EventType.from_string(et.type_string) is et
+
+
+# DevFlow PR + build event coverage — added 2026-04-30 so the
+# devflow_firehose Telegram topic surfaces SDLC activity (PRs, builds)
+# instead of just bridge ticks. Spec at
+# docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
+
+def test_devflow_pr_event_types_exist():
+    assert EventType.DEVFLOW_PR_OPENED.type_string == "devflow.pr_opened"
+    assert EventType.DEVFLOW_PR_MERGED.type_string == "devflow.pr_merged"
+    assert EventType.DEVFLOW_PR_CLOSED.type_string == "devflow.pr_closed"
+    assert EventType.DEVFLOW_PR_REVIEW_REQUESTED.type_string == "devflow.pr_review_requested"
+
+
+def test_devflow_build_event_types_exist():
+    assert EventType.DEVFLOW_BUILD_STARTED.type_string == "devflow.build_started"
+    assert EventType.DEVFLOW_BUILD_SUCCEEDED.type_string == "devflow.build_succeeded"
+    assert EventType.DEVFLOW_BUILD_FAILED.type_string == "devflow.build_failed"
+
+
+def test_devflow_pr_build_event_types_default_priorities():
+    # Routine activity: NORMAL is default; high-stakes signals (merged,
+    # review-requested, build failed) elevate to HIGH so significant_only
+    # verbosity surfaces them. Build started is LOW so it batches.
+    assert EventType.DEVFLOW_PR_OPENED.default_priority == Priority.NORMAL
+    assert EventType.DEVFLOW_PR_MERGED.default_priority == Priority.HIGH
+    assert EventType.DEVFLOW_PR_CLOSED.default_priority == Priority.NORMAL
+    assert EventType.DEVFLOW_PR_REVIEW_REQUESTED.default_priority == Priority.HIGH
+    assert EventType.DEVFLOW_BUILD_STARTED.default_priority == Priority.LOW
+    assert EventType.DEVFLOW_BUILD_SUCCEEDED.default_priority == Priority.NORMAL
+    assert EventType.DEVFLOW_BUILD_FAILED.default_priority == Priority.HIGH
+
+
+def test_devflow_pr_build_event_types_round_trip_via_from_string():
+    for et in (
+        EventType.DEVFLOW_PR_OPENED,
+        EventType.DEVFLOW_PR_MERGED,
+        EventType.DEVFLOW_PR_CLOSED,
+        EventType.DEVFLOW_PR_REVIEW_REQUESTED,
+        EventType.DEVFLOW_BUILD_STARTED,
+        EventType.DEVFLOW_BUILD_SUCCEEDED,
+        EventType.DEVFLOW_BUILD_FAILED,
+    ):
+        assert EventType.from_string(et.type_string) is et
