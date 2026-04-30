@@ -88,6 +88,12 @@ TOPIC_ROUTING: Dict[str, str] = {
     'cron_failed': 'watchdog_alerts',
     'cron_failed_consecutive': 'watchdog_alerts',
     'cron_stale': 'watchdog_alerts',
+    # cron_skipped_duplicate: same-job concurrency guard, low-priority
+    # informational telemetry (LOW priority => batched / digest_only-gated
+    # alongside cron_started). Routed to watchdog_alerts so a sudden burst
+    # of duplicate-skips on one job is visible to the operator without
+    # needing a dedicated topic. Added 2026-04-30 with EventType.
+    'cron_skipped_duplicate': 'watchdog_alerts',
     'application_blocked': 'watchdog_alerts',
     'application_failed': 'watchdog_alerts',
     # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)

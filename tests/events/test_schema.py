@@ -190,3 +190,23 @@ def test_notification_delivery_event_types_default_priorities():
 def test_notification_delivery_event_types_round_trip_via_from_string():
     for et in (EventType.NOTIFICATION_DELIVERED, EventType.NOTIFICATION_FAILED):
         assert EventType.from_string(et.type_string) is et
+
+
+# Cron same-job concurrency guard -- added 2026-04-30. Closes the
+# 2026-04-30 sentinel-vip-morning triple-fire (canonical case
+# event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). See
+# cron/scheduler.py `_in_flight` registry.
+
+def test_cron_skipped_duplicate_event_type_exists():
+    assert EventType.CRON_SKIPPED_DUPLICATE.type_string == "cron_skipped_duplicate"
+
+
+def test_cron_skipped_duplicate_default_priority_is_low():
+    assert EventType.CRON_SKIPPED_DUPLICATE.default_priority == Priority.LOW
+
+
+def test_cron_skipped_duplicate_round_trip_via_from_string():
+    assert (
+        EventType.from_string("cron_skipped_duplicate")
+        is EventType.CRON_SKIPPED_DUPLICATE
+    )

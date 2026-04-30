@@ -87,6 +87,48 @@ class TestCronLifecycle:
         assert len(consecutive) == 0
 
 
+class TestSkippedDuplicate:
+    """Cron same-job concurrency guard -- closes 2026-04-30 sentinel triple-fire
+    (canonical event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e)."""
+
+    def test_emit_skipped_duplicate_concurrent(self, emitter, bus):
+        emitter.on_job_skipped_duplicate(
+            job_id="092f4ed7657c",
+            job_name="sentinel-vip-morning",
+            prior_cron_started_event_id="4edcb4b1-aa07-4dbb-b799-8af167d4f92e",
+            prior_elapsed_seconds=12.4,
+            reason="concurrent_fire_blocked",
+        )
+
+        events = bus.query(event_type=EventType.CRON_SKIPPED_DUPLICATE)
+        assert len(events) == 1
+        evt = events[0]
+        assert evt.source == "sentinel-vip-morning"
+        assert evt.priority == Priority.LOW
+        assert evt.payload["job_id"] == "092f4ed7657c"
+        assert evt.payload["job_name"] == "sentinel-vip-morning"
+        assert (
+            evt.payload["prior_cron_started_event_id"]
+            == "4edcb4b1-aa07-4dbb-b799-8af167d4f92e"
+        )
+        assert evt.payload["prior_elapsed_seconds"] == 12.4
+        assert evt.payload["reason"] == "concurrent_fire_blocked"
+
+    def test_emit_skipped_duplicate_exceeded_timeout(self, emitter, bus):
+        emitter.on_job_skipped_duplicate(
+            job_id="092f4ed7657c",
+            job_name="sentinel-vip-morning",
+            prior_cron_started_event_id=None,
+            prior_elapsed_seconds=2100.0,
+            reason="prior_fire_exceeded_timeout",
+        )
+
+        events = bus.query(event_type=EventType.CRON_SKIPPED_DUPLICATE)
+        assert len(events) == 1
+        assert events[0].payload["reason"] == "prior_fire_exceeded_timeout"
+        assert events[0].payload["prior_cron_started_event_id"] is None
+
+
 def test_cron_emitter_has_no_regex_domain_parser():
     import events.producers.cron_emitter as ce
     src = open(ce.__file__, encoding="utf-8").read()

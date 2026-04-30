@@ -45,6 +45,19 @@ class EventType(Enum):
     CRON_FAILED = ("cron_failed", Priority.HIGH)
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL)
     CRON_STALE = ("cron_stale", Priority.HIGH)
+    # Cron same-job concurrency guard -- added 2026-04-30 to close the
+    # 2026-04-30 sentinel-vip-morning triple-fire (canonical case
+    # event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). Emitted by the
+    # _in_flight guard in cron/scheduler.py when a duplicate concurrent
+    # fire is detected (typically a user-initiated trigger_job racing a
+    # tick-scheduled fire). Subscribers should treat as low-priority
+    # informational telemetry.  Payload:
+    #   job_id, job_name, prior_cron_started_event_id,
+    #   prior_elapsed_seconds, reason
+    # where reason is one of:
+    #   concurrent_fire_blocked      (prior is healthy, still running)
+    #   prior_fire_exceeded_timeout  (prior is wedged-but-tracked)
+    CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW)
 
     # Job discovery & scoring
     JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)
