@@ -7358,6 +7358,13 @@ For more help on a command:
         "run", help="Run a job on the next scheduler tick"
     )
     cron_run.add_argument("job_id", help="Job ID to trigger")
+    cron_run.add_argument(
+        "--reason",
+        default=None,
+        help="Free-form reason captured in the cron_triggered audit event "
+             "(e.g. \"investigation 2026-04-30\"). Helps attribute "
+             "off-schedule fires in postmortems.",
+    )
     _add_accept_hooks_flag(cron_run)
 
     cron_remove = cron_subparsers.add_parser(
