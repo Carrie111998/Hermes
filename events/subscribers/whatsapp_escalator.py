@@ -393,13 +393,26 @@ class WhatsAppEscalator(BaseSubscriber):
         })
         self._queue_path.write_text(json.dumps(queue, indent=2), encoding="utf-8")
 
-    def flush_queue(self) -> int:
-        """Flush queued messages as overnight summary.  Returns count flushed.
+    # Maximum body characters per chunk. Sized to keep the full summary
+    # (header + body + footer) under WhatsApp's 4096-char per-message text
+    # limit, with margin for the "(N/M)" header and the "Details in Telegram"
+    # footer. The bridge's express.json() body limit (~100KB by default) is
+    # also satisfied by chunks of this size.
+    _FLUSH_CHUNK_BODY_LIMIT = 3500
 
-        Only clears the queue when delivery succeeds.  If the bridge is
-        unreachable or the target cannot be resolved (e.g. missing
-        WHATSAPP_HOME_CHANNEL), the queue is preserved so the next flush
-        attempt can retry — otherwise queued alerts would be silently lost.
+    def flush_queue(self) -> int:
+        """Flush queued messages as one or more chunked summaries.
+
+        Returns the count of messages successfully delivered.
+
+        Each delivered chunk fits under WhatsApp's 4096-char text limit and
+        the bridge's express.json() body limit. On partial failure (some
+        chunks succeed, a later one fails), the unsent remainder is
+        preserved for retry on the next flush — preventing both duplicate
+        sends of already-delivered chunks and silent loss of queued alerts.
+
+        If the bridge is unreachable or the target cannot be resolved (e.g.
+        missing WHATSAPP_HOME_CHANNEL), the entire queue is preserved.
         """
         if not self._queue_path.exists():
             return 0
@@ -411,16 +424,55 @@ class WhatsAppEscalator(BaseSubscriber):
             return 0
 
         messages = [item["message"].split("\n\nDetails in Telegram")[0] for item in queue]
-        summary = "Overnight Summary — {} events while you were away:\n\n".format(len(messages))
-        summary += "\n\n".join(f"- {m}" for m in messages)
-        summary += "\n\nDetails in Telegram"
+        total = len(messages)
 
-        delivered = self._deliver(summary)
-        if not delivered:
-            logger.warning(
-                "WhatsApp flush_queue: delivery failed, preserving %d queued messages",
-                len(queue),
-            )
-            return 0
+        # Group consecutive messages into chunks while combined body length
+        # stays under the limit. Each chunk records the slice [start, end)
+        # of `queue` it represents, so partial failure can preserve the
+        # exact unsent remainder.
+        chunks: List[tuple] = []  # (start_idx, end_idx, body_text)
+        cur_start = 0
+        cur_lines: List[str] = []
+        cur_chars = 0
+        for i, m in enumerate(messages):
+            line = f"- {m}"
+            # +2 accounts for the "\n\n" separator before this line.
+            if cur_chars + len(line) + 2 > self._FLUSH_CHUNK_BODY_LIMIT and cur_lines:
+                chunks.append((cur_start, i, "\n\n".join(cur_lines)))
+                cur_start = i
+                cur_lines = []
+                cur_chars = 0
+            cur_lines.append(line)
+            cur_chars += len(line) + 2
+        if cur_lines:
+            chunks.append((cur_start, total, "\n\n".join(cur_lines)))
+
+        n_chunks = len(chunks)
+
+        for idx, (start, _end, body) in enumerate(chunks):
+            if n_chunks == 1:
+                header = f"Overnight Summary — {total} events while you were away:"
+            else:
+                header = (
+                    f"Overnight Summary ({idx + 1}/{n_chunks}) — "
+                    f"{total} events while you were away:"
+                )
+            summary = f"{header}\n\n{body}\n\nDetails in Telegram"
+
+            if not self._deliver(summary):
+                # Stop on first failure; preserve everything from this chunk
+                # forward so the next flush can retry the unsent remainder.
+                unsent = queue[start:]
+                self._queue_path.write_text(
+                    json.dumps(unsent, indent=2), encoding="utf-8"
+                )
+                logger.warning(
+                    "WhatsApp flush_queue: delivered %d/%d chunks (%d/%d msgs); "
+                    "preserving %d remaining queued messages",
+                    idx, n_chunks, start, total, len(unsent),
+                )
+                return start
+
+        # All chunks delivered.
         self._queue_path.write_text("[]", encoding="utf-8")
-        return len(queue)
+        return total

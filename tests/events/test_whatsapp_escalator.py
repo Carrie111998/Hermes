@@ -314,3 +314,112 @@ class TestThrottleBuffer:
 
         assert len(sent) == 1
         assert "Acme" in sent[0]
+
+
+class TestFlushQueueChunking:
+    """flush_queue must chunk oversized queues to fit under the WhatsApp
+    bridge's express.json() ~100KB body limit and WhatsApp's 4096-char
+    per-message text limit. Regression: previously concatenated all queued
+    messages into a single payload, hitting HTTP 413 when the queue grew
+    over a few days of accumulation (e.g. 1814 watchdog probe events =
+    508KB on 2026-04-30)."""
+
+    def test_oversized_queue_chunks_under_whatsapp_message_limit(
+        self, bus, quiet_config, queue_path
+    ):
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        # 200 messages × ~250 chars each = 50KB total. The pre-fix code would
+        # concatenate this into one ~50KB payload that exceeds WhatsApp's
+        # 4096-char text limit.
+        queue = [
+            {"message": f"event_{i}: " + "x" * 240, "queued_at": "2026-04-30T01:00:00"}
+            for i in range(200)
+        ]
+        queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+        sent = []
+
+        def fake_send(msg):
+            # Simulate WhatsApp's hard 4096-char limit; refuse anything larger.
+            if len(msg) > 4096:
+                raise RuntimeError(f"WhatsApp message too long: {len(msg)} > 4096")
+            sent.append(msg)
+
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=fake_send,
+        )
+
+        count = escalator.flush_queue()
+
+        assert count == 200, f"Expected all 200 messages flushed, got {count}"
+        assert len(sent) > 1, "Oversized queue must produce multiple chunks"
+        for i, msg in enumerate(sent):
+            assert len(msg) <= 4096, f"Chunk {i} is {len(msg)} chars (>4096)"
+        # Queue file drained on full success.
+        assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+
+    def test_partial_chunk_failure_preserves_remainder(
+        self, bus, quiet_config, queue_path
+    ):
+        """If a mid-flight chunk fails, deliver the successful chunks and
+        preserve the unsent remainder for retry (rather than losing
+        already-delivered chunks or replaying duplicates)."""
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue = [
+            {"message": f"event_{i}: " + "x" * 240, "queued_at": "2026-04-30T01:00:00"}
+            for i in range(60)
+        ]
+        queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+        sent = []
+
+        def fake_send(msg):
+            if len(msg) > 4096:
+                raise RuntimeError(f"oversized: {len(msg)}")
+            # Fail on the 2nd chunk attempt — before appending, so `sent`
+            # only reflects truly delivered chunks.
+            if len(sent) == 1:
+                raise RuntimeError("simulated bridge error on 2nd chunk")
+            sent.append(msg)
+
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=fake_send,
+        )
+
+        count = escalator.flush_queue()
+
+        assert len(sent) == 1, "Only first chunk should have succeeded"
+        assert 0 < count < 60, f"Partial drain expected, got count={count}"
+
+        remaining = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(remaining) == 60 - count, (
+            f"Remainder mismatch: delivered={count}, remaining={len(remaining)}"
+        )
+        assert len(remaining) > 0, "Failed chunks must be preserved for retry"
+
+    def test_small_queue_still_drains_in_single_chunk(
+        self, bus, quiet_config, queue_path
+    ):
+        """Existing behavior: a small queue fits in one chunk and drains
+        with a single delivery. Chunking is purely additive for oversized
+        queues."""
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue = [
+            {"message": f"event_{i}", "queued_at": "2026-04-30T01:00:00"}
+            for i in range(5)
+        ]
+        queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+
+        count = escalator.flush_queue()
+
+        assert count == 5
+        assert len(sent) == 1
+        assert json.loads(queue_path.read_text(encoding="utf-8")) == []
