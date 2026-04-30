@@ -101,17 +101,27 @@ def read_health() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def list_pending_approvals() -> list[dict]:
+def list_pending_approvals(window_h: int | None = None) -> list[dict]:
     """Return APPROVAL_REQUEST entries in approval-log.jsonl that don't have a
     matching resolution recorded in our state DB.
 
     Each entry: {thread_id, job_id, job_title, job_company, score, primary_angle,
                  cover_preview, requested_at}.
     thread_id reconstructed from job_id ('job-<id>') matching the LangGraph runner's default.
+
+    If ``window_h`` is set, entries older than now - window_h hours are excluded.
+    The badge condition (Gap C3) uses window_h=24 so stale pending entries
+    don't trigger the visual flag indefinitely.
     """
     if not APPROVAL_LOG.exists():
         return []
     seen_resolutions = list_resolutions("approval")
+
+    cutoff = None
+    if window_h is not None and window_h > 0:
+        from datetime import datetime, timedelta, timezone
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=window_h)
+
     out: list[dict] = []
     for line in APPROVAL_LOG.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -127,6 +137,21 @@ def list_pending_approvals() -> list[dict]:
         thread_id = f"job-{jid}"
         if thread_id in seen_resolutions:
             continue
+
+        requested_at = e.get("at") or ""
+        if cutoff is not None:
+            from datetime import datetime, timezone
+            try:
+                s = requested_at.replace("Z", "+00:00") if requested_at.endswith("Z") else requested_at
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt < cutoff:
+                    continue
+            except Exception:
+                # Unparseable timestamp -> treat as in-window (fail-open)
+                pass
+
         out.append(
             {
                 "thread_id": thread_id,
@@ -136,7 +161,7 @@ def list_pending_approvals() -> list[dict]:
                 "score": e.get("score"),
                 "primary_angle": e.get("primary_angle", ""),
                 "cover_preview": e.get("cover_preview", ""),
-                "requested_at": e.get("at"),
+                "requested_at": requested_at,
             }
         )
     # Newest first
