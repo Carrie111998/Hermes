@@ -95,3 +95,13 @@ def failure_cluster_state_path() -> Path:
     Cross-profile (every agent's failures funnel here), so canonical root.
     """
     return events_dir() / "failure_cluster_state.json"
+
+
+def cron_trigger_log_path() -> Path:
+    """Per-job rolling log of off-schedule cron fires (cron_triggered events).
+
+    Maintained by the CronTriggerLog subscriber. JSONL format, weekly
+    rotation into events/audit/, 30-day retention. Operators grep this
+    by job_id during postmortems instead of scanning audit.jsonl in full.
+    """
+    return events_dir() / "cron_triggers.jsonl"

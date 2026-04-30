@@ -41,6 +41,13 @@ class EventType(Enum):
 
     # Cron lifecycle
     CRON_STARTED = ("cron_started", Priority.LOW)
+    # Off-schedule trigger record — emitted by trigger_job() in cron/jobs.py
+    # whenever a caller sets next_run_at = NOW (CLI `hermes cron run`, LLM
+    # cronjob tool action="run", HTTP API trigger endpoint). Carries caller
+    # + reason + previous/new next_run_at so off-schedule fires can be
+    # attributed in postmortems. LOW priority => audit-logger captures it
+    # but Telegram/WhatsApp routing leaves it out by default.
+    CRON_TRIGGERED = ("cron_triggered", Priority.LOW)
     CRON_COMPLETED = ("cron_completed", Priority.NORMAL)
     CRON_FAILED = ("cron_failed", Priority.HIGH)
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL)

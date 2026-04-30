@@ -41,6 +41,18 @@ class TestEventType:
         assert EventType.JOB_SCORED.default_priority == Priority.NORMAL
 
 
+class TestCronTriggeredEventType:
+    """The cron_triggered event records off-schedule fires (CLI / LLM / API
+    callers of trigger_job). Caller-traceability spec — plan
+    docs/superpowers/plans/2026-04-30-cron-trigger-traceability.md."""
+
+    def test_cron_triggered_event_type_exists(self):
+        assert EventType.from_string("cron_triggered") is EventType.CRON_TRIGGERED
+
+    def test_cron_triggered_default_priority_is_low(self):
+        assert EventType.CRON_TRIGGERED.default_priority is Priority.LOW
+
+
 class TestEvent:
     def test_create_minimal(self):
         event = Event.create(
