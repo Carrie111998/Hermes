@@ -42,7 +42,6 @@ TOPIC_ROUTING: Dict[str, str] = {
     'job_discovered': 'jobflow_firehose',
     'job_vip_discovered': 'jobflow_firehose',
     'job_scored': 'jobflow_firehose',
-    'job_high_score': 'jobflow_firehose',
     'tailor_completed': 'jobflow_firehose',
     'tailor_iteration': 'jobflow_firehose',
     'application_submitted': 'jobflow_firehose',
@@ -54,6 +53,9 @@ TOPIC_ROUTING: Dict[str, str] = {
     'application_ready': 'jobflow_decisions',
     'interview_signal': 'jobflow_decisions',
     'offer_signal': 'jobflow_decisions',
+    # Mirror scribe_realtime.py:34-38 so narrated and structured copies
+    # land on the same topic; CROSS_POST_TO_ALERTS still cross-posts at HIGH+.
+    'job_high_score': 'jobflow_decisions',
     # -> devflow_firehose
     'run_started': 'devflow_firehose',
     'run_completed': 'devflow_firehose',
