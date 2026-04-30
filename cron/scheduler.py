@@ -340,6 +340,16 @@ def _emit_tailor_iteration_event(emitter, job: dict, final_response: str) -> Non
 #
 # Failure modes are explicit AGENT_ERROR events so a regression in any
 # agent's prompt is observable on the bus rather than silently dropped.
+#
+# Agent-name override (2026-04-30): the LLM-supplied ``agent`` field is
+# overridden with ``canonical_agent_source(job_name)`` whenever the job
+# name maps to a known canonical identity.  This makes per-agent topic
+# routing (AGENT_TOPIC_MAP in telegram_notifier.py) deterministic
+# instead of dependent on the LLM picking the right name for its role
+# each run.  The original LLM choice is preserved as
+# ``agent_llm_supplied`` for audit/debugging.  Jobs without a canonical
+# mapping fall back to the LLM-supplied name.  See
+# docs/superpowers/specs/2026-04-30-agent-iteration-canonical-name.md.
 # ============================================================================
 AGENT_ITERATION_MARKER_RE = re.compile(
     r"<AGENT_ITERATION_JSON>(.*?)</AGENT_ITERATION_JSON>",
@@ -457,9 +467,26 @@ def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None
             payload = dict(parsed)
             payload["job_id"] = job_id
             payload["job_name"] = job_name
+
+            # Deterministic agent override: route by job_name, not LLM whim.
+            # The LLM is asked to "pick agent-name from your role" but its
+            # interpretation drifts run-to-run (devflow-bridge has been
+            # observed emitting agent=devflow|hermes_to_devflow|bridge|
+            # watchdog|hermes_to_devflow_watchdog).  When the job name has
+            # a known canonical agent, force it; preserve the LLM choice
+            # as agent_llm_supplied for audit.
+            from events.producers.agent_source_mapping import (
+                canonical_agent_source,
+                is_canonical_agent,
+            )
+            canonical_name = canonical_agent_source(job_name)
+            if is_canonical_agent(canonical_name):
+                payload["agent_llm_supplied"] = parsed.get("agent")
+                payload["agent"] = canonical_name
+
             bus.emit(
                 event_type=EventType.AGENT_ITERATION,
-                source=parsed.get("agent") or job_name or "unknown",
+                source=payload.get("agent") or job_name or "unknown",
                 payload=payload,
                 correlation_id=job_id or None,
                 job_id=job_id or None,

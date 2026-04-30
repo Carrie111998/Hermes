@@ -57,6 +57,17 @@ _CANONICAL_AGENTS = frozenset({
 _JOBFLOW_PREFIX = "jobflow-"
 
 
+def is_canonical_agent(name: Optional[str]) -> bool:
+    """Return True iff ``name`` is a known canonical agent identity.
+
+    Used by callers that need to distinguish a successful canonical
+    mapping from a passthrough (Rule 4) where the input shape is unknown
+    and was returned verbatim.  See cron/scheduler.py::_emit_agent_iteration_event
+    for the override-or-fall-back-to-LLM decision this enables.
+    """
+    return bool(name) and name in _CANONICAL_AGENTS
+
+
 def canonical_agent_source(raw: Optional[str]) -> str:
     """Return the canonical agent identity for a raw cron-job or mailbox
     source-agent value.

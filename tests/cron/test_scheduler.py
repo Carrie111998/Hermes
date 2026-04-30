@@ -2452,3 +2452,90 @@ class TestEmitAgentIterationEvent:
         emitter.bus.emit.side_effect = RuntimeError("simulated DB lock")
         # Must not raise
         _emit_agent_iteration_event(emitter, self._scout_job(), "anything")
+
+    # ------------------------------------------------------------------
+    # Canonical agent-name override (2026-04-30) — payload.agent is keyed
+    # off job_name via canonical_agent_source, not LLM choice.  See
+    # docs/superpowers/specs/2026-04-30-agent-iteration-canonical-name.md
+    # ------------------------------------------------------------------
+
+    def test_devflow_bridge_overrides_llm_supplied_agent(self):
+        """devflow-bridge job names emit ~5 different LLM-chosen agent
+        names (devflow, hermes_to_devflow, bridge, watchdog, …).  The
+        canonical mapping forces them all to 'devflow' so Telegram routing
+        is deterministic."""
+        from cron.scheduler import _emit_agent_iteration_event
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        bridge_job = {"id": "bridge-1", "name": "devflow-bridge"}
+        response = (
+            '<AGENT_ITERATION_JSON>'
+            '{"agent": "watchdog", "summary": "saw a successful run"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, bridge_job, response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ITERATION
+        payload = kwargs["payload"]
+        assert payload["agent"] == "devflow"
+        assert payload["agent_llm_supplied"] == "watchdog"
+        assert kwargs["source"] == "devflow"
+
+    def test_jobflow_devflow_overrides_llm_supplied_agent(self):
+        """jobflow-devflow's prompt says 'Act as the DevFlow agent for
+        JobFlow on Hermes' — the LLM may pick devflow|jobflow|jaum.  The
+        canonical mapping forces all three to 'devflow' so the Friday
+        standup lands in devflow_firehose every time."""
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = self._emitter_with_bus()
+        standup_job = {"id": "standup-1", "name": "jobflow-devflow"}
+        response = (
+            '<AGENT_ITERATION_JSON>'
+            '{"agent": "jobflow", "summary": "Weekday standup digest"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, standup_job, response)
+        kwargs = emitter.bus.emit.call_args.kwargs
+        payload = kwargs["payload"]
+        assert payload["agent"] == "devflow"
+        assert payload["agent_llm_supplied"] == "jobflow"
+        assert kwargs["source"] == "devflow"
+
+    def test_unknown_job_keeps_llm_supplied_agent(self):
+        """If job_name has no canonical mapping (ad-hoc cron, mistyped
+        name), don't break routing by overriding to a non-canonical
+        string.  Fall back to LLM-supplied so existing/legacy jobs keep
+        working."""
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = self._emitter_with_bus()
+        adhoc_job = {"id": "adhoc-1", "name": "ad-hoc-cron-foo"}
+        response = (
+            '<AGENT_ITERATION_JSON>'
+            '{"agent": "watchdog", "summary": "did a thing"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, adhoc_job, response)
+        kwargs = emitter.bus.emit.call_args.kwargs
+        payload = kwargs["payload"]
+        assert payload["agent"] == "watchdog"
+        assert "agent_llm_supplied" not in payload
+        assert kwargs["source"] == "watchdog"
+
+    def test_canonical_override_is_idempotent_when_llm_already_correct(self):
+        """When the LLM happens to pick the canonical name already, the
+        override is a no-op semantically.  agent_llm_supplied still
+        records what the LLM said (for audit consistency)."""
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = self._emitter_with_bus()
+        bridge_job = {"id": "bridge-2", "name": "devflow-bridge"}
+        response = (
+            '<AGENT_ITERATION_JSON>'
+            '{"agent": "devflow", "summary": "all good"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, bridge_job, response)
+        kwargs = emitter.bus.emit.call_args.kwargs
+        payload = kwargs["payload"]
+        assert payload["agent"] == "devflow"
+        assert payload["agent_llm_supplied"] == "devflow"
