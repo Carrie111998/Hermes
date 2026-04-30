@@ -103,6 +103,17 @@ TOPIC_ROUTING: Dict[str, str] = {
     # cutover only has to update one block.
     'watchdog_daily': 'watchdog_alerts',
     'agent_failure_cluster': 'watchdog_alerts',
+    # Notification delivery reverse-signal (2026-04-30). These entries
+    # exist so test_all_event_types_have_routing covers them, but the
+    # primary defense is the cycle guard in handle() — both delivery
+    # subscribers early-return for these types so they NEVER actually
+    # route to a chat. If the guard is ever removed by mistake, the
+    # routing here lands them in watchdog_alerts (sensible operator
+    # signal for delivery failures); LOW-priority NOTIFICATION_DELIVERED
+    # would be batched/filtered by verbosity. Spec at
+    # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+    'notification_delivered': 'watchdog_alerts',
+    'notification_failed': 'watchdog_alerts',
     # -> critic_proposals
     'critic_proposal': 'critic_proposals',
     'critic_auto_applied': 'critic_proposals',

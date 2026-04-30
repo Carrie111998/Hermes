@@ -176,6 +176,26 @@ class EventType(Enum):
     DEVFLOW_BUILD_SUCCEEDED = ("devflow.build_succeeded", Priority.NORMAL)
     DEVFLOW_BUILD_FAILED = ("devflow.build_failed", Priority.HIGH)
 
+    # Notification delivery reverse-signal — added 2026-04-30. The bus
+    # is one-way today: events emit -> telegram_notifier / whatsapp_escalator
+    # deliver via their adapters -> no signal flows back. These two types
+    # close the loop so audit-logger, a future delivery dashboard, and a
+    # future retry-router can see whether each notification reached the
+    # user. Producers: the two delivery subscribers' _deliver() methods,
+    # wrapped in try/except so a downstream emit failure never breaks the
+    # upstream delivery. Cycle prevention: subscribers MUST NOT consume
+    # their own delivery events — see _NEVER_CONSUME guards in each
+    # subscriber's handle(). Spec at
+    # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+    #   NOTIFICATION_DELIVERED — LOW so it batches in the audit layer
+    #   without flooding watchdog_alerts; carries original_event_id +
+    #   platform + target + latency_ms.
+    #   NOTIFICATION_FAILED — NORMAL so it surfaces in operator alerts
+    #   (digest_only verbosity passes it through alongside HIGH+ failures);
+    #   carries the same fields plus error.kind / error.message.
+    NOTIFICATION_DELIVERED = ("notification_delivered", Priority.LOW)
+    NOTIFICATION_FAILED = ("notification_failed", Priority.NORMAL)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

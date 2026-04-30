@@ -166,3 +166,27 @@ def test_devflow_pr_build_event_types_round_trip_via_from_string():
         EventType.DEVFLOW_BUILD_FAILED,
     ):
         assert EventType.from_string(et.type_string) is et
+
+
+# Notification reverse-signal coverage — added 2026-04-30. Spec at
+# docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+# Telegram + WhatsApp delivery emit these so audit + dashboards + a
+# future retry router can see whether a notification reached the user.
+
+def test_notification_delivery_event_types_exist():
+    assert EventType.NOTIFICATION_DELIVERED.type_string == "notification_delivered"
+    assert EventType.NOTIFICATION_FAILED.type_string == "notification_failed"
+
+
+def test_notification_delivery_event_types_default_priorities():
+    # Success is bus-only telemetry: LOW so the audit log absorbs it
+    # without batching pressure on watchdog_alerts. Failure is NORMAL
+    # so it surfaces in operator alerts (digest_only verbosity passes
+    # NORMAL+ when paired with HIGH gate) without paging-tier escalation.
+    assert EventType.NOTIFICATION_DELIVERED.default_priority == Priority.LOW
+    assert EventType.NOTIFICATION_FAILED.default_priority == Priority.NORMAL
+
+
+def test_notification_delivery_event_types_round_trip_via_from_string():
+    for et in (EventType.NOTIFICATION_DELIVERED, EventType.NOTIFICATION_FAILED):
+        assert EventType.from_string(et.type_string) is et
