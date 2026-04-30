@@ -2176,3 +2176,279 @@ class TestEmitTailorIterationEvent:
         kwargs = emitter.bus.emit.call_args.kwargs
         assert kwargs["correlation_id"] is None
         assert kwargs["job_id"] is None
+
+
+# ============================================================================
+# Generic AGENT_ITERATION event (2026-04-30) — extends TAILOR_ITERATION
+# pattern to every cron-driven agent.
+# ============================================================================
+
+
+class TestExtractAgentIteration:
+    """Unit tests for _extract_agent_iteration — pure, no side effects."""
+
+    def _valid_block(self, agent="scout", summary="Scanned 4 sources, 23 new") -> str:
+        return (
+            '<AGENT_ITERATION_JSON>'
+            f'{{"agent": "{agent}", "summary": "{summary}", '
+            '"counters": {"new": 23, "deduped": 11}}'
+            '</AGENT_ITERATION_JSON>'
+        )
+
+    def test_happy_path_returns_parsed_payload(self):
+        from cron.scheduler import _extract_agent_iteration
+        text = "Some preamble.\n\n" + self._valid_block() + "\n\nDone."
+        parsed, err, raw = _extract_agent_iteration(text)
+        assert err is None
+        assert parsed is not None
+        assert parsed["agent"] == "scout"
+        assert "23 new" in parsed["summary"]
+        assert parsed["counters"] == {"new": 23, "deduped": 11}
+        assert raw and "scout" in raw
+
+    def test_missing_marker_returns_missing(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_MISSING,
+        )
+        parsed, err, raw = _extract_agent_iteration("Did some work. [SILENT]")
+        assert parsed is None
+        assert err == AGENT_ITERATION_REASON_MISSING
+        assert raw is None
+
+    def test_empty_input_returns_missing(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_MISSING,
+        )
+        for text in ("", None):
+            parsed, err, _ = _extract_agent_iteration(text)
+            assert err == AGENT_ITERATION_REASON_MISSING
+
+    def test_malformed_json_returns_parse_failed(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_PARSE_FAILED,
+        )
+        text = "<AGENT_ITERATION_JSON>this is not json {[ </AGENT_ITERATION_JSON>"
+        parsed, err, raw = _extract_agent_iteration(text)
+        assert parsed is None
+        assert err == AGENT_ITERATION_REASON_PARSE_FAILED
+        assert raw and "not json" in raw
+
+    def test_missing_agent_field_returns_schema_mismatch(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = '<AGENT_ITERATION_JSON>{"summary": "ok"}</AGENT_ITERATION_JSON>'
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_missing_summary_returns_schema_mismatch(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = '<AGENT_ITERATION_JSON>{"agent": "scout"}</AGENT_ITERATION_JSON>'
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_empty_string_field_returns_schema_mismatch(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "  ", "summary": "ok"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_counters_must_be_dict(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "scout", "summary": "ok", '
+            '"counters": [1,2,3]}</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_counters_values_must_be_numeric_not_bool(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        # bool is subclass of int — must be rejected explicitly
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "scout", "summary": "ok", '
+            '"counters": {"flag": true}}</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_anomalies_must_be_list(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "scout", "summary": "ok", '
+            '"anomalies": "single string"}</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_reason_must_be_string_when_present(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "scout", "summary": "ok", '
+            '"reason": 123}</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_summary_truncated_at_max_chars(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_SUMMARY_MAX_CHARS,
+        )
+        long_summary = "x" * 500
+        text = (
+            f'<AGENT_ITERATION_JSON>{{"agent": "scout", "summary": "{long_summary}"}}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err is None
+        assert len(parsed["summary"]) == AGENT_ITERATION_SUMMARY_MAX_CHARS
+        assert parsed["summary"].endswith("…")
+
+    def test_agent_name_lowercased_and_stripped(self):
+        from cron.scheduler import _extract_agent_iteration
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "  Sentinel ", "summary": "ok"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err is None
+        assert parsed["agent"] == "sentinel"
+
+    def test_optional_fields_omitted(self):
+        """Minimum-viable payload (agent + summary) must succeed."""
+        from cron.scheduler import _extract_agent_iteration
+        text = (
+            '<AGENT_ITERATION_JSON>{"agent": "scout", "summary": "ok"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(text)
+        assert err is None
+        assert "counters" not in parsed
+        assert "anomalies" not in parsed
+
+
+class TestEmitAgentIterationEvent:
+    """Behavior tests for _emit_agent_iteration_event."""
+
+    def _emitter_with_bus(self):
+        emitter = MagicMock()
+        emitter.bus = MagicMock()
+        return emitter
+
+    def _scout_job(self):
+        return {"id": "scout-456", "name": "jobflow-scout"}
+
+    def test_jobflow_tailor_short_circuits_to_avoid_double_emit(self):
+        """jobflow-tailor has its own dedicated TAILOR_ITERATION event;
+        the generic helper must not also fire on it."""
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = self._emitter_with_bus()
+        tailor_job = {"id": "x", "name": "jobflow-tailor"}
+        valid = (
+            '<AGENT_ITERATION_JSON>{"agent": "tailor", "summary": "ok"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, tailor_job, valid)
+        assert emitter.bus.emit.call_count == 0
+
+    def test_no_emitter_short_circuits(self):
+        from cron.scheduler import _emit_agent_iteration_event
+        # Should not raise
+        _emit_agent_iteration_event(None, self._scout_job(), "")
+
+    def test_missing_marker_is_silent_no_error(self):
+        """Opt-in semantics: legacy jobs without the marker do NOT emit
+        AGENT_ERROR (unlike TAILOR_ITERATION which is contracted)."""
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = self._emitter_with_bus()
+        _emit_agent_iteration_event(emitter, self._scout_job(), "Done.")
+        assert emitter.bus.emit.call_count == 0
+
+    def test_happy_path_emits_agent_iteration(self):
+        from cron.scheduler import _emit_agent_iteration_event
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        response = (
+            '<AGENT_ITERATION_JSON>'
+            '{"agent": "scout", "summary": "Scanned 4 sources, 23 new", '
+            '"counters": {"new": 23, "deduped": 11}}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, self._scout_job(), response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ITERATION
+        assert kwargs["source"] == "scout"
+        assert kwargs["correlation_id"] == "scout-456"
+        payload = kwargs["payload"]
+        assert payload["agent"] == "scout"
+        assert "23 new" in payload["summary"]
+        assert payload["counters"]["new"] == 23
+        assert payload["job_name"] == "jobflow-scout"
+        assert payload["job_id"] == "scout-456"
+
+    def test_malformed_marker_emits_agent_error(self):
+        from cron.scheduler import (
+            _emit_agent_iteration_event,
+            AGENT_ITERATION_REASON_PARSE_FAILED,
+        )
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        response = (
+            "<AGENT_ITERATION_JSON>this is not json [{ </AGENT_ITERATION_JSON>"
+        )
+        _emit_agent_iteration_event(emitter, self._scout_job(), response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ERROR
+        assert kwargs["payload"]["reason"] == AGENT_ITERATION_REASON_PARSE_FAILED
+        assert kwargs["payload"]["job_name"] == "jobflow-scout"
+        assert "not json" in kwargs["payload"]["detail"]
+
+    def test_schema_mismatch_emits_agent_error(self):
+        from cron.scheduler import (
+            _emit_agent_iteration_event,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        # Missing both required fields
+        response = '<AGENT_ITERATION_JSON>{"foo": "bar"}</AGENT_ITERATION_JSON>'
+        _emit_agent_iteration_event(emitter, self._scout_job(), response)
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ERROR
+        assert kwargs["payload"]["reason"] == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
+    def test_emit_failure_does_not_propagate(self):
+        from cron.scheduler import _emit_agent_iteration_event
+        emitter = MagicMock()
+        emitter.bus = MagicMock()
+        emitter.bus.emit.side_effect = RuntimeError("simulated DB lock")
+        # Must not raise
+        _emit_agent_iteration_event(emitter, self._scout_job(), "anything")

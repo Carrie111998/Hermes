@@ -107,7 +107,44 @@ TOPIC_ROUTING: Dict[str, str] = {
     'user_inbound_message': 'scribe_daily',
     # -> security_and_system
     'secret_detected': 'security_and_system',
+    # agent_iteration: TOPIC_ROUTING entry is the FALLBACK only — the
+    # actual primary route is per-agent via resolve_target() reading
+    # payload.agent against AGENT_TOPIC_MAP below. resolve_target() short-
+    # circuits before this lookup runs, so this entry is hit only when
+    # the AGENT_ITERATION code path is bypassed (e.g. in test_all_event_
+    # types_have_routing coverage). Default keeps agent activity in the
+    # firehose where it does the least harm if AGENT_TOPIC_MAP misses.
+    'agent_iteration': 'jobflow_firehose',
 }
+
+# Per-agent routing for AGENT_ITERATION events — added 2026-04-30 to
+# distribute generic iteration summaries to the right Telegram topic
+# without needing one EventType per agent. Lookup uses the canonical
+# agent name from event.payload.agent (lowercase, hyphens only). Unknown
+# agents fall back to the default topic.
+AGENT_TOPIC_MAP: Dict[str, str] = {
+    # JobFlow agents
+    'scout': 'jobflow_firehose',
+    'matcher': 'jobflow_firehose',
+    'matcher-shadow': 'jobflow_firehose',
+    'tailor': 'jobflow_firehose',
+    'applier': 'jobflow_firehose',
+    'tracker': 'jobflow_firehose',
+    'sentinel': 'jobflow_firehose',
+    'cv-handler': 'jobflow_firehose',
+    'notifier': 'jobflow_firehose',
+    'main': 'jobflow_firehose',
+    # DevFlow agents
+    'devflow': 'devflow_firehose',
+    'devflow-standup': 'devflow_firehose',
+    'devflow-bridge': 'devflow_firehose',
+    # Platform / learning agents
+    'critic': 'critic_proposals',
+    'curator': 'curator_digest',
+    'watchdog': 'watchdog_alerts',
+    'scribe': 'scribe_daily',
+}
+AGENT_ITERATION_DEFAULT_TOPIC = 'jobflow_firehose'
 
 # Events that cross-post to alerts when high/critical
 CROSS_POST_TO_ALERTS = {
@@ -276,6 +313,20 @@ class TelegramNotifier(BaseSubscriber):
 
     def resolve_target(self, event: Event) -> Tuple[str, str, str]:
         """Resolve the primary Telegram target for an event."""
+        # AGENT_ITERATION routes per-agent (2026-04-30): the canonical
+        # agent name in payload.agent picks the topic. Falls through to
+        # TOPIC_ROUTING['agent_iteration'] only if payload.agent is
+        # missing or unknown.
+        if event.event_type == EventType.AGENT_ITERATION:
+            agent_name = ""
+            payload = event.payload or {}
+            if isinstance(payload, dict):
+                agent_name = (payload.get('agent') or '').strip().lower()
+            topic_key = AGENT_TOPIC_MAP.get(agent_name, AGENT_ITERATION_DEFAULT_TOPIC)
+            topic = self.topics.get(topic_key, {})
+            thread_id = str(topic.get("thread_id", ""))
+            return ("telegram", self.group_chat_id, thread_id)
+
         topic_key = TOPIC_ROUTING.get(event.event_type.type_string, "system")
 
         # User-facing NOTIFICATION messages (morning digest, follow-up alerts,
@@ -356,6 +407,31 @@ class TelegramNotifier(BaseSubscriber):
 
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"
+
+        if et == EventType.AGENT_ITERATION:
+            # Per-agent run summary (2026-04-30). Lead with agent name +
+            # the human-readable summary line. Counters are compactly
+            # rendered as "k=v · k=v" so the message stays a single
+            # readable line in Telegram even with 5-6 counters.
+            agent = (p.get("agent") or "?").strip()
+            summary = (p.get("summary") or "").strip()
+            counters = p.get("counters") or {}
+            anomalies = p.get("anomalies") or []
+            lines = [f"{agent}: {summary}" if summary else f"{agent}: (no summary)"]
+            if isinstance(counters, dict) and counters:
+                compact = " · ".join(f"{k}={v}" for k, v in counters.items())
+                lines.append(compact)
+            if isinstance(anomalies, list) and anomalies:
+                # Anomalies are short (we expect 0-3). Take first 3 to
+                # keep the message bounded.
+                anom_strs = []
+                for a in anomalies[:3]:
+                    if isinstance(a, dict):
+                        anom_strs.append(a.get("kind") or a.get("note") or str(a)[:40])
+                    else:
+                        anom_strs.append(str(a)[:40])
+                lines.append("⚠ " + " · ".join(anom_strs))
+            return "\n".join(lines)
 
         if et == EventType.SECRET_DETECTED:
             # SR-408 post-flood fix (2026-04-19). Before this branch the

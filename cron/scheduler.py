@@ -315,6 +315,174 @@ def _emit_tailor_iteration_event(emitter, job: dict, final_response: str) -> Non
         )
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("tailor_iteration emit failed: %s", e)
+
+
+# ============================================================================
+# AGENT_ITERATION — generic per-agent run summary (2026-04-30)
+#
+# Extends the TAILOR_ITERATION pattern to every cron-driven agent. Each
+# agent's SOUL.md contracts it to emit an <AGENT_ITERATION_JSON>{...}</AGENT_
+# ITERATION_JSON> block at the end of its cron output. The cron-wrapper
+# extracts and emits a structured EventType.AGENT_ITERATION event.
+#
+# Why generic vs. one EventType per agent: a single envelope keeps the
+# Critic's analyzer surface small (one event-type to query) and lets agents
+# evolve their counter schemas without bus.py changes. Per-agent topic
+# routing (AGENT_TOPIC_MAP in telegram_notifier.py) puts the message in the
+# right Telegram surface based on payload.agent.
+#
+# Schema (validated by _extract_agent_iteration):
+#   agent (str, required)        — canonical lowercase agent name
+#   summary (str, required)      — one-line human-readable text (≤200 chars)
+#   counters (dict, optional)    — agent-specific metrics
+#   anomalies (list, optional)   — list of dicts/strings flagged for Critic
+#   reason (str, optional)       — categorical reason (e.g. "no_work")
+#
+# Failure modes are explicit AGENT_ERROR events so a regression in any
+# agent's prompt is observable on the bus rather than silently dropped.
+# ============================================================================
+AGENT_ITERATION_MARKER_RE = re.compile(
+    r"<AGENT_ITERATION_JSON>(.*?)</AGENT_ITERATION_JSON>",
+    re.DOTALL,
+)
+AGENT_ITERATION_REQUIRED_FIELDS = ("agent", "summary")
+AGENT_ITERATION_REASON_MISSING = "agent_iteration_missing"
+AGENT_ITERATION_REASON_PARSE_FAILED = "agent_iteration_parse_failed"
+AGENT_ITERATION_REASON_SCHEMA_MISMATCH = "agent_iteration_schema_mismatch"
+AGENT_ITERATION_SUMMARY_MAX_CHARS = 200
+
+
+def _extract_agent_iteration(final_response: str):
+    """Extract the generic agent-iteration block from any cron output.
+
+    Returns ``(parsed_payload, error_reason, raw_block)`` matching the
+    TAILOR_ITERATION extractor's contract.
+
+    Schema validation:
+      - ``agent`` and ``summary`` must be non-empty strings.
+      - ``summary`` must be ≤AGENT_ITERATION_SUMMARY_MAX_CHARS (truncated
+        with marker rather than rejected — keeps real-world output flowing
+        even if an agent prompt-drifts).
+      - ``counters`` (if present) must be a dict mapping str → number.
+      - ``anomalies`` (if present) must be a list.
+      - ``reason`` (if present) must be a string.
+
+    The marker is OPTIONAL — _missing_ is signaled but ALSO silent (no
+    AGENT_ERROR) for non-contracted jobs. Only PRESENT-but-malformed cases
+    surface as AGENT_ERROR so we don't spam every legacy job's output.
+    """
+    text = final_response or ""
+    match = AGENT_ITERATION_MARKER_RE.search(text)
+    if not match:
+        return None, AGENT_ITERATION_REASON_MISSING, None
+
+    raw_block = match.group(1).strip()
+    try:
+        parsed = json.loads(raw_block)
+    except (json.JSONDecodeError, ValueError):
+        return None, AGENT_ITERATION_REASON_PARSE_FAILED, raw_block
+
+    if not isinstance(parsed, dict):
+        return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    for field_name in AGENT_ITERATION_REQUIRED_FIELDS:
+        value = parsed.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    counters = parsed.get("counters")
+    if counters is not None:
+        if not isinstance(counters, dict):
+            return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+        for key, val in counters.items():
+            if not isinstance(key, str):
+                return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    anomalies = parsed.get("anomalies")
+    if anomalies is not None and not isinstance(anomalies, list):
+        return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    reason = parsed.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    # Normalize: lowercase agent name, truncate summary if needed
+    parsed["agent"] = parsed["agent"].strip().lower()
+    if len(parsed["summary"]) > AGENT_ITERATION_SUMMARY_MAX_CHARS:
+        parsed["summary"] = (
+            parsed["summary"][: AGENT_ITERATION_SUMMARY_MAX_CHARS - 1] + "…"
+        )
+
+    return parsed, None, raw_block
+
+
+def _emit_agent_iteration_event(emitter, job: dict, final_response: str) -> None:
+    """Hook called from _process_job for ALL successful cron runs.
+
+    Unlike _emit_tailor_iteration_event which is gated by job_name, this
+    helper inspects every job's output for the AGENT_ITERATION marker.
+    Jobs without the marker emit nothing (no AGENT_ERROR — this is opt-in).
+
+    Emits one of:
+      - EventType.AGENT_ITERATION (happy path)
+      - EventType.AGENT_ERROR with payload.reason == AGENT_ITERATION_REASON_*
+        (only if the marker was PRESENT but malformed; missing marker is
+        silent so legacy jobs don't spam errors)
+    """
+    if not emitter:
+        return
+    # Skip jobflow-tailor — it has its own dedicated TAILOR_ITERATION
+    # event with stricter schema. Avoid double-emit.
+    if job.get("name") == TAILOR_ITERATION_JOB_NAME:
+        return
+    try:
+        from events.schema import EventType
+
+        bus = getattr(emitter, "bus", None)
+        if bus is None:
+            return
+
+        job_id = job.get("id") or ""
+        job_name = job.get("name", "")
+
+        parsed, error_reason, raw_block = _extract_agent_iteration(final_response)
+
+        if error_reason == AGENT_ITERATION_REASON_MISSING:
+            # Opt-in: no marker means legacy job; silent no-op.
+            return
+
+        if error_reason is None and parsed is not None:
+            payload = dict(parsed)
+            payload["job_id"] = job_id
+            payload["job_name"] = job_name
+            bus.emit(
+                event_type=EventType.AGENT_ITERATION,
+                source=parsed.get("agent") or job_name or "unknown",
+                payload=payload,
+                correlation_id=job_id or None,
+                job_id=job_id or None,
+            )
+            return
+
+        # Marker-present-but-malformed → AGENT_ERROR with diagnostic detail.
+        err_payload = {
+            "reason": error_reason,
+            "job_id": job_id,
+            "job_name": job_name,
+        }
+        if raw_block is not None:
+            err_payload["detail"] = raw_block[:2000]
+        bus.emit(
+            event_type=EventType.AGENT_ERROR,
+            source=job_name or "cron",
+            payload=err_payload,
+            correlation_id=job_id or None,
+            job_id=job_id or None,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("agent_iteration emit failed: %s", e)
 # ============================================================================
 
 
@@ -1493,6 +1661,12 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # event-design.md for failure-mode handling.
                 if success and emitter:
                     _emit_tailor_iteration_event(emitter, job, final_response or "")
+                    # Generic agent-iteration event (2026-04-30) — opt-in
+                    # via <AGENT_ITERATION_JSON> marker in any agent's
+                    # output. Skips jobflow-tailor (its dedicated event
+                    # already covers it). Missing-marker is silent; only
+                    # malformed-marker emits AGENT_ERROR.
+                    _emit_agent_iteration_event(emitter, job, final_response or "")
 
                 # OTel: finalize cron span with execution results + exit ctx.
                 try:

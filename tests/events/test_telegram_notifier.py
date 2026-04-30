@@ -65,6 +65,91 @@ class TestTopicRouting:
             assert et.type_string in TOPIC_ROUTING, \
                 f"EventType {et.type_string} missing from TOPIC_ROUTING"
 
+
+class TestAgentIterationRouting:
+    """AGENT_ITERATION uses per-agent topic dispatch (AGENT_TOPIC_MAP)
+    via resolve_target() rather than the static TOPIC_ROUTING table.
+    These tests pin that each agent name lands in the right topic.
+    """
+
+    def _make_event(self, agent_name: str):
+        from events.schema import Event, EventType
+        return Event.create(
+            EventType.AGENT_ITERATION, agent_name,
+            {"agent": agent_name, "summary": "test summary"},
+        )
+
+    def test_jobflow_agent_routes_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        for agent in ["scout", "matcher", "tailor", "applier", "tracker", "sentinel"]:
+            target = notifier.resolve_target(self._make_event(agent))
+            assert target[2] == "101", f"{agent} expected jobflow_firehose(101), got {target[2]}"
+
+    def test_critic_routes_to_critic_proposals(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._make_event("critic"))
+        assert target[2] == "108"
+
+    def test_curator_routes_to_curator_digest(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._make_event("curator"))
+        assert target[2] == "107"
+
+    def test_watchdog_routes_to_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._make_event("watchdog"))
+        assert target[2] == "100"
+
+    def test_devflow_routes_to_devflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        for agent in ["devflow", "devflow-standup", "devflow-bridge"]:
+            target = notifier.resolve_target(self._make_event(agent))
+            assert target[2] == "103", f"{agent} expected devflow_firehose(103), got {target[2]}"
+
+    def test_unknown_agent_falls_back_to_jobflow_firehose(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._make_event("some-future-agent"))
+        assert target[2] == "101"
+
+    def test_empty_agent_payload_falls_back_to_default(
+        self, bus, topics_config, verbosity_config,
+    ):
+        from events.schema import Event, EventType
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        # Missing agent field → default fallback
+        event = Event.create(
+            EventType.AGENT_ITERATION, "unknown",
+            {"summary": "no agent name"},
+        )
+        target = notifier.resolve_target(event)
+        assert target[2] == "101"
+
     def test_scout_events_route_to_scout(self):
         # v2 cutover 20260424T233627Z: scout-domain firehose absorbed into
         # jobflow_firehose (formerly the standalone "scout" topic).

@@ -79,6 +79,9 @@ EVENT_TYPE_EMOJI = {
     # Tailor structured iteration (2026-04-29) — counts + reason so the
     # Critic can distinguish "nothing to do" from "something is broken"
     EventType.TAILOR_ITERATION:         "✂️",
+    # Generic agent iteration (2026-04-30) — per-agent run summary
+    # extending TAILOR_ITERATION pattern across all cron-driven agents.
+    EventType.AGENT_ITERATION:          "🔁",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

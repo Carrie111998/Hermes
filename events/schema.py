@@ -90,6 +90,24 @@ class EventType(Enum):
     # the human-readable Telegram pathway is unchanged.
     TAILOR_ITERATION = ("tailor_iteration", Priority.LOW)
 
+    # Generic per-agent iteration summary event — added 2026-04-30 to
+    # extend the TAILOR_ITERATION pattern to every cron-driven agent
+    # (Scout, Matcher, Applier, Tracker, Sentinel, Critic, Curator,
+    # Watchdog, Scribe, DevFlow). Each agent's SOUL.md contracts it to
+    # emit an <AGENT_ITERATION_JSON>{...}</AGENT_ITERATION_JSON> block
+    # at the end of every cron run; the cron-wrapper extracts and
+    # emits this event. Payload schema:
+    #   agent (str, required)     — canonical agent name (e.g. "scout")
+    #   summary (str, required)   — one-line human-readable text
+    #   counters (dict, optional) — agent-specific metrics
+    #   anomalies (list, optional)— flagged issues for Critic triage
+    #   reason (str, optional)    — categorical reason like "no_work"
+    # Telegram routing is per-agent (see AGENT_TOPIC_MAP in
+    # telegram_notifier.py) so jobflow agents land in jobflow_firehose,
+    # platform agents in their own topics. LOW priority => batched 5-min
+    # coalescing window keeps volume bounded.
+    AGENT_ITERATION = ("agent_iteration", Priority.LOW)
+
     # Phase C iter2 (Critic proposals routed to WhatsApp/Telegram)
     CRITIC_PROPOSAL = ("critic_proposal", Priority.NORMAL)
     # Critic auto-apply event — added 2026-04-29 (consolidation phase C).
