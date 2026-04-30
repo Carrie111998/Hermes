@@ -287,6 +287,48 @@ def _compute_grace_seconds(schedule: dict) -> int:
     return MIN_GRACE
 
 
+def _compute_period_seconds(schedule: dict) -> Optional[int]:
+    """Compute the schedule's period in seconds.
+
+    Mirrors the period extraction inside _compute_grace_seconds but returns
+    the raw period (not period/2) and does not clamp. Used by
+    get_due_and_skipped_jobs() to decide fire-once-on-recovery eligibility:
+    a daily cron has period=86400, weekly has 604800, etc.
+
+    For irregular crons (e.g. "0 8,13,18 * * *" with 5h/5h/14h intervals),
+    returns the SMALLEST interval — this matches the conservative semantics
+    used by get_due_and_skipped_jobs() (a job is "daily-or-shorter" iff its
+    fastest cadence is <= 24h).
+
+    Returns None for kind="once" (no period) or invalid schedules.
+    """
+    kind = schedule.get("kind")
+
+    if kind == "interval":
+        minutes = schedule.get("minutes", 1)
+        return int(minutes) * 60
+
+    if kind == "cron" and HAS_CRONITER:
+        try:
+            now = _hermes_now()
+            cron = croniter(schedule["expr"], now)
+            # Sample enough successive fires to cover all distinct intervals
+            # in a typical recurrence pattern (24 fires covers a daily-pattern
+            # cron; weekly+ patterns will surface their period in the first
+            # interval). Take the minimum to make the result independent of
+            # wall-clock time-of-day.
+            fires = [cron.get_next(datetime) for _ in range(25)]
+            intervals = [
+                int((fires[i + 1] - fires[i]).total_seconds())
+                for i in range(len(fires) - 1)
+            ]
+            return min(intervals) if intervals else None
+        except Exception:
+            return None
+
+    return None
+
+
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
     """
     Compute the next run time for a schedule.

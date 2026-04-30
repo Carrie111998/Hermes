@@ -687,3 +687,38 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+from cron.jobs import _compute_period_seconds
+
+
+class TestComputePeriodSeconds:
+    def test_interval_returns_minutes_x_60(self):
+        schedule = {"kind": "interval", "minutes": 480}
+        assert _compute_period_seconds(schedule) == 480 * 60
+
+    def test_interval_minute_fallback(self):
+        schedule = {"kind": "interval", "minutes": 1}
+        assert _compute_period_seconds(schedule) == 60
+
+    def test_cron_daily_returns_86400(self):
+        schedule = {"kind": "cron", "expr": "0 19 * * *"}
+        assert _compute_period_seconds(schedule) == 86400
+
+    def test_cron_weekly_returns_604800(self):
+        schedule = {"kind": "cron", "expr": "0 9 * * 1"}
+        assert _compute_period_seconds(schedule) == 604800
+
+    def test_cron_every_5h_returns_18000(self):
+        schedule = {"kind": "cron", "expr": "0 8,13,18 * * *"}
+        # Periods are 5h, 5h, 14h — first interval used (matches grace logic)
+        assert _compute_period_seconds(schedule) == 18000
+
+    def test_once_returns_none(self):
+        assert _compute_period_seconds({"kind": "once", "at": "2026-05-01T10:00:00Z"}) is None
+
+    def test_unknown_kind_returns_none(self):
+        assert _compute_period_seconds({"kind": "weird"}) is None
+
+    def test_invalid_cron_expr_returns_none(self):
+        assert _compute_period_seconds({"kind": "cron", "expr": "not a cron"}) is None
