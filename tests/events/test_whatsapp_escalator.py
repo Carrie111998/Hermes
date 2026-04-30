@@ -423,3 +423,204 @@ class TestFlushQueueChunking:
         assert count == 5
         assert len(sent) == 1
         assert json.loads(queue_path.read_text(encoding="utf-8")) == []
+
+
+class TestNotificationDeliveredReverseSignal:
+    """NOTIFICATION_DELIVERED + NOTIFICATION_FAILED reverse signal for
+    WhatsApp side. Mirrors the telegram-notifier contract per the
+    2026-04-30 design doc.
+
+    WhatsApp's classify_tier returns None for the new types (they're
+    not in _TIER_BY_EVENT), so should_escalate naturally drops them
+    today. The explicit cycle guard is defense-in-depth: if anyone
+    ever adds a tier mapping for delivery events, the guard prevents
+    a self-consume loop.
+    """
+
+    def test_emits_notification_delivered_on_success(
+        self, bus, quiet_config, queue_path,
+    ):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: None,  # success
+        )
+        # interview_signal is IMMEDIATE tier -> bypasses throttle
+        original_id = bus.emit(
+            event_type=EventType.INTERVIEW_SIGNAL, source="tracker",
+            payload={"company": "Acme", "detail": "phone screen"},
+            priority=Priority.CRITICAL,
+        )
+        original = bus.query(event_type=EventType.INTERVIEW_SIGNAL)[0]
+
+        escalator.handle(original)
+
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 1, (
+            f"expected exactly one NOTIFICATION_DELIVERED, got {len(delivered)}"
+        )
+        evt = delivered[0]
+        assert evt.priority == Priority.LOW
+        assert evt.payload["original_event_id"] == original_id
+        assert evt.payload["original_event_type"] == "interview_signal"
+        assert evt.payload["platform"] == "whatsapp"
+        assert evt.payload["latency_ms"] >= 0
+        assert evt.correlation_id == original_id
+
+    def test_emits_notification_failed_on_exception(
+        self, bus, quiet_config, queue_path,
+    ):
+        def boom(msg):
+            raise RuntimeError("WhatsApp bridge connection refused")
+
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=boom,
+        )
+        original_id = bus.emit(
+            event_type=EventType.INTERVIEW_SIGNAL, source="tracker",
+            payload={"company": "Acme", "detail": "phone screen"},
+            priority=Priority.CRITICAL,
+        )
+        original = bus.query(event_type=EventType.INTERVIEW_SIGNAL)[0]
+
+        # _deliver() catches the exception; it returns False but never
+        # propagates. The reverse signal must fire.
+        escalator.handle(original)
+
+        failed = bus.query(event_type=EventType.NOTIFICATION_FAILED)
+        assert len(failed) == 1, (
+            f"expected exactly one NOTIFICATION_FAILED, got {len(failed)}"
+        )
+        evt = failed[0]
+        assert evt.priority == Priority.NORMAL
+        assert evt.payload["original_event_id"] == original_id
+        assert evt.payload["platform"] == "whatsapp"
+        assert evt.payload["error"]["kind"] == "RuntimeError"
+        assert "connection refused" in evt.payload["error"]["message"]
+
+    def test_emit_failure_does_not_break_delivery(
+        self, bus, quiet_config, queue_path, monkeypatch,
+    ):
+        """If bus.emit raises while emitting the reverse signal, the
+        actual WhatsApp send still succeeded and no exception bubbles
+        out of handle(). Production failure mode: a transient SQLite
+        lock on event_bus.db must not silence legit interview alerts.
+        """
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+        bus.emit(
+            event_type=EventType.INTERVIEW_SIGNAL, source="tracker",
+            payload={"company": "Acme", "detail": "phone screen"},
+            priority=Priority.CRITICAL,
+        )
+        original = bus.query(event_type=EventType.INTERVIEW_SIGNAL)[0]
+
+        emit_calls = {"count": 0}
+
+        def maybe_raising_emit(*args, **kwargs):
+            emit_calls["count"] += 1
+            raise RuntimeError("event_bus locked")
+
+        monkeypatch.setattr(bus, "emit", maybe_raising_emit)
+
+        # Must not raise.
+        escalator.handle(original)
+
+        assert len(sent) == 1, (
+            "delivery must complete despite reverse-signal emit failure"
+        )
+        assert emit_calls["count"] >= 1, (
+            "_deliver() must have attempted the reverse-signal emit"
+        )
+
+    def test_does_not_consume_own_notification_delivered_events(
+        self, bus, quiet_config, queue_path,
+    ):
+        """Cycle guard: NOTIFICATION_DELIVERED feeding back into handle()
+        must short-circuit. Today it's naturally dropped at should_escalate
+        because classify_tier returns None — the explicit guard is
+        defense-in-depth against future tier-mapping changes.
+        """
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+        delivered_event = Event.create(
+            EventType.NOTIFICATION_DELIVERED, "whatsapp-escalator",
+            {
+                "original_event_id": "abc-123",
+                "platform": "whatsapp",
+                "target": {"phone_or_channel": "WHATSAPP_HOME_CHANNEL"},
+                "latency_ms": 250,
+            },
+            priority=Priority.LOW,
+        )
+        escalator.handle(delivered_event)
+
+        assert sent == [], "subscriber must not deliver its own delivery events"
+        # Throttle buffer must also stay empty — the guard short-circuits
+        # before ANY downstream work, not just before _deliver().
+        assert escalator._throttle_buffer == []
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+    def test_does_not_consume_own_notification_failed_events(
+        self, bus, quiet_config, queue_path,
+    ):
+        """Cycle guard for NOTIFICATION_FAILED at NORMAL priority. Critical
+        because a future tier mapping for delivery failures (e.g. URGENT
+        if Diego wants paged failures) WOULD start consuming them, and
+        without the guard this loops indefinitely.
+        """
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+        failed_event = Event.create(
+            EventType.NOTIFICATION_FAILED, "whatsapp-escalator",
+            {
+                "original_event_id": "abc-123",
+                "platform": "whatsapp",
+                "target": {"phone_or_channel": "WHATSAPP_HOME_CHANNEL"},
+                "latency_ms": 50,
+                "error": {"kind": "RuntimeError", "message": "timeout"},
+            },
+            priority=Priority.NORMAL,
+        )
+        escalator.handle(failed_event)
+
+        assert sent == [], "subscriber must not retry its own failure events"
+        assert escalator._throttle_buffer == []
+        assert bus.query(event_type=EventType.NOTIFICATION_FAILED) == []
+
+    def test_throttled_delivery_does_not_emit_per_event(
+        self, bus, quiet_config, queue_path,
+    ):
+        """IMPORTANT (URGENT/IMPORTANT tier) events that aren't IMMEDIATE
+        breakthrough hit the 15-min throttle buffer rather than _deliver()
+        directly. Phase 1 scope: throttled deliveries do NOT emit
+        per-event reverse signals (mirrors Telegram's batched scoping).
+        Failures still emit when the eventual flush attempts a send.
+        """
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: None,
+        )
+        # application_ready is IMPORTANT tier (throttled, not immediate)
+        bus.emit(
+            event_type=EventType.APPLICATION_READY, source="applier",
+            payload={"company": "Acme", "title": "VP Finance"},
+            priority=Priority.HIGH,
+        )
+        original = bus.query(event_type=EventType.APPLICATION_READY)[0]
+
+        escalator.handle(original)
+
+        # Throttled into buffer, not delivered yet
+        assert len(escalator._throttle_buffer) == 1
+        # No reverse signal until the throttle window closes
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []

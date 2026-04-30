@@ -90,6 +90,20 @@ HIGH_SCORE_WA_THRESHOLD = 9.0
 AGENT_ERROR_WINDOW_SECONDS = 900
 AGENT_ERROR_CLUSTER_THRESHOLD = 3
 
+# Cycle-prevention: this subscriber emits NOTIFICATION_DELIVERED /
+# NOTIFICATION_FAILED from inside _deliver(); if it ALSO consumed those
+# events the loop is identical to telegram-notifier's. Today
+# classify_tier returns None for both types so should_escalate naturally
+# drops them, but the explicit guard is defense-in-depth against future
+# tier-mapping changes (e.g. someone routes NOTIFICATION_FAILED to URGENT
+# so Diego gets a WhatsApp ping when Telegram fails — that change MUST
+# also keep this guard intact). Spec at
+# docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+_NEVER_CONSUME = frozenset({
+    EventType.NOTIFICATION_DELIVERED,
+    EventType.NOTIFICATION_FAILED,
+})
+
 
 def classify_tier(event: Event) -> Optional[EscalationTier]:
     """Classify an event into its WhatsApp escalation tier.
@@ -266,6 +280,13 @@ class WhatsAppEscalator(BaseSubscriber):
         self._config_error_logged = True
 
     def handle(self, event: Event) -> None:
+        # Cycle prevention (2026-04-30): this subscriber EMITS delivery
+        # events from _deliver(); consuming them would recurse. Belt-
+        # and-braces over the should_escalate() filter (which today
+        # returns False for these types via classify_tier=None).
+        if event.event_type in _NEVER_CONSUME:
+            return
+
         if not self.should_escalate(event):
             return
 
@@ -281,9 +302,16 @@ class WhatsAppEscalator(BaseSubscriber):
             self._queue_message(message)
             return
 
-        # Breakthrough events always deliver immediately (bypass throttle)
+        # Breakthrough events always deliver immediately (bypass throttle).
+        # Pass `event` so _deliver emits the NOTIFICATION_DELIVERED /
+        # NOTIFICATION_FAILED reverse signal carrying original_event_id +
+        # latency. Throttled / queued sends call _deliver WITHOUT an event
+        # so they DO NOT emit per-event reverse signals (Phase 1 scope —
+        # spec §"Where to emit"). Failure paths in throttle/queue flushes
+        # still log via the existing logger.warning; their reverse-signal
+        # coverage is a Phase 2 follow-up.
         if classify_tier(event) == EscalationTier.IMMEDIATE:
-            self._deliver(message)
+            self._deliver(message, event=event)
             return
 
         # Throttle: buffer events within 15-minute windows
@@ -354,29 +382,133 @@ class WhatsAppEscalator(BaseSubscriber):
         """Flush pending throttle buffer and queue on shutdown."""
         self._flush_throttle_buffer()
 
-    def _deliver(self, message: str) -> bool:
-        """Send message via WhatsApp.  Returns True on success, False on failure."""
+    def _deliver(
+        self,
+        message: str,
+        *,
+        event: Optional[Event] = None,
+    ) -> bool:
+        """Send message via WhatsApp. Returns True on success, False on failure.
+
+        When ``event`` is provided (non-throttled, non-queued delivery
+        from handle()), emits NOTIFICATION_DELIVERED on success and
+        NOTIFICATION_FAILED on failure carrying the original event id +
+        target. Both reverse-signal emits swallow their own exceptions;
+        a bus failure here MUST NOT mask the upstream delivery state.
+
+        Throttled / queue-flush call sites pass no event so they do
+        NOT emit per-event reverse signals (Phase 1 scoping per the
+        design doc — keeps overnight digest flushes from doubling the
+        bus volume). Spec at
+        docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+        """
+        t0 = time.monotonic()
+        ok = False
+        exc: Optional[Exception] = None
+
         if self._send_fn:
             try:
                 self._send_fn(message)
-                return True
+                ok = True
             except Exception as e:
                 logger.error("WhatsApp delivery failed (send_fn): %s", e)
-                return False
+                exc = e
+        else:
+            try:
+                from cron.scheduler import _deliver_result
+                err = _deliver_result(
+                    {"deliver": "whatsapp", "id": "event-bus", "name": "event-bus"},
+                    message,
+                    skip_cron_framing=True,
+                )
+                if err:
+                    logger.warning("WhatsApp delivery failed: %s", err)
+                    # _deliver_result returns an error string; surface it
+                    # as a synthetic exception so the reverse signal
+                    # records why the bridge rejected the send.
+                    exc = RuntimeError(str(err))
+                else:
+                    ok = True
+            except Exception as e:
+                logger.error("WhatsApp delivery failed: %s", e)
+                exc = e
+
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        if event is not None:
+            if ok:
+                self._safe_emit_delivered(event, latency_ms)
+            else:
+                self._safe_emit_failed(
+                    event, latency_ms, exc or RuntimeError("unknown"),
+                )
+        return ok
+
+    def _whatsapp_target(self) -> Dict[str, str]:
+        """Render the target field for the reverse-signal payload.
+
+        WHATSAPP_HOME_CHANNEL is the env-bound destination per the
+        2026-04-19 hardening memo; record the symbolic name to avoid
+        leaking PII (the actual phone number / channel id) into
+        audit.jsonl. A future retry-router can resolve the symbolic
+        name to a routable channel.
+        """
+        channel = os.environ.get("WHATSAPP_HOME_CHANNEL", "WHATSAPP_HOME_CHANNEL")
+        return {"phone_or_channel": channel}
+
+    def _safe_emit_delivered(self, event: Event, latency_ms: int) -> None:
+        """Emit NOTIFICATION_DELIVERED. Swallows all exceptions."""
         try:
-            from cron.scheduler import _deliver_result
-            err = _deliver_result(
-                {"deliver": "whatsapp", "id": "event-bus", "name": "event-bus"},
-                message,
-                skip_cron_framing=True,
+            self.bus.emit(
+                event_type=EventType.NOTIFICATION_DELIVERED,
+                source="whatsapp-escalator",
+                payload={
+                    "original_event_id": event.event_id,
+                    "original_event_type": event.event_type.type_string,
+                    "platform": "whatsapp",
+                    "target": self._whatsapp_target(),
+                    "latency_ms": latency_ms,
+                },
+                priority=Priority.LOW,
+                correlation_id=event.event_id,
+                tags=["delivery", "whatsapp"],
             )
-            if err:
-                logger.warning("WhatsApp delivery failed: %s", err)
-                return False
-            return True
-        except Exception as e:
-            logger.error("WhatsApp delivery failed: %s", e)
-            return False
+        except Exception:
+            logger.exception(
+                "WhatsAppEscalator: failed to emit NOTIFICATION_DELIVERED "
+                "for event %s", event.event_id,
+            )
+
+    def _safe_emit_failed(
+        self, event: Event, latency_ms: int, exc: Exception,
+    ) -> None:
+        """Emit NOTIFICATION_FAILED. Swallows all exceptions."""
+        try:
+            self.bus.emit(
+                event_type=EventType.NOTIFICATION_FAILED,
+                source="whatsapp-escalator",
+                payload={
+                    "original_event_id": event.event_id,
+                    "original_event_type": event.event_type.type_string,
+                    "platform": "whatsapp",
+                    "target": self._whatsapp_target(),
+                    "latency_ms": latency_ms,
+                    "error": {
+                        "kind": type(exc).__name__,
+                        # Cap so a multi-KB stacktrace doesn't bloat the
+                        # bus DB. Full exception remains in the gateway
+                        # log via logger.error above.
+                        "message": str(exc)[:500],
+                    },
+                },
+                priority=Priority.NORMAL,
+                correlation_id=event.event_id,
+                tags=["delivery", "whatsapp", "failure"],
+            )
+        except Exception:
+            logger.exception(
+                "WhatsAppEscalator: failed to emit NOTIFICATION_FAILED "
+                "for event %s", event.event_id,
+            )
 
     def _queue_message(self, message: str) -> None:
         """Queue message for morning flush."""
