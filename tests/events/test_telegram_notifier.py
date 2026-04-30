@@ -1150,3 +1150,262 @@ def test_notifier_restores_batch_buffer_on_restart(tmp_path, monkeypatch):
         assert n2._batch_buffer.get("-1:15") == ["pending msg 1", "pending msg 2"]
     finally:
         bus.close()
+
+
+class TestNotificationDeliveredReverseSignal:
+    """NOTIFICATION_DELIVERED + NOTIFICATION_FAILED reverse-signal layer
+    (2026-04-30, design at docs/superpowers/specs/2026-04-30-notification-
+    delivered-design.md).
+
+    The bus is one-way today: events emit -> telegram_notifier delivers
+    via Telegram bridge -> nothing flows back. These tests pin the
+    reverse signal in TelegramNotifier._deliver(): on success emit a
+    LOW NOTIFICATION_DELIVERED carrying original_event_id, platform,
+    target, latency_ms; on failure emit a NORMAL NOTIFICATION_FAILED
+    with error.kind + error.message.
+
+    Cycle prevention: the subscriber MUST NOT consume its own delivery
+    events (would loop forever on every send). Tests pin the early-
+    return guard in handle().
+
+    Volume scoping: only non-batched (>= NORMAL priority) deliveries
+    emit reverse signals — LOW-priority batched deliveries do NOT, so
+    cron firehose chatter doesn't double the bus volume. Failures are
+    always emitted regardless of priority (operator must see them).
+    """
+
+    def test_emits_notification_delivered_on_success(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: None,  # success
+        )
+        original = Event.create(
+            EventType.JOB_SCORED, "matcher",
+            {"score": 7.5, "title": "Engineer", "company": "Beta"},
+            priority=Priority.NORMAL,
+        )
+        original_id = bus.emit(
+            event_type=EventType.JOB_SCORED, source="matcher",
+            payload=original.payload, priority=Priority.NORMAL,
+        )
+        original.event_id = original_id  # keep test event in sync with bus
+
+        notifier.handle(original)
+
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 1, (
+            f"expected exactly one NOTIFICATION_DELIVERED, got {len(delivered)}"
+        )
+        evt = delivered[0]
+        assert evt.priority == Priority.LOW
+        assert evt.payload["original_event_id"] == original_id
+        assert evt.payload["original_event_type"] == "job_scored"
+        assert evt.payload["platform"] == "telegram"
+        assert evt.payload["target"]["chat_id"] == "-1001234567890"
+        assert evt.payload["target"]["thread_id"] == "101"  # jobflow_firehose
+        assert evt.payload["target"]["topic_key"] == "jobflow_firehose"
+        assert evt.payload["latency_ms"] >= 0
+        assert evt.correlation_id == original_id
+
+    def test_emits_notification_failed_on_exception(
+        self, bus, topics_config, verbosity_config,
+    ):
+        def boom(chat_id, thread_id, msg):
+            raise RuntimeError("Bad Request: chat not found")
+
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=boom,
+        )
+        original_id = bus.emit(
+            event_type=EventType.JOB_SCORED, source="matcher",
+            payload={"score": 7.5, "title": "Engineer", "company": "Beta"},
+            priority=Priority.NORMAL,
+        )
+        # Recreate the Event object as handle() would receive it
+        original = bus.query(event_type=EventType.JOB_SCORED)[0]
+
+        # _deliver() catches the exception per the contract (non-raising
+        # wrapper around the send_fn). The reverse signal must still fire.
+        notifier.handle(original)
+
+        failed = bus.query(event_type=EventType.NOTIFICATION_FAILED)
+        assert len(failed) == 1, (
+            f"expected exactly one NOTIFICATION_FAILED, got {len(failed)}"
+        )
+        evt = failed[0]
+        assert evt.priority == Priority.NORMAL
+        assert evt.payload["original_event_id"] == original_id
+        assert evt.payload["platform"] == "telegram"
+        assert evt.payload["error"]["kind"] == "RuntimeError"
+        assert "Bad Request" in evt.payload["error"]["message"]
+
+    def test_emit_failure_does_not_break_delivery(
+        self, bus, topics_config, verbosity_config, monkeypatch,
+    ):
+        """If bus.emit raises while emitting the reverse signal, the
+        actual delivery must still complete and no exception bubbles out
+        of handle(). Production failure mode: a transient SQLite lock on
+        event_bus.db must not silence legit notifications.
+        """
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+        original_id = bus.emit(
+            event_type=EventType.JOB_SCORED, source="matcher",
+            payload={"score": 7.5, "title": "X", "company": "Y"},
+            priority=Priority.NORMAL,
+        )
+        original = bus.query(event_type=EventType.JOB_SCORED)[0]
+
+        # Break only the reverse-signal emit by replacing bus.emit with a
+        # raising version AFTER the original event was emitted by the
+        # producer above. The notifier's _deliver() will call bus.emit and
+        # the wrapper must swallow.
+        original_emit = bus.emit
+        emit_calls = {"count": 0}
+
+        def maybe_raising_emit(*args, **kwargs):
+            emit_calls["count"] += 1
+            raise RuntimeError("event_bus locked")
+
+        monkeypatch.setattr(bus, "emit", maybe_raising_emit)
+
+        # Must not raise. Send must succeed.
+        notifier.handle(original)
+
+        assert len(sent) == 1, "delivery must complete despite emit failure"
+        assert emit_calls["count"] >= 1, (
+            "_deliver() must have attempted the reverse-signal emit"
+        )
+
+    def test_does_not_consume_own_notification_delivered_events(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Cycle guard: NOTIFICATION_DELIVERED events feeding back into
+        handle() must short-circuit before reaching resolve_target(),
+        the batch buffer, or _deliver(). Without this, every successful
+        send would feed a delivery event back through the same subscriber
+        and recurse (LOW priority would batch and eventually flush a
+        message about a delivery, triggering another NOTIFICATION_
+        DELIVERED about delivering the delivery message — same loop).
+        """
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+        delivered_event = Event.create(
+            EventType.NOTIFICATION_DELIVERED, "telegram-notifier",
+            {
+                "original_event_id": "abc-123",
+                "platform": "telegram",
+                "target": {"chat_id": "-1", "thread_id": "101"},
+                "latency_ms": 10,
+            },
+            priority=Priority.LOW,
+        )
+        notifier.handle(delivered_event)
+
+        assert sent == [], "subscriber must not deliver its own delivery events"
+        # Cycle guard must short-circuit BEFORE the batch buffer too, otherwise
+        # a 5-min flush would still ship a "we delivered" message to a topic
+        # and then emit another NOTIFICATION_DELIVERED for that send.
+        assert notifier._batch_buffer == {}, (
+            f"cycle guard must skip batching too; got {notifier._batch_buffer}"
+        )
+        # And nothing on the bus emitted by us
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+    def test_does_not_consume_own_notification_failed_events(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """Cycle guard: NOTIFICATION_FAILED at NORMAL priority would
+        otherwise route to watchdog_alerts (per defensive TOPIC_ROUTING)
+        and trigger ANOTHER send -> if THAT failed, another
+        NOTIFICATION_FAILED -> recursion until SQLite locks up.
+        """
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+        failed_event = Event.create(
+            EventType.NOTIFICATION_FAILED, "telegram-notifier",
+            {
+                "original_event_id": "abc-123",
+                "platform": "telegram",
+                "target": {"chat_id": "-1", "thread_id": "101"},
+                "latency_ms": 50,
+                "error": {"kind": "RuntimeError", "message": "timeout"},
+            },
+            priority=Priority.NORMAL,
+        )
+        notifier.handle(failed_event)
+
+        assert sent == [], "subscriber must not retry its own failure events"
+        assert bus.query(event_type=EventType.NOTIFICATION_FAILED) == []
+
+    def test_cross_post_emits_two_delivered_events(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """interview_signal at HIGH cross-posts to watchdog_alerts (per
+        CROSS_POST_TO_ALERTS). Each target sends one message and emits
+        one NOTIFICATION_DELIVERED, so the audit log can answer "did
+        Telegram show this in BOTH topics?" per topic_key.
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: None,
+        )
+        original_id = bus.emit(
+            event_type=EventType.INTERVIEW_SIGNAL, source="tracker",
+            payload={"company": "Acme", "detail": "phone screen scheduled"},
+            priority=Priority.CRITICAL,  # interview_signal default is CRITICAL
+        )
+        original = bus.query(event_type=EventType.INTERVIEW_SIGNAL)[0]
+        notifier.handle(original)
+
+        delivered = bus.query(event_type=EventType.NOTIFICATION_DELIVERED)
+        assert len(delivered) == 2, (
+            f"expected 2 NOTIFICATION_DELIVERED (primary + cross-post); "
+            f"got {len(delivered)}"
+        )
+        thread_ids = {d.payload["target"]["thread_id"] for d in delivered}
+        # Primary jobflow_decisions = 102; cross-post watchdog_alerts = 100
+        assert thread_ids == {"102", "100"}, (
+            f"unexpected thread_ids in delivery events: {thread_ids}"
+        )
+        for d in delivered:
+            assert d.payload["original_event_id"] == original_id
+            assert d.correlation_id == original_id
+
+    def test_low_priority_batched_delivery_does_not_emit_per_event(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """LOW-priority events are buffered into the 5-min batch window
+        (one combined send later); per-event reverse signals would
+        double bus volume on the firehose. Phase 1 scoping: LOW deliveries
+        emit no reverse signal. Failures (when batches eventually flush)
+        will still emit per-platform (covered by a separate test).
+        """
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: None,
+        )
+        bus.emit(
+            event_type=EventType.JOB_DISCOVERED, source="scout",
+            payload={"title": "Analyst", "company": "Acme", "source": "Indeed"},
+            priority=Priority.LOW,
+        )
+        original = bus.query(event_type=EventType.JOB_DISCOVERED)[0]
+        notifier.handle(original)
+
+        # Buffered, not delivered yet
+        assert len(notifier._batch_buffer) > 0
+        # No reverse signal for the batched (yet-to-flush) event
+        assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []

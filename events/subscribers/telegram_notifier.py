@@ -200,6 +200,20 @@ DIGEST_EVENT_TYPES = frozenset({
     EventType.DIGEST_GENERATED,
 })
 
+# Cycle-prevention: this subscriber emits NOTIFICATION_DELIVERED /
+# NOTIFICATION_FAILED from inside _deliver(); if it ALSO consumed those
+# events, every send would feed a delivery event back through the same
+# subscriber and recurse (LOW would batch the recursion; NORMAL+ would
+# loop synchronously). Documented in the BaseSubscriber docstring rule:
+# no subscriber that emits a delivery event may consume one. See
+# docs/superpowers/specs/2026-04-30-notification-delivered-design.md
+# §"Cycle prevention" for why this is an in-handle early-return rather
+# than a class-level negative filter.
+_NEVER_CONSUME = frozenset({
+    EventType.NOTIFICATION_DELIVERED,
+    EventType.NOTIFICATION_FAILED,
+})
+
 CRON_SUMMARY_MAX_LINES = 24
 CRON_SUMMARY_MAX_CHARS = 1500
 CRON_SUMMARY_TRUNCATION_NOTE = (
@@ -281,6 +295,13 @@ class TelegramNotifier(BaseSubscriber):
             logger.warning("TelegramNotifier: failed to reload verbosity.json: %s", e)
 
     def handle(self, event: Event) -> None:
+        # Cycle prevention (2026-04-30): this subscriber EMITS delivery
+        # events from _deliver(); consuming them too would recurse. Must
+        # short-circuit BEFORE batching so a buffered delivery message
+        # doesn't eventually flush and re-trigger the loop.
+        if event.event_type in _NEVER_CONSUME:
+            return
+
         # Hot-reload verbosity config on each cycle (spec: hot-reloadable)
         self._reload_verbosity()
 
@@ -364,7 +385,18 @@ class TelegramNotifier(BaseSubscriber):
                 self._batch_buffer[key].append(message)
                 self._persist_batch_buffer()
             else:
-                self._deliver(chat_id, thread_id, message)
+                # Pass event + topic_key so _deliver can emit the
+                # NOTIFICATION_DELIVERED / NOTIFICATION_FAILED reverse
+                # signal carrying original_event_id + target metadata.
+                # Batched flushes call _deliver() without an event so
+                # they DO NOT emit per-event reverse signals (Phase 1
+                # scope per the design doc — keeps LOW-priority firehose
+                # volume bounded). Spec at
+                # docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+                self._deliver(
+                    chat_id, thread_id, message,
+                    event=event, topic_key=topic_key,
+                )
 
         # Flush any batches older than 5 minutes
         self._flush_stale_batches()
@@ -563,23 +595,135 @@ class TelegramNotifier(BaseSubscriber):
 
         return f"{kept_text}\n\n{CRON_SUMMARY_TRUNCATION_NOTE}"
 
-    def _deliver(self, chat_id: str, thread_id: str, message: str) -> None:
-        """Send a message to a Telegram chat/thread."""
-        if self._send_fn:
-            self._send_fn(chat_id, thread_id, message)
-            return
+    def _deliver(
+        self,
+        chat_id: str,
+        thread_id: str,
+        message: str,
+        *,
+        event: Optional[Event] = None,
+        topic_key: Optional[str] = None,
+    ) -> None:
+        """Send a message to a Telegram chat/thread.
 
-        # Production: use gateway delivery
+        When ``event`` is provided (non-batched delivery from handle()),
+        emits NOTIFICATION_DELIVERED on success and NOTIFICATION_FAILED
+        on exception, carrying original_event_id + target metadata.
+        Both reverse-signal emits are wrapped in helpers that swallow
+        their own exceptions, so a bus-side failure (transient SQLite
+        lock, schema mismatch) NEVER breaks the upstream delivery path.
+
+        Batched flushes (_flush_stale_batches) call this without an
+        event so per-event reverse signals don't double the LOW-priority
+        firehose volume — Phase 1 scoping per the design doc at
+        docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
+        """
+        t0 = time.monotonic()
         try:
-            from cron.scheduler import _deliver_result
-            target_str = f"telegram:{chat_id}:{thread_id}" if thread_id else f"telegram:{chat_id}"
-            _deliver_result(
-                {"deliver": target_str, "id": "event-bus", "name": "event-bus"},
-                message,
-                skip_cron_framing=True,
+            if self._send_fn:
+                self._send_fn(chat_id, thread_id, message)
+            else:
+                # Production: use gateway delivery
+                from cron.scheduler import _deliver_result
+                target_str = (
+                    f"telegram:{chat_id}:{thread_id}" if thread_id
+                    else f"telegram:{chat_id}"
+                )
+                _deliver_result(
+                    {"deliver": target_str, "id": "event-bus", "name": "event-bus"},
+                    message,
+                    skip_cron_framing=True,
+                )
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            if event is not None:
+                self._safe_emit_delivered(
+                    event, chat_id, thread_id, topic_key, latency_ms,
+                )
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            logger.error("TelegramNotifier delivery failed: %s", exc)
+            if event is not None:
+                self._safe_emit_failed(
+                    event, chat_id, thread_id, topic_key, latency_ms, exc,
+                )
+
+    def _safe_emit_delivered(
+        self,
+        event: Event,
+        chat_id: str,
+        thread_id: str,
+        topic_key: Optional[str],
+        latency_ms: int,
+    ) -> None:
+        """Emit NOTIFICATION_DELIVERED. Swallows all exceptions — a
+        bus failure here MUST NOT break the upstream delivery path."""
+        try:
+            self.bus.emit(
+                event_type=EventType.NOTIFICATION_DELIVERED,
+                source="telegram-notifier",
+                payload={
+                    "original_event_id": event.event_id,
+                    "original_event_type": event.event_type.type_string,
+                    "platform": "telegram",
+                    "target": {
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                        "topic_key": topic_key or "",
+                    },
+                    "latency_ms": latency_ms,
+                },
+                priority=Priority.LOW,
+                correlation_id=event.event_id,
+                tags=["delivery", "telegram"],
             )
-        except Exception as e:
-            logger.error("TelegramNotifier delivery failed: %s", e)
+        except Exception:
+            logger.exception(
+                "TelegramNotifier: failed to emit NOTIFICATION_DELIVERED "
+                "for event %s", event.event_id,
+            )
+
+    def _safe_emit_failed(
+        self,
+        event: Event,
+        chat_id: str,
+        thread_id: str,
+        topic_key: Optional[str],
+        latency_ms: int,
+        exc: Exception,
+    ) -> None:
+        """Emit NOTIFICATION_FAILED. Same swallow contract as
+        _safe_emit_delivered."""
+        try:
+            self.bus.emit(
+                event_type=EventType.NOTIFICATION_FAILED,
+                source="telegram-notifier",
+                payload={
+                    "original_event_id": event.event_id,
+                    "original_event_type": event.event_type.type_string,
+                    "platform": "telegram",
+                    "target": {
+                        "chat_id": chat_id,
+                        "thread_id": thread_id,
+                        "topic_key": topic_key or "",
+                    },
+                    "latency_ms": latency_ms,
+                    "error": {
+                        "kind": type(exc).__name__,
+                        # Cap so a multi-KB stacktrace doesn't bloat the
+                        # bus DB. The full exception stays in the gateway
+                        # log via logger.error above.
+                        "message": str(exc)[:500],
+                    },
+                },
+                priority=Priority.NORMAL,
+                correlation_id=event.event_id,
+                tags=["delivery", "telegram", "failure"],
+            )
+        except Exception:
+            logger.exception(
+                "TelegramNotifier: failed to emit NOTIFICATION_FAILED "
+                "for event %s", event.event_id,
+            )
 
     def _flush_stale_batches(self, max_age: float = 300.0) -> None:
         """Flush batched low-priority messages older than max_age seconds."""

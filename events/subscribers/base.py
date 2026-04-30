@@ -9,6 +9,14 @@ times in a row, the subscriber enters quarantine for CIRCUIT_BREAKER_COOLDOWN_SE
 During quarantine, poll() is a no-op — events pile up in the backlog (visible via
 subscriber_lag) instead of repeatedly invoking a broken handler.  A single
 agent_error event is emitted on the transition into quarantine.
+
+Cycle-prevention rule (2026-04-30): no subscriber that EMITS a delivery
+event (NOTIFICATION_DELIVERED / NOTIFICATION_FAILED) may CONSUME a
+delivery event. Today this applies to telegram-notifier and whatsapp-
+escalator: each emits the reverse signal from inside _deliver(), and
+each guards against consuming the type at the top of handle(). If you
+add a third delivery subscriber, it MUST follow the same pattern.
+Spec: docs/superpowers/specs/2026-04-30-notification-delivered-design.md.
 """
 
 import logging

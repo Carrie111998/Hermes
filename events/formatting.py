@@ -97,6 +97,15 @@ EVENT_TYPE_EMOJI = {
     EventType.DEVFLOW_BUILD_STARTED:    "🔨",
     EventType.DEVFLOW_BUILD_SUCCEEDED:  "🟢",
     EventType.DEVFLOW_BUILD_FAILED:     "🧨",
+    # Notification delivery reverse-signal (2026-04-30) — visibility
+    # for whether a notification reached the user. Distinct from generic
+    # green/red so an operator scanning watchdog_alerts can tell a
+    # delivery report apart from a build/system signal at a glance.
+    # The cycle guard in handle() makes these effectively unreachable
+    # in chat, but the icon entry keeps test_event_icons_cover_all_types
+    # honest and gives a fallback render if the guard ever regresses.
+    EventType.NOTIFICATION_DELIVERED:   "📬",
+    EventType.NOTIFICATION_FAILED:      "📭",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)
