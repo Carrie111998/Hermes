@@ -21,15 +21,21 @@ from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-# Maps event_type string → topic key
-# 7 trigger event types (job_high_score, application_submitted/ready,
-# interview_signal, offer_signal, critic_proposal, curator_daily) are
-# DELIBERATELY ABSENT from this dict as of 2026-04-28 — they are routed
-# to Telegram via the scribe-realtime subscriber, which formats each
-# event as a Scribe-styled one-liner before emitting a mailbox_message
-# NOTIFICATION with the explicit `to:` field. CROSS_POST_TO_ALERTS still
-# fires for the 4 high-priority types where it applies (preserved).
-# See: docs/superpowers/specs/2026-04-28-scribe-realtime-narration-design.md
+# Maps event_type string → topic key.
+# The 7 high-stakes trigger event types (job_high_score, application_submitted,
+# application_ready, interview_signal, offer_signal, critic_proposal,
+# curator_daily) are routed by BOTH paths and that is intentional:
+#   1. scribe-realtime renders each into a one-liner and emits a
+#      mailbox_message NOTIFICATION with `to:` set to a Scribe-narrative
+#      topic (e.g. hermes_milestones for interview/offer). resolve_target()
+#      honors the explicit `to:` field below.
+#   2. The original typed event is also routed via this TOPIC_ROUTING table
+#      to a structured-decisions topic (e.g. jobflow_decisions) so the
+#      action surface remains queryable independently of Scribe narration.
+# This dual path was previously claimed to be "deliberately absent" in
+# 2026-04-28 spec (2026-04-28-scribe-realtime-narration-design.md) but the
+# implementation kept both — verified 2026-04-30. CROSS_POST_TO_ALERTS still
+# fires for high-priority types (preserved).
 TOPIC_ROUTING: Dict[str, str] = {
     # === Hermes Telegram v2 (cutover 20260424T233627Z) ===
     # -> jobflow_firehose
@@ -228,10 +234,11 @@ class TelegramNotifier(BaseSubscriber):
                 and event.priority.level < Priority.HIGH.level):
             return
 
-        # secret_detected volume is unbounded when the scanner runs; route via
-        # audit-logger only. A daily rollup is handled by the digest.
-        if event.event_type.type_string == "secret_detected":
-            return
+        # secret_detected used to be hard-suppressed during the SR-409 scanner
+        # explosion (2026-04-19); the scanner is now disabled at the Scheduled
+        # Task level and the producer's seen-set is reseeded. Route normally;
+        # verbosity gating + per-topic mode in verbosity.json provides the
+        # rate-limit hook if volume returns. Re-enabled 2026-04-30.
 
         if not self.group_chat_id or not self.topics:
             self._load_config()
