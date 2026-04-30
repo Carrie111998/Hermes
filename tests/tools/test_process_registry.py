@@ -433,6 +433,32 @@ class TestCheckpoint:
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
 
+    def test_recover_swallows_generic_oserror_from_os_kill(self, registry, tmp_path):
+        """recover_from_checkpoint must catch any OSError from os.kill, not just
+        ProcessLookupError / PermissionError.
+
+        Regression: on Windows, os.kill(dead_or_recycled_pid, 0) can raise plain
+        OSError with WinError 11 (BAD_FORMAT) or 87 (INVALID_PARAMETER) — neither
+        is mapped to ProcessLookupError. The incomplete except list let the
+        exception escape, producing a 'Process checkpoint recovery: [WinError 11]'
+        warning on every gateway startup with a stale checkpoint entry."""
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_recycled",
+            "command": "stale",
+            "pid": 30752,
+            "task_id": "t1",
+        }]))
+
+        fake_oserror = OSError(
+            "[WinError 11] An attempt was made to load a program with an incorrect format"
+        )
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+             patch("os.kill", side_effect=fake_oserror):
+            recovered = registry.recover_from_checkpoint()
+            assert recovered == 0
+
     def test_write_checkpoint_includes_watcher_metadata(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
             s = _make_session()

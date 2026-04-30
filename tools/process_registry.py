@@ -257,7 +257,12 @@ class ProcessRegistry:
         try:
             os.kill(pid, 0)
             return True
-        except (ProcessLookupError, PermissionError):
+        except OSError:
+            # ProcessLookupError + PermissionError on POSIX; on Windows,
+            # os.kill(dead_or_recycled_pid, 0) can raise plain OSError with
+            # WinError 11 (BAD_FORMAT) or 87 (INVALID_PARAMETER), neither of
+            # which subclasses ProcessLookupError. Treat any OSError as
+            # "not alive" so a stale checkpoint entry can't crash recovery.
             return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
