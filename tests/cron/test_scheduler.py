@@ -146,6 +146,20 @@ class TestResolveDeliveryTarget:
             "thread_id": None,
         }
 
+    def test_bare_whatsapp_delivery_uses_whatsapp_home_channel(self, monkeypatch):
+        """Regression: _HOME_TARGET_ENV_VARS was missing a 'whatsapp' entry,
+        so bare deliver=whatsapp jobs (cron jobs + whatsapp_escalator's
+        synthetic event-bus job + digest_composer) all failed with
+        'no delivery target resolved for deliver=whatsapp' even when
+        WHATSAPP_HOME_CHANNEL was set."""
+        monkeypatch.setenv("WHATSAPP_HOME_CHANNEL", "53910513393901@lid")
+
+        assert _resolve_delivery_target({"deliver": "whatsapp"}) == {
+            "platform": "whatsapp",
+            "chat_id": "53910513393901@lid",
+            "thread_id": None,
+        }
+
     def test_explicit_telegram_topic_target_with_thread_id(self):
         """deliver: 'telegram:chat_id:thread_id' parses correctly."""
         job = {
