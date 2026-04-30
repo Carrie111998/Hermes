@@ -45,6 +45,11 @@ class EventType(Enum):
     CRON_FAILED = ("cron_failed", Priority.HIGH)
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL)
     CRON_STALE = ("cron_stale", Priority.HIGH)
+    # Added 2026-04-30: emitted by cron/scheduler.py:tick() when a recurring
+    # job is fast-forwarded past a missed fire window (gateway downtime
+    # exceeded the catch-up grace, OR the job is opted out of fire-once via
+    # recovery_policy="skip_only"). Spec: 2026-04-30-cron-restart-catchup-gap-design.md.
+    CRON_SKIPPED = ("cron_skipped", Priority.HIGH)
 
     # Job discovery & scoring
     JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)
