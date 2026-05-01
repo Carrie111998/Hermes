@@ -27,18 +27,8 @@ EVENT_TYPE_EMOJI = {
     EventType.CRON_FAILED:              "💥",
     EventType.CRON_FAILED_CONSECUTIVE:  "🔥",
     EventType.CRON_STALE:               "⌛",
-    # 💤 (sleeping-z, "system dormant") is deliberately distinct from
-    # ⏭️ on CRON_SKIPPED_DUPLICATE so operators scanning watchdog_alerts
-    # can tell the two apart at a glance:
-    #   CRON_SKIPPED           = slot fast-forwarded because the system was down
-    #   CRON_SKIPPED_DUPLICATE = fire rejected because a sibling was still running
-    # Both branches originally picked ⏭️; resolved in merge e85794fd (2026-04-30).
     EventType.CRON_SKIPPED:             "💤",
     EventType.CRON_SKIPPED_DUPLICATE:   "⏭️",
-    # Cron aborted on gateway shutdown (Guard #1, 2026-04-30) — distinct
-    # from CRON_FAILED (agent-fault) and CRON_SKIPPED_DUPLICATE (concurrency
-    # guard reject). Stop-sign signals "scheduler interrupted this fire."
-    EventType.CRON_ABORTED:             "🛑",
     EventType.JOB_DISCOVERED:           "🎯",
     EventType.JOB_SCORED:               "📊",
     EventType.JOB_HIGH_SCORE:           "⭐",

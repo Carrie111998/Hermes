@@ -15,19 +15,6 @@ def bus(tmp_path):
     return EventBus(db_path=db_path)
 
 
-def _seed_cursor_at_zero(bus: EventBus, subscriber_id: str = "critic-trigger") -> None:
-    """Force the subscriber's cursor to 0 so it sees events emitted BEFORE its
-    first poll. The bus's first-registration default (bus.py subscribe(),
-    2026-04-28) jumps to head-of-bus to prevent backlog floods on real
-    deploys; these tests construct CriticSubscriber, emit, then poll."""
-    bus._execute(
-        """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
-           VALUES (?, 0, datetime('now'))
-           ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
-        (subscriber_id,),
-    )
-
-
 @pytest.fixture
 def critic_script(tmp_path):
     """Mock critic_retro.py path."""
@@ -52,7 +39,6 @@ class TestCriticSubscriberFiltering:
     def test_ignores_other_event_types(self, bus, critic_script):
         from events.subscribers.critic_trigger import CriticSubscriber
         sub = CriticSubscriber(bus, critic_script_path=critic_script)
-        _seed_cursor_at_zero(bus)
         bus.emit(EventType.CRON_FAILED, "scout", {"error": "x"})
         with patch("subprocess.Popen") as mock_popen:
             sub.poll()
@@ -63,7 +49,6 @@ class TestCriticSubscriberInvocation:
     def test_emits_subprocess_with_cluster_args(self, bus, critic_script):
         from events.subscribers.critic_trigger import CriticSubscriber
         sub = CriticSubscriber(bus, critic_script_path=critic_script)
-        _seed_cursor_at_zero(bus)
         bus.emit(
             event_type=EventType.AGENT_FAILURE_CLUSTER,
             source="scout",
@@ -92,7 +77,6 @@ class TestCriticSubscriberInvocation:
         """Critic retro can take >5s; subscriber must not block the poll loop."""
         from events.subscribers.critic_trigger import CriticSubscriber
         sub = CriticSubscriber(bus, critic_script_path=critic_script)
-        _seed_cursor_at_zero(bus)
         bus.emit(
             event_type=EventType.AGENT_FAILURE_CLUSTER,
             source="scout",
@@ -107,7 +91,6 @@ class TestCriticSubscriberInvocation:
     def test_handles_subprocess_error_without_crashing(self, bus, critic_script):
         from events.subscribers.critic_trigger import CriticSubscriber
         sub = CriticSubscriber(bus, critic_script_path=critic_script)
-        _seed_cursor_at_zero(bus)
         bus.emit(
             event_type=EventType.AGENT_FAILURE_CLUSTER,
             source="scout",
@@ -122,7 +105,6 @@ class TestCriticSubscriberInvocation:
         from events.subscribers.critic_trigger import CriticSubscriber
         missing = tmp_path / "does_not_exist.py"
         sub = CriticSubscriber(bus, critic_script_path=missing)
-        _seed_cursor_at_zero(bus)
         bus.emit(
             event_type=EventType.AGENT_FAILURE_CLUSTER,
             source="scout",
@@ -145,7 +127,6 @@ class TestCriticSubscriberDebounce:
             bus, critic_script_path=critic_script,
             debounce_seconds=300,
         )
-        _seed_cursor_at_zero(bus)
         for _ in range(2):
             bus.emit(
                 event_type=EventType.AGENT_FAILURE_CLUSTER,
@@ -166,7 +147,6 @@ class TestCriticSubscriberDebounce:
             bus, critic_script_path=critic_script,
             debounce_seconds=300,
         )
-        _seed_cursor_at_zero(bus)
         bus.emit(
             event_type=EventType.AGENT_FAILURE_CLUSTER,
             source="scout",

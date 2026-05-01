@@ -224,37 +224,6 @@ def test_cron_skipped_duplicate_round_trip_via_from_string():
     )
 
 
-# Cron gateway-downtime miss -- added 2026-04-30. Emitted by
-# cron/scheduler.py:tick() via CronEventEmitter.on_job_skipped() when
-# get_due_and_skipped_jobs() reports a recurring job's missed fire was
-# fast-forwarded (skip_only opt-out, weekly cron, or daily missed >24h).
-# Spec: docs/superpowers/specs/2026-04-30-cron-restart-catchup-gap-design.md.
-
-def test_cron_skipped_event_type_exists():
-    assert EventType.CRON_SKIPPED.type_string == "cron_skipped"
-
-
-def test_cron_skipped_default_priority_is_high():
-    assert EventType.CRON_SKIPPED.default_priority == Priority.HIGH
-
-
-def test_cron_skipped_round_trip_via_from_string():
-    assert EventType.from_string("cron_skipped") is EventType.CRON_SKIPPED
-
-
-def test_cron_aborted_event_type_exists():
-    """Guard #1 (2026-04-30): CRON_ABORTED is emitted on gateway shutdown
-    so dangling cron_started events get a paired terminal event in
-    audit.jsonl. HIGH priority so the abort surfaces in operator alerts
-    rather than being batched into low-priority telemetry."""
-    assert EventType.CRON_ABORTED.type_string == "cron_aborted"
-    assert EventType.CRON_ABORTED.default_priority == Priority.HIGH
-
-
-def test_cron_aborted_round_trip_via_from_string():
-    assert EventType.from_string("cron_aborted") is EventType.CRON_ABORTED
-
-
 # Gateway lifecycle events — added 2026-04-30 (gateway-restart-cluster
 # investigation, mitigation M1). Distinguishes a watchdog recovery from
 # an operator restart at audit time. Without these, the only signal of a
