@@ -2253,7 +2253,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": str(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        """POST /api/jobs/{job_id}/run — trigger immediate execution.
+
+        Threads ``caller="http_api:api_server"`` plus an optional ``?reason=``
+        query string into ``trigger_job`` so every off-schedule fire from
+        this route lands in the audit log via the cron_triggered event with
+        attribution. Closes the postmortem-attribution gap surfaced by the
+        2026-04-30 sentinel-vip-morning triple-fire investigation
+        (sentinel-vip-burst-rc-2026-04-30.md §5).
+        """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -2264,7 +2272,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if id_err:
             return id_err
         try:
-            job = _cron_trigger(job_id)
+            reason = request.query.get("reason") or None
+            job = _cron_trigger(
+                job_id,
+                caller="http_api:api_server",
+                reason=reason,
+            )
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})

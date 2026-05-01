@@ -448,7 +448,15 @@ class TestResumeJob:
 class TestRunJob:
     @pytest.mark.asyncio
     async def test_run_job(self, adapter):
-        """POST /api/jobs/{id}/run returns triggered job."""
+        """POST /api/jobs/{id}/run returns triggered job + threads
+        ``caller="http_api:api_server"`` for postmortem attribution.
+
+        Updated 2026-04-30 follow-up to sentinel-vip-burst-rc-2026-04-30.md
+        §5: this route used to call ``_cron_trigger(job_id)`` anonymously,
+        which left the cron_triggered audit event without caller info and
+        tripped the trigger_job-called-anonymously warning.  The route
+        now passes caller + reason explicitly.
+        """
         app = _create_app(adapter)
         triggered_job = {**SAMPLE_JOB, "last_run": "2025-01-01T00:00:00Z"}
         mock_trigger = MagicMock(return_value=triggered_job)
@@ -462,7 +470,58 @@ class TestRunJob:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data["job"] == triggered_job
-                mock_trigger.assert_called_once_with(VALID_JOB_ID)
+                # No reason query param => reason=None passed through.
+                mock_trigger.assert_called_once_with(
+                    VALID_JOB_ID,
+                    caller="http_api:api_server",
+                    reason=None,
+                )
+
+    @pytest.mark.asyncio
+    async def test_run_job_threads_reason_query_param(self, adapter):
+        """``?reason=...`` query param is threaded into trigger_job for
+        postmortem attribution."""
+        app = _create_app(adapter)
+        triggered_job = {**SAMPLE_JOB}
+        mock_trigger = MagicMock(return_value=triggered_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/run?reason=manual_retry"
+                )
+                assert resp.status == 200
+                mock_trigger.assert_called_once_with(
+                    VALID_JOB_ID,
+                    caller="http_api:api_server",
+                    reason="manual_retry",
+                )
+
+    @pytest.mark.asyncio
+    async def test_run_job_empty_reason_normalizes_to_none(self, adapter):
+        """``?reason=`` (empty value) is normalized to None rather than
+        passed as an empty string -- keeps the audit payload tidy."""
+        app = _create_app(adapter)
+        triggered_job = {**SAMPLE_JOB}
+        mock_trigger = MagicMock(return_value=triggered_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_trigger", mock_trigger
+            ):
+                resp = await cli.post(
+                    f"/api/jobs/{VALID_JOB_ID}/run?reason="
+                )
+                assert resp.status == 200
+                mock_trigger.assert_called_once_with(
+                    VALID_JOB_ID,
+                    caller="http_api:api_server",
+                    reason=None,
+                )
 
 
 # ---------------------------------------------------------------------------
