@@ -16495,7 +16495,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-# Fire on_tool_call_start hook before the progress_queue guard so
+            # Fire on_tool_call_start hook before the progress_queue guard so
             # reaction swapping works even when tool progress messages are off.
             if event_type == "tool.started" and tool_name and _status_adapter and _loop_for_step and _run_still_current():
                 try:
