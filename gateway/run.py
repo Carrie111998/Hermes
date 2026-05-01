@@ -1237,6 +1237,69 @@ class GatewayRunner:
         self._exit_reason = reason
         self._shutdown_event.set()
 
+    def _detect_boot_reason(self) -> str:
+        """Return a coarse classification of why this gateway booted.
+
+        Used by the GATEWAY_STARTED payload (M1, 2026-04-30 gateway-restart
+        cluster mitigation). Lets a future operator distinguish at a glance:
+          - "replace": user ran ``hermes gateway run --replace`` to take
+            over a stuck/stale gateway
+          - "watchdog_recovery": gateway_watchdog.py spawned us after a
+            heartbeat-stale or pid-dead detection
+          - "manual": operator ran ``hermes gateway run`` from a terminal
+            (the most common today's restart-cluster pattern)
+
+        Heuristics are deliberately cheap; if any fail we fall back to
+        "manual" rather than blocking startup.
+        """
+        if "--replace" in sys.argv:
+            return "replace"
+        try:
+            import psutil as _ps  # type: ignore
+            _pp = _ps.Process(os.getppid())
+            _pcmd = " ".join(_pp.cmdline()).lower()
+            if "gateway_watchdog" in _pcmd:
+                return "watchdog_recovery"
+        except Exception:
+            pass
+        # Cross-check the watchdog's own JSONL log for a recent
+        # restart_spawned event, since on Windows the watchdog detaches the
+        # spawned gateway from itself (CREATE_NEW_PROCESS_GROUP) and the
+        # parent_pid we see is whatever shell hermes.exe inherited from.
+        # 2-minute window matches the watchdog's polling cadence.
+        try:
+            from pathlib import Path as _Path
+            _events = _Path.home() / ".hermes" / "watchdog_events.jsonl"
+            if _events.exists():
+                from datetime import datetime as _dt, timezone as _tz
+                _now = _dt.now(_tz.utc)
+                # Scan the last few lines (file is append-only, latest at
+                # the bottom). 4096 bytes covers ~50 events worst-case.
+                with _events.open("rb") as _fh:
+                    try:
+                        _fh.seek(-4096, 2)
+                    except OSError:
+                        _fh.seek(0)
+                    _tail = _fh.read().decode("utf-8", errors="replace")
+                for _line in reversed(_tail.splitlines()):
+                    try:
+                        _evt = json.loads(_line)
+                    except Exception:
+                        continue
+                    if _evt.get("event") != "watchdog_restart_spawned":
+                        continue
+                    _ts = _evt.get("ts", "")
+                    try:
+                        _evt_dt = _dt.fromisoformat(_ts.replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    if (_now - _evt_dt).total_seconds() <= 120:
+                        return "watchdog_recovery"
+                    break  # only check most recent restart_spawned
+        except Exception:
+            pass
+        return "manual"
+
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
@@ -2056,6 +2119,12 @@ class GatewayRunner:
         # This prevents unwanted auto-resets after `hermes update`,
         # `hermes gateway restart`, or `/restart`.
         _clean_marker = _hermes_home / ".clean_shutdown"
+        # Stash the boolean for the GATEWAY_STARTED payload below — by the
+        # time we emit, the marker file is gone (consumed/unlinked). Without
+        # this stash, distinguishing operator-restart-after-Ctrl-C from
+        # crash-recovery in the bus consumer requires reaching into the
+        # filesystem, which the consumer shouldn't have to do.
+        self._previous_shutdown_was_clean: bool = _clean_marker.exists()
         if _clean_marker.exists():
             logger.info("Previous gateway exited cleanly — skipping session suspension")
             try:
@@ -2288,7 +2357,41 @@ class GatewayRunner:
         asyncio.create_task(self._platform_reconnect_watcher())
 
         logger.info("Press Ctrl+C to stop")
-        
+
+        # Emit GATEWAY_STARTED — added 2026-04-30 (M1 in
+        # profiles/sentinel/workspace/gateway-restart-cluster-2026-04-30.md).
+        # Carries operator-relevant context so future restart-cluster
+        # investigations don't have to triangulate via gateway.pid mtime +
+        # agent.log boot lines + watchdog probe gaps. Best-effort; never
+        # raises (the helper internally swallows bus failures).
+        try:
+            from events.gateway_integration import emit_gateway_started
+            _boot_payload: Dict[str, Any] = {
+                "argv": list(sys.argv),
+                "parent_pid": os.getppid(),
+                "boot_reason": self._detect_boot_reason(),
+                "platforms_connected": [p.value for p in self.adapters.keys()],
+            }
+            try:
+                import psutil as _ps  # type: ignore
+                _pp = _ps.Process(os.getppid())
+                _boot_payload["parent_name"] = _pp.name()
+                _boot_payload["parent_cmdline"] = " ".join(_pp.cmdline())[:300]
+            except Exception:
+                pass
+            # Surface whether this boot followed a clean shutdown so
+            # consumers can distinguish operator-restart-after-Ctrl-C from
+            # crash-recovery without having to inspect the marker file
+            # themselves. ``_clean_marker.unlink()`` already happened
+            # earlier in _start (line ~2062) so we record a boolean we
+            # captured into self at that point.
+            _boot_payload["previous_clean_shutdown"] = getattr(
+                self, "_previous_shutdown_was_clean", False
+            )
+            emit_gateway_started(_boot_payload)
+        except Exception:
+            logger.debug("emit_gateway_started failed (non-fatal)", exc_info=True)
+
         return True
     
     async def _session_expiry_watcher(self, interval: int = 300):
@@ -2628,6 +2731,37 @@ class GatewayRunner:
             )
             self._running = False
             self._draining = True
+
+            # Emit GATEWAY_STOPPED early in the shutdown path — added
+            # 2026-04-30 (M1 in profiles/sentinel/workspace/
+            # gateway-restart-cluster-2026-04-30.md). Idempotent: this is
+            # the most-informed caller (knows graceful vs restart) so it
+            # emits first; later atexit / signal-handler / fatal-exception
+            # callers see the dedupe flag and no-op. We emit BEFORE
+            # adapter disconnect + bus close so the event lands on the
+            # bus while the EventBus thread is still polling.
+            try:
+                from events.gateway_integration import emit_gateway_stopped
+                _stop_payload: Dict[str, Any] = {
+                    "exit_reason": "restart" if self._restart_requested else "graceful",
+                }
+                if self._restart_requested:
+                    _stop_payload["restart_detached"] = bool(self._restart_detached)
+                    _stop_payload["restart_via_service"] = bool(self._restart_via_service)
+                # In-flight cron correlation_ids for spawn-task #1's
+                # CRON_ABORTED synthesizer to pick up. The cron tracker
+                # lives in cron/inflight.py (Codex's branch); fall back to
+                # an empty list if that module isn't on this branch yet.
+                try:
+                    from cron.inflight import current_inflight_correlation_ids  # type: ignore
+                    _stop_payload["inflight_cron_correlation_ids"] = list(
+                        current_inflight_correlation_ids()
+                    )
+                except Exception:
+                    _stop_payload["inflight_cron_correlation_ids"] = []
+                emit_gateway_stopped(_stop_payload)
+            except Exception:
+                logger.debug("emit_gateway_stopped (graceful) failed (non-fatal)", exc_info=True)
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
@@ -11171,6 +11305,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         else:
             _signal_initiated_shutdown = True
             logger.info("Received SIGTERM/SIGINT — initiating shutdown")
+            # GATEWAY_STOPPED defense-in-depth — added 2026-04-30 (M1).
+            # _stop_impl is about to run via asyncio.create_task(runner.stop())
+            # below and will emit the canonical event with full context, but
+            # if the asyncio loop fails to schedule the task (rare race during
+            # event-loop teardown), this signal-path emit guarantees we log
+            # the cause. Idempotent: if _stop_impl wins the race, this is a
+            # no-op.
+            try:
+                from events.gateway_integration import emit_gateway_stopped
+                emit_gateway_stopped({
+                    "exit_reason": "signal",
+                    "signal_initiated": True,
+                })
+            except Exception:
+                pass
         # Diagnostic: log all hermes-related processes so we can identify
         # what triggered the signal (hermes update, hermes gateway restart,
         # a stale detached subprocess, etc.).
@@ -11244,6 +11393,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+    # GATEWAY_STOPPED defense-in-depth — added 2026-04-30 (M1). Three
+    # independent paths can leave the gateway: graceful _stop_impl (most
+    # informed), atexit fall-through, signal handlers. emit_gateway_stopped
+    # is idempotent, so the first call wins; the others no-op. Registered
+    # AFTER remove_pid_file so we record stop-state while pid file metadata
+    # is still on disk (the bus emit only needs os.getpid()).
+    def _atexit_emit_gateway_stopped() -> None:
+        try:
+            from events.gateway_integration import emit_gateway_stopped
+            emit_gateway_stopped({"exit_reason": "atexit"})
+        except Exception:
+            pass
+    atexit.register(_atexit_emit_gateway_stopped)
 
     # Start the gateway
     success = await runner.start()
@@ -11360,6 +11522,20 @@ def main():
                             exc.__class__.__name__, exc, tb)
         except Exception:
             # Logging itself failed; fall through to sidecar
+            pass
+        # GATEWAY_STOPPED on fatal-exception path — added 2026-04-30 (M1).
+        # Idempotent: if the graceful path / signal handler / atexit already
+        # emitted, this no-ops. The event lands BEFORE the .fatal sidecar
+        # write so the bus consumer sees the cause without having to read
+        # the sidecar file.
+        try:
+            from events.gateway_integration import emit_gateway_stopped
+            emit_gateway_stopped({
+                "exit_reason": "fatal_exception",
+                "error_class": exc.__class__.__name__,
+                "error_message": str(exc)[:500],
+            })
+        except Exception:
             pass
         # Sidecar marker so the watchdog and the operator can see this happened
         # even if logging is broken. Located next to the PID file so the same
