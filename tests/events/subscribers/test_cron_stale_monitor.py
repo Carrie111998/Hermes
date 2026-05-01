@@ -199,6 +199,7 @@ class TestCronAbortedClearsOpenJobs:
         )
 
         mon = CronStaleMonitor(bus)
+        _seed_cursor_at_zero(bus, mon.subscriber_id)
         mon.poll()
 
         assert _stale_events(bus) == []
