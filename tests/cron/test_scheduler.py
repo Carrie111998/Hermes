@@ -3117,3 +3117,101 @@ class TestFlushInflightAborts:
 
         assert count == 0
         assert sch._in_flight == {}
+
+
+@pytest.mark.usefixtures("_tick_lock_isolated")
+class TestWallclockTimeoutEmitsCronFailedNotAborted:
+    """Pin the design decision (2026-04-30 trade-off addendum) that
+    wallclock-timeout failures flow through ``on_job_completed(success=False)``
+    -> CRON_FAILED, NOT through ``on_job_aborted`` -> CRON_ABORTED.
+
+    Rationale (see
+    docs/superpowers/specs/2026-04-30-cron-aborted-wallclock-trade-off.md):
+
+    cron_aborted is reserved for gateway-fault scenarios (gateway shutdown
+    with futures in flight) where the agent had no chance to control the
+    outcome. Wallclock timeout is the scheduler killing an agent that took
+    longer than ``HERMES_CRON_HARD_TIMEOUT`` -- the agent IS the source of
+    the wedge, so the failure is agent-attributable and belongs on the
+    cron_failed path. Re-classifying it as cron_aborted (or emitting both)
+    would silence FailureClusterDetector clustering, ``consecutive_errors``
+    -> ``cron_failed_consecutive`` -> WhatsApp URGENT escalation,
+    ``digest_composer`` failure grouping, and the ``control_center``
+    activity feed -- all of which are the right operator signals for
+    repeated wedges.
+
+    ``flush_inflight_aborts`` continues to accept the ``"wallclock_timeout"``
+    reason value as forward-compat (see ``test_supports_wallclock_timeout_reason``
+    above), but no production caller invokes it for that case.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_in_flight(self):
+        from cron import scheduler as sch
+        sch._in_flight.clear()
+        yield
+        sch._in_flight.clear()
+
+    def _job(self):
+        return {"id": "wallclock-job", "name": "hung-cron", "deliver": "local"}
+
+    def test_wallclock_failure_emits_cron_failed_via_on_job_completed(self):
+        """Mirrors the wallclock-timeout return tuple from
+        ``cron/scheduler.py:run_job`` (lines 1546-1573 raise TimeoutError;
+        the surrounding ``except Exception`` catches and returns
+        ``(False, output, "", error_msg)``). _process_job must then route
+        the failure through ``on_job_completed(success=False)`` -- which
+        emits CRON_FAILED and feeds FailureClusterDetector / consecutive
+        escalation -- and must NOT call ``on_job_aborted``.
+        """
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "started-evt-id"
+
+        wallclock_error = (
+            "TimeoutError: Cron job 'hung-cron' exceeded wall-clock limit "
+            "1800s (elapsed 1801s) -- last activity: api_call_streaming"
+        )
+
+        with patch(
+            "cron.scheduler.get_due_and_skipped_jobs",
+            return_value=([self._job()], []),
+        ), patch("cron.scheduler.advance_next_run"), patch(
+            "cron.scheduler._get_event_emitter", return_value=emitter
+        ), patch(
+            "cron.scheduler.run_job",
+            return_value=(
+                False,
+                "# Cron Job: hung-cron (FAILED)\n",
+                "",
+                wallclock_error,
+            ),
+        ), patch(
+            "cron.scheduler.save_job_output", return_value="/tmp/out.md"
+        ), patch(
+            "cron.scheduler._deliver_result", return_value=None
+        ), patch("cron.scheduler.mark_job_run"), patch(
+            "cron.jobs.load_jobs",
+            return_value=[{"id": "wallclock-job", "consecutive_errors": 0}],
+        ):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        # Behavior pin #1: failure routed through on_job_completed (which
+        # emits CRON_FAILED), not on_job_aborted (which would emit
+        # CRON_ABORTED and skip the cluster detector).
+        emitter.on_job_completed.assert_called_once()
+        kwargs = emitter.on_job_completed.call_args.kwargs
+        assert kwargs["success"] is False, (
+            "wallclock failure must surface as success=False so cron_failed "
+            "is emitted (not cron_completed)"
+        )
+        assert kwargs["error"] == wallclock_error, (
+            "error text must pass through verbatim so classify_failure_type "
+            "and operator-readable diagnostics work downstream"
+        )
+
+        # Behavior pin #2: no cron_aborted emission for wallclock-timeout.
+        # Replacing or duplicating cron_failed with cron_aborted here would
+        # silence cluster detection / consecutive escalation -- see the
+        # class docstring and the trade-off spec for rationale.
+        emitter.on_job_aborted.assert_not_called()

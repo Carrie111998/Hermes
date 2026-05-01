@@ -233,3 +233,81 @@ class TestOnJobAborted:
         )
 
         emitter._cluster_detector.record.assert_not_called()
+
+
+class TestWallclockTimeoutFlowsThroughCronFailed:
+    """Pin the design decision (2026-04-30 trade-off addendum) that a
+    wallclock-timeout failure surfaces as CRON_FAILED via
+    ``on_job_completed(success=False)``, NOT as CRON_ABORTED via
+    ``on_job_aborted``.
+
+    This is the emitter-level counterpart to
+    ``tests/cron/test_scheduler.py::TestWallclockTimeoutEmitsCronFailedNotAborted``,
+    which pins the scheduler's decision not to invoke ``on_job_aborted``
+    for the wallclock case. Together they prevent the symmetry argument
+    ("every cron_started should pair with cron_aborted on scheduler-kill")
+    from quietly silencing the cluster-detector / consecutive-failure
+    operator alerts that today's cron_failed path provides.
+
+    See ``docs/superpowers/specs/2026-04-30-cron-aborted-wallclock-trade-off.md``
+    for the full rationale.
+    """
+
+    def test_wallclock_error_emits_cron_failed_and_feeds_cluster_detector(
+        self, emitter, bus
+    ):
+        """Calling ``on_job_completed(success=False, error=<wallclock-text>)``
+        must emit CRON_FAILED (not CRON_ABORTED) and feed
+        FailureClusterDetector. ``on_job_aborted`` deliberately skips the
+        detector (see ``test_does_not_record_failure_cluster`` above) --
+        switching wallclock to that path would silence repeated-wedge
+        clustering. This test pins the contract that prevents that drift.
+        """
+        from unittest.mock import MagicMock
+
+        # Spy on the cluster detector so we can assert it's invoked
+        # (unlike the on_job_aborted path).
+        emitter._cluster_detector = MagicMock()
+        emitter._cluster_detector.record.return_value = None
+
+        wallclock_error = (
+            "TimeoutError: Cron job 'hung-cron' exceeded wall-clock limit "
+            "1800s (elapsed 1801s) -- last activity: api_call_streaming"
+        )
+
+        emitter.on_job_completed(
+            job_id="job-x",
+            job_name="hung-cron",
+            success=False,
+            duration=1801.0,
+            error=wallclock_error,
+            consecutive_errors=1,
+        )
+
+        # Behavior pin #1: emits CRON_FAILED, NOT CRON_ABORTED.
+        failed_events = bus.query(event_type=EventType.CRON_FAILED)
+        aborted_events = bus.query(event_type=EventType.CRON_ABORTED)
+        assert len(failed_events) == 1, (
+            "wallclock failure must emit cron_failed via on_job_completed; "
+            f"got {len(failed_events)} cron_failed events"
+        )
+        assert len(aborted_events) == 0, (
+            "wallclock failure must NOT emit cron_aborted; that event is "
+            "reserved for gateway-fault scenarios. See "
+            "docs/superpowers/specs/2026-04-30-cron-aborted-wallclock-trade-off.md"
+        )
+
+        # Behavior pin #2: error_text is preserved in the cron_failed
+        # payload so downstream classification + operator-readable
+        # diagnostics work.
+        assert "wall-clock" in failed_events[0].payload["error"].lower()
+
+        # Behavior pin #3: cluster detector is fed (unlike on_job_aborted's
+        # deliberate skip). This is the operator-page signal -- 3 consecutive
+        # wallclock failures from the same source can trip
+        # agent_failure_cluster -- that we'd lose by re-routing to
+        # cron_aborted.
+        emitter._cluster_detector.record.assert_called_once()
+        record_kwargs = emitter._cluster_detector.record.call_args.kwargs
+        assert record_kwargs["success"] is False
+        assert "wall-clock" in record_kwargs["error_text"].lower()
