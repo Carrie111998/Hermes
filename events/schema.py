@@ -41,6 +41,13 @@ class EventType(Enum):
 
     # Cron lifecycle
     CRON_STARTED = ("cron_started", Priority.LOW)
+    # Off-schedule trigger record — emitted by trigger_job() in cron/jobs.py
+    # whenever a caller sets next_run_at = NOW (CLI `hermes cron run`, LLM
+    # cronjob tool action="run", HTTP API trigger endpoint). Carries caller
+    # + reason + previous/new next_run_at so off-schedule fires can be
+    # attributed in postmortems. LOW priority => audit-logger captures it
+    # but Telegram/WhatsApp routing leaves it out by default.
+    CRON_TRIGGERED = ("cron_triggered", Priority.LOW)
     CRON_COMPLETED = ("cron_completed", Priority.NORMAL)
     CRON_FAILED = ("cron_failed", Priority.HIGH)
     CRON_FAILED_CONSECUTIVE = ("cron_failed_consecutive", Priority.CRITICAL)
@@ -49,7 +56,22 @@ class EventType(Enum):
     # job is fast-forwarded past a missed fire window (gateway downtime
     # exceeded the catch-up grace, OR the job is opted out of fire-once via
     # recovery_policy="skip_only"). Spec: 2026-04-30-cron-restart-catchup-gap-design.md.
+    # Distinct from CRON_SKIPPED_DUPLICATE below — that one is the concurrency-
+    # guard reject; this one is the gateway-downtime miss.
     CRON_SKIPPED = ("cron_skipped", Priority.HIGH)
+    # Cron same-job concurrency guard -- added 2026-04-30 to close the
+    # 2026-04-30 sentinel-vip-morning triple-fire (canonical case
+    # event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). Emitted by the
+    # _in_flight guard in cron/scheduler.py when a duplicate concurrent
+    # fire is detected (typically a user-initiated trigger_job racing a
+    # tick-scheduled fire). Subscribers should treat as low-priority
+    # informational telemetry.  Payload:
+    #   job_id, job_name, prior_cron_started_event_id,
+    #   prior_elapsed_seconds, reason
+    # where reason is one of:
+    #   concurrent_fire_blocked      (prior is healthy, still running)
+    #   prior_fire_exceeded_timeout  (prior is wedged-but-tracked)
+    CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW)
 
     # Job discovery & scoring
     JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)

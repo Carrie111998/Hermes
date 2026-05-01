@@ -236,8 +236,20 @@ def cron_edit(args):
     return 0
 
 
-def _job_action(action: str, job_id: str, success_verb: str) -> int:
-    result = _cron_api(action=action, job_id=job_id)
+def _job_action(
+    action: str,
+    job_id: str,
+    success_verb: str,
+    *,
+    reason: Optional[str] = None,
+    caller: Optional[str] = None,
+) -> int:
+    kwargs = {"action": action, "job_id": job_id}
+    if reason is not None:
+        kwargs["reason"] = reason
+    if caller is not None:
+        kwargs["caller"] = caller
+    result = _cron_api(**kwargs)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -280,7 +292,13 @@ def cron_command(args):
         return _job_action("resume", args.job_id, "Resumed")
 
     if subcmd == "run":
-        return _job_action("run", args.job_id, "Triggered")
+        return _job_action(
+            "run",
+            args.job_id,
+            "Triggered",
+            reason=getattr(args, "reason", None),
+            caller="hermes_cli:cron_run",
+        )
 
     if subcmd in {"remove", "rm", "delete"}:
         return _job_action("remove", args.job_id, "Removed")

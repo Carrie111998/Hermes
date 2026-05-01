@@ -610,12 +610,45 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
-def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Schedule a job to run on the next scheduler tick."""
+def _get_event_bus():
+    """Lazy-construct an EventBus instance for emit-side use.
+
+    Kept as a module function so tests can monkeypatch the entire bus,
+    and so an import failure (e.g. during early bootstrap) doesn't crash
+    cron.jobs at module load.
+    """
+    from events.bus import EventBus
+    return EventBus()
+
+
+def trigger_job(
+    job_id: str,
+    caller: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Schedule a job to run on the next scheduler tick.
+
+    Sets ``next_run_at = NOW`` and emits a ``cron_triggered`` event capturing
+    the caller (e.g. ``"hermes_cli:cron_run"``, ``"llm:cronjob_tool"``,
+    ``"http_api:web_server"``) and an optional reason string. ``caller=None``
+    is allowed for backward compatibility but logs a WARNING — every internal
+    caller should pass an explicit caller string.
+    """
     job = get_job(job_id)
     if not job:
         return None
-    return update_job(
+
+    if caller is None:
+        logger.warning(
+            "trigger_job called anonymously (caller=None) for job_id=%s "
+            "name=%s — postmortem attribution will be impossible. "
+            "Pass an explicit caller string.",
+            job_id, job.get("name"),
+        )
+
+    previous_next_run_at = job.get("next_run_at")
+
+    updated = update_job(
         job_id,
         {
             "enabled": True,
@@ -625,6 +658,30 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "next_run_at": _hermes_now().isoformat(),
         },
     )
+
+    if updated is not None:
+        try:
+            from events.producers.cron_trigger_emitter import emit_cron_triggered
+            bus = _get_event_bus()
+            emit_cron_triggered(
+                bus,
+                job_id=job_id,
+                job_name=updated.get("name") or job.get("name") or job_id,
+                caller=caller,
+                reason=reason,
+                previous_next_run_at=previous_next_run_at,
+                new_next_run_at=updated["next_run_at"],
+            )
+        except Exception:
+            # Defensive: any bus/import failure must not break trigger_job.
+            # The state mutation has already been persisted; the audit gap
+            # is a known degradation, not a correctness regression.
+            logger.exception(
+                "trigger_job: cron_triggered emit failed for job_id=%s",
+                job_id,
+            )
+
+    return updated
 
 
 def remove_job(job_id: str) -> bool:

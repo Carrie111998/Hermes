@@ -852,3 +852,84 @@ class TestRecoveryPolicy:
         due_2, _ = get_due_and_skipped_jobs()
         assert not any(j["id"] == job["id"] for j in due_2), \
             "advance_next_run must move past the missed time so we don't re-fire"
+
+
+# =========================================================================
+# trigger_job — caller traceability
+#
+# Spec: docs/superpowers/plans/2026-04-30-cron-trigger-traceability.md
+# Origin: 2026-04-30 sentinel-vip-morning triple-fire silence-investigation
+# =========================================================================
+
+class TestTriggerJob:
+    def test_basic_signature_with_caller_and_reason(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, trigger_job
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = trigger_job(
+            job["id"],
+            caller="hermes_cli:cron_run",
+            reason="investigation 2026-04-30",
+        )
+
+        assert result is not None
+        assert result["state"] == "scheduled"
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        e = events[0]
+        assert e.payload["caller"] == "hermes_cli:cron_run"
+        assert e.payload["reason"] == "investigation 2026-04-30"
+        assert e.payload["job_id"] == job["id"]
+        assert e.payload["job_name"] == job["name"]
+        assert e.payload["previous_next_run_at"] == job["next_run_at"]
+        assert e.payload["new_next_run_at"] == result["next_run_at"]
+
+    def test_anonymous_caller_logs_warning(self, tmp_cron_dir, monkeypatch, caplog):
+        import logging
+        from cron.jobs import create_job, trigger_job
+        from events.bus import EventBus
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            trigger_job(job["id"])  # no caller
+
+        assert any(
+            "anonymous" in rec.message.lower() or "caller=None" in rec.message
+            for rec in caplog.records
+        ), f"Expected anonymous-caller warning; got: {[r.message for r in caplog.records]}"
+
+    def test_returns_none_for_unknown_job(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import trigger_job
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        assert trigger_job("nonexistent", caller="test") is None
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
+
+    def test_emit_failure_does_not_break_trigger(self, tmp_cron_dir, monkeypatch):
+        """Bus failure must not propagate — trigger_job must still update state."""
+        from cron.jobs import create_job, trigger_job, get_job
+
+        def broken_bus():
+            raise RuntimeError("bus broken")
+
+        monkeypatch.setattr("cron.jobs._get_event_bus", broken_bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = trigger_job(job["id"], caller="test")
+
+        assert result is not None
+        assert result["state"] == "scheduled"
+        assert get_job(job["id"])["state"] == "scheduled"

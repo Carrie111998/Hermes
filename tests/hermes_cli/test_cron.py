@@ -17,7 +17,13 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
-    def test_pause_resume_run(self, tmp_cron_dir, capsys):
+    def test_pause_resume_run(self, tmp_cron_dir, capsys, monkeypatch):
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
         job = create_job(prompt="Check server status", schedule="every 1h")
 
         cron_command(Namespace(cron_command="pause", job_id=job["id"]))
@@ -28,9 +34,20 @@ class TestCronCommandLifecycle:
         resumed = get_job(job["id"])
         assert resumed["state"] == "scheduled"
 
-        cron_command(Namespace(cron_command="run", job_id=job["id"]))
+        cron_command(
+            Namespace(
+                cron_command="run",
+                job_id=job["id"],
+                reason="investigation 2026-04-30",
+            )
+        )
         triggered = get_job(job["id"])
         assert triggered["state"] == "scheduled"
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        assert events[0].payload["caller"] == "hermes_cli:cron_run"
+        assert events[0].payload["reason"] == "investigation 2026-04-30"
 
         out = capsys.readouterr().out
         assert "Paused job" in out

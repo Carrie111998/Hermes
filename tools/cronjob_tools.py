@@ -235,6 +235,7 @@ def cronjob(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
+    caller: Optional[str] = None,
     script: Optional[str] = None,
     enabled_toolsets: Optional[List[str]] = None,
     task_id: str = None,
@@ -333,7 +334,8 @@ def cronjob(
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
-            updated = trigger_job(job_id)
+            effective_caller = caller or "llm:cronjob_tool"
+            updated = trigger_job(job_id, caller=effective_caller, reason=reason)
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "update":

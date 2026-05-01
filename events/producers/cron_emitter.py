@@ -76,6 +76,9 @@ class CronEventEmitter:
           - "skip_only"            — explicit recovery_policy="skip_only" opt-out
 
         Routed to the watchdog_alerts Telegram topic.
+
+        Distinct from on_job_skipped_duplicate below: this is the gateway-
+        downtime miss path; that is the concurrency-guard reject path.
         """
         return self.bus.emit(
             event_type=EventType.CRON_SKIPPED,
@@ -86,6 +89,36 @@ class CronEventEmitter:
                 "missed_at": missed_at,
                 "missed_seconds": missed_seconds,
                 "schedule_kind": schedule_kind,
+                "reason": reason,
+            },
+        )
+
+    def on_job_skipped_duplicate(
+        self,
+        job_id: str,
+        job_name: str,
+        prior_cron_started_event_id: Optional[str],
+        prior_elapsed_seconds: float,
+        reason: str,
+    ) -> str:
+        """Emit cron_skipped_duplicate when the in-flight guard rejects a fire.
+
+        Triggered by the same-job concurrency guard in cron/scheduler.py
+        (Guard #3, added 2026-04-30 to close the sentinel-vip-morning
+        triple-fire -- canonical event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e).
+
+        ``reason`` is one of:
+          * ``"concurrent_fire_blocked"`` -- prior fire still healthy and running
+          * ``"prior_fire_exceeded_timeout"`` -- prior fire wedged-but-tracked
+        """
+        return self.bus.emit(
+            event_type=EventType.CRON_SKIPPED_DUPLICATE,
+            source=job_name,
+            payload={
+                "job_id": job_id,
+                "job_name": job_name,
+                "prior_cron_started_event_id": prior_cron_started_event_id,
+                "prior_elapsed_seconds": prior_elapsed_seconds,
                 "reason": reason,
             },
         )

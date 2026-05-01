@@ -2077,9 +2077,9 @@ async def resume_cron_job(job_id: str):
 
 
 @app.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(job_id: str):
+async def trigger_cron_job(job_id: str, reason: Optional[str] = None):
     from cron.jobs import trigger_job
-    job = trigger_job(job_id)
+    job = trigger_job(job_id, caller="http_api:web_server", reason=reason)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
