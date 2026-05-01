@@ -29,6 +29,7 @@ EVENT_TYPE_EMOJI = {
     EventType.CRON_STALE:               "⌛",
     EventType.CRON_SKIPPED:             "💤",
     EventType.CRON_SKIPPED_DUPLICATE:   "⏭️",
+    EventType.CRON_SKIPPED_MIN_INTERVAL: "⏳",
     EventType.JOB_DISCOVERED:           "🎯",
     EventType.JOB_SCORED:               "📊",
     EventType.JOB_HIGH_SCORE:           "⭐",

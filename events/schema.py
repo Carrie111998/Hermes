@@ -72,6 +72,23 @@ class EventType(Enum):
     #   concurrent_fire_blocked      (prior is healthy, still running)
     #   prior_fire_exceeded_timeout  (prior is wedged-but-tracked)
     CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW)
+    # Cron min-interval-since-last-fire guard (Guard #4) -- added
+    # 2026-04-30 to close the SEQUENTIAL-burst gap left by Guard #3
+    # (CRON_SKIPPED_DUPLICATE only catches CONCURRENT fires). The
+    # 2026-04-30 sentinel-vip-morning fires at 14:02 / 14:34 / 14:49 UTC
+    # were spaced 28 min and 13 min apart -- each prior fire had already
+    # released its in-flight slot before the next one arrived, so Guard
+    # #3 never engaged.  Guard #4 rejects a tick-time fire when the
+    # job's last_run_at is within ``min_seconds_between_fires`` of NOW,
+    # regardless of whether the prior fire was tick-scheduled or trigger-
+    # scheduled.  Default off (``min_seconds_between_fires`` unset = 0);
+    # opt-in per-job via the field in jobs.json.  See
+    # ~/.hermes/profiles/main/workspace/sentinel-vip-burst-rc-2026-04-30.md
+    # §6 for the full design + per-job rollout recommendation.
+    # Payload:
+    #   job_id, job_name, last_run_at, elapsed_since_last_seconds,
+    #   min_seconds_between_fires
+    CRON_SKIPPED_MIN_INTERVAL = ("cron_skipped_min_interval", Priority.LOW)
 
     # Job discovery & scoring
     JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)

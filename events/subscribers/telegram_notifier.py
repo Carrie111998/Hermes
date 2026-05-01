@@ -96,6 +96,13 @@ TOPIC_ROUTING: Dict[str, str] = {
     # of duplicate-skips on one job is visible to the operator without
     # needing a dedicated topic. Added 2026-04-30 with EventType.
     'cron_skipped_duplicate': 'watchdog_alerts',
+    # cron_skipped_min_interval: Guard #4 (sequential-burst rejection).
+    # Same routing rationale as cron_skipped_duplicate — a sudden burst of
+    # min-interval rejections on one job indicates an external trigger
+    # source misbehaving and should be visible to the operator. LOW
+    # priority => batched. Added 2026-04-30 follow-up to sentinel-vip-
+    # burst-rc-2026-04-30.md §6.
+    'cron_skipped_min_interval': 'watchdog_alerts',
     'application_blocked': 'watchdog_alerts',
     'application_failed': 'watchdog_alerts',
     # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)

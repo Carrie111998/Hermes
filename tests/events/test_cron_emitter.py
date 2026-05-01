@@ -151,6 +151,48 @@ class TestSkippedDuplicate:
         assert events[0].payload["prior_cron_started_event_id"] is None
 
 
+class TestSkippedMinInterval:
+    """Cron min-seconds-between-fires guard (Guard #4) -- closes the
+    SEQUENTIAL-burst gap left by Guard #3 (CRON_SKIPPED_DUPLICATE only
+    catches CONCURRENT fires).  See sentinel-vip-burst-rc-2026-04-30.md §6."""
+
+    def test_emit_skipped_min_interval_basic(self, emitter, bus):
+        emitter.on_job_skipped_min_interval(
+            job_id="092f4ed7657c",
+            job_name="sentinel-vip-morning",
+            last_run_at="2026-04-30T14:06:03+00:00",
+            elapsed_since_last_seconds=300.0,
+            min_seconds_between_fires=1800,
+        )
+
+        events = bus.query(event_type=EventType.CRON_SKIPPED_MIN_INTERVAL)
+        assert len(events) == 1
+        evt = events[0]
+        assert evt.source == "sentinel-vip-morning"
+        assert evt.priority == Priority.LOW
+        assert evt.payload["job_id"] == "092f4ed7657c"
+        assert evt.payload["job_name"] == "sentinel-vip-morning"
+        assert evt.payload["last_run_at"] == "2026-04-30T14:06:03+00:00"
+        assert evt.payload["elapsed_since_last_seconds"] == 300.0
+        assert evt.payload["min_seconds_between_fires"] == 1800
+
+    def test_event_type_is_distinct_from_skipped_duplicate(self):
+        """The two skip event types must NOT collide -- operator dashboards
+        distinguish 'burst was rejected' from 'concurrent was rejected'."""
+        assert (
+            EventType.CRON_SKIPPED_MIN_INTERVAL.type_string
+            == "cron_skipped_min_interval"
+        )
+        assert (
+            EventType.CRON_SKIPPED_DUPLICATE.type_string
+            == "cron_skipped_duplicate"
+        )
+        assert (
+            EventType.CRON_SKIPPED_MIN_INTERVAL
+            is not EventType.CRON_SKIPPED_DUPLICATE
+        )
+
+
 def test_cron_emitter_has_no_regex_domain_parser():
     import events.producers.cron_emitter as ce
     src = open(ce.__file__, encoding="utf-8").read()

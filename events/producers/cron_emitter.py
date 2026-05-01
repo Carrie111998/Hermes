@@ -123,6 +123,34 @@ class CronEventEmitter:
             },
         )
 
+    def on_job_skipped_min_interval(
+        self,
+        job_id: str,
+        job_name: str,
+        last_run_at: str,
+        elapsed_since_last_seconds: float,
+        min_seconds_between_fires: int,
+    ) -> str:
+        """Emit cron_skipped_min_interval when Guard #4 rejects a fire.
+
+        Triggered by the min-seconds-between-fires guard in cron/scheduler.py
+        (Guard #4, added 2026-04-30 follow-up to close the SEQUENTIAL-burst
+        gap left by Guard #3).  Guard #3 only catches concurrent re-fires;
+        Guard #4 catches sequential-but-too-soon fires after a prior fire
+        has fully completed.  See sentinel-vip-burst-rc-2026-04-30.md §6.
+        """
+        return self.bus.emit(
+            event_type=EventType.CRON_SKIPPED_MIN_INTERVAL,
+            source=job_name,
+            payload={
+                "job_id": job_id,
+                "job_name": job_name,
+                "last_run_at": last_run_at,
+                "elapsed_since_last_seconds": elapsed_since_last_seconds,
+                "min_seconds_between_fires": min_seconds_between_fires,
+            },
+        )
+
     def on_job_completed(
         self,
         job_id: str,
