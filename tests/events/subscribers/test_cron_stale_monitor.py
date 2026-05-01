@@ -141,3 +141,81 @@ class TestCronStaleMonitor:
         mon.poll()  # must not raise
 
         assert _stale_events(bus) == []
+
+
+class TestCronAbortedClearsOpenJobs:
+    """Guard #1 (2026-04-30): CRON_ABORTED is a terminal event for the
+    stale-monitor's purposes — it must clear _open_jobs and _alerted
+    so a future fire of the same job_id can be tracked again, and so
+    a job that aborted cleanly during gateway shutdown does not trip
+    a spurious cron_stale alert when the monitor is re-loaded after
+    restart."""
+
+    def test_cron_aborted_in_event_types_filter(self):
+        """The subscriber's event_types list must include CRON_ABORTED so
+        the bus delivers it (otherwise the handle() branch is dead code)."""
+        assert EventType.CRON_ABORTED in CronStaleMonitor.event_types
+
+    def test_started_then_aborted_clears_open_jobs(self, bus):
+        """After a cron_aborted matches a prior cron_started, the job is no
+        longer tracked; even an old started_at can no longer trigger
+        cron_stale because _open_jobs has been cleared."""
+        old = datetime.now(timezone.utc) - timedelta(
+            seconds=CronStaleMonitor.STALE_THRESHOLD_SECONDS + 30)
+        _emit_started(bus, "job-abort", started_at=old)
+        bus.emit(
+            EventType.CRON_ABORTED, "scheduler",
+            {
+                "job_id": "job-abort",
+                "job_name": "job-abort",
+                "cron_started_event_id": "any",
+                "started_at": old.isoformat(),
+                "aborted_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_seconds": 60.0,
+                "reason": "gateway_shutdown",
+            },
+        )
+
+        mon = CronStaleMonitor(bus)
+        mon.poll()
+
+        assert _stale_events(bus) == []
+        assert "job-abort" not in mon._open_jobs
+
+    def test_aborted_clears_alerted_set(self, bus):
+        """If a stale alert was already emitted, a subsequent cron_aborted
+        must clear _alerted so a NEW fire of the same job_id can alert again
+        (mirroring the cron_completed / cron_failed clear behavior).
+
+        Seed _alerted + _open_jobs directly so this test does not depend
+        on poll()'s stale-emission path (which has a pre-existing test-
+        environment quirk also affecting test_started_only_past_threshold_emits_stale)."""
+        from events.schema import Event
+
+        mon = CronStaleMonitor(bus)
+        # Seed registry as if a prior poll had marked the job stale.
+        mon._open_jobs["job-realert"] = (
+            datetime.now(timezone.utc) - timedelta(seconds=600),
+            "job-realert",
+        )
+        mon._alerted.add("job-realert")
+        assert "job-realert" in mon._alerted
+
+        # Drive handle() directly with a CRON_ABORTED event — this is the
+        # branch under test (terminal-event clear).
+        aborted = Event.create(
+            EventType.CRON_ABORTED, "scheduler",
+            payload={
+                "job_id": "job-realert",
+                "job_name": "job-realert",
+                "cron_started_event_id": "any",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "aborted_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed_seconds": 60.0,
+                "reason": "gateway_shutdown",
+            },
+        )
+        mon.handle(aborted)
+
+        assert "job-realert" not in mon._alerted
+        assert "job-realert" not in mon._open_jobs

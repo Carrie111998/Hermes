@@ -30,6 +30,10 @@ class CronStaleMonitor(BaseSubscriber):
         EventType.CRON_STARTED,
         EventType.CRON_COMPLETED,
         EventType.CRON_FAILED,
+        # Guard #1 (2026-04-30): cron_aborted on gateway shutdown is a
+        # terminal event for the stale-monitor's purposes -- clears
+        # _open_jobs / _alerted just like cron_completed / cron_failed.
+        EventType.CRON_ABORTED,
     ]
 
     # Default threshold raised from 600 → 1200 after the 2026-04-19 flood
@@ -78,7 +82,11 @@ class CronStaleMonitor(BaseSubscriber):
             job_name = event.payload.get("job_name") or event.source or job_id
             self._open_jobs[job_id] = (started_at, job_name)
             self._alerted.discard(job_id)
-        elif event.event_type in (EventType.CRON_COMPLETED, EventType.CRON_FAILED):
+        elif event.event_type in (
+            EventType.CRON_COMPLETED,
+            EventType.CRON_FAILED,
+            EventType.CRON_ABORTED,
+        ):
             self._open_jobs.pop(job_id, None)
             self._alerted.discard(job_id)
 
