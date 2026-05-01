@@ -17,6 +17,20 @@ def bus(tmp_path):
     return EventBus(db_path=db_path)
 
 
+def _seed_subscriber_at_zero(bus: EventBus, subscriber_id: str) -> None:
+    """Force the subscriber's cursor to 0 so subscribe() returns events emitted
+    BEFORE its first poll. The bus's first-registration default (bus.py
+    subscribe() / subscriber_lag()) jumps to head-of-bus to prevent backlog
+    floods on real deploys; tests that exercise the historical behavior need
+    explicit backfill."""
+    bus._execute(
+        """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+           VALUES (?, 0, datetime('now'))
+           ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+        (subscriber_id,),
+    )
+
+
 class TestEmit:
     def test_emit_returns_event_id(self, bus):
         event_id = bus.emit(
@@ -53,6 +67,7 @@ class TestEmit:
 
 class TestSubscribe:
     def test_subscribe_returns_new_events(self, bus):
+        _seed_subscriber_at_zero(bus, "test-sub")
         bus.emit(EventType.CRON_COMPLETED, "scout", {"a": 1})
         bus.emit(EventType.CRON_COMPLETED, "matcher", {"b": 2})
 
@@ -62,6 +77,7 @@ class TestSubscribe:
         assert events[1].payload == {"b": 2}
 
     def test_subscribe_with_type_filter(self, bus):
+        _seed_subscriber_at_zero(bus, "test-sub")
         bus.emit(EventType.CRON_STARTED, "scout", {})
         bus.emit(EventType.JOB_DISCOVERED, "scout", {"title": "VP Finance"})
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
@@ -71,6 +87,7 @@ class TestSubscribe:
         assert events[0].event_type == EventType.JOB_DISCOVERED
 
     def test_subscribe_with_priority_filter(self, bus):
+        _seed_subscriber_at_zero(bus, "test-sub")
         bus.emit(EventType.CRON_STARTED, "scout", {})  # LOW
         bus.emit(EventType.CRON_FAILED, "scout", {})  # HIGH
         bus.emit(EventType.INTERVIEW_SIGNAL, "tracker", {})  # CRITICAL
@@ -79,6 +96,7 @@ class TestSubscribe:
         assert len(events) == 2
 
     def test_subscribe_cursor_advances(self, bus):
+        _seed_subscriber_at_zero(bus, "test-sub")
         bus.emit(EventType.CRON_COMPLETED, "scout", {"batch": 1})
 
         events1 = bus.subscribe("test-sub")
@@ -92,6 +110,8 @@ class TestSubscribe:
         assert events2[0].payload == {"batch": 2}
 
     def test_independent_subscribers(self, bus):
+        _seed_subscriber_at_zero(bus, "sub-a")
+        _seed_subscriber_at_zero(bus, "sub-b")
         bus.emit(EventType.CRON_COMPLETED, "scout", {"x": 1})
 
         events_a = bus.subscribe("sub-a")
@@ -156,11 +176,11 @@ class TestSubscriberLag:
     """Lag = events emitted after a subscriber's current cursor position."""
 
     def test_lag_is_zero_for_unknown_subscriber(self, bus):
-        # No cursor recorded yet → count from beginning
+        # No cursor recorded yet → defaults to bus head, so lag is 0.
+        # Mirrors subscribe()'s first-registration head-jump (bus.py 2026-04-28).
         bus.emit(EventType.CRON_STARTED, "scout", {})
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
-        # With no cursor, lag == total event count
-        assert bus.subscriber_lag("never-seen") == 2
+        assert bus.subscriber_lag("never-seen") == 0
 
     def test_lag_after_partial_processing(self, bus):
         # Emit 5 events
@@ -464,6 +484,7 @@ class TestSubscribeUnknownEventType:
         assert events == []
 
     def test_subscribe_returns_valid_events_alongside_unknowns(self, bus):
+        _seed_subscriber_at_zero(bus, "test-sub")
         valid_id_1 = bus.emit(EventType.CRON_STARTED, "scout", {})
         self._insert_unknown_row(bus, event_id="poison-mid")
         valid_id_2 = bus.emit(EventType.CRON_COMPLETED, "matcher", {})
@@ -481,6 +502,7 @@ class TestSubscribeUnknownEventType:
         """When the unknown row precedes a valid event in the same batch, the
         subscriber's ack of the valid event will advance the cursor past the
         unknown row, so it never re-appears."""
+        _seed_subscriber_at_zero(bus, "test-sub")
         self._insert_unknown_row(bus, event_id="poison-before-valid")
         valid_id = bus.emit(EventType.CRON_COMPLETED, "scout", {})
 
@@ -498,6 +520,7 @@ class TestSubscribeUnknownEventType:
     def test_subscribe_logs_warning_for_unknown_event_type(self, bus, caplog):
         import logging
         caplog.set_level(logging.WARNING, logger="events.bus")
+        _seed_subscriber_at_zero(bus, "test-sub")
         self._insert_unknown_row(bus, event_type="some_future_type")
         bus.subscribe("test-sub")
         # The unknown event_type string and event_id should appear in logs so
