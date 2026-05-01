@@ -27,6 +27,19 @@ def setup(tmp_path):
     }
 
 
+def _seed_audit_logger_cursor(bus: EventBus) -> None:
+    """Force AuditLogger's cursor to 0 so it sees events emitted BEFORE the
+    first poll. The bus's first-registration default (bus.py subscribe(),
+    2026-04-28) jumps to head-of-bus to prevent backlog floods on real
+    deploys; these end-to-end tests construct AuditLogger and emit, then
+    poll."""
+    bus._execute(
+        """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+           VALUES ('audit-logger', 0, datetime('now'))
+           ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+    )
+
+
 class TestEndToEnd:
     def test_cron_emit_to_audit_log(self, setup):
         bus = setup["bus"]
@@ -35,6 +48,7 @@ class TestEndToEnd:
 
         audit_path = tmp_path / "events" / "audit.jsonl"
         audit = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
 
         # Producer emits
         emitter.on_job_started("j1", "jobflow-scout", "0 8 * * *")
@@ -58,6 +72,7 @@ class TestEndToEnd:
 
         audit_path = tmp_path / "events" / "audit.jsonl"
         audit = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
 
         health.report_health("telegram", healthy=True)
         health.report_health("telegram", healthy=False)
@@ -96,6 +111,7 @@ class TestEndToEnd:
 
         registry = SubscriberRegistry()
         audit = AuditLogger(bus, audit_path=tmp_path / "events" / "audit.jsonl")
+        _seed_audit_logger_cursor(bus)
         registry.register(audit)
 
         emitter.on_job_started("j1", "scout", "0 8 * * *")

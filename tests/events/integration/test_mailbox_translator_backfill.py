@@ -32,6 +32,16 @@ def test_real_score_result_flows_through_to_job_scored(mailbox_tree, tmp_path):
         watcher = MailboxWatcher(bus, mailbox_root=mailbox_tree / "mailbox")
         translator = MailboxTranslator(bus)
 
+        # Seed translator cursor at zero so it sees mailbox_message events
+        # emitted by watcher.scan(). Without this, the 2026-04-28 head-jump
+        # default in events/bus.py:subscribe() lands the cursor past the
+        # emitted rows on the very first poll.
+        bus._execute(
+            """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+               VALUES ('mailbox-translator', 0, datetime('now'))
+               ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+        )
+
         emitted = watcher.scan()
         assert emitted > 0, "MailboxWatcher should emit mailbox_message for fixtures"
 

@@ -55,6 +55,18 @@ def test_full_stack_score_result_reaches_telegram(tmp_path, monkeypatch):
         translator = MailboxTranslator(bus)
         notifier = TelegramNotifier(bus, send_fn=send_fn)
 
+        # Seed both subscriber cursors at zero. The 2026-04-28 head-jump
+        # default in events/bus.py:subscribe() means new subscribers default
+        # to the current bus head; this end-to-end test emits via watcher.scan()
+        # and the chain only works if each subscriber sees those events.
+        for sid in ("mailbox-translator", "telegram-notifier"):
+            bus._execute(
+                """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+                   VALUES (?, 0, datetime('now'))
+                   ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+                (sid,),
+            )
+
         watcher.scan()
         translator.poll()
         notifier.poll()
