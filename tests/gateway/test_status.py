@@ -424,6 +424,104 @@ class TestScopedLocks:
         payload = json.loads(lock_path.read_text())
         assert payload["pid"] == os.getpid()
 
+    def test_acquire_scoped_lock_recheck_takes_over_after_pid_dies(
+        self, tmp_path, monkeypatch
+    ):
+        """The Windows tasklist-zombie race observed at restart #5
+        2026-04-30: a recently-killed PID briefly reports alive in tasklist
+        before Windows reaps the entry, so the first ``_pid_exists`` check
+        returns True. With ``pid_recheck_after_seconds`` > 0, the second
+        check after a sleep returns False and we take over."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+
+        # Round 1: alive (the zombie). Round 2: dead (Windows reaped).
+        call_count = {"n": 0}
+        def flaky_pid_exists(pid):
+            call_count["n"] += 1
+            return call_count["n"] == 1
+
+        monkeypatch.setattr(status, "_pid_exists", flaky_pid_exists)
+        monkeypatch.setattr(status, "pid_exists", flaky_pid_exists)
+        # Don't actually sleep in the test.
+        monkeypatch.setattr(status.time, "sleep", lambda _s: None)
+
+        acquired, existing = status.acquire_scoped_lock(
+            "telegram-bot-token", "secret",
+            metadata={"platform": "telegram"},
+            pid_recheck_after_seconds=2.0,
+        )
+
+        assert acquired is True
+        assert call_count["n"] == 2  # checked once, slept, checked again
+        payload = json.loads(lock_path.read_text())
+        assert payload["pid"] == os.getpid()
+
+    def test_acquire_scoped_lock_recheck_still_alive_returns_false(
+        self, tmp_path, monkeypatch
+    ):
+        """If the PID is genuinely alive (not a zombie), even after the
+        recheck delay the lock acquisition still fails. Don't break the
+        legitimate two-gateways-running case."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+
+        # Both checks return alive.
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        monkeypatch.setattr(status.time, "sleep", lambda _s: None)
+
+        acquired, existing = status.acquire_scoped_lock(
+            "telegram-bot-token", "secret",
+            metadata={"platform": "telegram"},
+            pid_recheck_after_seconds=2.0,
+        )
+
+        assert acquired is False
+        assert existing["pid"] == 99999
+
+    def test_acquire_scoped_lock_recheck_zero_skips_sleep(
+        self, tmp_path, monkeypatch
+    ):
+        """Default ``pid_recheck_after_seconds=0`` preserves legacy fast-fail
+        behaviour — used by callers that don't want to pay the 2s recheck
+        cost (e.g. release path, status probes)."""
+        monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
+        lock_path = tmp_path / "locks" / "telegram-bot-token-2bb80d537b1da3e3.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 123,
+            "kind": "hermes-gateway",
+        }))
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
+        sleep_calls = []
+        monkeypatch.setattr(status.time, "sleep", lambda s: sleep_calls.append(s))
+
+        acquired, existing = status.acquire_scoped_lock(
+            "telegram-bot-token", "secret",
+            metadata={"platform": "telegram"},
+        )
+
+        assert acquired is False
+        assert sleep_calls == []  # default is 0 — no sleep
+
     def test_release_scoped_lock_only_removes_current_owner(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "locks"))
 

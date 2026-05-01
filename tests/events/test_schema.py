@@ -253,3 +253,27 @@ def test_cron_aborted_event_type_exists():
 
 def test_cron_aborted_round_trip_via_from_string():
     assert EventType.from_string("cron_aborted") is EventType.CRON_ABORTED
+
+
+# Gateway lifecycle events — added 2026-04-30 (gateway-restart-cluster
+# investigation, mitigation M1). Distinguishes a watchdog recovery from
+# an operator restart at audit time. Without these, the only signal of a
+# gateway boot is the platforms-up cluster, which fires for any boot
+# regardless of cause. Spec: profiles/sentinel/workspace/
+# gateway-restart-cluster-2026-04-30.md.
+
+def test_gateway_lifecycle_event_types_exist():
+    assert EventType.GATEWAY_STARTED.type_string == "gateway_started"
+    assert EventType.GATEWAY_STOPPED.type_string == "gateway_stopped"
+
+
+def test_gateway_lifecycle_event_types_default_priorities():
+    # NORMAL: not a failure (so not HIGH), but operator-relevant (so not
+    # LOW where it'd batch out of sight in digest-only verbosity).
+    assert EventType.GATEWAY_STARTED.default_priority == Priority.NORMAL
+    assert EventType.GATEWAY_STOPPED.default_priority == Priority.NORMAL
+
+
+def test_gateway_lifecycle_event_types_round_trip_via_from_string():
+    for et in (EventType.GATEWAY_STARTED, EventType.GATEWAY_STOPPED):
+        assert EventType.from_string(et.type_string) is et

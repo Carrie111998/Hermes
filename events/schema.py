@@ -239,6 +239,22 @@ class EventType(Enum):
     NOTIFICATION_DELIVERED = ("notification_delivered", Priority.LOW)
     NOTIFICATION_FAILED = ("notification_failed", Priority.NORMAL)
 
+    # Gateway lifecycle — added 2026-04-30 (gateway-restart-cluster
+    # mitigation M1, profiles/sentinel/workspace/
+    # gateway-restart-cluster-2026-04-30.md). Without these the only signal
+    # of a gateway boot is the platforms-up cluster, which fires for any
+    # boot regardless of cause; restart investigations had to triangulate
+    # via gateway.pid mtime + agent.log boot lines + watchdog probe gaps.
+    # GATEWAY_STARTED carries pid + parent_pid + parent_cmdline + boot_reason
+    # so a watchdog recovery is distinguishable from an operator restart.
+    # GATEWAY_STOPPED carries pid + exit_reason + runtime_seconds + the
+    # inflight cron correlation_ids list so spawn-task-#1's CRON_ABORTED
+    # synthesizer can see what got killed. NORMAL priority so digest_only
+    # verbosity surfaces them alongside HIGH+ failures, but not LOW where
+    # they'd batch out of operator visibility.
+    GATEWAY_STARTED = ("gateway_started", Priority.NORMAL)
+    GATEWAY_STOPPED = ("gateway_stopped", Priority.NORMAL)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

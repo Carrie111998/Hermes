@@ -63,6 +63,16 @@ _subscriber_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 _startup_monotonic: float = 0.0
 
+# Gateway lifecycle dedupe + timing — added 2026-04-30 (M1 in
+# profiles/sentinel/workspace/gateway-restart-cluster-2026-04-30.md).
+# emit_gateway_stopped() is wired from three paths (graceful _stop_impl +
+# atexit + signal handler) to maximize coverage on Windows where SIGTERM
+# semantics differ. _gateway_stopped_emitted dedupes so the triple doesn't
+# triple-emit. _gateway_started_at_monotonic is captured at started-emit
+# time so stopped-emit can include runtime_seconds without a global wallclock.
+_gateway_stopped_emitted: bool = False
+_gateway_started_at_monotonic: Optional[float] = None
+
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
@@ -184,6 +194,92 @@ def shutdown() -> None:
 def get_bus() -> Optional[EventBus]:
     """Get the global EventBus instance (for use by CronEventEmitter)."""
     return _bus
+
+
+def emit_gateway_started(boot_payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Emit a single GATEWAY_STARTED event. Best-effort; never raises.
+
+    Caller (gateway/run.py) supplies a ``boot_payload`` carrying the
+    operator-relevant context: parent_pid + parent_cmdline + argv +
+    boot_reason + previous_pid (when discoverable). ``pid`` is auto-filled
+    from os.getpid().
+
+    Records ``_gateway_started_at_monotonic`` so a subsequent
+    emit_gateway_stopped() call can include runtime_seconds without a
+    global wallclock comparison.
+
+    Returns the emitted event_id, or None if the bus is unavailable.
+    """
+    global _gateway_started_at_monotonic
+    if _bus is None:
+        return None
+    _gateway_started_at_monotonic = time.monotonic()
+    payload: Dict[str, Any] = {"pid": os.getpid()}
+    if boot_payload:
+        payload.update(boot_payload)
+    try:
+        from events.schema import EventType
+        return _bus.emit(
+            event_type=EventType.GATEWAY_STARTED,
+            source="gateway",
+            payload=payload,
+        )
+    except Exception:
+        logger.exception("Failed to emit GATEWAY_STARTED")
+        return None
+
+
+def emit_gateway_stopped(stop_payload: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Emit a GATEWAY_STOPPED event exactly once per gateway process.
+
+    Idempotent: subsequent calls are no-ops. This is the contract that
+    justifies wiring three callers in gateway/run.py main():
+      1. graceful _stop_impl path (knows the most context — exit_reason,
+         restart vs shutdown, drain timeout)
+      2. atexit.register hook (catches sys.exit / unhandled exception
+         fall-through after _stop_impl was bypassed)
+      3. signal handlers (SIGINT / SIGTERM / SIGBREAK on Windows) — fire
+         before the asyncio loop notices the signal
+
+    The first caller wins — the graceful path holds the most-informed
+    exit_reason, so we preserve it even if atexit fires later.
+
+    WMI Terminate (Windows TerminateProcess) bypasses all three. For that
+    case, the next gateway boot's M2 stale-lock detection synthesizes a
+    GATEWAY_STOPPED(reason=detected_dead, previous_pid=X) on behalf of the
+    dead process.
+
+    If ``_bus`` is None we return without flipping the dedupe flag, so
+    a later call after the bus comes up (e.g. mid-startup crash where
+    only atexit fires before bus init) can still emit the canonical event.
+
+    Returns the emitted event_id, or None if the bus is unavailable or
+    the event was already emitted.
+    """
+    global _gateway_stopped_emitted
+    if _gateway_stopped_emitted:
+        return None
+    if _bus is None:
+        return None
+    payload: Dict[str, Any] = {"pid": os.getpid()}
+    if _gateway_started_at_monotonic is not None:
+        payload["runtime_seconds"] = round(
+            time.monotonic() - _gateway_started_at_monotonic, 3
+        )
+    if stop_payload:
+        payload.update(stop_payload)
+    try:
+        from events.schema import EventType
+        event_id = _bus.emit(
+            event_type=EventType.GATEWAY_STOPPED,
+            source="gateway",
+            payload=payload,
+        )
+        _gateway_stopped_emitted = True
+        return event_id
+    except Exception:
+        logger.exception("Failed to emit GATEWAY_STOPPED")
+        return None
 
 
 def get_health_monitor() -> Optional[GatewayHealthMonitor]:

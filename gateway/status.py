@@ -18,6 +18,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -525,11 +526,27 @@ def remove_pid_file() -> None:
         pass
 
 
-def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, Any]] = None) -> tuple[bool, Optional[dict[str, Any]]]:
+def acquire_scoped_lock(
+    scope: str,
+    identity: str,
+    metadata: Optional[dict[str, Any]] = None,
+    *,
+    pid_recheck_after_seconds: float = 0.0,
+) -> tuple[bool, Optional[dict[str, Any]]]:
     """Acquire a machine-local lock keyed by scope + identity.
 
     Used to prevent multiple local gateways from using the same external identity
     at once (e.g. the same Telegram bot token across different HERMES_HOME dirs).
+
+    ``pid_recheck_after_seconds`` (added 2026-04-30, M2 in profiles/sentinel/
+    workspace/gateway-restart-cluster-2026-04-30.md) defends against the
+    Windows tasklist-zombie race observed at restart #5: a recently-killed
+    PID briefly reports alive in tasklist before Windows reaps the entry,
+    so the first ``_pid_exists`` check returns True and we declare FATAL
+    even though the process is dying. When > 0, after detecting an alive
+    PID we sleep for the given duration and re-check; if the second check
+    returns dead, we treat the lock as stale and take over. Default 0.0
+    preserves legacy fast-fail behaviour for non-platform callers.
     """
     lock_path = _get_scope_lock_path(scope, identity)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,7 +582,23 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
         if not stale:
             if not _pid_exists(existing_pid):
                 stale = True
-            else:
+            elif pid_recheck_after_seconds > 0:
+                # Tasklist-zombie defence (M2): the PID claims to be alive,
+                # but on Windows ``tasklist`` can briefly report a dying
+                # process as alive before TerminateProcess completes
+                # cleanup. Sleep, then re-check. If the second check shows
+                # dead, treat as stale. Restart-#5 evidence: 2026-04-30
+                # 13:25 EDT, PID 32692 was reported alive at 13:25:16 but
+                # confirmed dead 5 seconds later.
+                time.sleep(pid_recheck_after_seconds)
+                if not _pid_exists(existing_pid):
+                    stale = True
+                    logger.warning(
+                        "acquire_scoped_lock(%s): PID %d initially reported "
+                        "alive but reaped after %.1fs recheck — taking over",
+                        scope, existing_pid, pid_recheck_after_seconds,
+                    )
+            if not stale:
                 current_start = _get_process_start_time(existing_pid)
                 if (
                     existing.get("start_time") is not None

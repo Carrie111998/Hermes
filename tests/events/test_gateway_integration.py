@@ -3,6 +3,8 @@
 import json
 import time
 
+import pytest
+
 # Force cron.scheduler to load from the worktree BEFORE any test calls
 # gi.startup() — startup transitively imports obs/oauth_llm.py which
 # inserts ~/.hermes/agent-src at sys.path[0], shadowing the cwd-relative
@@ -12,6 +14,7 @@ import time
 from cron import scheduler as _cron_scheduler  # noqa: F401  -- side-effect import
 from events import gateway_integration as gi
 from events.paths import gateway_heartbeat_path
+from events.schema import EventType
 from events.subscribers.mailbox_translator import MailboxTranslator
 
 
@@ -334,3 +337,128 @@ class TestShutdownEmitsCronAborted:
         finally:
             if gi._bus is not None:
                 gi.shutdown()
+
+
+# Gateway lifecycle emission tests — added 2026-04-30 (M1 in
+# profiles/sentinel/workspace/gateway-restart-cluster-2026-04-30.md).
+# Behavioural surface: emit_gateway_started fires once per boot with the
+# operator-relevant context; emit_gateway_stopped is idempotent so the
+# graceful-path call + atexit + signal-handler triple don't triple-emit.
+
+
+class _FakeBus:
+    """Minimal EventBus stand-in that records emit() calls."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+        self.last_event_id = 0
+
+    def emit(self, *, event_type, source, payload, priority=None,
+             correlation_id=None, job_id=None, tags=None):
+        self.last_event_id += 1
+        self.events.append({
+            "event_id": str(self.last_event_id),
+            "event_type": event_type,
+            "source": source,
+            "payload": dict(payload),
+            "priority": priority,
+        })
+        return str(self.last_event_id)
+
+
+@pytest.fixture
+def isolated_bus(monkeypatch):
+    """Substitute the module-level _bus with a fake; reset the dedupe flag."""
+    fake = _FakeBus()
+    monkeypatch.setattr(gi, "_bus", fake)
+    # Each test starts with a fresh dedupe flag and a known started_at, so
+    # tests that exercise stopped-without-prior-started can still be assertive
+    # about the runtime_seconds key (it should be absent rather than computed
+    # against another test's leftover monotonic).
+    monkeypatch.setattr(gi, "_gateway_stopped_emitted", False)
+    monkeypatch.setattr(gi, "_gateway_started_at_monotonic", None)
+    return fake
+
+
+class TestEmitGatewayStarted:
+    def test_emits_with_default_pid_payload(self, isolated_bus):
+        gi.emit_gateway_started()
+        assert len(isolated_bus.events) == 1
+        ev = isolated_bus.events[0]
+        assert ev["event_type"] == EventType.GATEWAY_STARTED
+        assert ev["source"] == "gateway"
+        assert ev["payload"]["pid"] > 0  # os.getpid() is always positive
+
+    def test_merges_caller_payload(self, isolated_bus):
+        gi.emit_gateway_started({
+            "parent_pid": 12345,
+            "parent_cmdline": "hermes gateway run",
+            "boot_reason": "manual",
+            "argv": ["hermes", "gateway", "run"],
+        })
+        ev = isolated_bus.events[0]
+        assert ev["payload"]["parent_pid"] == 12345
+        assert ev["payload"]["boot_reason"] == "manual"
+        assert ev["payload"]["argv"] == ["hermes", "gateway", "run"]
+
+    def test_records_monotonic_start_for_runtime_calc(self, isolated_bus):
+        assert gi._gateway_started_at_monotonic is None
+        gi.emit_gateway_started()
+        assert gi._gateway_started_at_monotonic is not None
+
+    def test_no_op_when_bus_is_none(self, monkeypatch):
+        monkeypatch.setattr(gi, "_bus", None)
+        # Must not raise even when the bus is unavailable. This is the path
+        # taken if startup() failed mid-init.
+        gi.emit_gateway_started({"pid": 1})
+
+
+class TestEmitGatewayStopped:
+    def test_emits_basic_payload(self, isolated_bus):
+        gi.emit_gateway_stopped({"exit_reason": "graceful"})
+        assert len(isolated_bus.events) == 1
+        ev = isolated_bus.events[0]
+        assert ev["event_type"] == EventType.GATEWAY_STOPPED
+        assert ev["source"] == "gateway"
+        assert ev["payload"]["pid"] > 0
+        assert ev["payload"]["exit_reason"] == "graceful"
+
+    def test_idempotent_across_multiple_calls(self, isolated_bus):
+        # Graceful-path + atexit + signal-handler triple must not triple-emit.
+        # This is the core dedupe guarantee that justifies wiring all three.
+        gi.emit_gateway_stopped({"exit_reason": "graceful"})
+        gi.emit_gateway_stopped({"exit_reason": "atexit"})
+        gi.emit_gateway_stopped({"exit_reason": "signal", "signal": "SIGTERM"})
+        assert len(isolated_bus.events) == 1
+        # The first call wins — that's the most-informed exit reason since
+        # the graceful path runs first and knows the most context.
+        assert isolated_bus.events[0]["payload"]["exit_reason"] == "graceful"
+
+    def test_runtime_seconds_computed_when_started_recorded(
+        self, isolated_bus, monkeypatch
+    ):
+        # Pretend we started 1.5 seconds ago.
+        monkeypatch.setattr(gi.time, "monotonic", lambda: 100.0)
+        gi.emit_gateway_started()
+        monkeypatch.setattr(gi.time, "monotonic", lambda: 101.5)
+        gi.emit_gateway_stopped({"exit_reason": "graceful"})
+        # Last event is the STOPPED one (started + stopped both emitted).
+        stopped_ev = isolated_bus.events[-1]
+        assert stopped_ev["payload"]["runtime_seconds"] == 1.5
+
+    def test_runtime_seconds_omitted_when_started_never_recorded(
+        self, isolated_bus
+    ):
+        # If somehow we land in shutdown without having recorded a start,
+        # don't fabricate a runtime_seconds value.
+        gi.emit_gateway_stopped({"exit_reason": "atexit"})
+        ev = isolated_bus.events[0]
+        assert "runtime_seconds" not in ev["payload"]
+
+    def test_no_op_when_bus_is_none(self, monkeypatch):
+        monkeypatch.setattr(gi, "_bus", None)
+        monkeypatch.setattr(gi, "_gateway_stopped_emitted", False)
+        gi.emit_gateway_stopped({"exit_reason": "atexit"})
+        # No exception, and the dedupe flag stays unflipped so a later call
+        # (after the bus comes back) can still emit the canonical event.
+        assert gi._gateway_stopped_emitted is False
