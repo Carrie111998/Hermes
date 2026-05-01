@@ -96,6 +96,11 @@ TOPIC_ROUTING: Dict[str, str] = {
     # of duplicate-skips on one job is visible to the operator without
     # needing a dedicated topic. Added 2026-04-30 with EventType.
     'cron_skipped_duplicate': 'watchdog_alerts',
+    # cron_aborted: Guard #1 (2026-04-30) emits this on gateway shutdown
+    # for any cron whose cron_started has no terminal partner. HIGH
+    # priority surfaces alongside cron_failed in operator alerts —
+    # losing in-flight work is a real signal, not informational telemetry.
+    'cron_aborted': 'watchdog_alerts',
     'application_blocked': 'watchdog_alerts',
     'application_failed': 'watchdog_alerts',
     # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)

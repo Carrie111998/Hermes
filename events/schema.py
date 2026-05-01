@@ -72,6 +72,22 @@ class EventType(Enum):
     #   concurrent_fire_blocked      (prior is healthy, still running)
     #   prior_fire_exceeded_timeout  (prior is wedged-but-tracked)
     CRON_SKIPPED_DUPLICATE = ("cron_skipped_duplicate", Priority.LOW)
+    # Cron aborted on gateway shutdown -- Guard #1, added 2026-04-30 to
+    # close the audit gap surfaced by the sentinel-vip-morning incident
+    # (canonical event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e). When the
+    # gateway shuts down with a cron future still in flight, emit one
+    # cron_aborted per still-tracked job so audit.jsonl never accumulates
+    # dangling cron_started rows. Subscribers should treat as terminal --
+    # CronStaleMonitor must clear _open_jobs / _alerted on receipt, same
+    # as cron_completed / cron_failed.  Payload:
+    #   job_id, job_name, cron_started_event_id, started_at, aborted_at,
+    #   elapsed_seconds, reason
+    # where reason is one of:
+    #   gateway_shutdown    (gateway is going down with futures in flight)
+    #   wallclock_timeout   (HERMES_CRON_HARD_TIMEOUT enforcement)
+    # HIGH priority so the abort surfaces in operator alerts rather than
+    # being batched into low-priority telemetry.
+    CRON_ABORTED = ("cron_aborted", Priority.HIGH)
 
     # Job discovery & scoring
     JOB_DISCOVERED = ("job_discovered", Priority.NORMAL)

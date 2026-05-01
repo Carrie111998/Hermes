@@ -240,3 +240,16 @@ def test_cron_skipped_default_priority_is_high():
 
 def test_cron_skipped_round_trip_via_from_string():
     assert EventType.from_string("cron_skipped") is EventType.CRON_SKIPPED
+
+
+def test_cron_aborted_event_type_exists():
+    """Guard #1 (2026-04-30): CRON_ABORTED is emitted on gateway shutdown
+    so dangling cron_started events get a paired terminal event in
+    audit.jsonl. HIGH priority so the abort surfaces in operator alerts
+    rather than being batched into low-priority telemetry."""
+    assert EventType.CRON_ABORTED.type_string == "cron_aborted"
+    assert EventType.CRON_ABORTED.default_priority == Priority.HIGH
+
+
+def test_cron_aborted_round_trip_via_from_string():
+    assert EventType.from_string("cron_aborted") is EventType.CRON_ABORTED

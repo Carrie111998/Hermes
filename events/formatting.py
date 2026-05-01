@@ -35,6 +35,10 @@ EVENT_TYPE_EMOJI = {
     # Both branches originally picked ⏭️; resolved in merge e85794fd (2026-04-30).
     EventType.CRON_SKIPPED:             "💤",
     EventType.CRON_SKIPPED_DUPLICATE:   "⏭️",
+    # Cron aborted on gateway shutdown (Guard #1, 2026-04-30) — distinct
+    # from CRON_FAILED (agent-fault) and CRON_SKIPPED_DUPLICATE (concurrency
+    # guard reject). Stop-sign signals "scheduler interrupted this fire."
+    EventType.CRON_ABORTED:             "🛑",
     EventType.JOB_DISCOVERED:           "🎯",
     EventType.JOB_SCORED:               "📊",
     EventType.JOB_HIGH_SCORE:           "⭐",
