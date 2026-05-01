@@ -2514,6 +2514,18 @@ DEFAULT_CONFIG = {
     # Empty string means use server-local time.
     "timezone": "",
 
+    # Agent identity emoji shown on message acknowledgment and completion.
+    # Platforms that support reactions (Discord, Signal, etc.) display this emoji
+    # while the agent is processing. Empty string falls back to 👀.
+    # Can be overridden per-platform under discord.persona_emoji, etc.
+    "persona_emoji": "",
+
+    # Swap the active reaction emoji to reflect the current tool call.
+    # Provides per-tool visibility (📖 read_file, 💻 terminal, 🌐 browser, etc.)
+    # without cluttering the chat with text messages.
+    # Can be overridden per-platform under discord.dynamic_reactions, etc.
+    "dynamic_reactions": True,
+
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels
