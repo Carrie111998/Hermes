@@ -9,6 +9,22 @@ from events.schema import EventType, Priority
 from events.subscribers.base import BaseSubscriber, SubscriberRegistry
 
 
+def _seed_subscribers(bus: EventBus, *subscribers: BaseSubscriber) -> None:
+    """Force each subscriber's cursor to 0 so poll() returns events emitted
+    BEFORE the first poll. The bus's first-registration default (bus.py
+    subscribe(), 2026-04-28) jumps to head-of-bus to prevent backlog floods
+    on real deploys; tests that emit before polling need explicit backfill.
+    Call AFTER any mutation of subscriber.subscriber_id so the right key is
+    seeded."""
+    for s in subscribers:
+        bus._execute(
+            """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+               VALUES (?, 0, datetime('now'))
+               ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+            (s.subscriber_id,),
+        )
+
+
 class FlakySubscriber(BaseSubscriber):
     """Subscriber whose handle() can be made to throw on demand."""
 
@@ -61,6 +77,7 @@ class TestBaseSubscriber:
     def test_poll_processes_events(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = StubSubscriber(bus)
+        _seed_subscribers(bus, sub)
 
         bus.emit(EventType.CRON_COMPLETED, "scout", {"a": 1})
         bus.emit(EventType.CRON_STARTED, "matcher", {"b": 2})
@@ -72,6 +89,7 @@ class TestBaseSubscriber:
     def test_poll_advances_cursor(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = StubSubscriber(bus)
+        _seed_subscribers(bus, sub)
 
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
         sub.poll()
@@ -84,6 +102,7 @@ class TestBaseSubscriber:
     def test_filtered_subscriber(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FilteredSubscriber(bus)
+        _seed_subscribers(bus, sub)
 
         bus.emit(EventType.CRON_STARTED, "scout", {})        # LOW -- filtered
         bus.emit(EventType.JOB_HIGH_SCORE, "matcher", {})     # HIGH -- passes
@@ -112,6 +131,7 @@ class TestBaseSubscriber:
                     raise ValueError("boom")
 
         sub = FailingSubscriber(bus)
+        _seed_subscribers(bus, sub)
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
         bus.emit(EventType.CRON_COMPLETED, "matcher", {})
 
@@ -139,6 +159,7 @@ class TestSubscriberRegistry:
         sub1.subscriber_id = "stub-1"
         sub2 = StubSubscriber(bus)
         sub2.subscriber_id = "stub-2"
+        _seed_subscribers(bus, sub1, sub2)
 
         registry.register(sub1)
         registry.register(sub2)
@@ -155,6 +176,7 @@ class TestCircuitBreaker:
     def test_consecutive_errors_counter_increments(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
         bus.emit(EventType.CRON_COMPLETED, "test", {})
         sub.poll()
@@ -163,6 +185,7 @@ class TestCircuitBreaker:
     def test_success_resets_consecutive_errors(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
 
         # First event fails
         sub.raise_error = True
@@ -179,6 +202,7 @@ class TestCircuitBreaker:
     def test_threshold_opens_circuit(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
 
         # Emit exactly threshold events — after processing, circuit opens
@@ -190,6 +214,7 @@ class TestCircuitBreaker:
     def test_quarantined_subscriber_skips_handle(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
 
         # Trip the breaker
@@ -209,6 +234,7 @@ class TestCircuitBreaker:
     def test_cooldown_expiry_reopens_circuit(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
 
         for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
@@ -232,6 +258,7 @@ class TestCircuitBreaker:
     def test_emits_agent_error_on_trip(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
 
         for _ in range(sub.CIRCUIT_BREAKER_ERROR_THRESHOLD):
@@ -246,6 +273,7 @@ class TestCircuitBreaker:
     def test_agent_error_not_duplicated_while_quarantined(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
 
         # Trip
@@ -270,6 +298,7 @@ class TestLagAlertHelper:
         slow.subscriber_id = "slow"
         fast = StubSubscriber(bus)
         fast.subscriber_id = "fast"
+        _seed_subscribers(bus, slow, fast)
         registry.register(slow)
         registry.register(fast)
         return bus, registry, slow, fast
@@ -353,6 +382,7 @@ class TestSubscriberLagReport:
         a.subscriber_id = "sub-a"
         b = StubSubscriber(bus)
         b.subscriber_id = "sub-b"
+        _seed_subscribers(bus, a, b)
         registry.register(a)
         registry.register(b)
 
@@ -370,6 +400,7 @@ class TestSubscriberLagReport:
         registry = SubscriberRegistry()
 
         filtered = FilteredSubscriber(bus)
+        _seed_subscribers(bus, filtered)
         registry.register(filtered)
 
         for _ in range(150):
@@ -388,6 +419,7 @@ class TestDeadLetterRecording:
     def test_handler_exception_records_dead_letter(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = FlakySubscriber(bus)
+        _seed_subscribers(bus, sub)
         sub.raise_error = True
 
         eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
@@ -451,6 +483,7 @@ class TestAtLeastOnceDedup:
     def test_successful_handle_marks_handled(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = StubSubscriber(bus)
+        _seed_subscribers(bus, sub)
 
         eid = bus.emit(EventType.CRON_COMPLETED, "test", {})
         sub.poll()
@@ -501,6 +534,7 @@ class TestAtLeastOnceDedup:
                 self.processed.append(event)
 
         sub = SelectiveFailure(bus)
+        _seed_subscribers(bus, sub)
         good = bus.emit(EventType.CRON_COMPLETED, "test", {"bad": False})
         bad = bus.emit(EventType.CRON_COMPLETED, "test", {"bad": True})
 
@@ -514,6 +548,7 @@ class TestAtLeastOnceDedup:
         """A bus-level failure in mark_handled must not cascade into the subscriber."""
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         sub = StubSubscriber(bus)
+        _seed_subscribers(bus, sub)
 
         def boom(*args, **kwargs):
             raise RuntimeError("handled_events table broken")
