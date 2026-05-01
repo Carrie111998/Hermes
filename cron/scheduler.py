@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -176,6 +177,11 @@ class _InFlightRecord:
     start_monotonic: float
     job_name: str
     cron_started_event_id: Optional[str] = None
+    # ISO8601 UTC timestamp captured at registration. Used by
+    # flush_inflight_aborts (Guard #1) to populate cron_aborted.started_at
+    # so audit.jsonl pairs can be correlated by wall-clock time, not just
+    # by event_id.
+    started_at: Optional[str] = None
 
 
 _in_flight: Dict[str, _InFlightRecord] = {}
@@ -217,6 +223,7 @@ def _try_register_in_flight(job_id: str, job_name: str) -> Optional[_InFlightRec
             start_monotonic=time.monotonic(),
             job_name=job_name,
             cron_started_event_id=None,
+            started_at=datetime.now(timezone.utc).isoformat(),
         )
         return None
 
@@ -239,6 +246,63 @@ def _release_in_flight(job_id: str) -> None:
     """Release the in-flight slot for ``job_id`` (idempotent)."""
     with _in_flight_lock:
         _in_flight.pop(job_id, None)
+
+
+def flush_inflight_aborts(reason: str) -> int:
+    """Drain the in-flight cron registry, emitting cron_aborted per entry.
+
+    Used at gateway shutdown (Guard #1, 2026-04-30) to ensure every
+    cron_started has a paired terminal event in audit.jsonl. The
+    canonical incident this closes is the sentinel-vip-morning triple-
+    fire (event_id 4edcb4b1-aa07-4dbb-b799-8af167d4f92e), where the
+    gateway died mid-LLM and the third fire's cron_started never paired
+    with cron_completed or cron_failed.
+
+    Returns the count of cron_aborted events successfully emitted.
+
+    Defensive guarantees (mirrors the cron path's existing patterns):
+      * The registry is always cleared, even if the bus is unavailable
+        or every emit fails — a fresh gateway must not see stale entries.
+      * Emit exceptions are logged and swallowed per-entry so one broken
+        emit cannot wedge the shutdown path.
+
+    ``reason`` is one of:
+      * ``"gateway_shutdown"`` -- gateway is shutting down with futures in flight
+      * ``"wallclock_timeout"`` -- HERMES_CRON_HARD_TIMEOUT enforcement
+    """
+    aborted_at = datetime.now(timezone.utc).isoformat()
+
+    # Snapshot under the lock, then release so emits don't block other
+    # cron paths (notably the wallclock-poll loop's _release_in_flight).
+    with _in_flight_lock:
+        snapshot = list(_in_flight.items())
+        _in_flight.clear()
+
+    emitter = _get_event_emitter()
+    if emitter is None:
+        return 0
+
+    count = 0
+    now_mono = time.monotonic()
+    for job_id, rec in snapshot:
+        elapsed = max(0.0, now_mono - rec.start_monotonic)
+        try:
+            emitter.on_job_aborted(
+                job_id=job_id,
+                job_name=rec.job_name,
+                cron_started_event_id=rec.cron_started_event_id,
+                started_at=rec.started_at or aborted_at,
+                aborted_at=aborted_at,
+                elapsed_seconds=round(elapsed, 1),
+                reason=reason,
+            )
+            count += 1
+        except Exception:
+            logger.exception(
+                "flush_inflight_aborts: failed to emit cron_aborted for %s",
+                job_id,
+            )
+    return count
 
 
 def _summarize_for_event_bus(final_response: str) -> str:

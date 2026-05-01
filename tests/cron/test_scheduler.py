@@ -2890,6 +2890,33 @@ class TestInFlightRegistryShape:
         # type(threading.Lock()) — this checks we have a real lock object.
         assert isinstance(sch._in_flight_lock, type(threading.Lock()))
 
+    def test_record_carries_started_at_iso(self):
+        """Guard #1 contract: registry exposes the wall-clock ISO start
+        time so flush_inflight_aborts can populate cron_aborted's
+        started_at field for the audit-log pair."""
+        from cron.scheduler import _InFlightRecord
+        rec = _InFlightRecord(
+            start_monotonic=42.0,
+            job_name="any",
+            cron_started_event_id=None,
+            started_at="2026-04-30T14:49:52+00:00",
+        )
+        assert rec.started_at == "2026-04-30T14:49:52+00:00"
+
+    def test_register_populates_started_at(self):
+        """_try_register_in_flight stamps started_at with current UTC ISO."""
+        from datetime import datetime
+        from cron import scheduler as sch
+        sch._in_flight.clear()
+        try:
+            assert sch._try_register_in_flight("job-xyz", "any") is None
+            rec = sch._in_flight["job-xyz"]
+            assert rec.started_at is not None
+            parsed = datetime.fromisoformat(rec.started_at)
+            assert parsed.tzinfo is not None
+        finally:
+            sch._in_flight.clear()
+
 
 # Cron gateway-downtime skip wiring -- tick() consumes the new
 # `skipped` half of get_due_and_skipped_jobs() and emits CRON_SKIPPED
@@ -2967,3 +2994,126 @@ class TestCronSkipped:
             tick(verbose=False)  # must not propagate
         # The exception was caught — emitter.on_job_skipped was attempted.
         assert emitter.on_job_skipped.call_count == 1
+
+
+class TestFlushInflightAborts:
+    """Guard #1 (2026-04-30): drain the in-flight registry on gateway
+    shutdown and emit one cron_aborted per still-tracked job."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_in_flight(self):
+        from cron import scheduler as sch
+        sch._in_flight.clear()
+        yield
+        sch._in_flight.clear()
+
+    def test_emits_one_cron_aborted_per_inflight_entry(self):
+        import time
+        from datetime import datetime
+        from cron import scheduler as sch
+        from cron.scheduler import _InFlightRecord
+
+        emitter = MagicMock()
+        emitter.on_job_aborted.return_value = "abort-evt-id"
+
+        sch._in_flight["job-a"] = _InFlightRecord(
+            start_monotonic=time.monotonic() - 5.0,
+            job_name="sentinel-vip-morning",
+            cron_started_event_id="started-a",
+            started_at="2026-04-30T14:49:52+00:00",
+        )
+        sch._in_flight["job-b"] = _InFlightRecord(
+            start_monotonic=time.monotonic() - 2.0,
+            job_name="jobflow-scout",
+            cron_started_event_id="started-b",
+            started_at="2026-04-30T14:50:30+00:00",
+        )
+
+        with patch("cron.scheduler._get_event_emitter", return_value=emitter):
+            count = sch.flush_inflight_aborts("gateway_shutdown")
+
+        assert count == 2
+        assert emitter.on_job_aborted.call_count == 2
+        assert sch._in_flight == {}
+
+        calls = {
+            c.kwargs["job_id"]: c.kwargs
+            for c in emitter.on_job_aborted.call_args_list
+        }
+        assert calls["job-a"]["job_name"] == "sentinel-vip-morning"
+        assert calls["job-a"]["cron_started_event_id"] == "started-a"
+        assert calls["job-a"]["started_at"] == "2026-04-30T14:49:52+00:00"
+        assert calls["job-a"]["reason"] == "gateway_shutdown"
+        assert calls["job-a"]["elapsed_seconds"] >= 0.0
+        # aborted_at is now-ish ISO; smoke check it parses with tz info.
+        parsed = datetime.fromisoformat(calls["job-a"]["aborted_at"])
+        assert parsed.tzinfo is not None
+
+    def test_supports_wallclock_timeout_reason(self):
+        """The helper accepts the wallclock_timeout reason value verbatim
+        so a future wallclock-path wiring can call it without re-shaping."""
+        import time
+        from cron import scheduler as sch
+        from cron.scheduler import _InFlightRecord
+
+        emitter = MagicMock()
+        sch._in_flight["job-x"] = _InFlightRecord(
+            start_monotonic=time.monotonic() - 1800.0,
+            job_name="hung-job",
+            cron_started_event_id="started-x",
+            started_at="2026-04-30T13:00:00+00:00",
+        )
+
+        with patch("cron.scheduler._get_event_emitter", return_value=emitter):
+            count = sch.flush_inflight_aborts("wallclock_timeout")
+
+        assert count == 1
+        emitter.on_job_aborted.assert_called_once()
+        kwargs = emitter.on_job_aborted.call_args.kwargs
+        assert kwargs["reason"] == "wallclock_timeout"
+        assert kwargs["elapsed_seconds"] >= 1800.0
+
+    def test_no_emitter_clears_registry_returns_zero(self):
+        """When the bus is unavailable (degraded gateway), still clear
+        the registry so a re-init doesn't see stale entries — but emit
+        nothing. Defensive parity with the rest of the cron path."""
+        import time
+        from cron import scheduler as sch
+        from cron.scheduler import _InFlightRecord
+
+        sch._in_flight["job-y"] = _InFlightRecord(
+            start_monotonic=time.monotonic(),
+            job_name="any",
+            cron_started_event_id=None,
+            started_at="2026-04-30T15:00:00+00:00",
+        )
+
+        with patch("cron.scheduler._get_event_emitter", return_value=None):
+            count = sch.flush_inflight_aborts("gateway_shutdown")
+
+        assert count == 0
+        assert sch._in_flight == {}
+
+    def test_emitter_failure_does_not_break_drain(self):
+        """A broken emitter must never wedge the shutdown path. Failed
+        emits are logged and the drain continues; the registry is still
+        cleared."""
+        import time
+        from cron import scheduler as sch
+        from cron.scheduler import _InFlightRecord
+
+        emitter = MagicMock()
+        emitter.on_job_aborted.side_effect = RuntimeError("bus closed")
+
+        sch._in_flight["job-z"] = _InFlightRecord(
+            start_monotonic=time.monotonic(),
+            job_name="any",
+            cron_started_event_id=None,
+            started_at="2026-04-30T15:00:00+00:00",
+        )
+
+        with patch("cron.scheduler._get_event_emitter", return_value=emitter):
+            count = sch.flush_inflight_aborts("gateway_shutdown")
+
+        assert count == 0
+        assert sch._in_flight == {}
