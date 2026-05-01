@@ -933,6 +933,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        # Per-message active reaction tracking for persona/tool emoji swapping.
+        # Key: message.id (int), Value: currently active reaction emoji (str).
+        self._active_tool_reactions: Dict[int, str] = {}
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 2000-char preview
         # cap, every subsequent progressive edit truncates to the SAME text;
@@ -2782,36 +2785,85 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"} \
+            and self.config.extra.get("reactions", True)
+
+    def _dynamic_reactions_enabled(self) -> bool:
+        """Check if per-tool reaction swapping is enabled."""
+        return self._reactions_enabled() and self.config.extra.get("dynamic_reactions", True)
+
+    def _persona_emoji(self) -> str:
+        """Return the agent's persona emoji from config.
+
+        Set ``discord.persona_emoji`` in config.yaml to give the agent a
+        unique identity emoji (e.g. 🔎 for Sherlock, ⚡ for Newton).
+        Falls back to 👀 so existing deployments are unaffected.
+        """
+        return self.config.extra.get("persona_emoji", "👀")
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction and record durable handling state."""
+        """Add the agent's persona emoji when processing begins,
+        and record durable handling state."""
         message = event.raw_message
         acked = False
         if self._reactions_enabled() and hasattr(message, "add_reaction"):
-            acked = await self._add_reaction(message, "👀")
+            emoji = self._persona_emoji()
+            acked = await self._add_reaction(message, emoji)
+            self._active_tool_reactions[message.id] = emoji
         await asyncio.to_thread(
             self._record_discord_processing_start,
             event,
             emoji_ack=acked,
         )
 
+    async def on_tool_call_start(self, event: MessageEvent, tool_name: str) -> None:
+        """Swap the active reaction to the tool-specific emoji.
+
+        Called by the gateway's progress_callback on every ``tool.started``
+        event. Removes the previous reaction (persona or prior tool) and
+        adds the emoji that represents the current tool, so the message
+        always shows exactly one reaction reflecting what the agent is doing.
+        """
+        if not self._dynamic_reactions_enabled():
+            return
+        message = event.raw_message
+        if not hasattr(message, "add_reaction"):
+            return
+        from agent.display import get_tool_emoji
+        tool_emoji = get_tool_emoji(tool_name, default="⚙️")
+        current = self._active_tool_reactions.get(message.id)
+        if current and current != tool_emoji:
+            await self._remove_reaction(message, current)
+        await self._add_reaction(message, tool_emoji)
+        self._active_tool_reactions[message.id] = tool_emoji
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for final reaction and durable state."""
+        """Replace the active reaction with ✅ (success) or ❌ (failure),
+        then restore the persona emoji so the agent's identity is visible,
+        and record durable handling state.
+
+        Persona emoji identifies the agent during work; the terminal
+        reaction is a status indicator independent of identity.
+        """
+        if self._reactions_enabled():
+            message = event.raw_message
+            if hasattr(message, "add_reaction"):
+                current = self._active_tool_reactions.pop(message.id, self._persona_emoji())
+                await self._remove_reaction(message, current)
+                if outcome == ProcessingOutcome.SUCCESS:
+                    await self._add_reaction(message, "✅")
+                elif outcome == ProcessingOutcome.FAILURE:
+                    await self._add_reaction(message, "❌")
+                # CANCELLED: remove active reaction, leave nothing
+                # Restore persona emoji after the terminal reaction so the
+                # agent's identity is still visible on the message.
+                if outcome in (ProcessingOutcome.SUCCESS, ProcessingOutcome.FAILURE):
+                    await self._add_reaction(message, self._persona_emoji())
         await asyncio.to_thread(
             self._record_discord_processing_complete,
             event,
             outcome,
         )
-        if not self._reactions_enabled():
-            return
-        message = event.raw_message
-        if hasattr(message, "add_reaction"):
-            await self._remove_reaction(message, "👀")
-            if outcome == ProcessingOutcome.SUCCESS:
-                await self._add_reaction(message, "✅")
-            elif outcome == ProcessingOutcome.FAILURE:
-                await self._add_reaction(message, "❌")
 
     async def send(
         self,

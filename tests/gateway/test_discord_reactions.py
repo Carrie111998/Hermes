@@ -87,6 +87,7 @@ def _make_event(message_id: str, raw_message) -> MessageEvent:
 @pytest.mark.asyncio
 async def test_process_message_background_adds_and_swaps_reactions(adapter):
     raw_message = SimpleNamespace(
+        id=1,
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
     )
@@ -149,6 +150,7 @@ async def test_interaction_backed_events_do_not_attempt_reactions(adapter):
 @pytest.mark.asyncio
 async def test_reaction_helper_failures_do_not_break_message_flow(adapter):
     raw_message = SimpleNamespace(
+        id=3,
         add_reaction=AsyncMock(side_effect=[RuntimeError("no perms"), RuntimeError("no perms")]),
         remove_reaction=AsyncMock(side_effect=RuntimeError("no perms")),
     )
@@ -224,6 +226,7 @@ async def test_reactions_enabled_by_default(adapter, monkeypatch):
     monkeypatch.delenv("DISCORD_REACTIONS", raising=False)
 
     raw_message = SimpleNamespace(
+        id=6,
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
     )
@@ -237,6 +240,7 @@ async def test_reactions_enabled_by_default(adapter, monkeypatch):
 @pytest.mark.asyncio
 async def test_on_processing_complete_cancelled_removes_eyes_without_terminal_reaction(adapter):
     raw_message = SimpleNamespace(
+        id=7,
         add_reaction=AsyncMock(),
         remove_reaction=AsyncMock(),
     )
