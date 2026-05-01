@@ -162,3 +162,74 @@ def test_cron_emitter_has_no_regex_domain_parser():
         "_parse_output_for_domain_events should be removed; MailboxTranslator "
         "handles domain event emission."
     )
+
+
+class TestOnJobAborted:
+    """CronEventEmitter.on_job_aborted (Guard #1, 2026-04-30) — emits
+    CRON_ABORTED. Deliberately does NOT feed FailureClusterDetector:
+    abort is gateway-fault, not agent-fault, so it must not trip
+    same-source cluster alerts."""
+
+    def test_emits_cron_aborted_with_full_payload(self, emitter, bus):
+        emitter.on_job_aborted(
+            job_id="092f4ed7657c",
+            job_name="sentinel-vip-morning",
+            cron_started_event_id="4edcb4b1-aa07-4dbb-b799-8af167d4f92e",
+            started_at="2026-04-30T14:49:52+00:00",
+            aborted_at="2026-04-30T14:56:43+00:00",
+            elapsed_seconds=411.0,
+            reason="gateway_shutdown",
+        )
+
+        events = bus.query(event_type=EventType.CRON_ABORTED)
+        assert len(events) == 1
+        ev = events[0]
+        assert ev.source == "sentinel-vip-morning"
+        assert ev.priority == Priority.HIGH
+        assert ev.payload == {
+            "job_id": "092f4ed7657c",
+            "job_name": "sentinel-vip-morning",
+            "cron_started_event_id": "4edcb4b1-aa07-4dbb-b799-8af167d4f92e",
+            "started_at": "2026-04-30T14:49:52+00:00",
+            "aborted_at": "2026-04-30T14:56:43+00:00",
+            "elapsed_seconds": 411.0,
+            "reason": "gateway_shutdown",
+        }
+
+    def test_emits_for_wallclock_timeout_reason(self, emitter, bus):
+        """Reason field passes through verbatim so a future wallclock-path
+        wiring can call this helper without re-shaping."""
+        emitter.on_job_aborted(
+            job_id="job-x",
+            job_name="hung-job",
+            cron_started_event_id=None,
+            started_at="2026-04-30T13:00:00+00:00",
+            aborted_at="2026-04-30T13:30:00+00:00",
+            elapsed_seconds=1800.0,
+            reason="wallclock_timeout",
+        )
+
+        events = bus.query(event_type=EventType.CRON_ABORTED)
+        assert len(events) == 1
+        assert events[0].payload["reason"] == "wallclock_timeout"
+        assert events[0].payload["cron_started_event_id"] is None
+
+    def test_does_not_record_failure_cluster(self, emitter):
+        """Cron_aborted is gateway-fault. If on_job_aborted fed the
+        cluster detector, a single gateway restart could trip a spurious
+        agent_failure_cluster for whichever agent was in flight."""
+        from unittest.mock import MagicMock
+
+        emitter._cluster_detector = MagicMock()  # spy
+
+        emitter.on_job_aborted(
+            job_id="any",
+            job_name="any-cron",
+            cron_started_event_id=None,
+            started_at="2026-04-30T15:00:00+00:00",
+            aborted_at="2026-04-30T15:00:01+00:00",
+            elapsed_seconds=1.0,
+            reason="gateway_shutdown",
+        )
+
+        emitter._cluster_detector.record.assert_not_called()

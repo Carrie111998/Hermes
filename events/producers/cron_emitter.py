@@ -123,6 +123,48 @@ class CronEventEmitter:
             },
         )
 
+    def on_job_aborted(
+        self,
+        job_id: str,
+        job_name: str,
+        cron_started_event_id: Optional[str],
+        started_at: str,
+        aborted_at: str,
+        elapsed_seconds: float,
+        reason: str,
+    ) -> str:
+        """Emit cron_aborted when a cron is interrupted before terminal completion.
+
+        Guard #1 (2026-04-30) — closes the audit gap where a gateway
+        shutdown with in-flight cron futures left dangling cron_started
+        rows in audit.jsonl with no paired terminal event. Canonical
+        incident: sentinel-vip-morning event_id
+        4edcb4b1-aa07-4dbb-b799-8af167d4f92e (third fire's LLM hung in
+        Anthropic; gateway died at 14:56 before any terminal event fired).
+
+        ``reason`` is one of:
+          * ``"gateway_shutdown"`` -- gateway is shutting down with futures in flight
+          * ``"wallclock_timeout"`` -- HERMES_CRON_HARD_TIMEOUT enforcement
+
+        Deliberately does NOT call FailureClusterDetector.record(...).
+        Cron_aborted is gateway-fault, not agent-fault, so it must not
+        trip same-source cluster alerts -- a single gateway restart
+        could otherwise spuriously cluster whichever agent was in flight.
+        """
+        return self.bus.emit(
+            event_type=EventType.CRON_ABORTED,
+            source=job_name,
+            payload={
+                "job_id": job_id,
+                "job_name": job_name,
+                "cron_started_event_id": cron_started_event_id,
+                "started_at": started_at,
+                "aborted_at": aborted_at,
+                "elapsed_seconds": elapsed_seconds,
+                "reason": reason,
+            },
+        )
+
     def on_job_completed(
         self,
         job_id: str,
