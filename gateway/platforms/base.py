@@ -993,14 +993,54 @@ class BasePlatformAdapter(ABC):
             await result
 
     def _acquire_platform_lock(self, scope: str, identity: str, resource_desc: str) -> bool:
-        """Acquire a scoped lock for this adapter. Returns True on success."""
-        from gateway.status import acquire_scoped_lock
+        """Acquire a scoped lock for this adapter. Returns True on success.
+
+        Uses ``pid_recheck_after_seconds=2.0`` to defeat the Windows
+        tasklist-zombie race observed at 2026-04-30 restart #5: a
+        recently-killed PID briefly reports alive in tasklist before
+        Windows reaps the entry, so the first acquire fails with
+        ``*-session_lock`` FATAL even though the previous gateway is
+        actually dying. The 2-second recheck inside acquire_scoped_lock
+        catches the case where the previous gateway has finished dying
+        by the time we look again — the canonical operator restart path.
+
+        When the recheck succeeds and we take over a stale lock, we
+        synthesize a GATEWAY_STOPPED event for the dead previous PID
+        (M2 in profiles/sentinel/workspace/
+        gateway-restart-cluster-2026-04-30.md) so the bus consumer sees
+        why the previous gateway disappeared without having to scrape
+        gateway.pid mtime + agent.log.
+        """
+        from gateway.status import (
+            acquire_scoped_lock,
+            _read_json_file,
+            _get_scope_lock_path,
+        )
         self._platform_lock_scope = scope
         self._platform_lock_identity = identity
+        # Snapshot the existing claimer (if any) BEFORE the acquire so we
+        # can synthesize a GATEWAY_STOPPED for it if our acquire wins.
+        # acquire_scoped_lock unlinks stale lock files internally, so
+        # peeking after the acquire is too late — the file is gone.
+        _prior_record = _read_json_file(_get_scope_lock_path(scope, identity))
+        _prior_pid = (
+            int(_prior_record.get("pid", 0))
+            if isinstance(_prior_record, dict) else 0
+        ) or None
+
         acquired, existing = acquire_scoped_lock(
-            scope, identity, metadata={'platform': self.platform.value}
+            scope, identity,
+            metadata={'platform': self.platform.value},
+            pid_recheck_after_seconds=2.0,
         )
         if acquired:
+            # If we just took over from a previous PID that's now dead,
+            # synthesize a GATEWAY_STOPPED on its behalf so the bus has a
+            # paired START/STOP record. Skip when _prior_pid is None
+            # (clean acquire — no previous owner) or when the prior PID
+            # is our own (update-style takeover that already emitted).
+            if _prior_pid and _prior_pid != os.getpid():
+                self._synthesize_previous_gateway_stopped(_prior_pid, scope)
             return True
         owner_pid = existing.get('pid') if isinstance(existing, dict) else None
         message = (
@@ -1011,6 +1051,49 @@ class BasePlatformAdapter(ABC):
         logger.error('[%s] %s', self.name, message)
         self._set_fatal_error(f'{scope}_lock', message, retryable=False)
         return False
+
+    def _synthesize_previous_gateway_stopped(self, prev_pid: int, scope: str) -> None:
+        """Emit a GATEWAY_STOPPED event on behalf of a dead previous PID.
+
+        Called from ``_acquire_platform_lock`` only on the takeover-success
+        path: we just successfully acquired a lock that was previously held
+        by ``prev_pid``, and ``acquire_scoped_lock``'s liveness recheck
+        confirmed that PID is now dead. WMI Terminate (Windows
+        TerminateProcess) bypasses the normal signal-handler / atexit /
+        graceful-shutdown paths, so the previous gateway never got to emit
+        its own GATEWAY_STOPPED. This synthesis closes the audit gap.
+
+        ``source`` differs from a normal stopped emit so a bus consumer
+        can distinguish self-emitted from synthesized — we don't fake
+        being the dead process, we declare ourselves as the synthesizer.
+        Best-effort; never raises.
+        """
+        try:
+            from events.gateway_integration import get_bus
+            from events.schema import EventType
+            bus = get_bus()
+            if bus is None:
+                return
+            bus.emit(
+                event_type=EventType.GATEWAY_STOPPED,
+                source="gateway-stale-lock-detector",
+                payload={
+                    "pid": prev_pid,
+                    "exit_reason": "detected_dead",
+                    "scope": scope,
+                    "synthesized_by_pid": os.getpid(),
+                    "platform": self.platform.value,
+                },
+            )
+            logger.warning(
+                "[%s] Synthesized GATEWAY_STOPPED for dead previous PID %d "
+                "(took over %s lock)", self.name, prev_pid, scope,
+            )
+        except Exception:
+            logger.debug(
+                "synthesize_previous_gateway_stopped failed",
+                exc_info=True,
+            )
 
     def _release_platform_lock(self) -> None:
         """Release the scoped lock acquired by _acquire_platform_lock."""
