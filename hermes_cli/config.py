@@ -2235,6 +2235,18 @@ DEFAULT_CONFIG = {
     # Empty string means use server-local time.
     "timezone": "",
 
+    # Agent identity emoji shown on message acknowledgment and completion.
+    # Platforms that support reactions (Discord, Signal, etc.) display this emoji
+    # while the agent is processing. Empty string falls back to 👀.
+    # Can be overridden per-platform under discord.persona_emoji, etc.
+    "persona_emoji": "",
+
+    # Swap the active reaction emoji to reflect the current tool call.
+    # Provides per-tool visibility (📖 read_file, 💻 terminal, 🌐 browser, etc.)
+    # without cluttering the chat with text messages.
+    # Can be overridden per-platform under discord.dynamic_reactions, etc.
+    "dynamic_reactions": True,
+
     # Slack platform settings (gateway mode)
     "slack": {
         "require_mention": True,       # Require @mention to respond in channels
@@ -2253,8 +2265,8 @@ DEFAULT_CONFIG = {
         "history_backfill": True,         # If True, prepend recent channel scrollback when bot is triggered (recovers messages missed while require_mention gated them out)
         "history_backfill_limit": 50,     # Max number of recent messages to scan when assembling the backfill block
         "reactions": True,             # Add emoji reactions to messages during processing
-        "persona_emoji": "",           # Agent identity emoji shown on ack + completion (e.g. 🔎). Empty = 👀
-        "dynamic_reactions": True,     # Swap reaction per tool call to show current activity
+        # persona_emoji: ""            # Per-platform override (inherits global persona_emoji if unset)
+        # dynamic_reactions: true      # Per-platform override (inherits global dynamic_reactions if unset)
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require

@@ -1782,17 +1782,33 @@ class DiscordAdapter(BasePlatformAdapter):
             and self.config.extra.get("reactions", True)
 
     def _dynamic_reactions_enabled(self) -> bool:
-        """Check if per-tool reaction swapping is enabled."""
-        return self._reactions_enabled() and self.config.extra.get("dynamic_reactions", True)
+        """Check if per-tool reaction swapping is enabled.
+
+        Resolution order:
+        1. ``discord.dynamic_reactions`` in config.yaml (platform override)
+        2. ``dynamic_reactions`` at top-level in config.yaml (global default)
+        3. True (built-in default)
+        """
+        if not self._reactions_enabled():
+            return False
+        extra = self.config.extra
+        if "dynamic_reactions" in extra:
+            return bool(extra["dynamic_reactions"])
+        from hermes_cli.config import load_config
+        return bool(load_config().get("dynamic_reactions", True))
 
     def _persona_emoji(self) -> str:
-        """Return the agent's persona emoji from config.
+        """Return the agent's persona emoji.
 
-        Set ``discord.persona_emoji`` in config.yaml to give the agent a
-        unique identity emoji (e.g. 🔎 for Sherlock, ⚡ for Newton).
-        Falls back to 👀 so existing deployments are unaffected.
+        Resolution order:
+        1. ``discord.persona_emoji`` in config.yaml (platform override)
+        2. ``persona_emoji`` at top-level in config.yaml (global default)
+        3. 👀 (built-in fallback so existing deployments are unaffected)
         """
-        return self.config.extra.get("persona_emoji", "👀")
+        if emoji := self.config.extra.get("persona_emoji"):
+            return emoji
+        from hermes_cli.config import load_config
+        return load_config().get("persona_emoji") or "👀"
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add the agent's persona emoji when processing begins."""
