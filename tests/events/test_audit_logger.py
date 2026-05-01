@@ -192,3 +192,63 @@ class TestRotation:
         # The second file's name should have the collision suffix.
         assert "-1.jsonl" in rotated[1].name or "-1.jsonl" in rotated[0].name, \
             f"one file should have collision suffix, got {[r.name for r in rotated]}"
+
+
+
+class TestStartupCursorSeed:
+    """AuditLogger.startup() seeds the cursor row at last_rowid=0 so the
+    operator-facing audit trail captures every event — including those
+    emitted between gateway startup and AuditLogger's first non-empty poll.
+
+    Without the seed, bus.subscribe()'s first-call default (per
+    2026-04-28 scribe backlog-flood fix) jumps to MAX(rowid) = current
+    bus head and silently skips those early events.
+    """
+
+    def test_startup_seeds_cursor_at_zero_when_missing(self, bus, audit_path):
+        logger_inst = AuditLogger(bus, audit_path=audit_path)
+
+        logger_inst.startup()
+
+        conn = bus._get_conn()
+        row = conn.execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            ("audit-logger",),
+        ).fetchone()
+        assert row is not None
+        assert row["last_rowid"] == 0
+
+    def test_startup_does_not_overwrite_existing_cursor(self, bus, audit_path):
+        # Simulate a gateway restart with persistent state: cursor row
+        # already exists at last_rowid=42 from a prior session.
+        conn = bus._get_conn()
+        conn.execute(
+            "INSERT INTO subscriber_cursors (subscriber_id, last_rowid) VALUES (?, 42)",
+            ("audit-logger",),
+        )
+        conn.commit()
+
+        logger_inst = AuditLogger(bus, audit_path=audit_path)
+        logger_inst.startup()
+
+        row = conn.execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            ("audit-logger",),
+        ).fetchone()
+        assert row["last_rowid"] == 42
+
+    def test_audit_picks_up_events_emitted_before_first_poll(self, bus, audit_path):
+        # Events emitted BEFORE AuditLogger has ever polled — exactly the
+        # gateway-startup-to-first-poll window the seed protects.
+        bus.emit(EventType.CRON_STARTED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+
+        logger_inst = AuditLogger(bus, audit_path=audit_path)
+        logger_inst.startup()
+        logger_inst.poll()
+
+        assert audit_path.exists()
+        lines = audit_path.read_text().strip().split("\n")
+        assert len(lines) == 2
+        assert json.loads(lines[0])["event_type"] == "cron_started"
+        assert json.loads(lines[1])["event_type"] == "cron_completed"

@@ -39,6 +39,30 @@ class AuditLogger(BaseSubscriber):
         self._archive_dir = self.audit_path.parent / "audit"
         self._last_rotation_check: float = 0
 
+    def startup(self) -> None:
+        """Seed the cursor row at last_rowid=0 so the audit trail is gap-free.
+
+        AuditLogger is the operator-facing forensic record — it MUST capture
+        every event that lands in the bus, including ones emitted in the
+        first few seconds of gateway life before any non-empty poll has
+        happened. Without an explicit seed, ``bus.subscribe()``'s
+        first-call default (per the 2026-04-28 scribe backlog-flood fix)
+        jumps to MAX(rowid)=current bus head and silently skips those
+        early events. ``bus.ack([])`` short-circuits, so no cursor row is
+        ever inserted by the normal poll path until something is acked.
+
+        INSERT OR IGNORE leaves any pre-existing cursor row alone, so a
+        gateway restart with persistent state continues from where it
+        last acked instead of replaying the whole bus.
+        """
+        conn = self.bus._get_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO subscriber_cursors "
+            "(subscriber_id, last_rowid) VALUES (?, 0)",
+            (self.subscriber_id,),
+        )
+        conn.commit()
+
     def handle(self, event: Event) -> None:
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(event.to_dict(), ensure_ascii=False)
