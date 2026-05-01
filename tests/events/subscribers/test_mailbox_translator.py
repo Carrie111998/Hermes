@@ -17,6 +17,19 @@ def bus(tmp_path):
     b.close()
 
 
+def _seed_translator_cursor(bus: EventBus) -> None:
+    """Force MailboxTranslator's cursor to 0 so it sees mailbox_message events
+    emitted BEFORE the first poll. The bus's first-registration default
+    (bus.py subscribe(), 2026-04-28) jumps to head-of-bus to prevent backlog
+    floods on real deploys; these tests emit before constructing the
+    translator. Idempotent so safe to call before every poll site."""
+    bus._execute(
+        """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+           VALUES ('mailbox-translator', 0, datetime('now'))
+           ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+    )
+
+
 def _mailbox_event(bus, message_type, payload, correlation_id="corr-1"):
     return bus.emit(
         event_type=EventType.MAILBOX_MESSAGE,
@@ -39,6 +52,7 @@ def test_score_result_emits_job_scored(bus):
         "score": 7.2, "recommendation": "REVIEW",
         "company": "Acme", "title": "Director Finance",
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     assert any(et == EventType.JOB_SCORED for et, _ in events)
@@ -52,6 +66,7 @@ def test_score_result_high_score_double_emits(bus):
         "score": 9.1, "recommendation": "PROCEED",
         "company": "BigCo", "title": "VP Finance",
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     types = [et for et, _ in events]
@@ -67,6 +82,7 @@ def test_batch_summary_expands_to_per_job_events(bus):
             {"score": 5.0, "company": "C", "title": "Z"},
         ],
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     scored = [p for et, p in events if et == EventType.JOB_SCORED]
@@ -84,6 +100,7 @@ def test_batch_summary_real_protocol_field_results(bus):
             {"score": 9.2, "company": "Beta",  "title": "VP"},
         ],
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     scored = [p for et, p in events if et == EventType.JOB_SCORED]
@@ -96,6 +113,7 @@ def test_batch_summary_real_protocol_field_results(bus):
 def test_submit_confirm_emits_application_submitted(bus):
     _mailbox_event(bus, "SUBMIT_CONFIRM",
                    {"company": "Acme", "title": "Director", "submission_id": "s1"})
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     assert any(et == EventType.APPLICATION_SUBMITTED for et, _ in events)
@@ -104,6 +122,7 @@ def test_submit_confirm_emits_application_submitted(bus):
 def test_blocked_question_emits_application_blocked(bus):
     _mailbox_event(bus, "BLOCKED_QUESTION",
                    {"company": "Acme", "title": "Director", "question": "Eligible?"})
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     assert any(et == EventType.APPLICATION_BLOCKED for et, _ in events)
@@ -114,6 +133,7 @@ def test_pipeline_update_emits_stage_transition_only_if_different(bus):
                    {"job_key": "j1", "previous_stage": "discovered", "new_stage": "scored"})
     _mailbox_event(bus, "PIPELINE_UPDATE",
                    {"job_key": "j2", "previous_stage": "X", "new_stage": "X"})
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     transitions = [p for et, p in events if et == EventType.STAGE_TRANSITION]
@@ -125,6 +145,7 @@ def test_pipeline_update_emits_on_first_stage_assignment(bus):
     """First assignment has previous_stage=None but IS a real transition."""
     _mailbox_event(bus, "PIPELINE_UPDATE",
                    {"job_key": "j3", "previous_stage": None, "new_stage": "discovered"})
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     transitions = [p for et, p in events if et == EventType.STAGE_TRANSITION]
@@ -143,6 +164,7 @@ def test_pipeline_update_accepts_tailor_alias_fields(bus):
             "title": "LMS Deposit Strategy & Analytics - NAM and LATAM Balance Sheet Lead - Director",
         },
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     transitions = [p for et, p in events if et == EventType.STAGE_TRANSITION]
@@ -158,6 +180,7 @@ def test_pipeline_update_accepts_tailor_alias_fields(bus):
 def test_error_message_emits_agent_error(bus):
     _mailbox_event(bus, "ERROR",
                    {"message": "scout failed", "source_agent": "scout"})
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     assert any(et == EventType.AGENT_ERROR for et, _ in events)
@@ -207,6 +230,7 @@ class TestMailboxErrorFeedsClusterDetector:
     def test_three_same_type_error_messages_emit_cluster(self, isolated_bus):
         for _ in range(3):
             self._emit_error(isolated_bus, "scout", "Bailing: CAPTCHA detected")
+        _seed_translator_cursor(isolated_bus)
         MailboxTranslator(isolated_bus).poll()
         clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
         assert len(clusters) == 1, (
@@ -225,6 +249,7 @@ class TestMailboxErrorFeedsClusterDetector:
     def test_two_same_type_errors_no_cluster(self, isolated_bus):
         for _ in range(2):
             self._emit_error(isolated_bus, "scout", "Bailing: CAPTCHA detected")
+        _seed_translator_cursor(isolated_bus)
         MailboxTranslator(isolated_bus).poll()
         clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
         assert clusters == []
@@ -233,6 +258,7 @@ class TestMailboxErrorFeedsClusterDetector:
         self._emit_error(isolated_bus, "scout", "captcha")
         self._emit_error(isolated_bus, "scout", "HTTP 401 Unauthorized")
         self._emit_error(isolated_bus, "scout", "Request timed out")
+        _seed_translator_cursor(isolated_bus)
         MailboxTranslator(isolated_bus).poll()
         clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
         assert clusters == []
@@ -241,6 +267,7 @@ class TestMailboxErrorFeedsClusterDetector:
         self._emit_error(isolated_bus, "scout", "captcha")
         self._emit_error(isolated_bus, "matcher", "captcha")
         self._emit_error(isolated_bus, "applier", "captcha")
+        _seed_translator_cursor(isolated_bus)
         MailboxTranslator(isolated_bus).poll()
         clusters = isolated_bus.query(event_type=EventType.AGENT_FAILURE_CLUSTER)
         # No single source crossed the threshold of 3.
@@ -249,6 +276,7 @@ class TestMailboxErrorFeedsClusterDetector:
     def test_existing_agent_error_still_emits(self, isolated_bus):
         """Adding the cluster wiring must not regress the existing AGENT_ERROR."""
         self._emit_error(isolated_bus, "scout", "captcha")
+        _seed_translator_cursor(isolated_bus)
         MailboxTranslator(isolated_bus).poll()
         agent_errors = isolated_bus.query(event_type=EventType.AGENT_ERROR)
         assert len(agent_errors) == 1
@@ -319,12 +347,14 @@ class TestMailboxErrorFeedsClusterDetector:
 
 def test_unknown_message_type_produces_no_domain_event(bus):
     _mailbox_event(bus, "SOME_RANDOM_TYPE", {"foo": "bar"})
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     assert _recent_domain_events(bus) == []
 
 
 def test_cursor_advances_after_poll(bus):
     _mailbox_event(bus, "SCORE_RESULT", {"score": 5.0, "company": "A", "title": "B"})
+    _seed_translator_cursor(bus)
     t = MailboxTranslator(bus)
     t.poll()
     pre_events = len(bus.query())
@@ -338,6 +368,7 @@ def test_notification_interview_keyword_emits_interview_signal(bus):
         "body": "Interview scheduled with Acme next Tuesday",
         "company": "Acme",
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     assert any(et == EventType.INTERVIEW_SIGNAL for et, _ in events)
@@ -348,6 +379,7 @@ def test_notification_offer_keyword_emits_offer_signal(bus):
         "body": "We are pleased to offer you the Director of Finance role",
         "company": "BigCo",
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     assert any(et == EventType.OFFER_SIGNAL for et, _ in events)
@@ -357,6 +389,7 @@ def test_notification_without_keyword_emits_nothing(bus):
     _mailbox_event(bus, "NOTIFICATION", {
         "body": "Weekly pipeline update: 12 jobs discovered",
     })
+    _seed_translator_cursor(bus)
     MailboxTranslator(bus).poll()
     events = _recent_domain_events(bus)
     types = [et for et, _ in events]
