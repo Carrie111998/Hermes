@@ -7031,6 +7031,26 @@ For more help on a command:
         action="store_true",
         help="Kill ALL gateway processes across all profiles before restarting",
     )
+    # --detached / --foreground for the manual-restart fallback path (no
+    # systemd / launchd). Default differs by platform: Windows defaults to
+    # detached because foreground holds the operator's terminal hostage,
+    # which is exactly the friction that drove the four operator restarts
+    # on 2026-04-30 (gateway-restart-cluster-2026-04-30.md). POSIX
+    # platforms keep foreground default for backward compatibility.
+    gateway_restart.add_argument(
+        "--detached",
+        dest="detached",
+        action="store_true",
+        default=None,
+        help="Launch the new gateway detached and return control to the "
+             "shell immediately (default on Windows)",
+    )
+    gateway_restart.add_argument(
+        "--foreground",
+        dest="detached",
+        action="store_false",
+        help="Block the shell on the new gateway in foreground (default on POSIX)",
+    )
 
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")

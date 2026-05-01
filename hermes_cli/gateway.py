@@ -657,6 +657,132 @@ def kill_gateway_processes(force: bool = False, exclude_pids: set | None = None,
     return killed
 
 
+def cleanup_gateway_state_files() -> list[str]:
+    """Remove orphaned PID + lock files for the current profile.
+
+    After a non-graceful gateway shutdown (WMI Terminate, power loss,
+    OOM kill), several files can survive that block the next startup:
+      - ``gateway.pid``: still names the dead PID, so the new gateway's
+        startup conflict-check refuses to run.
+      - ``gateway.lock``: the runtime exclusive-access lock the dead
+        process was holding.
+      - ``gateway-locks/*.lock``: per-platform session-claim files
+        (whatsapp-session, telegram-bot-token) — the M2 stale-PID
+        recheck handles these in-process, but cleaning them up between
+        manual stop+start lets the new gateway acquire them
+        immediately on first attempt.
+      - ``platforms/*/.session.lock`` etc.: best-effort, swallow errors
+        if the platform layout has moved.
+
+    Returns the list of file basenames that were actually removed
+    (useful for tests and operator output). Best-effort: each removal
+    is wrapped so a single permission error doesn't stop the cleanup
+    of the rest. M3 in profiles/sentinel/workspace/
+    gateway-restart-cluster-2026-04-30.md, paired with the ADR-0022
+    Phase-7 lockfile-cleanup memory note.
+    """
+    from gateway.status import _get_pid_path, _get_gateway_lock_path
+    from hermes_constants import get_hermes_home
+
+    removed: list[str] = []
+    candidates: list[Path] = []
+    try:
+        pid_path = _get_pid_path()
+        candidates.append(pid_path)
+        candidates.append(_get_gateway_lock_path(pid_path))
+    except Exception:
+        pass
+
+    # Per-platform scoped locks live under ``gateway-locks/`` next to the
+    # profile root. Glob them rather than enumerating known scopes — new
+    # platforms get cleanup for free.
+    try:
+        home = get_hermes_home()
+        locks_dir = home / "gateway-locks"
+        if locks_dir.exists():
+            candidates.extend(locks_dir.glob("*.lock"))
+    except Exception:
+        pass
+
+    for path in candidates:
+        try:
+            if path.exists():
+                path.unlink()
+                removed.append(path.name)
+        except OSError:
+            # Permission denied / file in use — leave it for the new
+            # gateway's startup conflict-check to handle.
+            continue
+    return removed
+
+
+def launch_gateway_detached(extra_args: list[str] | None = None) -> int | None:
+    """Spawn ``hermes gateway run`` detached from the current shell.
+
+    Returns the new gateway PID (best-effort: subprocess.Popen.pid is
+    actually the PID of the wrapper hermes.exe on Windows, which then
+    execs the actual gateway python.exe — close enough for operator
+    logging). Returns None on launch failure.
+
+    Platform notes:
+      - **Windows**: uses ``CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS``
+        and ``stdin/stdout/stderr=DEVNULL`` so the new process survives
+        the parent shell closing. PowerShell's ``Start-Process`` detach
+        trap (memory: windows_start_process_detach_trap.md) is
+        sidestepped because we go through subprocess.Popen directly,
+        not Start-Process.
+      - **POSIX**: uses ``start_new_session=True`` which detaches via
+        setsid().
+
+    Used by ``hermes gateway restart --detached`` and by future M3
+    consumers that need to relaunch the gateway without blocking the
+    caller's terminal. Spec: profiles/sentinel/workspace/
+    gateway-restart-cluster-2026-04-30.md.
+    """
+    import subprocess
+
+    # Locate the hermes CLI entry. ``sys.argv[0]`` is the entry script we
+    # were invoked through — usually hermes.exe / hermes — which is what
+    # we want to re-invoke.  Falling back to "hermes" lets developer
+    # workflows that ran via ``python -m hermes_cli.main`` still work.
+    cli_entry: str | list[str]
+    if sys.argv and Path(sys.argv[0]).exists() and Path(sys.argv[0]).name.lower().startswith("hermes"):
+        cli_entry = sys.argv[0]
+    else:
+        cli_entry = "hermes"
+
+    cmd = [cli_entry] if isinstance(cli_entry, str) else list(cli_entry)
+    cmd += ["gateway", "run"]
+    if extra_args:
+        cmd += list(extra_args)
+
+    creationflags = 0
+    start_new_session = False
+    if sys.platform == "win32":
+        # CREATE_NEW_PROCESS_GROUP=0x00000200, DETACHED_PROCESS=0x00000008
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        )
+    else:
+        start_new_session = True
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            start_new_session=start_new_session,
+            close_fds=True,
+        )
+        return proc.pid
+    except Exception as exc:
+        print(f"⚠ Failed to launch detached gateway: {exc}")
+        return None
+
+
 def stop_profile_gateway() -> bool:
     """Stop only the gateway for the current profile (HERMES_HOME-scoped).
 
@@ -4165,9 +4291,36 @@ def _gateway_command_inner(args):
 
             _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
 
-            # Start fresh
-            print("Starting gateway...")
-            run_gateway(verbose=0)
+            # Lockfile cleanup — added 2026-04-30 (M3 in profiles/sentinel/
+            # workspace/gateway-restart-cluster-2026-04-30.md). After WMI
+            # Terminate or non-graceful exit, gateway.lock + gateway.pid +
+            # platform-lock files survive and block the new gateway's
+            # startup conflict-check. The M2 stale-PID recheck eventually
+            # recovers, but explicit cleanup between stop and start lets
+            # the new gateway acquire on first attempt without the
+            # 2-second tasklist-zombie window.
+            removed = cleanup_gateway_state_files()
+            if removed:
+                print(f"✓ Cleaned up {len(removed)} stale state file(s): {', '.join(removed)}")
+
+            # Start fresh — detached on Windows (default) so the operator's
+            # terminal returns immediately. Foreground (default on POSIX)
+            # blocks until the gateway exits, which is the legacy behaviour.
+            detached = getattr(args, 'detached', None)
+            if detached is None:
+                detached = is_windows()
+            if detached:
+                print("Starting gateway (detached)...")
+                pid = launch_gateway_detached()
+                if pid is not None:
+                    print(f"✓ Gateway launched in background (parent PID {pid})")
+                    print("  Tail logs:  hermes gateway status")
+                    print("  Stop:       hermes gateway stop")
+                else:
+                    sys.exit(1)
+            else:
+                print("Starting gateway...")
+                run_gateway(verbose=0)
     
     elif subcmd == "status":
         deep = getattr(args, 'deep', False)
