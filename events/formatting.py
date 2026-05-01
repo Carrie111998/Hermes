@@ -27,6 +27,12 @@ EVENT_TYPE_EMOJI = {
     EventType.CRON_FAILED:              "💥",
     EventType.CRON_FAILED_CONSECUTIVE:  "🔥",
     EventType.CRON_STALE:               "⌛",
+    # 💤 (sleeping-z, "system dormant") is deliberately distinct from
+    # ⏭️ on CRON_SKIPPED_DUPLICATE so operators scanning watchdog_alerts
+    # can tell the two apart at a glance:
+    #   CRON_SKIPPED           = slot fast-forwarded because the system was down
+    #   CRON_SKIPPED_DUPLICATE = fire rejected because a sibling was still running
+    # Both branches originally picked ⏭️; resolved in merge e85794fd (2026-04-30).
     EventType.CRON_SKIPPED:             "💤",
     EventType.CRON_SKIPPED_DUPLICATE:   "⏭️",
     EventType.JOB_DISCOVERED:           "🎯",
