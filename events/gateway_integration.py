@@ -141,8 +141,34 @@ def startup(adapters: Optional[Dict] = None) -> None:
 
 
 def shutdown() -> None:
-    """Stop polling and clean up."""
+    """Stop polling and clean up.
+
+    Guard #1 (2026-04-30): drain the in-flight cron registry into
+    cron_aborted events BEFORE stopping the poll loop and closing the
+    bus, so audit.jsonl pairs every cron_started with a terminal event
+    even when the gateway dies mid-run. When >= 1 abort is emitted we
+    also force a synchronous _registry.poll_all() so the AuditLogger
+    writes the events to audit.jsonl in this same shutdown cycle.
+    """
     global _subscriber_thread, _bus
+
+    # Drain in-flight crons FIRST, while the bus is still open and
+    # _stop_event is still unset (so subscribers can still process).
+    # Wrapped in try/except so a flush failure cannot wedge the rest of
+    # shutdown -- thread + bus teardown must still run.
+    try:
+        from cron import scheduler as _scheduler
+        emitted = _scheduler.flush_inflight_aborts("gateway_shutdown")
+        if emitted and _registry is not None:
+            try:
+                _registry.poll_all()
+            except Exception:
+                logger.exception(
+                    "EventBus shutdown: poll_all after flush_inflight_aborts failed",
+                )
+    except Exception:
+        logger.exception("EventBus shutdown: flush_inflight_aborts failed")
+
     _stop_event.set()
     if _subscriber_thread:
         _subscriber_thread.join(timeout=5)

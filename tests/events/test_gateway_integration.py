@@ -3,6 +3,13 @@
 import json
 import time
 
+# Force cron.scheduler to load from the worktree BEFORE any test calls
+# gi.startup() — startup transitively imports obs/oauth_llm.py which
+# inserts ~/.hermes/agent-src at sys.path[0], shadowing the cwd-relative
+# worktree path. Importing cron.scheduler here pins the cached module to
+# the worktree's version, which is what subsequent patch.object() calls
+# need to find flush_inflight_aborts.
+from cron import scheduler as _cron_scheduler  # noqa: F401  -- side-effect import
 from events import gateway_integration as gi
 from events.paths import gateway_heartbeat_path
 from events.subscribers.mailbox_translator import MailboxTranslator
@@ -208,3 +215,122 @@ def test_poll_loop_writes_heartbeat_file():
         assert payload["consecutive_outer_errors"] == 0
     finally:
         gi.shutdown()
+
+
+class TestShutdownEmitsCronAborted:
+    """Guard #1 (2026-04-30): shutdown() must drain the in-flight cron
+    registry into cron_aborted events BEFORE closing the bus, so
+    audit.jsonl never accumulates dangling cron_started rows after a
+    gateway restart.
+
+    Patches use ``patch.object`` against the loaded module rather than
+    string-based dotted names because the editable-install MAPPING and
+    sys.path-based PathFinder can resolve ``cron.scheduler`` to different
+    files. ``patch.object(scheduler, ...)`` patches the actual loaded
+    module — the same one ``gi.shutdown()`` will resolve via the regular
+    Python import system.
+    """
+
+    def test_shutdown_calls_flush_inflight_aborts_with_gateway_shutdown_reason(self):
+        """Wiring contract: shutdown() invokes flush_inflight_aborts with
+        the literal "gateway_shutdown" reason string."""
+        from unittest.mock import patch
+        from cron import scheduler
+
+        gi.startup()
+        try:
+            with patch.object(scheduler, "flush_inflight_aborts", return_value=0) as flush_mock:
+                gi.shutdown()
+                flush_mock.assert_called_once_with("gateway_shutdown")
+        finally:
+            if gi._bus is not None:
+                gi.shutdown()
+
+    def test_shutdown_polls_subscribers_when_aborts_emitted(self):
+        """When flush_inflight_aborts emits >= 1 cron_aborted, shutdown()
+        forces a synchronous registry.poll_all() so AuditLogger writes the
+        events to audit.jsonl in the same shutdown cycle (rather than
+        waiting for the next gateway start to drain them)."""
+        from unittest.mock import patch, MagicMock
+        from cron import scheduler
+
+        gi.startup()
+        try:
+            assert gi._registry is not None
+            poll_all_spy = MagicMock(wraps=gi._registry.poll_all)
+            gi._registry.poll_all = poll_all_spy
+            with patch.object(scheduler, "flush_inflight_aborts", return_value=2):
+                gi.shutdown()
+            poll_all_spy.assert_called_once()
+        finally:
+            if gi._bus is not None:
+                gi.shutdown()
+
+    def test_shutdown_skips_poll_all_when_no_aborts(self):
+        """When flush_inflight_aborts returns 0, the synchronous poll
+        is skipped — no point spinning subscribers if nothing was emitted."""
+        from unittest.mock import patch, MagicMock
+        from cron import scheduler
+
+        gi.startup()
+        try:
+            assert gi._registry is not None
+            poll_all_spy = MagicMock(wraps=gi._registry.poll_all)
+            gi._registry.poll_all = poll_all_spy
+            with patch.object(scheduler, "flush_inflight_aborts", return_value=0):
+                gi.shutdown()
+            poll_all_spy.assert_not_called()
+        finally:
+            if gi._bus is not None:
+                gi.shutdown()
+
+    def test_shutdown_survives_flush_exception(self):
+        """A broken flush_inflight_aborts must not wedge the rest of
+        shutdown — the global bus + thread state must still tear down."""
+        from unittest.mock import patch
+        from cron import scheduler
+
+        gi.startup()
+        try:
+            with patch.object(
+                scheduler,
+                "flush_inflight_aborts",
+                side_effect=RuntimeError("boom"),
+            ):
+                gi.shutdown()  # must NOT raise
+            assert gi._bus is None
+            assert gi._subscriber_thread is None
+        finally:
+            if gi._bus is not None:
+                gi.shutdown()
+
+    def test_shutdown_calls_flush_before_stop_event_and_bus_close(self):
+        """Ordering contract: flush_inflight_aborts runs BEFORE _stop_event
+        is set and BEFORE the bus is closed. Otherwise events emitted by
+        the flush would have nowhere to land."""
+        from unittest.mock import patch
+        from cron import scheduler
+
+        gi.startup()
+        try:
+            order = []
+
+            def fake_flush(reason):
+                order.append((
+                    reason,
+                    gi._bus is not None,
+                    not gi._stop_event.is_set(),
+                ))
+                return 0
+
+            with patch.object(scheduler, "flush_inflight_aborts", side_effect=fake_flush):
+                gi.shutdown()
+
+            assert len(order) == 1
+            reason, bus_open, stop_unset = order[0]
+            assert reason == "gateway_shutdown"
+            assert bus_open, "bus must still be open when flush runs"
+            assert stop_unset, "stop_event must still be unset when flush runs"
+        finally:
+            if gi._bus is not None:
+                gi.shutdown()
