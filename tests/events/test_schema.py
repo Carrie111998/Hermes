@@ -222,3 +222,21 @@ def test_cron_skipped_duplicate_round_trip_via_from_string():
         EventType.from_string("cron_skipped_duplicate")
         is EventType.CRON_SKIPPED_DUPLICATE
     )
+
+
+# Cron gateway-downtime miss -- added 2026-04-30. Emitted by
+# cron/scheduler.py:tick() via CronEventEmitter.on_job_skipped() when
+# get_due_and_skipped_jobs() reports a recurring job's missed fire was
+# fast-forwarded (skip_only opt-out, weekly cron, or daily missed >24h).
+# Spec: docs/superpowers/specs/2026-04-30-cron-restart-catchup-gap-design.md.
+
+def test_cron_skipped_event_type_exists():
+    assert EventType.CRON_SKIPPED.type_string == "cron_skipped"
+
+
+def test_cron_skipped_default_priority_is_high():
+    assert EventType.CRON_SKIPPED.default_priority == Priority.HIGH
+
+
+def test_cron_skipped_round_trip_via_from_string():
+    assert EventType.from_string("cron_skipped") is EventType.CRON_SKIPPED

@@ -2889,3 +2889,81 @@ class TestInFlightRegistryShape:
         # threading.Lock is a factory; the underlying type is exposed via
         # type(threading.Lock()) — this checks we have a real lock object.
         assert isinstance(sch._in_flight_lock, type(threading.Lock()))
+
+
+# Cron gateway-downtime skip wiring -- tick() consumes the new
+# `skipped` half of get_due_and_skipped_jobs() and emits CRON_SKIPPED
+# via the lazy-loaded CronEventEmitter. These tests guard against
+# silent breakage of the field-name mapping (s["name"] -> job_name=)
+# and the defensive try/except around the emit loop.
+# Spec: docs/superpowers/specs/2026-04-30-cron-restart-catchup-gap-design.md.
+@pytest.mark.usefixtures("_tick_lock_isolated")
+class TestCronSkipped:
+    def _skipped(self, **overrides):
+        """Build a skipped-list entry matching get_due_and_skipped_jobs() shape."""
+        base = {
+            "job_id": "abc123",
+            "name": "test-cron",
+            "missed_at": "2026-04-29T23:00:00+00:00",
+            "missed_seconds": 14400,
+            "schedule_kind": "cron",
+            "reason": "default_period_cap",
+        }
+        base.update(overrides)
+        return base
+
+    def test_non_empty_skipped_triggers_n_emissions_with_field_mapping(self):
+        """Each skipped entry produces one on_job_skipped call; s["name"] maps to job_name=."""
+        emitter = MagicMock()
+        emitter.on_job_skipped.return_value = "skip-evt-id"
+
+        skipped = [
+            self._skipped(job_id="a", name="job-a", reason="default_period_cap"),
+            self._skipped(job_id="b", name="job-b", reason="miss_exceeded_24h_cap"),
+            self._skipped(job_id="c", name="job-c", reason="skip_only"),
+        ]
+
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([], skipped)), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert emitter.on_job_skipped.call_count == 3
+        calls = [c.kwargs for c in emitter.on_job_skipped.call_args_list]
+        # Field-name mapping: dict key "name" → kwarg "job_name"
+        assert calls[0]["job_id"] == "a" and calls[0]["job_name"] == "job-a"
+        assert calls[1]["job_id"] == "b" and calls[1]["job_name"] == "job-b"
+        assert calls[2]["job_id"] == "c" and calls[2]["job_name"] == "job-c"
+        # All four payload-tail fields propagate
+        assert calls[0]["missed_at"] == "2026-04-29T23:00:00+00:00"
+        assert calls[0]["missed_seconds"] == 14400
+        assert calls[0]["schedule_kind"] == "cron"
+        assert {c["reason"] for c in calls} == {
+            "default_period_cap", "miss_exceeded_24h_cap", "skip_only",
+        }
+
+    def test_none_emitter_does_not_crash_tick(self):
+        """When the gateway is not started, _get_event_emitter() returns None."""
+        skipped = [self._skipped()]
+
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([], skipped)), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=None):
+            from cron.scheduler import tick
+            tick(verbose=False)  # must not raise
+
+    def test_emitter_failure_is_logged_and_does_not_block_tick(self):
+        """If on_job_skipped raises, the rest of tick still proceeds."""
+        emitter = MagicMock()
+        emitter.on_job_skipped.side_effect = RuntimeError("bus down")
+
+        skipped = [self._skipped(name="will-blow-up")]
+
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([], skipped)), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter):
+            from cron.scheduler import tick
+            tick(verbose=False)  # must not propagate
+        # The exception was caught — emitter.on_job_skipped was attempted.
+        assert emitter.on_job_skipped.call_count == 1
