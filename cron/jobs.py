@@ -281,8 +281,12 @@ def _compute_grace_seconds(schedule: dict) -> int:
             period_seconds = int((second - first).total_seconds())
             grace = period_seconds // 2
             return max(MIN_GRACE, min(grace, MAX_GRACE))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Failed to compute grace for cron expr=%r: %s",
+                schedule.get("expr"),
+                exc,
+            )
 
     return MIN_GRACE
 
@@ -323,7 +327,12 @@ def _compute_period_seconds(schedule: dict) -> Optional[int]:
                 for i in range(len(fires) - 1)
             ]
             return min(intervals) if intervals else None
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Failed to compute period for cron expr=%r: %s",
+                schedule.get("expr"),
+                exc,
+            )
             return None
 
     return None
@@ -852,7 +861,6 @@ def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any
             # For recurring jobs, check if the scheduled time is stale
             # (gateway was down and missed the window). Fast-forward to
             # the next future occurrence instead of firing a stale run.
-            grace = _compute_grace_seconds(schedule)
             missed_seconds = int((now - next_run_dt).total_seconds())
             if kind in ("cron", "interval"):
                 # Eligibility decision tree for missed recurring jobs.
@@ -863,6 +871,11 @@ def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any
                 # grace fall through to the existing `due.append` path with
                 # no log line and no skipped emission.
                 period_seconds = _compute_period_seconds(schedule)
+                # recovery_policy is currently a flag-style string. The only recognized
+                # value is "skip_only"; anything else (None, missing, or other strings)
+                # falls through to the period/miss-size eligibility check. If this ever
+                # needs richer shape (e.g. {"mode": "skip_only", "max_miss_seconds": N}),
+                # add an explicit shape check here.
                 recovery_policy = job.get("recovery_policy")
 
                 if recovery_policy == "skip_only":
@@ -916,6 +929,7 @@ def get_due_and_skipped_jobs() -> tuple[List[Dict[str, Any]], List[Dict[str, Any
                 # In BOTH cases we leave next_run_at alone so the scheduler's
                 # advance_next_run() (called before each run) handles
                 # advancement and prevents double-firing.
+                grace = _compute_grace_seconds(schedule)
                 if missed_seconds > grace:
                     logger.info(
                         "Job '%s' missed at %s (by %ds) — firing once on recovery; "
