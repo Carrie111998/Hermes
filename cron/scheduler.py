@@ -202,6 +202,44 @@ def _dup_guard_timeout_seconds() -> float:
     return val if val > 0 else _DEFAULT_DUP_GUARD_TIMEOUT_S
 
 
+# === Min-interval-since-last-fire guard (Guard #4, 2026-04-30 follow-up) ====
+#
+# Closes the SEQUENTIAL-burst gap left by Guard #3.  Guard #3 only catches
+# CONCURRENT re-fires (where one is still in-flight when the next arrives).
+# The 2026-04-30 sentinel-vip-morning fires at 14:02 / 14:34 / 14:49 UTC
+# were spaced 28 min and 13 min apart -- each prior fire had already
+# released its in-flight slot before the next arrived, so Guard #3 never
+# engaged.  This guard rejects a tick-time fire when the job's last_run_at
+# is within `min_seconds_between_fires` of NOW, regardless of whether the
+# prior fire was tick-scheduled or trigger-scheduled.
+#
+# Default off (per-job opt-in via the field in jobs.json, with a global
+# env override).  Recommended setting for sentinel-vip-* jobs is 1800
+# (30 min) -- see sentinel-vip-burst-rc-2026-04-30.md §6.
+def _job_min_seconds_between_fires(job: dict) -> int:
+    """Resolve the effective min-interval-between-fires for ``job``.
+
+    Priority: per-job ``min_seconds_between_fires`` field >
+    ``HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES`` env var > 0 (off).
+
+    Returns 0 when the guard is disabled for this job; the guard then
+    short-circuits without touching ``last_run_at``.
+    """
+    per_job = job.get("min_seconds_between_fires")
+    if per_job is not None:
+        try:
+            return max(0, int(per_job))
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
 def _try_register_in_flight(job_id: str, job_name: str) -> Optional[_InFlightRecord]:
     """Attempt to register a job as in-flight.
 
@@ -1806,6 +1844,67 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             # We hold the in-flight slot for _job_id from here; release it
             # on every exit path (the existing inner try/except below was
             # extended with a `finally: _release_in_flight(_job_id)`).
+
+            # Min-seconds-between-fires guard (Guard #4, 2026-04-30 follow-up)
+            # ------------------------------------------------------------
+            # Catches the SEQUENTIAL-burst pattern Guard #3 misses (where
+            # fires are spaced minutes apart, not concurrent).  Per-job
+            # opt-in via ``min_seconds_between_fires``; global opt-in via
+            # HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES.  Default 0 = off.
+            # See sentinel-vip-burst-rc-2026-04-30.md §6.
+            #
+            # Note: must release the in-flight slot we just acquired on
+            # every reject path so the legitimate next fire is not blocked
+            # by the rejected one's still-held slot.
+            _min_interval = _job_min_seconds_between_fires(job)
+            _last_run_at_str = job.get("last_run_at")
+            if _min_interval > 0 and _last_run_at_str:
+                from datetime import datetime as _datetime
+                from cron.jobs import _ensure_aware as _cron_ensure_aware
+                try:
+                    _last_run_dt = _cron_ensure_aware(
+                        _datetime.fromisoformat(_last_run_at_str)
+                    )
+                    _elapsed_since_last = (
+                        _hermes_now() - _last_run_dt
+                    ).total_seconds()
+                except (TypeError, ValueError) as ee:
+                    # Malformed last_run_at -> never block on it; let the
+                    # job proceed.  Defensive: production data should never
+                    # land here, but we don't want a parse bug to wedge the
+                    # scheduler.
+                    logger.debug(
+                        "Min-interval guard: failed to parse last_run_at=%r "
+                        "for job_id=%s (%s); proceeding without check",
+                        _last_run_at_str, _job_id, ee,
+                    )
+                    _elapsed_since_last = float("inf")
+
+                if _elapsed_since_last < _min_interval:
+                    logger.warning(
+                        "Cron min-interval fire blocked: job_id=%s job_name=%s "
+                        "elapsed=%.1fs min=%ds last_run=%s",
+                        _job_id, _cron_job_name,
+                        _elapsed_since_last, _min_interval, _last_run_at_str,
+                    )
+                    if emitter:
+                        try:
+                            emitter.on_job_skipped_min_interval(
+                                job_id=_job_id,
+                                job_name=_cron_job_name,
+                                last_run_at=_last_run_at_str,
+                                elapsed_since_last_seconds=round(
+                                    _elapsed_since_last, 1
+                                ),
+                                min_seconds_between_fires=_min_interval,
+                            )
+                        except Exception as ee:
+                            logger.debug(
+                                "Event emit failed for "
+                                "cron_skipped_min_interval: %s", ee
+                            )
+                    _release_in_flight(_job_id)
+                    return False
 
             # Emit cron_started event.  Capture the event_id so the next
             # duplicate-skip event can reference it for cross-event correlation.

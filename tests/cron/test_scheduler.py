@@ -2889,3 +2889,380 @@ class TestInFlightRegistryShape:
         # threading.Lock is a factory; the underlying type is exposed via
         # type(threading.Lock()) — this checks we have a real lock object.
         assert isinstance(sch._in_flight_lock, type(threading.Lock()))
+
+
+# Min-seconds-between-fires guard (Guard #4, 2026-04-30 follow-up) ---------
+# Closes the SEQUENTIAL-burst gap left by Guard #3.  The 2026-04-30 sentinel
+# triple-fire (14:02 / 14:34 / 14:49 UTC) had each prior fire fully
+# completing before the next arrived -- so the in-flight registry was empty
+# at each new fire's arrival and Guard #3 never engaged.  See
+# sentinel-vip-burst-rc-2026-04-30.md §6 for the full design.
+@pytest.mark.usefixtures("_tick_lock_isolated")
+class TestMinIntervalGuard:
+    @pytest.fixture(autouse=True)
+    def _reset_in_flight_and_env(self, monkeypatch):
+        """Clear _in_flight and the env-var override before/after each test."""
+        from cron import scheduler as sch
+        sch._in_flight.clear()
+        monkeypatch.delenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", raising=False)
+        yield
+        sch._in_flight.clear()
+
+    def _job(
+        self,
+        job_id="092f4ed7657c",
+        name="sentinel-vip-morning",
+        min_seconds_between_fires=None,
+        last_run_at=None,
+    ):
+        from hermes_time import now as _now
+        # Default last_run_at = recent (5 min ago), default min=1800 (30 min)
+        if last_run_at is None:
+            last_run_at = (_now()).isoformat()
+        job = {"id": job_id, "name": name, "deliver": "local"}
+        if min_seconds_between_fires is not None:
+            job["min_seconds_between_fires"] = min_seconds_between_fires
+        if last_run_at is not None:
+            job["last_run_at"] = last_run_at
+        return job
+
+    def test_fire_blocked_when_within_min_interval(self):
+        """last_run_at = now - 5 min, min = 30 min => fire is blocked,
+        run_job NOT called, cron_skipped_min_interval is emitted."""
+        from datetime import timedelta
+        from events.schema import EventType
+        from hermes_time import now as _now
+
+        five_min_ago = (_now() - timedelta(minutes=5)).isoformat()
+        job = self._job(
+            min_seconds_between_fires=1800,
+            last_run_at=five_min_ago,
+        )
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "should-not-be-emitted"
+        skip_calls = []
+
+        def capture_skip(**kwargs):
+            skip_calls.append(kwargs)
+            return "skip-evt-id"
+        emitter.on_job_skipped_min_interval.side_effect = capture_skip
+
+        run_job_called = False
+
+        def fail_run_job(j):
+            nonlocal run_job_called
+            run_job_called = True
+            return (True, "# output", "response", None)
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job", side_effect=fail_run_job), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        # Guard #4 must reject before run_job is invoked.
+        assert run_job_called is False, "run_job should NOT be called"
+        # cron_started must NOT have been emitted -- the guard fires earlier.
+        assert emitter.on_job_started.call_count == 0, (
+            "on_job_started should NOT have been emitted; Guard #4 rejects "
+            "before the cron_started emit point"
+        )
+        # Exactly one cron_skipped_min_interval emitted.
+        assert len(skip_calls) == 1, f"skip_calls={skip_calls!r}"
+        skip = skip_calls[0]
+        assert skip["job_id"] == "092f4ed7657c"
+        assert skip["job_name"] == "sentinel-vip-morning"
+        assert skip["last_run_at"] == five_min_ago
+        assert skip["min_seconds_between_fires"] == 1800
+        # ~300s (5 min) elapsed; allow some tolerance for test runtime.
+        assert 290 <= skip["elapsed_since_last_seconds"] <= 320, (
+            f"elapsed_since_last_seconds out of expected range: "
+            f"{skip['elapsed_since_last_seconds']}"
+        )
+        # Sanity: the EventType identifier is stable.
+        assert (
+            EventType.CRON_SKIPPED_MIN_INTERVAL.type_string
+            == "cron_skipped_min_interval"
+        )
+
+    def test_fire_proceeds_when_past_min_interval(self):
+        """last_run_at = now - 31 min, min = 30 min => fire proceeds normally.
+
+        Boundary: even one minute past the threshold lets the fire through.
+        """
+        from datetime import timedelta
+        from hermes_time import now as _now
+
+        thirty_one_min_ago = (_now() - timedelta(minutes=31)).isoformat()
+        job = self._job(
+            min_seconds_between_fires=1800,
+            last_run_at=thirty_one_min_ago,
+        )
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        # cron_started SHOULD have been emitted -- guard didn't engage.
+        assert emitter.on_job_started.call_count == 1
+        # No skip event emitted.
+        assert emitter.on_job_skipped_min_interval.call_count == 0
+
+    def test_guard_off_by_default(self):
+        """No min_seconds_between_fires field, no env var => fire proceeds
+        even with last_run_at very recent.  Backward-compat default."""
+        from datetime import timedelta
+        from hermes_time import now as _now
+
+        ten_seconds_ago = (_now() - timedelta(seconds=10)).isoformat()
+        job = self._job(
+            min_seconds_between_fires=None,  # explicitly off
+            last_run_at=ten_seconds_ago,
+        )
+        # Field is omitted from the dict so it's truly absent
+        job.pop("min_seconds_between_fires", None)
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert emitter.on_job_started.call_count == 1
+        assert emitter.on_job_skipped_min_interval.call_count == 0
+
+    def test_env_var_default_applies_when_per_job_unset(self, monkeypatch):
+        """When per-job field is unset but HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES
+        is set, the env-var value applies."""
+        from datetime import timedelta
+        from hermes_time import now as _now
+
+        monkeypatch.setenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", "1800")
+
+        five_min_ago = (_now() - timedelta(minutes=5)).isoformat()
+        job = self._job(
+            min_seconds_between_fires=None,
+            last_run_at=five_min_ago,
+        )
+        job.pop("min_seconds_between_fires", None)
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-should-not-fire"
+        skip_calls = []
+        emitter.on_job_skipped_min_interval.side_effect = (
+            lambda **kw: (skip_calls.append(kw), "skip-evt")[1]
+        )
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert len(skip_calls) == 1
+        assert skip_calls[0]["min_seconds_between_fires"] == 1800
+
+    def test_per_job_zero_overrides_env_var(self, monkeypatch):
+        """Per-job ``min_seconds_between_fires=0`` opts OUT of the guard
+        even when the env-var default is non-zero.  Per-job value wins."""
+        from datetime import timedelta
+        from hermes_time import now as _now
+
+        monkeypatch.setenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", "1800")
+
+        thirty_seconds_ago = (_now() - timedelta(seconds=30)).isoformat()
+        job = self._job(
+            min_seconds_between_fires=0,
+            last_run_at=thirty_seconds_ago,
+        )
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert emitter.on_job_started.call_count == 1
+        assert emitter.on_job_skipped_min_interval.call_count == 0
+
+    def test_in_flight_slot_released_on_reject(self):
+        """After Guard #4 rejects, _in_flight must be empty so the next
+        legitimate fire is not blocked by the rejected one's still-held slot."""
+        from datetime import timedelta
+        from cron import scheduler as sch
+        from hermes_time import now as _now
+
+        five_min_ago = (_now() - timedelta(minutes=5)).isoformat()
+        job = self._job(
+            min_seconds_between_fires=1800,
+            last_run_at=five_min_ago,
+        )
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-not-emitted"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert "092f4ed7657c" not in sch._in_flight, (
+            "_in_flight must be cleared after Guard #4 rejects; "
+            f"still holds {sch._in_flight!r}"
+        )
+
+    def test_malformed_last_run_at_does_not_block(self):
+        """A garbage last_run_at string must not wedge the scheduler.
+        Defensive: production data should never land here, but a parse
+        bug must let the job proceed."""
+        job = self._job(
+            min_seconds_between_fires=1800,
+            last_run_at="not-an-iso-timestamp",
+        )
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        # Fire proceeds; no skip event.
+        assert emitter.on_job_started.call_count == 1
+        assert emitter.on_job_skipped_min_interval.call_count == 0
+
+    def test_no_last_run_at_does_not_block(self):
+        """A first-ever fire (last_run_at absent) must not be blocked by
+        Guard #4.  This is the new-job bootstrap case."""
+        job = self._job(
+            min_seconds_between_fires=1800,
+            last_run_at=None,
+        )
+        # Explicitly absent
+        job.pop("last_run_at", None)
+
+        emitter = MagicMock()
+        emitter.on_job_started.return_value = "evt-1"
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler._get_event_emitter", return_value=emitter), \
+             patch("cron.scheduler.run_job",
+                   return_value=(True, "# output", "response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", return_value=None), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.jobs.load_jobs", return_value=[
+                 {"id": "092f4ed7657c", "consecutive_errors": 0}
+             ]):
+            from cron.scheduler import tick
+            tick(verbose=False)
+
+        assert emitter.on_job_started.call_count == 1
+        assert emitter.on_job_skipped_min_interval.call_count == 0
+
+    def test_helper_resolves_per_job_then_env_then_default(self, monkeypatch):
+        """_job_min_seconds_between_fires resolution priority."""
+        from cron.scheduler import _job_min_seconds_between_fires
+
+        # 1. Per-job field wins
+        monkeypatch.setenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", "9999")
+        assert _job_min_seconds_between_fires(
+            {"min_seconds_between_fires": 30}
+        ) == 30
+        # Per-job 0 wins (opt-out)
+        assert _job_min_seconds_between_fires(
+            {"min_seconds_between_fires": 0}
+        ) == 0
+
+        # 2. Env var wins when per-job unset
+        assert _job_min_seconds_between_fires({}) == 9999
+
+        # 3. Default 0 when both unset
+        monkeypatch.delenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES")
+        assert _job_min_seconds_between_fires({}) == 0
+
+        # 4. Garbage in env var falls back to default 0
+        monkeypatch.setenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", "not-an-int")
+        assert _job_min_seconds_between_fires({}) == 0
+
+        # 5. Garbage in per-job field falls back to env var
+        monkeypatch.setenv("HERMES_CRON_MIN_SECONDS_BETWEEN_FIRES", "1800")
+        assert _job_min_seconds_between_fires(
+            {"min_seconds_between_fires": "not-an-int"}
+        ) == 1800
+
+        # 6. Negative per-job value clamped to 0
+        assert _job_min_seconds_between_fires(
+            {"min_seconds_between_fires": -100}
+        ) == 0
