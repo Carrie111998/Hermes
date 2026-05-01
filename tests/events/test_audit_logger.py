@@ -20,9 +20,22 @@ def audit_path(tmp_path):
     return tmp_path / "events" / "audit.jsonl"
 
 
+def _seed_audit_logger_cursor(bus: EventBus) -> None:
+    """Force AuditLogger's cursor to 0 so it sees events emitted BEFORE the
+    first poll. The bus's first-registration default (bus.py subscribe(),
+    2026-04-28) jumps to head-of-bus to prevent backlog floods on real
+    deploys; these tests construct AuditLogger and emit, then poll."""
+    bus._execute(
+        """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+           VALUES ('audit-logger', 0, datetime('now'))
+           ON CONFLICT(subscriber_id) DO UPDATE SET last_rowid = 0""",
+    )
+
+
 class TestAuditLogger:
     def test_logs_events_as_jsonl(self, bus, audit_path):
         logger = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
         bus.emit(EventType.CRON_COMPLETED, "scout", {"jobs": 5})
         bus.emit(EventType.JOB_HIGH_SCORE, "matcher", {"score": 9.1})
 
@@ -41,6 +54,7 @@ class TestAuditLogger:
 
     def test_appends_to_existing_file(self, bus, audit_path):
         logger = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
 
         bus.emit(EventType.CRON_STARTED, "scout", {})
         logger.poll()
@@ -54,6 +68,7 @@ class TestAuditLogger:
     def test_creates_parent_dirs(self, bus, tmp_path):
         deep_path = tmp_path / "a" / "b" / "c" / "audit.jsonl"
         logger = AuditLogger(bus, audit_path=deep_path)
+        _seed_audit_logger_cursor(bus)
 
         bus.emit(EventType.CRON_STARTED, "scout", {})
         logger.poll()
@@ -75,6 +90,7 @@ class TestRotation:
         import time as _time
 
         logger_inst = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
 
         # Write some events first
         bus.emit(EventType.CRON_COMPLETED, "scout", {"jobs": 3})
@@ -128,6 +144,7 @@ class TestRotation:
         import time as _time
 
         logger_inst = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
 
         # Write initial event
         bus.emit(EventType.CRON_COMPLETED, "scout", {"jobs": 1})
