@@ -2955,7 +2955,7 @@ class TestMinIntervalGuard:
             run_job_called = True
             return (True, "# output", "response", None)
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job", side_effect=fail_run_job), \
@@ -3010,7 +3010,7 @@ class TestMinIntervalGuard:
         emitter = MagicMock()
         emitter.on_job_started.return_value = "evt-1"
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",
@@ -3046,7 +3046,7 @@ class TestMinIntervalGuard:
         emitter = MagicMock()
         emitter.on_job_started.return_value = "evt-1"
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",
@@ -3085,7 +3085,7 @@ class TestMinIntervalGuard:
             lambda **kw: (skip_calls.append(kw), "skip-evt")[1]
         )
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",
@@ -3119,7 +3119,7 @@ class TestMinIntervalGuard:
         emitter = MagicMock()
         emitter.on_job_started.return_value = "evt-1"
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",
@@ -3152,7 +3152,7 @@ class TestMinIntervalGuard:
         emitter = MagicMock()
         emitter.on_job_started.return_value = "evt-not-emitted"
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",
@@ -3183,7 +3183,7 @@ class TestMinIntervalGuard:
         emitter = MagicMock()
         emitter.on_job_started.return_value = "evt-1"
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",
@@ -3214,7 +3214,7 @@ class TestMinIntervalGuard:
         emitter = MagicMock()
         emitter.on_job_started.return_value = "evt-1"
 
-        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([job], [])), \
              patch("cron.scheduler.advance_next_run"), \
              patch("cron.scheduler._get_event_emitter", return_value=emitter), \
              patch("cron.scheduler.run_job",

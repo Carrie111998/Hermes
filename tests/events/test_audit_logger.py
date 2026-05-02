@@ -173,12 +173,15 @@ class TestRotation:
         from events.subscribers.audit_logger import SIZE_CAP_BYTES
 
         sub = AuditLogger(bus, audit_path=audit_path)
+        _seed_audit_logger_cursor(bus)
 
         # Write enough bytes to exceed the cap.
         audit_path.write_text("x" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
 
-        # Force a rotation check.
-        sub._last_rotation_check = 0
+        # Force a rotation check. Use -inf so the gate (`now - last > 3600`)
+        # always fires regardless of how recently `time.monotonic()`'s clock
+        # was reset (fresh CI VM, fresh boot — see 2026-05-02 follow-up).
+        sub._last_rotation_check = float("-inf")
         bus.emit(EventType.CRON_COMPLETED, "test", {})
         sub.poll()
 
@@ -195,7 +198,7 @@ class TestRotation:
         # collision-counter logic in _rotate_if_needed still works under the
         # new size-cap-triggered rotation cadence.
         audit_path.write_text("y" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
-        sub._last_rotation_check = 0
+        sub._last_rotation_check = float("-inf")
         bus.emit(EventType.CRON_COMPLETED, "test", {})
         sub.poll()
 
