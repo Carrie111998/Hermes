@@ -318,6 +318,203 @@ class TestGatewayMode:
         assert "gateway msg" in content
         assert "file msg" in content
 
+    def test_gateway_handlers_added_after_cli_init(self, hermes_home, monkeypatch):
+        """REGRESSION: production path calls setup_logging(mode="cli") at
+        hermes_cli/main.py module import, then setup_logging(mode="gateway")
+        from gateway/run.py. Pre-fix the second call was a silent no-op due
+        to the global ``_logging_initialized`` guard, so gateway.log stopped
+        being written (last record 2026-04-10).
+        """
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+        root = logging.getLogger()
+        gw_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
+        ]
+        assert len(gw_handlers) == 1, (
+            "gateway.log handler MUST be attached even after a prior cli-mode "
+            "init (regression: silently skipped pre-fix)"
+        )
+
+
+class TestGatewayForensicsLog:
+    """When mode='gateway', an unfiltered forensics log captures every
+    record at INFO+ from any logger, independent of stdout/stderr capture
+    by the wrapper that spawned us. Path overridable via
+    ``HERMES_GATEWAY_LOG_FILE`` env var.
+    """
+
+    def test_forensics_log_created_when_mode_gateway(self, hermes_home, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        root = logging.getLogger()
+
+        forensics_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
+        ]
+        assert len(forensics_handlers) == 1
+        assert forensics_handlers[0].level == logging.INFO
+
+    def test_forensics_log_not_created_in_cli_mode(self, hermes_home, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        root = logging.getLogger()
+
+        forensics_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
+        ]
+        assert len(forensics_handlers) == 0
+
+    def test_forensics_log_captures_non_gateway_loggers(self, hermes_home, monkeypatch):
+        """Forensics is unfiltered — captures gateway.*, events.*, tools.*,
+        and anything else that emits at INFO+. This is the key forensics
+        property: subscriber-loop and WAL-contention diagnostics show up
+        even when they originate from non-gateway loggers.
+        """
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+        # Cross-test pollution defense (mirroring test_agent_log_still_receives_all)
+        for name in ("events", "tools", "gateway"):
+            lg = logging.getLogger(name)
+            lg.propagate = True
+            lg.setLevel(logging.NOTSET)
+
+        logging.getLogger("gateway.run").info("gateway started")
+        logging.getLogger("events.bus").info("event published")
+        logging.getLogger("tools.terminal_tool").info("running command")
+
+        for h in logging.getLogger().handlers:
+            h.flush()
+
+        forensics = hermes_home / "logs" / "gateway-forensics.log"
+        assert forensics.exists()
+        content = forensics.read_text()
+        assert "gateway started" in content
+        assert "event published" in content
+        assert "running command" in content
+
+    def test_HERMES_GATEWAY_LOG_FILE_overrides_path(self, hermes_home, tmp_path, monkeypatch):
+        custom_path = tmp_path / "subdir" / "custom-forensics.log"
+        monkeypatch.setenv("HERMES_GATEWAY_LOG_FILE", str(custom_path))
+
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        root = logging.getLogger()
+
+        custom_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).resolve() == custom_path.resolve()
+        ]
+        assert len(custom_handlers) == 1, (
+            f"expected handler at {custom_path}, got: "
+            f"{[getattr(h, 'baseFilename', '') for h in root.handlers if isinstance(h, RotatingFileHandler)]}"
+        )
+
+        # Default path is NOT used when override is set.
+        default_path = hermes_home / "logs" / "gateway-forensics.log"
+        default_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).resolve() == default_path.resolve()
+        ]
+        assert len(default_handlers) == 0
+
+        # Parent directory is created on demand.
+        assert custom_path.parent.is_dir()
+
+    def test_HERMES_GATEWAY_LOG_FILE_expands_user(self, hermes_home, tmp_path, monkeypatch):
+        """``~`` in the env var expands to the user's home (per Path.expanduser)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("HERMES_GATEWAY_LOG_FILE", "~/my-forensics.log")
+
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        root = logging.getLogger()
+
+        expected = (tmp_path / "my-forensics.log").resolve()
+        matching = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).resolve() == expected
+        ]
+        assert len(matching) == 1, (
+            f"expected handler at {expected}, got: "
+            f"{[getattr(h, 'baseFilename', '') for h in root.handlers if isinstance(h, RotatingFileHandler)]}"
+        )
+
+    def test_forensics_handler_idempotent_on_repeat_call(self, hermes_home, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+        root = logging.getLogger()
+        forensics_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
+        ]
+        assert len(forensics_handlers) == 1
+
+    def test_forensics_handler_added_after_cli_init(self, hermes_home, monkeypatch):
+        """The forensics handler MUST be attached even when cli-mode init
+        ran first (the production path — see TestGatewayMode regression note).
+        """
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+        root = logging.getLogger()
+        forensics_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
+        ]
+        assert len(forensics_handlers) == 1
+
+    def test_invalid_HERMES_GATEWAY_LOG_FILE_does_not_crash(
+        self, hermes_home, tmp_path, monkeypatch, caplog
+    ):
+        """Bad ``HERMES_GATEWAY_LOG_FILE`` must not crash the gateway —
+        forensics is best-effort. The curated gateway.log handler stays
+        attached and the failure is surfaced via a warning.
+        """
+        # Create a file where a directory is expected. _add_rotating_handler
+        # will then fail at path.parent.mkdir() with NotADirectoryError on
+        # both POSIX and Windows.
+        blocker = tmp_path / "blocker-file"
+        blocker.write_text("not a directory")
+        monkeypatch.setenv(
+            "HERMES_GATEWAY_LOG_FILE", str(blocker / "child" / "forensics.log")
+        )
+
+        with caplog.at_level(logging.WARNING, logger="hermes_logging"):
+            # Must not raise.
+            hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+
+        # Curated gateway.log handler stays attached even when forensics fails.
+        root = logging.getLogger()
+        gw_handlers = [
+            h for h in root.handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
+        ]
+        assert len(gw_handlers) == 1
+
+        # Warning was emitted naming the env var.
+        assert any(
+            "gateway-forensics handler failed to attach" in r.message
+            for r in caplog.records
+        ), f"expected warning, got: {[r.message for r in caplog.records]}"
+
 
 class TestSessionContext:
     """set_session_context / clear_session_context + _SessionFilter."""

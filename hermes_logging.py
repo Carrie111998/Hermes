@@ -5,9 +5,15 @@ gateway call early in their startup path.  All log files live under
 ``~/.hermes/logs/`` (profile-aware via ``get_hermes_home()``).
 
 Log files produced:
-    agent.log   — INFO+, all agent/tool/session activity (the main log)
-    errors.log  — WARNING+, errors and warnings only (quick triage)
-    gateway.log — INFO+, gateway-only events (created when mode="gateway")
+    agent.log              — INFO+, all agent/tool/session activity (main log)
+    errors.log             — WARNING+, errors and warnings only (quick triage)
+    gateway.log            — INFO+, gateway-only events (mode="gateway")
+    gateway-forensics.log  — INFO+, unfiltered catch-all when mode="gateway",
+                             independent of stdout/stderr capture by the
+                             wrapper that spawned the gateway. Path
+                             overridable via ``HERMES_GATEWAY_LOG_FILE``
+                             (read from ``~/.hermes/.env`` — root, NOT
+                             profile-scoped — see hermes_cli/env_loader.py).
 
 All files use ``RotatingFileHandler`` with ``RedactingFormatter`` so
 secrets are never written to disk.
@@ -16,6 +22,9 @@ Component separation:
     gateway.log only receives records from ``gateway.*`` loggers —
     platform adapters, session management, slash commands, delivery.
     agent.log remains the catch-all (everything goes there).
+    gateway-forensics.log is also unfiltered but only attached when
+    mode="gateway" — gives forensics consumers a stable, gateway-process-
+    scoped grep target without competing with agent.log's CLI activity.
 
 Session context:
     Call ``set_session_context(session_id)`` at the start of a conversation
@@ -195,49 +204,70 @@ def setup_logging(
         The ``logs/`` directory where files are written.
     """
     global _logging_initialized
-    if _logging_initialized and not force:
-        home = hermes_home or get_hermes_home()
-        return home / "logs"
-
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Read config defaults (best-effort — config may not be loaded yet).
-    cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
-
-    level_name = (log_level or cfg_level or "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-    max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
-    backups = backup_count or cfg_backup or 3
 
     # Lazy import to avoid circular dependency at module load time.
     from agent.redact import RedactingFormatter
 
     root = logging.getLogger()
 
-    # --- agent.log (INFO+) — the main activity log -------------------------
-    _add_rotating_handler(
-        root,
-        log_dir / "agent.log",
-        level=level,
-        max_bytes=max_bytes,
-        backup_count=backups,
-        formatter=RedactingFormatter(_LOG_FORMAT),
-    )
+    # Global, mode-independent handlers (agent.log + errors.log) and
+    # noise/level config run only on first call. Subsequent calls skip
+    # this block — _add_rotating_handler is per-path idempotent anyway,
+    # but skipping avoids re-reading config and re-applying noise filters.
+    if not _logging_initialized or force:
+        log_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- errors.log (WARNING+) — quick triage log --------------------------
-    _add_rotating_handler(
-        root,
-        log_dir / "errors.log",
-        level=logging.WARNING,
-        max_bytes=2 * 1024 * 1024,
-        backup_count=2,
-        formatter=RedactingFormatter(_LOG_FORMAT),
-    )
+        # Read config defaults (best-effort — config may not be loaded yet).
+        cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
 
-    # --- gateway.log (INFO+, gateway component only) ------------------------
+        level_name = (log_level or cfg_level or "INFO").upper()
+        level = getattr(logging, level_name, logging.INFO)
+        max_bytes = (max_size_mb or cfg_max_size or 5) * 1024 * 1024
+        backups = backup_count or cfg_backup or 3
+
+        # --- agent.log (INFO+) — the main activity log ---------------------
+        _add_rotating_handler(
+            root,
+            log_dir / "agent.log",
+            level=level,
+            max_bytes=max_bytes,
+            backup_count=backups,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+        )
+
+        # --- errors.log (WARNING+) — quick triage log ----------------------
+        _add_rotating_handler(
+            root,
+            log_dir / "errors.log",
+            level=logging.WARNING,
+            max_bytes=2 * 1024 * 1024,
+            backup_count=2,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+        )
+
+        # Ensure root logger level is low enough for the handlers to fire.
+        if root.level == logging.NOTSET or root.level > level:
+            root.setLevel(level)
+
+        # Suppress noisy third-party loggers.
+        for name in _NOISY_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+        _logging_initialized = True
+
+    # Mode-specific handlers run on EVERY call so a later mode="gateway"
+    # call can upgrade an earlier mode="cli" init. Production path:
+    # hermes_cli/main.py:174 calls setup_logging(mode="cli") at module
+    # import; gateway/run.py later calls setup_logging(mode="gateway").
+    # Pre-fix the second call returned early because _logging_initialized
+    # was True, leaving gateway.log dead since 2026-04-10. Per-path
+    # idempotency in _add_rotating_handler prevents duplicates.
     if mode == "gateway":
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        # --- gateway.log (INFO+, gateway component only) -------------------
         _add_rotating_handler(
             root,
             log_dir / "gateway.log",
@@ -248,16 +278,50 @@ def setup_logging(
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 
-    # Ensure root logger level is low enough for the handlers to fire.
-    if root.level == logging.NOTSET or root.level > level:
-        root.setLevel(level)
+        # --- gateway-forensics.log (INFO+, unfiltered) ---------------------
+        # Belt-and-suspenders log independent of stdout/stderr capture by
+        # the wrapper that spawned the gateway (Windows Start-Detached
+        # redirect has been observed to silently drop output — see memory
+        # ``windows_start_process_detach_trap.md``). Captures every record
+        # at INFO+ from any logger so subscriber-loop and WAL-contention
+        # diagnostics show up even when they originate from non-gateway
+        # loggers (events.*, etc.). Path overridable via
+        # ``HERMES_GATEWAY_LOG_FILE`` (read from ~/.hermes/.env, NOT
+        # profile-scoped — see ``hermes_cli/env_loader.py``).
+        # Wrapped in try/except because the path comes from user env input
+        # and a bad value must not crash the gateway — the curated handlers
+        # above remain attached either way.
+        try:
+            forensics_path = _gateway_forensics_path(log_dir)
+            _add_rotating_handler(
+                root,
+                forensics_path,
+                level=logging.INFO,
+                max_bytes=10 * 1024 * 1024,
+                backup_count=5,
+                formatter=RedactingFormatter(_LOG_FORMAT),
+            )
+        except (OSError, ValueError) as exc:
+            logging.getLogger(__name__).warning(
+                "gateway-forensics handler failed to attach (HERMES_GATEWAY_LOG_FILE=%r): %s",
+                os.environ.get("HERMES_GATEWAY_LOG_FILE"),
+                exc,
+            )
 
-    # Suppress noisy third-party loggers.
-    for name in _NOISY_LOGGERS:
-        logging.getLogger(name).setLevel(logging.WARNING)
-
-    _logging_initialized = True
     return log_dir
+
+
+def _gateway_forensics_path(default_dir: Path) -> Path:
+    """Resolve the gateway forensics log path.
+
+    Priority:
+        1. ``HERMES_GATEWAY_LOG_FILE`` env var (absolute or ``~``-rooted)
+        2. ``<default_dir>/gateway-forensics.log``
+    """
+    override = os.environ.get("HERMES_GATEWAY_LOG_FILE")
+    if override:
+        return Path(override).expanduser()
+    return default_dir / "gateway-forensics.log"
 
 
 def setup_verbose_logging() -> None:

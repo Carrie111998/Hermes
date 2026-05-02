@@ -27,7 +27,7 @@ hermes-agent/
 ├── cli.py                # HermesCLI class — interactive CLI orchestrator (~11k LOC)
 ├── hermes_state.py       # SessionDB — SQLite session store (FTS5 search)
 ├── hermes_constants.py   # get_hermes_home(), display_hermes_home() — profile-aware paths
-├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log (profile-aware)
+├── hermes_logging.py     # setup_logging() — agent.log / errors.log / gateway.log / gateway-forensics.log (profile-aware)
 ├── batch_runner.py       # Parallel batch processing
 ├── agent/                # Agent internals (provider adapters, memory, caching, compression, etc.)
 ├── hermes_cli/           # CLI subcommands, setup wizard, plugins loader, skin engine
@@ -58,8 +58,11 @@ hermes-agent/
 
 **User config:** `~/.hermes/config.yaml` (settings), `~/.hermes/.env` (API keys only).
 **Logs:** `~/.hermes/logs/` — `agent.log` (INFO+), `errors.log` (WARNING+),
-`gateway.log` when running the gateway. Profile-aware via `get_hermes_home()`.
-Browse with `hermes logs [--follow] [--level ...] [--session ...]`.
+`gateway.log` (gateway-component records only) and `gateway-forensics.log`
+(unfiltered catch-all, INFO+) when running the gateway. Profile-aware via
+`get_hermes_home()`. Browse with `hermes logs [--follow] [--level ...]
+[--session ...]`. Override the forensics path with `HERMES_GATEWAY_LOG_FILE`
+in `~/.hermes/.env` (root, NOT profile-scoped — see `hermes_cli/env_loader.py`).
 
 ## File Dependency Chain
 
