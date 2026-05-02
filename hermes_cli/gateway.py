@@ -726,13 +726,17 @@ def launch_gateway_detached(extra_args: list[str] | None = None) -> int | None:
 
     Platform notes:
       - **Windows**: uses ``CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS``
-        and ``stdin/stdout/stderr=DEVNULL`` so the new process survives
-        the parent shell closing. PowerShell's ``Start-Process`` detach
-        trap (memory: windows_start_process_detach_trap.md) is
-        sidestepped because we go through subprocess.Popen directly,
-        not Start-Process.
+        and ``stdin=DEVNULL`` so the new process survives the parent
+        shell closing. PowerShell's ``Start-Process`` detach trap
+        (memory: windows_start_process_detach_trap.md) is sidestepped
+        because we go through subprocess.Popen directly, not
+        Start-Process.
       - **POSIX**: uses ``start_new_session=True`` which detaches via
         setsid().
+      - **stdout/stderr**: appended to ``~/.claude/logs/hermes-gateway.
+        {out,err}.log`` (same paths as gateway_watchdog and
+        laptop-start.ps1's Start-Detached) so a single tail covers
+        every spawn path.
 
     Used by ``hermes gateway restart --detached`` and by future M3
     consumers that need to relaunch the gateway without blocking the
@@ -767,12 +771,33 @@ def launch_gateway_detached(extra_args: list[str] | None = None) -> int | None:
     else:
         start_new_session = True
 
+    # Open log files for the new gateway's stdout/stderr in append mode.
+    # Same paths as gateway_watchdog._restart_gateway and laptop-start.ps1's
+    # Start-Detached invocation, so a single tail watches gateways spawned
+    # by any of the three paths. Without this, gateways from
+    # ``hermes gateway restart --detached`` had stdout/stderr pinned to
+    # DEVNULL, leaving no forensics for the next incident. DEVNULL fallback
+    # keeps the spawn path working if the log open fails (permissions, etc).
+    log_dir = Path.home() / ".claude" / "logs"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        stdout_handle = open(log_dir / "hermes-gateway.out.log", "ab")
+    except Exception:
+        stdout_handle = subprocess.DEVNULL
+    try:
+        stderr_handle = open(log_dir / "hermes-gateway.err.log", "ab")
+    except Exception:
+        stderr_handle = subprocess.DEVNULL
+
     try:
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
             creationflags=creationflags,
             start_new_session=start_new_session,
             close_fds=True,
@@ -781,6 +806,16 @@ def launch_gateway_detached(extra_args: list[str] | None = None) -> int | None:
     except Exception as exc:
         print(f"⚠ Failed to launch detached gateway: {exc}")
         return None
+    finally:
+        # Close the parent's copy of the file handles. The child has already
+        # received its inherited handles, so the file stays open on the
+        # child side until the gateway exits.
+        for handle in (stdout_handle, stderr_handle):
+            if hasattr(handle, "close"):
+                try:
+                    handle.close()
+                except Exception:
+                    pass
 
 
 def stop_profile_gateway() -> bool:
