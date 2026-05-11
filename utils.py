@@ -254,6 +254,36 @@ def normalize_proxy_env_vars() -> None:
         normalized = normalize_proxy_url(value)
         if normalized and normalized != value:
             os.environ[key] = normalized
+    _sanitize_no_proxy_ipv6()
+
+
+def _sanitize_no_proxy_ipv6() -> None:
+    """Strip unparseable IPv6 CIDR entries from NO_PROXY / no_proxy.
+
+    OrbStack injects raw IPv6 CIDR ranges (e.g. ``fd07:b51a:cc66:f0::/64``)
+    into NO_PROXY. httpx's URL parser interprets the colon-separated hex
+    groups as ``scheme:host:port`` and raises ``Invalid port`` when the
+    "port" segment contains colons.  Remove these entries so the OpenAI /
+    httpx client can be created without error.
+    """
+    import re
+
+    _NO_PROXY_KEYS = ("NO_PROXY", "no_proxy")
+    # Heuristic: bare IPv6 CIDR contains ':' and '/' — not a valid hostname
+    # or URL that httpx can parse.
+    _ipv6_cidr_re = re.compile(r"[0-9a-fA-F]{1,4}:")
+
+    for key in _NO_PROXY_KEYS:
+        value = os.environ.get(key, "")
+        if not value or ":" not in value:
+            continue
+        entries = [e.strip() for e in value.split(",")]
+        cleaned = [
+            e for e in entries
+            if not (_ipv6_cidr_re.match(e) and "/" in e and not e.startswith("["))
+        ]
+        if len(cleaned) != len(entries):
+            os.environ[key] = ",".join(cleaned)
 
 
 # ─── URL Parsing Helpers ──────────────────────────────────────────────────────

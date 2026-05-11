@@ -33,6 +33,15 @@ services:
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
+      # Disable OrbStack proxy — it injects HTTP_PROXY/HTTPS_PROXY that
+      # point at proxyproxy.orb.internal which is unreachable from the
+      # container.  Discord and external APIs connect directly instead.
+      - HTTP_PROXY=
+      - HTTPS_PROXY=
+      - ALL_PROXY=
+      - http_proxy=
+      - https_proxy=
+      - all_proxy=
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0

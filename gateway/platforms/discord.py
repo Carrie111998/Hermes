@@ -4061,6 +4061,39 @@ class DiscordAdapter(BasePlatformAdapter):
         # Save mention-stripped text before auto-threading since create_thread()
         # can clobber message.content, breaking /command detection in channels.
         raw_content = message.content.strip()
+        # Extract text and images from embeds (e.g., Frigate NVR webhook notifications).
+        # Webhook bots post embeds with empty message.content, so we synthesise
+        # readable text from the embed fields so Hermes can analyse them.
+        embed_images: list[str] = []
+        if not raw_content and message.embeds:
+            embed_texts = []
+            for embed in message.embeds:
+                parts = []
+                if getattr(embed, "title", None):
+                    parts.append(embed.title)
+                if getattr(embed, "description", None):
+                    parts.append(embed.description)
+                if getattr(embed, "fields", None):
+                    for field in embed.fields:
+                        parts.append(f"{field.name}: {field.value}")
+                if parts:
+                    embed_texts.append("\n".join(parts))
+                # Collect embed image URLs for vision analysis
+                image_url = getattr(getattr(embed, "image", None), "url", None)
+                if not image_url:
+                    image_url = getattr(getattr(embed, "thumbnail", None), "url", None)
+                if image_url:
+                    embed_images.append(image_url)
+            if embed_texts:
+                raw_content = "\n\n".join(embed_texts)
+        elif message.embeds:
+            # Raw content exists but still collect embed images
+            for embed in message.embeds:
+                image_url = getattr(getattr(embed, "image", None), "url", None)
+                if not image_url:
+                    image_url = getattr(getattr(embed, "thumbnail", None), "url", None)
+                if image_url:
+                    embed_images.append(image_url)
         normalized_content = raw_content
         mention_prefix = False
         if self._client.user and self._client.user in message.mentions:
@@ -4276,6 +4309,12 @@ class DiscordAdapter(BasePlatformAdapter):
                                 "[Discord] Failed to cache document %s: %s",
                                 att.filename, e, exc_info=True,
                             )
+
+        # Add embed image URLs to media_urls for vision analysis
+        for url in embed_images:
+            media_urls.append(url)
+            media_types.append("image/jpeg")
+            print(f"[Discord] Added embed image URL: {url}", flush=True)
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
         # to detect /slash commands in channel messages.
