@@ -15665,6 +15665,30 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5050, str(e))
 
 
+# ── Wiki RPCs ────────────────────────────────────────────────────────
+# Gateway-side scanner for the Karpathy compendium wiki pattern.
+# HermesNative (and any other WS client) can call these to render a
+# native knowledge graph without requiring local filesystem access.
+
+from tui_gateway import wiki as _wiki_mod
+
+@method("wiki.scan")
+def _(rid, params: dict) -> dict:
+    """Scan a wiki directory and return its page graph.
+
+    Params:
+        - ``path`` (str, optional): wiki root directory. Defaults to ``~/wiki``.
+
+    Returns:
+        ``{"pages": [...], "links": [...]}``
+    """
+    try:
+        result = _wiki_mod.scan(params.get("path"))
+        return _ok(rid, result)
+    except Exception as e:
+        return _err(rid, 5100, f"wiki scan failed: {e}")
+
+
 @method("wiki.page")
 def _(rid, params: dict) -> dict:
     try:
@@ -15753,3 +15777,23 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("feed.sources failed")
         return _err(rid, 5201, str(e))
+    """Read a single wiki page by relative path.
+
+    Params:
+        - ``path`` (str, required): relative path inside the wiki root
+          (e.g. ``entities/dflash-mlx.md``).
+        - ``wiki_root`` (str, optional): override the wiki root directory.
+
+    Returns:
+        ``{"id": "...", "frontmatter": {...}, "body": "...", "path": "..."}``
+    """
+    rel = str(params.get("path", "") or "").strip()
+    if not rel:
+        return _err(rid, 5101, "path required")
+    try:
+        result = _wiki_mod.page(rel, params.get("wiki_root"))
+    except Exception as e:
+        return _err(rid, 5103, f"wiki.page error: {e}")
+    if result is None:
+        return _err(rid, 5102, "page not found or access denied")
+    return _ok(rid, result)
