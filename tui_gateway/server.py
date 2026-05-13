@@ -35,6 +35,7 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
+from tui_gateway.wiki_api import wiki_scan, wiki_page
 
 logger = logging.getLogger(__name__)
 
@@ -15268,3 +15269,55 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5002, "command timed out (30s)")
     except Exception as e:
         return _err(rid, 5003, str(e))
+# ── Methods: session.set_prompt ──────────────────────────────────────
+
+
+@method("session.set_prompt")
+def _(rid, params: dict) -> dict:
+    """Set an ephemeral system prompt append on the live agent.
+
+    The prompt is appended to the agent's system prompt on every API call
+    but is NOT persisted to trajectories or the session database.
+    Setting an empty string clears the ephemeral prompt.
+    """
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    agent = session.get("agent")
+    if not agent:
+        return _err(rid, 4001, "session not ready")
+    if session.get("running"):
+        return _err(
+            rid,
+            4009,
+            "session busy — /interrupt the current turn before setting prompt",
+        )
+    prompt = str(params.get("prompt", "") or "").strip()
+    agent.ephemeral_system_prompt = prompt or None
+    agent._cached_system_prompt = None
+    return _ok(rid, {"prompt": prompt})
+
+@method("wiki.scan")
+def _(rid, params: dict) -> dict:
+    try:
+        path = params.get("path")
+        result = wiki_scan(path)
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("wiki.scan failed")
+        return _err(rid, 5050, str(e))
+
+
+@method("wiki.page")
+def _(rid, params: dict) -> dict:
+    try:
+        page_path = params.get("path")
+        if not page_path:
+            return _err(rid, 4001, "path is required")
+        result = wiki_page(page_path)
+        if result is None:
+            return _err(rid, 4040, f"page not found: {page_path}")
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("wiki.page failed")
+        return _err(rid, 5051, str(e))
