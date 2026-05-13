@@ -52,7 +52,7 @@ export VIRTUAL_ENV="$(pwd)/venv"
 uv pip install -e ".[all,dev]"
 uv pip install -e "./tinker-atropos"
 
-# Optional: browser tools
+# Install pre-commit hooks and browser tools
 npm install
 ```
 

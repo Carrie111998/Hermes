@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
-    "prepare": "git rev-parse --is-inside-work-tree >/dev/null 2>&1 && npx --no husky || true"
+    "prepare": "if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && node -e \"require.resolve('husky')\" 2>/dev/null; then npx --no husky; fi"
   },
   "repository": {
     "type": "git",

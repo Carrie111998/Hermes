@@ -76,7 +76,7 @@ uv pip install -e ".[all,dev]"
 # Optional: RL training submodule
 # git submodule update --init tinker-atropos && uv pip install -e "./tinker-atropos"
 
-# Optional: browser tools
+# Install pre-commit hooks and browser tools
 npm install
 ```
 
