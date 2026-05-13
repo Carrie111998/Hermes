@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "postinstall": "echo '✅ Browser tools ready. Run: python run_agent.py --help'",
-    "prepare": "test -n \"$npm_config_omit\" || husky"
+    "prepare": "if [ -d .git ] && command -v husky >/dev/null 2>&1; then husky; fi"
   },
   "repository": {
     "type": "git",

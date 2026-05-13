@@ -36,7 +36,7 @@ We value contributions in this order:
 | **Git** | With `--recurse-submodules` support, and the `git-lfs` extension installed |
 | **Python 3.11+** | uv will install it if missing |
 | **uv** | Fast Python package manager ([install](https://docs.astral.sh/uv/)) |
-| **Node.js 20+** | Optional — needed for browser tools and WhatsApp bridge (matches root `package.json` engines) |
+| **Node.js 20.17+** | Optional — needed for browser tools, pre-commit hooks, and WhatsApp bridge (matches root `package.json` engines) |
 
 ### Clone and Install
 
