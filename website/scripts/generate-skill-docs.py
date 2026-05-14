@@ -60,11 +60,28 @@ def _wrap_markdown_tables(text: str) -> str:
     ascii-guard interprets ``|`` at the start of a line as an ASCII box
     border.  Skill SKILL.md bodies frequently contain markdown tables that
     trigger false positives.  Wrapping them silences the lint.
+
+    Fenced code blocks are excluded so that pipe-delimited lines inside
+    examples (e.g. literal markdown tables in docs) are left untouched.
+    Already-wrapped regions (``<!-- ascii-guard-ignore -->``) are also
+    skipped to avoid double-wrapping.
     """
+    # Split the text into segments: fenced code blocks, ascii-guard-ignore
+    # regions, and everything else.  Only apply table wrapping to the
+    # "everything else" segments.
+    #
+    # Pattern matches (in order):
+    #   1. Fenced code blocks:  ```...``` or ~~~...~~~
+    #   2. Existing ascii-guard-ignore regions
+    _SKIP_RE = re.compile(
+        r"(?:^[ \t]*(?:```+|~~~+).*?^[ \t]*(?:```+|~~~+)[ \t]*$)"
+        r"|"
+        r"(?:<!-- ascii-guard-ignore -->.*?<!-- ascii-guard-ignore-end -->)",
+        re.MULTILINE | re.DOTALL,
+    )
 
     def _replacer(m: re.Match) -> str:
         table = m.group(0)
-        # Don't double-wrap if already inside ignore markers.
         return (
             "<!-- ascii-guard-ignore -->\n"
             + table
@@ -72,7 +89,18 @@ def _wrap_markdown_tables(text: str) -> str:
             + "<!-- ascii-guard-ignore-end -->\n"
         )
 
-    return _MD_TABLE_RE.sub(_replacer, text)
+    result = []
+    last_end = 0
+    for skip_match in _SKIP_RE.finditer(text):
+        # Process the gap before this skipped region
+        gap = text[last_end:skip_match.start()]
+        result.append(_MD_TABLE_RE.sub(_replacer, gap))
+        # Preserve the skipped region verbatim
+        result.append(skip_match.group(0))
+        last_end = skip_match.end()
+    # Process any trailing text after the last skipped region
+    result.append(_MD_TABLE_RE.sub(_replacer, text[last_end:]))
+    return "".join(result)
 
 
 def _wrap_ascii_art_code_blocks(code_segment: str) -> str:
