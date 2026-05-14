@@ -74,7 +74,9 @@ def _wrap_markdown_tables(text: str) -> str:
     #   1. Fenced code blocks:  ```...``` or ~~~...~~~
     #   2. Existing ascii-guard-ignore regions
     _SKIP_RE = re.compile(
-        r"(?:^[ \t]*(?:```+|~~~+).*?^[ \t]*(?:```+|~~~+)[ \t]*$)"
+        r"(?:^[ \t]*(```+).*?^[ \t]*\1[ \t]*$)"
+        r"|"
+        r"(?:^[ \t]*(~~~+).*?^[ \t]*\2[ \t]*$)"
         r"|"
         r"(?:<!-- ascii-guard-ignore -->.*?<!-- ascii-guard-ignore-end -->)",
         re.MULTILINE | re.DOTALL,

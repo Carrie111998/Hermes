@@ -6,13 +6,13 @@ set -euo pipefail
 # Prefer project venv first for consistent results across contributors.
 for candidate in .venv/bin/ruff venv/bin/ruff; do
   if [ -x "$candidate" ]; then
-    exec "$candidate" check --fix -- "$@"
+    exec "$candidate" check --fix --force-exclude -- "$@"
   fi
 done
 
 # Fall back to PATH (global install).
 if command -v ruff &>/dev/null; then
-  exec ruff check --fix -- "$@"
+  exec ruff check --fix --force-exclude -- "$@"
 fi
 
 echo "ERROR: ruff not found. Install dev deps: uv pip install -e '.[dev]'" >&2
