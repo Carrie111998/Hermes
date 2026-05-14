@@ -427,7 +427,65 @@ class TestStopProfileGateway:
         assert killed_pid in reap_extra_excludes[0]
 
 
+def test_get_gateway_runtime_snapshot_windows_uses_scheduled_task_state(monkeypatch):
+    runtime_pid = 20888
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [runtime_pid])
+    monkeypatch.setattr(gateway, "is_termux", lambda: False)
+    monkeypatch.setattr(gateway, "is_linux", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+
+    fake_windows = SimpleNamespace(
+        is_task_registered=lambda: True,
+        is_startup_entry_installed=lambda: False,
+        query_task_status=lambda: {"status": "Running"},
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.gateway_windows", fake_windows)
+    monkeypatch.setattr(
+        sys.modules["hermes_cli"], "gateway_windows", fake_windows, raising=False
+    )
+
+    snapshot = gateway.get_gateway_runtime_snapshot()
+
+    assert snapshot.manager == "windows scheduled task"
+    assert snapshot.service_installed is True
+    assert snapshot.service_running is True
+    assert snapshot.service_scope == "scheduled-task"
+    assert snapshot.gateway_pids == (20888,)
+    assert snapshot.running is True
+
+
+def test_get_gateway_runtime_snapshot_windows_uses_startup_entry_state(monkeypatch):
+    runtime_pid = 20888
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [runtime_pid])
+    monkeypatch.setattr(gateway, "is_termux", lambda: False)
+    monkeypatch.setattr(gateway, "is_linux", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+
+    fake_windows = SimpleNamespace(
+        is_task_registered=lambda: False,
+        is_startup_entry_installed=lambda: True,
+        query_task_status=lambda: {},
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.gateway_windows", fake_windows)
+    monkeypatch.setattr(
+        sys.modules["hermes_cli"], "gateway_windows", fake_windows, raising=False
+    )
+
+    snapshot = gateway.get_gateway_runtime_snapshot()
+
+    assert snapshot.manager == "windows startup entry"
+    assert snapshot.service_installed is True
+    assert snapshot.service_running is False
+    assert snapshot.service_scope == "startup"
+    assert snapshot.gateway_pids == (20888,)
+    assert snapshot.running is True
+
+
 def test_module_has_logger():
-    """Verify module has a logger instance (regression guard for #27154)."""
+
     assert hasattr(gateway, "logger")
     assert gateway.logger.name == "hermes_cli.gateway"
