@@ -70,17 +70,13 @@ def _wrap_markdown_tables(text: str) -> str:
     # regions, and everything else.  Only apply table wrapping to the
     # "everything else" segments.
     #
-    # Pattern matches (in order):
-    #   1. Fenced code blocks:  ```...``` or ~~~...~~~
-    #   2. Existing ascii-guard-ignore regions
-    _SKIP_RE = re.compile(
-        r"(?:^[ \t]*(```+).*?^[ \t]*\1[ \t]*$)"
-        r"|"
-        r"(?:^[ \t]*(~~~+).*?^[ \t]*\2[ \t]*$)"
-        r"|"
-        r"(?:<!-- ascii-guard-ignore -->.*?<!-- ascii-guard-ignore-end -->)",
-        re.MULTILINE | re.DOTALL,
-    )
+    # We use a line-by-line scanner instead of a single regex so that closing
+    # fences of *equal or greater* length than the opener are recognised
+    # (per CommonMark spec), which a backreference regex cannot express.
+
+    _FENCE_OPEN_RE = re.compile(r"^[ \t]*((`{3,})|(~{3,}))")
+    _IGNORE_OPEN = "<!-- ascii-guard-ignore -->"
+    _IGNORE_CLOSE = "<!-- ascii-guard-ignore-end -->"
 
     def _replacer(m: re.Match) -> str:
         table = m.group(0)
@@ -91,18 +87,69 @@ def _wrap_markdown_tables(text: str) -> str:
             + "<!-- ascii-guard-ignore-end -->\n"
         )
 
-    result = []
-    last_end = 0
-    for skip_match in _SKIP_RE.finditer(text):
-        # Process the gap before this skipped region
-        gap = text[last_end:skip_match.start()]
-        result.append(_MD_TABLE_RE.sub(_replacer, gap))
-        # Preserve the skipped region verbatim
-        result.append(skip_match.group(0))
-        last_end = skip_match.end()
-    # Process any trailing text after the last skipped region
-    result.append(_MD_TABLE_RE.sub(_replacer, text[last_end:]))
-    return "".join(result)
+    segments: list[tuple[str, bool]] = []  # (text, is_skip)
+    lines = text.split("\n")
+    buf: list[str] = []
+    in_skip = False
+    fence_char: str | None = None
+    fence_len = 0
+    in_ignore = False
+
+    def _flush() -> None:
+        if buf:
+            segments.append(("\n".join(buf) + "\n", in_skip))
+            buf.clear()
+
+    for line in lines:
+        if in_ignore:
+            buf.append(line)
+            if _IGNORE_CLOSE in line:
+                in_ignore = False
+                _flush()
+                in_skip = False
+            continue
+
+        if not in_skip and _IGNORE_OPEN in line:
+            _flush()
+            in_skip = True
+            in_ignore = True
+            buf.append(line)
+            continue
+
+        if not in_skip:
+            fm = _FENCE_OPEN_RE.match(line)
+            if fm:
+                _flush()
+                in_skip = True
+                fence_char = "`" if fm.group(2) else "~"
+                fence_len = len(fm.group(2) or fm.group(3))
+                buf.append(line)
+                continue
+            buf.append(line)
+        else:
+            # Inside a fenced code block — look for a closing fence
+            buf.append(line)
+            stripped = line.strip()
+            if (
+                fence_char
+                and stripped == stripped.rstrip()
+                and len(stripped) >= fence_len
+                and all(ch == fence_char for ch in stripped)
+            ):
+                _flush()
+                in_skip = False
+                fence_char = None
+                fence_len = 0
+
+    _flush()
+
+    result_parts: list[str] = []
+    for seg_text, is_skip in segments:
+        if is_skip:
+            result_parts.append(seg_text)
+        else:
+            result_parts.append(_MD_TABLE_RE.sub(_replacer, seg_text))
+    return "".join(result_parts)
 
 
 def _wrap_ascii_art_code_blocks(code_segment: str) -> str:

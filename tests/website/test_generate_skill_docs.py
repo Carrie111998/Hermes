@@ -208,3 +208,44 @@ def test_wrap_markdown_tables_wraps_table_outside_fence_but_not_inside(gen_modul
     wrap_pos = result.index("<!-- ascii-guard-ignore -->")
     real_table_pos = result.index("| real | table |")
     assert wrap_pos < real_table_pos
+
+
+def test_wrap_markdown_tables_longer_closing_fence(gen_module):
+    """CommonMark allows a closing fence longer than the opener; table inside
+    must not be wrapped."""
+    text = (
+        "```\n"
+        "| header | row |\n"
+        "|--------|-----|\n"
+        "| a      | b   |\n"
+        "````\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert "ascii-guard-ignore" not in result
+
+
+def test_render_skill_page_wraps_body_tables(gen_module):
+    """render_skill_page must apply _wrap_markdown_tables to the body so that
+    markdown tables in generated docs don't fail ascii-guard lint."""
+    meta = {
+        "slug": "test-skill",
+        "category": "testing",
+        "source_kind": "bundled",
+        "rel_path": "testing/test-skill",
+        "skill_md": "/dev/null",
+    }
+    fm = {
+        "name": "test-skill",
+        "description": "A test skill.",
+    }
+    body = (
+        "Some text.\n\n"
+        "| Col A | Col B |\n"
+        "|-------|-------|\n"
+        "| 1     | 2     |\n"
+    )
+    result = gen_module.render_skill_page(meta, fm, body)
+    # The body table should be wrapped (in addition to the info_table which
+    # render_skill_page wraps explicitly).
+    # Count: 2 ignore regions — one for info_table, one for body table.
+    assert result.count("<!-- ascii-guard-ignore -->") >= 2
