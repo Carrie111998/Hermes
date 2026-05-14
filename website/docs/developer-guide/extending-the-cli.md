@@ -12,6 +12,7 @@ Hermes exposes protected extension hooks on `HermesCLI` so wrapper CLIs can add 
 
 There are five extension seams available:
 
+<!-- ascii-guard-ignore -->
 | Hook | Purpose | Override when... |
 |------|---------|------------------|
 | `_get_extra_tui_widgets()` | Inject widgets into the layout | You need a persistent UI element (panel, status line, mini-player) |
@@ -19,6 +20,7 @@ There are five extension seams available:
 | `_build_tui_layout_children(**widgets)` | Full control over widget ordering | You need to reorder or wrap existing widgets (rare) |
 | `process_command()` | Add custom slash commands | You need `/mycommand` handling (pre-existing hook) |
 | `_build_tui_style_dict()` | Custom prompt_toolkit styles | You need custom colors or styling (pre-existing hook) |
+<!-- ascii-guard-ignore-end -->
 
 The first three are new protected hooks. The last two already existed.
 

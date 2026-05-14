@@ -45,6 +45,35 @@ _FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>```+|~~~+)", re.MULTILINE)
 # ignore markers in every SKILL.md — the generator handles it defensively.
 _BOX_DRAWING_CHARS = frozenset("┌┐└┘─│═║╔╗╚╝╠╣╦╩╬├┤┬┴┼╭╮╯╰▶◀▲▼")
 
+# Regex matching a contiguous block of markdown table rows (lines starting
+# with ``|``), optionally including ``|---|`` separator rows.  We match one
+# or more consecutive table-like lines.
+_MD_TABLE_RE = re.compile(
+    r"(?:^[ \t]*\|.+\|[ \t]*$\n?){2,}",
+    re.MULTILINE,
+)
+
+
+def _wrap_markdown_tables(text: str) -> str:
+    """Wrap markdown tables in ascii-guard-ignore markers.
+
+    ascii-guard interprets ``|`` at the start of a line as an ASCII box
+    border.  Skill SKILL.md bodies frequently contain markdown tables that
+    trigger false positives.  Wrapping them silences the lint.
+    """
+
+    def _replacer(m: re.Match) -> str:
+        table = m.group(0)
+        # Don't double-wrap if already inside ignore markers.
+        return (
+            "<!-- ascii-guard-ignore -->\n"
+            + table
+            + ("" if table.endswith("\n") else "\n")
+            + "<!-- ascii-guard-ignore-end -->\n"
+        )
+
+    return _MD_TABLE_RE.sub(_replacer, text)
+
 
 def _wrap_ascii_art_code_blocks(code_segment: str) -> str:
     """Wrap a fenced code segment in ascii-guard-ignore markers if it contains
@@ -439,7 +468,7 @@ def render_skill_page(
         "\n"
         "## Skill metadata\n"
         "\n"
-        f"{info_table}\n"
+        f"<!-- ascii-guard-ignore -->\n{info_table}\n<!-- ascii-guard-ignore-end -->\n"
         "\n"
         "## Reference: full SKILL.md\n"
         "\n"
@@ -447,7 +476,7 @@ def render_skill_page(
         "The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.\n"
         ":::\n"
         "\n"
-        f"{body_clean}\n"
+        f"{_wrap_markdown_tables(body_clean)}\n"
     )
 
 
