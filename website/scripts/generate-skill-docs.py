@@ -97,7 +97,7 @@ def _wrap_markdown_tables(text: str) -> str:
 
     def _flush() -> None:
         if buf:
-            segments.append(("\n".join(buf) + "\n", in_skip))
+            segments.append(("\n".join(buf), in_skip))
             buf.clear()
 
     for line in lines:
@@ -132,7 +132,6 @@ def _wrap_markdown_tables(text: str) -> str:
             stripped = line.strip()
             if (
                 fence_char
-                and stripped == stripped.rstrip()
                 and len(stripped) >= fence_len
                 and all(ch == fence_char for ch in stripped)
             ):
@@ -149,7 +148,7 @@ def _wrap_markdown_tables(text: str) -> str:
             result_parts.append(seg_text)
         else:
             result_parts.append(_MD_TABLE_RE.sub(_replacer, seg_text))
-    return "".join(result_parts)
+    return "\n".join(result_parts)
 
 
 def _wrap_ascii_art_code_blocks(code_segment: str) -> str:
