@@ -137,6 +137,7 @@ class LineAdapter(BasePlatformAdapter):
         # Member display name cache: (chat_type, chat_id, user_id) -> (display_name, inserted_at)
         self._member_name_cache: Dict[tuple, tuple] = {}
         self._MEMBER_NAME_CACHE_TTL = 3600.0  # 1 hour
+        self._MEMBER_NAME_CACHE_MAX_SIZE = 500  # evict oldest 25% when exceeded
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -493,6 +494,7 @@ class LineAdapter(BasePlatformAdapter):
             except Exception as exc:
                 logger.error("[%s] Push message to %s failed: %s",
                              self.name, payload.get("to"), exc)
+            self._cleanup_member_name_cache()
 
     # ------------------------------------------------------------------
     # Formatting (platform-specific override)
@@ -690,6 +692,7 @@ class LineAdapter(BasePlatformAdapter):
             display_name = profile.get("displayName")
             if display_name:
                 self._member_name_cache[cache_key] = (display_name, time.monotonic())
+                self._evict_oldest_if_needed()
             return display_name
         except Exception:
             logger.debug(
@@ -712,6 +715,22 @@ class LineAdapter(BasePlatformAdapter):
                 "[%s] Cleaned up %d expired member name cache entry(s)",
                 self.name, len(expired),
             )
+
+    def _evict_oldest_if_needed(self) -> None:
+        """Evict the oldest 25% of entries when cache exceeds the max size."""
+        if len(self._member_name_cache) <= self._MEMBER_NAME_CACHE_MAX_SIZE:
+            return
+        evict_count = max(1, self._MEMBER_NAME_CACHE_MAX_SIZE // 4)
+        sorted_entries = sorted(
+            self._member_name_cache.items(), key=lambda kv: kv[1][1]
+        )
+        for key, _ in sorted_entries[:evict_count]:
+            del self._member_name_cache[key]
+        logger.debug(
+            "[%s] Evicted %d oldest member name cache entry(s) (size=%d, max=%d)",
+            self.name, evict_count,
+            len(self._member_name_cache), self._MEMBER_NAME_CACHE_MAX_SIZE,
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a LINE chat (user / group / room).
