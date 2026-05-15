@@ -513,6 +513,31 @@ class _LineClient:
         except Exception:
             return None
 
+    async def get_member_profile(
+        self, chat_type: str, chat_id: str, user_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a member's profile from a group or room.
+
+        Returns the parsed JSON body (which includes ``displayName``) on
+        success, or ``None`` on any error (4xx, 5xx, timeout, parse failure).
+        """
+        import aiohttp
+        if chat_type == "group":
+            url = f"https://api.line.me/v2/bot/group/{chat_id}/member/{user_id}"
+        elif chat_type == "room":
+            url = f"https://api.line.me/v2/bot/room/{chat_id}/member/{user_id}"
+        else:
+            return None
+        timeout = aiohttp.ClientTimeout(total=3.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        return None
+                    return await resp.json(content_type=None)
+        except Exception:
+            return None
+
 
 # ---------------------------------------------------------------------------
 # Message builders
@@ -722,6 +747,24 @@ class LineAdapter(BasePlatformAdapter):
         # button per chat at a time. Postback cache request_id keyed by chat_id.
         self._pending_buttons: Dict[str, str] = {}
 
+        # Member display-name cache: (chat_type, chat_id, user_id) → (name, inserted_at)
+        self._member_name_cache: Dict[tuple, tuple] = {}
+        self._MEMBER_NAME_CACHE_TTL = 3600.0  # 1 hour
+        self._MEMBER_NAME_CACHE_MAX_SIZE = 500  # evict oldest 25 % when exceeded
+
+        # Dispatch retry tracking: event_id → (retry_count, inserted_at)
+        self._retry_counts: Dict[str, tuple] = {}
+        self._MAX_DISPATCH_RETRIES = 3
+        self._RETRY_COUNT_TTL = 3600.0  # 1 hour
+
+        # Dead-letter queue for diagnostics (capped)
+        self._dead_letter_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._DEAD_LETTER_QUEUE_MAX_SIZE = 1000
+        self._DEAD_LETTER_QUEUE_PRUNE_AT = 100
+
+        # Periodic cleanup task
+        self._cleanup_task: Optional[asyncio.Task] = None
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -798,6 +841,8 @@ class LineAdapter(BasePlatformAdapter):
             return False
 
         self._mark_connected()
+        # Start periodic cleanup of in-memory caches (member names, retry counts, etc.)
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         logger.info(
             "LINE: webhook listening on %s:%s%s%s",
             self.webhook_host,
@@ -809,6 +854,15 @@ class LineAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._mark_disconnected()
+
+        # Stop periodic cleanup
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
 
         if self._site is not None:
             try:
@@ -823,6 +877,15 @@ class LineAdapter(BasePlatformAdapter):
                 pass
             self._runner = None
         self._app = None
+
+        # Clear in-memory caches
+        self._member_name_cache.clear()
+        self._retry_counts.clear()
+        while not self._dead_letter_queue.empty():
+            try:
+                self._dead_letter_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
         # Cleanup any tracked tempfiles.
         for path in list(self._media_temp_paths):
@@ -955,6 +1018,24 @@ class LineAdapter(BasePlatformAdapter):
         else:
             text = f"[unsupported message type: {msg_type}]"
 
+        # Resolve sender display name for group/room messages.
+        # DM users are shown by their LINE userId which matches the chat_id.
+        user_name = user_id
+        if chat_type in ("group", "room") and user_id and chat_id and self._client:
+            cache_key = (chat_type, chat_id, user_id)
+            now = time.monotonic()
+            if cache_key in self._member_name_cache:
+                cached_name, inserted_at = self._member_name_cache[cache_key]
+                if now - inserted_at <= self._MEMBER_NAME_CACHE_TTL:
+                    user_name = cached_name
+            if user_name == user_id:
+                # Not in cache or expired — fetch from LINE API.
+                profile = await self._client.get_member_profile(chat_type, chat_id, user_id)
+                if profile and profile.get("displayName"):
+                    user_name = profile["displayName"]
+                    self._member_name_cache[cache_key] = (user_name, time.monotonic())
+                    self._evict_oldest_if_needed()
+
         # Best-effort typing indicator (DM only).
         if chat_type == "dm" and self._client:
             asyncio.create_task(self._client.loading(chat_id))
@@ -963,7 +1044,7 @@ class LineAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_type=chat_type,
             user_id=user_id,
-            user_name=user_id,
+            user_name=user_name,
             chat_name=chat_id,
         )
 
@@ -1151,6 +1232,105 @@ class LineAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """Strip Markdown that LINE can't render. URLs are preserved."""
         return strip_markdown_preserving_urls(content)
+
+    # ------------------------------------------------------------------
+    # Periodic cleanup
+    # ------------------------------------------------------------------
+
+    async def _cleanup_loop(self) -> None:
+        """Background task that periodically prunes stale in-memory state.
+
+        Runs every 5 minutes. Prevents unbounded growth of the member name
+        cache, retry-count dictionary, expired reply tokens, and the
+        dead-letter queue.
+        """
+        CLEANUP_INTERVAL = 300.0  # 5 minutes
+        while True:
+            await asyncio.sleep(CLEANUP_INTERVAL)
+            try:
+                self._clear_expired_reply_tokens()
+                self._cleanup_member_name_cache()
+                self._cleanup_retry_counts()
+                self._prune_dead_letter_queue()
+                self._cache.prune()
+            except Exception:
+                logger.debug(
+                    "LINE: periodic cleanup failed", exc_info=True,
+                )
+
+    def _clear_expired_reply_tokens(self) -> None:
+        """Remove reply tokens past their TTL."""
+        now = time.time()
+        expired = [
+            cid for cid, (_, exp) in self._reply_tokens.items() if now >= exp
+        ]
+        for cid in expired:
+            self._reply_tokens.pop(cid, None)
+        if expired:
+            logger.debug("LINE: cleared %d expired reply token(s)", len(expired))
+
+    def _cleanup_member_name_cache(self) -> None:
+        """Remove member name cache entries older than the TTL."""
+        now = time.monotonic()
+        expired = [
+            key for key, (_, inserted_at) in self._member_name_cache.items()
+            if now - inserted_at > self._MEMBER_NAME_CACHE_TTL
+        ]
+        for key in expired:
+            del self._member_name_cache[key]
+        if expired:
+            logger.debug(
+                "LINE: cleaned up %d expired member name cache entry(s)",
+                len(expired),
+            )
+
+    def _evict_oldest_if_needed(self) -> None:
+        """Evict the oldest 25% of entries when cache exceeds the max size."""
+        if len(self._member_name_cache) <= self._MEMBER_NAME_CACHE_MAX_SIZE:
+            return
+        evict_count = max(1, self._MEMBER_NAME_CACHE_MAX_SIZE // 4)
+        sorted_entries = sorted(
+            self._member_name_cache.items(), key=lambda kv: kv[1][1]
+        )
+        for key, _ in sorted_entries[:evict_count]:
+            del self._member_name_cache[key]
+        logger.debug(
+            "LINE: evicted %d oldest member name cache entry(s) (size=%d, max=%d)",
+            evict_count,
+            len(self._member_name_cache), self._MEMBER_NAME_CACHE_MAX_SIZE,
+        )
+
+    def _cleanup_retry_counts(self) -> None:
+        """Remove retry-count entries past their TTL.
+
+        Entries are keyed by event_id and store ``(count, inserted_at)``.
+        """
+        now = time.monotonic()
+        expired = [
+            eid for eid, (_, inserted_at) in self._retry_counts.items()
+            if now - inserted_at > self._RETRY_COUNT_TTL
+        ]
+        for eid in expired:
+            self._retry_counts.pop(eid, None)
+        if expired:
+            logger.debug(
+                "LINE: cleaned up %d stale retry-count entry(s)", len(expired),
+            )
+
+    def _prune_dead_letter_queue(self) -> None:
+        """Keep only the most recent entries in the dead-letter queue."""
+        q = self._dead_letter_queue
+        prune_at = self._DEAD_LETTER_QUEUE_PRUNE_AT
+        while q.qsize() > prune_at:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if q.qsize() > 0:
+            logger.debug(
+                "LINE: dead-letter queue size=%d (pruned to %d)",
+                q.qsize(), prune_at,
+            )
 
     # ------------------------------------------------------------------
     # Slow-LLM postback button — driven by _keep_typing
