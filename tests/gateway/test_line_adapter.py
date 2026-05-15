@@ -171,7 +171,7 @@ class TestLineAdapterInit:
 
     def test_group_policy_default(self):
         adapter = _make_adapter()
-        assert adapter.group_policy == "disabled"
+        assert adapter.group_policy == "open"
 
     def test_reply_tokens_empty_initially(self):
         adapter = _make_adapter()
@@ -381,7 +381,8 @@ class TestAccessControl:
         await client.close()
 
     @pytest.mark.asyncio
-    async def test_group_disabled_by_default(self):
+    async def test_group_open_by_default(self):
+        """group_policy defaults to 'open' — messages from groups are accepted."""
         adapter = _make_adapter(group_allow_from=["U123"])
         client = await _start_server(adapter)
         body = _make_webhook_body(
@@ -393,7 +394,7 @@ class TestAccessControl:
             _TEST_PATH, data=payload, headers={"X-Line-Signature": sig}
         )
         assert resp.status == 200
-        assert adapter._message_queue.empty()
+        assert not adapter._message_queue.empty()
         await client.close()
 
     @pytest.mark.asyncio
@@ -940,4 +941,263 @@ class TestChatTypePropagation:
         assert not adapter._message_queue.empty()
         event = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
         assert event.source.chat_type == "dm"
-        await client.close()
+
+
+# ---------------------------------------------------------------------------
+# get_chat_info — prefix-based routing
+# ---------------------------------------------------------------------------
+
+
+class TestGetChatInfo:
+    @pytest.mark.asyncio
+    async def test_group_prefix_calls_group_summary_api(self):
+        """C-prefixed chat_id calls /group/{id}/summary."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={
+            "groupId": "C123", "groupName": "Test Group", "pictureUrl": ""
+        })
+
+        info = await adapter.get_chat_info("C123")
+        assert info["type"] == "group"
+        assert info["name"] == "Test Group"
+        adapter._line_api_get.assert_called_once_with(
+            f"{LINE_API_BASE_URL}/group/C123/summary"
+        )
+
+    @pytest.mark.asyncio
+    async def test_room_prefix_returns_prefix_inference(self):
+        """R-prefixed chat_id infers room type (no summary endpoint)."""
+        adapter = _make_adapter()
+        # Room should not call API — no room summary endpoint exists
+        adapter._line_api_get = AsyncMock()
+
+        info = await adapter.get_chat_info("R456")
+        assert info["type"] == "room"
+        assert info["name"] == "R456"
+        adapter._line_api_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_user_prefix_calls_profile_api(self):
+        """U-prefixed chat_id calls /profile/{id}."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Test User",
+            "userId": "U789",
+            "pictureUrl": "",
+        })
+
+        info = await adapter.get_chat_info("U789")
+        assert info["type"] == "dm"
+        assert info["name"] == "Test User"
+        adapter._line_api_get.assert_called_once_with(
+            f"{LINE_API_BASE_URL}/profile/U789"
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_api_failure_falls_back_to_prefix(self):
+        """When group summary API fails, infer type from prefix."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(side_effect=RuntimeError("API down"))
+
+        info = await adapter.get_chat_info("C999")
+        assert info["type"] == "group"
+        assert info["name"] == "C999"
+
+    @pytest.mark.asyncio
+    async def test_unknown_prefix_falls_back_to_dm(self):
+        """Non-standard prefix defaults to dm through profile API (or fallback)."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(side_effect=RuntimeError("not found"))
+
+        info = await adapter.get_chat_info("X000")
+        # Falls back to prefix inference on API failure
+        assert info["type"] == "unknown"
+        assert info["name"] == "X000"
+
+    @pytest.mark.asyncio
+    async def test_empty_chat_id(self):
+        """Empty chat_id with empty prefix falls back to unknown."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(side_effect=RuntimeError("invalid"))
+
+        info = await adapter.get_chat_info("")
+        assert info["name"] == ""
+
+
+# ---------------------------------------------------------------------------
+# _get_member_display_name — cache + API resolution
+# ---------------------------------------------------------------------------
+
+
+class TestMemberDisplayName:
+    @pytest.mark.asyncio
+    async def test_dm_returns_none(self):
+        """DM chat type returns None — no member resolution needed."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock()
+
+        name = await adapter._get_member_display_name("dm", "U123", "U123")
+        assert name is None
+        adapter._line_api_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_group_calls_member_api_and_caches(self):
+        """Group lookup calls /group/{id}/member/{uid} and caches result."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Alice",
+            "userId": "U123",
+        })
+
+        name = await adapter._get_member_display_name("group", "C1", "U123")
+        assert name == "Alice"
+        cache_key = ("group", "C1", "U123")
+        assert cache_key in adapter._member_name_cache
+        assert adapter._member_name_cache[cache_key][0] == "Alice"
+
+    @pytest.mark.asyncio
+    async def test_room_calls_member_api_and_caches(self):
+        """Room lookup calls /room/{id}/member/{uid} and caches result."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Bob",
+            "userId": "U456",
+        })
+
+        name = await adapter._get_member_display_name("room", "R1", "U456")
+        assert name == "Bob"
+        cache_key = ("room", "R1", "U456")
+        assert cache_key in adapter._member_name_cache
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_avoids_api_call(self):
+        """Second lookup returns cached name without calling API."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Carol",
+        })
+
+        # First call — API hit
+        name1 = await adapter._get_member_display_name("group", "C2", "U789")
+        assert name1 == "Carol"
+        assert adapter._line_api_get.call_count == 1
+
+        # Second call — cache hit
+        name2 = await adapter._get_member_display_name("group", "C2", "U789")
+        assert name2 == "Carol"
+        assert adapter._line_api_get.call_count == 1  # no extra call
+
+    @pytest.mark.asyncio
+    async def test_api_failure_returns_none(self):
+        """When the member API fails, return None gracefully."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(side_effect=RuntimeError("API down"))
+
+        name = await adapter._get_member_display_name("group", "C1", "U999")
+        assert name is None
+        cache_key = ("group", "C1", "U999")
+        assert cache_key not in adapter._member_name_cache
+
+    @pytest.mark.asyncio
+    async def test_no_display_name_in_response(self):
+        """API response without displayName field returns None and doesn't cache."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={"userId": "U123"})
+
+        name = await adapter._get_member_display_name("group", "C1", "U123")
+        assert name is None
+        cache_key = ("group", "C1", "U123")
+        assert cache_key not in adapter._member_name_cache
+
+    @pytest.mark.asyncio
+    async def test_ttl_expiration_triggers_refetch(self):
+        """After TTL expires, the next lookup calls the API again."""
+        adapter = _make_adapter()
+        adapter._MEMBER_NAME_CACHE_TTL = 0.0  # immediate expiry
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Dave",
+        })
+
+        # First call
+        name1 = await adapter._get_member_display_name("group", "C3", "U111")
+        assert name1 == "Dave"
+        assert adapter._line_api_get.call_count == 1
+
+        # Second call — TTL=0 means expired, should re-fetch
+        adapter._line_api_get.return_value = {"displayName": "Dave2"}
+        name2 = await adapter._get_member_display_name("group", "C3", "U111")
+        assert name2 == "Dave2"
+        assert adapter._line_api_get.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self):
+        """When the API call times out, return None gracefully."""
+        adapter = _make_adapter()
+        adapter._MEMBER_API_TIMEOUT = 0.01  # very short timeout
+
+        async def slow_response():
+            await asyncio.sleep(10)
+            return {"displayName": "Slow"}
+
+        adapter._line_api_get = slow_response
+
+        name = await adapter._get_member_display_name("group", "C1", "U123")
+        assert name is None
+
+
+# ---------------------------------------------------------------------------
+# _member_name_cache — eviction and cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestMemberNameCache:
+    def test_evict_oldest_when_max_size_exceeded(self):
+        """When cache exceeds max size, oldest 25% are evicted."""
+        adapter = _make_adapter()
+        adapter._MEMBER_NAME_CACHE_MAX_SIZE = 4
+
+        # Fill with 5 entries (exceeds max of 4)
+        for i in range(5):
+            key = ("group", f"C{i}", f"U{i}")
+            adapter._member_name_cache[key] = (f"User{i}", time.monotonic())
+
+        # Should have evicted oldest ~1 entry (4 // 4 = 1)
+        adapter._evict_oldest_if_needed()
+        assert len(adapter._member_name_cache) <= adapter._MEMBER_NAME_CACHE_MAX_SIZE
+        # Oldest entries (User0) should be gone
+        assert ("group", "C0", "U0") not in adapter._member_name_cache
+
+    def test_no_eviction_below_max_size(self):
+        """When cache is at max size, no eviction happens."""
+        adapter = _make_adapter()
+        adapter._MEMBER_NAME_CACHE_MAX_SIZE = 10
+
+        for i in range(5):
+            key = ("group", f"C{i}", f"U{i}")
+            adapter._member_name_cache[key] = (f"User{i}", time.monotonic())
+
+        adapter._evict_oldest_if_needed()
+        assert len(adapter._member_name_cache) == 5  # all intact
+
+    def test_cleanup_removes_expired_entries(self):
+        """_cleanup_member_name_cache removes entries older than TTL."""
+        adapter = _make_adapter()
+        adapter._MEMBER_NAME_CACHE_TTL = 1.0
+
+        now = time.monotonic()
+        adapter._member_name_cache[("group", "C1", "U1")] = ("Alice", now - 100)
+        adapter._member_name_cache[("group", "C2", "U2")] = ("Bob", now)
+
+        adapter._cleanup_member_name_cache()
+
+        assert ("group", "C1", "U1") not in adapter._member_name_cache  # expired
+        assert ("group", "C2", "U2") in adapter._member_name_cache       # fresh
+
+    def test_disconnect_clears_cache(self):
+        """disconnect() clears the member name cache via .clear()."""
+        adapter = _make_adapter()
+        adapter._member_name_cache[("group", "C1", "U1")] = ("Alice", time.monotonic())
+        adapter._member_name_cache[("group", "C2", "U2")] = ("Bob", time.monotonic())
+
+        adapter._member_name_cache.clear()
+        assert len(adapter._member_name_cache) == 0

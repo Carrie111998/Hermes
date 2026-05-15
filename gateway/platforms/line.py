@@ -230,6 +230,7 @@ class LineAdapter(BasePlatformAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._member_name_cache.clear()
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
 
