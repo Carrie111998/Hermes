@@ -944,6 +944,145 @@ class TestChatTypePropagation:
 
 
 # ---------------------------------------------------------------------------
+# user_name resolution via member API (integration — webhook → source)
+# ---------------------------------------------------------------------------
+
+
+class TestGroupMessageUserName:
+    @pytest.mark.asyncio
+    async def test_group_message_resolves_sender_display_name(self):
+        """Group webhook resolves sender displayName from member API."""
+        adapter = _make_adapter(group_policy="allowlist", group_allow_from=["U123"])
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Alice", "userId": "U123",
+        })
+        client = await _start_server(adapter)
+
+        body = _make_webhook_body(
+            user_id="U123", text="group hello",
+            source_type="group", group_id="G123",
+            reply_token=None,
+        )
+        payload = json.dumps(body).encode()
+        sig = _line_signature(payload, _TEST_SECRET)
+        resp = await client.post(
+            _TEST_PATH, data=payload, headers={"X-Line-Signature": sig}
+        )
+        assert resp.status == 200
+        event = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
+        assert event.source.chat_type == "group"
+        assert event.source.user_name == "Alice"  # resolved from API
+        assert event.source.user_id == "U123"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_room_message_resolves_sender_display_name(self):
+        """Room webhook resolves sender displayName from member API."""
+        adapter = _make_adapter(group_policy="allowlist", group_allow_from=["U456"])
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Bob", "userId": "U456",
+        })
+        client = await _start_server(adapter)
+
+        body = _make_webhook_body(
+            user_id="U456", text="room hello",
+            source_type="room", room_id="R789",
+            reply_token=None,
+        )
+        payload = json.dumps(body).encode()
+        sig = _line_signature(payload, _TEST_SECRET)
+        resp = await client.post(
+            _TEST_PATH, data=payload, headers={"X-Line-Signature": sig}
+        )
+        assert resp.status == 200
+        event = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
+        assert event.source.chat_type == "room"
+        assert event.source.user_name == "Bob"
+        assert event.source.user_id == "U456"
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_dm_message_uses_user_id_as_name(self):
+        """DM webhook uses user_id as user_name (no member API call)."""
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock()
+        client = await _start_server(adapter)
+
+        body = _make_webhook_body(user_id="U789", text="dm hello")
+        payload = json.dumps(body).encode()
+        sig = _line_signature(payload, _TEST_SECRET)
+        resp = await client.post(
+            _TEST_PATH, data=payload, headers={"X-Line-Signature": sig}
+        )
+        assert resp.status == 200
+        event = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
+        assert event.source.chat_type == "dm"
+        assert event.source.user_name == "U789"  # user_id fallback
+        # Member API should not be called for DMs
+        adapter._line_api_get.assert_not_called()
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_group_api_failure_falls_back_to_user_id(self):
+        """When member API fails, user_name falls back to user_id."""
+        adapter = _make_adapter(group_policy="allowlist", group_allow_from=["U111"])
+        adapter._line_api_get = AsyncMock(side_effect=RuntimeError("API down"))
+        client = await _start_server(adapter)
+
+        body = _make_webhook_body(
+            user_id="U111", text="group msg",
+            source_type="group", group_id="G999",
+            reply_token=None,
+        )
+        payload = json.dumps(body).encode()
+        sig = _line_signature(payload, _TEST_SECRET)
+        resp = await client.post(
+            _TEST_PATH, data=payload, headers={"X-Line-Signature": sig}
+        )
+        assert resp.status == 200
+        event = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
+        assert event.source.user_name == "U111"  # fallback to user_id
+        await client.close()
+
+    @pytest.mark.asyncio
+    async def test_group_member_name_cached_on_second_message(self):
+        """Second message from same group member uses cached display name."""
+        adapter = _make_adapter(group_policy="allowlist", group_allow_from=["U222"])
+        adapter._line_api_get = AsyncMock(return_value={
+            "displayName": "Carol", "userId": "U222",
+        })
+        client = await _start_server(adapter)
+
+        # First message — API called, name cached
+        body1 = _make_webhook_body(
+            user_id="U222", text="first msg",
+            source_type="group", group_id="G1",
+            message_id="1001", reply_token=None,
+        )
+        payload1 = json.dumps(body1).encode()
+        sig1 = _line_signature(payload1, _TEST_SECRET)
+        await client.post(_TEST_PATH, data=payload1, headers={"X-Line-Signature": sig1})
+        event1 = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
+        assert event1.source.user_name == "Carol"
+        api_calls_after_first = adapter._line_api_get.call_count
+
+        # Second message — cache hit, no extra API call
+        body2 = _make_webhook_body(
+            user_id="U222", text="second msg",
+            source_type="group", group_id="G1",
+            message_id="1002", reply_token=None,
+        )
+        payload2 = json.dumps(body2).encode()
+        sig2 = _line_signature(payload2, _TEST_SECRET)
+        await client.post(_TEST_PATH, data=payload2, headers={"X-Line-Signature": sig2})
+        event2 = await asyncio.wait_for(adapter._message_queue.get(), timeout=1)
+        assert event2.source.user_name == "Carol"
+        assert adapter._line_api_get.call_count == api_calls_after_first
+
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
 # get_chat_info — prefix-based routing
 # ---------------------------------------------------------------------------
 
