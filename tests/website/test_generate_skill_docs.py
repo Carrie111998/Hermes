@@ -119,6 +119,25 @@ def test_bundled_catalog_explains_missing_local_skills(gen_module):
 # --- _wrap_markdown_tables tests ---
 
 
+def test_wrap_markdown_tables_no_tables_unchanged(gen_module):
+    """Input with no markdown tables must pass through byte-for-byte unchanged.
+
+    Regression for the _flush trailing-newline bug: the function was appending
+    an extra '\\n' to every segment unconditionally, so plain text got an
+    extra newline even when no tables were present.
+    """
+    for text in [
+        "Hello world\n",
+        "No tables here.\n\nJust paragraphs.\n",
+        "",
+        "Single line without newline",
+        "```\ncode block\nno pipe lines\n```\n",
+    ]:
+        assert gen_module._wrap_markdown_tables(text) == text, (
+            f"_wrap_markdown_tables changed non-table input: {text!r}"
+        )
+
+
 def test_wrap_markdown_tables_wraps_plain_table(gen_module):
     """A markdown table outside a code fence gets wrapped."""
     text = (
