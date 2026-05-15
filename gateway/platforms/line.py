@@ -134,6 +134,10 @@ class LineAdapter(BasePlatformAdapter):
         self._retry_counts: Dict[str, int] = {}
         self._retry_lock = asyncio.Lock()
 
+        # Member display name cache: (chat_type, chat_id, user_id) -> (display_name, inserted_at)
+        self._member_name_cache: Dict[tuple, tuple] = {}
+        self._MEMBER_NAME_CACHE_TTL = 3600.0  # 1 hour
+
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
@@ -379,6 +383,7 @@ class LineAdapter(BasePlatformAdapter):
                         logger.debug("[%s] reply_token for %s expired (%.1fs old)",
                                      self.name, reply_to, now - entry["inserted_at"])
             self._clear_expired_reply_tokens()
+            self._cleanup_member_name_cache()
 
             for i, chunk in enumerate(chunks):
                 if not chunk.strip():
@@ -625,11 +630,20 @@ class LineAdapter(BasePlatformAdapter):
                 "inserted_at": time.monotonic(),
             }
 
+        # Resolve sender display name for group/room messages
+        user_name: str = sender_id or ""
+        if chat_type in ("group", "room") and sender_id and chat_id:
+            display_name = await self._get_member_display_name(
+                chat_type, chat_id, sender_id
+            )
+            if display_name:
+                user_name = display_name
+
         source_info = self.build_source(
             chat_id=chat_id,
             chat_type=chat_type,
             user_id=sender_id,
-            user_name=sender_id,
+            user_name=user_name,
         )
 
         return [MessageEvent(
@@ -646,16 +660,91 @@ class LineAdapter(BasePlatformAdapter):
     # Required abstract methods
     # ------------------------------------------------------------------
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Get information about a LINE chat (user / group / room)."""
+    async def _get_member_display_name(
+        self, chat_type: str, chat_id: str, user_id: str
+    ) -> Optional[str]:
+        """Resolve a member's display name in a group or room.
+
+        Cached in-memory with a TTL to avoid stale display names and
+        prevent repeated API calls for the same member.
+        """
+        if chat_type not in ("group", "room") or not chat_id or not user_id:
+            return None
+
+        cache_key = (chat_type, chat_id, user_id)
+        now = time.monotonic()
+        if cache_key in self._member_name_cache:
+            cached_name, inserted_at = self._member_name_cache[cache_key]
+            if now - inserted_at <= self._MEMBER_NAME_CACHE_TTL:
+                return cached_name
+            # Expired — evict and re-fetch below
+            del self._member_name_cache[cache_key]
+
         try:
-            profile = await self._line_api_get(f"{LINE_API_BASE_URL}/profile/{chat_id}")
-            return {
-                "name": profile.get("displayName", chat_id),
-                "type": "dm",
-            }
+            endpoint = (
+                f"{LINE_API_BASE_URL}/group/{chat_id}/member/{user_id}"
+                if chat_type == "group"
+                else f"{LINE_API_BASE_URL}/room/{chat_id}/member/{user_id}"
+            )
+            profile = await self._line_api_get(endpoint)
+            display_name = profile.get("displayName")
+            if display_name:
+                self._member_name_cache[cache_key] = (display_name, time.monotonic())
+            return display_name
         except Exception:
-            return {"name": chat_id, "type": "unknown"}
+            logger.debug(
+                "[%s] Failed to resolve member name for %s in %s %s",
+                self.name, user_id, chat_type, chat_id,
+            )
+            return None
+
+    def _cleanup_member_name_cache(self) -> None:
+        """Remove member name cache entries older than the TTL."""
+        now = time.monotonic()
+        expired = [
+            key for key, (_, inserted_at) in self._member_name_cache.items()
+            if now - inserted_at > self._MEMBER_NAME_CACHE_TTL
+        ]
+        for key in expired:
+            del self._member_name_cache[key]
+        if expired:
+            logger.debug(
+                "[%s] Cleaned up %d expired member name cache entry(s)",
+                self.name, len(expired),
+            )
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """Get information about a LINE chat (user / group / room).
+
+        Uses the well-known LINE ID prefix to determine chat type:
+        ``U`` = user (DM), ``C`` = group, ``R`` = room.
+        """
+        prefix = (chat_id or "")[:1]
+        try:
+            if prefix == "C":
+                # Group: fetch group summary for the group name
+                summary = await self._line_api_get(
+                    f"{LINE_API_BASE_URL}/group/{chat_id}/summary"
+                )
+                return {
+                    "name": summary.get("groupName", chat_id),
+                    "type": "group",
+                }
+            elif prefix == "R":
+                # Room: no summary endpoint available; infer from prefix
+                return {"name": chat_id, "type": "room"}
+            else:
+                # User / DM: fetch profile
+                profile = await self._line_api_get(
+                    f"{LINE_API_BASE_URL}/profile/{chat_id}"
+                )
+                return {
+                    "name": profile.get("displayName", chat_id),
+                    "type": "dm",
+                }
+        except Exception:
+            chat_type = {"U": "dm", "C": "group", "R": "room"}.get(prefix, "unknown")
+            return {"name": chat_id, "type": chat_type}
 
     # ------------------------------------------------------------------
     # Signature verification
