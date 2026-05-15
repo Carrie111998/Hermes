@@ -925,9 +925,12 @@ class LineAdapter(BasePlatformAdapter):
         if len(body) > WEBHOOK_BODY_MAX_BYTES:
             return web.Response(status=413, text="payload too large")
 
-        signature = request.headers.get("X-Line-Signature", "")
-        if not verify_line_signature(body, signature, self.channel_secret):
-            return web.Response(status=401, text="invalid signature")
+        # Signature verification — skipped when channel_secret is unset
+        # (dev / local-testing environments where LINE signature is absent).
+        if self.channel_secret:
+            signature = request.headers.get("X-Line-Signature", "")
+            if not verify_line_signature(body, signature, self.channel_secret):
+                return web.Response(status=401, text="invalid signature")
 
         try:
             payload = json.loads(body.decode("utf-8"))

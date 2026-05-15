@@ -82,6 +82,12 @@ services:
       # - GOOGLE_CHAT_SERVICE_ACCOUNT_JSON=${GOOGLE_CHAT_SERVICE_ACCOUNT_JSON}
       # - GOOGLE_CHAT_ALLOWED_USERS=${GOOGLE_CHAT_ALLOWED_USERS}
     command: ["gateway", "run"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8645/webhook/line/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
   dashboard:
     image: hermes-dashboard
@@ -97,3 +103,9 @@ services:
       - HERMES_GID=${HERMES_GID:-10000}
     # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
     command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9119/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
