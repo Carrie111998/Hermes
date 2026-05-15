@@ -27,7 +27,7 @@ services:
   gateway:
     build: .
     image: hermes-agent
-    container_name: hermes-gateway
+    container_name: gateway
     restart: unless-stopped
     network_mode: host
     volumes:
@@ -44,6 +44,21 @@ services:
       - http_proxy=
       - https_proxy=
       - all_proxy=
+      # API keys — read from ~/.hermes/.env or host environment
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      # LINE Messaging API
+      - LINE_CHANNEL_ACCESS_TOKEN=${LINE_CHANNEL_ACCESS_TOKEN}
+      - LINE_CHANNEL_SECRET=${LINE_CHANNEL_SECRET}
+      - LINE_GROUP_POLICY=${LINE_GROUP_POLICY:-open}
+      - LINE_HOME_CHANNEL=${LINE_HOME_CHANNEL}
+      - LINE_HOME_CHANNEL_THREAD_ID=${LINE_HOME_CHANNEL_THREAD_ID}
+      - LINE_ALLOWED_USERS=${LINE_ALLOWED_USERS}
+      - LINE_GROUP_ALLOWED_USERS=${LINE_GROUP_ALLOWED_USERS}
+      - LINE_GROUP_ALLOWED_CHATS=${LINE_GROUP_ALLOWED_CHATS}
+      - LINE_ALLOW_ALL_USERS=${LINE_ALLOW_ALL_USERS}
+      - GATEWAY_ALLOW_ALL_USERS=${GATEWAY_ALLOW_ALL_USERS}
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
@@ -67,8 +82,8 @@ services:
     command: ["gateway", "run"]
 
   dashboard:
-    image: hermes-agent
-    container_name: hermes-dashboard
+    image: hermes-dashboard
+    container_name: dashboard
     restart: unless-stopped
     network_mode: host
     depends_on:

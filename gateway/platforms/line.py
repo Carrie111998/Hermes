@@ -125,13 +125,16 @@ class LineAdapter(BasePlatformAdapter):
         # webhook triggers (e.g., scheduled notifications, async results).
         self._send_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._send_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
 
         self._dedup = MessageDeduplicator(ttl_seconds=300)
 
         # Retry / dead-letter config
         self._MAX_DISPATCH_RETRIES = 3
+        self._DEAD_LETTER_QUEUE_MAX_SIZE = 1000
+        self._DEAD_LETTER_QUEUE_PRUNE_AT = 100  # keep only the most recent N entries
         self._dead_letter_queue: asyncio.Queue[dict] = asyncio.Queue()
-        self._retry_counts: Dict[str, int] = {}
+        self._retry_counts: Dict[str, tuple] = {}  # event_id -> (count, inserted_at)
         self._retry_lock = asyncio.Lock()
 
         # Member display name cache: (chat_type, chat_id, user_id) -> (display_name, inserted_at)
@@ -157,7 +160,8 @@ class LineAdapter(BasePlatformAdapter):
             return False
 
         import aiohttp
-        self._session = aiohttp.ClientSession(trust_env=True)
+        timeout = aiohttp.ClientTimeout(total=30)
+        self._session = aiohttp.ClientSession(trust_env=True, timeout=timeout)
 
         # Verify API credentials
         try:
@@ -191,6 +195,8 @@ class LineAdapter(BasePlatformAdapter):
             self._poll_task = asyncio.create_task(self._poll_loop())
             # Start the async push sender for Agent-initiated messages.
             self._send_task = asyncio.create_task(self._send_loop())
+            # Start periodic cleanup of in-memory caches.
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
             self._mark_connected()
             logger.info(
                 "[%s] HTTP server listening on %s:%d%s",
@@ -221,6 +227,14 @@ class LineAdapter(BasePlatformAdapter):
                 pass
             self._send_task = None
 
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._cleanup_task = None
+
         if self._site:
             await self._site.stop()
             self._site = None
@@ -231,6 +245,13 @@ class LineAdapter(BasePlatformAdapter):
             await self._session.close()
         self._session = None
         self._member_name_cache.clear()
+        self._retry_counts.clear()
+        # Drain the dead-letter queue
+        while not self._dead_letter_queue.empty():
+            try:
+                self._dead_letter_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         self._mark_disconnected()
         logger.info("[%s] Disconnected", self.name)
 
@@ -310,11 +331,18 @@ class LineAdapter(BasePlatformAdapter):
         """Dispatch a single event with retry + dead-letter fallback."""
         event_id = getattr(event, "message_id", None) or id(event)
         async with self._retry_lock:
-            retry_count = self._retry_counts.get(event_id, 0)
+            entry = self._retry_counts.get(event_id)
+            retry_count = entry[0] if entry else 0
 
         if retry_count >= self._MAX_DISPATCH_RETRIES:
             logger.error("[%s] Event %s failed after %d retries — moving to dead-letter queue",
                          self.name, event_id, self._MAX_DISPATCH_RETRIES)
+            # Cap queue size to prevent unbounded growth
+            while self._dead_letter_queue.qsize() >= self._DEAD_LETTER_QUEUE_MAX_SIZE:
+                try:
+                    self._dead_letter_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             await self._dead_letter_queue.put({
                 "event": event,
                 "retry_count": retry_count,
@@ -331,7 +359,7 @@ class LineAdapter(BasePlatformAdapter):
             await task  # Propagate exception to caller
         except Exception:
             async with self._retry_lock:
-                self._retry_counts[event_id] = retry_count + 1
+                self._retry_counts[event_id] = (retry_count + 1, time.monotonic())
             logger.warning("[%s] Dispatch failed for event %s (attempt %d/%d), scheduling retry",
                            self.name, event_id, retry_count + 1, self._MAX_DISPATCH_RETRIES,
                            exc_info=True)
@@ -497,6 +525,73 @@ class LineAdapter(BasePlatformAdapter):
                 logger.error("[%s] Push message to %s failed: %s",
                              self.name, payload.get("to"), exc)
             self._cleanup_member_name_cache()
+
+    # ------------------------------------------------------------------
+    # Periodic cleanup
+    # ------------------------------------------------------------------
+
+    async def _cleanup_loop(self) -> None:
+        """Background task that periodically prunes stale in-memory state.
+
+        Runs every ``_CLEANUP_INTERVAL`` seconds.  Prevents unbounded growth
+        of reply token cache, member name cache, retry-count dictionary, and
+        the dead-letter queue.
+        """
+        CLEANUP_INTERVAL = 300.0  # 5 minutes
+        while True:
+            await asyncio.sleep(CLEANUP_INTERVAL)
+            try:
+                self._clear_expired_reply_tokens()
+                self._cleanup_member_name_cache()
+                self._cleanup_retry_counts()
+                self._prune_dead_letter_queue()
+            except Exception:
+                logger.debug(
+                    "[%s] Periodic cleanup failed", self.name, exc_info=True,
+                )
+
+    def _cleanup_retry_counts(self) -> None:
+        """Remove retry-count entries older than ``_RETRY_COUNT_TTL``.
+
+        Entries are keyed by ``event_id`` and store ``(count, inserted_at)``.
+        Normally entries are popped on successful dispatch or after
+        ``_MAX_DISPATCH_RETRIES`` failures.  Entries that remain past the
+        TTL (e.g. from dropped or lost events) are swept here to prevent
+        unbounded dictionary growth.
+        """
+        RETRY_COUNT_TTL = 3600.0  # 1 hour
+        now = time.monotonic()
+        expired = [
+            eid for eid, (_, inserted_at) in self._retry_counts.items()
+            if now - inserted_at > RETRY_COUNT_TTL
+        ]
+        for eid in expired:
+            self._retry_counts.pop(eid, None)
+        if expired:
+            logger.debug(
+                "[%s] Cleaned up %d stale retry-count entry(s)",
+                self.name, len(expired),
+            )
+
+    def _prune_dead_letter_queue(self) -> None:
+        """Keep only the most recent entries in the dead-letter queue.
+
+        The queue exists for diagnostics.  When it exceeds
+        ``_DEAD_LETTER_QUEUE_PRUNE_AT`` entries, oldest items are
+        drained until the size is back within the limit.
+        """
+        q = self._dead_letter_queue
+        prune_at = self._DEAD_LETTER_QUEUE_PRUNE_AT
+        while q.qsize() > prune_at:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        if q.qsize() > 0:
+            logger.debug(
+                "[%s] Dead-letter queue size=%d (pruned to %d)",
+                self.name, q.qsize(), prune_at,
+            )
 
     # ------------------------------------------------------------------
     # Formatting (platform-specific override)
@@ -810,6 +905,10 @@ class LineAdapter(BasePlatformAdapter):
             try:
                 return await resp.json()
             except Exception:
+                logger.debug(
+                    "[%s] LINE API POST %s returned non-JSON response (status %d)",
+                    self.name, endpoint, resp.status,
+                )
                 return {}
 
     async def _line_api_get(self, endpoint: str) -> Dict[str, Any]:
@@ -826,7 +925,14 @@ class LineAdapter(BasePlatformAdapter):
                 except Exception:
                     msg = await resp.text()
                 raise RuntimeError(f"LINE API GET {endpoint} failed ({resp.status}): {msg}")
-            return await resp.json()
+            try:
+                return await resp.json()
+            except Exception:
+                logger.debug(
+                    "[%s] LINE API GET %s returned non-JSON response (status %d)",
+                    self.name, endpoint, resp.status,
+                )
+                return {}
 
     # ------------------------------------------------------------------
     # Text splitting

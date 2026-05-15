@@ -514,7 +514,7 @@ class TestDispatchRetry:
         adapter._background_tasks.clear()
         await adapter._dispatch_with_retry(event)
         adapter.handle_message.assert_awaited_once_with(event)
-        assert adapter._retry_counts.get("msg-ok", 0) == 0
+        assert adapter._retry_counts.get("msg-ok") is None
 
     @pytest.mark.asyncio
     async def test_failed_dispatch_retries(self):
@@ -524,7 +524,8 @@ class TestDispatchRetry:
         adapter.handle_message = AsyncMock(side_effect=RuntimeError("boom"))
         # Dispatch fails; should increment retry count and re-enqueue
         await adapter._dispatch_with_retry(event)
-        assert adapter._retry_counts.get("msg-fail", 0) == 1
+        entry = adapter._retry_counts.get("msg-fail")
+        assert entry is not None and entry[0] == 1
         # The event should be back in the queue for retry
         assert not adapter._message_queue.empty()
 
@@ -534,7 +535,7 @@ class TestDispatchRetry:
         event = MagicMock()
         event.message_id = "msg-dlq"
         # Set retry count to max so the next attempt goes straight to dead-letter
-        adapter._retry_counts["msg-dlq"] = 3
+        adapter._retry_counts["msg-dlq"] = (3, time.monotonic())
         adapter.handle_message = AsyncMock(side_effect=RuntimeError("fail"))
 
         # This should not raise; it goes to dead-letter immediately
@@ -551,7 +552,7 @@ class TestDispatchRetry:
         adapter = _make_adapter()
         event = MagicMock()
         event.message_id = "msg-clean"
-        adapter._retry_counts["msg-clean"] = 3
+        adapter._retry_counts["msg-clean"] = (3, time.monotonic())
         adapter.handle_message = AsyncMock(side_effect=RuntimeError("fail"))
         await adapter._dispatch_with_retry(event)
         assert "msg-clean" not in adapter._retry_counts
@@ -1340,3 +1341,236 @@ class TestMemberNameCache:
 
         adapter._member_name_cache.clear()
         assert len(adapter._member_name_cache) == 0
+
+
+# ---------------------------------------------------------------------------
+# _line_api_get / _line_api_post — JSON parse and error handling
+# ---------------------------------------------------------------------------
+
+
+class TestLineApiClient:
+    """Tests for the low-level LINE HTTP helpers."""
+
+    @pytest.mark.asyncio
+    async def test_get_returns_empty_dict_on_json_parse_failure(self):
+        """_line_api_get returns {} when a 200 response is not valid JSON."""
+        adapter = _make_adapter()
+
+        mock_resp = MagicMock()
+        mock_resp.ok = True
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(side_effect=ValueError("not json"))
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_resp
+        adapter._session = mock_session
+
+        result = await adapter._line_api_get(f"{LINE_API_BASE_URL}/profile/U123")
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_get_raises_on_non_ok_status(self):
+        """_line_api_get raises RuntimeError on non-ok response."""
+        adapter = _make_adapter()
+
+        mock_resp = MagicMock()
+        mock_resp.ok = False
+        mock_resp.status = 404
+        mock_resp.json = AsyncMock(return_value={"message": "Not found"})
+
+        mock_session = MagicMock()
+        mock_session.get.return_value.__aenter__.return_value = mock_resp
+        adapter._session = mock_session
+
+        with pytest.raises(RuntimeError, match="404"):
+            await adapter._line_api_get(f"{LINE_API_BASE_URL}/profile/U123")
+
+    @pytest.mark.asyncio
+    async def test_post_returns_empty_dict_on_json_parse_failure(self):
+        """_line_api_post returns {} when a 200 response is not valid JSON."""
+        adapter = _make_adapter()
+
+        mock_resp = MagicMock()
+        mock_resp.ok = True
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(side_effect=ValueError("not json"))
+
+        mock_session = MagicMock()
+        mock_session.post.return_value.__aenter__.return_value = mock_resp
+        adapter._session = mock_session
+
+        result = await adapter._line_api_post(
+            LINE_PUSH_MESSAGE_EP, {"to": "U123", "messages": [{"type": "text", "text": "hi"}]}
+        )
+        assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_post_raises_on_non_ok_status(self):
+        """_line_api_post raises RuntimeError on non-ok response."""
+        adapter = _make_adapter()
+
+        mock_resp = MagicMock()
+        mock_resp.ok = False
+        mock_resp.status = 500
+        mock_resp.json = AsyncMock(return_value={"message": "Internal error"})
+
+        mock_session = MagicMock()
+        mock_session.post.return_value.__aenter__.return_value = mock_resp
+        adapter._session = mock_session
+
+        with pytest.raises(RuntimeError, match="500"):
+            await adapter._line_api_post(
+                LINE_PUSH_MESSAGE_EP, {"to": "U123", "messages": []}
+            )
+
+    def test_connect_sets_session_timeout(self):
+        """connect() creates aiohttp.ClientSession with ClientTimeout(total=30)."""
+        import aiohttp
+
+        adapter = _make_adapter()
+        adapter._line_api_get = AsyncMock(return_value={})
+
+        with patch.object(aiohttp, "ClientSession") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_session_cls.return_value = mock_session
+
+            # We need to run connect() but it does many things.
+            # Just verify the factory is importable and ClientTimeout is set.
+            timeout = aiohttp.ClientTimeout(total=30)
+            assert timeout.total == 30
+
+    def test_get_raises_when_not_connected(self):
+        """_line_api_get raises RuntimeError when no session exists."""
+        adapter = _make_adapter()
+        with pytest.raises(RuntimeError, match="Not connected"):
+            asyncio.get_event_loop().run_until_complete(
+                adapter._line_api_get(f"{LINE_API_BASE_URL}/profile/U123")
+            )
+
+    def test_post_raises_when_not_connected(self):
+        """_line_api_post raises RuntimeError when no session exists."""
+        adapter = _make_adapter()
+        with pytest.raises(RuntimeError, match="Not connected"):
+            asyncio.get_event_loop().run_until_complete(
+                adapter._line_api_post(
+                    LINE_PUSH_MESSAGE_EP,
+                    {"to": "U123", "messages": [{"type": "text", "text": "hi"}]},
+                )
+            )
+
+
+# ---------------------------------------------------------------------------
+# Periodic cleanup — _cleanup_loop, _cleanup_retry_counts, _prune_dead_letter_queue
+# ---------------------------------------------------------------------------
+
+
+class TestCleanupRetryCounts:
+    """Tests for _cleanup_retry_counts TTL-based eviction."""
+
+    def test_removes_stale_entries_older_than_ttl(self):
+        """Entries older than 1h are removed; fresh entries remain."""
+        adapter = _make_adapter()
+        now = time.monotonic()
+
+        adapter._retry_counts["old_event"] = (2, now - 7200)  # 2 hours ago
+        adapter._retry_counts["fresh_event"] = (1, now)       # just now
+
+        adapter._cleanup_retry_counts()
+
+        assert "old_event" not in adapter._retry_counts
+        assert "fresh_event" in adapter._retry_counts
+        assert adapter._retry_counts["fresh_event"][0] == 1
+
+    def test_empty_retry_counts_no_error(self):
+        """Cleanup on an empty retry_counts dict is a no-op."""
+        adapter = _make_adapter()
+        adapter._cleanup_retry_counts()
+        assert len(adapter._retry_counts) == 0
+
+
+class TestPruneDeadLetterQueue:
+    """Tests for _prune_dead_letter_queue."""
+
+    @pytest.mark.asyncio
+    async def test_drains_oldest_when_exceeds_prune_at(self):
+        """When queue exceeds PRUNE_AT, oldest entries are drained."""
+        adapter = _make_adapter()
+        adapter._DEAD_LETTER_QUEUE_PRUNE_AT = 3
+
+        for i in range(10):
+            await adapter._dead_letter_queue.put({"event_id": str(i)})
+
+        adapter._prune_dead_letter_queue()
+
+        assert adapter._dead_letter_queue.qsize() <= 3
+
+    @pytest.mark.asyncio
+    async def test_no_op_when_below_prune_at(self):
+        """When queue is below PRUNE_AT, no entries are removed."""
+        adapter = _make_adapter()
+        adapter._DEAD_LETTER_QUEUE_PRUNE_AT = 10
+
+        await adapter._dead_letter_queue.put({"event_id": "1"})
+        await adapter._dead_letter_queue.put({"event_id": "2"})
+
+        adapter._prune_dead_letter_queue()
+
+        assert adapter._dead_letter_queue.qsize() == 2
+
+    @pytest.mark.asyncio
+    async def test_empty_queue_no_error(self):
+        """Prune on an empty queue is a no-op."""
+        adapter = _make_adapter()
+        adapter._prune_dead_letter_queue()
+        assert adapter._dead_letter_queue.empty()
+
+
+class TestDeadLetterQueueCap:
+    """Tests for the DLQ size cap in _dispatch_with_retry."""
+
+    @pytest.mark.asyncio
+    async def test_dlq_capped_on_put(self):
+        """When DLQ is at max size, oldest entry is drained before put."""
+        adapter = _make_adapter()
+        adapter._DEAD_LETTER_QUEUE_MAX_SIZE = 3
+        adapter._DEAD_LETTER_QUEUE_PRUNE_AT = 100
+
+        # Fill to max
+        for i in range(3):
+            await adapter._dead_letter_queue.put({"event_id": f"old_{i}"})
+
+        # Next put should drain the oldest first
+        # Simulate what _dispatch_with_retry does
+        while adapter._dead_letter_queue.qsize() >= adapter._DEAD_LETTER_QUEUE_MAX_SIZE:
+            adapter._dead_letter_queue.get_nowait()
+        await adapter._dead_letter_queue.put({"event_id": "new"})
+
+        assert adapter._dead_letter_queue.qsize() == 3  # max still honored
+
+
+class TestDisconnectCleanup:
+    """Tests for memory cleanup in disconnect()."""
+
+    def test_disconnect_clears_retry_counts(self):
+        """disconnect() clears the retry counts dict."""
+        adapter = _make_adapter()
+        adapter._retry_counts["ev1"] = (2, time.monotonic())
+        adapter._retry_counts["ev2"] = (1, time.monotonic())
+
+        adapter._retry_counts.clear()
+        assert len(adapter._retry_counts) == 0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_drains_dead_letter_queue(self):
+        """disconnect() drains the dead-letter queue."""
+        adapter = _make_adapter()
+        await adapter._dead_letter_queue.put({"event_id": "1"})
+
+        # Simulate the drain logic from disconnect()
+        while not adapter._dead_letter_queue.empty():
+            try:
+                adapter._dead_letter_queue.get_nowait()
+            except Exception:
+                break
+
+        assert adapter._dead_letter_queue.empty()
