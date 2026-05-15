@@ -21,11 +21,13 @@
 #     and API_SERVER_HOST. See docs/user-guide/api-server.md before doing
 #     this on an internet-facing host.
 #
+name: 15-hermes
+
 services:
   gateway:
     build: .
     image: hermes-agent
-    container_name: hermes
+    container_name: hermes-gateway
     restart: unless-stopped
     network_mode: host
     volumes:

@@ -1188,6 +1188,12 @@ def resolve_channel_prompt(
         prompt = prompts.get(key)
         if prompt is None:
             continue
+        # Allow list of prompts (rotating personalities)
+        if isinstance(prompt, list):
+            filtered = [p for p in prompt if str(p).strip()]
+            if filtered:
+                return filtered
+            continue
         prompt = str(prompt).strip()
         if prompt:
             return prompt

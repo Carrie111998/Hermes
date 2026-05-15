@@ -3515,9 +3515,18 @@ class DiscordAdapter(BasePlatformAdapter):
         return resolve_channel_skills(self.config.extra, channel_id, parent_id)
 
     def _resolve_channel_prompt(self, channel_id: str, parent_id: str | None = None) -> str | None:
-        """Resolve a Discord per-channel prompt, preferring the exact channel over its parent."""
+        """Resolve a Discord per-channel prompt, preferring the exact channel over its parent.
+
+        If the resolved prompt is a list, one entry is chosen at random so
+        every Frigate alert can use a different personality.
+        """
         from gateway.platforms.base import resolve_channel_prompt
-        return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
+        import random
+
+        prompt = resolve_channel_prompt(self.config.extra, channel_id, parent_id)
+        if isinstance(prompt, list) and prompt:
+            return random.choice(prompt)
+        return prompt
 
     def _discord_require_mention(self) -> bool:
         """Return whether Discord channel messages require a bot mention."""

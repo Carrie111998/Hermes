@@ -102,7 +102,7 @@ class LineAdapter(BasePlatformAdapter):
             extra.get("dm_policy") or os.getenv("LINE_DM_POLICY", "open")
         ).strip().lower()
         self.group_policy = str(
-            extra.get("group_policy") or os.getenv("LINE_GROUP_POLICY", "disabled")
+            extra.get("group_policy") or os.getenv("LINE_GROUP_POLICY", "open")
         ).strip().lower()
         self.allow_from = _coerce_list(
             extra.get("allow_from") or os.getenv("LINE_ALLOWED_USERS", "")
