@@ -138,6 +138,7 @@ class LineAdapter(BasePlatformAdapter):
         self._member_name_cache: Dict[tuple, tuple] = {}
         self._MEMBER_NAME_CACHE_TTL = 3600.0  # 1 hour
         self._MEMBER_NAME_CACHE_MAX_SIZE = 500  # evict oldest 25% when exceeded
+        self._MEMBER_API_TIMEOUT = 3.0  # max seconds for member profile lookups
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -688,13 +689,16 @@ class LineAdapter(BasePlatformAdapter):
                 if chat_type == "group"
                 else f"{LINE_API_BASE_URL}/room/{chat_id}/member/{user_id}"
             )
-            profile = await self._line_api_get(endpoint)
+            profile = await asyncio.wait_for(
+                self._line_api_get(endpoint),
+                timeout=self._MEMBER_API_TIMEOUT,
+            )
             display_name = profile.get("displayName")
             if display_name:
                 self._member_name_cache[cache_key] = (display_name, time.monotonic())
                 self._evict_oldest_if_needed()
             return display_name
-        except Exception:
+        except (Exception, asyncio.TimeoutError):
             logger.debug(
                 "[%s] Failed to resolve member name for %s in %s %s",
                 self.name, user_id, chat_type, chat_id,
