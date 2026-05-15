@@ -116,8 +116,8 @@ LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
-DEFAULT_WEBHOOK_PORT = 8646
-DEFAULT_WEBHOOK_PATH = "/line/webhook"
+DEFAULT_WEBHOOK_PORT = 8645
+DEFAULT_WEBHOOK_PATH = "/webhook/line"
 DEFAULT_MEDIA_PATH_PREFIX = "/line/media"
 
 # Slow-LLM postback button defaults
@@ -676,7 +676,7 @@ class LineAdapter(BasePlatformAdapter):
             )
         except (TypeError, ValueError):
             self.webhook_port = DEFAULT_WEBHOOK_PORT
-        self.webhook_path = extra.get("webhook_path", DEFAULT_WEBHOOK_PATH)
+        self.webhook_path = os.getenv("LINE_WEBHOOK_PATH") or extra.get("webhook_path", DEFAULT_WEBHOOK_PATH)
 
         # Public base URL — required for media sending when bind isn't
         # publicly reachable.
@@ -1691,6 +1691,8 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
         seeded["host"] = os.environ["LINE_HOST"]
     if os.getenv("LINE_PUBLIC_URL"):
         seeded["public_url"] = os.environ["LINE_PUBLIC_URL"]
+    if os.getenv("LINE_WEBHOOK_PATH"):
+        seeded["webhook_path"] = os.environ["LINE_WEBHOOK_PATH"]
     if os.getenv("LINE_HOME_CHANNEL"):
         seeded["home_channel"] = os.environ["LINE_HOME_CHANNEL"]
     return seeded or {}
