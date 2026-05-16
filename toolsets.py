@@ -170,6 +170,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "pa-business": {
+        "description": "Opt-in PA business-fact bridge for configured HTTP endpoints or local commands",
+        "tools": ["pa_business_read", "pa_business_write"],
+        "includes": [],
+    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",

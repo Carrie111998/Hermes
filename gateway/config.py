@@ -849,6 +849,10 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = {str(k): v for k, v in channel_prompts.items()}
                     else:
                         bridged["channel_prompts"] = channel_prompts
+                if "pa" in platform_cfg:
+                    bridged["pa"] = platform_cfg["pa"]
+                if "pa_job_type" in platform_cfg:
+                    bridged["pa_job_type"] = platform_cfg["pa_job_type"]
                 enabled_was_explicit = "enabled" in platform_cfg
                 if not bridged and not enabled_was_explicit:
                     continue

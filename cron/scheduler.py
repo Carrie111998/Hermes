@@ -28,7 +28,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
+from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,95 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
             exc,
         )
         return None
+
+
+def _resolve_cron_pa_context(job: dict, cfg: Mapping[str, Any] | None):
+    """Resolve the PA job brief for a scheduled run, when configured."""
+    config = cfg if isinstance(cfg, Mapping) else {}
+    pa_config = dict(config.get("pa") or {}) if isinstance(config.get("pa"), Mapping) else {}
+    if not is_truthy_value(pa_config.get("enabled"), default=False):
+        return None
+    if job.get("pa_job_type"):
+        pa_config["job_type"] = str(job.get("pa_job_type"))
+    metadata = {
+        "source": {"platform": "cron"},
+        "job": {
+            "id": job.get("id"),
+            "name": job.get("name"),
+        },
+        "job_type": job.get("pa_job_type"),
+    }
+    from agent.pa_constitution import resolve_context
+
+    return resolve_context(pa_config, metadata)
+
+
+def _merge_cron_pa_toolsets(
+    enabled_toolsets: list[str] | None,
+    disabled_toolsets: list[str] | None,
+    pa_context: Any,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Apply PA job-brief toolset scope to cron agent construction."""
+    if pa_context is None:
+        return enabled_toolsets, disabled_toolsets
+    job_brief = getattr(pa_context, "job_brief", None)
+    if job_brief is None:
+        return enabled_toolsets, disabled_toolsets
+
+    job_enabled = list(getattr(job_brief, "enabled_toolsets", ()) or ())
+    job_disabled = list(getattr(job_brief, "disabled_toolsets", ()) or ())
+    next_enabled = job_enabled if job_enabled else enabled_toolsets
+    next_disabled = list(disabled_toolsets or [])
+    next_disabled.extend(job_disabled)
+
+    def _dedupe(values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if text and text not in seen:
+                out.append(text)
+                seen.add(text)
+        return out or None
+
+    return _dedupe(next_enabled), _dedupe(next_disabled)
+
+
+def _render_cron_pa_ephemeral_prompt(pa_context: Any) -> str:
+    if pa_context is None:
+        return ""
+    from agent.pa_constitution import render_identity_prompt, render_job_prompt
+
+    return (
+        render_identity_prompt(pa_context.constitution)
+        + "\n\n"
+        + render_job_prompt(pa_context)
+    ).strip()
+
+
+def _record_cron_pa_behavior_event(session_db: Any, pa_context: Any, job: dict, session_id: str) -> None:
+    if session_db is None or pa_context is None:
+        return
+    recorder = getattr(session_db, "record_pa_behavior_event", None)
+    if recorder is None:
+        return
+    try:
+        recorder(
+            constitution_id=pa_context.constitution.id,
+            constitution_hash=pa_context.identity_hash,
+            job_type=pa_context.job_type,
+            job_hash=pa_context.job_hash,
+            session_id=session_id,
+            session_source="cron",
+            source_metadata={"job_id": job.get("id"), "job_name": job.get("name")},
+            actor="cron",
+            source="cron",
+            metadata={"behavior_hash": pa_context.behavior_hash},
+        )
+    except Exception as exc:
+        logger.debug("Job '%s': failed to record PA behavior event: %s", job.get("id"), exc)
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
@@ -1434,6 +1524,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 job_id, _mcp_exc,
             )
 
+        pa_resolved_context = _resolve_cron_pa_context(job, _cfg)
+        cron_enabled_toolsets, cron_disabled_toolsets = _merge_cron_pa_toolsets(
+            _resolve_cron_enabled_toolsets(job, _cfg),
+            ["cronjob", "messaging", "clarify"],
+            pa_resolved_context,
+        )
+        _record_cron_pa_behavior_event(
+            _session_db,
+            pa_resolved_context,
+            job,
+            _cron_session_id,
+        )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -1452,8 +1555,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=["cronjob", "messaging", "clarify"],
+            enabled_toolsets=cron_enabled_toolsets,
+            disabled_toolsets=cron_disabled_toolsets,
+            ephemeral_system_prompt=_render_cron_pa_ephemeral_prompt(pa_resolved_context) or None,
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project

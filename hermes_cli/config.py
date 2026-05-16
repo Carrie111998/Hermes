@@ -555,6 +555,11 @@ DEFAULT_CONFIG = {
         "image_input_mode": "auto",
         "disabled_toolsets": [],
     },
+    "pa": {
+        "enabled": False,
+        "constitution_path": "",
+        "business": {},
+    },
     
     "terminal": {
         "backend": "local",

@@ -244,10 +244,28 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS pa_behavior_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    session_source TEXT,
+    source_metadata TEXT,
+    actor TEXT,
+    source TEXT,
+    constitution_id TEXT,
+    constitution_hash TEXT,
+    job_type TEXT,
+    job_hash TEXT,
+    timestamp REAL NOT NULL,
+    metadata TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_session ON pa_behavior_events(session_id, timestamp, id);
+CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_job_type ON pa_behavior_events(job_type, timestamp, id);
+CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_timestamp ON pa_behavior_events(timestamp, id);
 """
 
 FTS_SQL = """
@@ -859,6 +877,109 @@ class SessionDB:
         """Ensure a session row exists (INSERT OR IGNORE). Accepts optional kwargs."""
         self._insert_session_row(session_id, source, model=model, **kwargs)
         return session_id
+
+    def record_pa_behavior_event(
+        self,
+        *,
+        constitution_id: Optional[str] = None,
+        constitution_hash: Optional[str] = None,
+        job_type: Optional[str] = None,
+        job_hash: Optional[str] = None,
+        session_id: Optional[str] = None,
+        session_source: Optional[str] = None,
+        source_metadata: Optional[Dict[str, Any]] = None,
+        actor: Optional[str] = None,
+        source: Optional[str] = None,
+        timestamp: Optional[float] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Record the PA behavior selection active for a session/source."""
+        event_timestamp = time.time() if timestamp is None else timestamp
+        source_metadata_json = (
+            json.dumps(source_metadata, sort_keys=True)
+            if source_metadata is not None
+            else None
+        )
+        metadata_json = (
+            json.dumps(metadata, sort_keys=True)
+            if metadata is not None
+            else None
+        )
+
+        def _do(conn):
+            cur = conn.execute(
+                """INSERT INTO pa_behavior_events (
+                    session_id,
+                    session_source,
+                    source_metadata,
+                    actor,
+                    source,
+                    constitution_id,
+                    constitution_hash,
+                    job_type,
+                    job_hash,
+                    timestamp,
+                    metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    session_source,
+                    source_metadata_json,
+                    actor,
+                    source,
+                    constitution_id,
+                    constitution_hash,
+                    job_type,
+                    job_hash,
+                    event_timestamp,
+                    metadata_json,
+                ),
+            )
+            return cur.lastrowid
+
+        return int(self._execute_write(_do))
+
+    def list_pa_behavior_events(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        job_type: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return PA behavior history, ordered by timestamp then row id."""
+        where = []
+        params: List[Any] = []
+        if session_id is not None:
+            where.append("session_id = ?")
+            params.append(session_id)
+        if job_type is not None:
+            where.append("job_type = ?")
+            params.append(job_type)
+
+        sql = "SELECT * FROM pa_behavior_events"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY timestamp ASC, id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+
+        events = [dict(row) for row in rows]
+        for event in events:
+            for field in ("source_metadata", "metadata"):
+                if event.get(field):
+                    try:
+                        event[field] = json.loads(event[field])
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            "Failed to deserialize %s in PA behavior event %s",
+                            field,
+                            event.get("id"),
+                        )
+        return events
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
@@ -2963,4 +3084,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

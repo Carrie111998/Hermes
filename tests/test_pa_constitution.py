@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from agent.pa_constitution import (
+    PAConstitution,
+    behavior_hash,
+    load_constitution,
+    load_constitution_data,
+    render_identity_prompt,
+    render_job_prompt,
+    resolve_context,
+)
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "pa" / "bobby_tgg_constitution.yaml"
+
+
+def test_fixture_loads() -> None:
+    constitution = load_constitution(FIXTURE)
+
+    assert isinstance(constitution, PAConstitution)
+    assert constitution.id == "bobby_tgg"
+    assert constitution.agent_name == "Bobby"
+    assert set(constitution.job_briefs) == {"tgg_ops_ingest", "tgg_management"}
+    assert len(constitution.selectors) == 2
+    assert len(constitution.hash) == 64
+    assert "Personal assistant for TGG" in render_identity_prompt(constitution)
+
+
+def test_invalid_fixture_fails_loudly() -> None:
+    with pytest.raises(ValueError, match="agent_name"):
+        load_constitution_data(
+            {
+                "id": "broken",
+                "identity": {},
+                "client": {},
+                "job_briefs": {},
+            },
+            source="broken.yaml",
+        )
+
+    with pytest.raises(ValueError, match="unknown job_type"):
+        load_constitution_data(
+            {
+                "id": "broken",
+                "agent_name": "Broken",
+                "identity": {},
+                "client": {},
+                "job_briefs": {
+                    "known": {
+                        "title": "Known",
+                        "purpose": "Known purpose",
+                        "instructions": ["Do the known thing."],
+                    }
+                },
+                "selectors": [{"job_type": "missing", "match": {"source.chat_id": "x"}}],
+            },
+            source="broken.yaml",
+        )
+
+
+def test_same_bobby_identity_hash_across_ops_and_management() -> None:
+    constitution = load_constitution(FIXTURE)
+    ops = resolve_context({"constitution": constitution}, {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}})
+    management = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "whatsapp", "chat_id": "tgg-management"}},
+    )
+
+    assert ops is not None
+    assert management is not None
+    assert ops.identity_hash == management.identity_hash == constitution.hash
+    assert ops.job_hash != management.job_hash
+
+
+def test_ops_and_management_render_different_job_prompts() -> None:
+    constitution = load_constitution(FIXTURE)
+    ops = resolve_context({"constitution": constitution}, {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}})
+    management = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "whatsapp", "chat_id": "tgg-management"}},
+    )
+
+    assert ops is not None
+    assert management is not None
+    ops_prompt = render_job_prompt(ops)
+    management_prompt = render_job_prompt(management)
+
+    assert ops_prompt != management_prompt
+    assert "TGG Operations Ingest" in ops_prompt
+    assert "create_fact" in ops_prompt
+    assert "TGG Management Brief" in management_prompt
+    assert "management_brief" in management_prompt
+
+
+def test_selector_resolves_tgg_ops_ingest_vs_tgg_management_from_metadata() -> None:
+    constitution = load_constitution(FIXTURE)
+
+    ops = resolve_context({"constitution": constitution}, {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}})
+    management = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "whatsapp", "chat_id": "tgg-management"}},
+    )
+    unresolved = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "whatsapp", "chat_id": "other"}},
+    )
+
+    assert ops is not None
+    assert ops.job_type == "tgg_ops_ingest"
+    assert management is not None
+    assert management.job_type == "tgg_management"
+    assert unresolved is None
+
+
+def test_stable_behavior_hashes() -> None:
+    constitution_a = load_constitution(FIXTURE)
+    constitution_b = load_constitution(FIXTURE)
+    ops_a = resolve_context(
+        {"constitution": constitution_a},
+        {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}, "message_id": "first"},
+    )
+    ops_b = resolve_context(
+        {"constitution": constitution_b},
+        {"source": {"platform": "whatsapp", "chat_id": "tgg-ops"}, "message_id": "second"},
+    )
+
+    assert ops_a is not None
+    assert ops_b is not None
+    assert constitution_a.hash == constitution_b.hash
+    assert ops_a.job_hash == ops_b.job_hash
+    assert ops_a.behavior_hash == ops_b.behavior_hash
+    assert behavior_hash({"b": 2, "a": [1, {"c": True}]}) == behavior_hash({"a": [1, {"c": True}], "b": 2})

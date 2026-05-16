@@ -122,6 +122,8 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         name = label_source[:50].strip() or "cron job"
     normalized["name"] = name
     normalized["schedule_display"] = _schedule_display_for_job(normalized)
+    pa_job_type = _coerce_job_text(normalized.get("pa_job_type")).strip()
+    normalized["pa_job_type"] = pa_job_type or None
 
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
@@ -494,6 +496,7 @@ def create_job(
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
+    pa_job_type: Optional[str] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
 ) -> Dict[str, Any]:
@@ -527,6 +530,9 @@ def create_job(
                           When set, only tools from these toolsets are loaded, reducing
                           token overhead. When omitted, all default tools are loaded.
                           Ignored when ``no_agent=True``.
+        pa_job_type: Optional PA constitution job type. When configured with a
+                     PA constitution, this selects the scheduled run's operating
+                     brief before model execution.
         workdir: Optional absolute path.  When set, the job runs as if launched
                 from that directory: AGENTS.md / CLAUDE.md / .cursorrules from
                 that directory are injected into the system prompt, and the
@@ -572,6 +578,8 @@ def create_job(
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
     normalized_toolsets = normalized_toolsets or None
+    normalized_pa_job_type = str(pa_job_type).strip() if isinstance(pa_job_type, str) else None
+    normalized_pa_job_type = normalized_pa_job_type or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
 
@@ -626,6 +634,7 @@ def create_job(
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
+        "pa_job_type": normalized_pa_job_type,
         "workdir": normalized_workdir,
     }
 

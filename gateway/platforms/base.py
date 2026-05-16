@@ -956,6 +956,12 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # Optional PA runtime hints. These select a job-specific operating brief
+    # before model execution; they are hints only and have no effect unless a
+    # PA constitution is configured.
+    pa_job_type: Optional[str] = None
+    pa_context: Optional[dict] = None
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the

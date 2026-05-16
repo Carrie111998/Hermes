@@ -41,7 +41,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List, Union
+from typing import Dict, Optional, Any, List, Union, Mapping
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
@@ -969,6 +969,155 @@ def _load_gateway_config() -> dict:
     except Exception:
         logger.debug("Could not load gateway config from %s", config_path)
     return {}
+
+
+def _pa_platform_extra(config: Any, platform: "Platform") -> dict:
+    """Return platform extra config for PA routing, or ``{}`` when absent."""
+    try:
+        platform_cfg = getattr(config, "platforms", {}).get(platform)
+        extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+        return dict(extra) if isinstance(extra, Mapping) else {}
+    except Exception:
+        return {}
+
+
+def _merge_pa_config(user_config: Mapping[str, Any] | None, platform_extra: Mapping[str, Any] | None = None) -> dict:
+    """Merge top-level ``pa`` config with platform PA overrides."""
+    cfg = user_config if isinstance(user_config, Mapping) else {}
+    merged: dict[str, Any] = {}
+    root_pa = cfg.get("pa")
+    if isinstance(root_pa, Mapping):
+        merged.update(root_pa)
+
+    extra = platform_extra if isinstance(platform_extra, Mapping) else {}
+    extra_pa = extra.get("pa")
+    if isinstance(extra_pa, Mapping):
+        merged.update(extra_pa)
+    if extra.get("pa_job_type"):
+        merged.setdefault("job_type", str(extra.get("pa_job_type")))
+    return merged
+
+
+def _source_pa_metadata(
+    source: "SessionSource",
+    *,
+    session_id: str | None = None,
+    session_key: str | None = None,
+    event_message_id: str | None = None,
+    pa_job_type: str | None = None,
+    pa_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build PA selector metadata from gateway source/event context."""
+    source_data = source.to_dict() if hasattr(source, "to_dict") else {}
+    metadata: dict[str, Any] = {
+        "source": source_data,
+        "session_id": session_id,
+        "session_key": session_key,
+        "message_id": event_message_id,
+    }
+    if isinstance(pa_context, Mapping):
+        metadata.update(dict(pa_context))
+    if pa_job_type:
+        metadata["job_type"] = pa_job_type
+        metadata["pa_job_type"] = pa_job_type
+    return metadata
+
+
+def _resolve_pa_context(
+    user_config: Mapping[str, Any] | None,
+    platform_extra: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any],
+):
+    """Resolve the selected PA constitution/job brief for this run."""
+    pa_config = _merge_pa_config(user_config, platform_extra)
+    if not pa_config or not is_truthy_value(pa_config.get("enabled"), default=False):
+        return None
+    try:
+        from agent.pa_constitution import resolve_context
+
+        return resolve_context(pa_config, metadata)
+    except Exception as exc:
+        logger.warning("PA context resolution failed: %s", exc)
+        raise
+
+
+def _merge_pa_toolsets(
+    enabled_toolsets: list[str] | None,
+    disabled_toolsets: list[str] | None,
+    pa_context: Any,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Apply job-brief toolset restrictions to an agent construction."""
+    if pa_context is None:
+        return enabled_toolsets, disabled_toolsets
+    job_brief = getattr(pa_context, "job_brief", None)
+    if job_brief is None:
+        return enabled_toolsets, disabled_toolsets
+
+    job_enabled = list(getattr(job_brief, "enabled_toolsets", ()) or ())
+    job_disabled = list(getattr(job_brief, "disabled_toolsets", ()) or ())
+
+    next_enabled = job_enabled if job_enabled else enabled_toolsets
+    next_disabled = list(disabled_toolsets or [])
+    next_disabled.extend(job_disabled)
+
+    def _dedupe(values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if text and text not in seen:
+                out.append(text)
+                seen.add(text)
+        return out or None
+
+    return _dedupe(next_enabled), _dedupe(next_disabled)
+
+
+def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
+    """Render PA identity + job brief for API-call-time prompt injection."""
+    if pa_context is None:
+        return ""
+    from agent.pa_constitution import render_identity_prompt, render_job_prompt
+
+    return (
+        render_identity_prompt(pa_context.constitution)
+        + "\n\n"
+        + render_job_prompt(pa_context)
+    ).strip()
+
+
+def _record_pa_behavior_event(
+    session_db: Any,
+    pa_context: Any,
+    source: "SessionSource",
+    metadata: Mapping[str, Any],
+    *,
+    session_id: str | None,
+    session_source: str | None,
+) -> None:
+    """Best-effort PA behavior history recording."""
+    if session_db is None or pa_context is None:
+        return
+    recorder = getattr(session_db, "record_pa_behavior_event", None)
+    if recorder is None:
+        return
+    try:
+        recorder(
+            constitution_id=pa_context.constitution.id,
+            constitution_hash=pa_context.identity_hash,
+            job_type=pa_context.job_type,
+            job_hash=pa_context.job_hash,
+            session_id=session_id,
+            session_source=session_source,
+            source_metadata=dict(metadata),
+            actor=source.user_id or source.user_name,
+            source="gateway",
+            metadata={"behavior_hash": pa_context.behavior_hash},
+        )
+    except Exception as exc:
+        logger.debug("Failed to record PA behavior event: %s", exc)
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
@@ -6165,6 +6314,8 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        pa_job_type=event.pa_job_type,
+                        pa_context=event.pa_context,
                     )
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
@@ -6192,6 +6343,8 @@ class GatewayRunner:
                             source=event.source,
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
+                            pa_job_type=event.pa_job_type,
+                            pa_context=event.pa_context,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
                     return "Agent still starting — /steer queued for the next turn."
@@ -6214,6 +6367,8 @@ class GatewayRunner:
                         source=event.source,
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
+                        pa_job_type=event.pa_job_type,
+                        pa_context=event.pa_context,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
                 return "No active agent — /steer queued for the next turn."
@@ -7713,6 +7868,8 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                pa_job_type=event.pa_job_type,
+                pa_context=event.pa_context,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9603,6 +9760,8 @@ class GatewayRunner:
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
+            pa_job_type=event.pa_job_type,
+            pa_context=event.pa_context,
         )
         
         # Let the normal message handler process it
@@ -9724,6 +9883,8 @@ class GatewayRunner:
                     source=event.source,
                     message_id=event.message_id,
                     channel_prompt=event.channel_prompt,
+                    pa_job_type=event.pa_job_type,
+                    pa_context=event.pa_context,
                 )
                 self._enqueue_fifo(_quick_key, kickoff_event, adapter)
             except Exception as exc:
@@ -14528,6 +14689,8 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        pa_job_type: Optional[str] = None,
+        pa_context: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14569,6 +14732,24 @@ class GatewayRunner:
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        pa_metadata = _source_pa_metadata(
+            source,
+            session_id=session_id,
+            session_key=session_key,
+            event_message_id=event_message_id,
+            pa_job_type=pa_job_type,
+            pa_context=pa_context,
+        )
+        pa_resolved_context = _resolve_pa_context(
+            user_config,
+            _pa_platform_extra(getattr(self, "config", None), source.platform),
+            pa_metadata,
+        )
+        enabled_toolsets, disabled_toolsets = _merge_pa_toolsets(
+            enabled_toolsets,
+            disabled_toolsets,
+            pa_resolved_context,
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -15094,8 +15275,19 @@ class GatewayRunner:
             event_channel_prompt = (channel_prompt or "").strip()
             if event_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + event_channel_prompt).strip()
+            pa_prompt = _render_pa_ephemeral_prompt(pa_resolved_context)
+            if pa_prompt:
+                combined_ephemeral = (combined_ephemeral + "\n\n" + pa_prompt).strip()
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
+            _record_pa_behavior_event(
+                getattr(self, "_session_db", None),
+                pa_resolved_context,
+                source,
+                pa_metadata,
+                session_id=session_id,
+                session_source=platform_key,
+            )
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
@@ -16442,6 +16634,8 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    pa_job_type=getattr(pending_event, "pa_job_type", None),
+                    pa_context=getattr(pending_event, "pa_context", None),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
