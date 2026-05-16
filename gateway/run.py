@@ -1104,6 +1104,65 @@ def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
     setter(policy)
 
 
+def _pa_response_policy(pa_context: Any) -> Mapping[str, Any]:
+    job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
+    response_policy = getattr(job_brief, "response_policy", None) if job_brief is not None else None
+    return response_policy if isinstance(response_policy, Mapping) else {}
+
+
+def _pa_tenant_slug(pa_context: Any) -> str | None:
+    constitution = getattr(pa_context, "constitution", None) if pa_context is not None else None
+    client = getattr(constitution, "client", None) if constitution is not None else None
+    if isinstance(client, Mapping):
+        value = client.get("tenant") or client.get("tenant_slug") or client.get("slug")
+        if value:
+            return str(value).strip() or None
+    return None
+
+
+def _pa_max_output_tokens(pa_context: Any) -> int | None:
+    raw = _pa_response_policy(pa_context).get("max_output_tokens")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _pa_allowed_slash_commands(pa_context: Any) -> set[str] | None:
+    policy = _pa_response_policy(pa_context)
+    if "slash_commands" not in policy:
+        return None
+    raw = policy.get("slash_commands")
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in {"*", "all", "full", "full_admin", "full-admin"}:
+            return None
+        items = [part for part in normalized.split(",") if part.strip()]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    elif raw is None:
+        items = []
+    else:
+        items = [raw]
+    allowed: set[str] = set()
+    for item in items:
+        name = str(item).strip().lower().lstrip("/")
+        if name:
+            allowed.add(name)
+    return allowed
+
+
+def _pa_slash_denial(pa_context: Any, canonical_cmd: str) -> str | None:
+    allowed = _pa_allowed_slash_commands(pa_context)
+    if allowed is None:
+        return None
+    command = str(canonical_cmd or "").strip().lower().lstrip("/")
+    if command and command in allowed:
+        return None
+    return f"Command `/{command or canonical_cmd}` is not available here."
+
+
 def _record_pa_behavior_event(
     session_db: Any,
     pa_context: Any,
@@ -6273,7 +6332,12 @@ class GatewayRunner:
             # session state. /help and /whoami fall under the always-allowed
             # floor inside _check_slash_access.
             if _evt_cmd and _cmd_def_inner is not None:
-                _denied = self._check_slash_access(source, _cmd_def_inner.name)
+                _denied = self._check_slash_access(
+                    source,
+                    _cmd_def_inner.name,
+                    pa_context=event.pa_context,
+                    event=event,
+                )
                 if _denied is not None:
                     return _denied
 
@@ -6619,7 +6683,12 @@ class GatewayRunner:
         # ``user_allowed_commands`` (plus the always-allowed floor: /help,
         # /whoami). Plain chat is unaffected — only slash commands gate.
         if command and canonical and is_gateway_known_command(canonical):
-            _denied = self._check_slash_access(source, canonical)
+            _denied = self._check_slash_access(
+                source,
+                canonical,
+                pa_context=event.pa_context,
+                event=event,
+            )
             if _denied is not None:
                 return _denied
 
@@ -6955,6 +7024,24 @@ class GatewayRunner:
                     # built-ins (command may be an alias target set by the
                     # quick-command block above, so _cmd_def can be stale).
                     if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
+                        _unknown_pa_context = event.pa_context
+                        if _unknown_pa_context is None:
+                            try:
+                                _unknown_pa_context = _resolve_pa_context(
+                                    _load_gateway_config(),
+                                    _pa_platform_extra(getattr(self, "config", None), source.platform),
+                                    _source_pa_metadata(
+                                        source,
+                                        event_message_id=getattr(event, "message_id", None),
+                                        pa_job_type=getattr(event, "pa_job_type", None),
+                                        pa_context=getattr(event, "pa_context", None),
+                                    ),
+                                )
+                            except Exception:
+                                _unknown_pa_context = None
+                        _pa_denied = _pa_slash_denial(_unknown_pa_context, command)
+                        if _pa_denied is not None:
+                            return _pa_denied
                         logger.warning(
                             "Unrecognized slash command /%s from %s — "
                             "replying with unknown-command notice",
@@ -8583,7 +8670,12 @@ class GatewayRunner:
 
 
     def _check_slash_access(
-        self, source: SessionSource, canonical_cmd: str
+        self,
+        source: SessionSource,
+        canonical_cmd: str,
+        *,
+        pa_context: Any = None,
+        event: MessageEvent | None = None,
     ) -> Optional[str]:
         """Return a denial message if ``source`` cannot run ``canonical_cmd``,
         else None. Used by both the cold and running-agent dispatch paths
@@ -8599,6 +8691,31 @@ class GatewayRunner:
 
         if not canonical_cmd:
             return None
+        resolved_pa_context = pa_context
+        if resolved_pa_context is None:
+            try:
+                resolved_pa_context = _resolve_pa_context(
+                    _load_gateway_config(),
+                    _pa_platform_extra(getattr(self, "config", None), source.platform),
+                    _source_pa_metadata(
+                        source,
+                        event_message_id=getattr(event, "message_id", None),
+                        pa_job_type=getattr(event, "pa_job_type", None),
+                        pa_context=getattr(event, "pa_context", None),
+                    ),
+                )
+            except Exception:
+                resolved_pa_context = None
+        pa_denial = _pa_slash_denial(resolved_pa_context, canonical_cmd)
+        if pa_denial is not None:
+            logger.info(
+                "Slash command /%s denied by PA job policy for %s:%s",
+                canonical_cmd,
+                source.platform.value if source.platform else "?",
+                source.chat_id,
+            )
+            return pa_denial
+
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
@@ -14780,6 +14897,8 @@ class GatewayRunner:
             disabled_toolsets,
             pa_resolved_context,
         )
+        pa_tenant_slug = _pa_tenant_slug(pa_resolved_context)
+        pa_max_output_tokens = _pa_max_output_tokens(pa_resolved_context)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -15505,6 +15624,8 @@ class GatewayRunner:
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=session_id,
+                    max_tokens=pa_max_output_tokens,
+                    tenant_slug=pa_tenant_slug,
                     platform=platform_key,
                     user_id=source.user_id,
                     user_name=source.user_name,
@@ -15532,6 +15653,8 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            agent.max_tokens = pa_max_output_tokens
+            agent.tenant_slug = pa_tenant_slug
             _apply_pa_compression_policy(agent, pa_resolved_context)
 
             _bg_review_release = threading.Event()

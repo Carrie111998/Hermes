@@ -28,6 +28,13 @@ def test_fixture_loads() -> None:
     assert len(constitution.selectors) == 4
     assert len(constitution.hash) == 64
     assert "Personal assistant for TGG" in render_identity_prompt(constitution)
+    assert constitution.job_briefs["tgg_ops_ingest"].response_policy["slash_commands"] == []
+    assert constitution.job_briefs["tgg_ops_ingest"].response_policy["max_output_tokens"] == 2048
+    assert constitution.job_briefs["tgg_management"].response_policy["slash_commands"] == [
+        "/pause",
+        "/summary",
+    ]
+    assert constitution.job_briefs["tgg_management"].response_policy["max_output_tokens"] == 8192
 
 
 def test_invalid_fixture_fails_loudly() -> None:

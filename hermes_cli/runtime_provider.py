@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from typing import Any, Dict, Optional
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,181 @@ def _get_model_config() -> Dict[str, Any]:
     if isinstance(model_cfg, str) and model_cfg.strip():
         return {"default": model_cfg.strip()}
     return {}
+
+
+def _truthy_config_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _read_marshal_secrets_env(env_name: str) -> str:
+    """Return a named secret from ~/.marshal/secrets.env without broad env fallback."""
+    if not env_name:
+        return ""
+    secrets_path = Path.home() / ".marshal" / "secrets.env"
+    try:
+        if not secrets_path.exists():
+            return ""
+        for raw_line in secrets_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() != env_name:
+                continue
+            cleaned = value.strip()
+            if (
+                len(cleaned) >= 2
+                and cleaned[0] == cleaned[-1]
+                and cleaned[0] in {"'", '"'}
+            ):
+                cleaned = cleaned[1:-1]
+            return cleaned.strip()
+    except Exception as exc:
+        logger.debug("Could not read %s from marshal secrets env: %s", env_name, exc)
+    return ""
+
+
+def _configured_api_key_source(
+    model_cfg: Dict[str, Any],
+    raw_config: Dict[str, Any],
+) -> tuple[str, str] | None:
+    """Return (env_name, source_path) for an explicit API key declaration."""
+    raw_source: Any = model_cfg.get("api_key_source")
+    source_path = "model.api_key_source"
+    if raw_source is None and model_cfg.get("secrets_env_key"):
+        raw_source = {"secrets_env_key": model_cfg.get("secrets_env_key")}
+        source_path = "model.secrets_env_key"
+    if raw_source is None:
+        raw_source = raw_config.get("api_key_source")
+        source_path = "api_key_source"
+    if raw_source is None and raw_config.get("secrets_env_key"):
+        raw_source = {"secrets_env_key": raw_config.get("secrets_env_key")}
+        source_path = "secrets_env_key"
+
+    if raw_source is None:
+        return None
+    if isinstance(raw_source, str):
+        env_name = raw_source.strip()
+    elif isinstance(raw_source, dict):
+        source_type = str(raw_source.get("type") or "env").strip().lower()
+        if source_type not in {"env", "secrets_env"}:
+            raise AuthError(
+                f"Unsupported api_key_source type {source_type!r}; only env is supported.",
+                code="unsupported_api_key_source",
+            )
+        env_name = str(
+            raw_source.get("secrets_env_key")
+            or raw_source.get("env")
+            or raw_source.get("env_key")
+            or raw_source.get("key")
+            or raw_source.get("name")
+            or ""
+        ).strip()
+    else:
+        raise AuthError(
+            "api_key_source must be a string env name or a mapping with secrets_env_key.",
+            code="invalid_api_key_source",
+        )
+
+    if not env_name:
+        raise AuthError(
+            f"{source_path} must name a secrets_env_key/env variable.",
+            code="missing_api_key_source",
+        )
+    return env_name, source_path
+
+
+def _pa_requires_api_key_source(raw_config: Dict[str, Any], model_cfg: Dict[str, Any]) -> bool:
+    """PA deployments must declare which key is being used; no implicit env scan."""
+    if _configured_api_key_source(model_cfg, raw_config):
+        return True
+    pa_config = raw_config.get("pa")
+    if isinstance(pa_config, dict) and _truthy_config_value(pa_config.get("enabled")):
+        return True
+    return False
+
+
+def _explicit_api_key_source_runtime(
+    *,
+    provider: str,
+    requested_provider: str,
+    model_cfg: Dict[str, Any],
+    raw_config: Dict[str, Any],
+    explicit_api_key: Optional[str],
+    explicit_base_url: Optional[str],
+) -> Dict[str, Any] | None:
+    """Resolve API-key providers from an explicitly declared source only."""
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if not pconfig or pconfig.auth_type != "api_key":
+        return None
+
+    source_decl = _configured_api_key_source(model_cfg, raw_config)
+    if source_decl is None:
+        if not _pa_requires_api_key_source(raw_config, model_cfg):
+            return None
+        raise AuthError(
+            "PA runtime config must declare model.api_key_source.secrets_env_key; "
+            "implicit provider env fallback is disabled.",
+            provider=provider,
+            code="missing_api_key_source",
+        )
+
+    env_name, source_path = source_decl
+    token = (explicit_api_key or "").strip()
+    source_label = "explicit-api-key"
+    if not token:
+        token = os.getenv(env_name, "").strip() or _read_marshal_secrets_env(env_name)
+        source_label = f"{source_path}:{env_name}"
+    if not has_usable_secret(token):
+        raise AuthError(
+            f"No usable API key found for explicit {source_path}={env_name!r}. "
+            f"Set {env_name} or add it to ~/.marshal/secrets.env.",
+            provider=provider,
+            code="api_key_source_unresolved",
+        )
+
+    cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+    cfg_base_url = ""
+    if cfg_provider == provider:
+        cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
+    env_base_url = ""
+    if pconfig.base_url_env_var:
+        env_base_url = os.getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
+    base_url = (
+        (explicit_base_url or "").strip().rstrip("/")
+        or cfg_base_url
+        or env_base_url
+        or (pconfig.inference_base_url or "").rstrip("/")
+    )
+
+    api_mode = "chat_completions"
+    if provider == "copilot":
+        api_mode = _copilot_runtime_api_mode(model_cfg, token)
+    elif provider == "xai":
+        api_mode = "codex_responses"
+    else:
+        configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+        configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+        if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+            api_mode = configured_mode
+        else:
+            detected = _detect_api_mode_for_url(base_url)
+            if detected:
+                api_mode = detected
+
+    return {
+        "provider": provider,
+        "api_mode": api_mode,
+        "base_url": base_url,
+        "api_key": token,
+        "source": source_label,
+        "api_key_source": env_name,
+        "requested_provider": requested_provider,
+    }
 
 
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
@@ -1036,6 +1212,18 @@ def resolve_runtime_provider(
     )
     if explicit_runtime:
         return explicit_runtime
+
+    raw_config = load_config()
+    api_key_source_runtime = _explicit_api_key_source_runtime(
+        provider=provider,
+        requested_provider=requested_provider,
+        model_cfg=model_cfg,
+        raw_config=raw_config if isinstance(raw_config, dict) else {},
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+    )
+    if api_key_source_runtime:
+        return api_key_source_runtime
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":

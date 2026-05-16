@@ -1,0 +1,10 @@
+model:
+  provider: gemini
+  default: gemini-2.5-flash
+  base_url: https://generativelanguage.googleapis.com/v1beta
+  api_key_source:
+    type: env
+    secrets_env_key: GEMINI_API_KEY_PCL_PA_SHARED
+pa:
+  enabled: true
+  constitution_path: tests/fixtures/pa/bobby_tgg_constitution.yaml

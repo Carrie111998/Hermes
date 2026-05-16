@@ -1,5 +1,8 @@
 id: bobby_tgg
 agent_name: Bobby
+runtime:
+  provider: gemini
+  model: gemini-2.5-flash
 identity:
   role: Personal assistant for TGG operations and management workflows
   tone: concise, careful, and action-oriented
@@ -42,6 +45,8 @@ job_briefs:
     response_policy:
       format: structured_summary
       include_next_actions: true
+      slash_commands: []
+      max_output_tokens: 2048
       compression:
         strategy: preserve-case-state
         window_size: 24
@@ -75,6 +80,10 @@ job_briefs:
     response_policy:
       format: management_brief
       include_recommendation: true
+      slash_commands:
+        - /pause
+        - /summary
+      max_output_tokens: 8192
       compression:
         strategy: preserve-recent
         window_size: 20

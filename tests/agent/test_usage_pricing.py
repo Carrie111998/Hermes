@@ -212,6 +212,18 @@ def test_deepseek_v4_pro_pricing_entry_exists():
     assert float(entry.cache_read_cost_per_million) == 0.0145
 
 
+def test_gemini_25_flash_pricing_entry_exists():
+    entry = get_pricing_entry(
+        "gemini-2.5-flash",
+        provider="gemini",
+    )
+
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 0.30
+    assert float(entry.output_cost_per_million) == 2.50
+    assert float(entry.cache_read_cost_per_million) == 0.03
+
+
 def test_deepseek_v4_pro_estimate_usage_cost():
     """Ensure deepseek-v4-pro sessions get a dollar estimate, not unknown."""
     result = estimate_usage_cost(

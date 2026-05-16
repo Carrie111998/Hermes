@@ -162,6 +162,7 @@ from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.llm_call_audit import audit_llm_call
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
     _deterministic_call_id as _codex_deterministic_call_id,
@@ -1184,6 +1185,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        tenant_slug: str = None,
     ):
         """
         Initialize the AI Agent.
@@ -1252,6 +1254,7 @@ class AIAgent:
         self._chat_name = chat_name
         self._chat_type = chat_type
         self._thread_id = thread_id
+        self.tenant_slug = tenant_slug
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
@@ -13470,6 +13473,21 @@ class AIAgent:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+
+                        audit_llm_call(
+                            tenant_slug=getattr(self, "tenant_slug", None),
+                            session_id=self.session_id,
+                            provider=self.provider,
+                            model=self.model,
+                            api_key=getattr(self, "api_key", ""),
+                            usage=canonical_usage,
+                            metadata={
+                                "api_mode": self.api_mode,
+                                "base_url": self.base_url,
+                                "cost_status": cost_result.status,
+                                "cost_source": cost_result.source,
+                            },
+                        )
 
                         # Persist token counts to session DB for /insights.
                         # Do this for every platform with a session_id so non-CLI

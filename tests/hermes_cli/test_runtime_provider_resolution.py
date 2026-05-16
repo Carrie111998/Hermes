@@ -1133,6 +1133,46 @@ def test_api_key_provider_anthropic_url_auto_detection(monkeypatch):
     assert resolved["base_url"] == "https://api.minimax.io/anthropic"
 
 
+def test_pa_api_key_provider_requires_explicit_api_key_source(monkeypatch):
+    """PA configs must not silently fall through to provider env names."""
+    model_cfg = {
+        "provider": "gemini",
+        "default": "gemini-2.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+    }
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "gemini")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
+    monkeypatch.setattr(rp, "load_config", lambda: {"pa": {"enabled": True}, "model": model_cfg})
+    monkeypatch.setenv("GEMINI_API_KEY", "implicit-key-that-must-not-win")
+
+    with pytest.raises(rp.AuthError, match="api_key_source"):
+        rp.resolve_runtime_provider(requested="gemini")
+
+
+def test_pa_api_key_provider_uses_declared_secrets_env_key(monkeypatch):
+    model_cfg = {
+        "provider": "gemini",
+        "default": "gemini-2.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "api_key_source": {
+            "type": "env",
+            "secrets_env_key": "GEMINI_API_KEY_PCL_PA_SHARED",
+        },
+    }
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "gemini")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: model_cfg)
+    monkeypatch.setattr(rp, "load_config", lambda: {"pa": {"enabled": True}, "model": model_cfg})
+    monkeypatch.setenv("GEMINI_API_KEY", "implicit-key-that-must-not-win")
+    monkeypatch.setenv("GEMINI_API_KEY_PCL_PA_SHARED", "shared-pa-key")
+
+    resolved = rp.resolve_runtime_provider(requested="gemini")
+
+    assert resolved["provider"] == "gemini"
+    assert resolved["api_key"] == "shared-pa-key"
+    assert resolved["api_key_source"] == "GEMINI_API_KEY_PCL_PA_SHARED"
+    assert resolved["source"] == "model.api_key_source:GEMINI_API_KEY_PCL_PA_SHARED"
+
+
 def test_api_key_provider_explicit_api_mode_config(monkeypatch):
     """API-key providers should respect api_mode from model config."""
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "minimax")

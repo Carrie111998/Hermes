@@ -4,6 +4,9 @@ from gateway.config import Platform
 from gateway.run import (
     GatewayRunner,
     _merge_pa_toolsets,
+    _pa_max_output_tokens,
+    _pa_slash_denial,
+    _pa_tenant_slug,
     _render_pa_ephemeral_prompt,
     _resolve_pa_context,
     _source_pa_metadata,
@@ -95,6 +98,12 @@ def test_gateway_pa_prompt_and_toolsets_enter_cache_signature():
     assert management_enabled == ["memory", "file", "web", "pa-business"]
     assert ops_disabled == ["clarify", "web", "shell"]
     assert management_disabled == ["clarify", "shell"]
+    assert _pa_tenant_slug(ops) == "tgg"
+    assert _pa_max_output_tokens(ops) == 2048
+    assert _pa_max_output_tokens(management) == 8192
+    assert _pa_slash_denial(ops, "help") == "Command `/help` is not available here."
+    assert _pa_slash_denial(management, "pause") is None
+    assert _pa_slash_denial(management, "sethome") == "Command `/sethome` is not available here."
 
     runtime = {"api_key": "key", "base_url": "https://example.invalid", "provider": "test"}
     ops_sig = GatewayRunner._agent_config_signature("model", runtime, ops_enabled, ops_prompt)

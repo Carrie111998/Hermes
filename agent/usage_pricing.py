@@ -300,6 +300,30 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://openai.com/api/pricing/",
         pricing_version="openai-pricing-2026-03-16",
     ),
+    # Gemini Developer API, Standard paid tier, text/image/video tokens.
+    # Source: https://ai.google.dev/gemini-api/docs/pricing
+    (
+        "gemini",
+        "gemini-2.5-flash",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.30"),
+        output_cost_per_million=Decimal("2.50"),
+        cache_read_cost_per_million=Decimal("0.03"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="gemini-pricing-2026-05-16",
+    ),
+    (
+        "gemini",
+        "gemini-2.5-flash-lite",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.40"),
+        cache_read_cost_per_million=Decimal("0.01"),
+        source="official_docs_snapshot",
+        source_url="https://ai.google.dev/gemini-api/docs/pricing",
+        pricing_version="gemini-pricing-2026-05-16",
+    ),
     # ── Anthropic older models (pre-4.5 generation) ────────────────────────
     (
         "anthropic",
@@ -546,6 +570,8 @@ def resolve_billing_route(
         return BillingRoute(provider="anthropic", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name == "openai":
         return BillingRoute(provider="openai", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
+    if provider_name in {"gemini", "google", "google-gemini", "google-ai-studio"}:
+        return BillingRoute(provider="gemini", model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"minimax", "minimax-cn"}:
         return BillingRoute(provider=provider_name, model=model.split("/")[-1], base_url=base_url or "", billing_mode="official_docs_snapshot")
     if provider_name in {"custom", "local"} or (base and "localhost" in base):
