@@ -225,6 +225,150 @@ def test_tenant_scoped_http_operation_injects_client_auth(fake_business_endpoint
     assert _FakeBusinessHandler.received["tgg_token"] == "tgg-secret"
 
 
+class _PathParamHandler(BaseHTTPRequestHandler):
+    """Records path + payload for any method, useful for path-param tests."""
+
+    last_request: dict = {}
+
+    def _record(self, body_bytes: bytes) -> None:
+        try:
+            payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+        except json.JSONDecodeError:
+            payload = {"__raw": body_bytes.decode("utf-8", errors="replace")}
+        type(self).last_request = {
+            "method": self.command,
+            "path": self.path,
+            "payload": payload,
+            "authorization": self.headers.get("Authorization"),
+            "ps_tenant": self.headers.get("X-PS-Tenant"),
+        }
+        body = json.dumps({"ok": True, "echoPath": self.path}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._record(b"")
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self._record(self.rfile.read(length))
+
+    def do_PATCH(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self._record(self.rfile.read(length))
+
+    def log_message(self, _format, *_args):
+        return
+
+
+@pytest.fixture
+def path_param_endpoint():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PathParamHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_path_param_interpolation_get(path_param_endpoint):
+    """GET with one path param + remaining payload becomes query string."""
+    config = {
+        "pa_business": {
+            "operations": {
+                "case_lookup": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases/{{jobNo}}",
+                    "path_params": ["jobNo"],
+                    "headers": {"X-PS-Tenant": "tgg"},
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config, "case_lookup", {"jobNo": "AM/JOB/2605/0112"}
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    # Slashes in jobNo must be percent-encoded (safe="").
+    assert last["path"] == "/api/operator/cases/AM%2FJOB%2F2605%2F0112"
+    assert last["payload"] == {}
+    assert last["ps_tenant"] == "tgg"
+
+
+def test_path_param_interpolation_patch_keeps_remaining_payload_in_body(path_param_endpoint):
+    """PATCH with path param: jobNo goes in URL, remaining payload becomes JSON body."""
+    config = {
+        "pa_business": {
+            "operations": {
+                "case_state_update": {
+                    "type": "http",
+                    "method": "PATCH",
+                    "url": f"{path_param_endpoint}/api/operator/cases/{{jobNo}}/state",
+                    "path_params": ["jobNo"],
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "case_state_update",
+        {"jobNo": "BS/JOB/2605/0087", "state": "completed"},
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "PATCH"
+    assert last["path"] == "/api/operator/cases/BS%2FJOB%2F2605%2F0087/state"
+    # jobNo was popped from payload; only state remains in the body.
+    assert last["payload"] == {"state": "completed"}
+
+
+def test_path_param_missing_from_payload_fails_loudly(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "case_lookup": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases/{{jobNo}}",
+                    "path_params": ["jobNo"],
+                }
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="requires path_param 'jobNo'"):
+        execute_business_operation(config, "case_lookup", {})
+
+
+def test_path_param_without_placeholder_fails_loudly(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "broken": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                    "path_params": ["jobNo"],
+                }
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="URL has no \\{jobNo\\} placeholder"):
+        execute_business_operation(config, "broken", {"jobNo": "X"})
+
+
 def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):
     from agent.pa_constitution import resolve_context
 

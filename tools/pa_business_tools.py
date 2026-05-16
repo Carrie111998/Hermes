@@ -32,6 +32,7 @@ class PABusinessOperation:
     tenant: str | None = None
     auth: Mapping[str, Any] | None = None
     timeout: float = DEFAULT_TIMEOUT_SECONDS
+    path_params: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,14 @@ def load_business_bridge_config(
             op_auth = raw.get("auth")
             if op_auth is not None and not isinstance(op_auth, Mapping):
                 raise ValueError(f"operation {op_name!r} auth must be a mapping")
+            raw_path_params = raw.get("path_params") or ()
+            if isinstance(raw_path_params, (str, bytes)) or not isinstance(
+                raw_path_params, (list, tuple)
+            ):
+                raise ValueError(
+                    f"operation {op_name!r} path_params must be a list of strings"
+                )
+            path_params = tuple(str(p) for p in raw_path_params)
             operations[op_name] = PABusinessOperation(
                 name=op_name,
                 kind=kind,
@@ -149,6 +158,7 @@ def load_business_bridge_config(
                 tenant=str(raw.get("tenant")) if raw.get("tenant") is not None else None,
                 auth=dict(op_auth) if isinstance(op_auth, Mapping) else None,
                 timeout=timeout,
+                path_params=path_params,
             )
             continue
 
@@ -283,6 +293,24 @@ def _execute_http_operation(
     data: bytes | None = None
     headers = {"Accept": "application/json", **dict(op.headers or {})}
     headers.update(_auth_headers(op.auth or bridge_config.auth or {}))
+
+    # Path-param substitution: extract listed keys from payload, URL-encode,
+    # and replace {name} placeholders in op.url. Remaining payload becomes
+    # the query string (GET) or JSON body (non-GET).
+    for param_name in op.path_params:
+        placeholder = "{" + param_name + "}"
+        if placeholder not in url:
+            raise ValueError(
+                f"operation {op.name!r} declares path_param {param_name!r} "
+                f"but URL has no {placeholder} placeholder"
+            )
+        if param_name not in request_payload:
+            raise ValueError(
+                f"operation {op.name!r} requires path_param {param_name!r} in payload"
+            )
+        value = request_payload.pop(param_name)
+        encoded = urllib.parse.quote(str(value), safe="")
+        url = url.replace(placeholder, encoded)
 
     if op.method == "GET":
         if request_payload:

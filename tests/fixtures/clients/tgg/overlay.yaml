@@ -11,6 +11,41 @@ client:
   business_bridge:
     tenant: tgg
     auth:
-      type: header
-      header: X-TGG-Token
-      token_env: TGG_BUSINESS_TOKEN
+      type: bearer
+      token_env: BOBBY_TGG_PS_SERVICE_TOKEN
+    operations:
+      tgg_case_lookup:
+        type: http
+        tenant: tgg
+        method: GET
+        url: http://127.0.0.1:5191/api/operator/cases/{jobNo}
+        path_params: [jobNo]
+        headers:
+          X-PS-Tenant: tgg
+        timeout: 10
+      tgg_case_list:
+        type: http
+        tenant: tgg
+        method: GET
+        url: http://127.0.0.1:5191/api/operator/cases
+        headers:
+          X-PS-Tenant: tgg
+        timeout: 10
+      tgg_case_update:
+        type: http
+        tenant: tgg
+        method: PATCH
+        url: http://127.0.0.1:5191/api/operator/cases/{jobNo}/state
+        path_params: [jobNo]
+        headers:
+          X-PS-Tenant: tgg
+        timeout: 10
+      tgg_case_observation:
+        type: http
+        tenant: tgg
+        method: POST
+        url: http://127.0.0.1:5191/api/operator/cases/{jobNo}/observations
+        path_params: [jobNo]
+        headers:
+          X-PS-Tenant: tgg
+        timeout: 10
