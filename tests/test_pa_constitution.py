@@ -25,7 +25,7 @@ def test_fixture_loads() -> None:
     assert constitution.id == "bobby_tgg"
     assert constitution.agent_name == "Bobby"
     assert set(constitution.job_briefs) == {"tgg_ops_ingest", "tgg_management"}
-    assert len(constitution.selectors) == 2
+    assert len(constitution.selectors) == 4
     assert len(constitution.hash) == 64
     assert "Personal assistant for TGG" in render_identity_prompt(constitution)
 
@@ -104,6 +104,14 @@ def test_selector_resolves_tgg_ops_ingest_vs_tgg_management_from_metadata() -> N
         {"constitution": constitution},
         {"source": {"platform": "whatsapp", "chat_id": "tgg-management"}},
     )
+    telegram_ops = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "telegram", "chat_id": "-5192935862"}},
+    )
+    telegram_management = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "telegram", "chat_id": "-5295904349"}},
+    )
     unresolved = resolve_context(
         {"constitution": constitution},
         {"source": {"platform": "whatsapp", "chat_id": "other"}},
@@ -113,6 +121,10 @@ def test_selector_resolves_tgg_ops_ingest_vs_tgg_management_from_metadata() -> N
     assert ops.job_type == "tgg_ops_ingest"
     assert management is not None
     assert management.job_type == "tgg_management"
+    assert telegram_ops is not None
+    assert telegram_ops.job_type == "tgg_ops_ingest"
+    assert telegram_management is not None
+    assert telegram_management.job_type == "tgg_management"
     assert unresolved is None
 
 

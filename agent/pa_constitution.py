@@ -63,7 +63,12 @@ def load_constitution(path: str | Path) -> PAConstitution:
     return load_constitution_data(loaded, source=str(constitution_path))
 
 
-def load_constitution_data(data: Mapping[str, Any], *, source: str = "<memory>") -> PAConstitution:
+def load_constitution_data(
+    data: Mapping[str, Any],
+    *,
+    source: str = "<memory>",
+    client_overlay: Mapping[str, Any] | None = None,
+) -> PAConstitution:
     """Validate raw constitution data and return the normalized dataclass form."""
     if not isinstance(data, Mapping):
         raise ValueError(f"{source}: constitution must be a mapping")
@@ -72,6 +77,22 @@ def load_constitution_data(data: Mapping[str, Any], *, source: str = "<memory>")
     agent_name = _required_str(data, "agent_name", source)
     identity = _required_mapping(data, "identity", source)
     client = _required_mapping(data, "client", source)
+    if client_overlay is None:
+        inline_overlay = data.get("client_overlay")
+        if inline_overlay is not None:
+            if not isinstance(inline_overlay, Mapping):
+                raise ValueError(f"{source}.client_overlay: must be a mapping")
+            client_overlay = inline_overlay
+    if client_overlay is not None:
+        from agent.pa_client_overlay import merge_client_overlay
+
+        agent_name, identity, client = merge_client_overlay(
+            agent_name=agent_name,
+            identity=identity,
+            client=client,
+            overlay=client_overlay,
+            source=f"{source}.client_overlay",
+        )
     sops = _string_tuple(data.get("sops", ()), f"{source}.sops")
 
     raw_job_briefs = _required_mapping(data, "job_briefs", source)
@@ -289,13 +310,73 @@ def _constitution_from_config(config: Mapping[str, Any]) -> PAConstitution | Non
         return None
     if isinstance(raw, str) and not raw.strip():
         return None
+    overlay = _client_overlay_from_config(config)
     if isinstance(raw, PAConstitution):
-        return raw
+        return apply_client_overlay(raw, overlay) if overlay else raw
     if isinstance(raw, Mapping):
-        return load_constitution_data(raw)
+        return load_constitution_data(raw, client_overlay=overlay)
     if isinstance(raw, str | Path):
-        return load_constitution(raw)
+        constitution = load_constitution(raw)
+        return apply_client_overlay(constitution, overlay) if overlay else constitution
     raise ValueError("PA constitution config must be a path, mapping, or PAConstitution")
+
+
+def apply_client_overlay(
+    constitution: PAConstitution,
+    overlay: Mapping[str, Any] | None,
+) -> PAConstitution:
+    """Return a constitution with identity-visible fields overridden by a client overlay."""
+    if not overlay:
+        return constitution
+    from agent.pa_client_overlay import merge_client_overlay
+
+    agent_name, identity, client = merge_client_overlay(
+        agent_name=constitution.agent_name,
+        identity=constitution.identity,
+        client=constitution.client,
+        overlay=overlay,
+        source=f"{constitution.source}.client_overlay",
+    )
+    identity_payload = {
+        "id": constitution.id,
+        "agent_name": agent_name,
+        "identity": identity,
+        "client": client,
+        "sops": constitution.sops,
+    }
+    return PAConstitution(
+        id=constitution.id,
+        agent_name=agent_name,
+        identity=identity,
+        client=client,
+        sops=constitution.sops,
+        job_briefs=constitution.job_briefs,
+        selectors=constitution.selectors,
+        source=constitution.source,
+        hash=behavior_hash(identity_payload),
+    )
+
+
+def _client_overlay_from_config(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    raw = (
+        config.get("client_overlay")
+        or config.get("pa_client_overlay")
+        or config.get("client_overlay_path")
+        or config.get("pa_client_overlay_path")
+        or config.get("overlay")
+        or config.get("overlay_path")
+    )
+    if raw is None:
+        return None
+    if isinstance(raw, Mapping):
+        return raw
+    if isinstance(raw, str | Path):
+        if isinstance(raw, str) and not raw.strip():
+            return None
+        from agent.pa_client_overlay import load_client_overlay
+
+        return load_client_overlay(raw)
+    raise ValueError("PA client overlay config must be a path or mapping")
 
 
 def _select_job_type(constitution: PAConstitution, metadata: Mapping[str, Any]) -> str | None:

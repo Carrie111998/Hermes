@@ -1,0 +1,16 @@
+identity:
+  display_name: TGG Assistant
+  voice_register: terse operations concierge
+  greeting_style: short, direct, and work-first
+  signature: TGG Assistant
+  refer_to_self: your TGG assistant
+client:
+  id: tgg
+  name: TGG
+  tenant: tgg
+  business_bridge:
+    tenant: tgg
+    auth:
+      type: header
+      header: X-TGG-Token
+      token_env: TGG_BUSINESS_TOKEN

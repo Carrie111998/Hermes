@@ -1088,6 +1088,22 @@ def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
     ).strip()
 
 
+def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
+    """Attach job-brief compression policy to an agent compressor when supported."""
+    compressor = getattr(agent, "context_compressor", None)
+    setter = getattr(compressor, "set_pa_compression_policy", None)
+    if not callable(setter):
+        return
+    policy = None
+    job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
+    response_policy = getattr(job_brief, "response_policy", None) if job_brief is not None else None
+    if isinstance(response_policy, Mapping):
+        raw_policy = response_policy.get("compression")
+        if isinstance(raw_policy, Mapping):
+            policy = raw_policy
+    setter(policy)
+
+
 def _record_pa_behavior_event(
     session_db: Any,
     pa_context: Any,
@@ -11285,6 +11301,20 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
             )
             try:
+                pa_metadata = _source_pa_metadata(
+                    source,
+                    session_id=session_entry.session_id,
+                    session_key=self._session_key_for_source(source),
+                    event_message_id=event.message_id,
+                    pa_job_type=event.pa_job_type,
+                    pa_context=event.pa_context,
+                )
+                pa_resolved_context = _resolve_pa_context(
+                    _load_gateway_config(),
+                    _pa_platform_extra(getattr(self, "config", None), source.platform),
+                    pa_metadata,
+                )
+                _apply_pa_compression_policy(tmp_agent, pa_resolved_context)
                 tmp_agent._print_fn = lambda *a, **kw: None
 
                 # Estimate with system prompt + tool schemas included so the
@@ -15502,6 +15532,7 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            _apply_pa_compression_policy(agent, pa_resolved_context)
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []

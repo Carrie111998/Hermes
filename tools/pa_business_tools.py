@@ -7,6 +7,7 @@ results to the caller.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import urllib.error
 import urllib.parse
@@ -28,12 +29,32 @@ class PABusinessOperation:
     url: str | None = None
     command: tuple[str, ...] | None = None
     headers: Mapping[str, str] | None = None
+    tenant: str | None = None
+    auth: Mapping[str, Any] | None = None
     timeout: float = DEFAULT_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
 class PABusinessBridgeConfig:
     operations: Mapping[str, PABusinessOperation]
+    tenant: str | None = None
+    auth: Mapping[str, Any] | None = None
+
+
+class TenantScopeMismatch(ValueError):
+    """Raised when a PA business operation crosses the resolved client tenant."""
+
+    code = "TENANT_SCOPE_MISMATCH"
+
+    def __init__(self, *, current_tenant: str | None, target_tenant: str | None, operation: str):
+        self.current_tenant = current_tenant
+        self.target_tenant = target_tenant
+        self.operation = operation
+        super().__init__(
+            "TENANT_SCOPE_MISMATCH: "
+            f"operation {operation!r} targets tenant {target_tenant!r} "
+            f"from resolved tenant {current_tenant!r}"
+        )
 
 
 def _bridge_section(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
@@ -57,6 +78,8 @@ def _bridge_section(config: Mapping[str, Any] | None) -> Mapping[str, Any]:
 
 def load_business_bridge_config(
     config: Mapping[str, Any] | None,
+    *,
+    pa_context: Any | None = None,
 ) -> PABusinessBridgeConfig:
     """Parse bridge config from a Hermes-style config mapping.
 
@@ -76,7 +99,19 @@ def load_business_bridge_config(
     Unknown or absent configuration produces an empty, inactive bridge.
     """
     section = _bridge_section(config)
+    client_bridge = _client_business_bridge(pa_context)
+    tenant = _client_tenant(pa_context)
+    auth = _client_auth(pa_context)
+    if isinstance(client_bridge.get("auth"), Mapping):
+        auth = client_bridge["auth"]
+    if client_bridge.get("tenant"):
+        tenant = str(client_bridge.get("tenant"))
     raw_operations = section.get("operations", {})
+    client_operations = client_bridge.get("operations", {})
+    if client_operations:
+        if not isinstance(client_operations, Mapping):
+            raise ValueError("constitution.client.business_bridge.operations must be a mapping")
+        raw_operations = {**dict(raw_operations), **dict(client_operations)}
     if not isinstance(raw_operations, Mapping):
         raise ValueError("pa_business.operations must be a mapping")
 
@@ -102,12 +137,17 @@ def load_business_bridge_config(
             headers = raw.get("headers") or {}
             if not isinstance(headers, Mapping):
                 raise ValueError(f"operation {op_name!r} headers must be a mapping")
+            op_auth = raw.get("auth")
+            if op_auth is not None and not isinstance(op_auth, Mapping):
+                raise ValueError(f"operation {op_name!r} auth must be a mapping")
             operations[op_name] = PABusinessOperation(
                 name=op_name,
                 kind=kind,
                 method=method,
                 url=url,
                 headers={str(k): str(v) for k, v in headers.items()},
+                tenant=str(raw.get("tenant")) if raw.get("tenant") is not None else None,
+                auth=dict(op_auth) if isinstance(op_auth, Mapping) else None,
                 timeout=timeout,
             )
             continue
@@ -127,18 +167,86 @@ def load_business_bridge_config(
             name=op_name,
             kind=kind,
             command=command_tuple,
+            tenant=str(raw.get("tenant")) if raw.get("tenant") is not None else None,
             timeout=timeout,
         )
 
-    return PABusinessBridgeConfig(operations=operations)
+    return PABusinessBridgeConfig(
+        operations=operations,
+        tenant=tenant,
+        auth=dict(auth) if isinstance(auth, Mapping) else None,
+    )
+
+
+def _client_business_bridge(pa_context: Any | None) -> Mapping[str, Any]:
+    constitution = getattr(pa_context, "constitution", None)
+    client = getattr(constitution, "client", None)
+    if not isinstance(client, Mapping):
+        return {}
+    for key in ("business_bridge", "business", "pa_business_bridge"):
+        value = client.get(key)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _client_tenant(pa_context: Any | None) -> str | None:
+    constitution = getattr(pa_context, "constitution", None)
+    client = getattr(constitution, "client", None)
+    if not isinstance(client, Mapping):
+        return None
+    for key in ("tenant", "tenant_id", "id", "slug"):
+        value = client.get(key)
+        if value:
+            return str(value)
+    name = client.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip().lower().replace(" ", "-")
+    return None
+
+
+def _client_auth(pa_context: Any | None) -> Mapping[str, Any]:
+    constitution = getattr(pa_context, "constitution", None)
+    client = getattr(constitution, "client", None)
+    if not isinstance(client, Mapping):
+        return {}
+    auth = client.get("auth")
+    return auth if isinstance(auth, Mapping) else {}
+
+
+def _runtime_pa_context(config: Mapping[str, Any] | None) -> Any | None:
+    if not isinstance(config, Mapping):
+        return None
+    pa_config = config.get("pa")
+    if not isinstance(pa_config, Mapping) or not pa_config.get("enabled"):
+        return None
+    try:
+        from agent.pa_constitution import resolve_context
+        from gateway.session_context import get_session_env
+
+        metadata = {
+            "source": {
+                "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+                "chat_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+                "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME", ""),
+                "thread_id": get_session_env("HERMES_SESSION_THREAD_ID", ""),
+                "user_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+                "user_name": get_session_env("HERMES_SESSION_USER_NAME", ""),
+            },
+            "session_key": get_session_env("HERMES_SESSION_KEY", ""),
+        }
+        return resolve_context(pa_config, metadata)
+    except Exception:
+        return None
 
 
 def _load_runtime_bridge_config() -> PABusinessBridgeConfig:
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import read_raw_config
     except Exception:
         return PABusinessBridgeConfig(operations={})
-    return load_business_bridge_config(load_config())
+    config = read_raw_config()
+    return load_business_bridge_config(config, pa_context=_runtime_pa_context(config))
 
 
 def _bridge_available() -> bool:
@@ -168,11 +276,13 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
 def _execute_http_operation(
     op: PABusinessOperation,
     payload: Mapping[str, Any] | None,
+    bridge_config: PABusinessBridgeConfig,
 ) -> dict[str, Any]:
     request_payload = _json_payload(payload)
     url = op.url or ""
     data: bytes | None = None
     headers = {"Accept": "application/json", **dict(op.headers or {})}
+    headers.update(_auth_headers(op.auth or bridge_config.auth or {}))
 
     if op.method == "GET":
         if request_payload:
@@ -227,23 +337,49 @@ def execute_business_operation(
     config: Mapping[str, Any] | PABusinessBridgeConfig | None,
     operation: str,
     payload: Mapping[str, Any] | None = None,
+    *,
+    pa_context: Any | None = None,
 ) -> dict[str, Any]:
     """Execute a configured business operation and return its JSON-ish result."""
     bridge_config = (
         config
         if isinstance(config, PABusinessBridgeConfig)
-        else load_business_bridge_config(config)
+        else load_business_bridge_config(config, pa_context=pa_context)
     )
     op = bridge_config.operations.get(operation)
     if op is None:
         known = ", ".join(sorted(bridge_config.operations)) or "none configured"
         raise ValueError(f"unknown PA business operation {operation!r}; known: {known}")
+    if op.tenant and bridge_config.tenant and op.tenant != bridge_config.tenant:
+        raise TenantScopeMismatch(
+            current_tenant=bridge_config.tenant,
+            target_tenant=op.tenant,
+            operation=operation,
+        )
 
     if op.kind == "http":
-        return _execute_http_operation(op, payload)
+        return _execute_http_operation(op, payload, bridge_config)
     if op.kind == "command":
         return _execute_command_operation(op, payload)
     raise ValueError(f"unsupported PA business operation type {op.kind!r}")
+
+
+def _auth_headers(auth: Mapping[str, Any]) -> dict[str, str]:
+    if not isinstance(auth, Mapping) or not auth:
+        return {}
+    token = auth.get("token")
+    token_env = auth.get("token_env")
+    if not token and token_env:
+        token = os.getenv(str(token_env), "")
+    if not token:
+        return {}
+    auth_type = str(auth.get("type") or auth.get("kind") or "header").strip().lower()
+    if auth_type in {"oauth", "bearer"}:
+        return {"Authorization": f"Bearer {token}"}
+    header = str(auth.get("header") or "Authorization")
+    scheme = auth.get("scheme")
+    value = f"{scheme} {token}" if scheme else str(token)
+    return {header: value}
 
 
 def _handle_business_read(args: Mapping[str, Any], **_kwargs: Any) -> str:

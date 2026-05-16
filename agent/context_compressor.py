@@ -21,7 +21,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from agent.auxiliary_client import call_llm, _is_connection_error
 from agent.context_engine import ContextEngine
@@ -74,6 +74,27 @@ _IMAGE_TOKEN_ESTIMATE = 1600
 # for tail-cut decisions.
 _IMAGE_CHAR_EQUIVALENT = _IMAGE_TOKEN_ESTIMATE * _CHARS_PER_TOKEN
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+_PA_POLICY_SUMMARY_PREFIX = "[PA CONTEXT COMPACTION]"
+_PA_CASE_STATE_MARKERS = (
+    "block",
+    "unit",
+    "case",
+    "status",
+    "completed",
+    "completion",
+    "worker",
+    "photo",
+    "photos",
+    "attached",
+    "observation",
+    "observed",
+    "update",
+    "updated",
+    "mutation",
+    "handoff",
+    "blocked",
+    "blocker",
+)
 
 
 def _content_length_for_budget(raw_content: Any) -> int:
@@ -484,11 +505,100 @@ class ContextCompressor(ContextEngine):
         # succeeded.  Silent recovery would hide the broken config.
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
+        self.pa_compression_policy: Optional[Mapping[str, Any]] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
+
+    def set_pa_compression_policy(self, policy: Mapping[str, Any] | None) -> None:
+        """Attach an optional PA job-brief compression policy."""
+        self.pa_compression_policy = dict(policy) if isinstance(policy, Mapping) else None
+
+    def _pa_compression_window(self, policy: Mapping[str, Any], default: int) -> int:
+        raw = policy.get("window_size", default)
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def _pa_policy_summary_message(self, strategy: str, detail: str) -> Dict[str, Any]:
+        return {
+            "role": "assistant",
+            "content": f"{_PA_POLICY_SUMMARY_PREFIX} {strategy}: {detail}",
+        }
+
+    def _pa_message_text(self, msg: Mapping[str, Any]) -> str:
+        text = _content_text_for_contains(msg.get("content"))
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls:
+            text += "\n" + json.dumps(tool_calls, sort_keys=True, default=str)
+        return text
+
+    def _pa_is_case_state_message(self, msg: Mapping[str, Any], preserve_fields: tuple[str, ...]) -> bool:
+        text = self._pa_message_text(msg).lower()
+        if not text.strip():
+            return False
+        if any(field.lower() in text for field in preserve_fields):
+            return True
+        return any(marker in text for marker in _PA_CASE_STATE_MARKERS)
+
+    def _compress_with_pa_policy(self, messages: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+        policy = self.pa_compression_policy
+        if not isinstance(policy, Mapping):
+            return None
+        strategy = str(policy.get("strategy") or "").strip().lower()
+        if not strategy:
+            return None
+        if strategy == "full-recall":
+            return [m.copy() for m in messages]
+
+        head_end = 1 if messages and messages[0].get("role") == "system" else 0
+        head = [m.copy() for m in messages[:head_end]]
+
+        if strategy == "preserve-recent":
+            window = self._pa_compression_window(policy, self.protect_last_n)
+            if len(messages) <= head_end + window:
+                return [m.copy() for m in messages]
+            tail = [m.copy() for m in messages[-window:]]
+            omitted = len(messages) - head_end - len(tail)
+            return [
+                *head,
+                self._pa_policy_summary_message(
+                    strategy,
+                    f"kept the latest {len(tail)} messages intact; omitted {omitted} older messages.",
+                ),
+                *tail,
+            ]
+
+        if strategy == "preserve-case-state":
+            window = self._pa_compression_window(policy, self.protect_last_n)
+            preserve_fields = tuple(
+                str(item)
+                for item in policy.get("preserve_fields", ())
+                if isinstance(item, str) and item
+            )
+            tail_start = max(head_end, len(messages) - window)
+            preserved: list[Dict[str, Any]] = []
+            dropped = 0
+            for msg in messages[head_end:tail_start]:
+                if self._pa_is_case_state_message(msg, preserve_fields):
+                    preserved.append(msg.copy())
+                else:
+                    dropped += 1
+            tail = [m.copy() for m in messages[tail_start:]]
+            return [
+                *head,
+                self._pa_policy_summary_message(
+                    strategy,
+                    f"kept {len(preserved)} case-state messages and latest {len(tail)} messages; dropped {dropped} chatter messages.",
+                ),
+                *preserved,
+                *tail,
+            ]
+
+        return None
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.
@@ -1398,6 +1508,10 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         self._last_aux_model_failure_error = None
         self._last_aux_model_failure_model = None
         n_messages = len(messages)
+        pa_policy_result = self._compress_with_pa_policy(messages)
+        if pa_policy_result is not None:
+            self.compression_count += 1
+            return self._sanitize_tool_pairs(pa_policy_result)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
         if n_messages <= _min_for_compress:
