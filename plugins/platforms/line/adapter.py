@@ -428,6 +428,14 @@ def _allowed_for_source(
 # LINE Reply / Push HTTP client
 # ---------------------------------------------------------------------------
 
+def _extract_line_status(error_message: str) -> int:
+    """Extract HTTP status code from RuntimeError messages like 'LINE push 400: ...'."""
+    parts = error_message.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1])
+    return 0
+
+
 class _LineClient:
     """Thin async wrapper around the LINE Messaging API.
 
@@ -444,31 +452,79 @@ class _LineClient:
             "Content-Type": "application/json",
         }
 
+    async def _retry_api_call(self, call_fn, *, max_retries: int = 3, base_delay: float = 1.0):
+        """Execute an API call with exponential backoff on 429/5xx and network errors.
+
+        Retries are logged at WARNING so operators can see when LINE is
+        throttling or the network is flaky. Non-retryable statuses (4xx
+        except 429) are raised immediately.
+        """
+        import aiohttp
+        RETRYABLE = frozenset({429, 500, 502, 503, 504})
+        RETRYABLE_EXC = (RuntimeError, aiohttp.ClientError, OSError)
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await call_fn()
+            except RETRYABLE_EXC as exc:
+                last_exc = exc
+                status = _extract_line_status(str(exc))
+                # Retry on retryable HTTP statuses or on network errors (status == 0)
+                if (status in RETRYABLE or status == 0) and attempt < max_retries:
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        "LINE API %s, retrying in %.1fs (attempt %d/%d)",
+                        status or type(exc).__name__, delay, attempt + 1, max_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+        raise last_exc  # type: ignore[misc]
+
     async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
-        timeout = aiohttp.ClientTimeout(total=self._timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                LINE_REPLY_URL,
-                headers=self._headers,
-                json={"replyToken": reply_token, "messages": messages},
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+
+        async def _do():
+            timeout = aiohttp.ClientTimeout(total=self._timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    LINE_REPLY_URL,
+                    headers=self._headers,
+                    json={"replyToken": reply_token, "messages": messages},
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.warning(
+                            "LINE reply %d for messages: %s",
+                            resp.status,
+                            json.dumps(messages, ensure_ascii=False)[:500],
+                        )
+                        raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+
+        await self._retry_api_call(_do)
 
     async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
         import aiohttp
-        timeout = aiohttp.ClientTimeout(total=self._timeout)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                LINE_PUSH_URL,
-                headers=self._headers,
-                json={"to": chat_id, "messages": messages},
-            ) as resp:
-                if resp.status >= 400:
-                    body = await resp.text()
-                    raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+
+        async def _do():
+            timeout = aiohttp.ClientTimeout(total=self._timeout)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    LINE_PUSH_URL,
+                    headers=self._headers,
+                    json={"to": chat_id, "messages": messages},
+                ) as resp:
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.warning(
+                            "LINE push %d to %s for messages: %s",
+                            resp.status,
+                            chat_id,
+                            json.dumps(messages, ensure_ascii=False)[:500],
+                        )
+                        raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+
+        await self._retry_api_call(_do)
 
     async def loading(self, chat_id: str, seconds: int = 60) -> None:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
@@ -530,11 +586,13 @@ class _LineClient:
             return None
         timeout = aiohttp.ClientTimeout(total=3.0)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=self._headers) as resp:
-                    if resp.status >= 400:
-                        return None
-                    return await resp.json(content_type=None)
+            async def _do():
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, headers=self._headers) as resp:
+                        if resp.status >= 400:
+                            raise RuntimeError(f"LINE member_profile {resp.status}")
+                        return await resp.json(content_type=None)
+            return await self._retry_api_call(_do, max_retries=2, base_delay=0.5)
         except Exception:
             return None
 
@@ -762,6 +820,33 @@ class LineAdapter(BasePlatformAdapter):
         self._DEAD_LETTER_QUEUE_MAX_SIZE = 1000
         self._DEAD_LETTER_QUEUE_PRUNE_AT = 100
 
+        # Group chat cooldown — minimum seconds between responses to the same
+        # group/room. 0 or negative disables the cooldown entirely.
+        try:
+            self._group_cooldown = float(
+                os.getenv("LINE_GROUP_COOLDOWN") or extra.get("group_cooldown", 300)
+            )
+        except (TypeError, ValueError):
+            self._group_cooldown = 300.0
+
+        # Group chat random delay — "min,max" in seconds. When set, the bot
+        # waits a random duration within this range before processing a group
+        # message. e.g. "60,1200" = 1-20 min. Empty or invalid disables.
+        self._group_random_min = 0.0
+        self._group_random_max = 0.0
+        raw_delay = os.getenv("LINE_GROUP_RANDOM_DELAY") or extra.get("group_random_delay", "")
+        if raw_delay and isinstance(raw_delay, str):
+            parts = raw_delay.split(",")
+            if len(parts) == 2:
+                try:
+                    self._group_random_min = float(parts[0].strip())
+                    self._group_random_max = float(parts[1].strip())
+                except ValueError:
+                    pass
+
+        # Per-group last response timestamp: chat_id → unix epoch
+        self._group_last_response: Dict[str, float] = {}
+
         # Periodic cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
 
@@ -881,6 +966,7 @@ class LineAdapter(BasePlatformAdapter):
         # Clear in-memory caches
         self._member_name_cache.clear()
         self._retry_counts.clear()
+        self._group_last_response.clear()
         while not self._dead_letter_queue.empty():
             try:
                 self._dead_letter_queue.get_nowait()
@@ -1053,13 +1139,50 @@ class LineAdapter(BasePlatformAdapter):
 
         event_obj = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT if msg_type == "text" else MessageType.IMAGE,
+            message_type=MessageType.TEXT if msg_type == "text" else MessageType.PHOTO,
             source=source_obj,
             raw_message=event,
             message_id=message_id,
             media_urls=media_urls,
             media_types=media_types,
         )
+
+        # Group/room cooldown + random delay for human-like pacing.
+        if chat_type in ("group", "room"):
+            now = time.time()
+
+            # Cooldown: skip if last response was too recent.
+            if self._group_cooldown > 0:
+                last = self._group_last_response.get(chat_id, 0)
+                elapsed = now - last
+                if elapsed < self._group_cooldown:
+                    logger.info(
+                        "LINE: group %s cooldown (%.0fs/%.0fs), skipping message",
+                        chat_id, elapsed, self._group_cooldown,
+                    )
+                    return
+
+            # Random delay: defer processing to a background task so the
+            # webhook can return 200 OK immediately.
+            if self._group_random_max > 0 and self._group_random_min > 0:
+                import random
+                delay = random.uniform(self._group_random_min, self._group_random_max)
+
+                async def _delayed_handle():
+                    await asyncio.sleep(delay)
+                    try:
+                        await self.handle_message(event_obj)
+                    except Exception:
+                        logger.exception(
+                            "LINE: delayed group message failed for %s", chat_id,
+                        )
+
+                asyncio.create_task(_delayed_handle())
+                logger.info(
+                    "LINE: group %s response delayed by %.0fs (range %.0f-%.0f)",
+                    chat_id, delay, self._group_random_min, self._group_random_max,
+                )
+                return
 
         await self.handle_message(event_obj)
 
@@ -1146,6 +1269,11 @@ class LineAdapter(BasePlatformAdapter):
     # Outbound send (text)
     # ------------------------------------------------------------------
 
+    def _record_group_response(self, chat_id: str) -> None:
+        """Record a response timestamp for group cooldown tracking."""
+        if chat_id and chat_id[:1] in ("C", "R"):
+            self._group_last_response[chat_id] = time.time()
+
     async def send(
         self,
         chat_id: str,
@@ -1160,16 +1288,23 @@ class LineAdapter(BasePlatformAdapter):
         # postback cache and route directly to LINE so they reach the user
         # as visible bubbles. Source: PR #18153.
         if _is_system_bypass(content):
-            return await self._send_text_chunks(chat_id, content, force_push=False)
+            result = await self._send_text_chunks(chat_id, content, force_push=False)
+            if result.success:
+                self._record_group_response(chat_id)
+            return result
 
         # If the chat has a PENDING postback button outstanding, route the
         # response into the cache for the user to fetch via tap.
         pending_rid = self._pending_buttons.get(chat_id)
         if pending_rid:
             self._cache.set_ready(pending_rid, content)
+            self._record_group_response(chat_id)
             return SendResult(success=True, message_id=pending_rid)
 
-        return await self._send_text_chunks(chat_id, content, force_push=False)
+        result = await self._send_text_chunks(chat_id, content, force_push=False)
+        if result.success:
+            self._record_group_response(chat_id)
+        return result
 
     async def _send_text_chunks(
         self,
@@ -1255,6 +1390,7 @@ class LineAdapter(BasePlatformAdapter):
                 self._cleanup_member_name_cache()
                 self._cleanup_retry_counts()
                 self._prune_dead_letter_queue()
+                self._cleanup_group_last_response()
                 self._cache.prune()
             except Exception:
                 logger.debug(
@@ -1334,6 +1470,17 @@ class LineAdapter(BasePlatformAdapter):
                 "LINE: dead-letter queue size=%d (pruned to %d)",
                 q.qsize(), prune_at,
             )
+
+    def _cleanup_group_last_response(self) -> None:
+        """Remove stale group response timestamps (older than cooldown × 10)."""
+        if not self._group_last_response:
+            return
+        cutoff = time.time() - max(self._group_cooldown * 10, 3600)
+        stale = [cid for cid, ts in self._group_last_response.items() if ts < cutoff]
+        for cid in stale:
+            self._group_last_response.pop(cid, None)
+        if stale:
+            logger.debug("LINE: cleaned up %d stale group response timestamp(s)", len(stale))
 
     # ------------------------------------------------------------------
     # Slow-LLM postback button — driven by _keep_typing
@@ -1626,6 +1773,7 @@ class LineAdapter(BasePlatformAdapter):
                 logger.warning("LINE: push for follow-up batch failed: %s", exc)
                 return SendResult(success=False, error=str(exc))
 
+        self._record_group_response(chat_id)
         return SendResult(success=True, message_id=None)
 
 
@@ -1811,13 +1959,12 @@ def register(ctx) -> None:
         pii_safe=False,
         allow_update_command=True,
         platform_hint=(
-            "You are chatting via LINE Messaging API. LINE does NOT render "
-            "Markdown — text bubbles show ** and # literally. Bare URLs are "
-            "auto-linked, but \\[label\\](url) syntax is not. Each text bubble "
-            "is capped at 5000 characters and at most 5 bubbles are sent per "
-            "reply, so keep responses concise. Image/audio/video sending "
-            "requires LINE_PUBLIC_URL configured to a publicly reachable HTTPS "
-            "host. Slow responses surface a 'Get answer' button the user taps "
-            "to fetch the reply via a fresh free token."
+            "You are chatting via LINE Messaging API. **CRITICAL: Keep every response "
+            "under 200 characters.** Short, direct answers only — no long explanations. "
+            "LINE does NOT render Markdown — text bubbles show ** and # literally. "
+            "Bare URLs are auto-linked, but \\[label\\](url) syntax is not. "
+            "Image/audio/video sending requires LINE_PUBLIC_URL configured to a "
+            "publicly reachable HTTPS host. Slow responses surface a 'Get answer' "
+            "button the user taps to fetch the reply via a fresh free token."
         ),
     )
