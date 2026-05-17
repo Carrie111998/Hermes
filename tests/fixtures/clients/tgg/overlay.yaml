@@ -49,3 +49,13 @@ client:
         headers:
           X-PS-Tenant: tgg
         timeout: 10
+      # Live operator-tuned behavior config. The gateway reads this on every
+      # decision turn and injects the rendered behavior block into the prompt.
+      agent_config_read:
+        type: http
+        tenant: tgg
+        method: GET
+        url: http://127.0.0.1:5191/api/operator/agent-config
+        headers:
+          X-PS-Tenant: tgg
+        timeout: 10

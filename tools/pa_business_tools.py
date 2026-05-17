@@ -410,6 +410,106 @@ def _auth_headers(auth: Mapping[str, Any]) -> dict[str, str]:
     return {header: value}
 
 
+# ── Live agent behavior config ─────────────────────────────────────────────
+#
+# The PS spine exposes an operator-tuned agent_config the deployed agent reads
+# on every decision turn. The bridge reaches it through a configured GET
+# operation (default name ``agent_config_read``); the gateway injects the
+# rendered behavior block into the decision-turn prompt. Every accessor below
+# fails soft — an inactive bridge, an unconfigured operation (a non-TGG
+# client), or a failed call yields an empty result so the agent simply runs on
+# its constitution defaults.
+
+AGENT_CONFIG_OPERATION = "agent_config_read"
+
+
+def _resolve_bridge(
+    config: Mapping[str, Any] | PABusinessBridgeConfig | None,
+) -> PABusinessBridgeConfig | None:
+    """Resolve a bridge config from an explicit arg, or the runtime config."""
+    try:
+        if isinstance(config, PABusinessBridgeConfig):
+            return config
+        if config is not None:
+            return load_business_bridge_config(config)
+        return _load_runtime_bridge_config()
+    except Exception:
+        return None
+
+
+def fetch_agent_config_view(
+    config: Mapping[str, Any] | PABusinessBridgeConfig | None = None,
+    *,
+    operation: str = AGENT_CONFIG_OPERATION,
+) -> dict[str, Any]:
+    """Fetch the live agent-config view ``{config, directives, keys}``.
+
+    Returns ``{}`` when the bridge is inactive, the operation is not configured
+    (e.g. a non-TGG client), or the call fails.
+    """
+    bridge = _resolve_bridge(config)
+    if bridge is None or operation not in bridge.operations:
+        return {}
+    try:
+        result = execute_business_operation(bridge, operation=operation)
+    except Exception:
+        return {}
+    data = result.get("data")
+    if isinstance(data, Mapping):
+        return dict(data)
+    # Tolerate a flat response shape that omits the {ok, data} envelope.
+    if isinstance(result.get("config"), Mapping):
+        return {k: v for k, v in result.items() if k != "status_code"}
+    return {}
+
+
+def fetch_agent_config_map(
+    config: Mapping[str, Any] | PABusinessBridgeConfig | None = None,
+    *,
+    operation: str = AGENT_CONFIG_OPERATION,
+) -> dict[str, Any]:
+    """The resolved agent-config key→value map. Empty when unavailable."""
+    view = fetch_agent_config_view(config, operation=operation)
+    cfg = view.get("config")
+    return dict(cfg) if isinstance(cfg, Mapping) else {}
+
+
+def read_agent_config(
+    key: str,
+    config: Mapping[str, Any] | PABusinessBridgeConfig | None = None,
+    *,
+    operation: str = AGENT_CONFIG_OPERATION,
+) -> Any:
+    """Read one live agent-config value from the PS spine.
+
+    Returns ``None`` when the key is absent or the config cannot be reached.
+    """
+    return fetch_agent_config_map(config, operation=operation).get(key)
+
+
+def render_agent_config_prompt(
+    config: Mapping[str, Any] | PABusinessBridgeConfig | None = None,
+    *,
+    operation: str = AGENT_CONFIG_OPERATION,
+) -> str:
+    """Render the live behavior-config block for decision-turn prompt injection.
+
+    Empty string when no config is available — the agent then runs on its
+    constitution defaults with no extra block.
+    """
+    view = fetch_agent_config_view(config, operation=operation)
+    directives = view.get("directives")
+    if not isinstance(directives, list) or not directives:
+        return ""
+    lines = [
+        "## Live Behavior Configuration",
+        "Operations-tuned settings for this client. They may change between "
+        "messages — apply them to your reply right now:",
+    ]
+    lines.extend(f"- {directive}" for directive in directives)
+    return "\n".join(lines)
+
+
 def _handle_business_read(args: Mapping[str, Any], **_kwargs: Any) -> str:
     return _handle_business_call(args)
 

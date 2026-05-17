@@ -1076,16 +1076,32 @@ def _merge_pa_toolsets(
 
 
 def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
-    """Render PA identity + job brief for API-call-time prompt injection."""
+    """Render PA identity + job brief for API-call-time prompt injection.
+
+    Also pulls the live operator-tuned behavior config from the PS spine and
+    appends it as a behavior block. This runs per decision turn (the caller is
+    inside ``run_sync``), so a config change lands on the agent's very next
+    reply. It fails soft — an inactive bridge or a failed fetch simply omits
+    the block and the agent runs on its constitution defaults.
+    """
     if pa_context is None:
         return ""
     from agent.pa_constitution import render_identity_prompt, render_job_prompt
 
-    return (
-        render_identity_prompt(pa_context.constitution)
-        + "\n\n"
-        + render_job_prompt(pa_context)
-    ).strip()
+    parts = [
+        render_identity_prompt(pa_context.constitution),
+        render_job_prompt(pa_context),
+    ]
+    try:
+        from tools.pa_business_tools import render_agent_config_prompt
+
+        config_block = render_agent_config_prompt()
+        if config_block:
+            parts.append(config_block)
+    except Exception as exc:
+        logger.debug("PA agent-config prompt injection skipped: %s", exc)
+
+    return "\n\n".join(parts).strip()
 
 
 def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
