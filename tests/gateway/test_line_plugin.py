@@ -46,6 +46,8 @@ validate_config = _line.validate_config
 _standalone_send = _line._standalone_send
 _env_enablement = _line._env_enablement
 _MessageDeduplicator = _line._MessageDeduplicator
+_extract_line_status = _line._extract_line_status
+_LineClient = _line._LineClient
 
 
 # ---------------------------------------------------------------------------
@@ -642,3 +644,145 @@ class TestAdapterInit:
         assert asyncio.run(ad.get_chat_info("U123"))["type"] == "dm"
         assert asyncio.run(ad.get_chat_info("C123"))["type"] == "group"
         assert asyncio.run(ad.get_chat_info("R123"))["type"] == "channel"
+
+
+# ---------------------------------------------------------------------------
+# 9. _extract_line_status
+# ---------------------------------------------------------------------------
+
+class TestExtractLineStatus:
+
+    def test_extracts_429(self):
+        assert _extract_line_status("LINE reply 429: rate limited") == 429
+
+    def test_extracts_500(self):
+        assert _extract_line_status("LINE push 500: internal error") == 500
+
+    def test_extracts_503(self):
+        assert _extract_line_status("LINE push 503: temporarily unavailable") == 503
+
+    def test_non_numeric_second_token_returns_0(self):
+        assert _extract_line_status("LINE error: something") == 0
+
+    def test_single_word_returns_0(self):
+        assert _extract_line_status("Error") == 0
+
+    def test_empty_string_returns_0(self):
+        assert _extract_line_status("") == 0
+
+    def test_connection_error_returns_0(self):
+        assert _extract_line_status("Cannot connect to host") == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. _LineClient._retry_api_call
+# ---------------------------------------------------------------------------
+
+class TestRetryApiCall:
+
+    @pytest.mark.asyncio
+    async def test_success_on_first_attempt_no_retry(self):
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _ok():
+            nonlocal call_count
+            call_count += 1
+            return "done"
+
+        result = await client._retry_api_call(_ok)
+        assert result == "done"
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retries_on_429_and_succeeds(self):
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("LINE push 429: rate limit")
+            return "ok"
+
+        result = await client._retry_api_call(_fail_then_ok, max_retries=3)
+        assert result == "ok"
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_503_and_succeeds(self):
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _fail_twice_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                raise RuntimeError("LINE push 503: unavailable")
+            return "ok"
+
+        result = await client._retry_api_call(_fail_twice_then_ok, max_retries=3)
+        assert result == "ok"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_raises_after_max_retries_exhausted(self):
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _always_fail():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("LINE reply 429: rate limit")
+
+        with pytest.raises(RuntimeError, match="LINE reply 429"):
+            await client._retry_api_call(_always_fail, max_retries=2)
+        assert call_count == 3  # initial + 2 retries
+
+    @pytest.mark.asyncio
+    async def test_does_not_retry_on_400(self):
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _bad_request():
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("LINE push 400: bad request body")
+
+        with pytest.raises(RuntimeError, match="LINE push 400"):
+            await client._retry_api_call(_bad_request, max_retries=3)
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retries_on_aiohttp_client_error(self):
+        import aiohttp
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _network_error():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise aiohttp.ClientError("connection reset")
+            return "recovered"
+
+        result = await client._retry_api_call(_network_error, max_retries=3)
+        assert result == "recovered"
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_retries_on_oserror(self):
+        client = _LineClient("test-token")
+        call_count = 0
+
+        async def _os_error():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise OSError("network unreachable")
+            return "recovered"
+
+        result = await client._retry_api_call(_os_error, max_retries=3)
+        assert result == "recovered"
+        assert call_count == 2

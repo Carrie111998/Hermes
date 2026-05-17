@@ -430,9 +430,10 @@ def _allowed_for_source(
 
 def _extract_line_status(error_message: str) -> int:
     """Extract HTTP status code from RuntimeError messages like 'LINE push 400: ...'."""
-    parts = error_message.split()
-    if len(parts) >= 2 and parts[1].isdigit():
-        return int(parts[1])
+    for part in error_message.split():
+        stripped = part.rstrip(":")
+        if stripped.isdigit():
+            return int(stripped)
     return 0
 
 
