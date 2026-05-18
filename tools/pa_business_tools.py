@@ -428,6 +428,7 @@ AGENT_ACTION_OPERATIONS = (
 )
 AGENT_ACTION_TYPES = {
     "observation",
+    "photo-pair-classified",
     "dry-run-reply",
     "executed-reply",
     "config-mutation",

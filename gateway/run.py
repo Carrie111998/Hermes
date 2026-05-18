@@ -1341,6 +1341,67 @@ def _record_pa_agent_action(
         return False
 
 
+def _classify_and_record_photo_pair(
+    runner: Any,
+    pa_context: Any,
+    event: "MessageEvent",
+    history: List[Dict[str, Any]],
+    *,
+    session_key: str,
+    source: str | None,
+    turn_id: str | None,
+) -> dict[str, Any] | None:
+    if not getattr(event, "media_refs", None):
+        return None
+    try:
+        from gateway.photo_pair_classifier import (
+            classify_photo_pair,
+            photo_message_from_event,
+            remember_photo_message,
+        )
+
+        history_by_session = getattr(runner, "_pa_photo_pair_history_by_session", None)
+        if history_by_session is None:
+            history_by_session = {}
+            setattr(runner, "_pa_photo_pair_history_by_session", history_by_session)
+
+        cached_photos = history_by_session.get(session_key, [])
+        classification = classify_photo_pair(
+            event,
+            history,
+            cached_photos=cached_photos,
+            current_text=getattr(event, "text", "") or "",
+        )
+        current_photo = (
+            classification.after
+            if classification is not None
+            else photo_message_from_event(event, current_text=getattr(event, "text", "") or "")
+        )
+        if current_photo is not None:
+            history_by_session[session_key] = remember_photo_message(
+                cached_photos,
+                current_photo,
+            )
+        if classification is None:
+            return None
+
+        payload = classification.payload
+        recorded = _record_pa_agent_action(
+            pa_context,
+            action_type="photo-pair-classified",
+            payload=payload,
+            source=source,
+            status="executed",
+            turn_id=turn_id,
+        )
+        if not recorded:
+            logger.debug("Photo-pair classification produced but was not recorded")
+        return payload
+    except Exception as exc:
+        logger.debug("Photo-pair classification skipped: %s", exc)
+        return None
+
+
 def _resolve_pa_context_for_action_log(
     user_config: Mapping[str, Any] | None,
     platform_extra: Mapping[str, Any] | None,
@@ -8165,6 +8226,15 @@ class GatewayRunner:
             },
             source=_pa_action_source_name,
             status="pending",
+            turn_id=_pa_action_turn_id,
+        )
+        _classify_and_record_photo_pair(
+            self,
+            _pa_action_context,
+            event,
+            history,
+            session_key=session_key,
+            source=_pa_action_source_name,
             turn_id=_pa_action_turn_id,
         )
 

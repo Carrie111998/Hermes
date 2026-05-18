@@ -187,6 +187,31 @@ def test_record_agent_action_executed_reply_type(fake_business_endpoint):
     assert received["payload"] == {"reply": "sent"}
 
 
+def test_record_agent_action_photo_pair_classified_type(fake_business_endpoint):
+    ok = record_agent_action(
+        agent_id="bobby",
+        engagement_id="00000000-0000-0000-0000-000000000006",
+        action_type="photo-pair-classified",
+        payload={
+            "before": {"file_id": "before-file", "getFile_url": "https://files/before.jpg"},
+            "after": {"file_id": "after-file", "getFile_url": "https://files/after.jpg"},
+            "confidence": 0.96,
+            "classified_at": "2026-05-18T12:00:31Z",
+        },
+        source="whatsapp",
+        status="executed",
+        turn_id="turn-photo-pair",
+        config=_agent_action_config(fake_business_endpoint),
+    )
+
+    assert ok is True
+    received = _FakeBusinessHandler.received["payload"]
+    assert received["action_type"] == "photo-pair-classified"
+    assert received["status"] == "executed"
+    assert received["payload"]["before"]["file_id"] == "before-file"
+    assert received["payload"]["after"]["getFile_url"] == "https://files/after.jpg"
+
+
 def test_record_agent_action_fails_soft_when_bridge_unavailable():
     ok = record_agent_action(
         agent_id="iris",
