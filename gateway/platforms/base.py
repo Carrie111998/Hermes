@@ -569,6 +569,47 @@ def _looks_like_image(data: bytes) -> bool:
     return False
 
 
+def format_media_refs_text(media_refs: List[Dict[str, Optional[str]]]) -> str:
+    """Render a list of media_refs as a copyable text block for agent context.
+
+    The agent reads the message text body and needs a stable, copyable
+    reference (file_id or file_url) it can quote into structured downstream
+    payloads (e.g. Bobby's PA observation ``media_url`` field; WB 71eadbc7).
+
+    Per-platform adapters populate media_refs with whatever stable handles
+    that platform exposes.  For Telegram this is:
+      file_id          — CDN-stable id, lives across sessions
+      file_unique_id   — bot-stable de-dup id
+      file_url         — full getFile URL (ephemeral ~1h)
+      file_path        — local cached path (mirrors media_urls entry)
+      mime_type        — content type (e.g. "image/jpeg")
+
+    Output format::
+
+        [media#1 image/jpeg
+          file_id=AgACAg...
+          file_url=https://api.telegram.org/file/bot.../photos/file_3.jpg
+          file_path=/tmp/.../img_abc123.jpg]
+
+    Empty input returns "".
+    """
+    if not media_refs:
+        return ""
+    lines: List[str] = []
+    for i, ref in enumerate(media_refs, start=1):
+        mime = ref.get("mime_type") or ""
+        head = f"[media#{i}"
+        if mime:
+            head += f" {mime}"
+        lines.append(head)
+        for key in ("file_id", "file_url", "file_path"):
+            val = ref.get(key)
+            if val:
+                lines.append(f"  {key}={val}")
+        lines.append("]")
+    return "\n".join(lines)
+
+
 def cache_image_from_bytes(data: bytes, ext: str = ".jpg") -> str:
     """
     Save raw image bytes to the cache and return the absolute file path.
@@ -943,7 +984,19 @@ class MessageEvent:
     # media_urls: local file paths (for vision tool access)
     media_urls: List[str] = field(default_factory=list)
     media_types: List[str] = field(default_factory=list)
-    
+
+    # Per-media structured references (parallel to media_urls).  Each dict carries
+    # a copyable, platform-stable handle for the media item so the agent can
+    # reference it in structured downstream payloads (e.g. Bobby's PA observation
+    # `media_url` field).  Telegram populates:
+    #   file_id          — Telegram's stable file_id (lives in CDN, copyable)
+    #   file_unique_id   — Telegram's de-dup identifier (stable per-bot)
+    #   file_url         — Full Telegram getFile URL (ephemeral ~1h)
+    #   file_path        — Local cached path (mirrors entry in media_urls)
+    #   mime_type        — Content type (e.g. "image/jpeg")
+    # Other adapters may populate a subset (e.g. file_url + file_path only).
+    media_refs: List[Dict[str, Optional[str]]] = field(default_factory=list)
+
     # Reply context
     reply_to_message_id: Optional[str] = None
     reply_to_text: Optional[str] = None  # Text of the replied-to message (for context injection)

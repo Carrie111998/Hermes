@@ -4146,6 +4146,83 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._pending_text_batch_tasks.pop(key, None)
 
     # ------------------------------------------------------------------
+    # Media reference helpers
+    # ------------------------------------------------------------------
+
+    def _build_telegram_file_url(self, file_path: Optional[str]) -> Optional[str]:
+        """Build the full Telegram getFile URL from a PTB File.file_path.
+
+        PTB's File.file_path is the relative path on Telegram's CDN (e.g.
+        "photos/file_3.jpg") when using the cloud API.  The full URL is
+        ``https://api.telegram.org/file/bot<TOKEN>/<file_path>``.
+
+        When a custom local Bot API server is used (config.extra.base_file_url
+        passed at builder time), file_path is already an absolute URL — return
+        it unchanged.
+
+        Returns None when file_path is missing or the bot token is unavailable.
+        """
+        if not file_path:
+            return None
+        # If file_path is already a full URL (local Bot API server case), use it.
+        if file_path.startswith(("http://", "https://", "file://")):
+            return file_path
+        token = getattr(self.config, "token", None)
+        if not token:
+            return None
+        return f"https://api.telegram.org/file/bot{token}/{file_path}"
+
+    def _build_media_ref(
+        self,
+        file_id: Optional[str],
+        file_unique_id: Optional[str],
+        file_obj_file_path: Optional[str],
+        cached_path: Optional[str],
+        mime_type: Optional[str],
+    ) -> Dict[str, Optional[str]]:
+        """Build a structured media-ref dict for MessageEvent.media_refs."""
+        return {
+            "file_id": file_id,
+            "file_unique_id": file_unique_id,
+            "file_url": self._build_telegram_file_url(file_obj_file_path),
+            "file_path": cached_path,
+            "mime_type": mime_type,
+        }
+
+    @staticmethod
+    def _format_media_refs_text(media_refs: List[Dict[str, Optional[str]]]) -> str:
+        """Render media_refs as a copyable text block for the agent's TEXT context.
+
+        Bobby and other agents read the message text body and need a stable,
+        copyable reference (file_id or file_url) they can quote into structured
+        downstream payloads (e.g. a PS observation's ``media_url`` field).
+
+        Output is a compact, parseable block:
+
+            [media#1 image/jpeg
+              file_id=AgACAg...
+              file_url=https://api.telegram.org/file/bot.../photos/file_3.jpg
+              file_path=/tmp/.../img_abc123.jpg]
+
+        Empty media_refs returns "".
+        """
+        if not media_refs:
+            return ""
+        lines: List[str] = []
+        for i, ref in enumerate(media_refs, start=1):
+            mime = ref.get("mime_type") or ""
+            head = f"[media#{i}"
+            if mime:
+                head += f" {mime}"
+            lines.append(head)
+            for key in ("file_id", "file_url", "file_path"):
+                val = ref.get(key)
+                if val:
+                    lines.append(f"  {key}={val}")
+            lines.append("]")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Photo batching
     # ------------------------------------------------------------------
 
@@ -4184,6 +4261,10 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            # Preserve per-photo media_refs across the burst so the agent sees
+            # one ref per attached photo (file_id / URL / cached path).
+            if getattr(event, "media_refs", None):
+                existing.media_refs.extend(event.media_refs)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
@@ -4248,8 +4329,19 @@ class TelegramAdapter(BasePlatformAdapter):
                             break
                 # Save to local cache (for vision tool access)
                 cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+                mime = f"image/{ext.lstrip('.')}"
                 event.media_urls = [cached_path]
-                event.media_types = [f"image/{ext.lstrip('.')}" ]
+                event.media_types = [mime]
+                # Surface a structured, copyable reference (file_id + getFile URL
+                # + cached path) so the agent can quote it into downstream
+                # payloads like PA observation media_url (WB 71eadbc7).
+                event.media_refs = [self._build_media_ref(
+                    file_id=getattr(photo, "file_id", None),
+                    file_unique_id=getattr(photo, "file_unique_id", None),
+                    file_obj_file_path=getattr(file_obj, "file_path", None),
+                    cached_path=cached_path,
+                    mime_type=mime,
+                )]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
@@ -4354,8 +4446,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         return
 
                     event.message_type = MessageType.PHOTO
+                    image_mime = doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")
                     event.media_urls = [cached_path]
-                    event.media_types = [doc_mime if doc_mime.startswith("image/") else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg")]
+                    event.media_types = [image_mime]
+                    # Document-as-image (Telegram screenshot fallback): surface
+                    # the same structured media-ref as the native photo path.
+                    event.media_refs = [self._build_media_ref(
+                        file_id=getattr(doc, "file_id", None),
+                        file_unique_id=getattr(doc, "file_unique_id", None),
+                        file_obj_file_path=getattr(file_obj, "file_path", None),
+                        cached_path=cached_path,
+                        mime_type=image_mime,
+                    )]
                     logger.info("[Telegram] Cached user image-document at %s", cached_path)
 
                     media_group_id = getattr(msg, "media_group_id", None)

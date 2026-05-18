@@ -776,6 +776,17 @@ def _build_media_placeholder(event) -> str:
             parts.append(f"[User sent audio: {url}]")
         else:
             parts.append(f"[User sent a file: {url}]")
+    # Append the structured media_refs block so queued events retain the
+    # copyable file_id / getFile URL the agent needs for downstream payloads.
+    media_refs = getattr(event, "media_refs", None) or []
+    if media_refs:
+        try:
+            from gateway.platforms.base import format_media_refs_text
+            refs_text = format_media_refs_text(media_refs)
+        except Exception:
+            refs_text = ""
+        if refs_text:
+            parts.append(refs_text)
     return "\n".join(parts)
 
 
@@ -7185,6 +7196,25 @@ class GatewayRunner:
         # trigger message, not the backfill block.
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+
+        # Surface structured media references in the agent's TEXT context.
+        # When an inbound message carries a photo/document, the platform
+        # adapter populates ``event.media_refs`` with per-media handles
+        # (e.g. Telegram file_id + getFile URL + local cached path).  The
+        # agent reads these to quote a stable, copyable identifier into
+        # structured downstream payloads (e.g. Bobby's PA observation
+        # ``media_url`` field; WB 71eadbc7).  The vision routing below
+        # still attaches pixels or pre-analyzes; this block is the
+        # text-context companion that makes the photo *referenceable*.
+        _media_refs = getattr(event, "media_refs", None)
+        if _media_refs:
+            try:
+                from gateway.platforms.base import format_media_refs_text
+                _refs_text = format_media_refs_text(_media_refs)
+            except Exception:
+                _refs_text = ""
+            if _refs_text:
+                message_text = f"{message_text}\n\n{_refs_text}" if message_text else _refs_text
 
         if event.media_urls:
             image_paths = []
