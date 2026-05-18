@@ -822,13 +822,31 @@ class LineAdapter(BasePlatformAdapter):
         self._DEAD_LETTER_QUEUE_PRUNE_AT = 100
 
         # Group chat cooldown — minimum seconds between responses to the same
-        # group/room. 0 or negative disables the cooldown entirely.
-        try:
-            self._group_cooldown = float(
-                os.getenv("LINE_GROUP_COOLDOWN") or extra.get("group_cooldown", 300)
-            )
-        except (TypeError, ValueError):
-            self._group_cooldown = 300.0
+        # group/room. Supports both a fixed value (e.g. 300 = 5 min) and a
+        # range "min,max" (e.g. "60,120" = random 1-2 min per response).
+        # 0 or negative disables the cooldown entirely.
+        self._group_cooldown_min = 300.0
+        self._group_cooldown_max = 300.0
+        raw_cooldown = os.getenv("LINE_GROUP_COOLDOWN") or extra.get("group_cooldown", "300")
+        if raw_cooldown and isinstance(raw_cooldown, str) and "," in str(raw_cooldown):
+            parts = str(raw_cooldown).split(",")
+            if len(parts) == 2:
+                try:
+                    lo = float(parts[0].strip())
+                    hi = float(parts[1].strip())
+                    if lo > 0 and hi >= lo:
+                        self._group_cooldown_min = lo
+                        self._group_cooldown_max = hi
+                except ValueError:
+                    pass
+        else:
+            try:
+                val = float(raw_cooldown)
+                if val >= 0:
+                    self._group_cooldown_min = val
+                    self._group_cooldown_max = val
+            except (TypeError, ValueError):
+                pass
 
         # Group chat random delay — "min,max" in seconds. When set, the bot
         # waits a random duration within this range before processing a group
@@ -846,7 +864,7 @@ class LineAdapter(BasePlatformAdapter):
                     pass
 
         # Per-group last response timestamp: chat_id → unix epoch
-        self._group_last_response: Dict[str, float] = {}
+        self._group_last_response: Dict[str, tuple] = {}
 
         # Periodic cleanup task
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -1153,15 +1171,17 @@ class LineAdapter(BasePlatformAdapter):
             now = time.time()
 
             # Cooldown: skip if last response was too recent.
-            if self._group_cooldown > 0:
-                last = self._group_last_response.get(chat_id, 0)
-                elapsed = now - last
-                if elapsed < self._group_cooldown:
-                    logger.info(
-                        "LINE: group %s cooldown (%.0fs/%.0fs), skipping message",
-                        chat_id, elapsed, self._group_cooldown,
-                    )
-                    return
+            if self._group_cooldown_min > 0:
+                last_entry = self._group_last_response.get(chat_id)
+                if last_entry is not None:
+                    last_ts, cooldown_s = last_entry
+                    elapsed = now - last_ts
+                    if elapsed < cooldown_s:
+                        logger.info(
+                            "LINE: group %s cooldown (%.0fs/%.0fs), skipping message",
+                            chat_id, elapsed, cooldown_s,
+                        )
+                        return
 
             # Random delay: defer processing to a background task so the
             # webhook can return 200 OK immediately.
@@ -1271,9 +1291,14 @@ class LineAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _record_group_response(self, chat_id: str) -> None:
-        """Record a response timestamp for group cooldown tracking."""
+        """Record a response timestamp + random cooldown for group tracking."""
         if chat_id and chat_id[:1] in ("C", "R"):
-            self._group_last_response[chat_id] = time.time()
+            import random
+            if self._group_cooldown_min == self._group_cooldown_max:
+                duration = self._group_cooldown_min
+            else:
+                duration = random.uniform(self._group_cooldown_min, self._group_cooldown_max)
+            self._group_last_response[chat_id] = (time.time(), duration)
 
     async def send(
         self,
@@ -1476,8 +1501,11 @@ class LineAdapter(BasePlatformAdapter):
         """Remove stale group response timestamps (older than cooldown × 10)."""
         if not self._group_last_response:
             return
-        cutoff = time.time() - max(self._group_cooldown * 10, 3600)
-        stale = [cid for cid, ts in self._group_last_response.items() if ts < cutoff]
+        cutoff = time.time() - max(self._group_cooldown_max * 10, 3600)
+        stale = [
+            cid for cid, entry in self._group_last_response.items()
+            if entry[0] < cutoff
+        ]
         for cid in stale:
             self._group_last_response.pop(cid, None)
         if stale:
