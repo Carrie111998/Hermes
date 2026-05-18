@@ -45,6 +45,111 @@ _FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>```+|~~~+)", re.MULTILINE)
 # ignore markers in every SKILL.md — the generator handles it defensively.
 _BOX_DRAWING_CHARS = frozenset("┌┐└┘─│═║╔╗╚╝╠╣╦╩╬├┤┬┴┼╭╮╯╰▶◀▲▼")
 
+# Regex matching a contiguous block of markdown table rows (lines starting
+# with ``|``), optionally including ``|---|`` separator rows.  We match one
+# or more consecutive table-like lines.
+_MD_TABLE_RE = re.compile(
+    r"(?:^[ \t]*\|.+\|[ \t]*$\n?){2,}",
+    re.MULTILINE,
+)
+
+
+def _wrap_markdown_tables(text: str) -> str:
+    """Wrap markdown tables in ascii-guard-ignore markers.
+
+    ascii-guard interprets ``|`` at the start of a line as an ASCII box
+    border.  Skill SKILL.md bodies frequently contain markdown tables that
+    trigger false positives.  Wrapping them silences the lint.
+
+    Fenced code blocks are excluded so that pipe-delimited lines inside
+    examples (e.g. literal markdown tables in docs) are left untouched.
+    Already-wrapped regions (``<!-- ascii-guard-ignore -->``) are also
+    skipped to avoid double-wrapping.
+    """
+    # Split the text into segments: fenced code blocks, ascii-guard-ignore
+    # regions, and everything else.  Only apply table wrapping to the
+    # "everything else" segments.
+    #
+    # We use a line-by-line scanner instead of a single regex so that closing
+    # fences of *equal or greater* length than the opener are recognised
+    # (per CommonMark spec), which a backreference regex cannot express.
+
+    _FENCE_OPEN_RE = re.compile(r"^[ \t]*((`{3,})|(~{3,}))")
+    _IGNORE_OPEN = "<!-- ascii-guard-ignore -->"
+    _IGNORE_CLOSE = "<!-- ascii-guard-ignore-end -->"
+
+    def _replacer(m: re.Match) -> str:
+        table = m.group(0)
+        return (
+            "<!-- ascii-guard-ignore -->\n"
+            + table
+            + ("" if table.endswith("\n") else "\n")
+            + "<!-- ascii-guard-ignore-end -->\n"
+        )
+
+    segments: list[tuple[str, bool]] = []  # (text, is_skip)
+    lines = text.split("\n")
+    buf: list[str] = []
+    in_skip = False
+    fence_char: str | None = None
+    fence_len = 0
+    in_ignore = False
+
+    def _flush() -> None:
+        if buf:
+            segments.append(("\n".join(buf), in_skip))
+            buf.clear()
+
+    for line in lines:
+        if in_ignore:
+            buf.append(line)
+            if _IGNORE_CLOSE in line:
+                in_ignore = False
+                _flush()
+                in_skip = False
+            continue
+
+        if not in_skip and _IGNORE_OPEN in line:
+            _flush()
+            in_skip = True
+            in_ignore = True
+            buf.append(line)
+            continue
+
+        if not in_skip:
+            fm = _FENCE_OPEN_RE.match(line)
+            if fm:
+                _flush()
+                in_skip = True
+                fence_char = "`" if fm.group(2) else "~"
+                fence_len = len(fm.group(2) or fm.group(3))
+                buf.append(line)
+                continue
+            buf.append(line)
+        else:
+            # Inside a fenced code block — look for a closing fence
+            buf.append(line)
+            stripped = line.strip()
+            if (
+                fence_char
+                and len(stripped) >= fence_len
+                and all(ch == fence_char for ch in stripped)
+            ):
+                _flush()
+                in_skip = False
+                fence_char = None
+                fence_len = 0
+
+    _flush()
+
+    result_parts: list[str] = []
+    for seg_text, is_skip in segments:
+        if is_skip:
+            result_parts.append(seg_text)
+        else:
+            result_parts.append(_MD_TABLE_RE.sub(_replacer, seg_text))
+    return "\n".join(result_parts)
+
 
 def _wrap_ascii_art_code_blocks(code_segment: str) -> str:
     """Wrap a fenced code segment in ascii-guard-ignore markers if it contains
@@ -439,7 +544,7 @@ def render_skill_page(
         "\n"
         "## Skill metadata\n"
         "\n"
-        f"{info_table}\n"
+        f"<!-- ascii-guard-ignore -->\n{info_table}\n<!-- ascii-guard-ignore-end -->\n"
         "\n"
         "## Reference: full SKILL.md\n"
         "\n"
@@ -447,7 +552,7 @@ def render_skill_page(
         "The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.\n"
         ":::\n"
         "\n"
-        f"{body_clean}\n"
+        f"{_wrap_markdown_tables(body_clean)}\n"
     )
 
 

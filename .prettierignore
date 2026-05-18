@@ -1,0 +1,8 @@
+venv/
+.venv/
+node_modules/
+*.egg-info/
+__pycache__/
+package-lock.json
+uv.lock
+flake.lock

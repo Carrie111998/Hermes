@@ -114,3 +114,157 @@ def test_bundled_catalog_explains_missing_local_skills(gen_module):
     result = gen_module.build_catalog_md_bundled([])
     assert "respects local deletions and user edits" in result
     assert "hermes skills reset <name> --restore" in result
+
+
+# --- _wrap_markdown_tables tests ---
+
+
+def test_wrap_markdown_tables_no_tables_unchanged(gen_module):
+    """Input with no markdown tables must pass through byte-for-byte unchanged.
+
+    Regression for the _flush trailing-newline bug: the function was appending
+    an extra '\\n' to every segment unconditionally, so plain text got an
+    extra newline even when no tables were present.
+    """
+    for text in [
+        "Hello world\n",
+        "No tables here.\n\nJust paragraphs.\n",
+        "",
+        "Single line without newline",
+        "```\ncode block\nno pipe lines\n```\n",
+    ]:
+        assert gen_module._wrap_markdown_tables(text) == text, (
+            f"_wrap_markdown_tables changed non-table input: {text!r}"
+        )
+
+
+def test_wrap_markdown_tables_wraps_plain_table(gen_module):
+    """A markdown table outside a code fence gets wrapped."""
+    text = (
+        "Some text.\n\n"
+        "| Col A | Col B |\n"
+        "|-------|-------|\n"
+        "| 1     | 2     |\n\n"
+        "More text."
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert "<!-- ascii-guard-ignore -->" in result
+    assert "<!-- ascii-guard-ignore-end -->" in result
+    assert "Some text." in result
+    assert "More text." in result
+
+
+def test_wrap_markdown_tables_skips_fenced_code_blocks(gen_module):
+    """Pipe-delimited lines inside a ``` code block must not be wrapped."""
+    text = (
+        "```\n"
+        "| header | row |\n"
+        "|--------|-----|\n"
+        "| a      | b   |\n"
+        "```\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert "ascii-guard-ignore" not in result
+
+
+def test_wrap_markdown_tables_skips_tilde_fenced_code_blocks(gen_module):
+    """Pipe-delimited lines inside a ~~~ code block must not be wrapped."""
+    text = (
+        "~~~\n"
+        "| header | row |\n"
+        "|--------|-----|\n"
+        "| a      | b   |\n"
+        "~~~\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert "ascii-guard-ignore" not in result
+
+
+def test_wrap_markdown_tables_mixed_fence_types(gen_module):
+    """A ~~~ block containing ``` should not cause early termination."""
+    text = (
+        "~~~markdown\n"
+        "```\n"
+        "| header | row |\n"
+        "|--------|-----|\n"
+        "```\n"
+        "~~~\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert "ascii-guard-ignore" not in result
+
+
+def test_wrap_markdown_tables_skips_existing_ignore_regions(gen_module):
+    """Tables already inside ascii-guard-ignore markers are not double-wrapped."""
+    text = (
+        "<!-- ascii-guard-ignore -->\n"
+        "| Col A | Col B |\n"
+        "|-------|-------|\n"
+        "| 1     | 2     |\n"
+        "<!-- ascii-guard-ignore-end -->\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert result.count("<!-- ascii-guard-ignore -->") == 1
+    assert result.count("<!-- ascii-guard-ignore-end -->") == 1
+
+
+def test_wrap_markdown_tables_wraps_table_outside_fence_but_not_inside(gen_module):
+    """Only the table outside a code fence is wrapped; the one inside is untouched."""
+    text = (
+        "| real | table |\n"
+        "|------|-------|\n"
+        "| a    | b     |\n\n"
+        "```\n"
+        "| example | table |\n"
+        "|---------|-------|\n"
+        "| x       | y     |\n"
+        "```\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert result.count("<!-- ascii-guard-ignore -->") == 1
+    assert result.count("<!-- ascii-guard-ignore-end -->") == 1
+    # The real table is wrapped
+    wrap_pos = result.index("<!-- ascii-guard-ignore -->")
+    real_table_pos = result.index("| real | table |")
+    assert wrap_pos < real_table_pos
+
+
+def test_wrap_markdown_tables_longer_closing_fence(gen_module):
+    """CommonMark allows a closing fence longer than the opener; table inside
+    must not be wrapped."""
+    text = (
+        "```\n"
+        "| header | row |\n"
+        "|--------|-----|\n"
+        "| a      | b   |\n"
+        "````\n"
+    )
+    result = gen_module._wrap_markdown_tables(text)
+    assert "ascii-guard-ignore" not in result
+
+
+def test_render_skill_page_wraps_body_tables(gen_module):
+    """render_skill_page must apply _wrap_markdown_tables to the body so that
+    markdown tables in generated docs don't fail ascii-guard lint."""
+    meta = {
+        "slug": "test-skill",
+        "category": "testing",
+        "source_kind": "bundled",
+        "rel_path": "testing/test-skill",
+        "skill_md": "/dev/null",
+    }
+    fm = {
+        "name": "test-skill",
+        "description": "A test skill.",
+    }
+    body = (
+        "Some text.\n\n"
+        "| Col A | Col B |\n"
+        "|-------|-------|\n"
+        "| 1     | 2     |\n"
+    )
+    result = gen_module.render_skill_page(meta, fm, body)
+    # The body table should be wrapped (in addition to the info_table which
+    # render_skill_page wraps explicitly).
+    # Count: 2 ignore regions — one for info_table, one for body table.
+    assert result.count("<!-- ascii-guard-ignore -->") >= 2

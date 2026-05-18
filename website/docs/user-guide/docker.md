@@ -75,12 +75,14 @@ docker run -d \
 
 The entrypoint starts `hermes dashboard` in the background (running as the non-root `hermes` user) before `exec`-ing the main command. Dashboard output is prefixed with `[dashboard]` in `docker logs` so it's easy to separate from gateway logs.
 
+<!-- ascii-guard-ignore -->
 | Environment variable | Description | Default |
 |---------------------|-------------|---------|
 | `HERMES_DASHBOARD` | Set to `1` (or `true` / `yes`) to launch the dashboard alongside the main command | *(unset — dashboard not started)* |
 | `HERMES_DASHBOARD_HOST` | Bind address for the dashboard HTTP server | `0.0.0.0` |
 | `HERMES_DASHBOARD_PORT` | Port for the dashboard HTTP server | `9119` |
 | `HERMES_DASHBOARD_TUI` | Set to `1` to expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket) | *(unset)* |
+<!-- ascii-guard-ignore-end -->
 
 The default `HERMES_DASHBOARD_HOST=0.0.0.0` is required for the host to reach the dashboard through the published port; the entrypoint automatically passes `--insecure` to `hermes dashboard` in that case. Override to `127.0.0.1` if you want to restrict the dashboard to in-container access only (e.g. behind a reverse proxy in a sidecar).
 
@@ -108,6 +110,7 @@ Or if you have already opened a terminal in your running container (via Docker D
 
 The `/opt/data` volume is the single source of truth for all Hermes state. It maps to your host's `~/.hermes/` directory and contains:
 
+<!-- ascii-guard-ignore -->
 | Path | Contents |
 |------|----------|
 | `.env` | API keys and secrets |
@@ -120,6 +123,7 @@ The `/opt/data` volume is the single source of truth for all Hermes state. It ma
 | `hooks/` | Event hooks |
 | `logs/` | Runtime logs |
 | `skins/` | Custom CLI skins |
+<!-- ascii-guard-ignore-end -->
 
 :::warning
 Never run two Hermes **gateway** containers against the same data directory simultaneously — session files and memory stores are not designed for concurrent write access.
@@ -231,11 +235,13 @@ Start with `docker compose up -d` and view logs with `docker compose logs -f`. D
 
 The Hermes container needs moderate resources. Recommended minimums:
 
+<!-- ascii-guard-ignore -->
 | Resource | Minimum | Recommended |
 |----------|---------|-------------|
 | Memory | 1 GB | 2–4 GB |
 | CPU | 1 core | 2 cores |
 | Disk (data volume) | 500 MB | 2+ GB (grows with sessions/skills) |
+<!-- ascii-guard-ignore-end -->
 
 Browser automation (Playwright/Chromium) is the most memory-hungry feature. If you don't need browser tools, 1 GB is sufficient. With browser tools active, allocate at least 2 GB.
 
