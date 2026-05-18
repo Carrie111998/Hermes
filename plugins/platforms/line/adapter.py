@@ -1328,11 +1328,12 @@ class LineAdapter(BasePlatformAdapter):
             self._record_group_response(chat_id)
             return SendResult(success=True, message_id=pending_rid)
 
-        # Hard cap: truncate outbound text to LINE_MAX_RESPONSE_CHARS so
-        # LINE users always see concise responses regardless of how long
-        # the agent's output is.
-        if len(content) > LINE_MAX_RESPONSE_CHARS:
-            content = content[:LINE_MAX_RESPONSE_CHARS]
+        # Hard cap for group/room chats only: truncate to 200 chars so
+        # the chat stays readable. DMs are uncapped — the 1:1 user gets
+        # the full response.
+        if chat_id and chat_id[:1] in ("C", "R"):
+            if len(content) > LINE_MAX_RESPONSE_CHARS:
+                content = content[:LINE_MAX_RESPONSE_CHARS]
 
         result = await self._send_text_chunks(chat_id, content, force_push=False)
         if result.success:
