@@ -1104,9 +1104,11 @@ def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
         render_job_prompt(pa_context),
     ]
     try:
-        from tools.pa_business_tools import render_agent_config_prompt
+        from tools.pa_business_tools import load_business_bridge_config, render_agent_config_prompt
 
-        config_block = render_agent_config_prompt()
+        config_block = render_agent_config_prompt(
+            load_business_bridge_config(None, pa_context=pa_context)
+        )
         if config_block:
             parts.append(config_block)
     except Exception as exc:
@@ -1322,7 +1324,9 @@ def _record_pa_agent_action(
     if not agent_id or not engagement_id:
         return False
     try:
-        from tools.pa_business_tools import record_agent_action
+        from tools.pa_business_tools import load_business_bridge_config, record_agent_action
+
+        bridge_config = load_business_bridge_config(None, pa_context=pa_context)
 
         return record_agent_action(
             agent_id=agent_id,
@@ -1335,6 +1339,7 @@ def _record_pa_agent_action(
             tokens_output=tokens_output,
             status=status,
             turn_id=turn_id,
+            config=bridge_config,
         )
     except Exception as exc:
         logger.debug("Failed to record PA agent action: %s", exc)

@@ -5,6 +5,7 @@ from gateway.run import (
     GatewayRunner,
     _merge_pa_toolsets,
     _pa_max_output_tokens,
+    _record_pa_agent_action,
     _pa_slash_denial,
     _pa_tenant_slug,
     _render_pa_ephemeral_prompt,
@@ -114,3 +115,86 @@ def test_gateway_pa_prompt_and_toolsets_enter_cache_signature():
         management_prompt,
     )
     assert ops_sig != management_sig
+
+
+def test_gateway_pa_prompt_uses_context_business_bridge(monkeypatch):
+    import tools.pa_business_tools as pa_business_tools
+
+    ops = _resolve_pa_context(
+        _config(),
+        {},
+        _source_pa_metadata(_source("tgg-ops"), session_id="s1", session_key="k1"),
+    )
+    assert ops is not None
+    sentinel = object()
+    seen = {}
+
+    def fake_load_business_bridge_config(config=None, *, pa_context=None):
+        assert config is None
+        assert pa_context is ops
+        return sentinel
+
+    def fake_render_agent_config_prompt(config=None, *, operation="agent_config_read"):
+        seen["config"] = config
+        seen["operation"] = operation
+        return "## Live Behavior Configuration\n- behavior.tone = brief"
+
+    monkeypatch.setattr(
+        pa_business_tools,
+        "load_business_bridge_config",
+        fake_load_business_bridge_config,
+    )
+    monkeypatch.setattr(
+        pa_business_tools,
+        "render_agent_config_prompt",
+        fake_render_agent_config_prompt,
+    )
+
+    prompt = _render_pa_ephemeral_prompt(ops)
+
+    assert "Live Behavior Configuration" in prompt
+    assert seen == {"config": sentinel, "operation": "agent_config_read"}
+
+
+def test_gateway_pa_action_logging_uses_context_business_bridge(monkeypatch):
+    import tools.pa_business_tools as pa_business_tools
+
+    ops = _resolve_pa_context(
+        _config(),
+        {},
+        _source_pa_metadata(_source("tgg-ops"), session_id="s1", session_key="k1"),
+    )
+    assert ops is not None
+    sentinel = object()
+    seen = {}
+
+    def fake_load_business_bridge_config(config=None, *, pa_context=None):
+        assert config is None
+        assert pa_context is ops
+        return sentinel
+
+    def fake_record_agent_action(**kwargs):
+        seen.update(kwargs)
+        return True
+
+    monkeypatch.setattr(
+        pa_business_tools,
+        "load_business_bridge_config",
+        fake_load_business_bridge_config,
+    )
+    monkeypatch.setattr(pa_business_tools, "record_agent_action", fake_record_agent_action)
+
+    ok = _record_pa_agent_action(
+        ops,
+        action_type="observation",
+        payload={"message": "hello"},
+        source="whatsapp:tgg-ops",
+        status="pending",
+        turn_id="turn-1",
+    )
+
+    assert ok is True
+    assert seen["config"] is sentinel
+    assert seen["agent_id"] == "bobby"
+    assert seen["engagement_id"] == "c432bb00-3f30-4344-b9b2-b962220cd512"
+    assert seen["action_type"] == "observation"
