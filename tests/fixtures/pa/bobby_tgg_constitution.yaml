@@ -14,6 +14,8 @@ client:
   name: TGG
   tenant: tgg
   owner: Bobby
+  agent_id: bobby
+  engagement_id: c432bb00-3f30-4344-b9b2-b962220cd512
   working_style: direct updates with clear next actions
 sops:
   - Confirm the job type before applying job-specific policy.
@@ -43,6 +45,7 @@ job_briefs:
         - link_source
       default_confidence: observed
     response_policy:
+      never_send_replies: true
       format: structured_summary
       include_next_actions: true
       slash_commands: []
@@ -78,6 +81,7 @@ job_briefs:
         - compare_fact
       default_confidence: derived
     response_policy:
+      never_send_replies: true
       format: management_brief
       include_recommendation: true
       slash_commands:
