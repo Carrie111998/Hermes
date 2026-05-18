@@ -289,10 +289,51 @@ class TestResolveRepoFromPathsInPrompt:
         result = self._resolve(f"write to {outside}/foo.md")
         assert result is None
 
+    def test_path_outside_workspace_returns_none(self, workspace, tmp_path):
+        # An absolute path that is a git repo but lives outside HERMES_WORKSPACE_PATH
+        # must not be returned — it bypasses the workspace safety boundary.
+        outside_repo = tmp_path.parent / "foreign-repo"
+        outside_repo.mkdir(exist_ok=True)
+        (outside_repo / ".git").mkdir(exist_ok=True)
+        result = self._resolve(f"create {outside_repo}/foo.md")
+        assert result is None
+
     def test_nonexistent_file_still_walks_to_git_root(self, workspace):
         # User describing a file to create — parent walk must still find .git.
         ghost = workspace / "docs" / "projects" / "nothy" / "NEW_FILE.md"
         result = self._resolve(f"create {ghost}")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_git_as_file_submodule_is_routed(self, workspace):
+        # In a real git submodule .git is a *file* (gitlink), not a directory.
+        # _find_git_root uses Path.exists() so both forms must be detected.
+        gitlink_sub = workspace / "repos" / "demos" / "gitlink-sub"
+        gitlink_sub.mkdir(parents=True)
+        # Write a gitlink file (mimics what `git submodule` creates).
+        (gitlink_sub / ".git").write_text("gitdir: ../../.git/modules/gitlink-sub\n")
+        result = self._resolve(f"edit {gitlink_sub}/README.md")
+        assert result is not None
+        assert result.slug == "gitlink-sub"
+        assert result.path == str(gitlink_sub)
+
+    def test_quoted_path_double_quotes(self, workspace):
+        result = self._resolve(f'create "{workspace}/docs/foo.md"')
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_quoted_path_single_quotes(self, workspace):
+        result = self._resolve(f"create '{workspace}/docs/foo.md'")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_backtick_path(self, workspace):
+        result = self._resolve(f"create `{workspace}/docs/foo.md`")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_parenthesized_path(self, workspace):
+        result = self._resolve(f"create ({workspace}/docs/foo.md)")
         assert result is not None
         assert result.slug == workspace.name
 

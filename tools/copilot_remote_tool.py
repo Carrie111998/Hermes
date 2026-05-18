@@ -250,17 +250,19 @@ def _resolve_repo_slug_cheap(slug: str) -> Optional[RepoEntry]:
     return None
 
 
-def _find_git_root(start: Path) -> Optional[Path]:
+def _find_git_root(start: Path, workspace_root: Optional[Path] = None) -> Optional[Path]:
     """Walk upward from ``start`` to the nearest dir containing ``.git``.
 
     Works for both top-level git repos (``.git`` is a directory) and
     submodules (``.git`` is a file pointing to a gitdir). Returns ``None``
     if no git boundary is found before reaching the filesystem root or
     leaving the workspace.
+
+    When ``workspace_root`` is provided (resolved), the returned path is
+    constrained to be within that root. This prevents routing to arbitrary
+    git repos on the host filesystem that were only mentioned by accident in
+    the prompt (e.g. ``/etc/myrepo``).
     """
-    import os
-    ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
-    workspace_root = Path(ws).resolve(strict=False) if ws else None
     try:
         current = start.resolve(strict=False)
     except OSError:
@@ -269,6 +271,13 @@ def _find_git_root(start: Path) -> Optional[Path]:
     while current and current not in seen:
         seen.add(current)
         if (current / ".git").exists():
+            # Safety guard: reject roots outside the workspace when a
+            # workspace boundary is known.
+            if workspace_root is not None:
+                try:
+                    current.relative_to(workspace_root)
+                except ValueError:
+                    return None
             return current
         if workspace_root is not None and current == workspace_root.parent:
             return None
@@ -279,14 +288,14 @@ def _find_git_root(start: Path) -> Optional[Path]:
     return None
 
 
-# Match plausible filesystem path tokens inside a prompt:
-#   - ``~/...``           (home-relative)
-#   - ``./...``           (cwd/workspace-relative)
-#   - ``/abs/path/...``   (absolute)
-#   - bare ``repos/...``  (workspace-rooted convention)
+# Match plausible filesystem path tokens inside a prompt.
+# Left boundary: start-of-string, whitespace, or an opening delimiter
+# (single/double quote, backtick, or open parenthesis) so that paths
+# enclosed in quotes, backticks, or parens are also captured, e.g.:
+#   create "./docs/foo.md"   `./docs/foo.md`   (./docs/foo.md)
 _PATH_TOKEN_RE = re.compile(
-    r"(?:(?<=\s)|^)"
-    r"(~/[^\s`'\")]+|\./[^\s`'\")]+|/[^\s`'\")]+|repos/[^\s`'\")]+)"
+    r"(?:(?<=[\s\"'`(])|^)"
+    r"(~/[^\s`'\")(]+|\./[^\s`'\")(]+|/[^\s`'\")(]+|repos/[^\s`'\")(]+)"
 )
 
 
@@ -349,7 +358,7 @@ def _resolve_repo_from_paths_in_prompt(prompt: str) -> Optional[RepoEntry]:
         start = candidate if candidate.exists() else candidate.parent
         if not start or not str(start):
             continue
-        git_root = _find_git_root(start)
+        git_root = _find_git_root(start, workspace_root=workspace_root)
         if git_root is None:
             continue
         # Slug: workspace-root repo uses workspace dir name (e.g.
