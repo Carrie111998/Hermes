@@ -62,7 +62,9 @@ services:
       - LINE_ALLOW_ALL_USERS=${LINE_ALLOW_ALL_USERS}
       - LINE_SLOW_RESPONSE_THRESHOLD=${LINE_SLOW_RESPONSE_THRESHOLD:-60}
       - LINE_PENDING_TEXT=${LINE_PENDING_TEXT:-AI考え中}
+      - LINE_PUBLIC_URL=${LINE_PUBLIC_URL}
       - GATEWAY_ALLOW_ALL_USERS=${GATEWAY_ALLOW_ALL_USERS}
+      - HERMES_GATEWAY_BUSY_ACK_ENABLED=${HERMES_GATEWAY_BUSY_ACK_ENABLED:-false}
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
       # - API_SERVER_HOST=0.0.0.0
