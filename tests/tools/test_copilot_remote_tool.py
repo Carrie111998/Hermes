@@ -214,3 +214,107 @@ def test_schema_marks_copilot_remote_as_default_implementation_tool():
     assert "default implementation tool" in description
     assert "code-writing" in description
     assert "website-building" in description
+
+
+# =========================================================================
+# Path-based routing (deterministic, runs before LLM router)
+# =========================================================================
+
+
+class TestResolveRepoFromPathsInPrompt:
+    """Covers _resolve_repo_from_paths_in_prompt + _find_git_root."""
+
+    @pytest.fixture()
+    def workspace(self, tmp_path, monkeypatch):
+        """Workspace with a monorepo root and a submodule under repos/."""
+        (tmp_path / ".git").mkdir()                          # workspace root is a git repo
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "projects").mkdir()
+        sub = tmp_path / "repos" / "demos" / "remix-of-nothy-demo"
+        sub.mkdir(parents=True)
+        (sub / ".git").mkdir()                               # submodule is its own git repo
+        (sub / "src").mkdir()
+        monkeypatch.setenv("HERMES_WORKSPACE_PATH", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path.parent))
+        return tmp_path
+
+    def _resolve(self, prompt):
+        from tools.copilot_remote_tool import _resolve_repo_from_paths_in_prompt
+        return _resolve_repo_from_paths_in_prompt(prompt)
+
+    def test_absolute_path_under_submodule_routes_to_submodule(self, workspace):
+        sub = workspace / "repos" / "demos" / "remix-of-nothy-demo" / "src"
+        result = self._resolve(f"create {sub}/foo.ts")
+        assert result is not None
+        assert result.slug == "remix-of-nothy-demo"
+        assert result.path == str(sub.parent)
+
+    def test_absolute_path_under_monorepo_routes_to_workspace_root(self, workspace):
+        result = self._resolve(f"please update {workspace}/docs/projects/foo.md")
+        assert result is not None
+        assert result.slug == workspace.name
+        assert result.path == str(workspace)
+
+    def test_dot_slash_anchors_to_workspace_root(self, workspace):
+        result = self._resolve("create a test file in ./docs/notes.md")
+        assert result is not None
+        assert result.slug == workspace.name
+        assert result.path == str(workspace)
+
+    def test_dot_slash_bare_routes_to_workspace_root(self, workspace):
+        # './' alone matches the workspace root (a git repo).
+        result = self._resolve("Please create a test file in ./foo.txt")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_tilde_path_expands_via_home(self, workspace, monkeypatch):
+        # Set HOME so ~/<workspace-name>/docs lands inside the workspace.
+        monkeypatch.setenv("HOME", str(workspace.parent))
+        result = self._resolve(f"add ~/{workspace.name}/docs/x.md please")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_bare_repos_path_routes_to_submodule(self, workspace):
+        result = self._resolve("Touch repos/demos/remix-of-nothy-demo/src/x.ts")
+        assert result is not None
+        assert result.slug == "remix-of-nothy-demo"
+
+    def test_no_path_token_returns_none(self, workspace):
+        result = self._resolve("Please make the website nicer")
+        assert result is None
+
+    def test_path_outside_any_git_repo_returns_none(self, workspace, tmp_path):
+        # /tmp (or sibling) has no .git ancestor — not routable.
+        outside = tmp_path.parent / "definitely-not-a-repo-xyz"
+        result = self._resolve(f"write to {outside}/foo.md")
+        assert result is None
+
+    def test_nonexistent_file_still_walks_to_git_root(self, workspace):
+        # User describing a file to create — parent walk must still find .git.
+        ghost = workspace / "docs" / "projects" / "nothy" / "NEW_FILE.md"
+        result = self._resolve(f"create {ghost}")
+        assert result is not None
+        assert result.slug == workspace.name
+
+
+class TestResolveRepoIntegratesPathRouting:
+    """End-to-end: _resolve_repo prefers path routing over the LLM router."""
+
+    def test_path_in_prompt_short_circuits_llm_router(self, tmp_path, monkeypatch):
+        (tmp_path / ".git").mkdir()
+        monkeypatch.setenv("HERMES_WORKSPACE_PATH", str(tmp_path))
+
+        def _llm_should_not_be_called(prompt):  # pragma: no cover - defensive
+            raise AssertionError("LLM router must not be called when a path resolves")
+
+        monkeypatch.setattr(
+            "tools.copilot_remote_tool._route_repo", _llm_should_not_be_called
+        )
+        from tools.copilot_remote_tool import _resolve_repo
+        entry, err = _resolve_repo(
+            prompt=f"create {tmp_path}/docs/x.md", repo="", repo_path=""
+        )
+        assert err is None
+        assert entry is not None
+        assert entry.path == str(tmp_path)
+        assert entry.slug == tmp_path.name

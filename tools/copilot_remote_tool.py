@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from agent.redact import redact_sensitive_text
@@ -249,6 +250,118 @@ def _resolve_repo_slug_cheap(slug: str) -> Optional[RepoEntry]:
     return None
 
 
+def _find_git_root(start: Path) -> Optional[Path]:
+    """Walk upward from ``start`` to the nearest dir containing ``.git``.
+
+    Works for both top-level git repos (``.git`` is a directory) and
+    submodules (``.git`` is a file pointing to a gitdir). Returns ``None``
+    if no git boundary is found before reaching the filesystem root or
+    leaving the workspace.
+    """
+    import os
+    ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
+    workspace_root = Path(ws).resolve(strict=False) if ws else None
+    try:
+        current = start.resolve(strict=False)
+    except OSError:
+        return None
+    seen: set[Path] = set()
+    while current and current not in seen:
+        seen.add(current)
+        if (current / ".git").exists():
+            return current
+        if workspace_root is not None and current == workspace_root.parent:
+            return None
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+    return None
+
+
+# Match plausible filesystem path tokens inside a prompt:
+#   - ``~/...``           (home-relative)
+#   - ``./...``           (cwd/workspace-relative)
+#   - ``/abs/path/...``   (absolute)
+#   - bare ``repos/...``  (workspace-rooted convention)
+_PATH_TOKEN_RE = re.compile(
+    r"(?:(?<=\s)|^)"
+    r"(~/[^\s`'\")]+|\./[^\s`'\")]+|/[^\s`'\")]+|repos/[^\s`'\")]+)"
+)
+
+
+def _expand_prompt_path(token: str) -> Optional[Path]:
+    """Expand a prompt-extracted path token to an absolute Path.
+
+    ``~`` expands via ``$HOME``; ``./`` and bare ``repos/...`` anchor to
+    ``$HERMES_WORKSPACE_PATH`` (the deterministic workspace root), not the
+    process cwd — model-side prompts have no concept of cwd, but they do
+    consistently mean "relative to the workspace I'm in".
+    """
+    import os
+    token = token.strip().rstrip(".,;:!?)")
+    if not token:
+        return None
+    if token.startswith("~"):
+        home = os.environ.get("HOME", "")
+        if not home:
+            return None
+        return Path(home + token[1:])
+    if token.startswith("./"):
+        ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
+        if not ws:
+            return None
+        return Path(ws) / token[2:]
+    if token.startswith("/"):
+        return Path(token)
+    if token.startswith("repos/"):
+        ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
+        if not ws:
+            return None
+        return Path(ws) / token
+    return None
+
+
+def _resolve_repo_from_paths_in_prompt(prompt: str) -> Optional[RepoEntry]:
+    """Deterministic path-based routing: extract path tokens, walk to git root.
+
+    Runs *before* the LLM router. For each path-shaped token in the prompt,
+    expand it to an absolute path, find the nearest ancestor containing a
+    ``.git`` marker, and return that as the target repo. Submodules under
+    ``$HERMES_WORKSPACE_PATH/repos/<org>/<slug>/`` resolve to the submodule;
+    paths under the workspace root but outside any submodule resolve to the
+    monorepo itself. Returns ``None`` if no path token in the prompt maps to
+    a git repository.
+    """
+    import os
+    if not prompt:
+        return None
+    ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
+    workspace_root = Path(ws).resolve(strict=False) if ws else None
+
+    for match in _PATH_TOKEN_RE.finditer(prompt):
+        token = match.group(1)
+        candidate = _expand_prompt_path(token)
+        if candidate is None:
+            continue
+        # If the path doesn't exist, still walk upward — the user may be
+        # describing a file they want *created*.
+        start = candidate if candidate.exists() else candidate.parent
+        if not start or not str(start):
+            continue
+        git_root = _find_git_root(start)
+        if git_root is None:
+            continue
+        # Slug: workspace-root repo uses workspace dir name (e.g.
+        # "rosenblatt", not "docs"); submodules use their own dir name.
+        if workspace_root is not None and git_root == workspace_root:
+            slug = workspace_root.name or "workspace"
+        else:
+            slug = git_root.name
+        return RepoEntry(slug=slug, path=str(git_root))
+    return None
+
+
 def _resolve_repo(prompt: str, repo: str = "", repo_path: str = "") -> tuple[Optional[RepoEntry], Optional[str]]:
     repo = (repo or "").strip()
     repo_path = (repo_path or "").strip()
@@ -304,6 +417,13 @@ def _resolve_repo(prompt: str, repo: str = "", repo_path: str = "") -> tuple[Opt
     if repo_path:
         slug = repo_path.rstrip("/").rsplit("/", 1)[-1] or "repo"
         return RepoEntry(slug=slug, path=repo_path), None
+
+    # Deterministic path-based routing first: cheap, no LLM needed, and
+    # handles top-level monorepo paths (docs/, infra/, ...) that the
+    # slug-only LLM router can't see.
+    path_routed = _resolve_repo_from_paths_in_prompt(prompt)
+    if path_routed:
+        return path_routed, None
 
     routed = _route_repo(prompt)
     if routed:

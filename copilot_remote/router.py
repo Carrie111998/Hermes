@@ -44,11 +44,49 @@ def _get_default_branch(repo_path: Path) -> str:
     return "main"
 
 
+def _workspace_root_entry(workspace_path: Path) -> Optional[RepoEntry]:
+    """Return a RepoEntry for the workspace root if it is itself a git repo.
+
+    The Rosenblatt-style layout puts submodule repos under
+    ``$HERMES_WORKSPACE_PATH/repos/{org}/{name}/``, but the workspace root
+    itself (e.g. ``~/rosenblatt``) is also a git repo containing top-level
+    folders like ``docs/``, ``agents/``, ``infra/``, etc. Without this
+    fallback, any request that references one of those top-level paths has
+    no routable target and falls through to the "Could not determine target
+    repo" error.
+    """
+    if not workspace_path.is_dir():
+        return None
+    git_marker = workspace_path / ".git"
+    if not git_marker.exists():
+        return None
+    slug = workspace_path.name or "workspace"
+    readme_path = workspace_path / "README.md"
+    readme_text = ""
+    if readme_path.exists():
+        try:
+            with readme_path.open("r", encoding="utf-8", errors="replace") as f:
+                readme_text = f.read(2000)
+        except OSError:
+            readme_text = ""
+    return RepoEntry(
+        slug=slug,
+        path=str(workspace_path),
+        readme_summary=readme_text[:2000],
+        description="Workspace monorepo root (fallback for top-level paths).",
+        default_branch=_get_default_branch(workspace_path),
+    )
+
+
 def _discover_repos(workspace_path: Path = None) -> List[RepoEntry]:
     """Discover repos by scanning the workspace repos/ directory.
 
     Expects structure: repos/{org}/{repo_name}/
     Reads README.md content for each repo to pass to the LLM.
+
+    If the workspace root itself is a git repo, it is appended as a
+    fallback ``RepoEntry`` so prompts that reference top-level workspace
+    paths (e.g. ``docs/``, ``infra/``) remain routable.
     """
     if workspace_path is None:
         ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
@@ -58,11 +96,12 @@ def _discover_repos(workspace_path: Path = None) -> List[RepoEntry]:
         workspace_path = Path(ws)
 
     repos_dir = workspace_path / "repos"
+    entries: List[RepoEntry] = []
     if not repos_dir.is_dir():
         logger.warning("Repos directory not found: %s", _sanitize_for_log(repos_dir))
-        return []
+        root_entry = _workspace_root_entry(workspace_path)
+        return [root_entry] if root_entry else []
 
-    entries = []
     for org_dir in sorted(repos_dir.iterdir()):
         if not org_dir.is_dir():
             continue
@@ -89,6 +128,13 @@ def _discover_repos(workspace_path: Path = None) -> List[RepoEntry]:
                 description="",
                 default_branch=default_branch,
             ))
+
+    # Append workspace root as a fallback so prompts referencing top-level
+    # paths (docs/, infra/, agents/, etc.) remain routable. Placed last so
+    # the LLM router prefers a more-specific submodule when one matches.
+    root_entry = _workspace_root_entry(workspace_path)
+    if root_entry and not any(e.path == root_entry.path for e in entries):
+        entries.append(root_entry)
 
     return entries
 
