@@ -416,9 +416,9 @@ def _auth_headers(auth: Mapping[str, Any]) -> dict[str, str]:
 # on every decision turn. The bridge reaches it through a configured GET
 # operation (default name ``agent_config_read``); the gateway injects the
 # rendered behavior block into the decision-turn prompt. Every accessor below
-# fails soft — an inactive bridge, an unconfigured operation (a non-TGG
-# client), or a failed call yields an empty result so the agent simply runs on
-# its constitution defaults.
+# fails soft — an inactive bridge, an unconfigured operation (a client
+# without this operation configured), or a failed call yields an empty result
+# so the agent simply runs on its constitution defaults.
 
 AGENT_CONFIG_OPERATION = "agent_config_read"
 
@@ -445,7 +445,7 @@ def fetch_agent_config_view(
     """Fetch the live agent-config view ``{config, directives, keys}``.
 
     Returns ``{}`` when the bridge is inactive, the operation is not configured
-    (e.g. a non-TGG client), or the call fails.
+    (e.g. a client without this operation configured), or the call fails.
     """
     bridge = _resolve_bridge(config)
     if bridge is None or operation not in bridge.operations:
