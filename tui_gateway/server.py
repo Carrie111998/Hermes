@@ -36,6 +36,7 @@ from tui_gateway.transport import (
     reset_transport,
 )
 from tui_gateway.wiki_api import wiki_scan, wiki_page
+import tui_gateway.wiki_api as wiki_api
 
 logger = logging.getLogger(__name__)
 
@@ -15128,6 +15129,167 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5024, str(e))
 
 
+def _find_local_skill_md(skill_name: str) -> Optional[Path]:
+    """Find a locally installed skill's SKILL.md file by name.
+
+    Searches ~/.hermes/skills/ recursively for a SKILL.md whose YAML
+    frontmatter ``name`` field matches *skill_name*.  Returns the
+    absolute Path or None.
+    """
+    import yaml
+
+    skills_dir = Path(get_hermes_home()) / "skills"
+    if not skills_dir.is_dir():
+        return None
+    for candidate in sorted(skills_dir.rglob("SKILL.md")):
+        try:
+            raw = candidate.read_text(encoding="utf-8")[:4096]
+        except (OSError, UnicodeDecodeError):
+            continue
+        # Extract YAML frontmatter between --- markers
+        if not raw.startswith("---"):
+            continue
+        end = raw.find("---", 3)
+        if end == -1:
+            continue
+        try:
+            fm = yaml.safe_load(raw[3:end])
+        except Exception:
+            continue
+        if isinstance(fm, dict) and fm.get("name") == skill_name:
+            return candidate
+    return None
+
+
+def _parse_skill_frontmatter(content: str) -> dict[str, Any]:
+    """Parse YAML frontmatter from a SKILL.md string."""
+    import yaml
+
+    if not content.startswith("---"):
+        return {}
+    end = content.find("---", 3)
+    if end == -1:
+        return {}
+    try:
+        return yaml.safe_load(content[3:end]) or {}
+    except Exception:
+        return {}
+
+
+def _skill_info_from_path(skill_md: Path, fm: dict[str, Any]) -> dict[str, Any]:
+    """Build a skill info dict consumable by HermesNative's SkillInfo."""
+    category = skill_md.parent.name if skill_md.parent.parent != skill_md.parent.parent.parent else "general"
+    # Use the relative path from skills/ dir as the category path
+    try:
+        skills_dir = Path(get_hermes_home()) / "skills"
+        rel = skill_md.parent.relative_to(skills_dir)
+        # category is the top-level directory name
+        parts = rel.parts
+        if parts:
+            category = parts[0] if len(parts) >= 1 else "general"
+    except ValueError:
+        category = "general"
+
+    info: dict[str, Any] = {
+        "name": fm.get("name", skill_md.parent.name),
+        "description": fm.get("description", ""),
+        "category": category,
+        "source": "local",
+        "id": fm.get("name", skill_md.parent.name),
+        "identifier": fm.get("name", skill_md.parent.name),
+        "tags": fm.get("metadata", {}).get("hermes", {}).get("tags", []) if isinstance(fm.get("metadata"), dict) else [],
+        "path": str(skill_md),
+        "skill_md_preview": "",  # populated by caller after reading content
+    }
+    return info
+
+
+@method("skills.get")
+def _(rid, params: dict) -> dict:
+    """Read a locally installed skill's SKILL.md content."""
+    skill_name = params.get("skill_id", "")
+    file_path = params.get("file_path")  # optional: relative path within skill dir
+
+    if not skill_name:
+        return _err(rid, 4018, "missing skill_id")
+
+    try:
+        skill_md = _find_local_skill_md(skill_name)
+        if skill_md is None:
+            return _err(rid, 4019, f"skill '{skill_name}' not found locally")
+
+        # If a file_path is given, read a specific file from the skill dir
+        if file_path:
+            target = (skill_md.parent / file_path).resolve()
+            # Safety: only allow reading within the skill directory
+            try:
+                target.relative_to(skill_md.parent)
+            except ValueError:
+                return _err(rid, 4020, f"path '{file_path}' escapes skill directory")
+            if not target.is_file():
+                return _err(rid, 4021, f"file '{file_path}' not found in skill dir")
+            content = target.read_text(encoding="utf-8")
+            return _ok(rid, {
+                "skill": _skill_info_from_path(skill_md, _parse_skill_frontmatter(content)),
+                "file_path": file_path,
+                "content": content,
+                "read_only": not os.access(target, os.W_OK),
+            })
+
+        content = skill_md.read_text(encoding="utf-8")
+        fm = _parse_skill_frontmatter(content)
+
+        info = _skill_info_from_path(skill_md, fm)
+        info["skill_md_preview"] = content[:2000]
+
+        read_only = not os.access(skill_md, os.W_OK)
+
+        return _ok(rid, {
+            "skill": info,
+            "file_path": "SKILL.md",
+            "content": content,
+            "read_only": read_only,
+        })
+    except Exception as e:
+        return _err(rid, 5024, str(e))
+
+
+@method("skills.update")
+def _(rid, params: dict) -> dict:
+    """Update a locally installed skill's SKILL.md content."""
+    skill_name = params.get("skill_id", "")
+    new_content = params.get("content", "")
+
+    if not skill_name:
+        return _err(rid, 4022, "missing skill_id")
+    if not new_content:
+        return _err(rid, 4023, "missing content")
+
+    try:
+        skill_md = _find_local_skill_md(skill_name)
+        if skill_md is None:
+            return _err(rid, 4019, f"skill '{skill_name}' not found locally")
+
+        if not os.access(skill_md, os.W_OK):
+            return _err(rid, 4024, f"skill '{skill_name}' is read-only")
+
+        skill_md.write_text(new_content, encoding="utf-8")
+        fm = _parse_skill_frontmatter(new_content)
+        info = _skill_info_from_path(skill_md, fm)
+        info["skill_md_preview"] = new_content[:2000]
+
+        # Reload skills so the agent picks up changes
+        try:
+            from agent.skill_commands import reload_skills
+            reload_skills()
+        except Exception:
+            pass  # best-effort; don't fail the write
+
+        return _ok(rid, {"skill": info})
+    except Exception as e:
+        return _err(rid, 5024, str(e))
+
+
 @method("skills.reload")
 def _(rid, params: dict) -> dict:
     try:
@@ -15300,8 +15462,9 @@ def _(rid, params: dict) -> dict:
 @method("wiki.scan")
 def _(rid, params: dict) -> dict:
     try:
-        path = params.get("path")
-        result = wiki_scan(path)
+        wiki_name = params.get("wiki") or params.get("path")
+        wiki_path = wiki_api.resolve_wiki(wiki_name)
+        result = wiki_scan(wiki_path)
         return _ok(rid, result)
     except Exception as e:
         logger.exception("wiki.scan failed")
@@ -15314,7 +15477,9 @@ def _(rid, params: dict) -> dict:
         page_path = params.get("path")
         if not page_path:
             return _err(rid, 4001, "path is required")
-        result = wiki_page(page_path)
+        wiki_name = params.get("wiki")
+        wiki_path = wiki_api.resolve_wiki(wiki_name)
+        result = wiki_page(page_path, wiki_path)
         if result is None:
             return _err(rid, 4040, f"page not found: {page_path}")
         return _ok(rid, result)
