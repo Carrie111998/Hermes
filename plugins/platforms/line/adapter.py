@@ -113,6 +113,7 @@ LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
+LINE_MAX_RESPONSE_CHARS = 200  # Hard cap for outbound text to LINE users
 
 # Webhook hardening
 WEBHOOK_BODY_MAX_BYTES = 1_048_576  # 1 MiB — webhooks are tiny JSON
@@ -1327,6 +1328,12 @@ class LineAdapter(BasePlatformAdapter):
             self._record_group_response(chat_id)
             return SendResult(success=True, message_id=pending_rid)
 
+        # Hard cap: truncate outbound text to LINE_MAX_RESPONSE_CHARS so
+        # LINE users always see concise responses regardless of how long
+        # the agent's output is.
+        if len(content) > LINE_MAX_RESPONSE_CHARS:
+            content = content[:LINE_MAX_RESPONSE_CHARS]
+
         result = await self._send_text_chunks(chat_id, content, force_push=False)
         if result.success:
             self._record_group_response(chat_id)
@@ -1988,8 +1995,7 @@ def register(ctx) -> None:
         pii_safe=False,
         allow_update_command=True,
         platform_hint=(
-            "You are chatting via LINE Messaging API. **CRITICAL: Keep every response "
-            "under 200 characters.** Short, direct answers only — no long explanations. "
+            "You are chatting via LINE Messaging API. "
             "LINE does NOT render Markdown — text bubbles show ** and # literally. "
             "Bare URLs are auto-linked, but \\[label\\](url) syntax is not. "
             "Image/audio/video sending requires LINE_PUBLIC_URL configured to a "
