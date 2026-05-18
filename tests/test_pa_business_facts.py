@@ -10,6 +10,7 @@ from tools.pa_business_tools import (
     TenantScopeMismatch,
     execute_business_operation,
     load_business_bridge_config,
+    record_agent_action,
 )
 
 
@@ -100,6 +101,115 @@ def test_local_command_operation_returns_json():
     result = execute_business_operation(config, "local_echo", {"amount": 42})
 
     assert result == {"ok": True, "payload": {"amount": 42}}
+
+
+def _agent_action_config(url: str) -> dict:
+    return {
+        "pa_business": {
+            "operations": {
+                "agent_action_record": {
+                    "type": "http",
+                    "url": url,
+                    "method": "POST",
+                }
+            }
+        }
+    }
+
+
+def test_record_agent_action_observation_type(fake_business_endpoint):
+    ok = record_agent_action(
+        agent_id="iris",
+        engagement_id="00000000-0000-0000-0000-000000000001",
+        action_type="observation",
+        payload={"incoming_message": "hello"},
+        source="whatsapp",
+        turn_id="turn-1",
+        config=_agent_action_config(fake_business_endpoint),
+    )
+
+    assert ok is True
+    assert _FakeBusinessHandler.received["payload"] == {
+        "agent_id": "iris",
+        "engagement_id": "00000000-0000-0000-0000-000000000001",
+        "action_type": "observation",
+        "payload": {"incoming_message": "hello"},
+        "source": "whatsapp",
+        "cost_usd": 0.0,
+        "tokens_input": 0,
+        "tokens_output": 0,
+        "status": "pending",
+        "turn_id": "turn-1",
+    }
+
+
+def test_record_agent_action_dry_run_reply_type(fake_business_endpoint):
+    ok = record_agent_action(
+        agent_id="iris",
+        engagement_id="00000000-0000-0000-0000-000000000002",
+        action_type="dry-run-reply",
+        payload={"reply": "draft only"},
+        source="telegram",
+        cost_usd=0.123456,
+        tokens_input=321,
+        tokens_output=45,
+        status="dry-run",
+        turn_id="turn-2",
+        config=_agent_action_config(fake_business_endpoint),
+    )
+
+    assert ok is True
+    received = _FakeBusinessHandler.received["payload"]
+    assert received["action_type"] == "dry-run-reply"
+    assert received["status"] == "dry-run"
+    assert received["payload"] == {"reply": "draft only"}
+    assert received["cost_usd"] == 0.123456
+    assert received["tokens_input"] == 321
+    assert received["tokens_output"] == 45
+
+
+def test_record_agent_action_executed_reply_type(fake_business_endpoint):
+    ok = record_agent_action(
+        agent_id="iris",
+        engagement_id="00000000-0000-0000-0000-000000000003",
+        action_type="executed-reply",
+        payload={"reply": "sent"},
+        source="whatsapp",
+        status="executed",
+        turn_id="turn-3",
+        config=_agent_action_config(fake_business_endpoint),
+    )
+
+    assert ok is True
+    received = _FakeBusinessHandler.received["payload"]
+    assert received["action_type"] == "executed-reply"
+    assert received["status"] == "executed"
+    assert received["payload"] == {"reply": "sent"}
+
+
+def test_record_agent_action_fails_soft_when_bridge_unavailable():
+    ok = record_agent_action(
+        agent_id="iris",
+        engagement_id="00000000-0000-0000-0000-000000000004",
+        action_type="observation",
+        payload={"incoming_message": "hello"},
+        config={"pa_business": {"operations": {}}},
+    )
+
+    assert ok is False
+
+
+def test_record_agent_action_agent_id_passed_verbatim(fake_business_endpoint):
+    ok = record_agent_action(
+        agent_id="Iris V1",
+        engagement_id="00000000-0000-0000-0000-000000000005",
+        action_type="observation",
+        payload={"incoming_message": "hello"},
+        config=_agent_action_config(fake_business_endpoint),
+    )
+
+    assert ok is True
+    assert _FakeBusinessHandler.received["payload"]["agent_id"] == "Iris V1"
 
 
 def test_nested_pa_business_config_is_supported(fake_business_endpoint):

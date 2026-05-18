@@ -1222,6 +1222,154 @@ def _record_pa_behavior_event(
         logger.debug("Failed to record PA behavior event: %s", exc)
 
 
+def _pa_mapping_path(data: Mapping[str, Any] | None, dotted_key: str) -> Any:
+    current: Any = data
+    for part in dotted_key.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _pa_normalize_agent_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = re.sub(r"[^a-z0-9._:-]+", "-", text.lower()).strip("-")
+    return normalized or None
+
+
+def _pa_action_agent_id(pa_context: Any) -> str | None:
+    constitution = getattr(pa_context, "constitution", None) if pa_context is not None else None
+    client = getattr(constitution, "client", None) if constitution is not None else None
+    identity = getattr(constitution, "identity", None) if constitution is not None else None
+    for container, key in (
+        (client, "agent_id"),
+        (identity, "agent_id"),
+        (client, "owner"),
+    ):
+        if isinstance(container, Mapping):
+            agent_id = _pa_normalize_agent_id(container.get(key))
+            if agent_id:
+                return agent_id
+    return (
+        _pa_normalize_agent_id(getattr(constitution, "agent_name", None))
+        or _pa_normalize_agent_id(getattr(constitution, "id", None))
+    )
+
+
+def _pa_action_engagement_id(pa_context: Any) -> str | None:
+    if pa_context is None:
+        return None
+    metadata = getattr(pa_context, "metadata", None)
+    constitution = getattr(pa_context, "constitution", None)
+    client = getattr(constitution, "client", None) if constitution is not None else None
+    for container in (metadata, client):
+        if not isinstance(container, Mapping):
+            continue
+        for key in ("engagement_id", "engagementId"):
+            value = container.get(key)
+            if value:
+                return str(value)
+        value = _pa_mapping_path(container, "engagement.id")
+        if value:
+            return str(value)
+    return None
+
+
+def _pa_action_source(source: "SessionSource") -> str | None:
+    platform = getattr(source, "platform", None)
+    value = getattr(platform, "value", platform)
+    return str(value) if value else None
+
+
+def _pa_agent_action_usage(agent_result: Mapping[str, Any]) -> tuple[float, int, int]:
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _as_int(value: Any) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return (
+        _as_float(agent_result.get("estimated_cost_usd")),
+        _as_int(agent_result.get("input_tokens") or agent_result.get("prompt_tokens")),
+        _as_int(agent_result.get("output_tokens") or agent_result.get("completion_tokens")),
+    )
+
+
+def _record_pa_agent_action(
+    pa_context: Any,
+    *,
+    action_type: str,
+    payload: dict[str, Any],
+    source: str | None,
+    status: str,
+    turn_id: str | None,
+    cost_usd: float = 0.0,
+    tokens_input: int = 0,
+    tokens_output: int = 0,
+) -> bool:
+    agent_id = _pa_action_agent_id(pa_context)
+    engagement_id = _pa_action_engagement_id(pa_context)
+    if not agent_id or not engagement_id:
+        return False
+    try:
+        from tools.pa_business_tools import record_agent_action
+
+        return record_agent_action(
+            agent_id=agent_id,
+            engagement_id=engagement_id,
+            action_type=action_type,
+            payload=payload,
+            source=source,
+            cost_usd=cost_usd,
+            tokens_input=tokens_input,
+            tokens_output=tokens_output,
+            status=status,
+            turn_id=turn_id,
+        )
+    except Exception as exc:
+        logger.debug("Failed to record PA agent action: %s", exc)
+        return False
+
+
+def _resolve_pa_context_for_action_log(
+    user_config: Mapping[str, Any] | None,
+    platform_extra: Mapping[str, Any] | None,
+    metadata: Mapping[str, Any],
+) -> Any | None:
+    try:
+        return _resolve_pa_context(user_config, platform_extra, metadata)
+    except Exception as exc:
+        logger.debug("PA action-log context resolution skipped: %s", exc)
+        return None
+
+
+def _pa_never_send_replies(pa_context: Any) -> bool:
+    policy = _pa_response_policy(pa_context)
+    for key in ("never_send_replies", "behavior.never_send_replies"):
+        if key in policy:
+            return is_truthy_value(policy.get(key), default=False)
+    try:
+        from tools.pa_business_tools import read_agent_config
+
+        return is_truthy_value(
+            read_agent_config("behavior.never_send_replies"),
+            default=False,
+        )
+    except Exception as exc:
+        logger.debug("PA never-send config read skipped: %s", exc)
+        return False
+
+
 def _resolve_gateway_model(config: dict | None = None) -> str:
     """Read model from config.yaml — single source of truth.
 
@@ -7985,6 +8133,40 @@ class GatewayRunner:
         )
         if message_text is None:
             return
+        _pa_action_message_id = self._reply_anchor_for_event(event)
+        _pa_action_metadata = _source_pa_metadata(
+            source,
+            session_id=session_entry.session_id,
+            session_key=session_key,
+            event_message_id=_pa_action_message_id,
+            pa_job_type=event.pa_job_type,
+            pa_context=event.pa_context,
+        )
+        _pa_action_context = _resolve_pa_context_for_action_log(
+            _load_gateway_config(),
+            _pa_platform_extra(getattr(self, "config", None), source.platform),
+            _pa_action_metadata,
+        )
+        _pa_action_turn_id = (
+            f"{session_entry.session_id}:{_pa_action_message_id or int(time.time() * 1000)}"
+        )
+        _pa_action_source_name = _pa_action_source(source)
+        _pa_suppress_reply_send = _pa_never_send_replies(_pa_action_context)
+        _record_pa_agent_action(
+            _pa_action_context,
+            action_type="observation",
+            payload={
+                "message": message_text,
+                "session_id": session_entry.session_id,
+                "session_key": session_key,
+                "message_id": _pa_action_message_id,
+                "source": source.to_dict() if hasattr(source, "to_dict") else {},
+                "job_type": getattr(_pa_action_context, "job_type", None),
+            },
+            source=_pa_action_source_name,
+            status="pending",
+            turn_id=_pa_action_turn_id,
+        )
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -8015,10 +8197,11 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
+                event_message_id=_pa_action_message_id,
                 channel_prompt=event.channel_prompt,
                 pa_job_type=event.pa_job_type,
                 pa_context=event.pa_context,
+                suppress_delivery=_pa_suppress_reply_send,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8140,6 +8323,26 @@ class GatewayRunner:
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent"):
                 response = f"{response}\n\n{_footer_line}"
+
+            _pa_cost, _pa_tokens_input, _pa_tokens_output = _pa_agent_action_usage(agent_result)
+            _record_pa_agent_action(
+                _pa_action_context,
+                action_type="dry-run-reply",
+                payload={
+                    "reply": response,
+                    "session_id": session_entry.session_id,
+                    "message_id": _pa_action_message_id,
+                    "model": agent_result.get("model"),
+                    "provider": agent_result.get("provider"),
+                    "never_send_replies": _pa_suppress_reply_send,
+                },
+                source=_pa_action_source_name,
+                cost_usd=_pa_cost,
+                tokens_input=_pa_tokens_input,
+                tokens_output=_pa_tokens_output,
+                status="dry-run",
+                turn_id=_pa_action_turn_id,
+            )
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -8327,6 +8530,13 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            if _pa_suppress_reply_send and response:
+                logger.info(
+                    "PA never_send_replies suppressed outbound reply for session %s",
+                    session_key or "?",
+                )
+                return None
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
@@ -8345,6 +8555,24 @@ class GatewayRunner:
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
                 if response:
+                    _record_pa_agent_action(
+                        _pa_action_context,
+                        action_type="executed-reply",
+                        payload={
+                            "reply": response,
+                            "session_id": session_entry.session_id,
+                            "message_id": _pa_action_message_id,
+                            "model": agent_result.get("model"),
+                            "provider": agent_result.get("provider"),
+                            "delivery": "already_sent",
+                        },
+                        source=_pa_action_source_name,
+                        cost_usd=_pa_cost,
+                        tokens_input=_pa_tokens_input,
+                        tokens_output=_pa_tokens_output,
+                        status="executed",
+                        turn_id=_pa_action_turn_id,
+                    )
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
                         await self._deliver_media_from_response(
@@ -8367,6 +8595,25 @@ class GatewayRunner:
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            if response:
+                _record_pa_agent_action(
+                    _pa_action_context,
+                    action_type="executed-reply",
+                    payload={
+                        "reply": response,
+                        "session_id": session_entry.session_id,
+                        "message_id": _pa_action_message_id,
+                        "model": agent_result.get("model"),
+                        "provider": agent_result.get("provider"),
+                        "delivery": "gateway-return",
+                    },
+                    source=_pa_action_source_name,
+                    cost_usd=_pa_cost,
+                    tokens_input=_pa_tokens_input,
+                    tokens_output=_pa_tokens_output,
+                    status="executed",
+                    turn_id=_pa_action_turn_id,
+                )
             return response
             
         except Exception as e:
@@ -14594,6 +14841,7 @@ class GatewayRunner:
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        suppress_delivery: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -14688,6 +14936,8 @@ class GatewayRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        if suppress_delivery:
+            _streaming_enabled = False
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -14737,7 +14987,7 @@ class GatewayRunner:
 
         # Send typing indicator
         _adapter = self.adapters.get(source.platform)
-        if _adapter:
+        if _adapter and not suppress_delivery:
             try:
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
@@ -14884,6 +15134,7 @@ class GatewayRunner:
         channel_prompt: Optional[str] = None,
         pa_job_type: Optional[str] = None,
         pa_context: Optional[Mapping[str, Any]] = None,
+        suppress_delivery: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -14908,6 +15159,7 @@ class GatewayRunner:
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                suppress_delivery=suppress_delivery,
             )
 
         from run_agent import AIAgent
@@ -14989,12 +15241,17 @@ class GatewayRunner:
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (
+            progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+            and not suppress_delivery
+        )
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
+            and not suppress_delivery
             and is_truthy_value(
                 display_config.get("interim_assistant_messages"),
                 default=True,
@@ -15534,6 +15791,8 @@ class GatewayRunner:
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if suppress_delivery:
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -15695,7 +15954,7 @@ class GatewayRunner:
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.status_callback = None if suppress_delivery else _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
@@ -16140,6 +16399,7 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            _resolved_provider = getattr(_agent, "provider", None) if _agent else None
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
@@ -16160,6 +16420,8 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": _resolved_provider,
+                    "estimated_cost_usd": result.get("estimated_cost_usd", 0.0),
                     "context_length": _context_length,
                 }
             
@@ -16279,6 +16541,8 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": _resolved_provider,
+                "estimated_cost_usd": result.get("estimated_cost_usd", 0.0),
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
@@ -16384,7 +16648,11 @@ class GatewayRunner:
         # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
         # 0 = disable notifications.
         _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        _NOTIFY_INTERVAL = (
+            None
+            if suppress_delivery
+            else _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        )
         _notify_start = time.time()
 
         async def _notify_long_running():
@@ -16836,6 +17104,7 @@ class GatewayRunner:
                     channel_prompt=next_channel_prompt,
                     pa_job_type=getattr(pending_event, "pa_job_type", None),
                     pa_context=getattr(pending_event, "pa_context", None),
+                    suppress_delivery=suppress_delivery,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

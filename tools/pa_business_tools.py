@@ -421,6 +421,23 @@ def _auth_headers(auth: Mapping[str, Any]) -> dict[str, str]:
 # so the agent simply runs on its constitution defaults.
 
 AGENT_CONFIG_OPERATION = "agent_config_read"
+AGENT_ACTION_OPERATIONS = (
+    "agent_action_record",
+    "agent_actions_write",
+    "record_agent_action",
+)
+AGENT_ACTION_TYPES = {
+    "observation",
+    "dry-run-reply",
+    "executed-reply",
+    "config-mutation",
+}
+AGENT_ACTION_STATUSES = {
+    "pending",
+    "dry-run",
+    "executed",
+    "suppressed",
+}
 
 
 def _resolve_bridge(
@@ -435,6 +452,63 @@ def _resolve_bridge(
         return _load_runtime_bridge_config()
     except Exception:
         return None
+
+
+def record_agent_action(
+    *,
+    agent_id: str,
+    engagement_id: str,
+    action_type: str,
+    payload: dict,
+    source: str | None = None,
+    cost_usd: float = 0.0,
+    tokens_input: int = 0,
+    tokens_output: int = 0,
+    status: str = "pending",
+    turn_id: str | None = None,
+    config: Mapping[str, Any] | PABusinessBridgeConfig | None = None,
+) -> bool:
+    """Record an agent action to dev.agent_actions. Fails soft."""
+    try:
+        if not agent_id or not engagement_id:
+            return False
+        if action_type not in AGENT_ACTION_TYPES or status not in AGENT_ACTION_STATUSES:
+            return False
+        if not isinstance(payload, dict):
+            return False
+
+        bridge = _resolve_bridge(config)
+        if bridge is None:
+            return False
+        operation = next(
+            (name for name in AGENT_ACTION_OPERATIONS if name in bridge.operations),
+            None,
+        )
+        if operation is None:
+            return False
+
+        result = execute_business_operation(
+            bridge,
+            operation=operation,
+            payload={
+                "agent_id": agent_id,
+                "engagement_id": engagement_id,
+                "action_type": action_type,
+                "payload": payload,
+                "source": source,
+                "cost_usd": float(cost_usd or 0.0),
+                "tokens_input": int(tokens_input or 0),
+                "tokens_output": int(tokens_output or 0),
+                "status": status,
+                "turn_id": turn_id,
+            },
+        )
+        status_code = int(result.get("status_code") or 200)
+        if status_code >= 400:
+            return False
+        return result.get("ok") is not False
+    except Exception:
+        return False
 
 
 def fetch_agent_config_view(
