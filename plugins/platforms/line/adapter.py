@@ -1124,6 +1124,9 @@ class LineAdapter(BasePlatformAdapter):
             title = msg.get("title", "")
             address = msg.get("address", "")
             text = f"[location: {title} {address}]".strip()
+        elif msg_type in ("template", "flex"):
+            alt_text = msg.get("altText", "")
+            text = f"[{msg_type}: {alt_text}]" if alt_text else f"[{msg_type}]"
         else:
             text = f"[unsupported message type: {msg_type}]"
 

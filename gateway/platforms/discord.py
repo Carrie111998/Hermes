@@ -4415,26 +4415,36 @@ class DiscordAdapter(BasePlatformAdapter):
             # Download the first embed image to a local temp file so LINE can
             # re-serve it via LINE_PUBLIC_URL (LINE requires HTTPS URLs).
             image_url = embed_images[0]
+            if not is_safe_url(image_url):
+                logger.warning("LINE forward: blocked unsafe image URL: %s", image_url)
+                image_url = None
             image_path: Optional[str] = None
-            try:
-                import aiohttp
-                timeout = aiohttp.ClientTimeout(total=15.0)
-                async with aiohttp.ClientSession(timeout=timeout) as sess:
-                    async with sess.get(image_url) as resp:
-                        if resp.status < 400:
-                            data = await resp.read()
-                            suffix = ".jpg"
-                            if "png" in (resp.content_type or ""):
-                                suffix = ".png"
-                            import tempfile
-                            tmp = tempfile.NamedTemporaryFile(
-                                delete=False, suffix=suffix
-                            )
-                            tmp.write(data)
-                            tmp.close()
-                            image_path = tmp.name
-            except Exception:
-                logger.debug("LINE forward: failed to download embed image", exc_info=True)
+            if image_url:
+                try:
+                    import aiohttp
+                    timeout = aiohttp.ClientTimeout(total=15.0)
+                    MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+                    async with aiohttp.ClientSession(timeout=timeout) as sess:
+                        async with sess.get(image_url) as resp:
+                            if resp.status < 400:
+                                content_length = resp.headers.get('Content-Length')
+                                if content_length and int(content_length) > MAX_IMAGE_SIZE:
+                                    raise ValueError(f"Image too large: {content_length} bytes")
+                                data = await resp.read()
+                                if len(data) > MAX_IMAGE_SIZE:
+                                    raise ValueError(f"Image exceeds max size {MAX_IMAGE_SIZE}")
+                                suffix = ".jpg"
+                                if "png" in (resp.content_type or ""):
+                                    suffix = ".png"
+                                import tempfile
+                                tmp = tempfile.NamedTemporaryFile(
+                                    delete=False, suffix=suffix
+                                )
+                                tmp.write(data)
+                                tmp.close()
+                                image_path = tmp.name
+                except Exception:
+                    logger.debug("LINE forward: failed to download embed image", exc_info=True)
 
             # Send text first, then image if available
             await adapter.send(line_chat_id, text)
