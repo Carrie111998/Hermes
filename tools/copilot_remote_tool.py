@@ -293,19 +293,22 @@ def _find_git_root(start: Path, workspace_root: Optional[Path] = None) -> Option
 # (single/double quote, backtick, or open parenthesis) so that paths
 # enclosed in quotes, backticks, or parens are also captured, e.g.:
 #   create "./docs/foo.md"   `./docs/foo.md`   (./docs/foo.md)
+# Trailing segment is optional so bare "./" and "repos/" also match —
+# these anchor to the workspace root directly.
 _PATH_TOKEN_RE = re.compile(
     r"(?:(?<=[\s\"'`(])|^)"
-    r"(~/[^\s`'\")(]+|\./[^\s`'\")(]+|/[^\s`'\")(]+|repos/[^\s`'\")(]+)"
+    r"(~/[^\s`'\")(]*|\.(?:/[^\s`'\")(]*)?|/[^\s`'\")(]+|repos(?:/[^\s`'\")(]*)?)"
 )
 
 
 def _expand_prompt_path(token: str) -> Optional[Path]:
     """Expand a prompt-extracted path token to an absolute Path.
 
-    ``~`` expands via ``$HOME``; ``./`` and bare ``repos/...`` anchor to
-    ``$HERMES_WORKSPACE_PATH`` (the deterministic workspace root), not the
-    process cwd — model-side prompts have no concept of cwd, but they do
-    consistently mean "relative to the workspace I'm in".
+    ``~`` expands via ``$HOME``; ``./``, bare ``.``, and bare/partial
+    ``repos/...`` anchor to ``$HERMES_WORKSPACE_PATH`` (the deterministic
+    workspace root), not the process cwd — model-side prompts have no
+    concept of cwd, but they do consistently mean "relative to the workspace
+    I'm in".
     """
     import os
     token = token.strip().rstrip(".,;:!?)")
@@ -316,14 +319,15 @@ def _expand_prompt_path(token: str) -> Optional[Path]:
         if not home:
             return None
         return Path(home + token[1:])
-    if token.startswith("./"):
+    if token in (".", "./") or token.startswith("./"):
         ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
         if not ws:
             return None
-        return Path(ws) / token[2:]
+        remainder = token[2:] if token.startswith("./") else ""
+        return Path(ws) / remainder if remainder else Path(ws)
     if token.startswith("/"):
         return Path(token)
-    if token.startswith("repos/"):
+    if token == "repos/" or token.startswith("repos/"):
         ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
         if not ws:
             return None
@@ -351,7 +355,11 @@ def _resolve_repo_from_paths_in_prompt(prompt: str) -> Optional[RepoEntry]:
         # git repos on the host are valid targets. Fail closed rather than
         # risk routing to an arbitrary directory based solely on prompt text.
         return None
-    workspace_root = Path(ws).resolve(strict=False)
+    try:
+        workspace_root = Path(ws).resolve(strict=False)
+    except OSError:
+        logger.debug("_resolve_repo_from_paths_in_prompt: could not resolve HERMES_WORKSPACE_PATH %r", ws)
+        return None
 
     for match in _PATH_TOKEN_RE.finditer(prompt):
         token = match.group(1)

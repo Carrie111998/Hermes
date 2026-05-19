@@ -262,8 +262,19 @@ class TestResolveRepoFromPathsInPrompt:
         assert result.path == str(workspace)
 
     def test_dot_slash_bare_routes_to_workspace_root(self, workspace):
-        # './' alone matches the workspace root (a git repo).
+        # './foo.txt' — relative path with filename — routes to workspace root.
         result = self._resolve("Please create a test file in ./foo.txt")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_bare_dot_slash_alone_routes_to_workspace_root(self, workspace):
+        # The exact pattern from the PR description: prompt contains only "./"
+        result = self._resolve("Please create a test file in ./")
+        assert result is not None
+        assert result.slug == workspace.name
+
+    def test_bare_dot_slash_at_end_of_sentence(self, workspace):
+        result = self._resolve("create a test file in ./")
         assert result is not None
         assert result.slug == workspace.name
 
@@ -336,6 +347,22 @@ class TestResolveRepoFromPathsInPrompt:
         result = self._resolve(f"create ({workspace}/docs/foo.md)")
         assert result is not None
         assert result.slug == workspace.name
+
+    def test_workspace_path_resolve_oserror_returns_none(self, monkeypatch):
+        # Simulate a symlink loop / OS error on Path.resolve() — must not raise.
+        monkeypatch.setenv("HERMES_WORKSPACE_PATH", "/some/path")
+        from unittest.mock import patch
+        from pathlib import Path as _Path
+        original_resolve = _Path.resolve
+
+        def _raise(self, strict=False):
+            if str(self) == "/some/path":
+                raise OSError("simulated symlink loop")
+            return original_resolve(self, strict=strict)
+
+        with patch.object(_Path, "resolve", _raise):
+            result = self._resolve("create ./docs/foo.md")
+        assert result is None
 
 
 class TestResolveRepoIntegratesPathRouting:
