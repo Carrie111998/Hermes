@@ -23,7 +23,7 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -42,14 +42,34 @@ const WHATSAPP_DEBUG =
   process.env &&
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
+const SYNC_FULL_HISTORY =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_SYNC_FULL_HISTORY === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SYNC_FULL_HISTORY.toLowerCase());
+const HISTORY_TO_LIVE_QUEUE =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_HISTORY_TO_LIVE_QUEUE === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_HISTORY_TO_LIVE_QUEUE.toLowerCase());
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
 const DOCUMENT_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'document_cache');
 const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
+const HISTORY_SYNC_PATH = process.env.WHATSAPP_HISTORY_SYNC_PATH ||
+  path.join(path.dirname(SESSION_DIR), 'history-sync.jsonl');
+const HISTORY_METADATA_PATH = process.env.WHATSAPP_HISTORY_METADATA_PATH ||
+  path.join(path.dirname(SESSION_DIR), 'history-metadata.jsonl');
+const QR_FILE = process.env.WHATSAPP_QR_FILE || '';
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
+const OUTBOUND_DISABLED =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_OUTBOUND_DISABLED === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_OUTBOUND_DISABLED.toLowerCase());
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
@@ -110,6 +130,24 @@ function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
   return chunks;
 }
 
+function rejectWhenOutboundDisabled(res, action) {
+  if (!OUTBOUND_DISABLED) return false;
+  res.status(403).json({
+    error: `WhatsApp outbound disabled: ${action}`,
+  });
+  return true;
+}
+
+function appendJsonLine(filePath, payload, label) {
+  try {
+    appendFileSync(filePath, `${JSON.stringify(payload)}\n`);
+    return true;
+  } catch (err) {
+    console.error(`[bridge] Failed to write ${label}:`, err.message);
+    return false;
+  }
+}
+
 function trackSentMessageId(sent) {
   if (sent?.key?.id) {
     recentlySentIds.add(sent.key.id);
@@ -168,7 +206,10 @@ const logger = pino({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
-const MAX_QUEUE_SIZE = 100;
+const MAX_QUEUE_SIZE = parseInt(
+  process.env.WHATSAPP_MAX_QUEUE_SIZE || (SYNC_FULL_HISTORY ? '5000' : '100'),
+  10,
+);
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
@@ -186,8 +227,8 @@ async function startSocket() {
     auth: state,
     logger,
     printQRInTerminal: false,
-    browser: ['Hermes Agent', 'Chrome', '120.0'],
-    syncFullHistory: false,
+    browser: ['Papercut Agents', 'Desktop', '1.0'],
+    syncFullHistory: SYNC_FULL_HISTORY,
     markOnlineOnConnect: false,
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
@@ -205,6 +246,14 @@ async function startSocket() {
 
     if (qr) {
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
+      if (QR_FILE) {
+        try {
+          writeFileSync(QR_FILE, qr);
+          console.log(`QR_FILE=${QR_FILE}`);
+        } catch (err) {
+          console.error('[bridge] Failed to write QR file:', err.message);
+        }
+      }
       qrcode.generate(qr, { small: true });
       console.log('\nWaiting for scan...\n');
     }
@@ -236,10 +285,11 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  async function enqueueMessages(messages, type, historyMeta = {}) {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
-    if (type !== 'notify' && type !== 'append') return;
+    const isHistory = type === 'history';
+    if (!isHistory && type !== 'notify' && type !== 'append') return;
 
     const botIds = Array.from(new Set([
       normalizeWhatsAppId(sock.user?.id),
@@ -250,10 +300,11 @@ async function startSocket() {
       if (!msg.message) continue;
 
       const chatId = msg.key.remoteJid;
+      if (chatId?.includes('status')) continue;
       if (WHATSAPP_DEBUG) {
         try {
           console.log(JSON.stringify({
-            event: 'upsert', type,
+            event: isHistory ? 'history_message' : 'upsert', type,
             fromMe: !!msg.key.fromMe, chatId,
             senderId: msg.key.participant || chatId,
             messageKeys: Object.keys(msg.message || {}),
@@ -265,9 +316,8 @@ async function startSocket() {
       const senderNumber = senderId.replace(/@.*/, '');
 
       // Handle fromMe messages based on mode
-      if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) continue;
-
+      if (msg.key.fromMe && !isHistory) {
+        if (isGroup) continue;
         if (WHATSAPP_MODE === 'bot') {
           // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
           continue;
@@ -438,13 +488,73 @@ async function startSocket() {
         hasQuotedMessage,
         botIds,
         timestamp: msg.messageTimestamp,
+        fromMe: !!msg.key.fromMe,
+        historySync: isHistory,
+        historySyncType: historyMeta.syncType || null,
+        historyIsLatest: historyMeta.isLatest ?? null,
       };
+
+      if (isHistory) {
+        appendJsonLine(HISTORY_SYNC_PATH, event, 'history sync event');
+        if (!HISTORY_TO_LIVE_QUEUE) {
+          continue;
+        }
+      }
 
       messageQueue.push(event);
       if (messageQueue.length > MAX_QUEUE_SIZE) {
         messageQueue.shift();
       }
     }
+  }
+
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    await enqueueMessages(messages || [], type);
+  });
+
+  sock.ev.on('messaging-history.set', async ({
+    chats = [],
+    contacts = [],
+    messages = [],
+    syncType,
+    isLatest,
+  }) => {
+    appendJsonLine(HISTORY_METADATA_PATH, {
+      recordType: 'history_batch',
+      capturedAt: new Date().toISOString(),
+      syncType,
+      isLatest,
+      chatCount: chats.length,
+      contactCount: contacts.length,
+      messageCount: messages.length,
+    }, 'history batch metadata');
+    for (const chat of chats) {
+      appendJsonLine(HISTORY_METADATA_PATH, {
+        recordType: 'chat',
+        capturedAt: new Date().toISOString(),
+        syncType,
+        isLatest,
+        chat,
+      }, 'history chat metadata');
+    }
+    for (const contact of contacts) {
+      appendJsonLine(HISTORY_METADATA_PATH, {
+        recordType: 'contact',
+        capturedAt: new Date().toISOString(),
+        syncType,
+        isLatest,
+        contact,
+      }, 'history contact metadata');
+    }
+    console.log(JSON.stringify({
+      event: 'history_sync',
+      chats: chats.length,
+      contacts: contacts.length,
+      messages: messages.length,
+      syncType,
+      isLatest,
+    }));
+    await enqueueMessages(messages || [], 'history', { syncType, isLatest });
   });
 }
 
@@ -491,6 +601,7 @@ app.get('/messages', (req, res) => {
 
 // Send a message
 app.post('/send', async (req, res) => {
+  if (rejectWhenOutboundDisabled(res, 'send')) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -524,6 +635,7 @@ app.post('/send', async (req, res) => {
 
 // Edit a previously sent message
 app.post('/edit', async (req, res) => {
+  if (rejectWhenOutboundDisabled(res, 'edit')) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -577,6 +689,7 @@ function inferMediaType(ext) {
 
 // Send media (image, video, document) natively
 app.post('/send-media', async (req, res) => {
+  if (rejectWhenOutboundDisabled(res, 'send-media')) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
@@ -654,6 +767,7 @@ app.post('/send-media', async (req, res) => {
 
 // Typing indicator
 app.post('/typing', async (req, res) => {
+  if (rejectWhenOutboundDisabled(res, 'typing')) return;
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
@@ -722,6 +836,17 @@ if (PAIR_ONLY) {
       console.log(`🔒 No WHATSAPP_ALLOWED_USERS set — incoming messages are rejected.`);
       console.log(`   Set WHATSAPP_ALLOWED_USERS=<phone> to authorize specific users,`);
       console.log(`   or WHATSAPP_ALLOWED_USERS=* for an explicit open bot.`);
+    }
+    if (OUTBOUND_DISABLED) {
+      console.log('🔒 Outbound WhatsApp send/edit/media/typing endpoints are disabled.');
+    }
+    if (SYNC_FULL_HISTORY) {
+      console.log(`🕰️  Full WhatsApp history sync is enabled (queue max: ${MAX_QUEUE_SIZE}).`);
+      console.log(`🕰️  History sync file: ${HISTORY_SYNC_PATH}`);
+      console.log(`🕰️  History metadata file: ${HISTORY_METADATA_PATH}`);
+      if (!HISTORY_TO_LIVE_QUEUE) {
+        console.log('🕰️  History sync will not enter the live message queue.');
+      }
     }
     console.log();
     startSocket();
