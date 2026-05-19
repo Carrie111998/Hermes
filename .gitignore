@@ -70,3 +70,8 @@ mini-swe-agent/
 result
 website/static/api/skills-index.json
 models-dev-upstream/
+
+# External projects / utilities
+ai-job-searcher/
+docker/claude-code/
+01-backup/
