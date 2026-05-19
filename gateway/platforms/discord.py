@@ -4383,6 +4383,72 @@ class DiscordAdapter(BasePlatformAdapter):
                     raise Exception(f"HTTP {resp.status}")
                 return await resp.read()
 
+    async def _forward_embed_to_line(
+        self,
+        message: DiscordMessage,
+        embed_images: List[str],
+        summary_text: str,
+        line_chat_id: str,
+    ) -> None:
+        """Forward a Frigate-style embed alert to LINE.
+
+        Downloads the first embed image, builds a short text summary, and
+        pushes both to the configured LINE chat via the LINE adapter.
+        Fire-and-forget — failures are logged but never raised.
+        """
+        try:
+            from gateway.config import Platform
+
+            adapter = self.gateway_runner.adapters.get(Platform("line"))
+            if not adapter:
+                logger.debug("LINE forward: LINE adapter not connected")
+                return
+
+            # Build short text: "🚨 Person detected / 📷 mipc / 🕐 09:29"
+            # Truncate each field to keep the message compact for LINE groups.
+            text = summary_text.strip() if summary_text else ""
+            if text:
+                text = text[:120]  # keep it short even before the 200-char cap
+            if not text:
+                text = "🚨 Camera alert"
+
+            # Download the first embed image to a local temp file so LINE can
+            # re-serve it via LINE_PUBLIC_URL (LINE requires HTTPS URLs).
+            image_url = embed_images[0]
+            image_path: Optional[str] = None
+            try:
+                import aiohttp
+                timeout = aiohttp.ClientTimeout(total=15.0)
+                async with aiohttp.ClientSession(timeout=timeout) as sess:
+                    async with sess.get(image_url) as resp:
+                        if resp.status < 400:
+                            data = await resp.read()
+                            suffix = ".jpg"
+                            if "png" in (resp.content_type or ""):
+                                suffix = ".png"
+                            import tempfile
+                            tmp = tempfile.NamedTemporaryFile(
+                                delete=False, suffix=suffix
+                            )
+                            tmp.write(data)
+                            tmp.close()
+                            image_path = tmp.name
+            except Exception:
+                logger.debug("LINE forward: failed to download embed image", exc_info=True)
+
+            # Send text first, then image if available
+            await adapter.send(line_chat_id, text)
+            if image_path:
+                try:
+                    await adapter.send_image_file(line_chat_id, image_path)
+                finally:
+                    try:
+                        os.unlink(image_path)
+                    except OSError:
+                        pass
+        except Exception:
+            logger.debug("LINE forward: push failed", exc_info=True)
+
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
         # In server channels (not DMs), require the bot to be @mentioned
@@ -4442,6 +4508,30 @@ class DiscordAdapter(BasePlatformAdapter):
                     image_url = getattr(getattr(embed, "thumbnail", None), "url", None)
                 if image_url:
                     embed_images.append(image_url)
+        # ── LINE forwarding for Frigate-style embed notifications ──────
+        # When DISCORD_FORWARD_TO_LINE is set, forward embed-based alerts
+        # (e.g. Frigate NVR camera notifications) to LINE via push API.
+        # Format: "discord_channel_id:line_chat_id" (comma-separated pairs).
+        if message.embeds and embed_images:
+            try:
+                forward_raw = os.getenv("DISCORD_FORWARD_TO_LINE", "")
+                if forward_raw:
+                    forward_map: Dict[str, str] = {}
+                    for pair in forward_raw.split(","):
+                        pair = pair.strip()
+                        if ":" in pair:
+                            dc_ch, line_ch = pair.split(":", 1)
+                            forward_map[dc_ch.strip()] = line_ch.strip()
+                    line_chat_id = forward_map.get(str(message.channel.id))
+                    if line_chat_id:
+                        asyncio.create_task(
+                            self._forward_embed_to_line(
+                                message, embed_images, raw_content, line_chat_id
+                            )
+                        )
+            except Exception:
+                logger.debug("LINE forward setup failed", exc_info=True)
+
         normalized_content = raw_content
         mention_prefix = False
 
