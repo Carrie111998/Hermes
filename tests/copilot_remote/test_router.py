@@ -69,6 +69,37 @@ class TestDiscoverRepos:
         entries = _discover_repos(tmp_path)
         assert entries == []
 
+    def test_workspace_root_appended_when_git_repo(self, tmp_path):
+        """Workspace root with .git is exposed as a fallback RepoEntry."""
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "README.md").write_text("# Monorepo Root\n")
+        repos = tmp_path / "repos" / "org-a" / "sub"
+        repos.mkdir(parents=True)
+        entries = _discover_repos(tmp_path)
+        slugs = [e.slug for e in entries]
+        assert "sub" in slugs
+        assert tmp_path.name in slugs
+        root = next(e for e in entries if e.slug == tmp_path.name)
+        assert root.path == str(tmp_path)
+        # Submodule entries come first; workspace root last.
+        assert slugs[-1] == tmp_path.name
+
+    def test_workspace_root_with_no_repos_dir_still_returned(self, tmp_path):
+        """If repos/ is missing but workspace root is a git repo, fallback applies."""
+        (tmp_path / ".git").mkdir()
+        entries = _discover_repos(tmp_path)
+        assert len(entries) == 1
+        assert entries[0].slug == tmp_path.name
+        assert entries[0].path == str(tmp_path)
+
+    def test_workspace_root_not_added_when_not_git_repo(self, tmp_path):
+        """No .git at workspace root → no fallback entry."""
+        repos = tmp_path / "repos" / "org-a" / "sub"
+        repos.mkdir(parents=True)
+        entries = _discover_repos(tmp_path)
+        slugs = [e.slug for e in entries]
+        assert slugs == ["sub"]
+
 
 # =========================================================================
 # Context building
