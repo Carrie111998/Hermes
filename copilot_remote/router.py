@@ -72,7 +72,7 @@ def _workspace_root_entry(workspace_path: Path) -> Optional[RepoEntry]:
     return RepoEntry(
         slug=slug,
         path=str(workspace_path),
-        readme_summary=readme_text[:2000],
+        readme_summary=readme_text,
         description="Workspace monorepo root (fallback for top-level paths).",
         default_branch=_get_default_branch(workspace_path),
     )
@@ -98,9 +98,17 @@ def _discover_repos(workspace_path: Path = None) -> List[RepoEntry]:
     repos_dir = workspace_path / "repos"
     entries: List[RepoEntry] = []
     if not repos_dir.is_dir():
-        logger.warning("Repos directory not found: %s", _sanitize_for_log(repos_dir))
         root_entry = _workspace_root_entry(workspace_path)
-        return [root_entry] if root_entry else []
+        if root_entry:
+            # Workspace layout doesn't use repos/<org>/... but the root is a
+            # valid git repo — routing can proceed normally, no warning needed.
+            logger.debug("Repos directory not found (%s); using workspace root as sole entry", _sanitize_for_log(repos_dir))
+            return [root_entry]
+        logger.warning(
+            "Repos directory not found and workspace root is not a git repo: %s",
+            _sanitize_for_log(repos_dir),
+        )
+        return []
 
     for org_dir in sorted(repos_dir.iterdir()):
         if not org_dir.is_dir():
@@ -124,7 +132,7 @@ def _discover_repos(workspace_path: Path = None) -> List[RepoEntry]:
             entries.append(RepoEntry(
                 slug=slug,
                 path=str(repo_dir),
-                readme_summary=readme_text[:2000],
+                readme_summary=readme_text,
                 description="",
                 default_branch=default_branch,
             ))

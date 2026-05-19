@@ -346,7 +346,12 @@ def _resolve_repo_from_paths_in_prompt(prompt: str) -> Optional[RepoEntry]:
     if not prompt:
         return None
     ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
-    workspace_root = Path(ws).resolve(strict=False) if ws else None
+    if not ws:
+        # Without a known workspace boundary we cannot safely constrain which
+        # git repos on the host are valid targets. Fail closed rather than
+        # risk routing to an arbitrary directory based solely on prompt text.
+        return None
+    workspace_root = Path(ws).resolve(strict=False)
 
     for match in _PATH_TOKEN_RE.finditer(prompt):
         token = match.group(1)
