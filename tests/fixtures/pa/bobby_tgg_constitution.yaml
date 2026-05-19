@@ -35,6 +35,7 @@ job_briefs:
       - memory
       - file
       - pa-business
+      - pa-photo-pair
     disabled_toolsets:
       - web
       - shell

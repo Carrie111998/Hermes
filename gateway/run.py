@@ -1346,6 +1346,15 @@ def _record_pa_agent_action(
         return False
 
 
+PA_PHOTO_PAIR_TOOLSET = "pa-photo-pair"
+
+
+def _pa_job_toolset_enabled(pa_context: Any, toolset_name: str) -> bool:
+    job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
+    enabled_toolsets = getattr(job_brief, "enabled_toolsets", ()) if job_brief is not None else ()
+    return toolset_name in {str(toolset).strip() for toolset in enabled_toolsets if str(toolset).strip()}
+
+
 def _classify_and_record_photo_pair(
     runner: Any,
     pa_context: Any,
@@ -1358,8 +1367,10 @@ def _classify_and_record_photo_pair(
 ) -> dict[str, Any] | None:
     if not getattr(event, "media_refs", None):
         return None
+    if not _pa_job_toolset_enabled(pa_context, PA_PHOTO_PAIR_TOOLSET):
+        return None
     try:
-        from gateway.photo_pair_classifier import (
+        from tools.pa_photo_pair_classifier import (
             classify_photo_pair,
             photo_message_from_event,
             remember_photo_message,

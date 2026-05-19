@@ -176,6 +176,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "pa-photo-pair": {
+        "description": "Opt-in PA before/after photo-pair classifier for sprucing-style workflows",
+        "tools": [],
+        "includes": [],
+    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",

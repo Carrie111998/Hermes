@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from gateway.photo_pair_classifier import classify_photo_pair
+from tools.pa_photo_pair_classifier import classify_photo_pair
 from gateway.platforms.base import MessageEvent, MessageType
 
 
@@ -128,7 +128,7 @@ def test_gateway_wrapper_records_photo_pair_action(monkeypatch):
 
     payload = gateway_run._classify_and_record_photo_pair(
         SimpleNamespace(),
-        object(),
+        SimpleNamespace(job_brief=SimpleNamespace(enabled_toolsets=("pa-photo-pair",))),
         _photo_event(base + timedelta(seconds=30)),
         [_photo_history_entry(base)],
         session_key="whatsapp:chat-1",
@@ -140,3 +140,28 @@ def test_gateway_wrapper_records_photo_pair_action(monkeypatch):
     assert recorded[0]["action_type"] == "photo-pair-classified"
     assert recorded[0]["status"] == "executed"
     assert recorded[0]["payload"]["before"]["file_id"] == "before-file"
+
+
+def test_gateway_wrapper_skips_photo_pair_without_toolset(monkeypatch):
+    from gateway import run as gateway_run
+
+    base = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+    recorded = []
+    monkeypatch.setattr(
+        gateway_run,
+        "_record_pa_agent_action",
+        lambda _ctx, **kwargs: recorded.append(kwargs) or True,
+    )
+
+    payload = gateway_run._classify_and_record_photo_pair(
+        SimpleNamespace(),
+        SimpleNamespace(job_brief=SimpleNamespace(enabled_toolsets=("memory", "file"))),
+        _photo_event(base + timedelta(seconds=30)),
+        [_photo_history_entry(base)],
+        session_key="whatsapp:chat-1",
+        source="whatsapp",
+        turn_id="turn-1",
+    )
+
+    assert payload is None
+    assert recorded == []

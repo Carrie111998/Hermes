@@ -1,4 +1,4 @@
-"""Photo-pair classification helpers for PA claim workflows."""
+"""Opt-in PA photo-pair classification helpers for sprucing workflows."""
 
 from __future__ import annotations
 
