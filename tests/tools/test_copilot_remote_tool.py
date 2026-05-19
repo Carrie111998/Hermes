@@ -278,6 +278,12 @@ class TestResolveRepoFromPathsInPrompt:
         assert result is not None
         assert result.slug == workspace.name
 
+    def test_bare_dot_routes_to_workspace_root(self, workspace):
+        # Bare "." must not be erased by rstrip before the workspace-anchor check.
+        result = self._resolve("create a test file in .")
+        assert result is not None
+        assert result.slug == workspace.name
+
     def test_tilde_path_expands_via_home(self, workspace, monkeypatch):
         # Set HOME so ~/<workspace-name>/docs lands inside the workspace.
         monkeypatch.setenv("HOME", str(workspace.parent))

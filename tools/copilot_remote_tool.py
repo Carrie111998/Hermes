@@ -311,7 +311,21 @@ def _expand_prompt_path(token: str) -> Optional[Path]:
     I'm in".
     """
     import os
-    token = token.strip().rstrip(".,;:!?)")
+    token = token.strip()
+    if not token:
+        return None
+    # Handle workspace-anchor tokens before stripping trailing punctuation so
+    # that a bare "." is not erased by rstrip(".,;:!?)") — "." is both a
+    # valid path token (workspace root) and a common sentence-ending character.
+    if token in (".", "./") or token.startswith("./"):
+        ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
+        if not ws:
+            return None
+        remainder = token[2:] if token.startswith("./") else ""
+        return Path(ws) / remainder if remainder else Path(ws)
+    # For all other token forms, strip trailing sentence punctuation that a
+    # user might append (e.g. "create ./docs/foo.md." or "add /abs/path,").
+    token = token.rstrip(".,;:!?)")
     if not token:
         return None
     if token.startswith("~"):
@@ -319,12 +333,6 @@ def _expand_prompt_path(token: str) -> Optional[Path]:
         if not home:
             return None
         return Path(home + token[1:])
-    if token in (".", "./") or token.startswith("./"):
-        ws = os.environ.get("HERMES_WORKSPACE_PATH", "")
-        if not ws:
-            return None
-        remainder = token[2:] if token.startswith("./") else ""
-        return Path(ws) / remainder if remainder else Path(ws)
     if token.startswith("/"):
         return Path(token)
     if token == "repos/" or token.startswith("repos/"):
