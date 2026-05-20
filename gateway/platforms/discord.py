@@ -4414,7 +4414,6 @@ class DiscordAdapter(BasePlatformAdapter):
                                 suffix = ".jpg"
                                 if "png" in (resp.content_type or ""):
                                     suffix = ".png"
-                                import tempfile
                                 tmp = tempfile.NamedTemporaryFile(
                                     delete=False, suffix=suffix
                                 )
@@ -4422,7 +4421,7 @@ class DiscordAdapter(BasePlatformAdapter):
                                 tmp.close()
                                 image_path = tmp.name
                 except Exception:
-                    logger.debug("LINE forward: failed to download embed image", exc_info=True)
+                    logger.warning("LINE forward: failed to download embed image", exc_info=True)
 
             # Send text first, then image if available
             await adapter.send(line_chat_id, text)
@@ -4435,7 +4434,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     except OSError:
                         pass
         except Exception:
-            logger.debug("LINE forward: push failed", exc_info=True)
+            logger.warning("LINE forward: push failed", exc_info=True)
 
     async def _handle_message(self, message: DiscordMessage) -> None:
         """Handle incoming Discord messages."""
