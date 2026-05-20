@@ -10,6 +10,11 @@ INSTALL_DIR="/opt/hermes"
 # optionally remap the hermes user/group to match host-side ownership, fix volume
 # permissions, then re-exec as hermes.
 if [ "$(id -u)" = "0" ]; then
+    # Ensure /usr/bin/python exists for scripts that call 'python' instead of 'python3'
+    if [ ! -e /usr/bin/python ] && [ -e /usr/bin/python3 ]; then
+        ln -s /usr/bin/python3 /usr/bin/python 2>/dev/null || true
+    fi
+
     if [ -n "$HERMES_UID" ] && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
         echo "Changing hermes UID to $HERMES_UID"
         usermod -u "$HERMES_UID" hermes
