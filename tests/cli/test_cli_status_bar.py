@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import cli as cli_mod
 from cli import HermesCLI
+from hermes_cli.skin_engine import set_active_skin
 
 
 def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
@@ -92,10 +93,57 @@ class TestCLIStatusBar:
         # stale prompt/input cells visible after resize.
         assert cli_mod._estimate_tui_input_height(["abcdef"], "⚔ ", 3) == 3
 
+    def test_input_height_counts_wide_characters_using_cell_width(self):
+        # Prompt width (2 cells) + ten CJK chars (20 cells) = 22 display cells,
+        # which wraps to two rows at 14 terminal columns.
+        assert cli_mod._estimate_tui_input_height(["你" * 10], "❯ ", 14) == 2
 
+    def test_input_height_clamps_zero_width_to_one_cell(self):
+        # Some terminals briefly report zero columns during resize. Treat that
+        # as a one-cell terminal rather than falling back to a fake wide width.
+        assert cli_mod._estimate_tui_input_height(["abcd"], "", 0) == 4
 
+    def test_build_status_bar_text_no_cost_in_status_bar(self):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10000,
+            completion_tokens=5000,
+            total_tokens=15000,
+            api_calls=7,
+            context_tokens=50000,
+            context_length=200_000,
+        )
 
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "$" not in text  # cost is never shown in status bar
 
+    def test_build_status_bar_text_collapses_for_narrow_terminal(self):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10000,
+            completion_tokens=2400,
+            total_tokens=12400,
+            api_calls=7,
+            context_tokens=12400,
+            context_length=200_000,
+        )
+
+        set_active_skin("default")
+        text = cli_obj._build_status_bar_text(width=60)
+
+        assert "⚕" in text
+        assert "$0.06" not in text  # cost hidden by default
+        assert "15m" in text
+        assert "200K" not in text
+
+    def test_build_status_bar_text_handles_missing_agent(self):
+        cli_obj = _make_cli()
+
+        set_active_skin("default")
+        text = cli_obj._build_status_bar_text(width=100)
+
+        assert "⚕" in text
+        assert "claude-sonnet-4-20250514" in text
 
     def test_compression_count_shown_in_wide_status_bar(self):
         cli_obj = _attach_agent(
