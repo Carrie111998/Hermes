@@ -45,9 +45,17 @@ except ImportError:
 
 import sys
 from pathlib import Path as _Path
-sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+
+_PROJECT_ROOT = str(_Path(__file__).resolve().parents[2])
+sys.path.insert(0, _PROJECT_ROOT)
 
 from gateway.config import Platform, PlatformConfig
+
+# Clean up so the mutation does not leak to other modules.
+try:
+    sys.path.remove(_PROJECT_ROOT)
+except ValueError:
+    pass
 import re
 
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
