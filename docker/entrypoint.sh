@@ -137,7 +137,7 @@ case "${HERMES_DASHBOARD:-}" in
         # process in `docker logs`.  stdbuf keeps the pipe line-buffered.
         (
             stdbuf -oL -eL hermes dashboard "${dash_args[@]}" 2>&1 \
-                | sed -u 's/^/[dashboard] /'
+                | sed 's/^/[dashboard] /'
         ) &
         ;;
 esac

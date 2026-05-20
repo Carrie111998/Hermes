@@ -65,7 +65,7 @@ case "${HERMES_DASHBOARD:-}" in
         # --insecure is required for non-localhost binding.
         (
             stdbuf -oL -eL hermes dashboard --host 0.0.0.0 --port 9119 --no-open --insecure --tui 2>&1 \
-                | sed -u 's/^/[dashboard] /'
+                | sed 's/^/[dashboard] /'
         ) &
         ;;
     *)
