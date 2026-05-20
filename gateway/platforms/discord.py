@@ -3891,9 +3891,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
         try:
-            parent = self._client.get_channel(parent_id)
-            if parent is None:
-                parent = await self._client.fetch_channel(parent_id)
+            parent = await self._resolve_channel(str(parent_id))
         except Exception as exc:
             logger.warning(
                 "[%s] Handoff thread: cannot resolve parent %s: %s",

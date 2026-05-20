@@ -104,8 +104,10 @@ echo "── Waiting for health check ──────────────
 if $DRY_RUN; then
   echo -e "${YELLOW}[dry-run]${NC} health check (skipped)"
 else
+GATEWAY_CONTAINER_NAME=${GATEWAY_CONTAINER_NAME:-gateway}
+
   for i in $(seq 1 15); do
-    STATUS=$(docker inspect gateway --format '{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+    STATUS=$(docker inspect "$GATEWAY_CONTAINER_NAME" --format '{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
     if [ "$STATUS" = "healthy" ]; then
       echo -e "${GREEN}✓${NC} gateway healthy"
       break
@@ -114,7 +116,7 @@ else
     sleep 2
   done
   if [ "$STATUS" != "healthy" ]; then
-    echo -e "${RED}error: gateway health check failed (status: $STATUS)${NC}" >&2
+    echo -e "${RED}error: $GATEWAY_CONTAINER_NAME health check failed (status: $STATUS)${NC}" >&2
     exit 1
   fi
 fi
