@@ -447,12 +447,28 @@ class _LineClient:
     """
 
     def __init__(self, channel_access_token: str, *, timeout: float = 15.0) -> None:
+        import aiohttp
+
         self._token = channel_access_token
         self._timeout = timeout
         self._headers = {
             "Authorization": f"Bearer {channel_access_token}",
             "Content-Type": "application/json",
         }
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> "aiohttp.ClientSession":
+        if self._session is None or self._session.closed:
+            import aiohttp
+
+            timeout = aiohttp.ClientTimeout(total=self._timeout)
+            self._session = aiohttp.ClientSession(timeout=timeout)
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
     async def _retry_api_call(self, call_fn, *, max_retries: int = 3, base_delay: float = 1.0):
         """Execute an API call with exponential backoff on 429/5xx and network errors.
@@ -484,47 +500,41 @@ class _LineClient:
         raise last_exc  # type: ignore[misc]
 
     async def reply(self, reply_token: str, messages: List[Dict[str, Any]]) -> None:
-        import aiohttp
-
         async def _do():
-            timeout = aiohttp.ClientTimeout(total=self._timeout)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    LINE_REPLY_URL,
-                    headers=self._headers,
-                    json={"replyToken": reply_token, "messages": messages},
-                ) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        logger.warning(
-                            "LINE reply %d for messages: %s",
-                            resp.status,
-                            json.dumps(messages, ensure_ascii=False)[:500],
-                        )
-                        raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
+            session = await self._get_session()
+            async with session.post(
+                LINE_REPLY_URL,
+                headers=self._headers,
+                json={"replyToken": reply_token, "messages": messages},
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "LINE reply %d for messages: %s",
+                        resp.status,
+                        json.dumps(messages, ensure_ascii=False)[:500],
+                    )
+                    raise RuntimeError(f"LINE reply {resp.status}: {body[:200]}")
 
         await self._retry_api_call(_do)
 
     async def push(self, chat_id: str, messages: List[Dict[str, Any]]) -> None:
-        import aiohttp
-
         async def _do():
-            timeout = aiohttp.ClientTimeout(total=self._timeout)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    LINE_PUSH_URL,
-                    headers=self._headers,
-                    json={"to": chat_id, "messages": messages},
-                ) as resp:
-                    if resp.status >= 400:
-                        body = await resp.text()
-                        logger.warning(
-                            "LINE push %d to %s for messages: %s",
-                            resp.status,
-                            chat_id,
-                            json.dumps(messages, ensure_ascii=False)[:500],
-                        )
-                        raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
+            session = await self._get_session()
+            async with session.post(
+                LINE_PUSH_URL,
+                headers=self._headers,
+                json={"to": chat_id, "messages": messages},
+            ) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.warning(
+                        "LINE push %d to %s for messages: %s",
+                        resp.status,
+                        chat_id,
+                        json.dumps(messages, ensure_ascii=False)[:500],
+                    )
+                    raise RuntimeError(f"LINE push {resp.status}: {body[:200]}")
 
         await self._retry_api_call(_do)
 
@@ -532,42 +542,43 @@ class _LineClient:
         """Loading indicator (DM only). LINE rejects this for groups/rooms."""
         if not chat_id or not chat_id.startswith("U"):
             return
-        import aiohttp
         # LINE caps loadingSeconds in 5-step increments, max 60.
         clamped = max(5, min(60, (seconds // 5) * 5 or 5))
         try:
-            timeout = aiohttp.ClientTimeout(total=5.0)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                await session.post(
-                    LINE_LOADING_URL,
-                    headers=self._headers,
-                    json={"chatId": chat_id, "loadingSeconds": clamped},
-                )
+            import aiohttp
+
+            session = await self._get_session()
+            await session.post(
+                LINE_LOADING_URL,
+                headers=self._headers,
+                json={"chatId": chat_id, "loadingSeconds": clamped},
+                timeout=aiohttp.ClientTimeout(total=5.0),
+            )
         except Exception as exc:  # best-effort; never raise
             logger.debug("LINE loading indicator failed: %s", exc)
 
     async def fetch_content(self, message_id: str) -> bytes:
         """Download an inbound media message's binary content."""
         import aiohttp
+
+        session = await self._get_session()
         url = LINE_CONTENT_URL_FMT.format(message_id=message_id)
-        timeout = aiohttp.ClientTimeout(total=30.0)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, headers={"Authorization": f"Bearer {self._token}"}) as resp:
-                if resp.status >= 400:
-                    raise RuntimeError(f"LINE content {resp.status}")
-                return await resp.read()
+        async with session.get(
+            url, headers={"Authorization": f"Bearer {self._token}"}, timeout=aiohttp.ClientTimeout(total=30.0)
+        ) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"LINE content {resp.status}")
+            return await resp.read()
 
     async def get_bot_user_id(self) -> Optional[str]:
         """Fetch this channel's own userId so we can filter self-messages."""
-        import aiohttp
-        timeout = aiohttp.ClientTimeout(total=10.0)
         try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(LINE_BOT_INFO_URL, headers=self._headers) as resp:
-                    if resp.status >= 400:
-                        return None
-                    data = await resp.json()
-                    return data.get("userId")
+            session = await self._get_session()
+            async with session.get(LINE_BOT_INFO_URL, headers=self._headers) as resp:
+                if resp.status >= 400:
+                    return None
+                data = await resp.json()
+                return data.get("userId")
         except Exception:
             return None
 
@@ -579,21 +590,19 @@ class _LineClient:
         Returns the parsed JSON body (which includes ``displayName``) on
         success, or ``None`` on any error (4xx, 5xx, timeout, parse failure).
         """
-        import aiohttp
         if chat_type == "group":
             url = f"https://api.line.me/v2/bot/group/{chat_id}/member/{user_id}"
         elif chat_type == "room":
             url = f"https://api.line.me/v2/bot/room/{chat_id}/member/{user_id}"
         else:
             return None
-        timeout = aiohttp.ClientTimeout(total=3.0)
         try:
             async def _do():
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, headers=self._headers) as resp:
-                        if resp.status >= 400:
-                            raise RuntimeError(f"LINE member_profile {resp.status}")
-                        return await resp.json(content_type=None)
+                session = await self._get_session()
+                async with session.get(url, headers=self._headers) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"LINE member_profile {resp.status}")
+                    return await resp.json(content_type=None)
             return await self._retry_api_call(_do, max_retries=2, base_delay=0.5)
         except Exception:
             return None
@@ -1009,6 +1018,13 @@ class LineAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._lock_key = None
+
+        if self._client is not None:
+            try:
+                await self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
     # ------------------------------------------------------------------
     # Webhook handlers

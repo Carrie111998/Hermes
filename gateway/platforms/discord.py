@@ -65,7 +65,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     SUPPORTED_DOCUMENT_TYPES,
 )
-from tools.url_safety import is_safe_url
+from tools.url_safety import is_safe_url, is_safe_url_async
 
 
 def _clean_discord_id(entry: str) -> str:
@@ -593,6 +593,18 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+
+    async def _resolve_channel(self, channel_id: str) -> Optional[Any]:
+        """Resolve a channel by ID, trying in-memory cache first then API fetch."""
+        if not self._client:
+            return None
+        channel = self._client.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self._client.fetch_channel(int(channel_id))
+            except Exception:
+                pass
+        return channel
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -1393,16 +1405,12 @@ class DiscordAdapter(BasePlatformAdapter):
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
-                channel = self._client.get_channel(int(thread_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(thread_id))
+                channel = await self._resolve_channel(thread_id)
                 if not channel:
                     return SendResult(success=False, error=f"Thread {thread_id} not found")
             else:
                 # Get the parent channel
-                channel = self._client.get_channel(int(chat_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._resolve_channel(chat_id)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
@@ -1605,9 +1613,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._resolve_channel(chat_id)
             msg = await channel.fetch_message(int(message_id))
             formatted = self.format_message(content)
             if len(formatted) > self.MAX_MESSAGE_LENGTH:
@@ -1633,9 +1639,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        channel = self._client.get_channel(int(chat_id))
-        if not channel:
-            channel = await self._client.fetch_channel(int(chat_id))
+        channel = await self._resolve_channel(chat_id)
         if not channel:
             return SendResult(success=False, error=f"Channel {chat_id} not found")
 
@@ -1681,9 +1685,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._resolve_channel(chat_id)
             if not channel:
                 logger.warning("[%s] Channel %s not found for multi-image send", self.name, chat_id)
                 return
@@ -1713,7 +1715,7 @@ class DiscordAdapter(BasePlatformAdapter):
                             continue
                         files.append(_discord_mod.File(local_path, filename=os.path.basename(local_path)))
                     else:
-                        if not is_safe_url(image_url):
+                        if not await is_safe_url_async(image_url):
                             logger.warning("[%s] Blocked unsafe image URL in batch", self.name)
                             continue
                         # Download to BytesIO so it renders inline
@@ -1810,9 +1812,7 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             import io
 
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._resolve_channel(chat_id)
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
 
@@ -2529,16 +2529,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        if not is_safe_url(image_url):
+        if not await is_safe_url_async(image_url):
             logger.warning("[%s] Blocked unsafe image URL during Discord send_image", self.name)
             return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._resolve_channel(chat_id)
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
 
@@ -2608,16 +2606,14 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        if not is_safe_url(animation_url):
+        if not await is_safe_url_async(animation_url):
             logger.warning("[%s] Blocked unsafe animation URL during Discord send_animation", self.name)
             return await super().send_animation(chat_id, animation_url, caption, reply_to, metadata=metadata)
 
         try:
             import aiohttp
 
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._resolve_channel(chat_id)
             if not channel:
                 return SendResult(success=False, error=f"Channel {chat_id} not found")
 
@@ -2752,9 +2748,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return {"name": "Unknown", "type": "dm"}
 
         try:
-            channel = self._client.get_channel(int(chat_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+            channel = await self._resolve_channel(chat_id)
 
             if not channel:
                 return {"name": str(chat_id), "type": "dm"}
@@ -3757,13 +3751,7 @@ class DiscordAdapter(BasePlatformAdapter):
         channel_id = getattr(interaction, "channel_id", None)
         if channel_id is None:
             return None
-        channel = self._client.get_channel(int(channel_id))
-        if channel is not None:
-            return channel
-        try:
-            return await self._client.fetch_channel(int(channel_id))
-        except Exception:
-            return None
+        return await self._resolve_channel(channel_id)
 
     async def _create_thread(
         self,
@@ -3979,9 +3967,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
 
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
+            channel = await self._resolve_channel(target_id)
 
             # Discord embed description limit is 4096; show full command up to that
             max_desc = 4088
@@ -4018,9 +4004,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
 
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
+            channel = await self._resolve_channel(target_id)
 
             # Embed description limit is 4096; message usually fits easily.
             max_desc = 4088
@@ -4072,9 +4056,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
 
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
+            channel = await self._resolve_channel(target_id)
 
             # Discord embed description limit is 4096; trim conservatively.
             max_desc = 4088
@@ -4135,9 +4117,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
+            channel = await self._resolve_channel(target_id)
 
             default_hint = f" (default: {default})" if default else ""
             embed = discord.Embed(
@@ -4179,9 +4159,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
 
-            channel = self._client.get_channel(int(target_id))
-            if not channel:
-                channel = await self._client.fetch_channel(int(target_id))
+            channel = await self._resolve_channel(target_id)
 
             try:
                 from hermes_cli.providers import get_label
@@ -4365,7 +4343,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return raw_bytes
 
         # Fallback: SSRF-gated URL download.
-        if not is_safe_url(att.url):
+        if not await is_safe_url_async(att.url):
             raise ValueError(
                 f"Blocked unsafe attachment URL (SSRF protection): {att.url}"
             )
@@ -4415,7 +4393,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Download the first embed image to a local temp file so LINE can
             # re-serve it via LINE_PUBLIC_URL (LINE requires HTTPS URLs).
             image_url = embed_images[0]
-            if not is_safe_url(image_url):
+            if not await is_safe_url_async(image_url):
                 logger.warning("LINE forward: blocked unsafe image URL: %s", image_url)
                 image_url = None
             image_path: Optional[str] = None
@@ -4489,7 +4467,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Webhook bots post embeds with empty message.content, so we synthesise
         # readable text from the embed fields so Hermes can analyse them.
         embed_images: list[str] = []
-        if not raw_content and message.embeds:
+        if not raw_content and getattr(message, 'embeds', []):
             embed_texts = []
             for embed in message.embeds:
                 parts = []
@@ -4510,7 +4488,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     embed_images.append(image_url)
             if embed_texts:
                 raw_content = "\n\n".join(embed_texts)
-        elif message.embeds:
+        elif getattr(message, 'embeds', []):
             # Raw content exists but still collect embed images
             for embed in message.embeds:
                 image_url = getattr(getattr(embed, "image", None), "url", None)
@@ -4522,7 +4500,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # When DISCORD_FORWARD_TO_LINE is set, forward embed-based alerts
         # (e.g. Frigate NVR camera notifications) to LINE via push API.
         # Format: "discord_channel_id:line_chat_id" (comma-separated pairs).
-        if message.embeds and embed_images:
+        if getattr(message, 'embeds', []) and embed_images:
             try:
                 forward_raw = os.getenv("DISCORD_FORWARD_TO_LINE", "")
                 if forward_raw:

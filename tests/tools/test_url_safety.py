@@ -16,6 +16,10 @@ import pytest
 
 
 class TestIsSafeUrl:
+    def setup_method(self):
+        from tools.url_safety import _DNS_CACHE
+        _DNS_CACHE.clear()
+
     def test_public_url_allowed(self):
         with patch("socket.getaddrinfo", return_value=[
             (2, 1, 6, "", ("93.184.216.34", 0)),
@@ -420,6 +424,10 @@ class TestAllowPrivateUrlsIntegration:
 
 class TestIsAlwaysBlockedUrl:
     """The always-blocked floor — cloud metadata only, narrower than is_safe_url."""
+
+    def setup_method(self):
+        from tools.url_safety import _DNS_CACHE
+        _DNS_CACHE.clear()
 
     # -- The sentinel set that must always block --------------------------------
 

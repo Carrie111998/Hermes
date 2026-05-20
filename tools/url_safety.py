@@ -23,10 +23,13 @@ Limitations (documented, not fixable at pre-flight level):
     where redirect handling is on their servers.
 """
 
+import asyncio
 import ipaddress
 import logging
 import os
 import socket
+import time
+from typing import Any, Dict, Tuple
 from urllib.parse import urlparse
 
 from utils import is_truthy_value
@@ -68,6 +71,45 @@ _TRUSTED_PRIVATE_IP_HOSTS = frozenset({
 # Must be blocked explicitly. Used by carrier-grade NAT, Tailscale/WireGuard
 # VPNs, and some cloud internal networks.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+# ---------------------------------------------------------------------------
+# DNS resolution cache — mitigates blocking I/O in async event loops
+# ---------------------------------------------------------------------------
+_DNS_CACHE: Dict[str, Tuple[Any, float]] = {}
+_DNS_CACHE_TTL = 60.0  # seconds
+
+
+def _cached_getaddrinfo(hostname: str) -> Any:
+    """Resolve hostname with a short-lived in-process cache.
+
+    DNS lookups via :func:`socket.getaddrinfo` are blocking syscalls.
+    In an asyncio event loop this stalls all other tasks.  We cache
+    successful results for ``_DNS_CACHE_TTL`` seconds so that
+    repeated safety checks for the same host (e.g. media CDN URLs)
+    do not block the loop.
+    """
+    now = time.monotonic()
+    cached = _DNS_CACHE.get(hostname)
+    if cached is not None:
+        result, expiry = cached
+        if now < expiry:
+            return result
+    result = socket.getaddrinfo(
+        hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
+    )
+    _DNS_CACHE[hostname] = (result, now + _DNS_CACHE_TTL)
+    return result
+
+
+async def _cached_getaddrinfo_async(hostname: str) -> Any:
+    """Async wrapper around :func:`_cached_getaddrinfo`.
+
+    Runs the blocking syscall in the default thread executor so it
+    does not stall the asyncio event loop.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _cached_getaddrinfo, hostname)
+
 
 # ---------------------------------------------------------------------------
 # Global toggle: allow private/internal IP resolution
@@ -211,9 +253,7 @@ def is_always_blocked_url(url: str) -> bool:
         # Hostname → resolve and check every answer.  DNS failure is NOT
         # always-blocked (caller's ordinary path handles that).
         try:
-            addr_info = socket.getaddrinfo(
-                hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM
-            )
+            addr_info = _cached_getaddrinfo(hostname)
         except socket.gaierror:
             return False
 
@@ -281,7 +321,7 @@ def is_safe_url(url: str) -> bool:
 
         # Try to resolve and check IP
         try:
-            addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            addr_info = _cached_getaddrinfo(hostname)
         except socket.gaierror:
             # DNS resolution failed — fail closed. If DNS can't resolve it,
             # the HTTP client will also fail, so blocking loses nothing.
@@ -326,5 +366,80 @@ def is_safe_url(url: str) -> bool:
     except Exception as exc:
         # Fail closed on unexpected errors — don't let parsing edge cases
         # become SSRF bypass vectors
+        logger.warning("Blocked request — URL safety check error for %s: %s", url, exc)
+        return False
+
+
+async def is_safe_url_async(url: str) -> bool:
+    """Async version of :func:`is_safe_url`.
+
+    Uses ``run_in_executor`` for the blocking DNS lookup so it does not
+    stall the asyncio event loop.  Identical logic to the sync variant.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        scheme = (parsed.scheme or "").strip().lower()
+        if scheme not in {"http", "https"}:
+            logger.warning("Blocked request — unsupported URL scheme: %s", scheme or "<empty>")
+            return False
+        if not hostname:
+            return False
+
+        # Block known internal hostnames — ALWAYS, even with toggle on
+        if hostname in _BLOCKED_HOSTNAMES:
+            logger.warning("Blocked request to internal hostname: %s", hostname)
+            return False
+
+        # Check the global toggle AFTER blocking metadata hostnames
+        allow_all_private = _global_allow_private_urls()
+
+        allow_private_ip = _allows_private_ip_resolution(hostname, scheme)
+
+        # Try to resolve and check IP (async, non-blocking)
+        try:
+            addr_info = await _cached_getaddrinfo_async(hostname)
+        except socket.gaierror:
+            # DNS resolution failed — fail closed. If DNS can't resolve it,
+            # the HTTP client will also fail, so blocking loses nothing.
+            logger.warning("Blocked request — DNS resolution failed for: %s", hostname)
+            return False
+
+        for family, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                continue
+
+            # Always block cloud metadata IPs and link-local, even with toggle on
+            if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):
+                logger.warning(
+                    "Blocked request to cloud metadata address: %s -> %s",
+                    hostname, ip_str,
+                )
+                return False
+
+            if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+                logger.warning(
+                    "Blocked request to private/internal address: %s -> %s",
+                    hostname, ip_str,
+                )
+                return False
+
+        if allow_all_private:
+            logger.debug(
+                "Allowing private/internal resolution (security.allow_private_urls=true): %s",
+                hostname,
+            )
+        elif allow_private_ip:
+            logger.debug(
+                "Allowing trusted hostname despite private/internal resolution: %s",
+                hostname,
+            )
+
+        return True
+
+    except Exception as exc:
         logger.warning("Blocked request — URL safety check error for %s: %s", url, exc)
         return False

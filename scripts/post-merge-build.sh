@@ -41,7 +41,7 @@ run() {
     echo -e "${YELLOW}[dry-run]${NC} $*"
   else
     echo -e "${GREEN}[exec]${NC} $*"
-    eval "$@"
+    "$@"
   fi
 }
 
@@ -113,6 +113,10 @@ else
     echo "  ($i/15) gateway status: $STATUS — waiting..."
     sleep 2
   done
+  if [ "$STATUS" != "healthy" ]; then
+    echo -e "${RED}error: gateway health check failed (status: $STATUS)${NC}" >&2
+    exit 1
+  fi
 fi
 
 echo ""
