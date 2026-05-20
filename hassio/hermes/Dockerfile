@@ -64,9 +64,9 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 # Runtime PATH to include .venv
 ENV PATH="/opt/hermes/.venv/bin:${PATH}"
 
-# Copy add-on files
-COPY hassio/hermes/run.sh /
-RUN chmod a+x /run.sh
+# Copy add-on files from the source tree already included in the image.
+# This avoids build context path resolution issues in some environments.
+RUN (cp hassio/hermes/run.sh /run.sh 2>/dev/null || cp run.sh /run.sh) && chmod a+x /run.sh
 
 ARG BUILD_ARCH
 LABEL \
