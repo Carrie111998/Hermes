@@ -35,7 +35,7 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
-from tui_gateway.wiki_api import wiki_scan, wiki_page
+from tui_gateway.wiki_api import wiki_scan, wiki_page, resolve_wiki, wiki_list
 import tui_gateway.wiki_api as wiki_api
 
 logger = logging.getLogger(__name__)
@@ -15463,7 +15463,7 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     try:
         wiki_name = params.get("wiki") or params.get("path")
-        wiki_path = wiki_api.resolve_wiki(wiki_name)
+        wiki_path = resolve_wiki(wiki_name)
         result = wiki_scan(wiki_path)
         return _ok(rid, result)
     except Exception as e:
@@ -15478,7 +15478,7 @@ def _(rid, params: dict) -> dict:
         if not page_path:
             return _err(rid, 4001, "path is required")
         wiki_name = params.get("wiki")
-        wiki_path = wiki_api.resolve_wiki(wiki_name)
+        wiki_path = resolve_wiki(wiki_name)
         result = wiki_page(page_path, wiki_path)
         if result is None:
             return _err(rid, 4040, f"page not found: {page_path}")
@@ -15486,3 +15486,13 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("wiki.page failed")
         return _err(rid, 5051, str(e))
+
+
+@method("wiki.list")
+def _(rid, params: dict) -> dict:
+    try:
+        result = wiki_list()
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("wiki.list failed")
+        return _err(rid, 5052, str(e))
