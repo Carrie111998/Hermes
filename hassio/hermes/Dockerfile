@@ -28,6 +28,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.6 /usr/local/bin/uv /usr/local/bin/uvx /us
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
