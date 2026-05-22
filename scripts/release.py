@@ -41,7 +41,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Home Assistant Add-on config
 HASSIO_CONFIG = REPO_ROOT / "config.yaml"
-HASSIO_DOCKERFILE = REPO_ROOT / "hassio" / "hermes" / "Dockerfile"
+HASSIO_DOCKERFILE = REPO_ROOT / "Dockerfile"
 
 # ──────────────────────────────────────────────────────────────────────
 # Git email → GitHub username mapping
