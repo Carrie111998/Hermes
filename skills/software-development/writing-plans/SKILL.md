@@ -4,6 +4,7 @@ description: Use when you have a spec or requirements for a multi-step task. Cre
 version: 1.1.0
 author: Hermes Agent (adapted from obra/superpowers)
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [planning, design, implementation, workflow, documentation]

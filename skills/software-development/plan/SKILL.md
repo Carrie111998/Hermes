@@ -4,6 +4,7 @@ description: Plan mode for Hermes — inspect context, write a markdown plan int
 version: 1.0.0
 author: Hermes Agent
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [planning, plan-mode, implementation, workflow]
