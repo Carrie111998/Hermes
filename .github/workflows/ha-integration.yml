@@ -1,0 +1,51 @@
+name: Home Assistant Integration Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gateway/platforms/homeassistant.py'
+      - 'tools/homeassistant_tool.py'
+      - 'tests/integration/test_ha_integration.py'
+      - 'tests/fakes/fake_ha_server.py'
+      - '.github/workflows/ha-integration.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'gateway/platforms/homeassistant.py'
+      - 'tools/homeassistant_tool.py'
+      - 'tests/integration/test_ha_integration.py'
+      - 'tests/fakes/fake_ha_server.py'
+      - '.github/workflows/ha-integration.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ha-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.12
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run Home Assistant Integration Tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest tests/integration/test_ha_integration.py -v -m integration -n0

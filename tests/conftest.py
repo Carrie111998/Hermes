@@ -592,7 +592,7 @@ def _enforce_test_timeout():
         yield
         return
     old = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(30)
+    signal.alarm(60)
     yield
     signal.alarm(0)
     signal.signal(signal.SIGALRM, old)

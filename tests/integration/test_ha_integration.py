@@ -50,7 +50,7 @@ class TestGatewayWebSocket:
     async def test_connect_auth_subscribe(self):
         """Full WS handshake succeeds: auth_required -> auth -> auth_ok -> subscribe -> ACK."""
         async with FakeHAServer() as server:
-            adapter = _adapter_for(server)
+            adapter = _adapter_for(server, watch_all=True)
             connected = await adapter.connect()
             assert connected is True
             assert adapter._running is True
@@ -63,7 +63,7 @@ class TestGatewayWebSocket:
         """connect() returns False when the server rejects auth."""
         async with FakeHAServer() as server:
             server.reject_auth = True
-            adapter = _adapter_for(server)
+            adapter = _adapter_for(server, watch_all=True)
             connected = await adapter.connect()
             assert connected is False
 
@@ -71,7 +71,7 @@ class TestGatewayWebSocket:
     async def test_event_received_and_forwarded(self):
         """Server pushes event -> adapter calls handle_message with correct MessageEvent."""
         async with FakeHAServer() as server:
-            adapter = _adapter_for(server)
+            adapter = _adapter_for(server, watch_all=True)
             adapter.handle_message = AsyncMock()
 
             await adapter.connect()
@@ -132,7 +132,7 @@ class TestGatewayWebSocket:
     async def test_disconnect_closes_cleanly(self):
         """disconnect() cancels listener and closes WebSocket."""
         async with FakeHAServer() as server:
-            adapter = _adapter_for(server)
+            adapter = _adapter_for(server, watch_all=True)
             await adapter.connect()
             ws_ref = adapter._ws
 
@@ -272,7 +272,7 @@ class TestSendNotification:
     async def test_send_notification_delivered(self):
         """Adapter send() delivers notification to fake server REST endpoint."""
         async with FakeHAServer() as server:
-            adapter = _adapter_for(server)
+            adapter = _adapter_for(server, watch_all=True)
 
             result = await adapter.send("ha_events", "Test notification from agent")
 
