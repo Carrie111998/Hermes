@@ -477,6 +477,26 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit JSON (structured) instead of the default human table",
     )
 
+    # --- operator views (ATLAS minimal dashboard API in the terminal) ---
+    p_operator = sub.add_parser(
+        "operator",
+        aliases=["ops"],
+        help="Render ATLAS operator graph/health views for this board",
+    )
+    p_operator.add_argument(
+        "--view",
+        choices=[
+            "all", "mission_dag", "blocker_map", "cross_board_handoffs",
+            "stale_queue", "orphan_queue", "mirror_health", "owner_inactivity",
+            "conflict_ledger", "promotion_trail", "ready_unblocked",
+        ],
+        default="all",
+        help="Limit output to one operator view (default: all)",
+    )
+    p_operator.add_argument("--root", default=None, help="Root mission task id")
+    p_operator.add_argument("--limit", type=int, default=200)
+    p_operator.add_argument("--json", action="store_true")
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -890,6 +910,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         "reassign": _cmd_reassign,
         "diagnostics": _cmd_diagnostics,
         "diag":     _cmd_diagnostics,
+        "operator": _cmd_operator_views,
+        "ops":      _cmd_operator_views,
         "link":     _cmd_link,
         "unlink":   _cmd_unlink,
         "claim":    _cmd_claim,
@@ -1752,6 +1774,64 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 if a.suggested:
                     print(f"       → {a.label}")
         print()
+    return 0
+
+
+def _operator_view_count(view_payload: Any) -> int:
+    if isinstance(view_payload, dict):
+        return len(view_payload.get("nodes", [])) + len(view_payload.get("edges", []))
+    if isinstance(view_payload, list):
+        return len(view_payload)
+    return 0
+
+
+def _cmd_operator_views(args: argparse.Namespace) -> int:
+    """Render the ATLAS operator graph/health bundle from Kanban rows."""
+    limit = max(1, int(getattr(args, "limit", 200) or 200))
+    with kb.connect() as conn:
+        payload = kb.operator_views(
+            conn,
+            root_task_id=getattr(args, "root", None),
+            limit=limit,
+        )
+    view = getattr(args, "view", "all") or "all"
+    if view != "all":
+        payload = {
+            **payload,
+            "views": {view: payload["views"].get(view, [] if view != "mission_dag" else {"nodes": [], "edges": []})},
+        }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    print(f"ATLAS operator views for board {payload['board']} (query path: {payload['query_path']})")
+    if payload.get("root_task_id"):
+        print(f"root mission: {payload['root_task_id']}")
+    print("")
+    for name, data in payload["views"].items():
+        count = _operator_view_count(data)
+        print(f"{name}: {count}")
+        if isinstance(data, dict):
+            for edge in data.get("edges", [])[:5]:
+                print(
+                    f"  edge {edge['from_ref']} -> {edge['to_ref']} "
+                    f"[{edge['current_state']}] action={edge['recommended_action']}"
+                )
+            for node in data.get("nodes", [])[:5]:
+                print(
+                    f"  node {node['ref']} {node['current_state'] if 'current_state' in node else node.get('status')} "
+                    f"@{node.get('assignee') or '-'} action={node.get('recommended_action')}"
+                )
+        elif isinstance(data, list):
+            for item in data[:5]:
+                ref = item.get("ref") or item.get("task_id") or item.get("surface")
+                state = item.get("current_state") or ""
+                reason = item.get("reason") or ""
+                action = item.get("recommended_action") or "inspect"
+                print(f"  {ref} {state} — {reason}; action={action}")
+        if count > 5:
+            print(f"  … {count - 5} more (use --json for full rows)")
+        print("")
     return 0
 
 

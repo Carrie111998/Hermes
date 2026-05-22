@@ -5736,6 +5736,452 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# ATLAS / operator graph + health views
+# ---------------------------------------------------------------------------
+
+_OPERATOR_TEXT_REFS_RE = re.compile(
+    r"\b(?:task:[a-z0-9][a-z0-9_-]{0,63}:t_[0-9a-fA-F]+|t_[0-9a-fA-F]+)\b"
+)
+
+
+def _task_ref(task_id: str, *, board_slug: Optional[str] = None) -> str:
+    """Return the stable task ref used in operator views."""
+    if board_slug:
+        return f"task:{board_slug}:{task_id}"
+    return f"task:{task_id}"
+
+
+def _operator_task_row(row: sqlite3.Row, *, board_slug: Optional[str] = None) -> dict[str, Any]:
+    return {
+        "task_id": row["id"],
+        "ref": _task_ref(row["id"], board_slug=board_slug),
+        "title": row["title"],
+        "status": row["status"],
+        "assignee": row["assignee"],
+        "tenant": row["tenant"] if "tenant" in row.keys() else None,
+        "priority": int(row["priority"] or 0),
+        "created_at": row["created_at"],
+        "started_at": row["started_at"],
+        "completed_at": row["completed_at"],
+    }
+
+
+def _operator_payload_snippet(payload: Any, *, limit: int = 240) -> str:
+    if payload is None:
+        return ""
+    if isinstance(payload, str):
+        text = payload
+    else:
+        try:
+            text = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            text = str(payload)
+    text = " ".join(text.split())
+    return text[:limit]
+
+
+def _operator_latest_event_provenance(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else None
+    except Exception:
+        payload = row["payload"]
+    return {
+        "surface": "kanban.task_events",
+        "event_id": int(row["id"]),
+        "kind": row["kind"],
+        "created_at": row["created_at"],
+        "snippet": _operator_payload_snippet(payload),
+    }
+
+
+def _operator_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+    event = conn.execute(
+        "SELECT id, kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'scheduled') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event is not None:
+        payload = None
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else None
+        except Exception:
+            payload = event["payload"]
+        return {
+            "surface": "kanban.task_events",
+            "event_id": int(event["id"]),
+            "kind": event["kind"],
+            "created_at": event["created_at"],
+            "snippet": _operator_payload_snippet(payload),
+        }
+    comment = conn.execute(
+        "SELECT id, author, body, created_at FROM task_comments "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if comment is None:
+        return None
+    return {
+        "surface": "kanban.task_comments",
+        "comment_id": int(comment["id"]),
+        "author": comment["author"],
+        "created_at": comment["created_at"],
+        "snippet": _operator_payload_snippet(comment["body"]),
+    }
+
+
+def _operator_diag_action(diag: dict[str, Any]) -> str:
+    for action in diag.get("actions") or []:
+        if action.get("suggested"):
+            return action.get("label") or action.get("kind") or "inspect task"
+    actions = diag.get("actions") or []
+    if actions:
+        return actions[0].get("label") or actions[0].get("kind") or "inspect task"
+    kind = diag.get("kind") or "diagnostic"
+    if kind == "stuck_in_blocked":
+        return "answer the block reason or unblock with feedback"
+    if kind == "stranded_in_ready":
+        return "ensure dispatcher/gateway is running or reassign"
+    return "inspect diagnostics and latest task events"
+
+
+def _operator_diagnostics(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> dict[str, list[dict[str, Any]]]:
+    try:
+        from hermes_cli import kanban_diagnostics as kd
+        from hermes_cli.config import load_config
+
+        config = kd.config_from_runtime_config(load_config())
+    except Exception:
+        kd = None  # type: ignore[assignment]
+        config = {}
+    if kd is None:
+        return {}
+    if not rows:
+        return {}
+    ids = [r["id"] for r in rows]
+    placeholders = ",".join("?" for _ in ids)
+    events_by_task: dict[str, list[sqlite3.Row]] = {tid: [] for tid in ids}
+    for event in conn.execute(
+        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+        tuple(ids),
+    ).fetchall():
+        events_by_task.setdefault(event["task_id"], []).append(event)
+    runs_by_task: dict[str, list[sqlite3.Row]] = {tid: [] for tid in ids}
+    for run in conn.execute(
+        f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+        tuple(ids),
+    ).fetchall():
+        runs_by_task.setdefault(run["task_id"], []).append(run)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        dl = kd.compute_task_diagnostics(
+            row,
+            events_by_task.get(row["id"], []),
+            runs_by_task.get(row["id"], []),
+            config=config,
+        )
+        if dl:
+            out[row["id"]] = [d.to_dict() for d in dl]
+    return out
+
+
+def operator_views(
+    conn: sqlite3.Connection,
+    *,
+    board_slug: Optional[str] = None,
+    root_task_id: Optional[str] = None,
+    stale_hours: int = 24,
+    owner_inactive_hours: int = 48,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Return the minimal ATLAS operator graph/health view bundle.
+
+    This is deliberately read-only and SQLite-backed: it gives a steward one
+    query path for "why blocked/stale/conflicted?" before the full Postgres
+    mirror/dashboard exists.  Every view row includes refs, current state, a
+    recommended action, and provenance pointing back to Kanban rows.
+    """
+    now = int(time.time())
+    board = board_slug or get_current_board()
+    all_rows = conn.execute(
+        "SELECT * FROM tasks WHERE status != 'archived' ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    rows_by_id = {r["id"]: r for r in all_rows}
+    active_ids = set(rows_by_id)
+    links = conn.execute(
+        "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+    ).fetchall()
+    latest_event_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) AS n FROM task_events"
+    ).fetchone()["n"]
+
+    root_id = root_task_id or next((r["id"] for r in all_rows if "ATLAS COMMAND" in (r["title"] or "").upper()), None)
+    visible_ids: set[str]
+    if root_id and root_id in active_ids:
+        adjacency: dict[str, set[str]] = {tid: set() for tid in active_ids}
+        for link in links:
+            adjacency.setdefault(link["parent_id"], set()).add(link["child_id"])
+            adjacency.setdefault(link["child_id"], set()).add(link["parent_id"])
+        visible_ids = set()
+        stack = [root_id]
+        while stack:
+            tid = stack.pop()
+            if tid in visible_ids:
+                continue
+            visible_ids.add(tid)
+            stack.extend(adjacency.get(tid, set()) - visible_ids)
+    else:
+        visible_ids = active_ids
+    visible_rows = [r for r in all_rows if r["id"] in visible_ids]
+
+    diag_by_task = _operator_diagnostics(conn, visible_rows)
+
+    mission_dag_nodes = []
+    for row in visible_rows[:limit]:
+        node = _operator_task_row(row, board_slug=board)
+        node["recommended_action"] = (
+            "review block reason" if row["status"] == "blocked"
+            else "claim or dispatch" if row["status"] == "ready"
+            else "monitor active run" if row["status"] == "running"
+            else "wait for parent dependencies" if row["status"] == "todo"
+            else "inspect task"
+        )
+        node["provenance"] = _operator_latest_event_provenance(conn, row["id"])
+        mission_dag_nodes.append(node)
+    mission_dag_edges = [
+        {
+            "edge_id": f"kanban-parent-child:{link['parent_id']}->{link['child_id']}",
+            "kind": "parent_child",
+            "from_ref": _task_ref(link["parent_id"], board_slug=board),
+            "to_ref": _task_ref(link["child_id"], board_slug=board),
+            "current_state": "active" if link["parent_id"] in active_ids and link["child_id"] in active_ids else "missing_target",
+            "recommended_action": "inspect missing endpoint" if link["parent_id"] not in active_ids or link["child_id"] not in active_ids else "follow dependency edge",
+            "provenance": {"surface": "kanban.task_links", "parent_id": link["parent_id"], "child_id": link["child_id"]},
+        }
+        for link in links[:limit]
+        if link["parent_id"] in visible_ids or link["child_id"] in visible_ids
+    ]
+
+    blocker_map = []
+    for link in links:
+        if link["parent_id"] not in visible_ids and link["child_id"] not in visible_ids:
+            continue
+        child = rows_by_id.get(link["child_id"])
+        parent = rows_by_id.get(link["parent_id"])
+        if child is None:
+            continue
+        if parent is None or parent["status"] != "done":
+            reason = "missing parent target" if parent is None else f"parent is {parent['status']}"
+            blocker_map.append({
+                "task_id": child["id"],
+                "ref": _task_ref(child["id"], board_slug=board),
+                "blocked_by_ref": _task_ref(link["parent_id"], board_slug=board),
+                "current_state": child["status"],
+                "reason": reason,
+                "recommended_action": "repair missing parent edge" if parent is None else "complete/unblock/reassign blocker",
+                "provenance": {"surface": "kanban.task_links", "parent_id": link["parent_id"], "child_id": link["child_id"]},
+            })
+    for row in visible_rows:
+        if row["status"] == "blocked":
+            blocker_map.append({
+                "task_id": row["id"],
+                "ref": _task_ref(row["id"], board_slug=board),
+                "blocked_by_ref": None,
+                "current_state": "blocked",
+                "reason": "explicitly blocked by worker/operator",
+                "recommended_action": "answer block reason or unblock with feedback",
+                "provenance": _operator_block_reason(conn, row["id"]),
+            })
+
+    stale_queue = []
+    for row in visible_rows:
+        row_diags = diag_by_task.get(row["id"], [])
+        for diag in row_diags:
+            stale_queue.append({
+                "task_id": row["id"],
+                "ref": _task_ref(row["id"], board_slug=board),
+                "current_state": row["status"],
+                "reason": diag.get("title") or diag.get("kind"),
+                "severity": diag.get("severity"),
+                "recommended_action": _operator_diag_action(diag),
+                "provenance": {"surface": "kanban.diagnostics", "kind": diag.get("kind"), "data": diag.get("data") or {}},
+            })
+        age = now - int(row["created_at"] or now)
+        if not row_diags and row["status"] in {"todo", "running", "blocked", "ready"} and age >= stale_hours * 3600:
+            stale_queue.append({
+                "task_id": row["id"],
+                "ref": _task_ref(row["id"], board_slug=board),
+                "current_state": row["status"],
+                "reason": f"no terminal state after {int(age/3600)}h",
+                "severity": "warning",
+                "recommended_action": "inspect latest event and owner activity",
+                "provenance": _operator_latest_event_provenance(conn, row["id"]),
+            })
+
+    children = {link["child_id"] for link in links}
+    parents = {link["parent_id"] for link in links}
+    orphan_queue = []
+    for row in all_rows:
+        if row["id"] == root_id or row["status"] in {"done", "archived"}:
+            continue
+        if row["id"] not in children and row["id"] not in parents:
+            orphan_queue.append({
+                "task_id": row["id"],
+                "ref": _task_ref(row["id"], board_slug=board),
+                "current_state": row["status"],
+                "reason": "no parent or child edge connects this task to the mission DAG",
+                "recommended_action": "link to root mission or archive if intentionally standalone",
+                "provenance": _operator_latest_event_provenance(conn, row["id"]),
+            })
+
+    conflict_terms = ("conflict", "conflicted", "no-stomp", "cas", "hallucinat")
+    conflict_ledger = []
+    for event in conn.execute(
+        "SELECT e.*, t.title, t.status, t.assignee FROM task_events e "
+        "LEFT JOIN tasks t ON t.id = e.task_id ORDER BY e.id DESC LIMIT ?",
+        (limit * 5,),
+    ).fetchall():
+        snippet = _operator_payload_snippet(event["payload"])
+        haystack = f"{event['kind']} {snippet}".lower()
+        if any(term in haystack for term in conflict_terms):
+            conflict_ledger.append({
+                "task_id": event["task_id"],
+                "ref": _task_ref(event["task_id"], board_slug=board),
+                "current_state": event["status"],
+                "reason": event["kind"],
+                "recommended_action": "resolve conflict; do not stomp source-owned fields",
+                "provenance": {"surface": "kanban.task_events", "event_id": int(event["id"]), "created_at": event["created_at"], "snippet": snippet},
+            })
+            if len(conflict_ledger) >= limit:
+                break
+
+    promotion_terms = ("promoted", "promotion", "gbrain", "wiki", "canon")
+    promotion_trail = []
+    for comment in conn.execute(
+        "SELECT c.*, t.title, t.status FROM task_comments c "
+        "LEFT JOIN tasks t ON t.id = c.task_id ORDER BY c.id DESC LIMIT ?",
+        (limit * 5,),
+    ).fetchall():
+        body = comment["body"] or ""
+        if any(term in body.lower() for term in promotion_terms):
+            promotion_trail.append({
+                "task_id": comment["task_id"],
+                "ref": _task_ref(comment["task_id"], board_slug=board),
+                "current_state": comment["status"],
+                "reason": "promotion/canon reference in comment",
+                "recommended_action": "verify wiki/GBrain handle and source revision before treating as canon",
+                "provenance": {"surface": "kanban.task_comments", "comment_id": int(comment["id"]), "author": comment["author"], "created_at": comment["created_at"], "snippet": _operator_payload_snippet(body)},
+            })
+            if len(promotion_trail) >= limit:
+                break
+
+    ready_unblocked = []
+    for row in visible_rows:
+        if row["status"] != "ready":
+            continue
+        blockers = [b for b in blocker_map if b.get("task_id") == row["id"] and b.get("blocked_by_ref")]
+        if not blockers:
+            ready_unblocked.append({
+                "task_id": row["id"],
+                "ref": _task_ref(row["id"], board_slug=board),
+                "current_state": "ready",
+                "reason": "all known parents are done and no active claim is present",
+                "recommended_action": "dispatcher should claim; start gateway or reassign if it remains ready",
+                "provenance": _operator_latest_event_provenance(conn, row["id"]),
+            })
+
+    cross_board_handoffs = []
+    for row in visible_rows:
+        text = "\n".join(str(x or "") for x in (row["title"], row["body"]))
+        refs = set(_OPERATOR_TEXT_REFS_RE.findall(text))
+        for comment in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 20",
+            (row["id"],),
+        ).fetchall():
+            refs.update(_OPERATOR_TEXT_REFS_RE.findall(comment["body"] or ""))
+        qualified = sorted(ref for ref in refs if ref.startswith("task:") and not ref.startswith(f"task:{board}:"))
+        if qualified:
+            cross_board_handoffs.append({
+                "task_id": row["id"],
+                "ref": _task_ref(row["id"], board_slug=board),
+                "current_state": row["status"],
+                "handoff_refs": qualified,
+                "reason": "mentions fully-qualified task refs on another board",
+                "recommended_action": "verify target board visibility and create typed edge if this is an active dependency",
+                "provenance": {"surface": "kanban.tasks/task_comments", "matched_refs": qualified},
+            })
+
+    latest_source_event = conn.execute(
+        "SELECT id, task_id, kind, created_at FROM task_events ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    mirror_health = [{
+        "surface": "kanban.sqlite",
+        "ref": f"board:{board}",
+        "current_state": "source_of_truth",
+        "reason": "Postgres mirror health is not stored in this SQLite board; exposing source event cursor for backfill/mirror workers",
+        "recommended_action": "run mirror backfill/worker and compare latest_event_id against Postgres atlas_sync_jobs",
+        "provenance": {
+            "surface": "kanban.task_events",
+            "latest_event_id": int(latest_event_id or 0),
+            "latest_event_task_id": latest_source_event["task_id"] if latest_source_event else None,
+            "latest_event_kind": latest_source_event["kind"] if latest_source_event else None,
+            "latest_event_at": latest_source_event["created_at"] if latest_source_event else None,
+        },
+    }]
+
+    owner_inactivity = []
+    for row in conn.execute(
+        "SELECT assignee, MAX(COALESCE(started_at, created_at)) AS last_seen, "
+        "COUNT(*) AS active_tasks FROM tasks "
+        "WHERE status NOT IN ('done', 'archived') AND assignee IS NOT NULL "
+        "GROUP BY assignee ORDER BY last_seen ASC"
+    ).fetchall():
+        age = now - int(row["last_seen"] or now)
+        if age >= owner_inactive_hours * 3600:
+            owner_inactivity.append({
+                "owner": row["assignee"],
+                "ref": f"profile:{row['assignee']}",
+                "current_state": "inactive",
+                "reason": f"no started/created activity on active tasks for {int(age/3600)}h",
+                "active_tasks": int(row["active_tasks"] or 0),
+                "recommended_action": "check gateway/profile health or reassign stale tasks",
+                "provenance": {"surface": "kanban.tasks", "last_seen_at": row["last_seen"]},
+            })
+
+    views = {
+        "mission_dag": {"nodes": mission_dag_nodes, "edges": mission_dag_edges},
+        "blocker_map": blocker_map[:limit],
+        "cross_board_handoffs": cross_board_handoffs[:limit],
+        "stale_queue": stale_queue[:limit],
+        "orphan_queue": orphan_queue[:limit],
+        "mirror_health": mirror_health,
+        "owner_inactivity": owner_inactivity[:limit],
+        "conflict_ledger": conflict_ledger[:limit],
+        "promotion_trail": promotion_trail[:limit],
+        "ready_unblocked": ready_unblocked[:limit],
+    }
+    return {
+        "board": board,
+        "root_task_id": root_id,
+        "generated_at": now,
+        "query_path": "kanban.operator_views",
+        "acceptance": {
+            "why_blocked_stale_conflicted": "blocker_map + stale_queue + conflict_ledger share task refs and Kanban provenance",
+            "provenance_surfaces": ["kanban.tasks", "kanban.task_links", "kanban.task_events", "kanban.task_comments", "kanban.diagnostics"],
+        },
+        "views": views,
+    }
+
+
 def _to_epoch(val) -> Optional[int]:
     """Normalise a timestamp to unix epoch seconds.
 

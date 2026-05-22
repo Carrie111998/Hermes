@@ -485,6 +485,41 @@ def get_board(
 
 
 # ---------------------------------------------------------------------------
+# GET /operator/views
+# ---------------------------------------------------------------------------
+
+@router.get("/operator/views")
+def get_operator_views(
+    board: Optional[str] = Query(None, description="Kanban board slug (omit for current)"),
+    view: str = Query("all", description="One view name or 'all'"),
+    root: Optional[str] = Query(None, description="Root mission task id"),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Return the minimal ATLAS operator graph/health view bundle.
+
+    This is the dashboard/API sibling of ``hermes kanban operator``: one
+    read-only query path for mission DAG, blockers, stale/conflict queues,
+    mirror cursors, and provenance before the full Postgres mirror exists.
+    """
+    allowed = {
+        "all", "mission_dag", "blocker_map", "cross_board_handoffs",
+        "stale_queue", "orphan_queue", "mirror_health", "owner_inactivity",
+        "conflict_ledger", "promotion_trail", "ready_unblocked",
+    }
+    if view not in allowed:
+        raise HTTPException(status_code=400, detail=f"unknown operator view {view!r}")
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        payload = kanban_db.operator_views(conn, board_slug=board, root_task_id=root, limit=limit)
+        if view != "all":
+            payload["views"] = {view: payload["views"].get(view)}
+        return payload
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # GET /tasks/:id
 # ---------------------------------------------------------------------------
 

@@ -253,6 +253,58 @@ def test_link_detects_cycle(kanban_home):
             kb.link_tasks(conn, b, a)
 
 
+def test_operator_views_bundle_surfaces_graph_health_and_provenance(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="ATLAS COMMAND root", body="mission root")
+        blocker = kb.create_task(conn, title="blocker", assignee="owner-a")
+        child = kb.create_task(
+            conn,
+            title="child depends on blocker",
+            body="handoff to task:other-board:t_deadbeef",
+            assignee="owner-b",
+            parents=[root, blocker],
+        )
+        blocked = kb.create_task(conn, title="needs human", assignee="owner-c")
+        assert kb.block_task(conn, blocked, reason="review-required: needs operator input")
+        kb.add_comment(conn, blocked, "dev", "promoted to wiki canon after review")
+
+        payload = kb.operator_views(conn, board_slug="atlas-command", root_task_id=root, limit=50)
+
+    assert payload["query_path"] == "kanban.operator_views"
+    assert payload["root_task_id"] == root
+    assert set(payload["views"]) >= {
+        "mission_dag", "blocker_map", "cross_board_handoffs", "stale_queue",
+        "orphan_queue", "mirror_health", "owner_inactivity", "conflict_ledger",
+        "promotion_trail", "ready_unblocked",
+    }
+    assert any(
+        edge["from_ref"] == f"task:atlas-command:{root}"
+        and edge["to_ref"] == f"task:atlas-command:{child}"
+        for edge in payload["views"]["mission_dag"]["edges"]
+    )
+    assert any(row["task_id"] == child and row["blocked_by_ref"] == f"task:atlas-command:{blocker}"
+               for row in payload["views"]["blocker_map"])
+    assert any("task:other-board:t_deadbeef" in row["handoff_refs"]
+               for row in payload["views"]["cross_board_handoffs"])
+    assert any(row["task_id"] == blocked and row["provenance"]["surface"].startswith("kanban.")
+               for row in payload["views"]["orphan_queue"])
+    assert payload["views"]["mirror_health"][0]["provenance"]["latest_event_id"] >= 1
+    assert any(row["task_id"] == blocked for row in payload["views"]["promotion_trail"])
+
+
+def test_operator_views_root_limits_mission_dag_to_connected_component(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="ATLAS COMMAND root")
+        child = kb.create_task(conn, title="connected", parents=[root])
+        unrelated = kb.create_task(conn, title="unrelated")
+
+        payload = kb.operator_views(conn, board_slug="atlas-command", root_task_id=root)
+
+    node_ids = {node["task_id"] for node in payload["views"]["mission_dag"]["nodes"]}
+    assert {root, child} <= node_ids
+    assert unrelated not in node_ids
+
+
 def test_recompute_ready_cascades_through_chain(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
