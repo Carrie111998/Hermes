@@ -9,7 +9,7 @@
   stdenv,
   makeWrapper,
   callPackage,
-  python312,
+  python313,
   nodejs_22,
   ripgrep,
   git,
@@ -72,12 +72,12 @@ let
 
   runtimePath = lib.makeBinPath runtimeDeps;
 
-  sitePackagesPath = python312.sitePackages;
+  sitePackagesPath = python313.sitePackages;
 
   # Walk propagatedBuildInputs to include transitive Python deps in PYTHONPATH.
   # Without this, a plugin listing e.g. requests as a dep would fail at runtime
   # if requests isn't already in the sealed uv2nix venv.
-  allExtraPythonPackages = python312.pkgs.requiredPythonModules extraPythonPackages;
+  allExtraPythonPackages = python313.pkgs.requiredPythonModules extraPythonPackages;
 
   pythonPath = lib.makeSearchPath sitePackagesPath allExtraPythonPackages;
 
@@ -188,7 +188,7 @@ stdenv.mkDerivation {
       STAMP_VALUE="${pyprojectHash}:${uvLockHash}"
       if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP")" != "$STAMP_VALUE" ]; then
         echo "hermes-agent: installing Python dependencies..."
-        uv venv .venv --python ${python312}/bin/python3 2>/dev/null || true
+        uv venv .venv --python ${python313}/bin/python3 2>/dev/null || true
         source .venv/bin/activate
         uv pip install -e ".[all]"
         [ -d mini-swe-agent ] && uv pip install -e ./mini-swe-agent 2>/dev/null || true
