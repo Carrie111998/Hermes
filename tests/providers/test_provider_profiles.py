@@ -1,6 +1,7 @@
 """Tests for the provider module registry and profiles."""
 
-from providers import get_provider_profile, _REGISTRY
+import pytest
+from providers import get_provider_profile, _REGISTRY, register_provider, _ALIASES
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
 
@@ -21,6 +22,25 @@ class TestRegistry:
 
     def test_unknown_provider_returns_none(self):
         assert get_provider_profile("nonexistent-provider") is None
+
+    def test_duplicate_name_warns(self, caplog):
+        """Re-registering a provider with the same name should log a warning (#30921)."""
+        profile = ProviderProfile(name="nvidia", base_url="https://fake.example.com")
+        with caplog.at_level("WARNING", logger="providers"):
+            register_provider(profile)
+        assert any("already registered" in m for m in caplog.messages)
+
+    def test_duplicate_alias_warns(self, caplog):
+        """Re-registering a provider with an overlapping alias should log a warning (#30921)."""
+        profile = ProviderProfile(
+            name="__test_override__",
+            aliases=("or",),  # "or" is already mapped to "openrouter"
+        )
+        with caplog.at_level("WARNING", logger="providers"):
+            register_provider(profile)
+        assert any("alias" in m.lower() and "already mapped" in m.lower() for m in caplog.messages)
+        # Alias should be remapped to the new provider
+        assert _ALIASES.get("or") == "__test_override__"
 
     def test_all_providers_have_name(self):
         get_provider_profile("nvidia")  # trigger discovery
