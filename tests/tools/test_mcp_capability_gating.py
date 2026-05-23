@@ -102,11 +102,14 @@ class TestKeepaliveProbe:
 
         import tools.mcp_tool as mcp_mod
         orig = mcp_mod.asyncio.wait
+        orig_jitter = mcp_mod._mcp_keepalive_jitter_seconds
         mcp_mod.asyncio.wait = fake_wait
+        mcp_mod._mcp_keepalive_jitter_seconds = lambda _name: 0.0
         try:
             return await task._wait_for_lifecycle_event()
         finally:
             mcp_mod.asyncio.wait = orig
+            mcp_mod._mcp_keepalive_jitter_seconds = orig_jitter
 
     async def test_keepalive_uses_ping_for_prompt_only_server(self):
         task = MCPServerTask("test")
@@ -162,11 +165,14 @@ class TestKeepaliveInterval:
 
         import tools.mcp_tool as mcp_mod
         orig = mcp_mod.asyncio.wait
+        orig_jitter = mcp_mod._mcp_keepalive_jitter_seconds
         mcp_mod.asyncio.wait = fake_wait
+        mcp_mod._mcp_keepalive_jitter_seconds = lambda _name: 0.0
         try:
             await task._wait_for_lifecycle_event()
         finally:
             mcp_mod.asyncio.wait = orig
+            mcp_mod._mcp_keepalive_jitter_seconds = orig_jitter
         return captured["timeout"]
 
     @pytest.mark.asyncio
@@ -188,13 +194,16 @@ class TestKeepaliveInterval:
 def _mcp_error(code, message="boom"):
     """Build a real MCPError carrying a JSON-RPC error code.
 
-    mcp 2.0 renamed ``McpError`` to ``MCPError`` and replaced its
-    ``ErrorData`` positional with flat ``code`` / ``message`` arguments. The
-    ``.error.code`` attribute ``_is_method_not_found_error`` inspects survives
-    unchanged, which is the point of the structural check.
+    mcp versions expose either ``McpError(ErrorData(...))`` or
+    ``MCPError(code=..., message=...)``. The ``.error.code`` attribute
+    ``_is_method_not_found_error`` inspects survives unchanged, which is the
+    point of the structural check.
     """
-    from mcp.shared.exceptions import MCPError
-    return MCPError(code=code, message=message)
+    from mcp.shared import exceptions
+
+    if hasattr(exceptions, "MCPError"):
+        return exceptions.MCPError(code=code, message=message)
+    return exceptions.McpError(exceptions.ErrorData(code=code, message=message))
 
 
 class TestMethodNotFoundDetection:
@@ -294,5 +303,3 @@ class TestKeepaliveProbeFallback:
         await task._discover_tools()
 
         assert task._ping_unsupported is False
-
-
