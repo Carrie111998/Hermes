@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,6 +102,50 @@ def test_local_command_operation_returns_json():
     result = execute_business_operation(config, "local_echo", {"amount": 42})
 
     assert result == {"ok": True, "payload": {"amount": 42}}
+
+
+def test_tgg_ilinked_lookup_adapter_calls_christopher_job_detail(monkeypatch, tmp_path):
+    fake = tmp_path / "christopher"
+    fake.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import json,sys",
+                "print(json.dumps({'ok': True, 'argv': sys.argv[1:]}))",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    config = {
+        "pa_business": {
+            "operations": {
+                "ilinked_lookup": {
+                    "type": "command",
+                    "command": [
+                        sys.executable,
+                        "-m",
+                        "tools.tgg_ilinked_lookup",
+                    ],
+                    "timeout": 10,
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config, "ilinked_lookup", {"jobNo": "SD/JOB/2605/1008"}
+    )
+
+    assert result["ok"] is True
+    assert result["argv"] == [
+        "ilinked",
+        "detail",
+        "--job",
+        "SD/JOB/2605/1008",
+    ]
 
 
 def _agent_action_config(url: str) -> dict:

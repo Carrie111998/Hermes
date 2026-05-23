@@ -29,6 +29,7 @@ job_briefs:
       - Extract source, sender, timestamp, commitments, blockers, and requested actions.
       - Preserve original wording for material facts that may need audit.
       - For case-state updates, call pa_business_write with operation tgg_case_update before replying.
+      - For iLinked source-of-truth checks, call pa_business_read with operation ilinked_lookup. The operation is read-only; never create, update, submit, or save anything in iLinked.
       - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup and report inability if the tool blocks it.
       - Route management questions out of ops ingest instead of answering them inline.
     enabled_toolsets:
@@ -66,6 +67,7 @@ job_briefs:
     instructions:
       - Separate facts, interpretation, recommendations, and open questions.
       - For status questions about a block or unit, call pa_business_read with operation tgg_case_lookup before summarizing.
+      - For iLinked source-of-truth checks, call pa_business_read with operation ilinked_lookup. The operation is read-only; never create, update, submit, or save anything in iLinked.
       - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup and report inability if the tool blocks it.
       - Prefer short executive summaries with explicit tradeoffs.
       - Escalate missing financial, legal, or client-commitment facts.
