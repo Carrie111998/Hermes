@@ -27,7 +27,7 @@ import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 from hermes_constants import get_hermes_dir
 
@@ -266,6 +266,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._group_allow_from = self._coerce_allow_list(config.extra.get("group_allow_from") or config.extra.get("groupAllowFrom"))
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
+        self._turn_debounce_ms: int = int(
+            config.extra.get("turn_debounce_ms")
+            or os.getenv("WHATSAPP_TURN_DEBOUNCE_MS", "1500")
+            or 0
+        )
+        self._turn_buffers: Dict[str, List[MessageEvent]] = {}
+        self._turn_tasks: Dict[str, asyncio.Task] = {}
         self._bridge_log_fh = None
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
@@ -484,6 +491,156 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if self._message_mentions_bot(data):
             return True
         return self._message_matches_mention_patterns(data)
+
+    @staticmethod
+    def _bridge_chat_type(data: Dict[str, Any]) -> str:
+        return "group" if data.get("isGroup", False) else "dm"
+
+    @staticmethod
+    def _is_numeric_chat_label(chat_id: str, chat_name: Optional[str]) -> bool:
+        if not chat_name:
+            return True
+        label = str(chat_name).strip()
+        if not label:
+            return True
+        numeric_part = str(chat_id or "").split("@", 1)[0]
+        return label == numeric_part or bool(re.fullmatch(r"\d{8,}", label))
+
+    def _persist_channel_directory_entry(self, data: Dict[str, Any]) -> None:
+        """Persist bridge-supplied chat metadata immediately for target listing."""
+        chat_id = str(data.get("chatId") or "")
+        if not chat_id:
+            return
+        chat_name = data.get("chatName")
+        # Avoid overwriting a good directory name with the old numeric fallback.
+        if self._bridge_chat_type(data) == "group" and self._is_numeric_chat_label(chat_id, chat_name):
+            return
+        try:
+            from gateway.channel_directory import upsert_channel_entry
+            upsert_channel_entry("whatsapp", {
+                "id": chat_id,
+                "name": chat_name or chat_id,
+                "type": self._bridge_chat_type(data),
+            })
+        except Exception as e:
+            logger.debug("[%s] Failed to persist WhatsApp channel metadata: %s", self.name, e)
+
+    def _debounce_seconds(self) -> float:
+        raw_ms = getattr(self, "_turn_debounce_ms", 0) or 0
+        try:
+            ms = int(raw_ms)
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, ms / 1000.0)
+
+    async def _queue_or_handle_event(self, event: MessageEvent) -> None:
+        """Debounce WhatsApp events into one turn per chat window."""
+        debounce_s = self._debounce_seconds()
+        if debounce_s <= 0:
+            await self.handle_message(event)
+            return
+
+        source = event.source
+        chat_id = source.chat_id if source else ""
+        if not chat_id:
+            await self.handle_message(event)
+            return
+
+        buffers = getattr(self, "_turn_buffers", None)
+        tasks = getattr(self, "_turn_tasks", None)
+        if buffers is None or tasks is None:
+            self._turn_buffers = {}
+            self._turn_tasks = {}
+            buffers = self._turn_buffers
+            tasks = self._turn_tasks
+
+        buffers.setdefault(chat_id, []).append(event)
+        existing = tasks.get(chat_id)
+        if existing and not existing.done():
+            existing.cancel()
+        tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, debounce_s))
+
+    async def _flush_turn_after(self, chat_id: str, debounce_s: float) -> None:
+        try:
+            await asyncio.sleep(debounce_s)
+            await self._flush_turn(chat_id)
+        except asyncio.CancelledError:
+            return
+
+    async def _flush_turn(self, chat_id: str) -> None:
+        buffers = getattr(self, "_turn_buffers", {})
+        tasks = getattr(self, "_turn_tasks", {})
+        events = buffers.pop(chat_id, [])
+        tasks.pop(chat_id, None)
+        if not events:
+            return
+        bundled = self._build_turn_event(events)
+        await self.handle_message(bundled)
+
+    def _build_turn_event(self, events: List[MessageEvent]) -> MessageEvent:
+        if len(events) == 1:
+            return events[0]
+
+        first = events[0]
+        source = first.source
+        lines = [
+            f"WhatsApp turn bundle ({len(events)} messages)",
+        ]
+        if source:
+            chat_label = source.chat_name or source.chat_id
+            lines.append(f"Chat: {chat_label} ({source.chat_id})")
+        lines.append("")
+
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        raw_messages: List[Any] = []
+        ids: List[str] = []
+        for index, event in enumerate(events, start=1):
+            raw = event.raw_message or {}
+            raw_messages.append(raw)
+            if event.message_id:
+                ids.append(str(event.message_id))
+            sender = source.user_name if index == 1 and source else None
+            if event.source:
+                sender = event.source.user_name or event.source.user_id or sender
+            message_id = event.message_id or raw.get("messageId") or f"message-{index}"
+            timestamp = raw.get("timestamp")
+            prefix = f"{index}. "
+            if timestamp:
+                prefix += f"[{timestamp}] "
+            if sender:
+                prefix += f"{sender}: "
+            text = event.text or ""
+            if event.media_urls and not text:
+                text = "[media received]"
+            lines.append(f"{prefix}{text}".rstrip())
+            if event.media_urls:
+                lines.append(f"   attachments: {', '.join(event.media_urls)}")
+            lines.append(f"   source_message_id: {message_id}")
+            media_urls.extend(event.media_urls or [])
+            media_types.extend(event.media_types or [])
+
+        message_type = MessageType.TEXT
+        if media_urls:
+            non_text_types = [event.message_type for event in events if event.media_urls]
+            if non_text_types and len(set(non_text_types)) == 1:
+                message_type = non_text_types[0]
+            else:
+                message_type = MessageType.DOCUMENT
+
+        return MessageEvent(
+            text="\n".join(lines),
+            message_type=message_type,
+            source=source,
+            raw_message={
+                "bundle": True,
+                "messages": raw_messages,
+                "sourceMessageIds": ids,
+            },
+            message_id="+".join(ids) if ids else first.message_id,
+            media_urls=media_urls,
+            media_types=media_types,
+        )
     
     async def connect(self) -> bool:
         """
@@ -795,6 +952,19 @@ class WhatsAppAdapter(BasePlatformAdapter):
             except (asyncio.CancelledError, Exception):
                 pass
         self._poll_task = None
+
+        # Flush any buffered WhatsApp turn before shutdown; if flushing fails,
+        # cancel the timers so no task keeps the loop alive.
+        for chat_id in list(getattr(self, "_turn_buffers", {}).keys()):
+            try:
+                await self._flush_turn(chat_id)
+            except Exception:
+                pass
+        for task in list(getattr(self, "_turn_tasks", {}).values()):
+            if not task.done():
+                task.cancel()
+        if hasattr(self, "_turn_tasks"):
+            self._turn_tasks.clear()
 
         # Close the persistent HTTP session
         if self._http_session and not self._http_session.closed:
@@ -1139,7 +1309,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         for msg_data in messages:
                             event = await self._build_message_event(msg_data)
                             if event:
-                                await self.handle_message(event)
+                                await self._queue_or_handle_event(event)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1183,6 +1353,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 user_id=data.get("senderId"),
                 user_name=data.get("senderName"),
             )
+            self._persist_channel_directory_entry(data)
             
             # Download media URLs to the local cache so agent tools
             # can access them reliably regardless of URL expiration.

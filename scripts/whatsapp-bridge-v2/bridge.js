@@ -27,6 +27,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, rea
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
+import QRCode from 'qrcode';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
@@ -62,17 +63,17 @@ const HISTORY_SYNC_PATH = process.env.WHATSAPP_HISTORY_SYNC_PATH ||
   path.join(path.dirname(SESSION_DIR), 'history-sync.jsonl');
 const HISTORY_METADATA_PATH = process.env.WHATSAPP_HISTORY_METADATA_PATH ||
   path.join(path.dirname(SESSION_DIR), 'history-metadata.jsonl');
+const STORE_FILE = process.env.WHATSAPP_STORE_FILE ||
+  path.join(path.dirname(SESSION_DIR), 'message-store.json');
 const HERMES_HOME = process.env.HERMES_HOME || path.dirname(path.dirname(SESSION_DIR));
 const CHAT_METADATA_FILE = process.env.WHATSAPP_CHAT_METADATA_FILE ||
   path.join(HERMES_HOME, 'whatsapp-chat-metadata.json');
+const STORE_WRITE_INTERVAL_MS = parseInt(process.env.WHATSAPP_STORE_WRITE_INTERVAL_MS || '10000', 10);
+const MAX_STORE_MESSAGES = parseInt(process.env.WHATSAPP_MAX_STORE_MESSAGES || '20000', 10);
 const QR_FILE = process.env.WHATSAPP_QR_FILE || '';
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
-const OUTBOUND_DISABLED =
-  typeof process !== 'undefined' &&
-  process.env &&
-  typeof process.env.WHATSAPP_OUTBOUND_DISABLED === 'string' &&
-  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_OUTBOUND_DISABLED.toLowerCase());
+const OUTBOUND_DISABLED = true;
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
@@ -184,9 +185,9 @@ function loadChatMetadata() {
         chatMetadata.set(id, entry);
       }
     }
-    console.log(`[bridge] Loaded chat metadata: ${CHAT_METADATA_FILE}`);
+    console.log(`[bridge-v2] Loaded chat metadata: ${CHAT_METADATA_FILE}`);
   } catch (err) {
-    console.warn('[bridge] Failed to load chat metadata:', err.message);
+    console.warn('[bridge-v2] Failed to load chat metadata:', err.message);
   }
 }
 
@@ -203,7 +204,7 @@ function flushChatMetadata() {
     }, null, 2));
     chatMetadataDirty = false;
   } catch (err) {
-    console.warn('[bridge] Failed to write chat metadata:', err.message);
+    console.warn('[bridge-v2] Failed to write chat metadata:', err.message);
   }
 }
 
@@ -332,6 +333,64 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
+const messageStore = new Map();
+let messageStoreDirty = false;
+
+try {
+  if (existsSync(STORE_FILE)) {
+    const parsed = JSON.parse(readFileSync(STORE_FILE, 'utf8'));
+    const entries = Array.isArray(parsed?.messages) ? parsed.messages : [];
+    for (const entry of entries) {
+      if (entry?.key && entry?.message) {
+        messageStore.set(entry.key, entry);
+      }
+    }
+    console.log(`[bridge-v2] Loaded message store: ${STORE_FILE}`);
+  }
+} catch (err) {
+  console.warn('[bridge-v2] Failed to load message store:', err.message);
+}
+
+function messageStoreKey(key) {
+  if (!key?.remoteJid || !key?.id) return '';
+  return `${key.remoteJid}::${key.id}`;
+}
+
+function rememberMessage(msg) {
+  const key = messageStoreKey(msg?.key);
+  if (!key || !msg?.message) return;
+  messageStore.set(key, {
+    key,
+    remoteJid: msg.key.remoteJid,
+    id: msg.key.id,
+    fromMe: !!msg.key.fromMe,
+    participant: msg.key.participant || null,
+    message: msg.message,
+    messageTimestamp: msg.messageTimestamp || null,
+    storedAt: new Date().toISOString(),
+  });
+  while (messageStore.size > MAX_STORE_MESSAGES) {
+    messageStore.delete(messageStore.keys().next().value);
+  }
+  messageStoreDirty = true;
+}
+
+function flushStore() {
+  if (!messageStoreDirty) return;
+  try {
+    mkdirSync(path.dirname(STORE_FILE), { recursive: true });
+    writeFileSync(STORE_FILE, JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      messages: Array.from(messageStore.values()),
+    }));
+    messageStoreDirty = false;
+  } catch (err) {
+    console.warn('[bridge-v2] Failed to write message store:', err.message);
+  }
+}
+
+setInterval(flushStore, STORE_WRITE_INTERVAL_MS).unref();
 
 // Message queue for polling
 const messageQueue = [];
@@ -346,8 +405,14 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+let latestQr = '';
+let latestQrAt = null;
+let lastDisconnectReason = null;
+let connectedAt = null;
+let socketStartedAt = null;
 
 async function startSocket() {
+  socketStartedAt = new Date().toISOString();
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -362,18 +427,19 @@ async function startSocket() {
     // Required for Baileys 7.x: without this, incoming messages that need
     // E2EE session re-establishment are silently dropped (msg.message === null)
     getMessage: async (key) => {
-      // We don't maintain a message store, so return a placeholder.
-      // This is enough for Baileys to complete the retry handshake.
-      return { conversation: '' };
+      const stored = messageStore.get(messageStoreKey(key));
+      return stored?.message || { conversation: '' };
     },
   });
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); flushStore(); });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      latestQr = qr;
+      latestQrAt = new Date().toISOString();
       console.log('\n📱 Scan this QR code with WhatsApp on your phone:\n');
       if (QR_FILE) {
         try {
@@ -390,6 +456,8 @@ async function startSocket() {
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
+      lastDisconnectReason = reason || null;
+      connectedAt = null;
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -405,6 +473,10 @@ async function startSocket() {
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      connectedAt = new Date().toISOString();
+      latestQr = '';
+      latestQrAt = null;
+      lastDisconnectReason = null;
       console.log('✅ WhatsApp connected!');
       if (PAIR_ONLY) {
         console.log('✅ Pairing complete. Credentials saved.');
@@ -621,11 +693,11 @@ async function startSocket() {
         quotedParticipant,
         quotedRemoteJid,
         hasQuotedMessage,
-        botIds,
-        timestamp: msg.messageTimestamp,
-        fromMe: !!msg.key.fromMe,
-        historySync: isHistory,
-        historySyncType: historyMeta.syncType || null,
+    botIds,
+    timestamp: msg.messageTimestamp,
+    fromMe: !!msg.key.fromMe,
+    historySync: isHistory,
+    historySyncType: historyMeta.syncType || null,
         historyIsLatest: historyMeta.isLatest ?? null,
       };
 
@@ -644,6 +716,7 @@ async function startSocket() {
   }
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    for (const msg of messages || []) rememberMessage(msg);
     await enqueueMessages(messages || [], type);
   });
 
@@ -690,6 +763,7 @@ async function startSocket() {
       syncType,
       isLatest,
     }));
+    for (const msg of messages || []) rememberMessage(msg);
     await enqueueMessages(messages || [], 'history', { syncType, isLatest });
   });
 }
@@ -956,10 +1030,86 @@ app.get('/health', (req, res) => {
   res.json({
     status: connectionState,
     queueLength: messageQueue.length,
+    paired: connectionState === 'connected',
+    hasQr: !!latestQr,
+    qrUpdatedAt: latestQrAt,
+    connectedAt,
+    startedAt: socketStartedAt,
+    lastDisconnectReason,
+    storeFile: STORE_FILE,
+    storeMessages: messageStore.size,
     chatMetadataFile: CHAT_METADATA_FILE,
     chatMetadataCount: chatMetadata.size,
     uptime: process.uptime(),
   });
+});
+
+app.get('/state', (req, res) => {
+  res.json({
+    ok: true,
+    status: connectionState,
+    paired: connectionState === 'connected',
+    hasQr: !!latestQr,
+    qrUpdatedAt: latestQrAt,
+    connectedAt,
+    startedAt: socketStartedAt,
+    lastDisconnectReason,
+  });
+});
+
+app.post('/start', (req, res) => {
+  res.json({
+    ok: true,
+    status: connectionState,
+    paired: connectionState === 'connected',
+    hasQr: !!latestQr,
+    qrUpdatedAt: latestQrAt,
+    connectedAt,
+    startedAt: socketStartedAt,
+    lastDisconnectReason,
+  });
+});
+
+app.get('/qr', (req, res) => {
+  if (!latestQr) {
+    return res.status(connectionState === 'connected' ? 409 : 404).json({
+      ok: false,
+      status: connectionState,
+      reason: connectionState === 'connected' ? 'already-paired' : 'qr-not-ready',
+    });
+  }
+  res.json({
+    ok: true,
+    status: connectionState,
+    qr: latestQr,
+    qrUpdatedAt: latestQrAt,
+  });
+});
+
+app.get('/qr.png', async (req, res) => {
+  if (!latestQr) {
+    return res.status(connectionState === 'connected' ? 409 : 404).json({
+      ok: false,
+      status: connectionState,
+      reason: connectionState === 'connected' ? 'already-paired' : 'qr-not-ready',
+    });
+  }
+  try {
+    const png = await QRCode.toBuffer(latestQr, {
+      type: 'png',
+      width: 720,
+      margin: 2,
+      errorCorrectionLevel: 'M',
+    });
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': png.length,
+      'Cache-Control': 'no-store',
+    });
+    res.end(png);
+  } catch (err) {
+    res.status(500).json({ ok: false, reason: err.message });
+  }
 });
 
 // Start

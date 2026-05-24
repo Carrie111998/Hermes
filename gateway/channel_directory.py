@@ -8,6 +8,7 @@ action="list" and for resolving human-friendly channel names to numeric IDs.
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
+WHATSAPP_METADATA_PATH = get_hermes_home() / "whatsapp-chat-metadata.json"
 
 
 def _normalize_channel_query(value: str) -> str:
@@ -53,6 +55,111 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
     return f"{base_name} / {topic_label}"
 
 
+def _whatsapp_numeric_fallback(chat_id: str) -> str:
+    return str(chat_id or "").split("@", 1)[0]
+
+
+def _is_whatsapp_numeric_name(chat_id: str, name: Optional[str]) -> bool:
+    if not name:
+        return True
+    clean = str(name).strip()
+    if not clean:
+        return True
+    fallback = _whatsapp_numeric_fallback(chat_id)
+    return clean == fallback or bool(re.fullmatch(r"\d{8,}", clean))
+
+
+def _load_whatsapp_metadata() -> Dict[str, Dict[str, Any]]:
+    """Load bridge-captured WhatsApp chat metadata keyed by chat id."""
+    if not WHATSAPP_METADATA_PATH.exists():
+        return {}
+    try:
+        with open(WHATSAPP_METADATA_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.debug("Channel directory: failed to read WhatsApp metadata: %s", e)
+        return {}
+
+    chats = data.get("chats") if isinstance(data, dict) else data
+    if isinstance(chats, dict):
+        return {
+            str(chat_id): value
+            for chat_id, value in chats.items()
+            if isinstance(value, dict)
+        }
+    if isinstance(chats, list):
+        result: Dict[str, Dict[str, Any]] = {}
+        for item in chats:
+            if not isinstance(item, dict):
+                continue
+            chat_id = item.get("id") or item.get("chatId")
+            if chat_id:
+                result[str(chat_id)] = item
+        return result
+    return {}
+
+
+def _merge_whatsapp_metadata(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Overlay real WhatsApp chat subjects onto session-discovered entries."""
+    metadata = _load_whatsapp_metadata()
+    if not metadata:
+        return entries
+
+    merged: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for entry in entries:
+        entry = dict(entry)
+        chat_id = str(entry.get("id") or "")
+        meta = metadata.get(chat_id)
+        if meta:
+            name = meta.get("name") or meta.get("subject")
+            if name and not _is_whatsapp_numeric_name(chat_id, str(name)):
+                entry["name"] = str(name)
+            entry["type"] = meta.get("type") or entry.get("type")
+        merged.append(entry)
+        seen_ids.add(chat_id)
+
+    for chat_id, meta in metadata.items():
+        if chat_id in seen_ids:
+            continue
+        name = meta.get("name") or meta.get("subject") or _whatsapp_numeric_fallback(chat_id)
+        merged.append({
+            "id": chat_id,
+            "name": str(name),
+            "type": meta.get("type") or ("group" if chat_id.endswith("@g.us") else "dm"),
+        })
+    return merged
+
+
+def upsert_channel_entry(platform_name: str, channel: Dict[str, Any]) -> None:
+    """Persist a single channel entry into the cached directory."""
+    channel_id = channel.get("id")
+    if not channel_id:
+        return
+    directory = load_directory()
+    platforms = directory.setdefault("platforms", {})
+    entries = list(platforms.get(platform_name, []))
+
+    updated = False
+    for index, entry in enumerate(entries):
+        if entry.get("id") != channel_id:
+            continue
+        merged = dict(entry)
+        merged.update({k: v for k, v in channel.items() if v is not None})
+        entries[index] = merged
+        updated = True
+        break
+    if not updated:
+        entries.append({k: v for k, v in channel.items() if v is not None})
+
+    platforms[platform_name] = entries
+    directory["updated_at"] = datetime.now().isoformat()
+    try:
+        atomic_json_write(DIRECTORY_PATH, directory)
+    except Exception as e:
+        logger.debug("Channel directory: failed to upsert %s:%s: %s", platform_name, channel_id, e)
+
+
 # ---------------------------------------------------------------------------
 # Build / refresh
 # ---------------------------------------------------------------------------
@@ -84,7 +191,10 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
         plat_name = plat.value
         if plat_name in _SKIP_SESSION_DISCOVERY or plat_name in platforms:
             continue
-        platforms[plat_name] = _build_from_sessions(plat_name)
+        entries = _build_from_sessions(plat_name)
+        if plat_name == "whatsapp":
+            entries = _merge_whatsapp_metadata(entries)
+        platforms[plat_name] = entries
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them).

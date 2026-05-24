@@ -267,6 +267,65 @@ class TestBuildFromSessions:
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
 
+    def test_whatsapp_metadata_replaces_numeric_group_name(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "wa_group": {
+                "origin": {
+                    "platform": "whatsapp",
+                    "chat_id": "120363425326357814@g.us",
+                    "chat_name": "120363425326357814",
+                },
+                "chat_type": "group",
+            },
+        })
+        metadata_file = tmp_path / "whatsapp-chat-metadata.json"
+        metadata_file.write_text(json.dumps({
+            "version": 1,
+            "chats": {
+                "120363425326357814@g.us": {
+                    "id": "120363425326357814@g.us",
+                    "name": "Savills Rental Sprucing & Maintenance",
+                    "type": "group",
+                }
+            },
+        }))
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), \
+             patch("gateway.channel_directory.WHATSAPP_METADATA_PATH", metadata_file):
+            entries = _build_from_sessions("whatsapp")
+            from gateway.channel_directory import _merge_whatsapp_metadata
+            merged = _merge_whatsapp_metadata(entries)
+
+        assert merged == [{
+            "id": "120363425326357814@g.us",
+            "name": "Savills Rental Sprucing & Maintenance",
+            "type": "group",
+            "thread_id": None,
+        }]
+
+    def test_whatsapp_metadata_adds_unseen_chat(self, tmp_path):
+        metadata_file = tmp_path / "whatsapp-chat-metadata.json"
+        metadata_file.write_text(json.dumps({
+            "version": 1,
+            "chats": {
+                "120363999@g.us": {
+                    "id": "120363999@g.us",
+                    "name": "TGG Defect Queue",
+                    "type": "group",
+                }
+            },
+        }))
+
+        with patch("gateway.channel_directory.WHATSAPP_METADATA_PATH", metadata_file):
+            from gateway.channel_directory import _merge_whatsapp_metadata
+            merged = _merge_whatsapp_metadata([])
+
+        assert merged == [{
+            "id": "120363999@g.us",
+            "name": "TGG Defect Queue",
+            "type": "group",
+        }]
+
 
 class TestFormatDirectoryForDisplay:
     def test_empty_directory(self, tmp_path):
