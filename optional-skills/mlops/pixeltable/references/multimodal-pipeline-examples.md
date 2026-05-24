@@ -22,13 +22,13 @@ docs = pxt.create_table('rag.docs', {
 # Split into chunks
 chunks = pxt.create_view(
     'rag.chunks', docs,
-    iterator=document_splitter(docs.doc, separators='paragraph'),
+    iterator=document_splitter(docs.doc, separators='token_limit', limit=300),
     if_exists='ignore'
 )
 
 # Add embedding index for similarity search
 embed_fn = sentence_transformer.using(model_id='intfloat/e5-large-v2')
-chunks.add_embedding_index('text', embedding=embed_fn)
+chunks.add_embedding_index('text', embedding=embed_fn, if_exists='ignore')
 
 # Insert documents
 docs.insert([
@@ -105,7 +105,7 @@ imgs = pxt.create_table('images.gallery', {
 
 # Add CLIP embedding index for cross-modal search
 embed_fn = clip.using(model_id='openai/clip-vit-base-patch32')
-imgs.add_embedding_index('image', embedding=embed_fn)
+imgs.add_embedding_index('image', embedding=embed_fn, if_exists='ignore')
 
 # Insert images
 imgs.insert([
@@ -182,7 +182,7 @@ articles.add_computed_column(
 
 # Step 2: Embed the summary for search
 embed_fn = sentence_transformer.using(model_id='all-MiniLM-L6-v2')
-articles.add_embedding_index('summary', embedding=embed_fn)
+articles.add_embedding_index('summary', embedding=embed_fn, if_exists='ignore')
 
 # Insert triggers both summarization and embedding
 articles.insert([{

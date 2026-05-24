@@ -21,18 +21,16 @@ echo "--- Verifying import ---"
 python3 -c "import pixeltable as pxt; print(f'Pixeltable {pxt.__version__} ready')"
 
 echo ""
-echo "--- Installing MCP server (optional) ---"
-if pip install --quiet mcp-server-pixeltable-developer 2>/dev/null; then
-    echo "MCP server installed"
-    echo ""
-    echo "Add to ~/.hermes/config.yaml:"
+echo "--- Checking MCP server (optional) ---"
+if command -v uvx &>/dev/null; then
+    echo "uvx found. To enable MCP tools, add to ~/.hermes/config.yaml:"
     echo ""
     echo "  mcpServers:"
     echo "    pixeltable:"
     echo "      command: uvx"
     echo "      args: [mcp-server-pixeltable-developer]"
 else
-    echo "MCP server skipped (install manually: pip install mcp-server-pixeltable-developer)"
+    echo "uvx not found. Install uv (https://docs.astral.sh/uv/) for MCP server support."
 fi
 
 echo ""

@@ -11,18 +11,10 @@ mcpServers:
     args: [mcp-server-pixeltable-developer]
 ```
 
-If `uvx` is not available, install with:
+If `uvx` is not available, install `uv` first:
 
 ```bash
-pip install mcp-server-pixeltable-developer
-```
-
-Then use:
-
-```yaml
-mcpServers:
-  pixeltable:
-    command: mcp-server-pixeltable-developer
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 Optional environment variables:
@@ -84,15 +76,15 @@ After adding, restart Hermes. Tools appear under `native-mcp` with the `pixeltab
 |---|---|
 | `pixeltable_check_dependencies` | Check if packages needed for a function are installed |
 | `pixeltable_install_dependency` | Install a missing Python dependency |
-| `pixeltable_install_package` | Install an arbitrary pip package |
+| `install_package` | Install an arbitrary pip package |
 
 ### REPL and Introspection
 
 | Tool | What it does |
 |---|---|
-| `pixeltable_execute_python` | Run arbitrary Python in a persistent Pixeltable REPL |
-| `pixeltable_introspect_function` | Get signature and docs for a Pixeltable function |
-| `pixeltable_list_available_functions` | List all registered functions by module |
+| `execute_python` | Run arbitrary Python in a persistent Pixeltable REPL |
+| `introspect_function` | Get signature and docs for a Pixeltable function |
+| `list_available_functions` | List all registered functions by module |
 
 ### Configuration
 
@@ -106,12 +98,12 @@ After adding, restart Hermes. Tools appear under `native-mcp` with the `pixeltab
 
 | Tool | What it does |
 |---|---|
-| `pixeltable_display_in_browser` | Render table data in a browser canvas |
-| `pixeltable_log_bug` | Log a bug for the current session |
-| `pixeltable_log_missing_feature` | Log a feature request |
-| `pixeltable_log_success` | Log a successful operation |
-| `pixeltable_generate_bug_report` | Generate a structured bug report |
-| `pixeltable_get_session_summary` | Get a summary of the current session |
+| `display_in_browser` | Render table data in a browser canvas |
+| `log_bug` | Log a bug for the current session |
+| `log_missing_feature` | Log a feature request |
+| `log_success` | Log a successful operation |
+| `generate_bug_report` | Generate a structured bug report |
+| `get_session_summary` | Get a summary of the current session |
 
 ## Example: Using MCP Tools in Hermes
 

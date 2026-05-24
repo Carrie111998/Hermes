@@ -147,3 +147,44 @@ class TestSupportFiles:
     def test_pipeline_reference_has_examples(self) -> None:
         text = PIPELINE_REF.read_text()
         assert 'import pixeltable' in text, 'Pipeline reference must contain runnable Python examples'
+
+
+class TestApiCorrectness:
+    """Verify the skill teaches correct, non-hallucinated Pixeltable API patterns."""
+
+    HALLUCINATED_PATTERNS = [
+        (r'openai\.vision\b', 'openai.vision does not exist'),
+        (r'from pixeltable\.iterators\s+import\s+FrameIterator', 'FrameIterator deprecated import'),
+        (r'pxt\.Table\s*\(', 'pxt.Table() does not exist'),
+        (r'pxt\.load_table\b', 'pxt.load_table does not exist'),
+        (r'pxt\.connect\b', 'pxt.connect does not exist'),
+        (r"if_not_exists\s*=", 'if_not_exists is not a valid kwarg; use if_exists'),
+    ]
+
+    def test_no_hallucinated_apis_in_skill(self, skill_text: str) -> None:
+        code_blocks = re.findall(r'```python\n(.*?)```', skill_text, re.DOTALL)
+        code_text = '\n'.join(code_blocks)
+        for pattern, msg in self.HALLUCINATED_PATTERNS:
+            assert not re.search(pattern, code_text), f'SKILL.md code contains hallucinated API: {msg}'
+
+    def test_no_hallucinated_apis_in_references(self) -> None:
+        text = PIPELINE_REF.read_text()
+        for pattern, msg in self.HALLUCINATED_PATTERNS:
+            assert not re.search(pattern, text), f'Pipeline examples contain hallucinated API: {msg}'
+
+    def test_similarity_uses_keyword_arg(self, skill_text: str) -> None:
+        code_blocks = re.findall(r'```python\n(.*?)```', skill_text, re.DOTALL)
+        code_text = '\n'.join(code_blocks)
+        positional = re.findall(r"\.similarity\(\s*'[^']+'\s*\)", code_text)
+        assert not positional, f'SKILL.md code uses positional similarity(): {positional}'
+
+    def test_similarity_uses_keyword_in_references(self) -> None:
+        text = PIPELINE_REF.read_text()
+        positional = re.findall(r"\.similarity\(\s*'[^']+'\s*\)", text)
+        assert not positional, f'Pipeline examples use positional similarity(): {positional}'
+
+    def test_idempotency_pattern_present(self, skill_text: str) -> None:
+        assert "if_exists='ignore'" in skill_text, 'SKILL.md must demonstrate if_exists=ignore pattern'
+
+    def test_collect_pattern_present(self, skill_text: str) -> None:
+        assert '.collect()' in skill_text, 'SKILL.md must show .collect() to terminate queries'

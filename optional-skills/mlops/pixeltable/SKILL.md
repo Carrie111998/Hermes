@@ -88,11 +88,13 @@ For multi-step workflows, write a Python script with `write_file` and execute wi
 | Create directory | `pxt.create_dir('mydir', if_exists='ignore')` |
 | Create table | `pxt.create_table('mydir.t', {'text': pxt.String, 'img': pxt.Image})` |
 | Insert rows | `t.insert([{'text': 'hello', 'img': 'path/to/img.jpg'}])` |
-| Add computed column | `t.add_computed_column(emb=embed_fn(t.text))` |
-| Add embedding index | `t.add_embedding_index('text', embedding=embed_fn)` |
+| Add computed column | `t.add_computed_column(emb=embed_fn(t.text), if_exists='ignore')` |
+| Add embedding index | `t.add_embedding_index('text', embedding=embed_fn, if_exists='ignore')` |
 | Similarity search | `t.order_by(t.text.similarity(string='query'), asc=False).limit(5).collect()` |
-| Create view | `pxt.create_view('mydir.chunks', t, iterator=document_splitter(t.doc, separators='paragraph'))` |
+| Create view | `pxt.create_view('mydir.chunks', t, iterator=document_splitter(t.doc, separators='token_limit', limit=300))` |
 | Query with filter | `t.where(t.category == 'science').select(t.text, t.score).collect()` |
+| Define a UDF | `@pxt.udf` decorator on a typed Python function |
+| Define a query function | `@pxt.query` decorator — returns a query expression, no `.collect()` inside |
 | Drop table | `pxt.drop_table('mydir.t')` |
 | List tables | `pxt.list_tables()` |
 
@@ -116,7 +118,7 @@ imgs = pxt.create_table('images.gallery', {'image': pxt.Image, 'label': pxt.Stri
 
 # CLIP embeds images AND text into the same vector space
 embed_fn = clip.using(model_id='openai/clip-vit-base-patch32')
-imgs.add_embedding_index('image', embedding=embed_fn)
+imgs.add_embedding_index('image', embedding=embed_fn, if_exists='ignore')
 
 # Insert real sample images (COCO dataset hosted on GitHub)
 base = 'https://raw.githubusercontent.com/pixeltable/pixeltable/release/docs/resources/images'
@@ -179,12 +181,12 @@ docs = pxt.create_table('rag.docs', {'doc': pxt.Document}, if_exists='ignore')
 
 chunks = pxt.create_view(
     'rag.chunks', docs,
-    iterator=document_splitter(docs.doc, separators='paragraph'),
+    iterator=document_splitter(docs.doc, separators='token_limit', limit=300),
     if_exists='ignore'
 )
 
 embed_fn = sentence_transformer.using(model_id='intfloat/e5-large-v2')
-chunks.add_embedding_index('text', embedding=embed_fn)
+chunks.add_embedding_index('text', embedding=embed_fn, if_exists='ignore')
 
 docs.insert([{'doc': '/path/to/document.pdf'}])
 
@@ -198,8 +200,19 @@ print(results)
 - **Embedded PostgreSQL**: Pixeltable starts an embedded PostgreSQL process on first import. If port 5432 is already in use, set `PXT_HOME` to an alternate directory or configure a different port in `~/.pixeltable/config.toml`.
 - **Media storage**: Images, video, and audio files are copied to `~/.pixeltable/media/`. For large datasets, ensure sufficient disk space or configure `PXT_HOME` to point to a volume with more room.
 - **Computed column re-execution**: Changing a computed column expression re-processes all existing rows. For large tables, add computed columns before bulk inserts.
+- **`if_exists='ignore'` won't fix bugs**: If a computed column has wrong logic, `if_exists='ignore'` silently skips it. You must `t.drop_column('col')` then recreate.
 - **API keys**: Functions from `pixeltable.functions.openai`, `.anthropic`, etc. require the corresponding API keys set as environment variables.
 - **First import is slow**: The initial `import pixeltable` downloads and starts PostgreSQL (~10 seconds on first run, ~2 seconds thereafter).
+
+**Common mistakes — do NOT use these patterns:**
+
+| Wrong | Correct |
+|---|---|
+| `openai.vision(...)` | Does not exist. Use `openai.chat_completions(messages=[...])` with `image_url` blocks |
+| `from pixeltable.iterators import FrameIterator` | Deprecated. Use `from pixeltable.functions.video import frame_iterator` |
+| `t.col.similarity('query')` | Positional arg deprecated. Use `t.col.similarity(string='query')` |
+| `pxt.Table(...)` or `pxt.connect(...)` | Do not exist. Use `pxt.create_table(...)` and `pxt.get_table(...)` |
+| `for row in data: model.predict(row)` | Use computed columns instead — they auto-execute on insert |
 
 ## Verification
 
