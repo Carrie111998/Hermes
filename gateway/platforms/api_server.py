@@ -92,6 +92,25 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
 
+try:
+    from tui_gateway.file_serve import (
+        cleanup_stale_files,
+        register_file,
+        resolve_file,
+        validate_bearer_token,
+        DEFAULT_SERVE_ROOT,
+        FILE_TTL_SECONDS,
+    )
+except ImportError:
+    register_file = None  # type: ignore[assignment]
+    resolve_file = None  # type: ignore[assignment]
+    validate_bearer_token = None  # type: ignore[assignment]
+    cleanup_stale_files = None  # type: ignore[assignment]
+    DEFAULT_SERVE_ROOT = None
+    FILE_TTL_SECONDS = 3600
+
+import mimetypes
+
 logger = logging.getLogger(__name__)
 
 
@@ -5249,6 +5268,127 @@ class APIServerAdapter(BasePlatformAdapter):
             self._run_statuses.pop(run_id, None)
 
     # ------------------------------------------------------------------
+    # File serving for TUI gateway clients (HermesNative)
+    # ------------------------------------------------------------------
+
+    async def _handle_file_download(self, request: "web.Request") -> "web.Response":
+        """GET /v1/files/{session_id}/{filename} -- serve agent-produced files.
+
+        Authenticated with the same Bearer token used for the WebSocket
+        connection.  Path traversal is blocked.  The file must exist inside
+        ``~/.hermes/served-files/{session_id}/``.
+        """
+        if register_file is None:
+            return web.Response(status=503, text="File serving not available")
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        filename = request.match_info.get("filename", "")
+
+        if not session_id or not filename:
+            return web.Response(status=400, text="Missing session_id or filename")
+
+        file_path = resolve_file(session_id, filename)
+        if file_path is None:
+            return web.Response(status=404, text="File not found")
+
+        mime_type, _ = mimetypes.guess_type(str(file_path))
+        if not mime_type:
+            mime_type = "application/octet-stream"
+
+        return web.FileResponse(
+            path=str(file_path),
+            headers={
+                "Content-Type": mime_type,
+                "Cache-Control": "private, max-age=3600",
+            },
+        )
+
+    async def _handle_file_upload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/upload -- accept file upload from HermesNative clients.
+
+        Accepts multipart form data with a ``file`` field.  Query params:
+        ``filename`` (optional) and ``session_id`` (optional).  The uploaded
+        file is staged into ``~/.hermes/served-files/{session_id}/`` and the
+        server-side path is returned for use with ``image.attach`` RPC.
+        """
+        if register_file is None or DEFAULT_SERVE_ROOT is None:
+            return web.Response(status=503, text="File serving not available")
+
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            reader = await request.multipart()
+        except Exception:
+            return web.Response(status=400, text="Expected multipart/form-data")
+
+        file_field = None
+        filename = request.query.get("filename", "upload")
+        session_id = request.query.get("session_id", "default")
+
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == "file":
+                file_field = part
+                if part.filename:
+                    filename = part.filename
+                break
+
+        if file_field is None:
+            return web.Response(status=400, text="No 'file' field in multipart form")
+
+        data = await file_field.read()
+        if not data:
+            return web.Response(status=400, text="Empty file")
+
+        ext = os.path.splitext(filename)[1] or ".bin"
+        root = Path(DEFAULT_SERVE_ROOT)
+        dest_dir = root / session_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        file_id = uuid.uuid4().hex[:8]
+        dest = dest_dir / f"{file_id}{ext}"
+        dest.write_bytes(data)
+
+        base_url = os.environ.get(
+            "HERMES_FILE_SERVE_URL",
+            f"http://{self._host}:{self._port}",
+        )
+        url = f"{base_url.rstrip('/')}/v1/files/{session_id}/{file_id}{ext}"
+
+        logger.info(
+            "[api_server] uploaded file: %s (%d bytes) -> %s",
+            filename, len(data), url,
+        )
+
+        return web.json_response({
+            "path": str(dest),
+            "url": url,
+            "filename": filename,
+            "size": len(data),
+        })
+
+    async def _sweep_served_files(self) -> None:
+        """Periodically clean up stale served files (every 10 minutes)."""
+        if cleanup_stale_files is None:
+            return
+        while True:
+            await asyncio.sleep(600)
+            try:
+                removed = cleanup_stale_files()
+                if removed:
+                    logger.debug("[api_server] swept %d stale served files", removed)
+            except Exception:
+                logger.exception("[api_server] file sweep failed")
+
+    # ------------------------------------------------------------------
     # BasePlatformAdapter interface
     # ------------------------------------------------------------------
 
@@ -5315,6 +5455,30 @@ class APIServerAdapter(BasePlatformAdapter):
             if self.gateway_runner is not None:
                 self._app["gateway_runner"] = self.gateway_runner
 
+            # WebSocket JSON-RPC endpoint (full TUI parity for native clients)
+            self._app.router.add_get("/v1/ws", self._handle_ws)
+            # File serving for TUI gateway clients
+            if register_file is not None:
+                self._app.router.add_get(
+                    "/v1/files/{session_id}/{filename}",
+                    self._handle_file_download,
+                )
+                self._app.router.add_post(
+                    "/v1/upload",
+                    self._handle_file_upload,
+                )
+                # Background file cleanup sweep (every 10 minutes)
+                file_cleanup_task = asyncio.create_task(
+                    self._sweep_served_files()
+                )
+                try:
+                    self._background_tasks.add(file_cleanup_task)
+                except TypeError:
+                    pass
+                if hasattr(file_cleanup_task, "add_done_callback"):
+                    file_cleanup_task.add_done_callback(
+                        self._background_tasks.discard
+                    )
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
