@@ -133,6 +133,24 @@
       "sourcePath": "scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
       "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
       "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/config.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/config.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/deploy/configure_christopher_outbound.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge-v2/allowlist.test.mjs",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/allowlist.test.mjs",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
     }
   ],
   "requiredEnv": [
@@ -154,16 +172,30 @@
       "name": "christopher-tgg-hermes.service",
       "preRestartHooks": [
         {
+          "name": "configure-outbound-policy",
+          "command": "python3 /home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py --management-chat 120363409954029949@g.us --ops-chat 120363403088884777@g.us --ops-chat 120363403845802098@g.us --ops-chat 120363405141229117@g.us --ops-chat 120363420803272720@g.us --ops-chat 120363421153247095@g.us --ops-chat 120363421424519051@g.us --ops-chat 120363422582425366@g.us --ops-chat 120363423535922556@g.us --ops-chat 120363423568509280@g.us"
+        },
+        {
           "name": "daemon-reload",
           "command": "systemctl daemon-reload"
         }
-      ]
+      ],
+      "postRestartHooks": []
     },
     {
-      "name": "christopher-tgg-whatsapp.service"
+      "name": "christopher-tgg-whatsapp.service",
+      "preRestartHooks": [
+        {
+          "name": "install-v2-unit",
+          "command": "install -m 0644 /home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service /etc/systemd/system/christopher-tgg-whatsapp.service && systemctl daemon-reload"
+        }
+      ],
+      "postRestartHooks": []
     },
     {
-      "name": "wa-pair-server.service"
+      "name": "wa-pair-server.service",
+      "preRestartHooks": [],
+      "postRestartHooks": []
     }
   ],
   "verifyHooks": [
@@ -188,16 +220,20 @@
       "command": "grep -q 'default: gemini-3-flash-preview' /home/pclaw/.hermes-christopher-tgg/config.yaml"
     },
     {
-      "name": "outbound-disabled",
-      "command": "systemctl show christopher-tgg-whatsapp.service --property=Environment --value | tr ' ' '\\n' | grep -qx 'WHATSAPP_OUTBOUND_DISABLED=true'"
-    },
-    {
       "name": "live-config-case-create",
       "command": "grep -q 'url: https://systems.papercut-labs.com/api/operator/cases/create' /home/pclaw/.hermes-christopher-tgg-state/config.yaml"
     },
     {
       "name": "live-constitution-custom-create",
       "command": "grep -q 'operation tgg_case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q '      - custom' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
+    },
+    {
+      "name": "outbound-policy-check",
+      "command": "python3 /home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py --management-chat 120363409954029949@g.us --ops-chat 120363403088884777@g.us --ops-chat 120363403845802098@g.us --ops-chat 120363405141229117@g.us --ops-chat 120363420803272720@g.us --ops-chat 120363421153247095@g.us --ops-chat 120363421424519051@g.us --ops-chat 120363422582425366@g.us --ops-chat 120363423535922556@g.us --ops-chat 120363423568509280@g.us --check-only"
+    },
+    {
+      "name": "v2-outbound-policy-env",
+      "command": "python3 /home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py --management-chat 120363409954029949@g.us --ops-chat 120363403088884777@g.us --ops-chat 120363403845802098@g.us --ops-chat 120363405141229117@g.us --ops-chat 120363420803272720@g.us --ops-chat 120363421153247095@g.us --ops-chat 120363421424519051@g.us --ops-chat 120363422582425366@g.us --ops-chat 120363423535922556@g.us --ops-chat 120363423568509280@g.us --check-only --check-v2-service-env christopher-tgg-whatsapp.service"
     }
   ],
   "runtimeOnlyDriftExclusions": [
