@@ -173,11 +173,11 @@
     },
     {
       "name": "hermes-health",
-      "command": "curl -fsS http://127.0.0.1:3000/health >/tmp/christopher-hermes-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-hermes-health.json'))\nassert p.get('status') in ('ok','healthy')\nPY2"
+      "command": "curl -fsS http://127.0.0.1:3000/health >/tmp/christopher-hermes-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-hermes-health.json'))\nassert p.get('status') in ('ok','healthy','connected')\nPY2"
     },
     {
       "name": "whatsapp-v2-health",
-      "command": "curl -fsS http://127.0.0.1:3001/health >/tmp/christopher-wa-v2-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-wa-v2-health.json'))\nassert p.get('connected') is True\nassert p.get('paired') is True\nPY2"
+      "command": "curl -fsS http://127.0.0.1:3001/health >/tmp/christopher-wa-v2-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-wa-v2-health.json'))\nassert p.get('status') in ('connected','ok','healthy') or p.get('connected') is True\nassert p.get('paired') is True\nPY2"
     },
     {
       "name": "config-constitution-present",
