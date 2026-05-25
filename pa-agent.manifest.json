@@ -235,7 +235,7 @@
     },
     {
       "name": "live-constitution-custom-create",
-      "command": "grep -q 'operation tgg_case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q '      - custom' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
+      "command": "grep -q 'operation tgg_case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -Eq '^[[:space:]]*- custom$' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     },
     {
       "name": "outbound-policy-check",

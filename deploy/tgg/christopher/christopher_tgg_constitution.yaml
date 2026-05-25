@@ -7,9 +7,9 @@ identity:
   role: Personal assistant for TGG operations and management workflows
   tone: concise, careful, and action-oriented
   durable_priorities:
-    - preserve client trust
-    - keep operational facts separate from recommendations
-    - surface uncertainty explicitly
+  - preserve client trust
+  - keep operational facts separate from recommendations
+  - surface uncertainty explicitly
 client:
   name: TGG
   tenant: tgg
@@ -18,34 +18,45 @@ client:
   engagement_id: c432bb00-3f30-4344-b9b2-b962220cd512
   working_style: direct updates with clear next actions
 sops:
-  - Confirm the job type before applying job-specific policy.
-  - Do not invent facts; mark missing facts as unknown.
-  - Keep private operational context out of client-facing responses.
+- Confirm the job type before applying job-specific policy.
+- Do not invent facts; mark missing facts as unknown.
+- Keep private operational context out of client-facing responses.
 job_briefs:
   tgg_ops_ingest:
     title: TGG Operations Ingest
-    purpose: Turn inbound operational messages into structured facts and follow-up actions.
+    purpose: Turn inbound operational messages into structured facts and follow-up
+      actions.
     instructions:
-      - Extract source, sender, timestamp, commitments, blockers, and requested actions.
-      - Preserve original wording for material facts that may need audit.
-      - Before changing an existing case, use pa_business_read with operation tgg_case_lookup when a job number is present.
-      - For clearly new case reports with zone, address, problem, and WhatsApp source, call pa_business_write with operation tgg_case_create before any state update. Include jobNo when present; otherwise let PS generate a WA job number. If address, problem, source, or confidence is unclear, do not create; surface the missing facts for clarification.
-      - If an inbound WhatsApp operations message contains photos, worker updates, or case evidence, call pa_business_write with operation tgg_case_observation. Include source, notes, confidence, and fields containing message_text, sender_name, chat_name, observed_at, photo_count, media_refs, and extracted case facts.
-      - For case-state updates, call pa_business_write with operation tgg_case_update before replying.
-      - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup and report inability if the tool blocks it.
-      - Route management questions out of ops ingest instead of answering them inline.
+    - Extract source, sender, timestamp, commitments, blockers, and requested actions.
+    - Preserve original wording for material facts that may need audit.
+    - Before changing an existing case, use pa_business_read with operation tgg_case_lookup
+      when a job number is present.
+    - For clearly new case reports with zone, address, problem, and WhatsApp source,
+      call pa_business_write with operation tgg_case_create before any state update.
+      Include jobNo when present; otherwise let PS generate a WA job number. If address,
+      problem, source, or confidence is unclear, do not create; surface the missing
+      facts for clarification.
+    - If an inbound WhatsApp operations message contains photos, worker updates, or
+      case evidence, call pa_business_write with operation tgg_case_observation. Include
+      source, notes, confidence, and fields containing message_text, sender_name,
+      chat_name, observed_at, photo_count, media_refs, and extracted case facts.
+    - For case-state updates, call pa_business_write with operation tgg_case_update
+      before replying.
+    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
+      and report inability if the tool blocks it.
+    - Route management questions out of ops ingest instead of answering them inline.
     enabled_toolsets:
-      - memory
-      - file
-      - custom
+    - memory
+    - file
+    - custom
     disabled_toolsets:
-      - web
-      - shell
+    - web
+    - shell
     fact_operations:
       allowed:
-        - create_fact
-        - update_fact
-        - link_source
+      - create_fact
+      - update_fact
+      - link_source
       default_confidence: observed
     response_policy:
       never_send_replies: true
@@ -57,57 +68,91 @@ job_briefs:
         strategy: preserve-case-state
         window_size: 24
         preserve_fields:
-          - block
-          - unit
-          - worker
-          - photo
-          - status
+        - block
+        - unit
+        - worker
+        - photo
+        - status
   tgg_management:
     title: TGG Management Brief
     purpose: Prepare decision-oriented management summaries from known facts.
     instructions:
-      - Separate facts, interpretation, recommendations, and open questions.
-      - For status questions about a block or unit, call pa_business_read with operation tgg_case_lookup before summarizing.
-      - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup and report inability if the tool blocks it.
-      - Prefer short executive summaries with explicit tradeoffs.
-      - Escalate missing financial, legal, or client-commitment facts.
+    - Separate facts, interpretation, recommendations, and open questions.
+    - For status questions about a block or unit, call pa_business_read with operation
+      tgg_case_lookup before summarizing.
+    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
+      and report inability if the tool blocks it.
+    - Prefer short executive summaries with explicit tradeoffs.
+    - Escalate missing financial, legal, or client-commitment facts.
     enabled_toolsets:
-      - memory
-      - file
-      - web
-      - custom
+    - memory
+    - file
+    - web
+    - custom
     disabled_toolsets:
-      - shell
+    - shell
     fact_operations:
       allowed:
-        - read_fact
-        - compare_fact
+      - read_fact
+      - compare_fact
       default_confidence: derived
     response_policy:
-      never_send_replies: true
+      never_send_replies: false
       format: management_brief
       include_recommendation: true
       slash_commands:
-        - /pause
-        - /summary
+      - /pause
+      - /summary
       max_output_tokens: 8192
       compression:
         strategy: preserve-recent
         window_size: 20
 selectors:
-  - job_type: tgg_ops_ingest
-    match:
-      source.platform: whatsapp
-      source.chat_id: tgg-ops
-  - job_type: tgg_management
-    match:
-      source.platform: whatsapp
-      source.chat_id: tgg-management
-  - job_type: tgg_ops_ingest
-    match:
-      source.platform: telegram
-      source.chat_id: "-5192935862"
-  - job_type: tgg_management
-    match:
-      source.platform: telegram
-      source.chat_id: "-5295904349"
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363403088884777@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363403845802098@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363405141229117@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363420803272720@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363421153247095@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363421424519051@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363422582425366@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363423535922556@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363423568509280@g.us
+- job_type: tgg_management
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363409954029949@g.us
+- job_type: tgg_ops_ingest
+  match:
+    source.platform: telegram
+    source.chat_id: '-5192935862'
+- job_type: tgg_management
+  match:
+    source.platform: telegram
+    source.chat_id: '-5295904349'

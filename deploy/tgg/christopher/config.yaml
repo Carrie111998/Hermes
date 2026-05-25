@@ -8,7 +8,6 @@ model:
 pa:
   enabled: true
   constitution_path: /home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml
-  job_type: tgg_ops_ingest
   overlay:
     identity:
       display_name: Christopher
@@ -107,11 +106,14 @@ platforms:
       require_mention: false
       dm_policy: open
       group_policy: open
-      pa_job_type: tgg_ops_ingest
+      outbound_allowed_chats:
+      - 120363409954029949@g.us
 whatsapp:
   require_mention: false
   dm_policy: open
   group_policy: open
+  outbound_allowed_chats:
+  - 120363409954029949@g.us
 onboarding:
   seen:
     busy_input_prompt: true
