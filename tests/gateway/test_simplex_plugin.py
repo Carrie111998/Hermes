@@ -256,6 +256,17 @@ async def test_list_channels_returns_none_on_contacts_timeout():
     assert await adapter.list_channels() is None
 
 
+@pytest.mark.asyncio
+async def test_send_when_ws_not_connected_reports_failure():
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+    # No _ws assigned — _send_ws should drop quietly
+    result = await adapter.send("contact-42", "hi")
+    assert result.success is False
+    assert result.error is not None
+
+
 # ---------------------------------------------------------------------------
 # 8. Inbound: filter own-echo by corrId prefix
 # ---------------------------------------------------------------------------

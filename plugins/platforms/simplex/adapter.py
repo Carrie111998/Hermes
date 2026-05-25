@@ -788,21 +788,23 @@ class SimplexAdapter(BasePlatformAdapter):
                     break
         return corr_id
 
-    async def _send_ws(self, payload: dict) -> None:
-        """Fire-and-forget JSON payload write.
+    async def _send_ws(self, payload: dict) -> bool:
+        """Send one JSON payload over the active WebSocket.
 
-        Drops cleanly when the WebSocket is missing or already closed; the
-        caller never has to handle reconnection — the ``_ws_listener``
-        loop does that out of band.
+        Returns True on success, False if the socket is unavailable or an
+        error occurs so callers can surface failures instead of silently
+        reporting success.
         """
         ws = self._ws
         if not ws:
-            logger.debug("SimpleX: WS send dropped (not connected)")
-            return
+            logger.debug("SimpleX: WS send rejected (not connected)")
+            return False
         try:
             await ws.send(json.dumps(payload))
+            return True
         except Exception as e:
             logger.warning("SimpleX: WS send error: %s", e)
+            return False
 
     async def _send_command(
         self, command: str, timeout: float = 30.0
@@ -891,7 +893,14 @@ class SimplexAdapter(BasePlatformAdapter):
             else:
                 cmd_str = f"/_send @{chat_id} json {composed}"
 
-            await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
+            ok = await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
+            if not ok:
+                return SendResult(
+                    success=False,
+                    error="SimpleX WebSocket is unavailable or closed",
+                    retryable=True,
+                    error_kind="transient",
+                )
 
         for path in media_paths:
             is_voice = os.path.splitext(path)[1].lower() in _voice_exts
