@@ -48,7 +48,7 @@ DEFAULT_POLICY_ENV = Path("/home/pclaw/.hermes-christopher-tgg/outbound-policy.e
 def _backup(path: Path) -> None:
     if not path.exists():
         return
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = path.with_name(f"{path.name}.bak-{stamp}-stream2-outbound")
     backup.write_bytes(path.read_bytes())
 
