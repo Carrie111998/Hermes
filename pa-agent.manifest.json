@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "remoteRoot": "/home/pclaw/apps/hermes-pcl",
+  "include": [
+    "toolsets.py",
+    "tools/tgg_ilinked_lookup.py",
+    "scripts/whatsapp-bridge/allowlist.js",
+    "scripts/whatsapp-bridge/allowlist.test.mjs",
+    "scripts/whatsapp-bridge/bridge.js",
+    "scripts/whatsapp-bridge/package.json",
+    "scripts/whatsapp-bridge/package-lock.json",
+    "scripts/whatsapp-bridge-v2/allowlist.js",
+    "scripts/whatsapp-bridge-v2/bridge.js",
+    "scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
+    "scripts/whatsapp-bridge-v2/package.json",
+    "scripts/whatsapp-bridge-v2/package-lock.json",
+    "tests/fixtures/clients/tgg/overlay.yaml",
+    "tests/fixtures/pa/bobby_tgg_constitution.yaml"
+  ],
+  "requiredEnv": [
+    {
+      "name": "GEMINI_API_KEY_PCL_PA_SHARED",
+      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+    },
+    {
+      "name": "CHRISTOPHER_TGG_PS_SERVICE_TOKEN",
+      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+    }
+  ],
+  "services": [
+    {
+      "name": "christopher-tgg-hermes.service",
+      "restart": true,
+      "postRestartHooks": [
+        {
+          "name": "hermes-active",
+          "command": "systemctl is-active christopher-tgg-hermes.service"
+        },
+        {
+          "name": "legacy-bridge-health",
+          "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\"; print(\"port3000 connected\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+        }
+      ]
+    },
+    {
+      "name": "christopher-tgg-whatsapp.service",
+      "restart": true,
+      "postRestartHooks": [
+        {
+          "name": "whatsapp-active",
+          "command": "systemctl is-active christopher-tgg-whatsapp.service"
+        },
+        {
+          "name": "v2-bridge-health",
+          "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3001/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\" and d.get(\"paired\") is True; print(\"port3001 connected+paired\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+        },
+        {
+          "name": "outbound-disabled",
+          "command": "systemctl show christopher-tgg-whatsapp.service --property=Environment --value | tr ' ' '\\n' | grep -qx 'WHATSAPP_OUTBOUND_DISABLED=true'"
+        }
+      ]
+    }
+  ],
+  "verifyHooks": [
+    {
+      "name": "services-active",
+      "command": "systemctl is-active christopher-tgg-hermes.service christopher-tgg-whatsapp.service"
+    },
+    {
+      "name": "legacy-bridge-health",
+      "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\"; print(\"port3000 connected\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+    },
+    {
+      "name": "v2-bridge-health",
+      "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3001/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\" and d.get(\"paired\") is True; print(\"port3001 connected+paired\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+    },
+    {
+      "name": "model-config",
+      "command": "grep -q 'default: gemini-3-flash-preview' /home/pclaw/.hermes-christopher-tgg/config.yaml"
+    },
+    {
+      "name": "outbound-disabled",
+      "command": "systemctl show christopher-tgg-whatsapp.service --property=Environment --value | tr ' ' '\\n' | grep -qx 'WHATSAPP_OUTBOUND_DISABLED=true'"
+    }
+  ],
+  "runtimeOnlyDriftExclusions": [
+    "logs",
+    "sessions",
+    "state.db",
+    "state.db-wal",
+    "state.db-shm",
+    "whatsapp",
+    "whatsapp-v2",
+    "message-store.json",
+    "media",
+    "cache",
+    ".cache",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache"
+  ],
+  "retainDeploys": 5
+}
