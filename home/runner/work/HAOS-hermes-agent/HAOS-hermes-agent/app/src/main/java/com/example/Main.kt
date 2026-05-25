@@ -1,16 +1,16 @@
 // app/build.gradle.kts
 android {
-    // ... altre configurazioni ...
+    // ... altre configurazioni
 
     defaultConfig {
         // ...
-        // Recupera la chiave dalle variabili d'ambiente (ottimo per la CI/CD)
-        val geminiApiKey = System.getenv("GEMINI_API_KEY") ?: ""
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
+        // Recupera la chiave da ambiente o usa un placeholder
+        val geminiKey = System.getenv("GEMINI_API_KEY") ?: "\"YOUR_DEFAULT_API_KEY\""
+        buildConfigField("String", "GEMINI_API_KEY", geminiKey)
     }
 
     buildFeatures {
-        // CORREZIONE: Abilita la generazione della classe BuildConfig
+        // ATTENZIONE: Impostare a true per abilitare la classe BuildConfig
         buildConfig = true
     }
 }
