@@ -1,4 +1,4 @@
-id: christopher_tgg
+id: bobby_tgg
 agent_name: Christopher
 runtime:
   provider: gemini
@@ -29,19 +29,19 @@ job_briefs:
     instructions:
     - Extract source, sender, timestamp, commitments, blockers, and requested actions.
     - Preserve original wording for material facts that may need audit.
-    - Before changing an existing case, use pa_business_read with operation tgg_case_lookup
+    - Before changing an existing case, use pa_business_read with operation case_lookup
       when a job number is present.
     - For clearly new case reports with zone, address, problem, and WhatsApp source,
-      call pa_business_write with operation tgg_case_create before any state update.
-      Include jobNo when present; otherwise let PS generate a WA job number. If address,
-      problem, source, or confidence is unclear, do not create; surface the missing
-      facts for clarification.
+      call pa_business_write with operation case_create before any state update. Include
+      jobNo when present; otherwise let PS generate a WA job number. If address, problem,
+      source, or confidence is unclear, do not create; surface the missing facts for
+      clarification.
     - If an inbound WhatsApp operations message contains photos, worker updates, or
-      case evidence, call pa_business_write with operation tgg_case_observation. Include
+      case evidence, call pa_business_write with operation case_observation. Include
       source, notes, confidence, and fields containing message_text, sender_name,
       chat_name, observed_at, photo_count, media_refs, and extracted case facts.
-    - For case-state updates, call pa_business_write with operation tgg_case_update
-      before replying.
+    - For case-state updates, call pa_business_write with operation case_update before
+      replying.
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
     - Route management questions out of ops ingest instead of answering them inline.
@@ -78,8 +78,11 @@ job_briefs:
     purpose: Prepare decision-oriented management summaries from known facts.
     instructions:
     - Separate facts, interpretation, recommendations, and open questions.
-    - For status questions about a block or unit, call pa_business_read with operation
-      tgg_case_lookup before summarizing.
+    - For status questions about a block, unit, or operator-cases job number, call
+      pa_business_read with operation case_lookup before summarizing.
+    - For questions comparing WhatsApp/operator-cases with iLinked, call pa_business_read
+      with operation ilinked_lookup before summarizing and include bidirectional gap
+      findings in Facts.
     - For questions about iLinked Work Costing scope, estimated amounts, vendor/contract,
       or WC line items, call pa_business_read with operation ilinked_wc_lookup before
       summarizing and include the result in Facts.
@@ -107,8 +110,8 @@ job_briefs:
       format: management_brief
       include_recommendation: true
       slash_commands:
-      - /pause
-      - /summary
+      - "/pause"
+      - "/summary"
       max_output_tokens: 8192
       compression:
         strategy: preserve-recent
@@ -157,8 +160,8 @@ selectors:
 - job_type: tgg_ops_ingest
   match:
     source.platform: telegram
-    source.chat_id: '-5192935862'
+    source.chat_id: "-5192935862"
 - job_type: tgg_management
   match:
     source.platform: telegram
-    source.chat_id: '-5295904349'
+    source.chat_id: "-5295904349"
