@@ -389,6 +389,10 @@ def test_pa_business_toolset_is_registered_without_all_tools():
     assert toolset is not None
     assert set(toolset["tools"]) == {"pa_business_read", "pa_business_write"}
     assert resolve_toolset("pa-business") == ["pa_business_read", "pa_business_write"]
+    custom = get_toolset("custom")
+    assert custom is not None
+    assert set(custom["tools"]) == {"pa_business_read", "pa_business_write"}
+    assert resolve_toolset("custom") == ["pa_business_read", "pa_business_write"]
 
 
 def test_tenant_scoped_http_operation_injects_client_auth(fake_business_endpoint):
@@ -541,6 +545,41 @@ def test_path_param_interpolation_patch_keeps_remaining_payload_in_body(path_par
     assert last["path"] == "/api/operator/cases/BS%2FJOB%2F2605%2F0087/state"
     # jobNo was popped from payload; only state remains in the body.
     assert last["payload"] == {"state": "completed"}
+
+
+def test_case_create_operation_posts_body_without_path_params(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "case_create": {
+                    "type": "http",
+                    "method": "POST",
+                    "url": f"{path_param_endpoint}/api/operator/cases/create",
+                    "headers": {"X-PS-Tenant": "tgg"},
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "case_create",
+        {
+            "zone": "B15",
+            "address": "Blk 771 #04-18",
+            "problem": "Ceiling leak",
+            "source": "whatsapp:tgg-ops:test",
+            "photos": ["p1", "p2"],
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "POST"
+    assert last["path"] == "/api/operator/cases/create"
+    assert last["payload"]["address"] == "Blk 771 #04-18"
+    assert last["payload"]["photos"] == ["p1", "p2"]
+    assert last["ps_tenant"] == "tgg"
 
 
 def test_path_param_missing_from_payload_fails_loudly(path_param_endpoint):

@@ -31,6 +31,14 @@ client:
         headers:
           X-PS-Tenant: tgg
         timeout: 10
+      tgg_case_create:
+        type: http
+        tenant: tgg
+        method: POST
+        url: http://127.0.0.1:5191/api/operator/cases/create
+        headers:
+          X-PS-Tenant: tgg
+        timeout: 10
       tgg_case_update:
         type: http
         tenant: tgg
