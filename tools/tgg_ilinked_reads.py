@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 DEFAULT_CORPUS_GLOBS = (
+    "~/pcl/ilinked-corpus/tgg/full-import-*",
+    "/home/pclaw/pcl/ilinked-corpus/tgg/full-import-*",
     "/home/pclaw/ilinked-corpus/tgg/full-import-*",
     "/home/pclaw/.christopher/ilinked-corpus/full-import-*",
     "/home/pclaw/.christopher/ilinked-corpus/current",
@@ -24,6 +26,8 @@ DEFAULT_CORPUS_GLOBS = (
 
 DEFAULT_DETAIL_FIXTURES = (
     "/home/pclaw/.christopher/ilinked-corpus/detail-work-costing.json",
+    "/home/pclaw/apps/hermes-pcl/tests/fixtures/clients/tgg/ilinked/detail-work-costing.json",
+    "tests/fixtures/clients/tgg/ilinked/detail-work-costing.json",
     "/Users/pcloffice/pcl-biz/_agents/edna/specs/2026-05-23-tgg-content-inventory/cli-samples/detail-work-costing.json",
 )
 

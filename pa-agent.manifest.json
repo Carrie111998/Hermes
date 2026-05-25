@@ -74,6 +74,16 @@
       "owner": "pclaw:pclaw"
     },
     {
+      "sourcePath": "tools/tgg_ilinked_reads.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tools/tgg_ilinked_reads.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "tests/fixtures/clients/tgg/ilinked/detail-work-costing.json",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tests/fixtures/clients/tgg/ilinked/detail-work-costing.json",
+      "owner": "pclaw:pclaw"
+    },
+    {
       "sourcePath": "toolsets.py",
       "targetPath": "home/pclaw/apps/hermes-pcl/toolsets.py",
       "owner": "pclaw:pclaw"
@@ -234,6 +244,14 @@
     {
       "name": "v2-outbound-policy-env",
       "command": "python3 /home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py --management-chat 120363409954029949@g.us --ops-chat 120363403088884777@g.us --ops-chat 120363403845802098@g.us --ops-chat 120363405141229117@g.us --ops-chat 120363420803272720@g.us --ops-chat 120363421153247095@g.us --ops-chat 120363421424519051@g.us --ops-chat 120363422582425366@g.us --ops-chat 120363423535922556@g.us --ops-chat 120363423568509280@g.us --check-only --check-v2-service-env christopher-tgg-whatsapp.service"
+    },
+    {
+      "name": "ilinked-reads-wc-smoke",
+      "command": "cd /home/pclaw/apps/hermes-pcl && python3 -m tools.tgg_ilinked_reads wc <<'JSON' >/tmp/christopher-ilinked-wc.json\n{\"job_no\":\"AM/JOB/2605/0906\"}\nJSON\npython3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-ilinked-wc.json'))\nassert p.get('ok') is True, p\nd=p['data']\nassert d.get('work_costing_id') == 'AM/WC/2605/0334', d\nassert d.get('cost_line_count', 0) > 0, d\nassert d.get('approval_status') == 'Approved', d\nPY2"
+    },
+    {
+      "name": "ilinked-reads-status-smoke",
+      "command": "cd /home/pclaw/apps/hermes-pcl && python3 -m tools.tgg_ilinked_reads status <<'JSON' >/tmp/christopher-ilinked-status.json\n{\"job_no\":\"SK/JOB/2605/0068\"}\nJSON\npython3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-ilinked-status.json'))\nassert p.get('ok') is True, p\nd=p['data']\nassert d.get('task_no') == 'SK/JOB/2605/0068', d\nassert d.get('status') == 'Pending Execution', d\nassert d.get('end_date'), d\nPY2"
     }
   ],
   "runtimeOnlyDriftExclusions": [
