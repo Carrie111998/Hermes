@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -104,20 +103,51 @@ def test_local_command_operation_returns_json():
     assert result == {"ok": True, "payload": {"amount": 42}}
 
 
-def test_tgg_ilinked_lookup_adapter_calls_christopher_job_detail(monkeypatch, tmp_path):
-    fake = tmp_path / "christopher"
-    fake.write_text(
-        "\n".join(
-            [
-                "#!/usr/bin/env python3",
-                "import json,sys",
-                "print(json.dumps({'ok': True, 'argv': sys.argv[1:]}))",
-            ]
+def test_tgg_ilinked_lookup_adapter_reads_corpus_exact_job(monkeypatch, tmp_path):
+    corpus = tmp_path / "full-import-test"
+    tree = corpus / "tree"
+    tree.mkdir(parents=True)
+    (tree / "leaf-0001-page-first.json").write_text(
+        json.dumps(
+            {
+                "leaf": {"text": "Job (1)"},
+                "pageArg": "first",
+                "grid": {
+                    "ok": True,
+                    "headers": [
+                        "",
+                        "Task Number",
+                        "Description",
+                        "Task Type",
+                        "Location",
+                        "Created Date",
+                        "Created By",
+                        "Sub Status",
+                        "Status",
+                    ],
+                    "rows": [
+                        {
+                            "cells": [
+                                {"text": ""},
+                                {"text": "SD/JOB/2605/1008"},
+                                {"text": "Kitchen sink leak"},
+                                {"text": "Job"},
+                                {
+                                    "text": "BLK 223A SUMANG LANE, #12-4947 MATILDA EDGE, SINGAPORE 821223"
+                                },
+                                {"text": "2026-05-25"},
+                                {"text": "Sky"},
+                                {"text": "Assigned"},
+                                {"text": "Open"},
+                            ]
+                        }
+                    ],
+                },
+            }
         ),
         encoding="utf-8",
     )
-    fake.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("CHRISTOPHER_ILINKED_CORPUS_DIR", str(corpus))
 
     config = {
         "pa_business": {
@@ -140,12 +170,10 @@ def test_tgg_ilinked_lookup_adapter_calls_christopher_job_detail(monkeypatch, tm
     )
 
     assert result["ok"] is True
-    assert result["argv"] == [
-        "ilinked",
-        "detail",
-        "--job",
-        "SD/JOB/2605/1008",
-    ]
+    assert result["confidence"] == "exact"
+    assert result["matches"][0]["entry"]["taskNo"] == "SD/JOB/2605/1008"
+    assert result["matches"][0]["entry"]["block"] == "223A"
+    assert result["matches"][0]["entry"]["unit"] == "12-4947"
 
 
 def _agent_action_config(url: str) -> dict:
