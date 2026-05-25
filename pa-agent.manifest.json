@@ -252,6 +252,14 @@
     {
       "name": "ilinked-reads-status-smoke",
       "command": "cd /home/pclaw/apps/hermes-pcl && python3 -m tools.tgg_ilinked_reads status <<'JSON' >/tmp/christopher-ilinked-status.json\n{\"job_no\":\"SK/JOB/2605/0068\"}\nJSON\npython3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-ilinked-status.json'))\nassert p.get('ok') is True, p\nd=p['data']\nassert d.get('task_no') == 'SK/JOB/2605/0068', d\nassert d.get('status') == 'Pending Execution', d\nassert d.get('end_date'), d\nPY2"
+    },
+    {
+      "name": "live-config-ilinked-reads",
+      "command": "grep -q 'ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/config.yaml && grep -q 'ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/config.yaml"
+    },
+    {
+      "name": "live-constitution-ilinked-reads",
+      "command": "grep -q 'operation ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     }
   ],
   "runtimeOnlyDriftExclusions": [

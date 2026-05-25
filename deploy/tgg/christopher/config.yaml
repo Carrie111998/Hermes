@@ -94,6 +94,24 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
+          ilinked_wc_lookup:
+            type: command
+            tenant: tgg
+            command:
+            - python3
+            - -m
+            - tools.tgg_ilinked_reads
+            - wc
+            timeout: 30
+          ilinked_status:
+            type: command
+            tenant: tgg
+            command:
+            - python3
+            - -m
+            - tools.tgg_ilinked_reads
+            - status
+            timeout: 30
       agent_id: christopher
       owner: Christopher
 platforms:
