@@ -126,6 +126,7 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
+    GOOGLE_CHAT = "google_chat"
     YUANBAO = "yuanbao"
     @classmethod
     def _missing_(cls, value):
@@ -435,6 +436,10 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     ),
     Platform.QQBOT: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("client_secret")
+    ),
+    Platform.GOOGLE_CHAT: lambda cfg: bool(
+        (os.getenv("GOOGLE_CHAT_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT"))
+        and (os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME") or os.getenv("GOOGLE_CHAT_SUBSCRIPTION"))
     ),
     Platform.YUANBAO: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("app_secret")

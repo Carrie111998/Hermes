@@ -33,6 +33,9 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 WORKDIR /opt/hermes
+# Non-root user for runtime
+RUN adduser -u 10000 -D -h /opt/hermes hermes
+
 
 # Layer-cached dependency install
 COPY package.json package-lock.json ./
@@ -50,7 +53,7 @@ RUN npm install --prefer-offline --no-audit && \
 # Python dependencies
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all
+RUN uv sync --frozen --no-install-project --extra all --extra messaging
 
 # Source code
 COPY --chown=root:root . .
@@ -58,6 +61,10 @@ COPY --chown=root:root . .
 # Build assets
 RUN cd web && npm run build && \
     cd ../ui-tui && npm run build
+
+# Permissions for runtime
+RUN chmod -R a+rX /opt/hermes && \
+    chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/node_modules
 
 # Link hermes-agent
 RUN uv pip install --no-cache-dir --no-deps -e "."
@@ -77,4 +84,4 @@ LABEL \
     io.hass.type="app" \
     io.hass.version="0.15.1"
 
-CMD [ "/run.sh" ]
+ENTRYPOINT [ "/sbin/tini", "--", "/run.sh" ]

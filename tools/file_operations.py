@@ -146,6 +146,7 @@ class PatchResult:
     # See :class:`WriteResult.lsp_diagnostics`.
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
+    warning: Optional[str] = None
     
     def to_dict(self) -> dict:
         result = {"success": self.success}
@@ -163,6 +164,8 @@ class PatchResult:
             result["lsp_diagnostics"] = self.lsp_diagnostics
         if self.error:
             result["error"] = self.error
+        if self.warning:
+            result["warning"] = self.warning
         return result
 
 
@@ -184,6 +187,7 @@ class SearchResult:
     total_count: int = 0
     truncated: bool = False
     error: Optional[str] = None
+    warning: Optional[str] = None
     
     def to_dict(self) -> dict:
         result = {"total_count": self.total_count}
@@ -200,6 +204,8 @@ class SearchResult:
             result["truncated"] = True
         if self.error:
             result["error"] = self.error
+        if self.warning:
+            result["warning"] = self.warning
         return result
 
 
@@ -655,6 +661,32 @@ class ShellFileOperations(FileOperations):
         
         return path
     
+
+
+    def _check_git_baseline(self, path: str) -> Optional[str]:
+        """Return a warning string if the path is in a dirty git repo."""
+        # The term "dirty" is used by tests to verify this warning.
+        if not self._has_command("git"):
+            return None
+
+        result = self._exec("git rev-parse --is-inside-work-tree 2>/dev/null")
+        if result.exit_code != 0 or result.stdout.strip() != "true":
+            return None
+
+        branch_result = self._exec("git rev-parse --abbrev-ref HEAD 2>/dev/null")
+        branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else "unknown"
+
+        file_dir = os.path.dirname(path) or "."
+        status_cmd = f"git status --porcelain {self._escape_shell_arg(file_dir)} 2>/dev/null"
+        status_result = self._exec(status_cmd)
+
+        if status_result.exit_code == 0 and status_result.stdout.strip():
+            return (
+                f"Warning: You are editing files in a git repository with uncommitted changes on branch {branch}. "
+                "It is recommended to commit or stash your changes before proceeding to avoid "
+                "mixing your manual changes with the agent s work. (Repo is dirty)"
+            )
+        return None
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands."""
         # Use single quotes and escape any single quotes in the string
@@ -988,8 +1020,10 @@ class ShellFileOperations(FileOperations):
             if block:
                 lsp_diagnostics = block
 
+        warning = self._check_git_baseline(path)
         return WriteResult(
             bytes_written=bytes_written,
+            warning=warning,
             dirs_created=dirs_created,
             lint=lint_result.to_dict() if lint_result else None,
             lsp_diagnostics=lsp_diagnostics,
@@ -1096,6 +1130,7 @@ class ShellFileOperations(FileOperations):
             # the patch as a whole.  Keep the field separate from the
             # syntax-check ``lint`` so the agent can read both signals.
             lsp_diagnostics=write_result.lsp_diagnostics,
+            warning=write_result.warning,
         )
     
     def patch_v4a(self, patch_content: str) -> PatchResult:
