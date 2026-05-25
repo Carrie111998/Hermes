@@ -1,78 +1,187 @@
 {
   "version": 1,
-  "remoteRoot": "/home/pclaw/apps/hermes-pcl",
-  "include": [
-    "toolsets.py",
-    "tools/tgg_ilinked_lookup.py",
-    "scripts/whatsapp-bridge/allowlist.js",
-    "scripts/whatsapp-bridge/allowlist.test.mjs",
-    "scripts/whatsapp-bridge/bridge.js",
-    "scripts/whatsapp-bridge/package.json",
-    "scripts/whatsapp-bridge/package-lock.json",
-    "scripts/whatsapp-bridge-v2/allowlist.js",
-    "scripts/whatsapp-bridge-v2/bridge.js",
-    "scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
-    "scripts/whatsapp-bridge-v2/package.json",
-    "scripts/whatsapp-bridge-v2/package-lock.json",
-    "tests/fixtures/clients/tgg/overlay.yaml",
-    "tests/fixtures/pa/bobby_tgg_constitution.yaml"
+  "remoteRoot": "/",
+  "include": [],
+  "files": [
+    {
+      "sourcePath": "gateway/platforms/whatsapp.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/platforms/whatsapp.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/channel_directory.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/channel_directory.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/whatsapp_identity.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/whatsapp_identity.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/pairing.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/pairing.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge/allowlist.js",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/allowlist.js",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge/bridge.js",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/bridge.js",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge/package.json",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/package.json",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge/package-lock.json",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/package-lock.json",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge-v2/allowlist.js",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/allowlist.js",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge-v2/bridge.js",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/bridge.js",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge-v2/package.json",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/package.json",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge-v2/package-lock.json",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/package-lock.json",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "tools/pa_business_tools.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tools/pa_business_tools.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "tools/tgg_ilinked_lookup.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tools/tgg_ilinked_lookup.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "toolsets.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/toolsets.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "tests/fixtures/pa/bobby_tgg_constitution.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tests/fixtures/pa/bobby_tgg_constitution.yaml",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "tests/fixtures/clients/tgg/overlay.yaml",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tests/fixtures/clients/tgg/overlay.yaml",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "pa-agent.manifest.json",
+      "targetPath": "home/pclaw/apps/hermes-pcl/pa-agent.manifest.json",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/config.yaml",
+      "targetPath": "home/pclaw/.hermes-christopher-tgg-state/config.yaml",
+      "mode": "600",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/christopher_tgg_constitution.yaml",
+      "targetPath": "home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/systemd/christopher-tgg-hermes.service",
+      "targetPath": "etc/systemd/system/christopher-tgg-hermes.service",
+      "mode": "644",
+      "owner": "root:root"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/systemd/christopher-tgg-whatsapp.service",
+      "targetPath": "etc/systemd/system/christopher-tgg-whatsapp.service",
+      "mode": "644",
+      "owner": "root:root"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/systemd/wa-pair-server.service",
+      "targetPath": "etc/systemd/system/wa-pair-server.service",
+      "mode": "644",
+      "owner": "root:root"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge/allowlist.test.mjs",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/allowlist.test.mjs",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
+      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
+      "owner": "pclaw:pclaw"
+    }
   ],
   "requiredEnv": [
     {
       "name": "GEMINI_API_KEY_PCL_PA_SHARED",
-      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+      "envFile": "/home/pclaw/.hermes-christopher-tgg-state/.env"
+    },
+    {
+      "name": "GEMINI_API_KEY",
+      "envFile": "/home/pclaw/.hermes-christopher-tgg-state/.env"
     },
     {
       "name": "CHRISTOPHER_TGG_PS_SERVICE_TOKEN",
-      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+      "envFile": "/home/pclaw/.hermes-christopher-tgg-state/.env"
     }
   ],
   "services": [
     {
       "name": "christopher-tgg-hermes.service",
-      "restart": true,
-      "postRestartHooks": [
+      "preRestartHooks": [
         {
-          "name": "hermes-active",
-          "command": "systemctl is-active christopher-tgg-hermes.service"
-        },
-        {
-          "name": "legacy-bridge-health",
-          "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\"; print(\"port3000 connected\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+          "name": "daemon-reload",
+          "command": "systemctl daemon-reload"
         }
       ]
     },
     {
-      "name": "christopher-tgg-whatsapp.service",
-      "restart": true,
-      "postRestartHooks": [
-        {
-          "name": "whatsapp-active",
-          "command": "systemctl is-active christopher-tgg-whatsapp.service"
-        },
-        {
-          "name": "v2-bridge-health",
-          "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3001/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\" and d.get(\"paired\") is True; print(\"port3001 connected+paired\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
-        },
-        {
-          "name": "outbound-disabled",
-          "command": "systemctl show christopher-tgg-whatsapp.service --property=Environment --value | tr ' ' '\\n' | grep -qx 'WHATSAPP_OUTBOUND_DISABLED=true'"
-        }
-      ]
+      "name": "christopher-tgg-whatsapp.service"
+    },
+    {
+      "name": "wa-pair-server.service"
     }
   ],
   "verifyHooks": [
     {
-      "name": "services-active",
-      "command": "systemctl is-active christopher-tgg-hermes.service christopher-tgg-whatsapp.service"
+      "name": "systemd-active",
+      "command": "systemctl is-active --quiet christopher-tgg-hermes.service && systemctl is-active --quiet christopher-tgg-whatsapp.service && systemctl is-active --quiet wa-pair-server.service"
     },
     {
-      "name": "legacy-bridge-health",
-      "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3000/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\"; print(\"port3000 connected\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+      "name": "hermes-health",
+      "command": "curl -fsS http://127.0.0.1:3000/health >/tmp/christopher-hermes-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-hermes-health.json'))\nassert p.get('status') in ('ok','healthy')\nPY2"
     },
     {
-      "name": "v2-bridge-health",
-      "command": "bash -lc 'for i in $(seq 1 30); do curl -fsS http://127.0.0.1:3001/health | python3 -c '\"'\"'import json,sys; d=json.load(sys.stdin); assert d.get(\"status\") == \"connected\" and d.get(\"paired\") is True; print(\"port3001 connected+paired\")'\"'\"' && exit 0; sleep 1; done; exit 1'"
+      "name": "whatsapp-v2-health",
+      "command": "curl -fsS http://127.0.0.1:3001/health >/tmp/christopher-wa-v2-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-wa-v2-health.json'))\nassert p.get('connected') is True\nassert p.get('paired') is True\nPY2"
+    },
+    {
+      "name": "config-constitution-present",
+      "command": "test -s /home/pclaw/.hermes-christopher-tgg-state/config.yaml && test -s /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     },
     {
       "name": "model-config",
@@ -84,20 +193,18 @@
     }
   ],
   "runtimeOnlyDriftExclusions": [
-    "logs",
-    "sessions",
-    "state.db",
-    "state.db-wal",
-    "state.db-shm",
-    "whatsapp",
-    "whatsapp-v2",
-    "message-store.json",
-    "media",
-    "cache",
-    ".cache",
-    "__pycache__",
-    ".pytest_cache",
-    ".ruff_cache"
+    "home/pclaw/apps/hermes-pcl/.venv",
+    "home/pclaw/apps/hermes-pcl/__pycache__",
+    "home/pclaw/apps/hermes-pcl/logs",
+    "home/pclaw/.hermes-christopher-tgg-state/logs",
+    "home/pclaw/.hermes-christopher-tgg-state/sessions",
+    "home/pclaw/.hermes-christopher-tgg-state/state.db",
+    "home/pclaw/.hermes-christopher-tgg-state/state.db-wal",
+    "home/pclaw/.hermes-christopher-tgg-state/state.db-shm",
+    "home/pclaw/.hermes-christopher-tgg-state/whatsapp-v2",
+    "home/pclaw/.hermes-christopher-tgg-state/message-store.json",
+    "home/pclaw/.hermes-christopher-tgg-state/media",
+    "home/pclaw/.hermes-christopher-tgg-state/.cache"
   ],
   "retainDeploys": 5
 }

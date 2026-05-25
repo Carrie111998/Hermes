@@ -1,0 +1,27 @@
+[Unit]
+Description=Christopher TGG Hermes Gateway (read-only WhatsApp observer)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pclaw
+Group=pclaw
+WorkingDirectory=/home/pclaw/apps/hermes-pcl
+Environment=HOME=/home/pclaw
+Environment=USER=pclaw
+Environment=LOGNAME=pclaw
+Environment=HERMES_HOME=/home/pclaw/.hermes-christopher-tgg
+Environment=PATH=/home/pclaw/apps/hermes-pcl/.venv/bin:/home/pclaw/.local/bin:/home/pclaw/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=VIRTUAL_ENV=/home/pclaw/apps/hermes-pcl/.venv
+ExecStart=/home/pclaw/apps/hermes-pcl/.venv/bin/python -m hermes_cli.main gateway run --replace
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=240
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

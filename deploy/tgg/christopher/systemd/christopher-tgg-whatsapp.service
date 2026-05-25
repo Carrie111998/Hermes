@@ -1,0 +1,33 @@
+[Unit]
+Description=Christopher TGG WhatsApp bridge (read-only)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pclaw
+Group=pclaw
+WorkingDirectory=/home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2
+Environment=HOME=/home/pclaw
+Environment=USER=pclaw
+Environment=LOGNAME=pclaw
+Environment=WHATSAPP_MODE=bot
+Environment=WHATSAPP_ALLOWED_USERS=*
+Environment=WHATSAPP_OUTBOUND_DISABLED=true
+Environment=WHATSAPP_SYNC_FULL_HISTORY=true
+Environment=WHATSAPP_HISTORY_TO_LIVE_QUEUE=false
+Environment=WHATSAPP_MAX_QUEUE_SIZE=5000
+Environment=WHATSAPP_STORE_FILE=/home/pclaw/.hermes-christopher-tgg/whatsapp-v2/message-store.json
+Environment=WHATSAPP_HISTORY_SYNC_PATH=/home/pclaw/.hermes-christopher-tgg/whatsapp-v2/history-sync.jsonl
+Environment=WHATSAPP_HISTORY_METADATA_PATH=/home/pclaw/.hermes-christopher-tgg/whatsapp-v2/history-metadata.jsonl
+ExecStart=/usr/bin/node bridge.js --port 3001 --session /home/pclaw/.hermes-christopher-tgg/whatsapp-v2/session --mode bot
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
