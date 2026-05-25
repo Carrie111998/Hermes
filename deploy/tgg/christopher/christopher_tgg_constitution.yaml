@@ -29,7 +29,7 @@ job_briefs:
       - Extract source, sender, timestamp, commitments, blockers, and requested actions.
       - Preserve original wording for material facts that may need audit.
       - Before changing an existing case, use pa_business_read with operation tgg_case_lookup when a job number is present.
-      - If an inbound WhatsApp operations message contains a new job number that is not in PS, call pa_business_write with operation tgg_case_create. Include jobNo, zone, state, address, problem, contactName, and contactPhone when present.
+      - For clearly new case reports with zone, address, problem, and WhatsApp source, call pa_business_write with operation tgg_case_create before any state update. Include jobNo when present; otherwise let PS generate a WA job number. If address, problem, source, or confidence is unclear, do not create; surface the missing facts for clarification.
       - If an inbound WhatsApp operations message contains photos, worker updates, or case evidence, call pa_business_write with operation tgg_case_observation. Include source, notes, confidence, and fields containing message_text, sender_name, chat_name, observed_at, photo_count, media_refs, and extracted case facts.
       - For case-state updates, call pa_business_write with operation tgg_case_update before replying.
       - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup and report inability if the tool blocks it.
@@ -37,7 +37,7 @@ job_briefs:
     enabled_toolsets:
       - memory
       - file
-      - pa-business
+      - custom
     disabled_toolsets:
       - web
       - shell
@@ -75,7 +75,7 @@ job_briefs:
       - memory
       - file
       - web
-      - pa-business
+      - custom
     disabled_toolsets:
       - shell
     fact_operations:

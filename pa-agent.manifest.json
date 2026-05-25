@@ -190,6 +190,14 @@
     {
       "name": "outbound-disabled",
       "command": "systemctl show christopher-tgg-whatsapp.service --property=Environment --value | tr ' ' '\\n' | grep -qx 'WHATSAPP_OUTBOUND_DISABLED=true'"
+    },
+    {
+      "name": "live-config-case-create",
+      "command": "grep -q 'url: https://systems.papercut-labs.com/api/operator/cases/create' /home/pclaw/.hermes-christopher-tgg-state/config.yaml"
+    },
+    {
+      "name": "live-constitution-custom-create",
+      "command": "grep -q 'operation tgg_case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q '      - custom' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     }
   ],
   "runtimeOnlyDriftExclusions": [
