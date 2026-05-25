@@ -110,8 +110,8 @@ job_briefs:
       format: management_brief
       include_recommendation: true
       slash_commands:
-      - "/pause"
-      - "/summary"
+      - /pause
+      - /summary
       max_output_tokens: 8192
       compression:
         strategy: preserve-recent
@@ -160,8 +160,8 @@ selectors:
 - job_type: tgg_ops_ingest
   match:
     source.platform: telegram
-    source.chat_id: "-5192935862"
+    source.chat_id: '-5192935862'
 - job_type: tgg_management
   match:
     source.platform: telegram
-    source.chat_id: "-5295904349"
+    source.chat_id: '-5295904349'

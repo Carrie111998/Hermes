@@ -7,7 +7,7 @@ model:
     secrets_env_key: GEMINI_API_KEY_PCL_PA_SHARED
 pa:
   enabled: true
-  constitution_path: "/home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml"
+  constitution_path: /home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml
   overlay:
     identity:
       display_name: Christopher
@@ -150,7 +150,7 @@ pa:
             tenant: tgg
             command:
             - python3
-            - "-m"
+            - -m
             - tools.tgg_ilinked_lookup
             timeout: 90
           ilinked_wc_lookup:
@@ -158,7 +158,7 @@ pa:
             tenant: tgg
             command:
             - python3
-            - "-m"
+            - -m
             - tools.tgg_ilinked_reads
             - wc
             timeout: 30
@@ -167,7 +167,7 @@ pa:
             tenant: tgg
             command:
             - python3
-            - "-m"
+            - -m
             - tools.tgg_ilinked_reads
             - status
             timeout: 30
@@ -178,8 +178,8 @@ platforms:
     enabled: true
     extra:
       bridge_port: 3000
-      bridge_script: "/home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/bridge.js"
-      session_path: "/home/pclaw/.hermes-christopher-tgg/whatsapp/session"
+      bridge_script: /home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/bridge.js
+      session_path: /home/pclaw/.hermes-christopher-tgg/whatsapp/session
       require_mention: false
       dm_policy: open
       group_policy: open
