@@ -96,7 +96,7 @@ def test_gateway_pa_prompt_and_toolsets_enter_cache_signature():
     assert "TGG Operations Ingest" in ops_prompt
     assert "TGG Management Brief" in management_prompt
     assert ops_enabled == ["memory", "file", "pa-business", "pa-photo-pair"]
-    assert management_enabled == ["memory", "file", "web", "pa-business"]
+    assert management_enabled == ["memory", "file", "web", "custom"]
     assert ops_disabled == ["clarify", "web", "shell"]
     assert management_disabled == ["clarify", "shell"]
     assert _pa_tenant_slug(ops) == "tgg"

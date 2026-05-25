@@ -176,6 +176,129 @@ def test_tgg_ilinked_lookup_adapter_reads_corpus_exact_job(monkeypatch, tmp_path
     assert result["matches"][0]["entry"]["unit"] == "12-4947"
 
 
+
+
+def test_tgg_ilinked_wc_lookup_adapter_returns_structured_cost_lines(monkeypatch, tmp_path):
+    detail = {
+        "ok": True,
+        "data": {
+            "kind": "work_costing",
+            "identifier": "AM/WC/2605/0334",
+            "matched_row": {
+                "values": {
+                    "Work Costing Number": "AM/WC/2605/0334",
+                    "Work Costing Description": "Spruce Package B 1 Room",
+                    "Job Number": "AM/JOB/2605/0906",
+                    "Location": "BLK 420 ANG MO KIO AVENUE 10, #06-1125",
+                    "Commencement Date": "01 Jun 2026",
+                    "Estimated End Date": "24 Jul 2026",
+                    "Estimated WC Amount": "$5,328.93",
+                    "Status": "Approved",
+                    "Created Date": "18 May 2026",
+                    "Last Modified Date": "22 May 2026",
+                }
+            },
+            "tables": [
+                {
+                    "headers": [],
+                    "rows": [
+                        [
+                            "", "", "", "1", "Service",
+                            "Carry Out and Complete Sprucing Works",
+                            "PG", "3,678.00", "1.00", "3,678.00",
+                            "", "", "", "[1000] - BUILDING WORKS",
+                            "SAVILLS PROPERTY MANAGEMENT PTE. LTD.",
+                            "D/496/25 - PROVISION OF MANAGING AGENT SE",
+                            "AM/WC/2605/0334-WO01",
+                        ]
+                    ],
+                }
+            ],
+        },
+    }
+    fixture = tmp_path / "detail-work-costing.json"
+    fixture.write_text(json.dumps(detail), encoding="utf-8")
+    monkeypatch.setenv("CHRISTOPHER_ILINKED_DETAIL_JSON", str(fixture))
+
+    config = {
+        "pa_business": {
+            "operations": {
+                "ilinked_wc_lookup": {
+                    "type": "command",
+                    "command": [sys.executable, "-m", "tools.tgg_ilinked_reads", "wc"],
+                    "timeout": 10,
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config, "ilinked_wc_lookup", {"job_no": "AM/JOB/2605/0906"}
+    )
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["work_costing_id"] == "AM/WC/2605/0334"
+    assert data["job_no"] == "AM/JOB/2605/0906"
+    assert data["total_estimate"] == "$5,328.93"
+    assert data["approval_status"] == "Approved"
+    assert data["vendor"] == "SAVILLS PROPERTY MANAGEMENT PTE. LTD."
+    assert data["cost_lines"][0]["description"] == "Carry Out and Complete Sprucing Works"
+
+
+def test_tgg_ilinked_status_adapter_reads_corpus_index(monkeypatch, tmp_path):
+    corpus = tmp_path / "full-import-test"
+    corpus.mkdir()
+    (corpus / "task-index-date-desc.json").write_text(
+        json.dumps(
+            [
+                {
+                    "task_key": "ZZ/JOB/2605/0001",
+                    "date_iso": "2026-06-30",
+                    "leaf_text": "Job (1)",
+                    "cells": [
+                        "",
+                        "ZZ/JOB/2605/0001",
+                        "Sprucing scope",
+                        "Job",
+                        "BLK 1 TEST ROAD #01-01",
+                        "20 May 2026",
+                        "Sky",
+                        "Contractor to Inspect/Repair",
+                        "Pending Execution",
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CHRISTOPHER_ILINKED_CORPUS_DIR", str(corpus))
+
+    config = {
+        "pa_business": {
+            "operations": {
+                "ilinked_status": {
+                    "type": "command",
+                    "command": [sys.executable, "-m", "tools.tgg_ilinked_reads", "status"],
+                    "timeout": 10,
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config, "ilinked_status", {"job_no": "ZZ/JOB/2605/0001"}
+    )
+
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["task_no"] == "ZZ/JOB/2605/0001"
+    assert data["status"] == "Pending Execution"
+    assert data["sub_status"] == "Contractor to Inspect/Repair"
+    assert data["end_date"] == "2026-06-30"
+    assert data["source"]["type"] == "task-index"
+
+
 def _agent_action_config(url: str) -> dict:
     return {
         "pa_business": {

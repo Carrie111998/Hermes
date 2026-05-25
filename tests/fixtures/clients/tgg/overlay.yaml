@@ -65,6 +65,24 @@ client:
           - -m
           - tools.tgg_ilinked_lookup
         timeout: 90
+      ilinked_wc_lookup:
+        type: command
+        tenant: tgg
+        command:
+          - python3
+          - -m
+          - tools.tgg_ilinked_reads
+          - wc
+        timeout: 30
+      ilinked_status:
+        type: command
+        tenant: tgg
+        command:
+          - python3
+          - -m
+          - tools.tgg_ilinked_reads
+          - status
+        timeout: 30
       # Live operator-tuned behavior config. The gateway reads this on every
       # decision turn and injects the rendered behavior block into the prompt.
       agent_config_read:
