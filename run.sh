@@ -1,4 +1,4 @@
-#!/usr/bin/with-contenv bashio
+#!/usr/bin/env bashio
 
 # ==============================================================================
 # Home Assistant Add-on entrypoint for Hermes Agent

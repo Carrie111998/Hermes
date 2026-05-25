@@ -1,0 +1,2 @@
+Fixed Home Assistant Add-on startup failure caused by s6-overlay-suexec PID 1 restriction by updating run.sh shebang to use env bashio.
+Updated Dockerfile to use nodejs-current (Node.js 24) as requested by the user.

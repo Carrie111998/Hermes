@@ -5,7 +5,7 @@ FROM ${BUILD_FROM}
 RUN apk add --no-cache \
     build-base \
     curl \
-    nodejs \
+    nodejs-current \
     npm \
     python3-dev \
     ripgrep \
