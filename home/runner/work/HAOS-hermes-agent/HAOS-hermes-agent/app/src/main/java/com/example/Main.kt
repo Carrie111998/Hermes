@@ -1,17 +1,14 @@
-// app/build.gradle.kts
 android {
     // ... altre configurazioni ...
 
     defaultConfig {
-        // ... altre configurazioni ...
-        
-        // Definisce la costante leggendola dalle variabili d'ambiente o local.properties
+        // Recupera la chiave dalle variabili d'ambiente (es. in CI) o usa una stringa vuota di fallback
         val geminiApiKey = System.getenv("GEMINI_API_KEY") ?: ""
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
     }
 
     buildFeatures {
-        // CORRETTO: Abilita la generazione della classe BuildConfig
+        // Abilita la generazione della classe BuildConfig
         buildConfig = true
     }
 }
