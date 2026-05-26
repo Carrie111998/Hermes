@@ -1,15 +1,17 @@
-// app/build.gradle.kts
+// In app/build.gradle.kts
 android {
-    // ... altre configurazioni ...
-
-    buildFeatures {
-        // Abilita la generazione della classe BuildConfig
-        buildConfig = true
-    }
+    compileSdk = 34 // o la tua versione attuale
 
     defaultConfig {
-        // Definisci il campo per evitare errori a runtime (es. leggendo da local.properties o env)
-        val geminiApiKey = project.findProperty("GEMINI_API_KEY") ?: System.getenv("GEMINI_API_KEY") ?: ""
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiApiKey\"")
+        // ... altre configurazioni ...
+        
+        // Esempio di come definire la chiave (può leggere da variabili d'ambiente)
+        val geminiApiKey = System.getenv("GEMINI_API_KEY") ?: "\"DEFAULT_KEY\""
+        buildConfigField("String", "GEMINI_API_KEY", geminiApiKey)
+    }
+
+    buildFeatures {
+        // CORREZIONE: Abilita esplicitamente la generazione della classe BuildConfig
+        buildConfig = true
     }
 }
