@@ -28,6 +28,9 @@ export ANTHROPIC_API_KEY=$(bashio::config 'anthropic_api_key')
 export HERMES_DASHBOARD=$(bashio::config 'enable_dashboard')
 export HERMES_GATEWAY_BUSY_INPUT_MODE=$(bashio::config 'busy_input_mode')
 
+# Allow running as root (required for Home Assistant environment)
+export HERMES_ALLOW_ROOT_GATEWAY=1
+
 # Home Assistant integration
 export HASS_URL="http://supervisor/core"
 export HASS_TOKEN="${SUPERVISOR_TOKEN}"
