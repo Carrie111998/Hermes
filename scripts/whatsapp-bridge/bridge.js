@@ -539,6 +539,7 @@ async function startSocket() {
       const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
       const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
       const hasQuotedMessage = !!contextInfo?.quotedMessage;
+      const quotedFromBot = quotedMessageId ? recentlySentIds.has(quotedMessageId) : false;
 
       // Extract message body
       let body = '';
@@ -660,6 +661,7 @@ async function startSocket() {
         quotedParticipant,
         quotedRemoteJid,
         hasQuotedMessage,
+        quotedFromBot,
         botIds,
         timestamp: msg.messageTimestamp,
         fromMe: !!msg.key.fromMe,

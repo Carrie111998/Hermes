@@ -416,6 +416,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
         return bot_ids
 
     def _message_is_reply_to_bot(self, data: Dict[str, Any]) -> bool:
+        if data.get("quotedFromBot"):
+            return True
         quoted_participant = self._normalize_whatsapp_id(data.get("quotedParticipant"))
         if not quoted_participant:
             return False
