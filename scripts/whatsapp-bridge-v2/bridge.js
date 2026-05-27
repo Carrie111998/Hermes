@@ -11,6 +11,8 @@
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
+ *   POST /create-group   - Create a WhatsApp group { subject, participants }
+ *   POST /leave-group    - Leave a WhatsApp group { chatId, expectedSubject? }
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
  *
@@ -78,6 +80,12 @@ const OUTBOUND_DISABLED =
   process.env &&
   typeof process.env.WHATSAPP_OUTBOUND_DISABLED === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_OUTBOUND_DISABLED.toLowerCase());
+const GROUP_CREATE_ENABLED =
+  typeof process !== 'undefined' &&
+  process.env &&
+  typeof process.env.WHATSAPP_GROUP_CREATE_ENABLED === 'string' &&
+  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_GROUP_CREATE_ENABLED.toLowerCase());
+const GROUP_CREATE_MAX_PARTICIPANTS = parseInt(process.env.WHATSAPP_GROUP_CREATE_MAX_PARTICIPANTS || '10', 10);
 const OUTBOUND_ALLOWED_CHATS_RAW =
   process.env.WHATSAPP_OUTBOUND_ALLOWED_CHATS ??
   process.env.WHATSAPP_OUTBOUND_ALLOW_CHATS;
@@ -165,6 +173,24 @@ function rejectWhenOutboundBlocked(res, action, chatId) {
     reason: decision.reason,
   });
   return true;
+}
+
+function rejectWhenGroupAdminBlocked(res, action) {
+  if (OUTBOUND_DISABLED) {
+    res.status(403).json({
+      error: `WhatsApp outbound blocked: ${action}`,
+      reason: 'global_disabled',
+    });
+    return true;
+  }
+  if (!GROUP_CREATE_ENABLED) {
+    res.status(403).json({
+      error: `WhatsApp group admin blocked: ${action}`,
+      reason: 'group_create_not_enabled',
+    });
+    return true;
+  }
+  return false;
 }
 
 function appendJsonLine(filePath, payload, label) {
@@ -315,6 +341,26 @@ function trackSentMessageId(sent) {
 function normalizeWhatsAppId(value) {
   if (!value) return '';
   return String(value).replace(':', '@');
+}
+
+function normalizeParticipantJid(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const compact = raw.replace(/[\s()-]/g, '');
+  const jid = compact.replace(/:.*@/, '@').toLowerCase();
+  if (/^\d+@s\.whatsapp\.net$/.test(jid) || /^\d+@lid$/.test(jid)) {
+    return jid;
+  }
+  const phone = compact.replace(/^\+/, '');
+  if (/^\d{8,20}$/.test(phone)) {
+    return `${phone}@s.whatsapp.net`;
+  }
+  return '';
+}
+
+function normalizeGroupJid(value) {
+  const jid = String(value || '').trim().replace(/:.*@/, '@').toLowerCase();
+  return /^\d+@g\.us$/.test(jid) ? jid : '';
 }
 
 function getMessageContent(msg) {
@@ -1018,6 +1064,103 @@ app.post('/typing', async (req, res) => {
   }
 });
 
+// Create a WhatsApp group. Explicitly feature-gated because there is no
+// existing chat id to run through the per-chat outbound allowlist yet.
+app.post('/create-group', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  if (rejectWhenGroupAdminBlocked(res, 'create-group')) return;
+
+  const subject = String(req.body?.subject || '').trim();
+  const rawParticipants = req.body?.participants;
+  if (!subject) {
+    return res.status(400).json({ error: 'subject is required' });
+  }
+  if (subject.length > 100) {
+    return res.status(400).json({ error: 'subject must be <= 100 characters' });
+  }
+  if (!Array.isArray(rawParticipants) || rawParticipants.length === 0) {
+    return res.status(400).json({ error: 'participants must be a non-empty array' });
+  }
+
+  const participants = [];
+  const invalidParticipants = [];
+  for (const value of rawParticipants) {
+    const jid = normalizeParticipantJid(value);
+    if (!jid) {
+      invalidParticipants.push(value);
+      continue;
+    }
+    if (!participants.includes(jid)) participants.push(jid);
+  }
+  if (invalidParticipants.length > 0) {
+    return res.status(400).json({
+      error: 'participants contains invalid WhatsApp identifiers',
+      invalidParticipants,
+    });
+  }
+  if (participants.length === 0) {
+    return res.status(400).json({ error: 'participants must include at least one valid user' });
+  }
+  if (Number.isFinite(GROUP_CREATE_MAX_PARTICIPANTS) && participants.length > GROUP_CREATE_MAX_PARTICIPANTS) {
+    return res.status(400).json({
+      error: `participants exceeds WHATSAPP_GROUP_CREATE_MAX_PARTICIPANTS=${GROUP_CREATE_MAX_PARTICIPANTS}`,
+    });
+  }
+
+  try {
+    const metadata = await sock.groupCreate(subject, participants);
+    const jid = metadata?.id || metadata?.jid || metadata?.gid || '';
+    if (jid) {
+      rememberChatMetadata(jid, {
+        name: metadata?.subject || subject,
+        subject: metadata?.subject || subject,
+        type: 'group',
+        participants: (metadata?.participants || []).map(p => p.id).filter(Boolean),
+      }, 'createGroup');
+      flushChatMetadata();
+    }
+    res.json({
+      success: true,
+      jid,
+      subject: metadata?.subject || subject,
+      participants: (metadata?.participants || []).map(p => p.id).filter(Boolean),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Cleanup helper for endpoint smoke tests. The caller must name the expected
+// subject to reduce accidental leaves from real operator groups.
+app.post('/leave-group', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  if (rejectWhenGroupAdminBlocked(res, 'leave-group')) return;
+
+  const chatId = normalizeGroupJid(req.body?.chatId);
+  const expectedSubject = String(req.body?.expectedSubject || '').trim();
+  if (!chatId) return res.status(400).json({ error: 'valid group chatId is required' });
+  if (!expectedSubject) return res.status(400).json({ error: 'expectedSubject is required' });
+
+  try {
+    const metadata = await sock.groupMetadata(chatId);
+    if (metadata?.subject !== expectedSubject) {
+      return res.status(409).json({
+        error: 'group subject mismatch',
+        expectedSubject,
+        actualSubject: metadata?.subject || '',
+      });
+    }
+    await sock.groupLeave(chatId);
+    res.json({ success: true, chatId, subject: metadata?.subject });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Chat info
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
@@ -1166,6 +1309,9 @@ if (PAIR_ONLY) {
       } else {
         console.log('🔒 Outbound WhatsApp fail-closed: no allowed chats configured.');
       }
+    }
+    if (GROUP_CREATE_ENABLED) {
+      console.log(`🔒 WhatsApp group admin endpoints enabled (max participants: ${GROUP_CREATE_MAX_PARTICIPANTS}).`);
     }
     if (SYNC_FULL_HISTORY) {
       console.log(`🕰️  Full WhatsApp history sync is enabled (queue max: ${MAX_QUEUE_SIZE}).`);
