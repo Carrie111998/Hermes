@@ -11097,10 +11097,12 @@ class GatewayRunner:
             force_document_attachments = "[[as_document]]" in response
 
             media_files, _ = adapter.extract_media(response)
-            _, cleaned = adapter.extract_images(response)
+            attachment_images, cleaned = adapter.extract_attachment_images(response)
+            extracted_images, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
 
-            _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            _reply_anchor = self._reply_anchor_for_event(event)
+            _thread_meta = self._thread_metadata_for_source(event.source, _reply_anchor)
 
             from gateway.platforms.base import should_send_media_as_audio
 
@@ -11130,6 +11132,18 @@ class GatewayRunner:
                 else:
                     non_image_local.append(file_path)
 
+            images_from_markers = list(attachment_images or []) + list(extracted_images or [])
+            if images_from_markers:
+                try:
+                    await adapter.send_multiple_images(
+                        chat_id=event.source.chat_id,
+                        images=images_from_markers,
+                        metadata=_thread_meta,
+                        reply_to=_reply_anchor,
+                    )
+                except Exception as e:
+                    logger.warning("[%s] Post-stream image marker delivery failed: %s", adapter.name, e)
+
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
@@ -11137,6 +11151,7 @@ class GatewayRunner:
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
+                        reply_to=_reply_anchor,
                     )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
