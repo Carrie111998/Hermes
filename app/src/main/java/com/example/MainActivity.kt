@@ -1,2 +1,4 @@
 ### 3. 💡 AZIONE CORRETTIVA DI JULES
-Per applicare automaticamente questa correzione e prevenire disallineamenti futuri, Jules deve eseguire il seguente comando nella root del repository locale prima di fare il push di ogni modifica alle dipendenze web:
+Per applicare e prevenire questo errore in futuro, Jules dovrebbe:
+
+1. **Risolvere immediatamente il problema locale:** Eseguire il comando preposto nella root del repository prima di effettuare il commit:
