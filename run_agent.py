@@ -190,6 +190,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.self_improvement import resolve_self_improvement_notify_policy
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from hermes_cli.config import cfg_get
 
@@ -2101,6 +2102,7 @@ class AIAgent:
         _agent_section = _agent_cfg.get("agent", {})
         if not isinstance(_agent_section, dict):
             _agent_section = {}
+        self._self_improvement_notify_policy = resolve_self_improvement_notify_policy(_agent_cfg)
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
         # App-level API retry count (wraps each model API call).  Default 3,
@@ -4417,10 +4419,12 @@ class AIAgent:
 
                 if actions:
                     summary = " · ".join(dict.fromkeys(actions))
-                    self._safe_print(
-                        f"  💾 Self-improvement review: {summary}"
-                    )
-                    _bg_cb = self.background_review_callback
+                    notify_policy = getattr(self, "_self_improvement_notify_policy", "channel")
+                    if notify_policy in {"channel", "operator_log"}:
+                        self._safe_print(
+                            f"  💾 Self-improvement review: {summary}"
+                        )
+                    _bg_cb = self.background_review_callback if notify_policy == "channel" else None
                     if _bg_cb:
                         try:
                             _bg_cb(

@@ -520,11 +520,14 @@ class QueuedCommentaryAgent:
 
 
 class BackgroundReviewAgent:
+    last_had_callback = None
+
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
         self.tools = []
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).last_had_callback = self.background_review_callback is not None
         if self.background_review_callback:
             self.background_review_callback("💾 Skill 'prospect-scanner' created.")
         return {
@@ -810,6 +813,7 @@ async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monke
 
 @pytest.mark.asyncio
 async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
+    BackgroundReviewAgent.last_had_callback = None
     adapter, result = await _run_with_agent(
         monkeypatch,
         tmp_path,
@@ -820,6 +824,58 @@ async def test_run_agent_defers_background_review_notification_until_release(mon
 
     assert result["final_response"] == "done"
     assert adapter.sent == []
+    assert BackgroundReviewAgent.last_had_callback is True
+
+
+@pytest.mark.asyncio
+async def test_run_agent_background_review_operator_log_policy_skips_channel_callback(monkeypatch, tmp_path):
+    BackgroundReviewAgent.last_had_callback = None
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-bg-review-operator-log",
+        config_data={"agent": {"self_improvement": {"notify": "operator_log"}}},
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert BackgroundReviewAgent.last_had_callback is False
+
+
+@pytest.mark.asyncio
+async def test_run_agent_background_review_off_policy_skips_channel_callback(monkeypatch, tmp_path):
+    BackgroundReviewAgent.last_had_callback = None
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-bg-review-off",
+        config_data={"agent": {"self_improvement": {"notify": "off"}}},
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert BackgroundReviewAgent.last_had_callback is False
+
+
+@pytest.mark.asyncio
+async def test_run_agent_background_review_channel_policy_is_backstopped_on_whatsapp(monkeypatch, tmp_path):
+    BackgroundReviewAgent.last_had_callback = None
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-bg-review-wa",
+        config_data={"agent": {"self_improvement": {"notify": "channel"}}},
+        platform=Platform.WHATSAPP,
+        chat_id="120363407433776639@g.us",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert BackgroundReviewAgent.last_had_callback is False
 
 
 @pytest.mark.asyncio

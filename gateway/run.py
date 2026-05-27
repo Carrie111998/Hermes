@@ -52,6 +52,7 @@ from typing import Dict, Optional, Any, List, Union, Mapping
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from agent.self_improvement import resolve_self_improvement_notify_policy
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -940,8 +941,15 @@ def _check_unavailable_skill(command_name: str) -> str | None:
 
 
 def _platform_config_key(platform: "Platform") -> str:
-    """Map a Platform enum to its config.yaml key (LOCAL→"cli", rest→enum value)."""
-    return "cli" if platform == Platform.LOCAL else platform.value
+    """Map a Platform enum/raw value to its config.yaml key (LOCAL→"cli")."""
+    value = getattr(platform, "value", platform)
+    normalized = str(value or "").strip().lower()
+    return "cli" if normalized == "local" else normalized
+
+
+def _platform_allows_chat_sidebands(platform: "Platform") -> bool:
+    """Return False for client channels that must not receive operator sidebands."""
+    return _platform_config_key(platform) != Platform.WHATSAPP.value
 
 
 def _teams_pipeline_plugin_enabled() -> bool:
@@ -16087,7 +16095,8 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            chat_sidebands_enabled = source.platform != Platform.WHATSAPP
+            self_improvement_notify_policy = resolve_self_improvement_notify_policy(user_config)
+            chat_sidebands_enabled = _platform_allows_chat_sidebands(source.platform)
             agent.tool_progress_callback = progress_callback if tool_progress_enabled and chat_sidebands_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
@@ -16137,7 +16146,11 @@ class GatewayRunner:
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send if chat_sidebands_enabled else None
+            agent.background_review_callback = (
+                _bg_review_send
+                if chat_sidebands_enabled and self_improvement_notify_policy == "channel"
+                else None
+            )
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:
