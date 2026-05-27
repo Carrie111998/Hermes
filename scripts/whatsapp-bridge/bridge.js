@@ -95,7 +95,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -103,7 +103,7 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
       timeoutMs,
     );
   });
-  return Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
+  return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
     .finally(() => clearTimeout(timer));
 }
 
@@ -305,6 +305,24 @@ function trackSentMessageId(sent) {
       recentlySentIds.delete(recentlySentIds.values().next().value);
     }
   }
+}
+
+const recentInboundMessages = new Map();
+const MAX_RECENT_INBOUND_MESSAGES = parseInt(process.env.WHATSAPP_RECENT_INBOUND_MESSAGES || '500', 10);
+
+function rememberInboundMessage(msg) {
+  const messageId = msg?.key?.id;
+  if (!messageId || msg?.key?.fromMe) return;
+  recentInboundMessages.set(messageId, msg);
+  while (recentInboundMessages.size > MAX_RECENT_INBOUND_MESSAGES) {
+    recentInboundMessages.delete(recentInboundMessages.keys().next().value);
+  }
+}
+
+function sendOptionsForReplyTo(replyTo) {
+  if (!replyTo) return {};
+  const quoted = recentInboundMessages.get(String(replyTo));
+  return quoted ? { quoted } : {};
 }
 
 function normalizeWhatsAppId(value) {
@@ -649,6 +667,7 @@ async function startSocket() {
         historySyncType: historyMeta.syncType || null,
         historyIsLatest: historyMeta.isLatest ?? null,
       };
+      rememberInboundMessage(msg);
 
       if (isHistory) {
         appendJsonLine(HISTORY_SYNC_PATH, event, 'history sync event');
@@ -772,7 +791,8 @@ app.post('/send', async (req, res) => {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+      const options = i === 0 ? sendOptionsForReplyTo(replyTo) : {};
+      const sent = await sendWithTimeout(chatId, { text: chunks[i] }, options);
       trackSentMessageId(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
