@@ -2289,7 +2289,7 @@ def delegate_task(
             if getattr(parent_agent, "session_cost_source", "none") in {None, "", "none"}:
                 parent_agent.session_cost_source = "subagent"
             if getattr(parent_agent, "session_cost_status", "unknown") in {None, "", "unknown"}:
-                parent_agent.session_cost_status = "estimated"
+                parent_agent.session_cost_status = "calculated_from_usage"
         except Exception:
             logger.debug("Subagent cost rollup failed", exc_info=True)
 

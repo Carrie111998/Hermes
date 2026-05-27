@@ -760,7 +760,7 @@ class TestSubagentCostRollup(unittest.TestCase):
         self.assertAlmostEqual(parent.session_estimated_cost_usd, 0.45, places=6)
         # cost_source promoted from "none" since the parent had no direct spend.
         self.assertEqual(parent.session_cost_source, "subagent")
-        self.assertEqual(parent.session_cost_status, "estimated")
+        self.assertEqual(parent.session_cost_status, "calculated_from_usage")
         # All internal fields stripped from results.
         for entry in result["results"]:
             self.assertNotIn("_child_cost_usd", entry)

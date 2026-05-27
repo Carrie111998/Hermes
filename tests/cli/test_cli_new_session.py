@@ -47,7 +47,7 @@ class _FakeAgent:
         self.session_reasoning_tokens = 80
         self.session_api_calls = 5
         self.session_estimated_cost_usd = 0.42
-        self.session_cost_status = "estimated"
+        self.session_cost_status = "calculated_from_usage"
         self.session_cost_source = "openrouter"
         self.context_compressor = _FakeCompressor()
 

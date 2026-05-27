@@ -89,6 +89,12 @@
       "owner": "pclaw:pclaw"
     },
     {
+      "sourcePath": "agent/usage_pricing.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/agent/usage_pricing.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
       "sourcePath": "tests/fixtures/pa/bobby_tgg_constitution.yaml",
       "targetPath": "home/pclaw/apps/hermes-pcl/tests/fixtures/pa/bobby_tgg_constitution.yaml",
       "owner": "pclaw:pclaw"

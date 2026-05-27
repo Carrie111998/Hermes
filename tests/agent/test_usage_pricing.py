@@ -224,6 +224,43 @@ def test_gemini_25_flash_pricing_entry_exists():
     assert float(entry.cache_read_cost_per_million) == 0.03
 
 
+def test_gemini_3_flash_preview_pricing_entry_exists():
+    entry = get_pricing_entry(
+        "gemini-3-flash-preview",
+        provider="gemini",
+    )
+
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 0.50
+    assert float(entry.output_cost_per_million) == 3.00
+    assert float(entry.cache_read_cost_per_million) == 0.05
+
+
+def test_gemini_31_flash_lite_pricing_entry_exists():
+    entry = get_pricing_entry(
+        "gemini-3.1-flash-lite",
+        provider="gemini",
+    )
+
+    assert entry is not None
+    assert float(entry.input_cost_per_million) == 0.25
+    assert float(entry.output_cost_per_million) == 1.50
+    assert float(entry.cache_read_cost_per_million) == 0.025
+
+
+def test_gemini_3_flash_preview_estimate_usage_cost():
+    result = estimate_usage_cost(
+        "gemini-3-flash-preview",
+        CanonicalUsage(input_tokens=1000000, output_tokens=500000, cache_read_tokens=200000),
+        provider="gemini",
+    )
+
+    assert result.status == "calculated_from_usage"
+    assert result.amount_usd is not None
+    # 1M input × $0.50/M + 500K output × $3/M + 200K cache-read × $0.05/M
+    assert float(result.amount_usd) == 2.01
+
+
 def test_deepseek_v4_pro_estimate_usage_cost():
     """Ensure deepseek-v4-pro sessions get a dollar estimate, not unknown."""
     result = estimate_usage_cost(
@@ -232,7 +269,7 @@ def test_deepseek_v4_pro_estimate_usage_cost():
         provider="deepseek",
     )
 
-    assert result.status == "estimated"
+    assert result.status == "calculated_from_usage"
     assert result.amount_usd is not None
     # 1M input × $1.74/M + 500K output × $3.48/M = $1.74 + $1.74 = $3.48
     assert float(result.amount_usd) == 3.48

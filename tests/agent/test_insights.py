@@ -164,12 +164,12 @@ class TestEstimateCost:
             1_000_000,
             provider="anthropic",
         )
-        assert status == "estimated"
+        assert status == "calculated_from_usage"
         assert cost == pytest.approx(18.0, abs=0.01)
 
     def test_zero_tokens(self):
         cost, status = _estimate_cost("gpt-4o", 0, 0, provider="openai")
-        assert status == "estimated"
+        assert status == "calculated_from_usage"
         assert cost == 0.0
 
     def test_cache_aware_usage(self):
@@ -181,7 +181,7 @@ class TestEstimateCost:
             cache_write_tokens=400,
             provider="anthropic",
         )
-        assert status == "estimated"
+        assert status == "calculated_from_usage"
         expected = (1000 * 3.0 + 500 * 15.0 + 2000 * 0.30 + 400 * 3.75) / 1_000_000
         assert cost == pytest.approx(expected, abs=0.0001)
 
