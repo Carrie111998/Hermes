@@ -3047,6 +3047,25 @@ class TestRunConversation:
 
         assert result["api_calls"] == 1
 
+    def test_cron_platform_does_not_auto_delegate_even_with_trigger(self, agent):
+        """Explicit Copilot directives should NOT auto-delegate in cron sessions."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        agent.platform = "cron"
+        resp = _mock_response(content="Here is the digest.", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("use copilot to create a webpage")
+
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "Here is the digest."
+
     def test_explanation_request_does_not_auto_delegate_to_copilot_remote(self, agent):
         self._setup_agent(agent)
         agent.valid_tool_names.add("copilot_remote")

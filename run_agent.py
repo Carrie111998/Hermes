@@ -175,9 +175,9 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 # Patterns that signal an explicit request to delegate work to Copilot remote.
 # Each pattern is a regex matched against the lowercased, cleaned message text.
-# The negative lookbehind (?<!\w) ensures these don't match inside larger words,
-# and the _NEGATION_PREFIX check (applied separately) catches "don't use copilot",
-# "do not use copilot", "how do i use copilot", etc.
+# Word boundaries (\b) avoid matching inside larger words, and the
+# _COPILOT_REMOTE_NEGATION_PREFIXES check (applied separately) blocks negated /
+# informational phrases like "don't use copilot", "do not use copilot", "what is copilot", etc.
 _COPILOT_REMOTE_AUTO_DELEGATION_TRIGGER_PATTERNS = (
     r"\buse copilot (to|for|remote)\b",
     r"\blaunch copilot\b",
