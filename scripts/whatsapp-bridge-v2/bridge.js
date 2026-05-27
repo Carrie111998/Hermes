@@ -12,7 +12,7 @@
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /typing         - Send typing indicator { chatId }
  *   POST /create-group   - Create a WhatsApp group { subject, participants }
- *   POST /leave-group    - Leave a WhatsApp group { chatId, expectedSubject? }
+ *   POST /leave-group    - Leave a WhatsApp group { chatId, expectedSubject?, removeParticipants? }
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
  *
@@ -1133,7 +1133,9 @@ app.post('/create-group', async (req, res) => {
 });
 
 // Cleanup helper for endpoint smoke tests. The caller must name the expected
-// subject to reduce accidental leaves from real operator groups.
+// subject to reduce accidental leaves from real operator groups. For throwaway
+// smoke groups, removeParticipants=true removes non-bot participants first so
+// the cleanup does not strand a test phone in an empty group.
 app.post('/leave-group', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
@@ -1154,8 +1156,22 @@ app.post('/leave-group', async (req, res) => {
         actualSubject: metadata?.subject || '',
       });
     }
+    const removedParticipants = [];
+    if (req.body?.removeParticipants === true) {
+      const ownIds = new Set([
+        normalizeParticipantJid(sock.user?.id),
+        normalizeParticipantJid(sock.user?.lid),
+      ].filter(Boolean));
+      const removableParticipants = (metadata?.participants || [])
+        .map(p => normalizeParticipantJid(p?.id))
+        .filter(jid => jid && !ownIds.has(jid));
+      if (removableParticipants.length > 0) {
+        await sock.groupParticipantsUpdate(chatId, removableParticipants, 'remove');
+        removedParticipants.push(...removableParticipants);
+      }
+    }
     await sock.groupLeave(chatId);
-    res.json({ success: true, chatId, subject: metadata?.subject });
+    res.json({ success: true, chatId, subject: metadata?.subject, removedParticipants });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
