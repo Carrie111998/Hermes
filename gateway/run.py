@@ -16072,11 +16072,12 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            chat_sidebands_enabled = source.platform != Platform.WHATSAPP
+            agent.tool_progress_callback = progress_callback if tool_progress_enabled and chat_sidebands_enabled else None
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
-            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = None if suppress_delivery else _status_callback_sync
+            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages and chat_sidebands_enabled else None
+            agent.status_callback = None if suppress_delivery or not chat_sidebands_enabled else _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
@@ -16121,7 +16122,7 @@ class GatewayRunner:
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
+            agent.background_review_callback = _bg_review_send if chat_sidebands_enabled else None
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:
@@ -16773,6 +16774,7 @@ class GatewayRunner:
         _NOTIFY_INTERVAL = (
             None
             if suppress_delivery
+            or source.platform == Platform.WHATSAPP
             else _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
         )
         _notify_start = time.time()
