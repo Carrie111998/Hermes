@@ -479,11 +479,6 @@ def _finish_job(job_id: str, exit_code: int) -> None:
 
 
 def _launch(args: Dict[str, Any]) -> str:
-    # === ROSENBLATT PATCH START: block copilot_remote launch in cron sessions ===
-    # Reason: cron agents are non-interactive and auto-approving; spawning an
-    # unattended Copilot remote session from a cron context would chain two
-    # autonomous agents together with no human in the loop.
-    # Upstream: internal-only (Rosenblatt cron safety policy)
     if os.environ.get("HERMES_CRON_SESSION", "").strip() in ("1", "true", "yes"):
         return _error(
             "copilot_remote launch is not available in cron sessions. "
@@ -491,7 +486,6 @@ def _launch(args: Dict[str, Any]) -> str:
             "remote session. Send a message to Hermes interactively to launch "
             "a Copilot job, or use the `terminal` tool for unattended scripting."
         )
-    # === ROSENBLATT PATCH END ===
 
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
