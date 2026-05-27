@@ -175,16 +175,32 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 # Patterns that signal an explicit request to delegate work to Copilot remote.
 # Each pattern is a regex matched against the lowercased, cleaned message text.
+# The negative lookbehind (?<!\w) ensures these don't match inside larger words,
+# and the _NEGATION_PREFIX check (applied separately) catches "don't use copilot",
+# "do not use copilot", "how do i use copilot", etc.
 _COPILOT_REMOTE_AUTO_DELEGATION_TRIGGER_PATTERNS = (
     r"\buse copilot (to|for|remote)\b",
     r"\blaunch copilot\b",
-    r"\bcopilot remote\b",
-    r"\bcopilot_remote\b",
+    r"(?:^|(?<=\. ))copilot remote\b",
+    r"(?:^|(?<=\. ))copilot_remote\b",
     r"\bask copilot\b",
     r"\bhave copilot\b",
     r"\bsend (this |it )?to copilot\b",
     r"\bdelegate (this |it )?to copilot\b",
     r"\bhand ?off (this |it )?to copilot\b",
+)
+
+# Negation prefixes that immediately precede a trigger phrase and cancel it.
+_COPILOT_REMOTE_NEGATION_PREFIXES = (
+    r"don'?t ",
+    r"do not ",
+    r"didn'?t ",
+    r"never ",
+    r"stop ",
+    r"how (do|would|can|should) (i|you|we) ",
+    r"how to ",
+    r"what is ",
+    r"what'?s ",
 )
 
 
@@ -4422,10 +4438,19 @@ class AIAgent:
         # Only auto-delegate when the user explicitly requests Copilot delegation.
         if "copilot" not in text:
             return False
-        return any(
-            re.search(pattern, text)
-            for pattern in _COPILOT_REMOTE_AUTO_DELEGATION_TRIGGER_PATTERNS
-        )
+
+        for pattern in _COPILOT_REMOTE_AUTO_DELEGATION_TRIGGER_PATTERNS:
+            match = re.search(pattern, text)
+            if match:
+                # Check that the match isn't preceded by a negation prefix.
+                before = text[:match.start()]
+                if any(
+                    re.search(neg + r"$", before)
+                    for neg in _COPILOT_REMOTE_NEGATION_PREFIXES
+                ):
+                    continue
+                return True
+        return False
 
     def _format_copilot_remote_auto_response(self, tool_result: str) -> str:
         """Build a concise user-facing response from a copilot_remote result."""

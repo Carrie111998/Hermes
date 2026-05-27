@@ -151,6 +151,20 @@ def test_launch_requires_prompt(db):
     assert "prompt is required" in result["error"]
 
 
+def test_launch_blocked_in_cron_session(db, monkeypatch):
+    """copilot_remote launch must be blocked when HERMES_CRON_SESSION is set."""
+    monkeypatch.setenv("HERMES_CRON_SESSION", "True")
+    result = json.loads(
+        copilot_remote(
+            {"action": "launch", "prompt": "build a website", "repo": "repo-name"},
+            task_id="cron-session-1",
+        )
+    )
+
+    assert result["success"] is False
+    assert "not available in cron sessions" in result["error"]
+
+
 def test_list_and_show(db):
     db.create_copilot_remote(
         job_id="job-1",

@@ -3010,6 +3010,43 @@ class TestRunConversation:
         assert result["api_calls"] == 1
         assert result["final_response"] == "I'll create that for you."
 
+    def test_negated_copilot_directive_does_not_auto_delegate(self, agent):
+        """Negated directives like 'don't use copilot to...' should NOT auto-delegate."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        resp = _mock_response(content="OK, I'll handle it locally.", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "don't use copilot to create this, do it yourself"
+            )
+
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "OK, I'll handle it locally."
+
+    def test_question_about_copilot_does_not_auto_delegate(self, agent):
+        """Questions about copilot_remote should NOT trigger auto-delegation."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        resp = _mock_response(content="copilot_remote is a tool that...", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("what is copilot_remote?")
+
+        assert result["api_calls"] == 1
+
     def test_explanation_request_does_not_auto_delegate_to_copilot_remote(self, agent):
         self._setup_agent(agent)
         agent.valid_tool_names.add("copilot_remote")

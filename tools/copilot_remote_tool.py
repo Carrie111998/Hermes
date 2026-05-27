@@ -479,7 +479,7 @@ def _finish_job(job_id: str, exit_code: int) -> None:
 
 
 def _launch(args: Dict[str, Any]) -> str:
-    if os.environ.get("HERMES_CRON_SESSION", "").strip() in ("1", "true", "yes"):
+    if os.environ.get("HERMES_CRON_SESSION", "").strip().lower() in ("1", "true", "yes", "on"):
         return _error(
             "copilot_remote launch is not available in cron sessions. "
             "Cron jobs run non-interactively and cannot supervise a Copilot "
