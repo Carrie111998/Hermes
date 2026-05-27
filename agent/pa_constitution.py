@@ -22,6 +22,7 @@ class PAJobBrief:
     title: str
     purpose: str
     instructions: tuple[str, ...]
+    runtime: Mapping[str, Any] = field(default_factory=dict)
     enabled_toolsets: tuple[str, ...] = field(default_factory=tuple)
     disabled_toolsets: tuple[str, ...] = field(default_factory=tuple)
     fact_operations: Mapping[str, Any] = field(default_factory=dict)
@@ -252,6 +253,7 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
     title = _required_str(raw_brief, "title", f"{source}.job_briefs.{job_type}")
     purpose = _required_str(raw_brief, "purpose", f"{source}.job_briefs.{job_type}")
     instructions = _string_tuple(raw_brief.get("instructions", ()), f"{source}.job_briefs.{job_type}.instructions")
+    runtime = _optional_mapping(raw_brief.get("runtime", {}), f"{source}.job_briefs.{job_type}.runtime")
     fact_operations = _optional_mapping(raw_brief.get("fact_operations", {}), f"{source}.job_briefs.{job_type}.fact_operations")
     response_policy = _optional_mapping(raw_brief.get("response_policy", {}), f"{source}.job_briefs.{job_type}.response_policy")
     enabled_toolsets = _string_tuple(
@@ -267,6 +269,7 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         "title": title,
         "purpose": purpose,
         "instructions": instructions,
+        "runtime": runtime,
         "enabled_toolsets": enabled_toolsets,
         "disabled_toolsets": disabled_toolsets,
         "fact_operations": fact_operations,
@@ -277,6 +280,7 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         title=title,
         purpose=purpose,
         instructions=instructions,
+        runtime=dict(runtime),
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         fact_operations=dict(fact_operations),
@@ -464,6 +468,7 @@ def _normalize(value: Any) -> Any:
             "title": value.title,
             "purpose": value.purpose,
             "instructions": value.instructions,
+            "runtime": value.runtime,
             "enabled_toolsets": value.enabled_toolsets,
             "disabled_toolsets": value.disabled_toolsets,
             "fact_operations": value.fact_operations,

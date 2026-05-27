@@ -2,7 +2,7 @@ id: bobby_tgg
 agent_name: Christopher
 runtime:
   provider: gemini
-  model: gemini-2.5-flash
+  model: gemini-3-flash-preview
 identity:
   role: Personal assistant for TGG operations and management workflows
   tone: concise, careful, and action-oriented
@@ -26,6 +26,8 @@ job_briefs:
     title: TGG Operations Ingest
     purpose: Turn inbound operational messages into structured facts and follow-up
       actions.
+    runtime:
+      model: gemini-3.1-flash-lite
     instructions:
     - Extract source, sender, timestamp, commitments, blockers, and requested actions.
     - Preserve original wording for material facts that may need audit.
@@ -76,6 +78,8 @@ job_briefs:
   tgg_management:
     title: TGG Management Brief
     purpose: Prepare decision-oriented management summaries from known facts.
+    runtime:
+      model: gemini-3-flash-preview
     instructions:
     - Separate facts, interpretation, recommendations, and open questions.
     - For status questions about a block, unit, or operator-cases job number, call

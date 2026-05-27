@@ -135,6 +135,40 @@ def test_selector_resolves_tgg_ops_ingest_vs_tgg_management_from_metadata() -> N
     assert unresolved is None
 
 
+def test_job_brief_runtime_is_loaded_and_hashes() -> None:
+    constitution = load_constitution_data(
+        {
+            "id": "runtime-test",
+            "agent_name": "Runtime Test",
+            "identity": {"role": "PA"},
+            "client": {"name": "Client"},
+            "job_briefs": {
+                "ops": {
+                    "title": "Ops",
+                    "purpose": "Ingest ops.",
+                    "instructions": ["Extract facts."],
+                    "runtime": {"model": "gemini-3.1-flash-lite"},
+                },
+                "management": {
+                    "title": "Management",
+                    "purpose": "Answer management.",
+                    "instructions": ["Answer questions."],
+                    "runtime": {"model": "gemini-3-flash-preview"},
+                },
+            },
+            "selectors": [],
+        },
+        source="runtime.yaml",
+    )
+
+    ops = constitution.job_briefs["ops"]
+    management = constitution.job_briefs["management"]
+
+    assert ops.runtime["model"] == "gemini-3.1-flash-lite"
+    assert management.runtime["model"] == "gemini-3-flash-preview"
+    assert ops.hash != management.hash
+
+
 def test_stable_behavior_hashes() -> None:
     constitution_a = load_constitution(FIXTURE)
     constitution_b = load_constitution(FIXTURE)

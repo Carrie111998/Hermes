@@ -1086,6 +1086,39 @@ def _merge_pa_toolsets(
     return _dedupe(next_enabled), _dedupe(next_disabled)
 
 
+def _apply_pa_job_runtime(
+    model: str,
+    runtime_kwargs: Mapping[str, Any] | None,
+    pa_context: Any,
+) -> tuple[str, dict]:
+    """Apply PA job-specific runtime defaults before session overrides.
+
+    PA selectors already decide which operational job a source belongs to.
+    Runtime defaults belong on that selected job brief so channel ids do not
+    get duplicated in gateway config.
+    """
+    next_runtime = dict(runtime_kwargs or {})
+    job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
+    job_runtime = getattr(job_brief, "runtime", None) if job_brief is not None else None
+    if not isinstance(job_runtime, Mapping) or not job_runtime:
+        return model, next_runtime
+
+    next_model = model
+    configured_model = job_runtime.get("model") or job_runtime.get("default")
+    if isinstance(configured_model, str) and configured_model.strip():
+        next_model = configured_model.strip()
+
+    for key in ("provider", "base_url", "api_mode", "command", "credential_pool"):
+        value = job_runtime.get(key)
+        if value is not None:
+            next_runtime[key] = value
+    if "args" in job_runtime:
+        args = job_runtime.get("args") or []
+        next_runtime["args"] = list(args) if isinstance(args, (list, tuple)) else [str(args)]
+
+    return next_model, next_runtime
+
+
 def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
     """Render PA identity + job brief for API-call-time prompt injection.
 
@@ -2295,6 +2328,7 @@ class GatewayRunner:
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        pa_context: Any = None,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -2348,6 +2382,7 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        model, runtime_kwargs = _apply_pa_job_runtime(model, runtime_kwargs, pa_context)
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -15837,6 +15872,7 @@ class GatewayRunner:
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    pa_context=pa_resolved_context,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
