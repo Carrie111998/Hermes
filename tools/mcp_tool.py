@@ -638,6 +638,120 @@ def _safe_numeric(value, default, coerce=int, minimum=1):
         return default
 
 
+# ---------------------------------------------------------------------------
+# Per-request context-template resolution for MCP-headers config.
+#
+# Distinguishing case from config-load-time substitution:
+#
+#   ``${ENV_VAR}``           — substituted ONCE at config load time by an
+#                              external envsubst pass (typically a
+#                              deploy-time entrypoint script). Values are
+#                              frozen for the lifetime of the MCP server task.
+#
+#   ``${context:NAME}``      — left intact through config load, then
+#                              resolved PER REQUEST from
+#                              ``gateway.session_context``. Asyncio-task-local,
+#                              so concurrent handler tasks each see their own
+#                              session state and never bleed into each other.
+#
+# This split lets consumers attach per-request values (most commonly delegated
+# user identity) to outbound MCP HTTP headers without monkey-patching httpx or
+# routing through a sidecar process.  Transport-specific behavior:
+#
+#   * Streamable HTTP (default for remote MCP servers) — per-request hook on
+#     httpx.AsyncClient.event_hooks["request"] performs substitution.  Empty
+#     resolved values cause the header to be dropped (not sent as an empty
+#     string).
+#
+#   * SSE — the headers dict is passed to ``sse_client`` once at stream-open;
+#     per-request substitution is not possible.  Templates resolve at
+#     stream-open time and are then frozen for the SSE connection's
+#     lifetime (typically minutes-to-hours).
+# ---------------------------------------------------------------------------
+
+_CONTEXT_TEMPLATE_RE = re.compile(r'\$\{context:([A-Za-z_][A-Za-z0-9_]*)\}')
+
+
+def _has_context_template(value: Any) -> bool:
+    """Return True if *value* is a string containing ``${context:NAME}``."""
+    return isinstance(value, str) and bool(_CONTEXT_TEMPLATE_RE.search(value))
+
+
+def _resolve_context_templates(value: str) -> str:
+    """Replace every ``${context:NAME}`` occurrence in *value* with the
+    current resolution of ``NAME`` via ``gateway.session_context``.
+
+    Unset names resolve to ``""``.  Mixed literal text + templates is fine
+    (e.g. ``"Bearer ${context:JWT}"``).  Non-template input is returned
+    unchanged.
+
+    The final substituted string is stripped of leading/trailing
+    whitespace.  An all-whitespace resolved value (``"   "`` from a
+    paste artifact, env-injection mishap, etc.) is therefore equivalent
+    to empty — which downstream call sites treat as "drop this header"
+    rather than send ``X-Foo:`` with whitespace.  Intentional inner
+    whitespace ("Bearer abc 123") is preserved.
+    """
+    if not isinstance(value, str):
+        return value
+    # Lazy import — keeps the gateway -> tools dependency one-way and avoids
+    # paying the import cost when no headers use templates.
+    from gateway.session_context import get_session_env
+
+    def _replace(match: re.Match) -> str:
+        name = match.group(1)
+        # str()-coerce in case a plugin registers a ContextVar whose value
+        # is not a string (int, bool, None). re.sub raises TypeError on
+        # non-string replacements; defensive coercion keeps the resolver
+        # robust against plugin authors who didn't read the str-only
+        # convention.
+        return str(get_session_env(name, ""))
+
+    return _CONTEXT_TEMPLATE_RE.sub(_replace, value).strip()
+
+
+def _split_static_and_templated_headers(
+    headers: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, str]]:
+    """Separate a headers dict into a static part and a templated part.
+
+    Returns ``(static, templated)`` where *static* contains values with no
+    ``${context:NAME}`` placeholders (safe to set as httpx client defaults)
+    and *templated* contains the raw template strings (to be resolved
+    per-request via a request hook).
+    """
+    static: Dict[str, Any] = {}
+    templated: Dict[str, str] = {}
+    for key, value in headers.items():
+        if _has_context_template(value):
+            templated[key] = value
+        else:
+            static[key] = value
+    return static, templated
+
+
+def _resolve_frozen_headers(
+    static_headers: Dict[str, Any],
+    templated_headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Resolve templated headers ONCE (for SSE / legacy-HTTP transports
+    that don't support per-request injection) and merge with statics.
+
+    Templated entries whose resolution is empty after stripping are
+    dropped (don't emit ``X-Foo:`` with blank content for the
+    connection's lifetime).  Used by both the SSE and the legacy HTTP
+    branches; extracted as a helper so the freeze-time semantics are
+    testable without spinning up a real ``sse_client`` /
+    ``streamablehttp_client`` instance.
+    """
+    resolved_templated = {
+        key: resolved
+        for key, template in templated_headers.items()
+        if (resolved := _resolve_context_templates(template))
+    }
+    return {**static_headers, **resolved_templated}
+
+
 class SamplingHandler:
     """Handles sampling/createMessage requests for a single MCP server.
 
@@ -1351,6 +1465,11 @@ class MCPServerTask:
         # case-insensitive so conventional casing is preserved.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
+        # Separate headers carrying ``${context:NAME}`` templates from static
+        # ones. Static headers go on the httpx client as defaults; templated
+        # headers are resolved per-request via a request event hook so each
+        # outgoing MCP call sees the calling task's current session state.
+        static_headers, templated_headers = _split_static_and_templated_headers(headers)
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
 
@@ -1393,9 +1512,35 @@ class MCPServerTask:
             # Streamable HTTP code path's httpx read timeout below. Original
             # observation from @amiller in PR #5981 (Router Teamwork,
             # Supermemory on Cloudflare Workers idle-disconnect at ~60s).
+            # SSE is one long-lived connection — per-request substitution is
+            # not possible.  Resolve any ``${context:NAME}`` templates ONCE
+            # at stream-open and pass the resulting static dict.  Sessions
+            # spun up before the session context vars are set will see empty
+            # values, which is consistent with non-templated unset env vars.
+            #
+            # Warn loudly: if the caller configured templated headers on an
+            # SSE server, they almost certainly meant per-request semantics.
+            # Frozen-at-open is a real footgun for identity-carrying headers
+            # (a stream opened by user A keeps user A's principal for every
+            # user-B turn over its lifetime).
+            if templated_headers:
+                logger.warning(
+                    "MCP server '%s' (SSE transport): templated headers "
+                    "%s are resolved ONCE at stream-open and frozen for "
+                    "the connection's lifetime — per-request resolution is "
+                    "not possible on SSE. Switch to Streamable HTTP "
+                    "(transport: http) if you need per-request values.",
+                    self.name, sorted(templated_headers.keys()),
+                )
+            # Resolve+merge with empty-drop discipline — see
+            # ``_resolve_frozen_headers`` doc for why this matters on SSE
+            # (a stream opened before any context var is set would
+            # otherwise send ``X-Foo:`` with blank content for the
+            # connection's lifetime).
+            sse_headers = _resolve_frozen_headers(static_headers, templated_headers)
             _sse_kwargs: dict = {
                 "url": url,
-                "headers": headers or None,
+                "headers": sse_headers or None,
                 "timeout": float(connect_timeout),
                 "sse_read_timeout": 300.0,
             }
@@ -1426,9 +1571,24 @@ class MCPServerTask:
             import httpx
 
             _original_url = httpx.URL(url)
+            # Bind the per-server templated_headers dict into the closures
+            # so concurrent MCP servers don't share resolution state, and
+            # so the cross-origin redirect stripper knows which identity-
+            # carrying headers must be dropped on origin change.
+            _templated_for_hook = dict(templated_headers)
 
-            async def _strip_auth_on_cross_origin_redirect(response):
-                """Strip Authorization headers when redirected to a different origin."""
+            async def _strip_identity_on_cross_origin_redirect(response):
+                """Strip identity-carrying headers when redirected to a
+                different origin.
+
+                Covers the static ``Authorization`` header (the original
+                concern) *and* any ``${context:NAME}``-templated headers
+                (delegated principal, signed assertions, etc.) injected
+                by the per-request hook below. Both classes follow the
+                same threat model: an attacker who controls a redirect
+                target could otherwise harvest identity tokens by 302'ing
+                to a server they control.
+                """
                 if response.is_redirect and response.next_request:
                     target = response.next_request.url
                     if (target.scheme, target.host, target.port) != (
@@ -1436,15 +1596,60 @@ class MCPServerTask:
                     ):
                         response.next_request.headers.pop("authorization", None)
                         response.next_request.headers.pop("Authorization", None)
+                        # Drop every templated identity header on cross-origin
+                        # redirect. Header names are case-sensitive in the
+                        # httpx.Headers store via __delitem__ but case-
+                        # insensitive on read — pop() handles both casings.
+                        for name in _templated_for_hook:
+                            response.next_request.headers.pop(name, None)
+
+            event_hooks: Dict[str, List[Any]] = {
+                "response": [_strip_identity_on_cross_origin_redirect],
+            }
+            if templated_headers:
+                async def _inject_templated_headers(request):
+                    """Resolve ``${context:NAME}`` templates against the
+                    *calling task's* session context on each outbound request.
+
+                    **Cross-origin safety:** the hook fires on EVERY outbound
+                    request, including redirects. If a redirect target is on
+                    a different origin than the configured MCP URL, we must
+                    NOT re-inject identity-carrying templated headers there
+                    — same threat model as the static-``Authorization``
+                    cross-origin strip. Without this guard, a malicious 302
+                    target could harvest delegated-principal claims even
+                    though the response hook stripped them off the
+                    next_request.
+                    """
+                    target = request.url
+                    same_origin = (
+                        target.scheme, target.host, target.port,
+                    ) == (
+                        _original_url.scheme, _original_url.host, _original_url.port,
+                    )
+                    for name in _templated_for_hook:
+                        if not same_origin:
+                            # Redirected away from the configured origin:
+                            # never inject identity headers, and proactively
+                            # strip any that survived for some reason.
+                            request.headers.pop(name, None)
+                            continue
+                        resolved = _resolve_context_templates(_templated_for_hook[name])
+                        if resolved:
+                            request.headers[name] = resolved
+                        elif name in request.headers:
+                            del request.headers[name]
+
+                event_hooks["request"] = [_inject_templated_headers]
 
             client_kwargs: dict = {
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                 "verify": ssl_verify,
-                "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
+                "event_hooks": event_hooks,
             }
-            if headers:
-                client_kwargs["headers"] = headers
+            if static_headers:
+                client_kwargs["headers"] = static_headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
 
@@ -1466,9 +1671,28 @@ class MCPServerTask:
                                 "tearing down HTTP session", self.name,
                             )
         else:
-            # Deprecated API (mcp < 1.24.0): manages httpx client internally.
+            # Deprecated API (mcp < 1.24.0): manages httpx client internally,
+            # so we can't install a per-request event hook.  Resolve any
+            # ``${context:NAME}`` templates once at startup and freeze — the
+            # session-context value at server-init time is what every
+            # subsequent MCP call will carry.  Acceptable for the deprecated
+            # path; new HTTP path (mcp >= 1.24.0) uses per-request resolution.
+            #
+            # Warn loudly: same footgun as the SSE branch — frozen-at-open
+            # identity is wrong for any multi-user delegation use case.
+            if templated_headers:
+                logger.warning(
+                    "MCP server '%s' (legacy HTTP, mcp < 1.24.0): templated "
+                    "headers %s are resolved ONCE at startup and frozen — "
+                    "the per-request resolution path requires mcp >= 1.24.0. "
+                    "Upgrade the mcp package if you need per-request values.",
+                    self.name, sorted(templated_headers.keys()),
+                )
+            # Same resolve-and-merge with empty-drop discipline as the
+            # SSE branch above — see ``_resolve_frozen_headers``.
+            legacy_headers = _resolve_frozen_headers(static_headers, templated_headers)
             _http_kwargs: dict = {
-                "headers": headers,
+                "headers": legacy_headers,
                 "timeout": float(connect_timeout),
                 "verify": ssl_verify,
             }
