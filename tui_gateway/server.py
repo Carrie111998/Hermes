@@ -1917,7 +1917,7 @@ def _make_agent(sid: str, key: str, session_id: str | None = None):
         verbose_logging=_load_tool_progress_mode() == "verbose",
         reasoning_config=_load_reasoning_config(),
         service_tier=_load_service_tier(),
-        enabled_toolsets=_load_enabled_toolsets(),
+        enabled_toolsets=_load_enabled_toolsets() or [],
         platform="tui",
         session_id=session_id or key,
         session_db=_get_db(),
@@ -3937,14 +3937,10 @@ def _(rid, params: dict) -> dict:
             arg = str(value or "").strip().lower()
             if arg in {"show", "on"}:
                 cfg = _load_cfg()
-                display = (
-                    cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
-                )
-                sections = (
-                    display.get("sections")
-                    if isinstance(display.get("sections"), dict)
-                    else {}
-                )
+                display_raw = cfg.get("display")
+                display = display_raw if isinstance(display_raw, dict) else {}
+                sections_raw = display.get("sections")
+                sections = sections_raw if isinstance(sections_raw, dict) else {}
                 display["show_reasoning"] = True
                 sections["thinking"] = "expanded"
                 display["sections"] = sections
@@ -3955,14 +3951,10 @@ def _(rid, params: dict) -> dict:
                 return _ok(rid, {"key": key, "value": "show"})
             if arg in {"hide", "off"}:
                 cfg = _load_cfg()
-                display = (
-                    cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
-                )
-                sections = (
-                    display.get("sections")
-                    if isinstance(display.get("sections"), dict)
-                    else {}
-                )
+                display_raw = cfg.get("display")
+                display = display_raw if isinstance(display_raw, dict) else {}
+                sections_raw = display.get("sections")
+                sections = sections_raw if isinstance(sections_raw, dict) else {}
                 display["show_reasoning"] = False
                 sections["thinking"] = "hidden"
                 display["sections"] = sections
@@ -3987,10 +3979,10 @@ def _(rid, params: dict) -> dict:
         if nv not in _DETAIL_MODES:
             return _err(rid, 4002, f"unknown details_mode: {value}")
         cfg = _load_cfg()
-        display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
-        sections = (
-            display.get("sections") if isinstance(display.get("sections"), dict) else {}
-        )
+        display_raw = cfg.get("display")
+        display = display_raw if isinstance(display_raw, dict) else {}
+        sections_raw = display.get("sections")
+        sections = sections_raw if isinstance(sections_raw, dict) else {}
         display["details_mode"] = nv
         for section in _DETAIL_SECTION_NAMES:
             sections[section] = nv
@@ -4009,10 +4001,10 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4002, f"unknown section: {section}")
 
         cfg = _load_cfg()
-        display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
-        sections_cfg = (
-            display.get("sections") if isinstance(display.get("sections"), dict) else {}
-        )
+        display_raw = cfg.get("display")
+        display = display_raw if isinstance(display_raw, dict) else {}
+        sections_cfg_raw = display.get("sections")
+        sections_cfg = sections_cfg_raw if isinstance(sections_cfg_raw, dict) else {}
 
         nv = str(value or "").strip().lower()
         if not nv:
@@ -4046,7 +4038,8 @@ def _(rid, params: dict) -> dict:
     if key == "compact":
         raw = str(value or "").strip().lower()
         cfg0 = _load_cfg()
-        d0 = cfg0.get("display") if isinstance(cfg0.get("display"), dict) else {}
+        d0_raw = cfg0.get("display")
+        d0 = d0_raw if isinstance(d0_raw, dict) else {}
         cur_b = bool(d0.get("tui_compact", False))
         if raw in {"", "toggle"}:
             nv_b = not cur_b
@@ -4080,7 +4073,8 @@ def _(rid, params: dict) -> dict:
     if key == "mouse":
         raw = str(value or "").strip().lower()
         cfg = _load_cfg()
-        display = cfg.get("display") if isinstance(cfg.get("display"), dict) else {}
+        display_raw = cfg.get("display")
+        display = display_raw if isinstance(display_raw, dict) else {}
         current = _display_mouse_tracking(display)
 
         if raw in {"", "toggle"}:
@@ -4126,9 +4120,12 @@ def _(rid, params: dict) -> dict:
                 _write_config_key("display.personality", pname)
                 _write_config_key("agent.system_prompt", new_prompt)
                 nv = str(value or "default")
-                history_reset, info = _apply_personality_to_session(
-                    sid_key, session, new_prompt
-                )
+                history_reset = False
+                info = None
+                if session is not None:
+                    history_reset, info = _apply_personality_to_session(
+                        sid_key, session, new_prompt
+                    )
             else:
                 _write_config_key(f"display.{key}", value)
                 nv = value
@@ -5574,23 +5571,24 @@ def _(rid, params: dict) -> dict:
     except Exception:
         pass
 
-    plugin_handler = None
-    resolve_plugin_command_result = None
+    plugin_handler: Any = None
+    resolve_plugin_command_result_opt: Any = None
     if _cmd_base:
         try:
             from hermes_cli.plugins import (
                 get_plugin_command_handler,
-                resolve_plugin_command_result,
+                resolve_plugin_command_result as resolve_plugin_command_result_found,
             )
 
             plugin_handler = get_plugin_command_handler(_cmd_base)
+            resolve_plugin_command_result_opt = resolve_plugin_command_result_found
         except Exception:
             plugin_handler = None
-            resolve_plugin_command_result = None
+            resolve_plugin_command_result_opt = None
 
-    if plugin_handler and resolve_plugin_command_result:
+    if plugin_handler and resolve_plugin_command_result_opt:
         try:
-            result = resolve_plugin_command_result(plugin_handler(_cmd_arg))
+            result = resolve_plugin_command_result_opt(plugin_handler(_cmd_arg))
             return _ok(rid, {"output": str(result or "(no output)")})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
@@ -6344,7 +6342,7 @@ def _(rid, params: dict) -> dict:
             if session
             else _load_enabled_toolsets()
         )
-        tools = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+        tools = get_tool_definitions(enabled_toolsets=enabled or [], quiet_mode=True)
         sections = {}
 
         for tool in sorted(tools, key=lambda t: t["function"]["name"]):
@@ -6562,7 +6560,7 @@ def _(rid, params: dict) -> dict:
                 def print(self, *a, **k):
                     pass
 
-            do_install(query, skip_confirm=True, console=_Q())
+            do_install(query, skip_confirm=True, console=_Q())  # type: ignore
             return _ok(rid, {"installed": True, "name": query})
         if action == "browse":
             from hermes_cli.skills_hub import browse_skills

@@ -125,7 +125,7 @@ def atomic_json_write(
             os.fsync(f.fileno())
         # Preserve symlinks — swap in-place on the real file (GitHub #16743).
         real_path = atomic_replace(tmp_path, path)
-        _restore_file_mode(real_path, original_mode)
+        _restore_file_mode(Path(real_path), original_mode)
     except BaseException:
         # Intentionally catch BaseException so temp-file cleanup still runs for
         # KeyboardInterrupt/SystemExit before re-raising the original signal.
@@ -177,7 +177,7 @@ def atomic_yaml_write(
             os.fsync(f.fileno())
         # Preserve symlinks — swap in-place on the real file (GitHub #16743).
         real_path = atomic_replace(tmp_path, path)
-        _restore_file_mode(real_path, original_mode)
+        _restore_file_mode(Path(real_path), original_mode)
     except BaseException:
         # Match atomic_json_write: cleanup must also happen for process-level
         # interruptions before we re-raise them.
@@ -243,7 +243,7 @@ def atomic_roundtrip_yaml_update(
             f.flush()
             os.fsync(f.fileno())
         real_path = atomic_replace(tmp_path, path)
-        _restore_file_mode(real_path, original_mode)
+        _restore_file_mode(Path(real_path), original_mode)
     except BaseException:
         try:
             os.unlink(tmp_path)
