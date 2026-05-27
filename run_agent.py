@@ -173,65 +173,19 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 
-_COPILOT_REMOTE_AUTO_DELEGATION_VERBS = (
-    "add",
-    "build",
-    "change",
-    "create",
-    "debug",
-    "edit",
-    "fix",
-    "implement",
-    "make",
-    "patch",
-    "refactor",
-    "repair",
-    "test",
-    "update",
-    "write",
+# Patterns that signal an explicit request to delegate work to Copilot remote.
+# Each pattern is a regex matched against the lowercased, cleaned message text.
+_COPILOT_REMOTE_AUTO_DELEGATION_TRIGGER_PATTERNS = (
+    r"\buse copilot (to|for|remote)\b",
+    r"\blaunch copilot\b",
+    r"\bcopilot remote\b",
+    r"\bcopilot_remote\b",
+    r"\bask copilot\b",
+    r"\bhave copilot\b",
+    r"\bsend (this |it )?to copilot\b",
+    r"\bdelegate (this |it )?to copilot\b",
+    r"\bhand ?off (this |it )?to copilot\b",
 )
-
-_COPILOT_REMOTE_AUTO_DELEGATION_TARGETS = (
-    "app",
-    "bug",
-    "code",
-    "component",
-    "config",
-    "configuration",
-    "docs",
-    "documentation",
-    "file",
-    "feature",
-    "frontend",
-    "html",
-    "implementation",
-    "page",
-    "repo",
-    "repository",
-    "script",
-    "site",
-    "static page",
-    "static webpage",
-    "test",
-    "web page",
-    "webpage",
-    "website",
-)
-
-_COPILOT_REMOTE_AUTO_DELEGATION_SKIP_PATTERNS = (
-    "do it yourself",
-    "don't use copilot",
-    "dont use copilot",
-    "explain",
-    "how do i",
-    "how would",
-    "plan",
-    "review",
-    "tell me",
-    "without copilot",
-    "why",
-)
-
 
 
 _MAX_TOOL_WORKERS = 8
@@ -4440,14 +4394,16 @@ class AIAgent:
         return result["final_response"]
 
     def _should_auto_delegate_to_copilot_remote(self, user_message: Any) -> bool:
-        """Return True when an implementation request should bypass local execution."""
+        """Return True only when the user explicitly requests Copilot delegation."""
         if "copilot_remote" not in self.valid_tool_names:
+            return False
+        if self.platform == "cron":
             return False
         if not isinstance(user_message, str):
             return False
 
         # Strip platform-injected envelopes that contain prior conversation
-        # text — these otherwise contaminate skip-pattern matching.
+        # text — these otherwise contaminate trigger-phrase matching.
         # 1) Slack thread-context block:
         #    "[Thread context — prior messages in this thread (not yet in
         #     conversation history):]\n...content...\n[End of thread context]\n\n"
@@ -4463,35 +4419,13 @@ class AIAgent:
         if not text or text.startswith("/"):
             return False
 
-        if any(
-            re.search(rf"\b{re.escape(pattern)}\b", text)
-            for pattern in _COPILOT_REMOTE_AUTO_DELEGATION_SKIP_PATTERNS
-        ):
+        # Only auto-delegate when the user explicitly requests Copilot delegation.
+        if "copilot" not in text:
             return False
-
-        explicit_copilot_request = "copilot" in text and any(
-            phrase in text
-            for phrase in (
-                "use copilot",
-                "launch copilot",
-                "copilot remote",
-                "copilot_remote",
-                "ask copilot",
-                "have copilot",
-            )
+        return any(
+            re.search(pattern, text)
+            for pattern in _COPILOT_REMOTE_AUTO_DELEGATION_TRIGGER_PATTERNS
         )
-        if explicit_copilot_request:
-            return True
-
-        has_implementation_verb = any(
-            re.search(rf"\b{re.escape(verb)}\b", text)
-            for verb in _COPILOT_REMOTE_AUTO_DELEGATION_VERBS
-        )
-        has_implementation_target = any(
-            re.search(rf"\b{re.escape(target)}\b", text)
-            for target in _COPILOT_REMOTE_AUTO_DELEGATION_TARGETS
-        )
-        return has_implementation_verb and has_implementation_target
 
     def _format_copilot_remote_auto_response(self, tool_result: str) -> str:
         """Build a concise user-facing response from a copilot_remote result."""
