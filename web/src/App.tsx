@@ -519,9 +519,13 @@ export default function App() {
           <Menu />
         </Button>
 
-        <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
+        <a
+          href="https://chat.ethniceats.com"
+          className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground no-underline"
+          style={{ mixBlendMode: "plus-lighter" }}
+        >
           {t.app.brand}
-        </Typography>
+        </a>
       </header>
 
       {mobileOpen && (
@@ -575,11 +579,15 @@ export default function App() {
               >
                 <PluginSlot name="header-left" />
 
-                <Typography className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase">
+                <a
+                  href="https://chat.ethniceats.com"
+                  className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase no-underline"
+                  style={{ mixBlendMode: "plus-lighter" }}
+                >
                   Hermes
                   <br />
                   Agent
-                </Typography>
+                </a>
               </div>
 
               <Button
