@@ -145,6 +145,48 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
+          work_costing_lookup:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/work-costings/{wcNo}
+            path_params:
+            - wcNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          job_work_costings:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/work-costings
+            path_params:
+            - jobNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          work_costing_upsert:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/work-costings
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          work_costing_ingest_ilinked:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/work-costings/ingest-ilinked/{jobNo}
+            path_params:
+            - jobNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 20
           agent_config_read:
             type: http
             tenant: tgg

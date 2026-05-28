@@ -116,6 +116,11 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     prompt = "\n".join(brief.instructions)
 
     assert "operation case_search" in prompt
+    assert "receivedAgeLabel" in prompt
+    assert "General lists should stay case-shaped" in prompt
+    assert "job_work_costings" in prompt
+    assert "work_costing_lookup" in prompt
+    assert "work_costing_ingest_ilinked" in prompt
     assert "operator DB only" in prompt
     assert "iLinked is opt-in only" in prompt
     assert "Do not include Recommendations or Open Questions sections by default" in prompt

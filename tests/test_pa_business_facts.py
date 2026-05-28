@@ -120,8 +120,12 @@ def test_tgg_production_config_exposes_searchable_case_operations():
 
     assert "case_search" in bridge.operations
     assert "tgg_case_search" in bridge.operations
+    assert "job_work_costings" in bridge.operations
+    assert "work_costing_lookup" in bridge.operations
+    assert "work_costing_ingest_ilinked" in bridge.operations
     assert bridge.operations["case_search"].url.endswith("/api/operator/cases")
     assert bridge.operations["tgg_case_search"].method == "GET"
+    assert bridge.operations["job_work_costings"].url.endswith("/api/operator/cases/{jobNo}/work-costings")
 
 
 def test_ilinked_read_operations_require_explicit_current_user_cue():

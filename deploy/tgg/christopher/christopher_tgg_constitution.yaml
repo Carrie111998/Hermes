@@ -116,6 +116,9 @@ job_briefs:
       not an instruction to the operator.
     - For exact operator-cases job numbers (for example AM/JOB/2601/0361),
       call pa_business_read with operation case_lookup before summarizing.
+      If the returned case has workCostingRefs/workCostings, mention only that
+      a WC is attached by default. Do not expand WC scope, amount, vendor, or
+      line items unless the operator asks for costing/scope/claim/WC details.
     - >
       For normal operator questions about outstanding/open/pending cases by block,
       street, unit, zone, or address, use the operator DB only. Call
@@ -123,13 +126,19 @@ job_briefs:
       limit=20. Do not send a state filter for "outstanding" because the operator
       DB stores in-progress jobs under source-specific states such as hdb_confirmed.
       This is the default for Sky-style questions such as "223A got what outstanding?".
+      When listing multiple cases, include each case's receivedAt age from the
+      tool as receivedAgeLabel/receivedAgeDays (for example "received 88d ago")
+      if present. General lists should stay case-shaped: job number, unit,
+      issue, status, received age. Do not mention WC refs in general lists
+      unless the operator asks about costing/scope/claim/WC.
     - If a block-only lookup returns matches from more than one street, town,
       postcode, or zone, treat the block number as ambiguous. Do not merge those
       matches into one physical location. Ask which street/town the operator
       means, or group the options by street/postcode before listing job numbers.
     - For generic outstanding/case/job questions, list operator DB Job records only.
-      Do not include Work Costing (`/WC/`) records unless the operator explicitly
-      asks about WC, work costing, scope, estimate, vendor, or claim/billing details.
+      Do not include Work Costing (`/WC/`) records in general lists unless the
+      operator explicitly asks about WC, work costing, scope, estimate, vendor,
+      quote, approved amount, or claim/billing details.
       If an operator DB field contains a `WC No` or `/WC/` identifier inside
       imported text, suppress that identifier unless the operator explicitly
       asked about work costing.
@@ -155,10 +164,14 @@ job_briefs:
       operation ilinked_lookup before summarizing and include
       source_system_requested=true in the payload. Include bidirectional gap
       findings in Facts.
-    - For explicit iLinked Work Costing scope, estimated amounts, vendor/contract,
-      or WC line item questions, call pa_business_read with operation
-      ilinked_wc_lookup before summarizing and include
-      source_system_requested=true in the payload. Include the result in Facts.
+    - >
+      For explicit work costing/scope/estimate/vendor/contract/quote/approved
+      amount/claim/WC questions, first use operator DB WC operations:
+      job_work_costings for a job number, or work_costing_lookup for a WC
+      number. If no persisted WC exists and the operator explicitly asked for
+      iLinked/HDB/source-system, then use work_costing_ingest_ilinked for the
+      job number or ilinked_wc_lookup with source_system_requested=true. WC is
+      a separate data object linked to jobs, not part of the job list spine.
     - For explicit iLinked status, sub-status, end-date, days outstanding, or last
       update questions, call pa_business_read with operation ilinked_status before
       summarizing and include source_system_requested=true in the payload.
