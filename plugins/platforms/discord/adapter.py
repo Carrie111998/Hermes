@@ -2054,6 +2054,71 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a previously sent Discord message.
+
+        Used by the gateway's post-delivery cleanup path to remove transient
+        progress / status / "Still working…" bubbles after the final response
+        lands on this channel.
+
+        **Category filtering** — if ``cleanup_categories`` is configured in
+        this adapter's platform ``extra`` (e.g.
+        ``extra: {cleanup_categories: ["progress", "status"]}``), only
+        messages whose content matches one of the listed categories are
+        deleted.  ``"all"`` (default) deletes every tracked message ID.
+
+        Bots can only delete their own messages; permission errors and
+        missing messages are swallowed at debug level.
+        """
+        if not self._client:
+            return False
+
+        # --- category filtering ------------------------------------------------
+        _categories = self.config.extra.get("cleanup_categories", "all")
+        if _categories not in {"all", True}:
+            import re as _re  # noqa: F811  – local-only alias
+            _cat_patterns: dict[str, _re.Pattern | None] = {
+                "progress": _re.compile(r"🔍|⏳|Still working|Running\s+\w+", _re.IGNORECASE),
+                "status":   _re.compile(r"[⚠️❌✅🔄]|rate\s+limit|fallback|gateway\s+restart", _re.IGNORECASE),
+                "error":    _re.compile(r"❌|error|failed|timeout|unavailable", _re.IGNORECASE),
+            }
+            if isinstance(_categories, str):
+                _categories = [_categories]
+            try:
+                _channel = self._client.get_channel(int(chat_id))
+                if not _channel:
+                    _channel = await self._client.fetch_channel(int(chat_id))
+                _msg = await _channel.fetch_message(int(message_id))
+                _text = _msg.content or ""
+                _match_found = False
+                for _cat, _pat in _cat_patterns.items():
+                    if _cat in _categories and _pat and _pat.search(_text):
+                        _match_found = True
+                        break
+                if not _match_found:
+                    return False  # category filter says: keep this one
+            except Exception:
+                pass  # if fetch fails, fall through and attempt delete anyway
+        # ----------------------------------------------------------------------
+
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            msg = await channel.fetch_message(int(message_id))
+            await msg.delete()
+            logger.debug(
+                "[%s] Deleted message %s in channel %s",
+                self.name, message_id, chat_id,
+            )
+            return True
+        except Exception as e:  # pragma: no cover
+            logger.debug(
+                "[%s] Failed to delete message %s: %s",
+                self.name, message_id, e,
+            )
+            return False
+
     async def _send_file_attachment(
         self,
         chat_id: str,
