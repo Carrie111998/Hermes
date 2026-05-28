@@ -458,7 +458,15 @@ class TestScopedLocks:
             "kind": "hermes-gateway",
         }))
 
+        # The os.kill mock makes the POSIX existence probe (os.kill(pid, 0))
+        # report "alive". On Windows pid_exists() uses tasklist instead, which
+        # would report the fake PID 99999 as dead and let the lock be taken
+        # over — so also patch _pid_exists/pid_exists to treat 99999 as a live
+        # process on both platforms (mirrors
+        # test_acquire_scoped_lock_recheck_still_alive_returns_false below).
         monkeypatch.setattr(status.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "pid_exists", lambda pid: True)
         monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 123)
 
         acquired, existing = status.acquire_scoped_lock("telegram-bot-token", "secret", metadata={"platform": "telegram"})
