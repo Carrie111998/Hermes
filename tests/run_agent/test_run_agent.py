@@ -984,6 +984,83 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert MEMORY_GUIDANCE not in prompt
 
+    def test_pa_profile_suppresses_framework_identity_and_uses_pa_memory_guidance(self):
+        from agent.prompt_builder import MEMORY_GUIDANCE, PA_FACT_OPERATIONS_MEMORY_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "memory"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "agent": {
+                        "profile": "pa",
+                        "expose_framework_identity": "auto",
+                        "memory_guidance": "auto",
+                    },
+                    "memory": {},
+                    "skills": {},
+                    "compression": {},
+                },
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "hermes-agent.nousresearch.com" not in prompt
+        assert "If the user asks about configuring, setting up, or using Hermes Agent itself" not in prompt
+        assert MEMORY_GUIDANCE not in prompt
+        assert PA_FACT_OPERATIONS_MEMORY_GUIDANCE in prompt
+
+    def test_default_profile_keeps_framework_identity_and_default_memory_guidance(self):
+        from agent.prompt_builder import MEMORY_GUIDANCE, PA_FACT_OPERATIONS_MEMORY_GUIDANCE
+
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "memory"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "agent": {
+                        "profile": "",
+                        "expose_framework_identity": "auto",
+                        "memory_guidance": "auto",
+                    },
+                    "memory": {},
+                    "skills": {},
+                    "compression": {},
+                },
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+            prompt = agent._build_system_prompt()
+
+        assert "hermes-agent.nousresearch.com" in prompt
+        assert MEMORY_GUIDANCE in prompt
+        assert PA_FACT_OPERATIONS_MEMORY_GUIDANCE not in prompt
+
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
         # Should contain current date info like "Conversation started:"

@@ -148,6 +148,8 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     build_nous_subscription_prompt,
+    memory_guidance_for_agent_profile,
+    should_expose_framework_identity,
 )
 from agent.model_metadata import (
     fetch_model_metadata,
@@ -2104,6 +2106,8 @@ class AIAgent:
             _agent_section = {}
         self._self_improvement_notify_policy = resolve_self_improvement_notify_policy(_agent_cfg)
         self._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+        self._expose_framework_identity = should_expose_framework_identity(_agent_section)
+        self._memory_guidance_block = memory_guidance_for_agent_profile(_agent_section)
 
         # App-level API retry count (wraps each model API call).  Default 3,
         # overridable via agent.api_max_retries in config.yaml.  See #11616.
@@ -6048,12 +6052,15 @@ class AIAgent:
             stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
         # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
-        stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
+        # Client-deployed PA tenants hide framework identity by profile/config so the
+        # assistant leads with the tenant persona, not the Hermes developer product.
+        if self._expose_framework_identity:
+            stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
-        if "memory" in self.valid_tool_names:
-            tool_guidance.append(MEMORY_GUIDANCE)
+        if "memory" in self.valid_tool_names and self._memory_guidance_block:
+            tool_guidance.append(self._memory_guidance_block)
         if "session_search" in self.valid_tool_names:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:

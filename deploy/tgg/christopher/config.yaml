@@ -5,6 +5,8 @@ model:
   api_key_source:
     type: env
     secrets_env_key: GEMINI_API_KEY_PCL_PA_SHARED
+agent:
+  profile: pa
 pa:
   enabled: true
   constitution_path: /home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml

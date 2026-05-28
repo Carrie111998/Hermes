@@ -179,6 +179,30 @@
       "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/allowlist.test.mjs",
       "mode": "644",
       "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "run_agent.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/run_agent.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "agent/prompt_builder.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/agent/prompt_builder.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "hermes_cli/config.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/hermes_cli/config.py",
+      "mode": "644",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "deploy/tgg/christopher/SOUL.md",
+      "targetPath": "home/pclaw/.hermes-christopher-tgg-state/SOUL.md",
+      "mode": "600",
+      "owner": "pclaw:pclaw"
     }
   ],
   "requiredEnv": [
@@ -264,6 +288,10 @@
     {
       "name": "live-constitution-ilinked-reads",
       "command": "grep -q 'ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
+    },
+    {
+      "name": "pa-profile-system-prompt",
+      "command": "cd /home/pclaw/apps/hermes-pcl && HERMES_HOME=/home/pclaw/.hermes-christopher-tgg-state /home/pclaw/apps/hermes-pcl/.venv/bin/python - <<'PY2'\nfrom run_agent import AIAgent\nagent = AIAgent(\n    api_key='test-k...7890',\n    base_url='https://generativelanguage.googleapis.com/v1beta',\n    provider='gemini',\n    model='gemini-3.1-flash-lite',\n    quiet_mode=True,\n    skip_context_files=True,\n    load_soul_identity=True,\n    skip_memory=True,\n)\nagent.valid_tool_names.add('memory')\nprompt = agent._build_system_prompt()\nfor forbidden in (\n    'You are Hermes Agent',\n    'created by Nous Research',\n    'hermes-agent.nousresearch.com',\n    'If the user asks about configuring, setting up, or using Hermes Agent itself',\n    'Save durable facts using the memory tool: user preferences',\n    'use session_search to recall those from past transcripts',\n):\n    assert forbidden not in prompt, forbidden\nassert 'You are Christopher, the operations and management AI assistant for TGG' in prompt\nassert 'Papercut Agents operations assistant' in prompt\nPY2"
     }
   ],
   "runtimeOnlyDriftExclusions": [
