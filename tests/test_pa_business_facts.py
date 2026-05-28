@@ -119,16 +119,12 @@ def test_tgg_production_config_exposes_searchable_case_operations():
     bridge = load_business_bridge_config(config, pa_context=pa_context)
 
     assert "case_search" in bridge.operations
-    assert "case_count" in bridge.operations
     assert "tgg_case_search" in bridge.operations
-    assert "tgg_case_count" in bridge.operations
     assert "job_work_costings" in bridge.operations
     assert "work_costing_lookup" in bridge.operations
     assert "work_costing_ingest_ilinked" in bridge.operations
     assert bridge.operations["case_search"].url.endswith("/api/operator/cases")
-    assert bridge.operations["case_count"].url.endswith("/api/operator/cases/count")
     assert bridge.operations["tgg_case_search"].method == "GET"
-    assert bridge.operations["tgg_case_count"].method == "GET"
     assert bridge.operations["job_work_costings"].url.endswith("/api/operator/cases/{jobNo}/work-costings")
 
 

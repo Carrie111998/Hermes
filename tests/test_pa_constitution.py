@@ -141,8 +141,8 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert "Sprucing/EASE cases" in prompt
     assert "Do not interleave them" in prompt
     assert "serviceLine=maintenance or serviceLine=sprucing" in prompt
-    assert "operation case_count" in prompt
-    assert "Do NOT infer totals by counting case_search rows" in prompt
+    assert "resultServiceLineSplit" in prompt
+    assert "Do NOT infer totals by counting returned rows" in prompt
     assert "Run separate case_search calls" in prompt
     assert "Sort each section by receivedAgeDays descending" in prompt
     assert "syntheticJobNo=true" in prompt

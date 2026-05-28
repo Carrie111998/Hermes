@@ -63,15 +63,6 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
-          case_count:
-            type: http
-            tenant: tgg
-            method: GET
-            url: https://systems.papercut-labs.com/api/operator/cases/count
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
           case_update:
             type: http
             tenant: tgg
@@ -128,15 +119,6 @@ pa:
             tenant: tgg
             method: GET
             url: https://systems.papercut-labs.com/api/operator/cases
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
-          tgg_case_count:
-            type: http
-            tenant: tgg
-            method: GET
-            url: https://systems.papercut-labs.com/api/operator/cases/count
             headers:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1

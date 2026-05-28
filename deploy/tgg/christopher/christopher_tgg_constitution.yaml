@@ -132,10 +132,12 @@ job_briefs:
       issue, status, received age. Do not mention WC refs in general lists
       unless the operator asks about costing/scope/claim/WC.
       For exact count questions ("how many", "count only", "maint vs sprucing"),
-      call pa_business_read with operation case_count using the same search,
-      state, zone, serviceLine, and sourceStatus filters you would use for
-      case_search. Do NOT infer totals by counting case_search rows; case_search
-      is paginated and may be partial.
+      call pa_business_read with operation case_search using the same search,
+      state, zone, serviceLine, and sourceStatus filters you would normally use,
+      with a small limit such as 1. Answer counts from resultTotal,
+      resultServiceLineSplit, and resultStateSplit on the returned rows. Do NOT
+      infer totals by counting returned rows; case_search is paginated and may
+      be partial.
       Use serviceLine/serviceLineLabel from the tool when present. If a mixed
       result contains both Maintenance and Sprucing/EASE cases, you MUST group
       them under separate headings ("Maintenance cases" and "Sprucing/EASE
