@@ -158,7 +158,7 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert {"/new", "/reset", "/approve", "/always"}.issubset(
         set(brief.response_policy["slash_commands"])
     )
-    assert brief.response_policy["max_output_tokens"] == 64000
+    assert "max_output_tokens" not in brief.response_policy
 
 
 def test_tgg_production_management_selectors_include_live_wa_groups() -> None:

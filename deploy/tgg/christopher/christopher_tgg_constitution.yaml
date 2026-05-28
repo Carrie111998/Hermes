@@ -251,7 +251,6 @@ job_briefs:
       - /reset
       - /approve
       - /always
-      max_output_tokens: 64000
       compression:
         strategy: preserve-recent
         window_size: 20
