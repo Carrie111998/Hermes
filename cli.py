@@ -2546,9 +2546,9 @@ class HermesCLI:
     
     def __init__(
         self,
-        model: str = None,
-        toolsets: List[str] = None,
-        provider: str = None,
+        model: str | None = None,
+        toolsets: List[str] | None = None,
+        provider: str | None = None,
         api_key: str = None,
         base_url: str = None,
         max_turns: int = None,
