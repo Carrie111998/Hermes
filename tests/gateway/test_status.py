@@ -247,9 +247,100 @@ class TestGatewayPidState:
         monkeypatch.setattr(status.os, "kill", fake_kill)
 
         try:
-            assert status.get_running_pid() == os.getpid()
+            if status._IS_WINDOWS:
+                # On Windows the runtime lock keeps gateway.lock under a
+                # mandatory byte-range lock, so the live PID stored in the lock
+                # record is unreadable.  With gateway.pid intentionally stale (a
+                # dead PID), the live PID is unrecoverable, so get_running_pid
+                # reports None — rather than crashing (the pre-fix bug) or
+                # returning the dead PID.
+                assert status.get_running_pid() is None
+            else:
+                # POSIX uses an advisory lock, so the lock record stays readable
+                # and the live PID in it wins over the stale gateway.pid.
+                assert status.get_running_pid() == os.getpid()
         finally:
             status.release_gateway_runtime_lock()
+
+    def test_read_pid_record_treats_held_lock_as_locked_sentinel(self, tmp_path, monkeypatch):
+        """A lock/PID file that exists but raises PermissionError on read must
+        be reported as a {"locked": True} sentinel rather than propagating the
+        exception.
+
+        Regression for the Hermes Dashboard 500: while the gateway is running
+        it keeps gateway.lock open with a mandatory byte-range lock
+        (msvcrt.locking) on Windows, so read_text() over the locked region
+        raises PermissionError ([Errno 13]).
+        """
+        import pathlib
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        lock_path = tmp_path / status._GATEWAY_LOCK_FILENAME
+        lock_path.write_text("contents are unreadable while the lock is held")
+
+        real_read_text = pathlib.Path.read_text
+
+        def deny_locked_read(self, *args, **kwargs):
+            if self.name == status._GATEWAY_LOCK_FILENAME:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", deny_locked_read)
+
+        assert status._read_pid_record(lock_path) == {"locked": True}
+
+    def test_get_running_pid_survives_held_lock_without_os_kill(self, tmp_path, monkeypatch):
+        """Regression for the Hermes Dashboard 500 on /api/status.
+
+        With the gateway running, gateway.lock is held exclusively, so reading
+        it raises PermissionError.  get_running_pid must (1) not crash, (2)
+        treat the held lock as proof-of-life and return the PID from the
+        readable gateway.pid, and (3) MUST NOT probe liveness via os.kill —
+        Python routes os.kill through TerminateProcess / console-ctrl events on
+        Windows, so it can never be used as a liveness probe there (see
+        TestPidExists).
+        """
+        import pathlib
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        pid_path = tmp_path / "gateway.pid"
+        pid_path.write_text(json.dumps({
+            "pid": os.getpid(),
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 123,
+        }))
+        lock_path = tmp_path / status._GATEWAY_LOCK_FILENAME
+        lock_path.write_text("held by the live gateway — unreadable")
+
+        # The runtime lock is held by a live process.
+        monkeypatch.setattr(
+            status, "is_gateway_runtime_lock_active", lambda lock_path=None: True
+        )
+
+        # Reading the lock file raises PermissionError (Windows mandatory lock);
+        # the readable gateway.pid is unaffected.
+        real_read_text = pathlib.Path.read_text
+
+        def deny_locked_read(self, *args, **kwargs):
+            if self.name == status._GATEWAY_LOCK_FILENAME:
+                raise PermissionError(13, "Permission denied")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "read_text", deny_locked_read)
+
+        # gateway.pid names a live process.
+        monkeypatch.setattr(status, "pid_exists", lambda pid: True)
+
+        # Safety invariant: liveness must NOT be probed with os.kill on this path.
+        def forbidden_kill(*args, **kwargs):
+            raise AssertionError("os.kill must not be called on the held-lock path")
+
+        monkeypatch.setattr(status.os, "kill", forbidden_kill)
+
+        assert status.get_running_pid() == os.getpid()
+        # The PID file must survive — it must not be cleaned up as "stale".
+        assert pid_path.exists()
 
 
 class TestGatewayRuntimeStatus:

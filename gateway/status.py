@@ -247,7 +247,21 @@ def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:
     if not pid_path.exists():
         return None
 
-    raw = pid_path.read_text().strip()
+    try:
+        raw = pid_path.read_text().strip()
+    except PermissionError:
+        # The file exists but cannot be read because a live process holds it
+        # open with an exclusive / non-shareable lock.  On Windows the running
+        # gateway keeps gateway.lock locked via msvcrt.locking, so read_text()
+        # over the locked byte range raises PermissionError ([Errno 13]).  A
+        # lock we cannot read *because it is held* is positive proof the owning
+        # process is alive — surface that to callers as a sentinel instead of
+        # propagating the exception (regression: Hermes Dashboard /api/status
+        # returned HTTP 500, see get_running_pid()).
+        return {"locked": True}
+    except OSError:
+        # Any other read failure (transient FS error, etc.) — treat as absent.
+        return None
     if not raw:
         return None
 
@@ -852,6 +866,27 @@ def get_running_pid(
 
     primary_record = _read_pid_record(resolved_pid_path)
     fallback_record = _read_gateway_lock_record(resolved_lock_path)
+
+    # When the runtime lock is held by a live process that keeps the lock file
+    # exclusively locked (Windows msvcrt.locking), the lock record cannot be
+    # read and _read_pid_record returns the {"locked": True} sentinel.  We only
+    # reach this point with the runtime lock CONFIRMED active above, so an
+    # unreadable-because-locked lock file is itself proof the gateway is alive.
+    # Resolve the PID from the readable gateway.pid record and verify liveness
+    # with pid_exists() (tasklist on Windows) — never os.kill(), which Python
+    # routes through TerminateProcess / console-ctrl events on Windows and must
+    # not be used as a liveness probe there (see pid_exists()).  Returning here
+    # also keeps the Windows running-gateway path out of the os.kill()-based
+    # loop below entirely.
+    if isinstance(fallback_record, dict) and fallback_record.get("locked"):
+        pid = _pid_from_record(primary_record)
+        if pid is not None and pid_exists(pid):
+            return pid
+        # The lock is held (a gateway is alive) but gateway.pid does not name a
+        # live process and the real PID is unrecoverable from an unreadable
+        # lock.  Leave the PID file in place (the lock is active) and report an
+        # unknown PID rather than deleting a live gateway's metadata.
+        return None
 
     for record in (primary_record, fallback_record):
         pid = _pid_from_record(record)
