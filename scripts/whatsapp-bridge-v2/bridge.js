@@ -108,7 +108,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -116,7 +116,7 @@ function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
       timeoutMs,
     );
   });
-  return Promise.race([sock.sendMessage(chatId, payload), timeoutPromise])
+  return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
     .finally(() => clearTimeout(timer));
 }
 
@@ -340,7 +340,7 @@ function trackSentMessageId(sent) {
 
 function normalizeWhatsAppId(value) {
   if (!value) return '';
-  return String(value).replace(':', '@');
+  return String(value).trim().replace(/:.*@/, '@');
 }
 
 function normalizeParticipantJid(value) {
@@ -473,6 +473,23 @@ const MAX_QUEUE_SIZE = parseInt(
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
 const MAX_RECENT_IDS = 50;
+const recentInboundMessages = new Map();
+const MAX_RECENT_INBOUND_MESSAGES = parseInt(process.env.WHATSAPP_RECENT_INBOUND_MESSAGES || '500', 10);
+
+function rememberInboundMessage(msg) {
+  const messageId = msg?.key?.id;
+  if (!messageId || msg?.key?.fromMe) return;
+  recentInboundMessages.set(messageId, msg);
+  while (recentInboundMessages.size > MAX_RECENT_INBOUND_MESSAGES) {
+    recentInboundMessages.delete(recentInboundMessages.keys().next().value);
+  }
+}
+
+function sendOptionsForReplyTo(replyTo) {
+  if (!replyTo) return {};
+  const quoted = recentInboundMessages.get(String(replyTo));
+  return quoted ? { quoted } : {};
+}
 
 let sock = null;
 let connectionState = 'disconnected';
@@ -643,6 +660,7 @@ async function startSocket() {
       const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
       const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
       const hasQuotedMessage = !!contextInfo?.quotedMessage;
+      const quotedFromBot = quotedMessageId ? recentlySentIds.has(quotedMessageId) : false;
 
       // Extract message body
       let body = '';
@@ -764,6 +782,7 @@ async function startSocket() {
         quotedParticipant,
         quotedRemoteJid,
         hasQuotedMessage,
+        quotedFromBot,
     botIds,
     timestamp: msg.messageTimestamp,
     fromMe: !!msg.key.fromMe,
@@ -771,6 +790,7 @@ async function startSocket() {
     historySyncType: historyMeta.syncType || null,
         historyIsLatest: historyMeta.isLatest ?? null,
       };
+      rememberInboundMessage(msg);
 
       if (isHistory) {
         appendJsonLine(HISTORY_SYNC_PATH, event, 'history sync event');
@@ -896,7 +916,8 @@ app.post('/send', async (req, res) => {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
+      const options = i === 0 ? sendOptionsForReplyTo(replyTo) : {};
+      const sent = await sendWithTimeout(chatId, { text: chunks[i] }, options);
       trackSentMessageId(sent);
       if (sent?.key?.id) messageIds.push(sent.key.id);
       if (chunks.length > 1 && i < chunks.length - 1) {
@@ -974,7 +995,7 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  const { chatId, filePath, mediaType, caption, fileName, replyTo } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
   }
@@ -1036,7 +1057,7 @@ app.post('/send-media', async (req, res) => {
         break;
     }
 
-    const sent = await sendWithTimeout(chatId, msgPayload);
+    const sent = await sendWithTimeout(chatId, msgPayload, sendOptionsForReplyTo(replyTo));
 
     trackSentMessageId(sent);
 
