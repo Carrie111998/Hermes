@@ -315,6 +315,7 @@ class TestBridgeEventMetadata:
             "quotedParticipant": "99999999999@s.whatsapp.net",
             "quotedRemoteJid": "15551234567@s.whatsapp.net",
             "hasQuotedMessage": True,
+            "quotedText": "SK/JOB/2605/0068 latest: Pending Execution",
         }
 
         event = await adapter._build_message_event(data)
@@ -324,6 +325,9 @@ class TestBridgeEventMetadata:
         assert event.raw_message["quotedParticipant"] == "99999999999@s.whatsapp.net"
         assert event.raw_message["quotedRemoteJid"] == "15551234567@s.whatsapp.net"
         assert event.raw_message["hasQuotedMessage"] is True
+        assert event.reply_to_message_id == "outbound-msg"
+        assert "SK/JOB/2605/0068" in (event.reply_to_text or "")
+        assert "Quoted WhatsApp message case refs" in (event.reply_to_text or "")
 
 
 # ---------------------------------------------------------------------------

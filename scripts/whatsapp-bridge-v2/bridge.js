@@ -385,6 +385,23 @@ function getContextInfo(messageContent) {
   return {};
 }
 
+function textFromMessageContent(messageContent) {
+  if (!messageContent || typeof messageContent !== 'object') return '';
+  if (messageContent.conversation) return String(messageContent.conversation);
+  if (messageContent.extendedTextMessage?.text) return String(messageContent.extendedTextMessage.text);
+  if (messageContent.imageMessage?.caption) return String(messageContent.imageMessage.caption);
+  if (messageContent.videoMessage?.caption) return String(messageContent.videoMessage.caption);
+  if (messageContent.documentMessage?.caption) return String(messageContent.documentMessage.caption);
+  if (messageContent.documentWithCaptionMessage?.message) {
+    return textFromMessageContent(getMessageContent({ message: messageContent.documentWithCaptionMessage.message }));
+  }
+  if (messageContent.audioMessage || messageContent.pttMessage) return '[voice message]';
+  if (messageContent.imageMessage) return '[image]';
+  if (messageContent.videoMessage) return '[video]';
+  if (messageContent.documentMessage) return '[document]';
+  return '';
+}
+
 mkdirSync(SESSION_DIR, { recursive: true });
 
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
@@ -660,6 +677,9 @@ async function startSocket() {
       const quotedParticipant = normalizeWhatsAppId(contextInfo?.participant || '') || null;
       const quotedRemoteJid = normalizeWhatsAppId(contextInfo?.remoteJid || '') || null;
       const hasQuotedMessage = !!contextInfo?.quotedMessage;
+      const quotedText = hasQuotedMessage
+        ? textFromMessageContent(getMessageContent({ message: contextInfo.quotedMessage }))
+        : '';
       const quotedFromBot = quotedMessageId ? recentlySentIds.has(quotedMessageId) : false;
 
       // Extract message body
@@ -782,6 +802,7 @@ async function startSocket() {
         quotedParticipant,
         quotedRemoteJid,
         hasQuotedMessage,
+        quotedText,
         quotedFromBot,
     botIds,
     timestamp: msg.messageTimestamp,

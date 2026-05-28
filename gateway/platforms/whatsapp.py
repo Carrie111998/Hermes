@@ -460,6 +460,33 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 cleaned = re.sub(rf"@{re.escape(bare_id)}\b[,:\-]*\s*", "", cleaned)
         return cleaned.strip() or text
 
+    @staticmethod
+    def _extract_tgg_refs(text: str) -> list[str]:
+        if not text:
+            return []
+        refs = re.findall(
+            r"\b(?:[A-Z]{2}/(?:JOB|WC)/\d{4}/\d{4}|WA-ONLY-[A-Z0-9]+)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        seen: set[str] = set()
+        out: list[str] = []
+        for ref in refs:
+            normalized = ref.upper()
+            if normalized not in seen:
+                seen.add(normalized)
+                out.append(normalized)
+        return out
+
+    def _reply_context_text(self, data: Dict[str, Any]) -> str | None:
+        quoted_text = str(data.get("quotedText") or "").strip()
+        if not quoted_text:
+            return None
+        refs = self._extract_tgg_refs(quoted_text)
+        if refs:
+            return f"Quoted WhatsApp message case refs: {', '.join(refs)}\n{quoted_text}"
+        return quoted_text
+
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
         chat_id_raw = str(data.get("chatId") or "")
         # WhatsApp uses pseudo-chats for Status updates (Stories) and
@@ -1450,6 +1477,8 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 source=source,
                 raw_message=data,
                 message_id=data.get("messageId"),
+                reply_to_message_id=data.get("quotedMessageId"),
+                reply_to_text=self._reply_context_text(data),
                 media_urls=cached_urls,
                 media_types=media_types,
             )
