@@ -136,6 +136,11 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert "source_system_requested=true" in prompt
     assert "state the assumption before answering" in prompt
     assert "223A got what outstanding?" in prompt
+    assert "serviceLine/serviceLineLabel" in prompt
+    assert "Maintenance and Sprucing/EASE cases" in prompt
+    assert "serviceLine=maintenance or serviceLine=sprucing" in prompt
+    assert "Honor shortness signals" in prompt
+    assert "Response length should track the question's information need" in prompt
     assert "custom" in brief.enabled_toolsets
     assert "terminal" in brief.disabled_toolsets
     assert "shell" not in brief.disabled_toolsets
@@ -143,7 +148,7 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert {"/new", "/reset", "/approve", "/always"}.issubset(
         set(brief.response_policy["slash_commands"])
     )
-    assert brief.response_policy["max_output_tokens"] == 25000
+    assert brief.response_policy["max_output_tokens"] == 64000
 
 
 def test_tgg_production_management_selectors_include_live_wa_groups() -> None:
