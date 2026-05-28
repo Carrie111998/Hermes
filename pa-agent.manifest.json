@@ -211,16 +211,6 @@
       "postRestartHooks": []
     },
     {
-      "name": "christopher-tgg-whatsapp.service",
-      "preRestartHooks": [
-        {
-          "name": "install-v2-unit",
-          "command": "install -m 0644 /home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service /etc/systemd/system/christopher-tgg-whatsapp.service && systemctl daemon-reload"
-        }
-      ],
-      "postRestartHooks": []
-    },
-    {
       "name": "wa-pair-server.service",
       "preRestartHooks": [],
       "postRestartHooks": []
@@ -229,11 +219,7 @@
   "verifyHooks": [
     {
       "name": "systemd-active",
-      "command": "systemctl is-active --quiet christopher-tgg-hermes.service && systemctl is-active --quiet christopher-tgg-whatsapp.service && systemctl is-active --quiet wa-pair-server.service"
-    },
-    {
-      "name": "hermes-health",
-      "command": "curl -fsS http://127.0.0.1:3000/health >/tmp/christopher-hermes-health.json && python3 - <<'PY2'\nimport json\np=json.load(open('/tmp/christopher-hermes-health.json'))\nassert p.get('status') in ('ok','healthy','connected')\nPY2"
+      "command": "systemctl is-active --quiet christopher-tgg-hermes.service && systemctl is-active --quiet wa-pair-server.service"
     },
     {
       "name": "whatsapp-v2-health",
@@ -262,10 +248,6 @@
     {
       "name": "outbound-policy-check",
       "command": "python3 /home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py --management-chat 120363409954029949@g.us --management-chat 120363427363740087@g.us --management-chat 120363427897872447@g.us --management-chat 120363407433776639@g.us --management-chat 120363426509183563@g.us --management-chat 120363407903158826@g.us --ops-chat 120363403088884777@g.us --ops-chat 120363403845802098@g.us --ops-chat 120363405141229117@g.us --ops-chat 120363420803272720@g.us --ops-chat 120363421153247095@g.us --ops-chat 120363421424519051@g.us --ops-chat 120363422582425366@g.us --ops-chat 120363423535922556@g.us --ops-chat 120363423568509280@g.us --check-only"
-    },
-    {
-      "name": "v2-outbound-policy-env",
-      "command": "python3 /home/pclaw/apps/hermes-pcl/scripts/deploy/configure_christopher_outbound.py --management-chat 120363409954029949@g.us --management-chat 120363427363740087@g.us --management-chat 120363427897872447@g.us --management-chat 120363407433776639@g.us --management-chat 120363426509183563@g.us --management-chat 120363407903158826@g.us --ops-chat 120363403088884777@g.us --ops-chat 120363403845802098@g.us --ops-chat 120363405141229117@g.us --ops-chat 120363420803272720@g.us --ops-chat 120363421153247095@g.us --ops-chat 120363421424519051@g.us --ops-chat 120363422582425366@g.us --ops-chat 120363423535922556@g.us --ops-chat 120363423568509280@g.us --check-only --check-v2-service-env christopher-tgg-whatsapp.service"
     },
     {
       "name": "ilinked-reads-wc-smoke",
