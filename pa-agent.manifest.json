@@ -243,7 +243,7 @@
     },
     {
       "name": "live-constitution-custom-create",
-      "command": "grep -q 'operation case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -Eq '^[[:space:]]*- custom$' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
+      "command": "grep -q 'operation case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -Eq '^[[:space:]]*- custom$' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     },
     {
       "name": "outbound-policy-check",
@@ -263,7 +263,7 @@
     },
     {
       "name": "live-constitution-ilinked-reads",
-      "command": "grep -q 'operation ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
+      "command": "grep -q 'ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     }
   ],
   "runtimeOnlyDriftExclusions": [
