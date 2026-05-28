@@ -30,6 +30,15 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), [Open
 
 ## Quick Install
 
+### Home Assistant Add-on
+
+Hermes Agent can be installed as an official Home Assistant Add-on, providing seamless integration with your smart home and voice assistant.
+
+1. Add this repository to your Home Assistant instance: `https://github.com/thcuba/HAOS-hermes-agent`
+2. Install the **Hermes Agent** add-on from the Add-on Store.
+3. Configure your API keys in the add-on configuration tab.
+4. Start the add-on and access the dashboard via Ingress.
+
 ### Linux, macOS, WSL2, Termux
 
 ```bash
