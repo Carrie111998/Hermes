@@ -66,6 +66,38 @@ class _AsyncCM:
         return False
 
 
+class TestOutboundMediaPath:
+    """WhatsApp outbound media path resolution."""
+
+    def test_resolves_portal_media_alias_to_media_root(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._media_root = tmp_path / "media"
+        target = adapter._media_root / "backfill" / "case" / "photo.jpg"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"jpg")
+
+        resolved = adapter._resolve_outbound_media_path("/media/backfill/case/photo.jpg")
+
+        assert resolved == str(target)
+
+    def test_keeps_existing_local_path(self, tmp_path):
+        adapter = _make_adapter()
+        existing = tmp_path / "photo.jpg"
+        existing.write_bytes(b"jpg")
+
+        resolved = adapter._resolve_outbound_media_path(str(existing))
+
+        assert resolved == str(existing)
+
+    def test_keeps_missing_media_alias_when_unresolvable(self, tmp_path):
+        adapter = _make_adapter()
+        adapter._media_root = tmp_path / "media"
+
+        resolved = adapter._resolve_outbound_media_path("/media/missing/photo.jpg")
+
+        assert resolved == "/media/missing/photo.jpg"
+
+
 # ---------------------------------------------------------------------------
 # format_message tests
 # ---------------------------------------------------------------------------

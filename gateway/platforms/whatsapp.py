@@ -259,6 +259,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
             "session_path",
             get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")
         ))
+        self._media_root: Path = Path(
+            config.extra.get("media_root")
+            or os.getenv("WHATSAPP_MEDIA_ROOT", "/home/pclaw/.systems-pcl/data/media")
+        )
         self._reply_prefix: Optional[str] = config.extra.get("reply_prefix")
         self._dm_policy = str(config.extra.get("dm_policy") or os.getenv("WHATSAPP_DM_POLICY", "open")).strip().lower()
         self._allow_from = self._coerce_allow_list(config.extra.get("allow_from") or config.extra.get("allowFrom"))
@@ -328,6 +332,31 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _resolve_outbound_media_path(self, file_path: str) -> str:
+        """Resolve portal-style media aliases before sending native WhatsApp media."""
+        raw_path = os.path.expanduser(str(file_path or "").strip())
+        if not raw_path or os.path.exists(raw_path):
+            return raw_path
+
+        rel_path: Optional[str] = None
+        if raw_path.startswith("/media/"):
+            rel_path = raw_path.removeprefix("/media/")
+        elif raw_path.startswith("media/"):
+            rel_path = raw_path.removeprefix("media/")
+
+        if not rel_path:
+            return raw_path
+
+        media_root = getattr(
+            self,
+            "_media_root",
+            Path(os.getenv("WHATSAPP_MEDIA_ROOT", "/home/pclaw/.systems-pcl/data/media")),
+        )
+        resolved = Path(media_root) / rel_path
+        if resolved.exists():
+            return str(resolved)
+        return raw_path
 
     @staticmethod
     def _is_broadcast_chat(chat_id: str) -> bool:
@@ -1176,6 +1205,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         try:
             import aiohttp
 
+            file_path = self._resolve_outbound_media_path(file_path)
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=f"File not found: {file_path}")
 
