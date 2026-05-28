@@ -384,3 +384,26 @@ async def test_manager_provider_token_exchange_includes_dcr_secret(tmp_path, mon
 
     assert body["client_secret"] == ["secret"]
     assert provider.context.client_info.token_endpoint_auth_method == "client_secret_post"
+
+
+def test_manager_reuses_cached_dcr_redirect_port(tmp_path, monkeypatch):
+    """Manager provider path must reuse the redirect_uri registered by DCR."""
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    (token_dir / "supabase.client.json").write_text(json.dumps({
+        "client_id": "client-id",
+        "client_secret": "secret",
+        "redirect_uris": ["http://127.0.0.1:53902/callback"],
+        "token_endpoint_auth_method": "client_secret_post",
+    }))
+
+    mgr = MCPOAuthManager()
+    provider = mgr.get_or_build_provider("supabase", "https://mcp.supabase.com/mcp", None)
+
+    assert str(provider.context.client_metadata.redirect_uris[0]) == (
+        "http://127.0.0.1:53902/callback"
+    )

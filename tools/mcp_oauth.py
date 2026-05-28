@@ -766,7 +766,6 @@ class HermesOAuthClientProvider(OAuthClientProvider):
         await self.context.storage.set_tokens(token_response)
         return True
 
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -807,6 +806,41 @@ def _configure_callback_port(cfg: dict) -> int:
     cfg["_resolved_port"] = port
     _oauth_port = port  # legacy consumer: _wait_for_callback reads this
     return port
+
+
+def _reuse_stored_redirect_port(storage: "HermesTokenStorage", cfg: dict) -> None:
+    """Reuse the redirect port registered for a cached DCR client.
+
+    Dynamic client registration binds the generated client_id to the redirect
+    URI used at registration time. If a later process restart picks a fresh
+    random port, providers such as Supabase reject authorization before token
+    exchange with ``redirect_uri not allowed``.
+    """
+    configured = cfg.get("redirect_port")
+    if configured not in (None, 0, "0", ""):
+        return
+
+    try:
+        data = _read_json(storage._client_info_path())
+    except (AttributeError, TypeError):
+        return
+    if not isinstance(data, dict):
+        return
+
+    for redirect_uri in data.get("redirect_uris") or []:
+        try:
+            parsed = urlparse(str(redirect_uri))
+        except (TypeError, ValueError):
+            continue
+        if parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
+            continue
+        cfg["redirect_port"] = parsed.port
+        logger.debug(
+            "MCP OAuth for '%s': reusing cached redirect port %s",
+            storage._server_name,
+            parsed.port,
+        )
+        return
 
 
 def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
@@ -910,6 +944,7 @@ def build_oauth_auth(
             "initial authorization, then cached tokens will be reused."
         )
 
+    _reuse_stored_redirect_port(storage, cfg)
     _configure_callback_port(cfg)
     client_metadata = _build_client_metadata(cfg)
     _maybe_preregister_client(storage, cfg, client_metadata)

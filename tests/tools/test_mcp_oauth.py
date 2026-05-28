@@ -298,6 +298,23 @@ class TestBuildOAuthAuth:
         assert token_path.exists()
         assert json.loads(token_path.read_text())["access_token"] == "access-token"
 
+    def test_cached_dcr_client_reuses_registered_redirect_port(self, tmp_path, monkeypatch):
+        """Cached DCR clients must keep the registered redirect_uri port."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        token_dir = tmp_path / "mcp-tokens"
+        token_dir.mkdir(parents=True)
+        (token_dir / "supabase.client.json").write_text(json.dumps({
+            "client_id": "client-id",
+            "client_secret": "secret",
+            "redirect_uris": ["http://127.0.0.1:53902/callback"],
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+
+        provider = build_oauth_auth("supabase", "https://mcp.supabase.com/mcp")
+
+        assert str(provider.context.client_metadata.redirect_uris[0]) == (
+            "http://127.0.0.1:53902/callback"
+        )
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -728,6 +745,23 @@ def test_configure_callback_port_uses_explicit_port():
     assert cfg["_resolved_port"] == 54321
 
 
+def test_reuse_stored_redirect_port_preserves_explicit_config(tmp_path, monkeypatch):
+    from tools.mcp_oauth import HermesTokenStorage, _reuse_stored_redirect_port
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    token_dir = tmp_path / "mcp-tokens"
+    token_dir.mkdir(parents=True)
+    (token_dir / "supabase.client.json").write_text(json.dumps({
+        "client_id": "client-id",
+        "redirect_uris": ["http://127.0.0.1:53902/callback"],
+    }))
+
+    cfg = {"redirect_port": 54321}
+    _reuse_stored_redirect_port(HermesTokenStorage("supabase"), cfg)
+
+    assert cfg["redirect_port"] == 54321
+
+
 def test_build_oauth_auth_preserves_server_url_path():
     """server_url with path is forwarded to OAuthClientProvider unmodified.
 
@@ -759,8 +793,6 @@ def test_build_oauth_auth_preserves_server_url_path():
         )
 
     assert captured["server_url"] == "https://mcp.notion.com/mcp"
-
-
 
 class TestPasteCallbackReader:
     """_paste_callback_reader parses redirect URLs / query strings from stdin."""
