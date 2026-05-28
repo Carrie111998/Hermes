@@ -132,11 +132,15 @@ job_briefs:
       issue, status, received age. Do not mention WC refs in general lists
       unless the operator asks about costing/scope/claim/WC.
       Use serviceLine/serviceLineLabel from the tool when present. If a mixed
-      result contains both Maintenance and Sprucing/EASE cases, separate the
-      answer under those two headings instead of merging them into one list.
+      result contains both Maintenance and Sprucing/EASE cases, you MUST group
+      them under separate headings ("Maintenance cases" and "Sprucing/EASE
+      cases"). Do not interleave them in one numbered list with parenthetical
+      service labels.
       If the operator asks "maintenance only" or "sprucing only", pass
       serviceLine=maintenance or serviceLine=sprucing in the case_search
       payload.
+      For oldest/long-outstanding lists, sort by receivedAgeDays descending
+      before summarizing.
     - If a block-only lookup returns matches from more than one street, town,
       postcode, or zone, treat the block number as ambiguous. Do not merge those
       matches into one physical location. Ask which street/town the operator

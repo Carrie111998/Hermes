@@ -137,8 +137,11 @@ def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
     assert "state the assumption before answering" in prompt
     assert "223A got what outstanding?" in prompt
     assert "serviceLine/serviceLineLabel" in prompt
-    assert "Maintenance and Sprucing/EASE cases" in prompt
+    assert "Maintenance cases" in prompt
+    assert "Sprucing/EASE cases" in prompt
+    assert "Do not interleave them" in prompt
     assert "serviceLine=maintenance or serviceLine=sprucing" in prompt
+    assert "sort by receivedAgeDays descending" in prompt
     assert "Honor shortness signals" in prompt
     assert "Response length should track the question's information need" in prompt
     assert "custom" in brief.enabled_toolsets
