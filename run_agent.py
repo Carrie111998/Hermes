@@ -10942,6 +10942,7 @@ class AIAgent:
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
+                user_task=getattr(self, "_current_user_task", None),
                 tool_call_id=tool_call_id,
                 session_id=self.session_id or "",
                 enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
@@ -11659,6 +11660,7 @@ class AIAgent:
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
+                        user_task=getattr(self, "_current_user_task", None),
                         tool_call_id=tool_call.id,
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
@@ -11679,6 +11681,7 @@ class AIAgent:
                 try:
                     function_result = handle_function_call(
                         function_name, function_args, effective_task_id,
+                        user_task=getattr(self, "_current_user_task", None),
                         tool_call_id=tool_call.id,
                         session_id=self.session_id or "",
                         enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
@@ -12234,6 +12237,7 @@ class AIAgent:
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
+        self._current_user_task = original_user_message
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on

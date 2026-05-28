@@ -3,14 +3,22 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from tools.pa_business_tools import (
     TenantScopeMismatch,
     execute_business_operation,
     load_business_bridge_config,
     record_agent_action,
+    _user_task_allows_ilinked,
+)
+
+
+TGG_PRODUCTION_CONFIG = (
+    Path(__file__).parents[1] / "deploy" / "tgg" / "christopher" / "config.yaml"
 )
 
 
@@ -101,6 +109,38 @@ def test_local_command_operation_returns_json():
     result = execute_business_operation(config, "local_echo", {"amount": 42})
 
     assert result == {"ok": True, "payload": {"amount": 42}}
+
+
+def test_tgg_production_config_exposes_searchable_case_operations():
+    config = yaml.safe_load(TGG_PRODUCTION_CONFIG.read_text(encoding="utf-8"))
+    pa_context = SimpleNamespace(
+        constitution=SimpleNamespace(client=config["pa"]["overlay"]["client"])
+    )
+    bridge = load_business_bridge_config(config, pa_context=pa_context)
+
+    assert "case_search" in bridge.operations
+    assert "tgg_case_search" in bridge.operations
+    assert bridge.operations["case_search"].url.endswith("/api/operator/cases")
+    assert bridge.operations["tgg_case_search"].method == "GET"
+
+
+def test_ilinked_read_operations_require_explicit_current_user_cue():
+    assert _user_task_allows_ilinked("case_lookup", "latest note for 0182")
+    assert not _user_task_allows_ilinked("ilinked_status", "latest note for 0182")
+    assert not _user_task_allows_ilinked("ilinked_lookup", "223A outstanding")
+    assert _user_task_allows_ilinked(
+        "ilinked_status",
+        "",
+        {"jobNo": "SK/JOB/2604/0360", "source_system_requested": True},
+    )
+    assert not _user_task_allows_ilinked(
+        "ilinked_status",
+        "latest note for 0182",
+        {"jobNo": "PG/JOB/2605/0182", "source_system_requested": True},
+    )
+    assert _user_task_allows_ilinked("ilinked_status", "check iLinked for SK/JOB/2604/0360")
+    assert _user_task_allows_ilinked("ilinked_status", "HDB status for SK/JOB/2604/0360")
+    assert _user_task_allows_ilinked("ilinked_wc_lookup", "work costing scope for 0360")
 
 
 def test_tgg_ilinked_lookup_adapter_reads_corpus_exact_job(monkeypatch, tmp_path):

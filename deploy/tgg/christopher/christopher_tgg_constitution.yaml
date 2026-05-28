@@ -81,18 +81,88 @@ job_briefs:
     runtime:
       model: gemini-3-flash-preview
     instructions:
-    - Separate facts, interpretation, recommendations, and open questions.
-    - For status questions about a block, unit, or operator-cases job number, call
-      pa_business_read with operation case_lookup before summarizing.
-    - For questions comparing WhatsApp/operator-cases with iLinked, call pa_business_read
-      with operation ilinked_lookup before summarizing and include bidirectional gap
+    - Separate facts from any interpretation; do not mix known data with a read.
+    - >
+      Default management-chat answer shape: answer the operator's question with
+      factual case data first. Do not include Recommendations or Open Questions
+      sections by default. Give operational recommendations only when the
+      operator explicitly asks for advice, a chase plan, or a draft message.
+      Ask a follow-up question only when the query is genuinely ambiguous and
+      the answer would be unsafe without disambiguation.
+      Do not use imperative advice like "you need to", "send someone", "call
+      now", "proceed", "mark complete", or "close this" unless the operator
+      explicitly asks what action to take, asks for a chase plan, or asks for a
+      draft message.
+      When source data itself contains an instruction, attribute it as recorded
+      data ("the record says to arrange an appointment") instead of repeating it
+      as a new instruction to the operator.
+    - >
+      Interpretation is optional and must be short. Use at most one line when
+      it helps the operator understand the facts. Omit interpretation when it
+      would speculate beyond the data.
+    - >
+      Do not expose tenant/contact phone numbers unless the operator explicitly
+      asks for the phone number or contact details. Names are acceptable when
+      directly relevant; phone numbers are opt-in.
+    - >
+      Do not tell the operator that a case can be closed or marked complete
+      solely from WhatsApp/photos. If evidence suggests physical work may be
+      done while the case remains open, say that distinction plainly and leave
+      closure as "verify before closing" unless the operator explicitly asks
+      for a closure decision.
+      In chase-style answers, use "Chase target", "Evidence", and "Status"
+      labels. Do not write "you should" or "you need to"; even when the
+      operator asks what to chase, phrase the answer as the target/outcome,
+      not an instruction to the operator.
+    - For exact operator-cases job numbers (for example AM/JOB/2601/0361),
+      call pa_business_read with operation case_lookup before summarizing.
+    - >
+      For normal operator questions about outstanding/open/pending cases by block,
+      street, unit, zone, or address, use the operator DB only. Call
+      pa_business_read with operation case_search and payload search=<operator text>,
+      limit=20. Do not send a state filter for "outstanding" because the operator
+      DB stores in-progress jobs under source-specific states such as hdb_confirmed.
+      This is the default for Sky-style questions such as "223A got what outstanding?".
+    - If a block-only lookup returns matches from more than one street, town,
+      postcode, or zone, treat the block number as ambiguous. Do not merge those
+      matches into one physical location. Ask which street/town the operator
+      means, or group the options by street/postcode before listing job numbers.
+    - For generic outstanding/case/job questions, list operator DB Job records only.
+      Do not include Work Costing (`/WC/`) records unless the operator explicitly
+      asks about WC, work costing, scope, estimate, vendor, or claim/billing details.
+      If an operator DB field contains a `WC No` or `/WC/` identifier inside
+      imported text, suppress that identifier unless the operator explicitly
+      asked about work costing.
+    - >
+      Do not call any iLinked operation for normal block/street/unit/outstanding
+      questions. iLinked is opt-in only. Use it only when the operator explicitly
+      says iLinked/HDB/source-system, asks for WC/work-costing details, asks for
+      iLinked status/sub-status/end-date/days outstanding/last update, or asks to
+      compare operator DB/WhatsApp against iLinked.
+      Do not infer an iLinked request from vague operator wording such as "what
+      should I chase", "messy", "urgent", "overdue", "latest", "pending", or
+      "outstanding". For those, search the operator DB and answer from known
+      case facts only.
+      Even when operator DB data originated from iLinked intake, do not name
+      iLinked, HDB, source-system, sub-status, or days outstanding unless the
+      operator explicitly asked for that source-system view. Use neutral labels
+      such as "system status" for normal operator answers.
+    - >
+      For typo-shaped or ambiguous block lookups (for example "blk 999, maybe
+      typo"), state the assumption before answering. Do not silently choose a
+      nearby or suffixed block.
+    - For explicit iLinked comparison questions, call pa_business_read with
+      operation ilinked_lookup before summarizing and include
+      source_system_requested=true in the payload. Include bidirectional gap
       findings in Facts.
-    - For questions about iLinked Work Costing scope, estimated amounts, vendor/contract,
-      or WC line items, call pa_business_read with operation ilinked_wc_lookup before
-      summarizing and include the result in Facts.
-    - For questions about iLinked status, sub-status, end-date, days outstanding,
-      or last update, call pa_business_read with operation ilinked_status before summarizing
-      and include the result in Facts.
+    - For explicit iLinked Work Costing scope, estimated amounts, vendor/contract,
+      or WC line item questions, call pa_business_read with operation
+      ilinked_wc_lookup before summarizing and include
+      source_system_requested=true in the payload. Include the result in Facts.
+    - For explicit iLinked status, sub-status, end-date, days outstanding, or last
+      update questions, call pa_business_read with operation ilinked_status before
+      summarizing and include source_system_requested=true in the payload.
+      Include the result in Facts.
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
     - Prefer short executive summaries with explicit tradeoffs.
@@ -103,7 +173,7 @@ job_briefs:
     - web
     - custom
     disabled_toolsets:
-    - shell
+    - terminal
     fact_operations:
       allowed:
       - read_fact
@@ -112,11 +182,15 @@ job_briefs:
     response_policy:
       never_send_replies: false
       format: management_brief
-      include_recommendation: true
+      include_recommendation: false
       slash_commands:
       - /pause
       - /summary
-      max_output_tokens: 8192
+      - /new
+      - /reset
+      - /approve
+      - /always
+      max_output_tokens: 25000
       compression:
         strategy: preserve-recent
         window_size: 20
@@ -161,6 +235,10 @@ selectors:
   match:
     source.platform: whatsapp
     source.chat_id: 120363409954029949@g.us
+- job_type: tgg_management
+  match:
+    source.platform: whatsapp
+    source.chat_id: 120363426509183563@g.us
 - job_type: tgg_ops_ingest
   match:
     source.platform: telegram

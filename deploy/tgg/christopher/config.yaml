@@ -13,7 +13,7 @@ pa:
       display_name: Christopher
       voice_register: terse operations concierge
       greeting_style: short, direct, work-first
-      signature: Christopher
+      signature: ''
       refer_to_self: Christopher
     client:
       id: tgg
@@ -46,6 +46,15 @@ pa:
               User-Agent: curl/8.7.1
             timeout: 10
           case_list:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/cases
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          case_search:
             type: http
             tenant: tgg
             method: GET
@@ -97,6 +106,15 @@ pa:
               User-Agent: curl/8.7.1
             timeout: 10
           tgg_case_list:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/cases
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_case_search:
             type: http
             tenant: tgg
             method: GET
@@ -176,21 +194,42 @@ pa:
 platforms:
   whatsapp:
     enabled: true
+    gateway_restart_notification: false
     extra:
-      bridge_port: 3000
-      bridge_script: /home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/bridge.js
-      session_path: /home/pclaw/.hermes-christopher-tgg/whatsapp/session
-      require_mention: false
-      dm_policy: open
+      bridge_port: 3001
+      bridge_script: /home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/bridge.js
+      session_path: /home/pclaw/.hermes-christopher-tgg/whatsapp-v2/session
+      require_mention: true
+      dm_policy: allowlist
+      allow_from:
+      - 6591455515
+      - 188690831777827
+      - 6596515711
+      - 6594564662
+      - 6580913349
+      - 244809512038554
       group_policy: open
       outbound_allowed_chats:
       - 120363409954029949@g.us
+      - 120363427363740087@g.us
+      - 120363407433776639@g.us
+      - 120363426509183563@g.us
 whatsapp:
-  require_mention: false
-  dm_policy: open
+  require_mention: true
+  dm_policy: allowlist
+  allow_from:
+  - 6591455515
+  - 188690831777827
+  - 6596515711
+  - 6594564662
+  - 6580913349
+  - 244809512038554
   group_policy: open
   outbound_allowed_chats:
   - 120363409954029949@g.us
+  - 120363427363740087@g.us
+  - 120363407433776639@g.us
+  - 120363426509183563@g.us
 onboarding:
   seen:
     busy_input_prompt: true

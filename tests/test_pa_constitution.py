@@ -16,6 +16,13 @@ from agent.pa_constitution import (
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "pa" / "bobby_tgg_constitution.yaml"
+TGG_PRODUCTION_CONSTITUTION = (
+    Path(__file__).parents[1]
+    / "deploy"
+    / "tgg"
+    / "christopher"
+    / "christopher_tgg_constitution.yaml"
+)
 
 
 def test_fixture_loads() -> None:
@@ -101,6 +108,55 @@ def test_ops_and_management_render_different_job_prompts() -> None:
     assert "create_fact" in ops_prompt
     assert "TGG Management Brief" in management_prompt
     assert "management_brief" in management_prompt
+
+
+def test_tgg_management_defaults_to_operator_db_before_ilinked() -> None:
+    constitution = load_constitution(TGG_PRODUCTION_CONSTITUTION)
+    brief = constitution.job_briefs["tgg_management"]
+    prompt = "\n".join(brief.instructions)
+
+    assert "operation case_search" in prompt
+    assert "operator DB only" in prompt
+    assert "iLinked is opt-in only" in prompt
+    assert "Do not include Recommendations or Open Questions sections by default" in prompt
+    assert "Do not use imperative advice" in prompt
+    assert "attribute it as recorded data" in prompt
+    assert "Do not expose tenant/contact phone numbers" in prompt
+    assert "Do not tell the operator that a case can be closed" in prompt
+    assert "use \"Chase target\", \"Evidence\", and \"Status\"" in prompt
+    assert "Do not write \"you should\" or \"you need to\"" in prompt
+    assert "suppress that identifier" in prompt
+    assert "Do not infer an iLinked request from vague operator wording" in prompt
+    assert "Use neutral labels such as \"system status\"" in prompt
+    assert "source_system_requested=true" in prompt
+    assert "state the assumption before answering" in prompt
+    assert "223A got what outstanding?" in prompt
+    assert "custom" in brief.enabled_toolsets
+    assert "terminal" in brief.disabled_toolsets
+    assert "shell" not in brief.disabled_toolsets
+    assert brief.response_policy["include_recommendation"] is False
+    assert {"/new", "/reset", "/approve", "/always"}.issubset(
+        set(brief.response_policy["slash_commands"])
+    )
+    assert brief.response_policy["max_output_tokens"] == 25000
+
+
+def test_tgg_production_management_selectors_include_live_wa_groups() -> None:
+    constitution = load_constitution(TGG_PRODUCTION_CONSTITUTION)
+
+    legacy_management = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "whatsapp", "chat_id": "120363409954029949@g.us"}},
+    )
+    live_test_management = resolve_context(
+        {"constitution": constitution},
+        {"source": {"platform": "whatsapp", "chat_id": "120363426509183563@g.us"}},
+    )
+
+    assert legacy_management is not None
+    assert legacy_management.job_type == "tgg_management"
+    assert live_test_management is not None
+    assert live_test_management.job_type == "tgg_management"
 
 
 def test_selector_resolves_tgg_ops_ingest_vs_tgg_management_from_metadata() -> None:
