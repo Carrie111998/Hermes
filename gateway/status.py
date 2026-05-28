@@ -893,21 +893,31 @@ def get_running_pid(
         if pid is None:
             continue
 
-        try:
-            os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            # The process exists but belongs to another user/service scope.
-            # With the runtime lock still held, prefer keeping it visible
-            # rather than deleting the PID file as "stale".
-            if _record_looks_like_gateway(record):
-                return pid
-            continue
-        except OSError:
-            # Windows raises OSError with WinError 87 for an invalid pid
-            # (process is definitely gone). Treat as "process doesn't exist".
-            continue
+        if _IS_WINDOWS:
+            # NEVER probe liveness with os.kill on Windows.  CPython routes
+            # os.kill(pid, 0) through GenerateConsoleCtrlEvent (signal 0 ==
+            # CTRL_C_EVENT) / TerminateProcess, so it is unreliable as an
+            # existence check and can kill the target (see pid_exists() and
+            # TestPidExists).  Use pid_exists() (tasklist) instead; a dead PID
+            # is skipped just like the POSIX ProcessLookupError branch below.
+            if not pid_exists(pid):
+                continue
+        else:
+            try:
+                os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                # The process exists but belongs to another user/service scope.
+                # With the runtime lock still held, prefer keeping it visible
+                # rather than deleting the PID file as "stale".
+                if _record_looks_like_gateway(record):
+                    return pid
+                continue
+            except OSError:
+                # A non-ESRCH/EPERM OSError (e.g. an invalid pid) means the
+                # process is gone. Treat as "process doesn't exist".
+                continue
 
         recorded_start = record.get("start_time")
         current_start = _get_process_start_time(pid)

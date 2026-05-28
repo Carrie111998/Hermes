@@ -342,6 +342,128 @@ class TestGatewayPidState:
         # The PID file must survive — it must not be cleaned up as "stale".
         assert pid_path.exists()
 
+    def test_get_running_pid_loop_uses_pid_exists_not_os_kill_on_windows(self, tmp_path, monkeypatch):
+        """The liveness loop must probe via pid_exists() (tasklist) on Windows,
+        never os.kill().
+
+        This is the *edge* path the 2026-05-28 held-lock early return does not
+        cover: the runtime lock is active and its record is readable (not the
+        {"locked": True} sentinel), so execution reaches the
+        ``for record in (primary_record, fallback_record)`` loop with a stale
+        gateway.pid on disk.  CPython routes os.kill(pid, 0) through
+        GenerateConsoleCtrlEvent / TerminateProcess on Windows (signal 0 ==
+        CTRL_C_EVENT), so it can never be used as an existence probe there
+        (see TestPidExists).  The loop must resolve liveness with pid_exists().
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+
+        pid_path = tmp_path / "gateway.pid"
+        # A PID that real os.kill()/tasklist would report dead — only the
+        # patched pid_exists() decides liveness, proving the probe path is used.
+        pid_path.write_text(json.dumps({
+            "pid": 99999,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 123,
+        }))
+
+        # Runtime lock is held by a live gateway, but the lock record is
+        # readable (no locked sentinel) → execution falls through to the loop.
+        monkeypatch.setattr(
+            status, "is_gateway_runtime_lock_active", lambda lock_path=None: True
+        )
+        # Windows has no /proc, so start_time + cmdline come back empty and the
+        # gateway identity is established from the PID-file metadata.
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda pid: None)
+
+        probed = []
+        monkeypatch.setattr(status, "pid_exists", lambda pid: probed.append(pid) or True)
+
+        def forbidden_kill(*args, **kwargs):
+            raise AssertionError("os.kill must not be called on the Windows path")
+
+        monkeypatch.setattr(status.os, "kill", forbidden_kill)
+
+        assert status.get_running_pid() == 99999
+        # Liveness was probed via pid_exists(), not os.kill().
+        assert 99999 in probed
+        assert pid_path.exists()
+
+    def test_get_running_pid_loop_treats_dead_pid_via_pid_exists_on_windows(self, tmp_path, monkeypatch):
+        """On Windows, when pid_exists() reports the PID dead, the loop must skip
+        it (without ever calling os.kill) and clean up the stale metadata."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+
+        pid_path = tmp_path / "gateway.pid"
+        pid_path.write_text(json.dumps({
+            "pid": 99999,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 123,
+        }))
+
+        monkeypatch.setattr(
+            status, "is_gateway_runtime_lock_active", lambda lock_path=None: True
+        )
+
+        probed = []
+        monkeypatch.setattr(status, "pid_exists", lambda pid: probed.append(pid) or False)
+
+        def forbidden_kill(*args, **kwargs):
+            raise AssertionError("os.kill must not be called on the Windows path")
+
+        monkeypatch.setattr(status.os, "kill", forbidden_kill)
+
+        assert status.get_running_pid() is None
+        # The dead-PID verdict came from pid_exists(), not os.kill().
+        assert 99999 in probed
+        # Stale metadata is cleaned up.
+        assert not pid_path.exists()
+
+    def test_get_running_pid_loop_preserves_os_kill_eperm_semantics_on_posix(self, tmp_path, monkeypatch):
+        """POSIX semantics are preserved after gating the probe behind
+        ``if _IS_WINDOWS: ... else:``.
+
+        On POSIX the loop must keep using os.kill(pid, 0), and a live-but-foreign
+        gateway (os.kill raises EPERM/PermissionError) must still be reported so
+        it stays visible rather than being cleaned up as "stale".  The Windows
+        tasklist probe (pid_exists) must NOT be used on POSIX.  This runs
+        deterministically on any host by patching _IS_WINDOWS=False.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
+
+        pid_path = tmp_path / "gateway.pid"
+        pid_path.write_text(json.dumps({
+            "pid": 99999,
+            "kind": "hermes-gateway",
+            "argv": ["python", "-m", "hermes_cli.main", "gateway"],
+            "start_time": 123,
+        }))
+
+        monkeypatch.setattr(
+            status, "is_gateway_runtime_lock_active", lambda lock_path=None: True
+        )
+
+        # EPERM ⇒ the process is alive but owned by another scope; a
+        # gateway-looking record must be reported (kept visible).
+        def eperm_kill(pid, sig):
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(status.os, "kill", eperm_kill)
+
+        # The Windows tasklist probe must not be the POSIX liveness path.
+        def forbidden_pid_exists(*args, **kwargs):
+            raise AssertionError("pid_exists() must not be the POSIX liveness probe")
+
+        monkeypatch.setattr(status, "pid_exists", forbidden_pid_exists)
+
+        assert status.get_running_pid() == 99999
+        assert pid_path.exists()
+
 
 class TestGatewayRuntimeStatus:
     def test_write_runtime_status_overwrites_stale_pid_on_restart(self, tmp_path, monkeypatch):
