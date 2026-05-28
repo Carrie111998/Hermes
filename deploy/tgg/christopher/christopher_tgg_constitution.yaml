@@ -2,7 +2,7 @@ id: bobby_tgg
 agent_name: Christopher
 runtime:
   provider: gemini
-  model: gemini-3-flash-preview
+  model: gemini-3.1-flash-lite
 identity:
   role: Personal assistant for TGG operations and management workflows
   tone: concise, careful, and action-oriented
@@ -79,7 +79,7 @@ job_briefs:
     title: TGG Management Brief
     purpose: Prepare decision-oriented management summaries from known facts.
     runtime:
-      model: gemini-3-flash-preview
+      model: gemini-3.1-flash-lite
     instructions:
     - Separate facts from any interpretation; do not mix known data with a read.
     - >
