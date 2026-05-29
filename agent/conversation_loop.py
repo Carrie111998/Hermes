@@ -3107,6 +3107,24 @@ def run_conversation(
                             f"❌ Non-retryable error (HTTP {status_code}): "
                             f"{agent._summarize_api_error(api_error)}"
                         )
+                    # SR-471 (ADR-0024 §3): the alert half. Emit a loud
+                    # AGENT_LOOP_FAULT bus event for this non-retryable abort,
+                    # IGNORING the non-retryable classification — silence is the
+                    # R57 bug. Best-effort; the helper never raises. Re-wired here
+                    # after the v0.15.x run_agent monolith→module extraction
+                    # dropped the original emit from the loop.
+                    try:
+                        from events.loop_fault import emit_agent_loop_fault
+                        emit_agent_loop_fault(
+                            api_error,
+                            source_hint=getattr(agent, "log_prefix", "") or "",
+                            phase="non_retryable_abort",
+                            provider=_provider,
+                            model=_model,
+                            status_code=status_code,
+                        )
+                    except Exception:
+                        logger.debug("AGENT_LOOP_FAULT emit skipped", exc_info=True)
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
                     agent._vprint(f"{agent.log_prefix}   🌐 Endpoint: {_base}", force=True)

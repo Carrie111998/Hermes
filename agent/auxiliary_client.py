@@ -1911,14 +1911,14 @@ def build_codex_probe_client() -> "Optional[Tuple[OpenAI, str]]":
     """Return a RAW OpenAI client + model for the backend-conformance canary
     (SR-470), or None if no Codex OAuth credentials are available.
 
-    Delegates to _try_codex() so the canary resolves the EXACT same token /
+    Delegates to _build_codex_client() so the canary resolves the EXACT same token /
     base_url (credential-pool entry or auth.json fallback) the production
     auxiliary path uses, then unwraps the CodexAuxiliaryClient shim to expose
     the raw openai.OpenAI client. The canary needs the raw client so it can
     issue its own responses.stream() and inspect the raw response.completed
     snapshot the SDK parser chokes on. Read-only; one cheap request per run.
     """
-    wrapped, model = _try_codex()
+    wrapped, model = _build_codex_client(_CODEX_AUX_MODEL)
     raw = getattr(wrapped, "_real_client", None)
     if raw is None:
         return None
