@@ -20,12 +20,9 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
-import logging
 import os
 import re
-import signal
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,6 +32,22 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── Per-file process isolation ──────────────────────────────────────────────
+# Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
+# ``python -m pytest <file>`` subprocess per test file. Cross-file state
+# leakage (module-level dicts, ContextVars, caches) is impossible: each
+# file gets a clean Python interpreter. Intra-file ordering is the test
+# author's responsibility — if test A in foo.py mutates state that test B
+# in foo.py reads, that's a real bug to fix in the file (it would also
+# bite anyone running ``pytest tests/foo.py`` directly).
+#
+# This replaces the historic _reset_module_state autouse fixture (manual
+# state clearing) and the brief experiment with subprocess-per-test
+# isolation (too slow at ~17k tests).
+#
+# See ``scripts/run_tests_parallel.py`` for the runner.
 
 
 # ── Credential env-var filter ──────────────────────────────────────────────
@@ -134,7 +147,6 @@ _CREDENTIAL_NAMES = frozenset({
     "TOOL_GATEWAY_USER_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET",
     "WEBHOOK_SECRET",
-    "AI_GATEWAY_API_KEY",
     "VOICE_TOOLS_OPENAI_KEY",
     "BROWSER_USE_API_KEY",
     "CUSTOM_API_KEY",
@@ -145,7 +157,6 @@ _CREDENTIAL_NAMES = frozenset({
     "OLLAMA_BASE_URL",
     "GROQ_BASE_URL",
     "XAI_BASE_URL",
-    "AI_GATEWAY_BASE_URL",
     "ANTHROPIC_BASE_URL",
 })
 
@@ -187,19 +198,31 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_BACKGROUND_NOTIFICATIONS",
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
+    "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.
     "HERMES_KANBAN_DB",
     "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_HOME",
     "HERMES_KANBAN_WORKSPACES_ROOT",
     "HERMES_KANBAN_LOGS_ROOT",
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    # Dashboard OAuth auth gate (PR #30156). When set, the bundled
+    # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
+    # which is triggered by any `/api/status` call. That leaks a provider
+    # into the dashboard_auth registry across tests in the same worker and
+    # makes assertions like `auth_providers == []` flaky. CI never sets
+    # these, so production tests must not see them either.
+    "HERMES_DASHBOARD_OAUTH_CLIENT_ID",
+    "HERMES_DASHBOARD_PORTAL_URL",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
-    "TERMINAL_VERCEL_RUNTIME",
     "TERMINAL_CONTAINER_CPU",
     "TERMINAL_CONTAINER_DISK",
     "TERMINAL_CONTAINER_MEMORY",
@@ -238,6 +261,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "TELEGRAM_HOME_CHANNEL",
     "TELEGRAM_HOME_CHANNEL_THREAD_ID",
     "TELEGRAM_HOME_CHANNEL_NAME",
+    "TELEGRAM_CRON_THREAD_ID",
     "DISCORD_HOME_CHANNEL",
     "DISCORD_HOME_CHANNEL_THREAD_ID",
     "DISCORD_HOME_CHANNEL_NAME",
@@ -271,9 +295,18 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "WECOM_HOME_CHANNEL",
     "WECOM_HOME_CHANNEL_THREAD_ID",
     "WECOM_HOME_CHANNEL_NAME",
+    # API server bind/auth settings are common in local gateway profiles and
+    # change adapter defaults plus load_gateway_config() enablement. Tests that
+    # need them set opt in explicitly with monkeypatch.
+    "API_SERVER_ENABLED",
+    "API_SERVER_HOST",
+    "API_SERVER_PORT",
+    "API_SERVER_KEY",
+    "API_SERVER_CORS_ORIGINS",
+    "API_SERVER_MODEL_NAME",
     # Platform gating — set by load_gateway_config() as a side effect when
     # a config.yaml is present, so individual test bodies that call the
-    # loader leak these values into later tests on the same xdist worker.
+    # loader leak these values into later tests in the same process.
     # Force-clear on every test setup so the leak can't happen.
     "SLACK_REQUIRE_MENTION",
     "SLACK_STRICT_MENTION",
@@ -339,6 +372,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_METADATA_SERVICE_TIMEOUT", "1")
     monkeypatch.setenv("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "1")
+    # Tirith auto-installs from GitHub when enabled and missing. Unit tests
+    # should never perform that implicit network/bootstrap path; Tirith-specific
+    # tests opt back in by patching the security config directly.
+    monkeypatch.setenv("TIRITH_ENABLED", "false")
 
     # 5. Reset plugin singleton so tests don't leak plugins from
     #    ~/.hermes/plugins/ (which, per step 3, is now empty — but the
@@ -378,7 +415,7 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
-# ── Module-level state reset ───────────────────────────────────────────────
+# ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Python modules are singletons per process, and pytest-xdist workers are
 # long-lived. Module-level dicts/sets (tool registries, approval state,
@@ -528,13 +565,12 @@ def mock_config():
     }
 
 
-# ── Global test timeout ─────────────────────────────────────────────────────
-# Kill any individual test that takes longer than 30 seconds.
-# Prevents hanging tests (subprocess spawns, blocking I/O) from stalling the
-# entire test suite.
+# ── Per-test timeout — handled by the isolation plugin ─────────────────────
+#
+# The subprocess-per-test plugin enforces the configured ``isolate_timeout``
+# ini key by terminating the child if it overruns. The old SIGALRM-based
+# fixture (POSIX-only, didn't work on Windows) is gone.
 
-def _timeout_handler(signum, frame):
-    raise TimeoutError("Test exceeded 30 second timeout")
 
 @pytest.fixture(autouse=True)
 def _ensure_current_event_loop(request):
@@ -578,45 +614,6 @@ def _ensure_current_event_loop(request):
                 loop.close()
             finally:
                 asyncio.set_event_loop(None)
-
-
-@pytest.fixture(autouse=True)
-def _enforce_test_timeout():
-    """Kill any individual test that takes longer than 30 seconds.
-    SIGALRM is Unix-only; skip on Windows."""
-    if sys.platform == "win32":
-        yield
-        return
-    old = signal.signal(signal.SIGALRM, _timeout_handler)
-    signal.alarm(30)
-    yield
-    signal.alarm(0)
-    signal.signal(signal.SIGALRM, old)
-
-
-@pytest.fixture(autouse=True)
-def _reset_tool_registry_caches():
-    """Clear tool-registry-level caches between tests.
-
-    The production registry caches ``check_fn()`` results for 30 s
-    (see tools/registry.py) and :func:`get_tool_definitions` memoizes
-    its result (see model_tools.py). Both are keyed on state that tests
-    routinely mutate (env vars, registry._generation, config.yaml mtime)
-    — but a stale result from test A can still be served to test B
-    because 30 s covers the entire suite, and xdist worker reuse means
-    one test's cache lands in another's process. Clearing before every
-    test keeps hermetic behavior.
-    """
-    try:
-        from tools.registry import invalidate_check_fn_cache
-        invalidate_check_fn_cache()
-    except ImportError:
-        pass
-    try:
-        from model_tools import _clear_tool_defs_cache
-        _clear_tool_defs_cache()
-    except ImportError:
-        pass
 
 
 # ── Live-system guard ──────────────────────────────────────────────────────
