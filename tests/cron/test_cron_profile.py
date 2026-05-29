@@ -414,7 +414,10 @@ class TestTickProfilePartition:
         profile_job = {"id": "a", "name": "A", "profile": "default"}
         parallel_job = {"id": "b", "name": "B", "profile": None}
 
-        monkeypatch.setattr(sched, "get_due_jobs", lambda: [profile_job, parallel_job])
+        # v0.15.1 catch-up: the fork's tick() consumes get_due_and_skipped_jobs()
+        # (it emits skipped-job events), so patch that — patching get_due_jobs
+        # (what pure-upstream tick used) leaves tick reading the real empty list.
+        monkeypatch.setattr(sched, "get_due_and_skipped_jobs", lambda: ([profile_job, parallel_job], []))
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
         calls: list[tuple[str, str]] = []

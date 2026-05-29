@@ -1933,7 +1933,11 @@ class TestSilentDelivery:
 
     def test_whitespace_only_response_is_marked_failed_not_delivered(self):
         """Whitespace-only final responses should behave like empty responses."""
-        with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
+        # v0.15.1 catch-up: tick() consumes get_due_and_skipped_jobs() (upstream),
+        # so patch that — the auto-merge had carried the fork's stale get_due_jobs
+        # patch, which left tick reading the real (empty) due list (mirrors the
+        # sibling test_output_saved above).
+        with patch("cron.scheduler.get_due_and_skipped_jobs", return_value=([self._make_job()], [])), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "   \n\t  ", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result") as deliver_mock, \
