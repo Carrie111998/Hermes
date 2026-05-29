@@ -2224,6 +2224,15 @@ _stdio_pids: Dict[int, str] = {}  # pid -> server_name
 # sessions (e.g. concurrent cron jobs or live user chats).
 _orphan_stdio_pids: set = set()
 
+# Server names whose registration is IN FLIGHT — between the `k not in _servers`
+# check and the spawned bridge landing in _servers. Guards against a concurrent
+# caller (parallel cron jobs share this process + module state) racing past the
+# check and spawning a DUPLICATE stdio bridge for the same server. Each duplicate
+# then parks at _wait_for_lifecycle_event (never exits → never marked an orphan),
+# so the per-tick orphan reaper never reaps it = a slow bridge leak. Protected by
+# _lock; claimed in register_mcp_servers() and released in its finally.
+_registering: set = set()
+
 
 def _snapshot_child_pids() -> set:
     """Return a set of current child process PIDs.
@@ -3339,8 +3348,13 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
+            if k not in _servers and k not in _registering
+            and _parse_boolish(v.get("enabled", True), default=True)
         }
+        # Claim these names (released in the finally below) so a concurrent
+        # register_mcp_servers() — e.g. parallel cron jobs — can't race past the
+        # `k not in _servers` check and double-spawn a bridge for the same server.
+        _registering.update(new_servers.keys())
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
@@ -3388,6 +3402,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     try:
         _run_on_mcp_loop(_discover_all, timeout=120)
     finally:
+        # Release the in-flight claim so future (re)registrations can proceed.
+        with _lock:
+            for _name in new_servers:
+                _registering.discard(_name)
         if _was_interrupted:
             _set_interrupt(True)
 
