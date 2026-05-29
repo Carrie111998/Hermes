@@ -1212,6 +1212,51 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
     return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
 
+def build_codex_probe_client() -> "Optional[Tuple[OpenAI, str]]":
+    """Return a RAW OpenAI client + model for the backend-conformance canary
+    (SR-470), or None if no Codex OAuth token is available.
+
+    Unlike _try_codex(), this returns the un-wrapped openai.OpenAI client (not
+    the CodexAuxiliaryClient shim) so the canary can issue its own
+    responses.stream() and inspect the raw response.completed snapshot the SDK
+    parser chokes on. Read-only; the canary issues one cheap request per run.
+    """
+    token = _read_codex_access_token()
+    if not token:
+        return None
+    client = OpenAI(
+        api_key=token,
+        base_url=_CODEX_AUX_BASE_URL,
+        default_headers=_codex_cloudflare_headers(token),
+    )
+    return client, _CODEX_AUX_MODEL
+
+
+def build_anthropic_probe_client() -> "Optional[Tuple[Any, str]]":
+    """Return a native Anthropic client + model for the canary's mirror
+    shape-assert on the Messages endpoint, or None if Anthropic is not
+    configured. Reuses the same resolution _try_anthropic() uses.
+    """
+    try:
+        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+    except ImportError:
+        return None
+    pool_present, entry = _select_pool_entry("anthropic")
+    token = _pool_runtime_api_key(entry) if pool_present else resolve_anthropic_token()
+    if not token:
+        return None
+    base_url = (
+        _pool_runtime_base_url(entry, _ANTHROPIC_DEFAULT_BASE_URL)
+        if pool_present else _ANTHROPIC_DEFAULT_BASE_URL
+    )
+    model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
+    try:
+        client = build_anthropic_client(token, base_url)
+    except ImportError:
+        return None
+    return client, model
+
+
 def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
