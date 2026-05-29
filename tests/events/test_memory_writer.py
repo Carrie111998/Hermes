@@ -52,6 +52,7 @@ class TestMemPalaceWrite:
 
     def test_interview_signal_writes_to_mempalace(self, tmp_path):
         """INTERVIEW_SIGNAL should call mempalace add_drawer with the event content."""
+        pytest.importorskip("mempalace")  # mempalace ships in its own venv; skip where absent
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         writer = MemoryWriter(bus)
 
@@ -114,6 +115,7 @@ class TestMemPalaceWrite:
 
     def test_collection_is_cached_across_writes(self, tmp_path):
         """Subsequent writes should reuse the same collection object."""
+        pytest.importorskip("mempalace")  # mempalace ships in its own venv; skip where absent
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
         writer = MemoryWriter(bus)
 

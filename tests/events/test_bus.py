@@ -17,6 +17,22 @@ def bus(tmp_path):
     return EventBus(db_path=db_path)
 
 
+def _subscribe(bus, subscriber_id, **kwargs):
+    """Seed the cursor read-from-start on first subscribe, then subscribe.
+
+    EventBus defaults a never-seen subscriber's cursor to head (the ADR-0018
+    scanner-flood mitigation). These tests emit then subscribe via a raw id and
+    expect to consume those events, so seed cursor=0. INSERT OR IGNORE preserves
+    a cursor already advanced by a prior ack (so cursor-advance tests still work).
+    """
+    bus._execute(
+        "INSERT OR IGNORE INTO subscriber_cursors "
+        "(subscriber_id, last_rowid, updated_at) VALUES (?, 0, datetime('now'))",
+        (subscriber_id,),
+    )
+    return bus.subscribe(subscriber_id, **kwargs)
+
+
 class TestEmit:
     def test_emit_returns_event_id(self, bus):
         event_id = bus.emit(
@@ -56,7 +72,7 @@ class TestSubscribe:
         bus.emit(EventType.CRON_COMPLETED, "scout", {"a": 1})
         bus.emit(EventType.CRON_COMPLETED, "matcher", {"b": 2})
 
-        events = bus.subscribe("test-sub")
+        events = _subscribe(bus,"test-sub")
         assert len(events) == 2
         assert events[0].payload == {"a": 1}
         assert events[1].payload == {"b": 2}
@@ -66,7 +82,7 @@ class TestSubscribe:
         bus.emit(EventType.JOB_DISCOVERED, "scout", {"title": "VP Finance"})
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
 
-        events = bus.subscribe("test-sub", event_types=[EventType.JOB_DISCOVERED])
+        events = _subscribe(bus,"test-sub", event_types=[EventType.JOB_DISCOVERED])
         assert len(events) == 1
         assert events[0].event_type == EventType.JOB_DISCOVERED
 
@@ -75,27 +91,27 @@ class TestSubscribe:
         bus.emit(EventType.CRON_FAILED, "scout", {})  # HIGH
         bus.emit(EventType.INTERVIEW_SIGNAL, "tracker", {})  # CRITICAL
 
-        events = bus.subscribe("test-sub", min_priority=Priority.HIGH)
+        events = _subscribe(bus,"test-sub", min_priority=Priority.HIGH)
         assert len(events) == 2
 
     def test_subscribe_cursor_advances(self, bus):
         bus.emit(EventType.CRON_COMPLETED, "scout", {"batch": 1})
 
-        events1 = bus.subscribe("test-sub")
+        events1 = _subscribe(bus,"test-sub")
         assert len(events1) == 1
         bus.ack("test-sub", [e.event_id for e in events1])
 
         bus.emit(EventType.CRON_COMPLETED, "matcher", {"batch": 2})
 
-        events2 = bus.subscribe("test-sub")
+        events2 = _subscribe(bus,"test-sub")
         assert len(events2) == 1
         assert events2[0].payload == {"batch": 2}
 
     def test_independent_subscribers(self, bus):
         bus.emit(EventType.CRON_COMPLETED, "scout", {"x": 1})
 
-        events_a = bus.subscribe("sub-a")
-        events_b = bus.subscribe("sub-b")
+        events_a = _subscribe(bus,"sub-a")
+        events_b = _subscribe(bus,"sub-b")
         assert len(events_a) == 1
         assert len(events_b) == 1
 
@@ -103,8 +119,8 @@ class TestSubscribe:
 
         bus.emit(EventType.CRON_COMPLETED, "matcher", {"x": 2})
 
-        events_a2 = bus.subscribe("sub-a")
-        events_b2 = bus.subscribe("sub-b")
+        events_a2 = _subscribe(bus,"sub-a")
+        events_b2 = _subscribe(bus,"sub-b")
         assert len(events_a2) == 1  # only new event
         assert len(events_b2) == 2  # both events (never acked)
 
@@ -156,11 +172,12 @@ class TestSubscriberLag:
     """Lag = events emitted after a subscriber's current cursor position."""
 
     def test_lag_is_zero_for_unknown_subscriber(self, bus):
-        # No cursor recorded yet → count from beginning
+        # An unknown subscriber starts at head (ADR-0018 scanner-flood
+        # mitigation — it never replays history), so it has no backlog.
         bus.emit(EventType.CRON_STARTED, "scout", {})
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
-        # With no cursor, lag == total event count
-        assert bus.subscriber_lag("never-seen") == 2
+        # With no cursor, lag is 0 (head-default), not the total event count.
+        assert bus.subscriber_lag("never-seen") == 0
 
     def test_lag_after_partial_processing(self, bus):
         # Emit 5 events
@@ -460,7 +477,7 @@ class TestSubscribeUnknownEventType:
     def test_subscribe_does_not_raise_on_unknown_event_type(self, bus):
         self._insert_unknown_row(bus)
         # Pre-fix: ValueError("Unknown event type in DB: unknown_future_type")
-        events = bus.subscribe("test-sub")
+        events = _subscribe(bus,"test-sub")
         assert events == []
 
     def test_subscribe_returns_valid_events_alongside_unknowns(self, bus):
@@ -468,7 +485,7 @@ class TestSubscribeUnknownEventType:
         self._insert_unknown_row(bus, event_id="poison-mid")
         valid_id_2 = bus.emit(EventType.CRON_COMPLETED, "matcher", {})
 
-        events = bus.subscribe("test-sub")
+        events = _subscribe(bus,"test-sub")
         ids = [e.event_id for e in events]
         assert valid_id_1 in ids
         assert valid_id_2 in ids
@@ -484,7 +501,7 @@ class TestSubscribeUnknownEventType:
         self._insert_unknown_row(bus, event_id="poison-before-valid")
         valid_id = bus.emit(EventType.CRON_COMPLETED, "scout", {})
 
-        events1 = bus.subscribe("test-sub")
+        events1 = _subscribe(bus,"test-sub")
         assert len(events1) == 1
         assert events1[0].event_id == valid_id
 
@@ -492,14 +509,14 @@ class TestSubscribeUnknownEventType:
         bus.ack("test-sub", [valid_id])
 
         # Next subscribe must not re-read the poison row
-        events2 = bus.subscribe("test-sub")
+        events2 = _subscribe(bus,"test-sub")
         assert events2 == []
 
     def test_subscribe_logs_warning_for_unknown_event_type(self, bus, caplog):
         import logging
         caplog.set_level(logging.WARNING, logger="events.bus")
         self._insert_unknown_row(bus, event_type="some_future_type")
-        bus.subscribe("test-sub")
+        _subscribe(bus,"test-sub")
         # The unknown event_type string and event_id should appear in logs so
         # operators can correlate to the producer.
         warning_msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]

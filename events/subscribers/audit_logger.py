@@ -29,6 +29,10 @@ SIZE_CAP_BYTES = 256 * 1024 * 1024  # 256 MiB
 class AuditLogger(BaseSubscriber):
     subscriber_id = "audit-logger"
     poll_interval_seconds = 5
+    # Manages its own cursor seed in startup() (at 0, for a gap-free forensic
+    # trail) — opt out of the construction-time head-seed so startup()'s
+    # INSERT OR IGNORE at 0 isn't blocked by a pre-existing row.
+    SEED_CURSOR_AT_CONSTRUCTION = False
 
     def __init__(self, bus: EventBus, audit_path: Optional[Path] = None):
         super().__init__(bus)

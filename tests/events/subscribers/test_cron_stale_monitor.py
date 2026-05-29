@@ -46,20 +46,36 @@ def _emit_started(bus, job_id: str, started_at: datetime | None = None) -> str:
     return eid
 
 
+def _monitor(bus):
+    """Construct a CronStaleMonitor and read from the start of the bus.
+
+    These tests emit cron_started/_completed BEFORE constructing the monitor,
+    so force the cursor to 0 (the construction-time seed lands at head, past the
+    already-emitted events). See events/subscribers/base.py.
+    """
+    m = CronStaleMonitor(bus)
+    bus._execute(
+        "INSERT OR REPLACE INTO subscriber_cursors "
+        "(subscriber_id, last_rowid, updated_at) VALUES (?, 0, datetime('now'))",
+        (m.subscriber_id,),
+    )
+    return m
+
+
 class TestCronStaleMonitor:
     def test_started_then_completed_does_not_alert(self, bus):
         _emit_started(bus, "job-a")
         bus.emit(EventType.CRON_COMPLETED, "scheduler",
                  {"job_id": "job-a", "job_name": "job-a", "duration": 1.2})
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
 
         assert _stale_events(bus) == []
 
     def test_started_only_within_threshold_does_not_alert(self, bus):
         _emit_started(bus, "job-b")
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
 
         assert _stale_events(bus) == []
@@ -69,7 +85,7 @@ class TestCronStaleMonitor:
             seconds=CronStaleMonitor.STALE_THRESHOLD_SECONDS + 30)
         _emit_started(bus, "job-c", started_at=old)
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
 
         stale = _stale_events(bus)
@@ -82,7 +98,7 @@ class TestCronStaleMonitor:
             seconds=CronStaleMonitor.STALE_THRESHOLD_SECONDS + 30)
         _emit_started(bus, "job-d", started_at=old)
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
         mon.poll()
         mon.poll()
@@ -96,7 +112,7 @@ class TestCronStaleMonitor:
             seconds=CronStaleMonitor.STALE_THRESHOLD_SECONDS + 30)
         _emit_started(bus, "job-e", started_at=old)
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
         assert len(_stale_events(bus)) == 1
 
@@ -115,7 +131,7 @@ class TestCronStaleMonitor:
                  {"job_id": "job-f", "job_name": "job-f",
                   "duration": 0.1, "error": "boom", "consecutive_errors": 1})
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
 
         assert _stale_events(bus) == []
@@ -126,7 +142,7 @@ class TestCronStaleMonitor:
         _emit_started(bus, "job-g", started_at=old)
         _emit_started(bus, "job-h")  # fresh
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()
 
         stale = _stale_events(bus)
@@ -137,7 +153,7 @@ class TestCronStaleMonitor:
         """Defensive: a CRON_STARTED without job_id in payload should not crash."""
         bus.emit(EventType.CRON_STARTED, "scheduler", {})  # no job_id
 
-        mon = CronStaleMonitor(bus)
+        mon = _monitor(bus)
         mon.poll()  # must not raise
 
         assert _stale_events(bus) == []

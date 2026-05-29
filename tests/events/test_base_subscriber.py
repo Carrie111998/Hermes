@@ -9,6 +9,20 @@ from events.schema import EventType, Priority
 from events.subscribers.base import BaseSubscriber, SubscriberRegistry
 
 
+def _seed0(bus, subscriber_id):
+    """Seed a subscriber's cursor to 0 (read-from-start).
+
+    BaseSubscriber seeds its cursor at construction (base.py), but keyed on the
+    class-default subscriber_id. Tests that reassign ``sub.subscriber_id`` after
+    construction must seed the new id so emit-then-poll / lag assertions see the
+    pre-emitted events instead of the head-default."""
+    bus._execute(
+        "INSERT OR REPLACE INTO subscriber_cursors "
+        "(subscriber_id, last_rowid, updated_at) VALUES (?, 0, datetime('now'))",
+        (subscriber_id,),
+    )
+
+
 class FlakySubscriber(BaseSubscriber):
     """Subscriber whose handle() can be made to throw on demand."""
 
@@ -142,6 +156,8 @@ class TestSubscriberRegistry:
 
         registry.register(sub1)
         registry.register(sub2)
+        _seed0(bus, "stub-1")
+        _seed0(bus, "stub-2")
 
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
 
@@ -272,6 +288,8 @@ class TestLagAlertHelper:
         fast.subscriber_id = "fast"
         registry.register(slow)
         registry.register(fast)
+        _seed0(bus, "slow")
+        _seed0(bus, "fast")
         return bus, registry, slow, fast
 
     def test_no_alert_when_all_under_threshold(self, tmp_path):
@@ -355,6 +373,8 @@ class TestSubscriberLagReport:
         b.subscriber_id = "sub-b"
         registry.register(a)
         registry.register(b)
+        _seed0(bus, "sub-a")
+        _seed0(bus, "sub-b")
 
         bus.emit(EventType.CRON_COMPLETED, "scout", {})
         bus.emit(EventType.CRON_COMPLETED, "scout", {})

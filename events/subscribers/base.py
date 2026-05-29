@@ -128,6 +128,12 @@ class BaseSubscriber(ABC):
     poll_interval_seconds: int = 5
     event_types: Optional[List[EventType]] = None
     min_priority: Optional[Priority] = None
+    # Seed this subscriber's cursor at construction (in __init__ below) to the
+    # current bus head. Set False on subscribers that manage their own cursor
+    # seed in startup() — e.g. AuditLogger seeds at 0 for a gap-free forensic
+    # trail and relies on the row NOT pre-existing, so a head-seed here would
+    # block its INSERT OR IGNORE.
+    SEED_CURSOR_AT_CONSTRUCTION: bool = True
 
     # Circuit breaker: overridable on subclasses for tighter/looser behaviour
     CIRCUIT_BREAKER_ERROR_THRESHOLD: int = 5
@@ -155,7 +161,7 @@ class BaseSubscriber(ABC):
         # history, so the ADR-0018 scanner-flood mitigation stays intact.
         # Best-effort: never breaks construction (falls back to the bus's
         # first-poll head-default if the cursor table isn't writable yet).
-        if self.subscriber_id:
+        if self.subscriber_id and self.SEED_CURSOR_AT_CONSTRUCTION:
             try:
                 self.bus._execute(
                     "INSERT OR IGNORE INTO subscriber_cursors "

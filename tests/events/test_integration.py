@@ -35,6 +35,7 @@ class TestEndToEnd:
 
         audit_path = tmp_path / "events" / "audit.jsonl"
         audit = AuditLogger(bus, audit_path=audit_path)
+        audit.startup()  # seed cursor at 0 so the trail captures events emitted below
 
         # Producer emits
         emitter.on_job_started("j1", "jobflow-scout", "0 8 * * *")
@@ -58,6 +59,7 @@ class TestEndToEnd:
 
         audit_path = tmp_path / "events" / "audit.jsonl"
         audit = AuditLogger(bus, audit_path=audit_path)
+        audit.startup()  # seed cursor at 0 so the trail captures events emitted below
 
         health.report_health("telegram", healthy=True)
         health.report_health("telegram", healthy=False)
@@ -96,6 +98,7 @@ class TestEndToEnd:
 
         registry = SubscriberRegistry()
         audit = AuditLogger(bus, audit_path=tmp_path / "events" / "audit.jsonl")
+        audit.startup()  # seed cursor at 0 so poll_all captures the events emitted below
         registry.register(audit)
 
         emitter.on_job_started("j1", "scout", "0 8 * * *")
