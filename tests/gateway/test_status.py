@@ -271,18 +271,13 @@ class TestGatewayPidState:
         monkeypatch.setattr(status.os, "kill", fake_kill)
 
         try:
-            if status._IS_WINDOWS:
-                # On Windows the runtime lock keeps gateway.lock under a
-                # mandatory byte-range lock, so the live PID stored in the lock
-                # record is unreadable.  With gateway.pid intentionally stale (a
-                # dead PID), the live PID is unrecoverable, so get_running_pid
-                # reports None — rather than crashing (the pre-fix bug) or
-                # returning the dead PID.
-                assert status.get_running_pid() is None
-            else:
-                # POSIX uses an advisory lock, so the lock record stays readable
-                # and the live PID in it wins over the stale gateway.pid.
-                assert status.get_running_pid() == os.getpid()
+            # v0.15.1 catch-up: upstream v2026.5.7 moved the Windows lock byte to
+            # _WINDOWS_LOCK_OFFSET (1MB) so the JSON record at offset 0 stays
+            # readable while the mutual-exclusion lock is held (lets the Dashboard
+            # /api/status read the PID without lock contention). The record is now
+            # readable on every platform, so the live PID in it wins over the
+            # stale gateway.pid uniformly — Windows no longer reports None.
+            assert status.get_running_pid() == os.getpid()
         finally:
             status.release_gateway_runtime_lock()
 
