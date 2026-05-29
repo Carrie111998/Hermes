@@ -38,7 +38,10 @@ class TestRepairToolCallArguments:
             ("", "{}"),                                   # empty -> {}
             ("   ", "{}"),                                # whitespace -> {}
             ("None", "{}"),                               # python None literal
-            ('{"a": 1}', '{"a": 1}'),                     # already valid -> unchanged
+            # v0.15.1 catch-up: upstream "Repair pass 0" (#12068) re-serialises
+            # valid JSON with compact separators to strip any unescaped control
+            # chars. Spacing is normalised away but the parsed value is identical.
+            ('{"a": 1}', '{"a":1}'),                      # valid -> compacted (pass-0 reserialise)
             ('{"a": 1,}', '{"a": 1}'),                    # trailing comma stripped
             ('{"a": 1', '{"a": 1}'),                      # unclosed object closed
             # Single-pass closer-append produces '{"a": [1, 2}]' (curly then
@@ -524,6 +527,14 @@ class TestBuildAssistantMessage:
         agent.reasoning_callback = None
         agent.stream_delta_callback = None
         agent._stream_callback = None
+        # v0.15.1 catch-up: upstream widened _build_assistant_message's
+        # tool-call path to consult the active provider for the DeepSeek/Kimi
+        # reasoning_content pad (#15250, #17400) via _needs_thinking_reasoning_pad().
+        # Set these to inert non-thinking defaults so the pinned message *shape*
+        # is exercised without triggering provider-specific reasoning padding.
+        agent.provider = ""
+        agent.model = ""
+        agent.base_url = ""
         return agent
 
     def test_plain_text_message(self):
