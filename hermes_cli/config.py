@@ -2805,6 +2805,22 @@ DEFAULT_CONFIG = {
 
     # Permanently allowed dangerous command patterns (added via "always" approval)
     "command_allowlist": [],
+
+    # Best-effort notifications when the CLI is blocked waiting for the user
+    # to approve a command, answer clarify(), or enter a sudo password. Disabled
+    # by default; if enabled, delivery failures never affect prompt semantics.
+    "notifications": {
+        "human_intervention": {
+            "enabled": False,
+            "channels": ["bell", "log"],
+            "gateway_targets": [],
+            "cooldown_seconds": 20,
+            "repeat_before_timeout_seconds": 15,
+            "include_command_preview": True,
+            "command_preview_chars": 120,
+        },
+    },
+
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
 

@@ -12229,6 +12229,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # thread. Modal prompts must paint at once and must not be gated by the
         # _invalidate throttle / resize guard — see _paint_now / _invalidate (#41098).
         self._paint_now()
+        try:
+            from hermes_cli.human_intervention_notifications import notify_human_intervention
+            notify_human_intervention(
+                "clarify",
+                "Hermes needs your input",
+                f"Question: {question}",
+                session_key=getattr(self, "session_id", ""),
+                dedupe_key=f"clarify:{question}",
+                timeout_seconds=timeout,
+            )
+        except Exception:
+            pass
 
         # Poll for the user's response. The countdown in the hint line updates
         # on each repaint; refresh it once a second so the timer stays visible
@@ -12286,6 +12298,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Modal prompt — paint immediately, bypassing the throttle/resize guard
         # so the prompt can't be dropped and time out unseen (#41098).
         self._paint_now()
+        try:
+            from hermes_cli.human_intervention_notifications import notify_human_intervention
+            notify_human_intervention(
+                "sudo",
+                "Hermes needs your sudo password",
+                "A command is waiting for sudo password input in the CLI.",
+                session_key=getattr(self, "session_id", ""),
+                dedupe_key="sudo-password",
+                timeout_seconds=timeout,
+            )
+        except Exception:
+            pass
 
         while True:
             try:
@@ -12314,7 +12338,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
-                           smart_denied: bool = False) -> str:
+                           smart_denied: bool = False,
+                           intervention_kind: str = "approval") -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
@@ -12354,6 +12379,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the command is denied on timeout without the user ever seeing it
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
+            try:
+                from hermes_cli.human_intervention_notifications import notify_human_intervention
+                notify_human_intervention(
+                    intervention_kind,
+                    "Hermes needs command approval" if intervention_kind == "approval" else "Hermes needs computer-use approval",
+                    f"{description}\nCommand: {command}",
+                    session_key=getattr(self, "session_id", ""),
+                    dedupe_key=f"{intervention_kind}:{command}",
+                    timeout_seconds=timeout,
+                )
+            except Exception:
+                pass
 
             _last_countdown_refresh = _time.monotonic()
             while True:
@@ -12412,6 +12449,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         verdict = self._approval_callback(
             command=f"computer_use: {summary}",
             description=f"Allow computer_use to perform `{action}`?",
+            intervention_kind="computer_use",
         )
         return {
             "once": "approve_once",
