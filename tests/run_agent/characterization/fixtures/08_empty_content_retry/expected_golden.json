@@ -1,0 +1,35 @@
+{
+  "api_calls": 2,
+  "completed": true,
+  "create_call_kwargs_summary": [
+    {
+      "has_tools": true,
+      "message_count": 2,
+      "model": "characterization-model",
+      "tool_count": 1
+    },
+    {
+      "has_tools": true,
+      "message_count": 2,
+      "model": "characterization-model",
+      "tool_count": 1
+    }
+  ],
+  "error": null,
+  "final_response": "Recovered after an empty turn.",
+  "messages_fingerprint": [
+    {
+      "content": "go",
+      "has_tool_calls": false,
+      "role": "user",
+      "tool_names": []
+    },
+    {
+      "content": "Recovered after an empty turn.",
+      "has_tool_calls": false,
+      "role": "assistant",
+      "tool_names": []
+    }
+  ],
+  "partial": false
+}

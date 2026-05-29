@@ -1,0 +1,29 @@
+{
+  "api_calls": 1,
+  "completed": true,
+  "create_call_kwargs_summary": [
+    {
+      "has_tools": true,
+      "message_count": 2,
+      "model": "characterization-model",
+      "tool_count": 1
+    }
+  ],
+  "error": null,
+  "final_response": "The answer is 42.",
+  "messages_fingerprint": [
+    {
+      "content": "what is the answer",
+      "has_tool_calls": false,
+      "role": "user",
+      "tool_names": []
+    },
+    {
+      "content": "The answer is 42.",
+      "has_tool_calls": false,
+      "role": "assistant",
+      "tool_names": []
+    }
+  ],
+  "partial": false
+}

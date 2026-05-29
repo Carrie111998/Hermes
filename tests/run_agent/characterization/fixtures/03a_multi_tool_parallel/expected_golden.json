@@ -1,0 +1,58 @@
+{
+  "api_calls": 2,
+  "completed": true,
+  "create_call_kwargs_summary": [
+    {
+      "has_tools": true,
+      "message_count": 2,
+      "model": "characterization-model",
+      "tool_count": 1
+    },
+    {
+      "has_tools": true,
+      "message_count": 5,
+      "model": "characterization-model",
+      "tool_count": 1
+    }
+  ],
+  "error": null,
+  "final_response": "Read both files.",
+  "messages_fingerprint": [
+    {
+      "content": "read both files",
+      "has_tool_calls": false,
+      "role": "user",
+      "tool_names": []
+    },
+    {
+      "content": "",
+      "has_tool_calls": true,
+      "role": "assistant",
+      "tool_names": [
+        "read_file",
+        "read_file"
+      ]
+    },
+    {
+      "content": "{\"ok\": true}",
+      "has_tool_calls": false,
+      "role": "tool",
+      "tool_call_ref": true,
+      "tool_names": []
+    },
+    {
+      "content": "{\"ok\": true}",
+      "has_tool_calls": false,
+      "role": "tool",
+      "tool_call_ref": true,
+      "tool_names": []
+    },
+    {
+      "content": "Read both files.",
+      "has_tool_calls": false,
+      "role": "assistant",
+      "tool_names": []
+    }
+  ],
+  "partial": false
+}

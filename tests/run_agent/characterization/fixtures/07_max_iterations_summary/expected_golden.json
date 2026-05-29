@@ -1,0 +1,77 @@
+{
+  "api_calls": 2,
+  "completed": false,
+  "create_call_kwargs_summary": [
+    {
+      "has_tools": true,
+      "message_count": 2,
+      "model": "characterization-model",
+      "tool_count": 1
+    },
+    {
+      "has_tools": true,
+      "message_count": 4,
+      "model": "characterization-model",
+      "tool_count": 1
+    },
+    {
+      "has_tools": false,
+      "message_count": 7,
+      "model": "characterization-model",
+      "tool_count": 0
+    }
+  ],
+  "error": null,
+  "final_response": "Here is what I accomplished.",
+  "messages_fingerprint": [
+    {
+      "content": "loop forever",
+      "has_tool_calls": false,
+      "role": "user",
+      "tool_names": []
+    },
+    {
+      "content": "",
+      "has_tool_calls": true,
+      "role": "assistant",
+      "tool_names": [
+        "read_file"
+      ]
+    },
+    {
+      "content": "{\"ok\": true}",
+      "has_tool_calls": false,
+      "role": "tool",
+      "tool_call_ref": true,
+      "tool_names": []
+    },
+    {
+      "content": "",
+      "has_tool_calls": true,
+      "role": "assistant",
+      "tool_names": [
+        "read_file"
+      ]
+    },
+    {
+      "content": "{\"ok\": true}",
+      "has_tool_calls": false,
+      "role": "tool",
+      "tool_call_ref": true,
+      "tool_names": []
+    },
+    {
+      "content": "<len=188>",
+      "has_tool_calls": false,
+      "role": "user",
+      "tool_names": []
+    },
+    {
+      "content": "Here is what I accomplished.",
+      "has_tool_calls": false,
+      "role": "assistant",
+      "tool_names": []
+    }
+  ],
+  "partial": false
+}
