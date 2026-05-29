@@ -41,10 +41,12 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_cookies,
 )
 from hermes_cli.dashboard_auth.login_page import render_login_html
+from hermes_cli.dashboard_uploads import router as chat_uploads_router
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter()
+router.include_router(chat_uploads_router)
 
 
 def _redirect_uri(request: Request) -> str:
