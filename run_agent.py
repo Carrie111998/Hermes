@@ -94,7 +94,7 @@ from tools.browser_tool import cleanup_browser
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
 from agent.retry_utils import jittered_backoff
-from agent.error_classifier import classify_api_error, FailoverReason
+from agent.error_classifier import classify_api_error, FailoverReason, is_library_exception
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -10716,6 +10716,11 @@ class AIAgent:
                     is_local_validation_error = (
                         isinstance(api_error, (ValueError, TypeError))
                         and not isinstance(api_error, UnicodeEncodeError)
+                        # SR-493 (ADR-0024 §4): a ValueError/TypeError raised from
+                        # INSIDE an LLM SDK is backend-contract drift, not a Hermes
+                        # programming bug — let it retry/fallback (and SR-471
+                        # alerts) instead of aborting silently.
+                        and not is_library_exception(api_error)
                     )
                     is_client_error = (
                         is_local_validation_error

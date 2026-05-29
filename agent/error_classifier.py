@@ -891,3 +891,32 @@ def _extract_message(error: Exception, body: dict) -> str:
             return msg.strip()[:500]
     # Fallback to str(error)
     return str(error)[:500]
+
+
+def is_library_exception(exc: BaseException) -> bool:
+    """True if exc's DEEPEST traceback frame is inside a third-party LLM SDK
+    (openai / anthropic / httpx / httpcore), i.e. a library-internal fault
+    rather than a bug in Hermes's own code.
+
+    SR-493 (ADR-0024 §4): such exceptions — e.g. the R57 openai ``parse_response``
+    ``TypeError`` on ``output=None`` — must NOT be auto-bucketed as non-retryable
+    "programming bugs". They are transient backend-contract drift; the loop should
+    retry/fallback (and SR-471 alerts), not silently abort on the first hit.
+    """
+    tb = getattr(exc, "__traceback__", None)
+    last = None
+    while tb is not None:
+        last = tb
+        tb = tb.tb_next
+    if last is None:
+        return False
+    try:
+        fn = last.tb_frame.f_code.co_filename.replace("\\", "/").lower()
+    except Exception:
+        return False
+    markers = (
+        "/site-packages/openai/", "/site-packages/anthropic/",
+        "/site-packages/httpx/", "/site-packages/httpcore/",
+        "/openai/lib/", "/openai/_", "/openai/resources/", "/anthropic/",
+    )
+    return any(m in fn for m in markers)
