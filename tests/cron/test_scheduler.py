@@ -16,7 +16,8 @@ from tools.credential_files import clear_credential_files
 def _tick_lock_isolated(tmp_path):
     """Redirect scheduler tick lock to a per-test temp dir.
 
-    tick() acquires an exclusive file lock at module-level _LOCK_FILE; under
+    tick() acquires an exclusive file lock at the path returned by
+    _get_lock_paths() (derived at call time from _get_hermes_home()); under
     pytest-xdist parallel workers this races and lock-losers short-circuit
     with `return 0` before _process_job runs, breaking any test that asserts
     positive behavior (delivery called, output saved, log emitted).
@@ -24,10 +25,10 @@ def _tick_lock_isolated(tmp_path):
     Test classes that call tick() must opt in via
     @pytest.mark.usefixtures("_tick_lock_isolated").
     """
-    lock_dir = tmp_path / "cron"
-    lock_dir.mkdir()
-    with patch("cron.scheduler._LOCK_DIR", lock_dir), \
-         patch("cron.scheduler._LOCK_FILE", lock_dir / ".tick.lock"):
+    # v0.15.1 catch-up: upstream replaced the module-level _LOCK_DIR/_LOCK_FILE
+    # constants with _get_lock_paths(), which derives the lock dir from the
+    # _hermes_home override hook. Patch that hook so the lock lands under tmp.
+    with patch("cron.scheduler._hermes_home", tmp_path):
         yield
 
 
