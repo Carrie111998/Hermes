@@ -1171,9 +1171,14 @@ class TestPidExists:
         assert status.pid_exists(2**30 - 1) is False
 
     def test_legacy_underscore_alias_still_works(self):
-        # gateway/status.py:460 and callers in this repo still use the
-        # leading-underscore name; the alias keeps them working.
-        assert status._pid_exists is status.pid_exists
+        # gateway/status.py and callers in this repo still use the
+        # leading-underscore name.  v0.15.1 catch-up: upstream v2026.5.16
+        # (#21561) made _pid_exists a distinct psutil-first probe rather than
+        # a bare alias of pid_exists, so assert it remains a working callable
+        # liveness check (not object identity).
+        assert callable(status._pid_exists)
+        assert status._pid_exists(os.getpid()) is True
+        assert status._pid_exists(2**30 - 1) is False
 
 
 class TestPlannedStopMarker:

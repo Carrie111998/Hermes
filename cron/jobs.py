@@ -849,7 +849,11 @@ def trigger_job(
     is allowed for backward compatibility but logs a WARNING — every internal
     caller should pass an explicit caller string.
     """
-    job = get_job(job_id)
+    # v0.15.1 catch-up: resolve by ID or name (upstream resolve_job_ref) so
+    # `cron run <name>` works; raises AmbiguousJobReference for an ambiguous
+    # name (caller-facing, intentional). Fork's CRON_TRIGGERED traceability
+    # below is preserved.
+    job = resolve_job_ref(job_id)
     if not job:
         return None
 
@@ -864,7 +868,7 @@ def trigger_job(
     previous_next_run_at = job.get("next_run_at")
 
     updated = update_job(
-        job_id,
+        job["id"],
         {
             "enabled": True,
             "state": "scheduled",
@@ -880,8 +884,8 @@ def trigger_job(
             bus = _get_event_bus()
             emit_cron_triggered(
                 bus,
-                job_id=job_id,
-                job_name=updated.get("name") or job.get("name") or job_id,
+                job_id=job["id"],
+                job_name=updated.get("name") or job.get("name") or job["id"],
                 caller=caller,
                 reason=reason,
                 previous_next_run_at=previous_next_run_at,
