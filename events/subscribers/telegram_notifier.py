@@ -111,7 +111,6 @@ TOPIC_ROUTING: Dict[str, str] = {
     'watchdog_probe_transition': 'watchdog_alerts',
     'watchdog_silence_alert': 'watchdog_alerts',
     'watchdog_recovered': 'watchdog_alerts',
-    'watchdog_burst': 'watchdog_alerts',
     'watchdog_self_degraded': 'watchdog_alerts',
     # Once-per-day aggregate health heartbeat (2026-04-30) — see
     # EventType.WATCHDOG_DAILY docstring for the visibility-restoration
