@@ -61,7 +61,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
     STICKY_FAILURE_RESET_THRESHOLD = 5
 
     def __init__(self, fallback_ips: Iterable[str], **transport_kwargs):
-        self._fallback_ips = [ip for ip in dict.fromkeys(_normalize_fallback_ips(fallback_ips))]
+        self._fallback_ips = list(dict.fromkeys(_normalize_fallback_ips(fallback_ips)))
         proxy_url = _resolve_proxy_url(target_hosts=[_TELEGRAM_API_HOST, *self._fallback_ips])
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
