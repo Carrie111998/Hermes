@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 
 
 def test_default_config_includes_disabled_human_intervention_notifications():
@@ -75,7 +76,7 @@ def test_bell_and_log_channels_are_best_effort(tmp_path, monkeypatch):
     assert "supersecret" not in line
 
 
-def test_gateway_targets_call_send_message_tool_without_raising(tmp_path, monkeypatch):
+def test_gateway_targets_call_send_message_tool_without_blocking_on_slow_target(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from hermes_cli import human_intervention_notifications as mod
 
@@ -95,10 +96,13 @@ def test_gateway_targets_call_send_message_tool_without_raising(tmp_path, monkey
 
     def fake_send_message_tool(args):
         sent.append(args)
+        if args["target"] == "weixin":
+            time.sleep(0.2)
         return json.dumps({"success": True})
 
     monkeypatch.setattr(mod, "_send_gateway_message", fake_send_message_tool)
 
+    start = time.monotonic()
     mod.notify_human_intervention(
         "clarify",
         "Hermes needs input",
@@ -107,6 +111,13 @@ def test_gateway_targets_call_send_message_tool_without_raising(tmp_path, monkey
         dedupe_key="clarify-1",
         timeout_seconds=120,
     )
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.15
+
+    deadline = time.monotonic() + 1
+    while len(sent) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
 
     assert [call["target"] for call in sent] == ["telegram", "weixin"]
     assert all(call["action"] == "send" for call in sent)

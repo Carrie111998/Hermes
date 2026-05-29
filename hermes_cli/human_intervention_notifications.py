@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -122,8 +123,19 @@ def _send_gateway_message(args: dict[str, Any]) -> str:
 
 
 def _send_gateway_targets(targets: list[str], body: str) -> None:
-    for target in targets:
-        _send_gateway_message({"action": "send", "target": target, "message": body})
+    def worker() -> None:
+        for target in targets:
+            try:
+                _send_gateway_message({"action": "send", "target": target, "message": body})
+            except Exception:
+                pass
+
+    thread = threading.Thread(
+        target=worker,
+        name="hermes-human-intervention-gateway-notify",
+        daemon=True,
+    )
+    thread.start()
 
 
 def notify_human_intervention(
