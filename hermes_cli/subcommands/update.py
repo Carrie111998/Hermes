@@ -62,6 +62,18 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         ),
     )
     update_parser.add_argument(
+        "--release",
+        nargs="?",
+        const="latest",
+        default=None,
+        metavar="TAG",
+        help=(
+            "Pin to an official tagged release instead of tracking a branch. "
+            "Use --release alone for the latest vYYYY.M.D tag, or provide an "
+            "exact tag. The release is checked out as a detached HEAD."
+        ),
+    )
+    update_parser.add_argument(
         "--force",
         action="store_true",
         default=False,
