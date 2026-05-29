@@ -1,0 +1,41 @@
+{
+  "api_calls": 2,
+  "completed": true,
+  "create_call_kwargs_summary": [
+    {
+      "has_tools": true,
+      "message_count": 1,
+      "model": "characterization-model",
+      "tool_count": 1
+    },
+    {
+      "has_tools": true,
+      "message_count": 2,
+      "model": "characterization-model",
+      "tool_count": 1
+    }
+  ],
+  "error": null,
+  "final_response": "complete",
+  "messages_fingerprint": [
+    {
+      "content": "codex path",
+      "has_tool_calls": false,
+      "role": "user",
+      "tool_names": []
+    },
+    {
+      "content": "partial",
+      "has_tool_calls": false,
+      "role": "assistant",
+      "tool_names": []
+    },
+    {
+      "content": "complete",
+      "has_tool_calls": false,
+      "role": "assistant",
+      "tool_names": []
+    }
+  ],
+  "partial": false
+}

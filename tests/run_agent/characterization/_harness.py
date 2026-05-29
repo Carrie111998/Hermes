@@ -96,24 +96,180 @@ def build_response(fixture: Dict[str, Any]) -> SimpleNamespace:
     )
 
 
+# ---------------------------------------------------------------------------
+# Provider-branch response shapes (the SECOND mock seam)
+# ---------------------------------------------------------------------------
+#
+# api_mode={anthropic_messages,codex_responses} do NOT route through the
+# ``run_agent.OpenAI`` chat.completions seam — they dispatch through the
+# instance methods ``_anthropic_messages_create`` / ``_run_codex_stream``
+# inside ``_interruptible_api_call`` (run_agent.py).  Because the harness
+# forces ``_disable_streaming=True``, the loop takes the non-streaming
+# ``_interruptible_api_call`` path for every api_mode, so patching those two
+# methods is sufficient to characterize the whole provider loop branch with
+# no real client call.  The same fixture vocabulary (content / finish_reason /
+# tool_calls) feeds all three seams; these builders translate one fixture into
+# the *provider-native* response shape each transport's ``normalize_response``
+# consumes (shapes verified against test_pure_seams.py::TestAnthropicNormalize
+# and ::TestCodexNormalize).
+
+
+# Reverse of ``AnthropicTransport._STOP_REASON_MAP``: the fixture carries the
+# OpenAI-style normalized ``finish_reason``; Anthropic responses carry a raw
+# ``stop_reason`` that the transport maps back.  Build the raw value so the
+# round-trip through ``map_finish_reason`` reproduces the fixture's intent.
+_ANTHROPIC_STOP_REASON = {
+    "stop": "end_turn",
+    "tool_calls": "tool_use",
+    "length": "max_tokens",
+    "content_filter": "refusal",
+}
+
+
+def build_anthropic_response(fixture: Dict[str, Any]) -> SimpleNamespace:
+    """Convert a fixture into the Anthropic Messages-API response shape.
+
+    ``AnthropicTransport.normalize_response`` iterates ``response.content``
+    (a list of ``text`` / ``thinking`` / ``tool_use`` blocks) and reads
+    ``response.stop_reason``.  Tool-call ``arguments`` (a JSON string or dict
+    in the fixture) become the block's ``input`` *dict*, mirroring the wire
+    format.  ``usage`` is present-but-None (the transport reads it via getattr).
+    """
+    blocks: List[SimpleNamespace] = []
+    content = fixture.get("content")
+    if content:
+        blocks.append(SimpleNamespace(type="text", text=content))
+    for tc in fixture.get("tool_calls") or []:
+        args = tc.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (ValueError, TypeError):
+                args = {}
+        blocks.append(
+            SimpleNamespace(
+                type="tool_use",
+                id=tc["id"],
+                name=tc["name"],
+                input=args,
+            )
+        )
+    finish_reason = fixture.get("finish_reason", "stop")
+    stop_reason = _ANTHROPIC_STOP_REASON.get(finish_reason, "end_turn")
+    return SimpleNamespace(content=blocks, stop_reason=stop_reason, usage=None)
+
+
+def build_codex_response(fixture: Dict[str, Any]) -> SimpleNamespace:
+    """Convert a fixture into the Codex Responses-API response shape.
+
+    ``_normalize_codex_response`` iterates ``response.output`` (a list of
+    ``message`` / ``function_call`` items) and reads ``response.status``.  A
+    fixture ``finish_reason == "incomplete"`` becomes ``status="incomplete"``
+    (with a non-empty ``output`` so ``validate_response`` passes), which
+    ``_normalize_codex_response`` maps to ``finish_reason="incomplete"`` and
+    drives the loop's codex continuation branch (run_agent.py:11088).
+    ``incomplete_details`` is None so the loop's raw-status check
+    (run_agent.py:9664) does NOT divert into the length/truncation branch.
+    """
+    output: List[SimpleNamespace] = []
+    content = fixture.get("content")
+    if content:
+        output.append(
+            SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text=content)],
+            )
+        )
+    for tc in fixture.get("tool_calls") or []:
+        args = tc.get("arguments", "{}")
+        if isinstance(args, (dict, list)):
+            args = json.dumps(args)
+        output.append(
+            SimpleNamespace(
+                type="function_call",
+                id=tc["id"],
+                call_id=tc["id"],
+                name=tc["name"],
+                arguments=args,
+                status="completed",
+            )
+        )
+    finish_reason = fixture.get("finish_reason", "stop")
+    status = "incomplete" if finish_reason == "incomplete" else "completed"
+    return SimpleNamespace(output=output, status=status, incomplete_details=None)
+
+
+def _summarize_provider_call(api_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """4-key call summary for provider seams, identical in shape to the OpenAI
+    seam's so the golden's ``create_call_kwargs_summary`` stays uniform.
+
+    Anthropic kwargs carry ``messages``; Codex Responses kwargs carry ``input``
+    — count whichever is present.
+    """
+    msgs = api_kwargs.get("messages")
+    if msgs is None:
+        msgs = api_kwargs.get("input")
+    msgs = msgs if isinstance(msgs, list) else []
+    tools = api_kwargs.get("tools")
+    tools = tools if isinstance(tools, list) else []
+    return {
+        "model": api_kwargs.get("model"),
+        "message_count": len(msgs),
+        "tool_count": len(tools),
+        "has_tools": bool(tools),
+    }
+
+
+class _ScriptCursor:
+    """Shared response cursor + call log across every provider seam.
+
+    A single cursor backs the OpenAI ``chat.completions`` seam AND the
+    Anthropic / Codex provider seams, so a multi-turn script advances
+    deterministically no matter which seam the loop dispatches to, and every
+    model call the loop issues is recorded exactly once in ``calls`` (the
+    basis for the golden's ``create_call_kwargs_summary``).  An exhausted
+    script raises rather than silently looping — that means the loop made more
+    calls than the scenario anticipated, which is a test bug.
+    """
+
+    def __init__(self, script: List[Dict[str, Any]]):
+        self._script = list(script)
+        self._idx = 0
+        self.calls: List[Dict[str, Any]] = []
+
+    def take(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        self.calls.append(summary)
+        if self._idx >= len(self._script):
+            raise AssertionError(
+                f"Scripted seam exhausted: loop requested response "
+                f"#{self._idx + 1} but only {len(self._script)} were scripted. "
+                f"(summary={summary})"
+            )
+        fixture = self._script[self._idx]
+        self._idx += 1
+        return fixture
+
+    @property
+    def call_count(self) -> int:
+        return self._idx
+
+
 class _ScriptedCompletions:
     """``client.chat.completions`` stand-in.
 
-    ``create(**kwargs)`` pops the next scripted response and records a compact
-    summary of the kwargs it received.  If the script is exhausted it raises a
-    clear error rather than silently looping — an exhausted script is a test
-    bug (the loop made more calls than the scenario anticipated).
+    ``create(**kwargs)`` records a compact kwargs summary and pops the next
+    scripted response via the shared cursor.
     """
 
-    def __init__(self, script: List[Dict[str, Any]], calls: List[Dict[str, Any]]):
-        self._script = list(script)
-        self._idx = 0
-        self.calls = calls
+    def __init__(self, cursor: _ScriptCursor):
+        self._cursor = cursor
 
     def create(self, **kwargs):  # noqa: D401 — SDK-compatible signature
         messages = kwargs.get("messages") or []
         tools = kwargs.get("tools") or []
-        self.calls.append(
+        fixture = self._cursor.take(
             {
                 "model": kwargs.get("model"),
                 "message_count": len(messages),
@@ -121,19 +277,11 @@ class _ScriptedCompletions:
                 "has_tools": bool(tools),
             }
         )
-        if self._idx >= len(self._script):
-            raise AssertionError(
-                f"ScriptedClient exhausted: loop requested response "
-                f"#{self._idx + 1} but only {len(self._script)} were scripted. "
-                f"(message_count={len(messages)}, tool_count={len(tools)})"
-            )
-        fixture = self._script[self._idx]
-        self._idx += 1
         return build_response(fixture)
 
     @property
     def call_count(self) -> int:
-        return self._idx
+        return self._cursor.call_count
 
 
 class ScriptedClient:
@@ -143,11 +291,16 @@ class ScriptedClient:
     construction kwargs (api_key, base_url, http_client, ...).  Has no
     ``is_closed`` / ``_client`` attribute, so ``_is_openai_client_closed``
     always reports it as live and the agent never tries to rebuild it.
+
+    ``.calls`` aliases the shared cursor's call log, so provider seams that
+    advance the same cursor are reflected in ``summarize_create_calls`` even
+    though they never touch ``chat.completions``.
     """
 
     def __init__(self, script: List[Dict[str, Any]]):
-        self.calls: List[Dict[str, Any]] = []
-        self._completions = _ScriptedCompletions(script, self.calls)
+        self._cursor = _ScriptCursor(script)
+        self.calls: List[Dict[str, Any]] = self._cursor.calls
+        self._completions = _ScriptedCompletions(self._cursor)
         self.chat = SimpleNamespace(completions=self._completions)
 
     # The agent calls .close() on per-request clients; make it a no-op that
@@ -157,7 +310,7 @@ class ScriptedClient:
 
     @property
     def call_count(self) -> int:
-        return self._completions.call_count
+        return self._cursor.call_count
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +408,36 @@ def make_agent(
     agent.save_trajectories = False
     agent._characterization_client = shared_client
     agent._characterization_task_id = task_id
+
+    # Second mock seam: provider api_modes bypass the OpenAI chat.completions
+    # symbol and dispatch through these instance methods (run_agent.py).  Patch
+    # them onto the agent so they pop from the SAME shared cursor as the OpenAI
+    # seam — one script, one call log, regardless of which seam the loop reaches.
+    # (Patched as instance attributes => called unbound: the signatures below
+    # match the loop's call sites, no leading ``self``.)
+    cursor = shared_client._cursor
+    if api_mode == "anthropic_messages":
+        def _scripted_anthropic_messages_create(api_kwargs):
+            fixture = cursor.take(_summarize_provider_call(api_kwargs))
+            return build_anthropic_response(fixture)
+
+        stack.enter_context(
+            patch.object(
+                agent, "_anthropic_messages_create",
+                _scripted_anthropic_messages_create,
+            )
+        )
+    elif api_mode == "codex_responses":
+        def _scripted_run_codex_stream(api_kwargs, client=None, on_first_delta=None):
+            fixture = cursor.take(_summarize_provider_call(api_kwargs))
+            return build_codex_response(fixture)
+
+        stack.enter_context(
+            patch.object(
+                agent, "_run_codex_stream",
+                _scripted_run_codex_stream,
+            )
+        )
 
     # Neutralize filesystem / persistence side-effects for the whole turn.
     stack.enter_context(patch.object(agent, "_persist_session"))

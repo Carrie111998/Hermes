@@ -10,10 +10,12 @@ makes them a valid oracle for the upcoming ``agent/*`` refactor.  Goldens are
 written on first run (sorted-key JSON) and asserted thereafter; re-pin an
 intentional change with ``HERMES_CHAR_REGEN=1``.
 
-Scenarios that are infeasible to wire cheaply against the current code
-(provider seams that bypass the OpenAI-client symbol) are kept as ``xfail``
-with a precise reason rather than deleted — their absence is itself a
-documented finding.
+Provider api_modes (anthropic_messages, codex_responses) bypass the
+OpenAI-client symbol and dispatch through ``_anthropic_messages_create`` /
+``_run_codex_stream``.  Those branches are characterized end-to-end via the
+harness's SECOND mock seam (``_harness.build_anthropic_response`` /
+``build_codex_response``), which scripts those instance methods from the same
+shared cursor — no real network call, no provider SDK round-trip.
 """
 
 from __future__ import annotations
@@ -379,20 +381,13 @@ def test_empty_content_then_retry_recovers():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason=(
-        "Layer-A anthropic_messages routes through the native Anthropic SDK seam "
-        "(_anthropic_messages_create), NOT the run_agent.OpenAI symbol the harness "
-        "patches, so the loop blocks on a real client call. With no per-test "
-        "timeout on Windows this HANGS rather than failing cleanly, which defeats "
-        "xfail -- hence skip. chat_completions is the priority loop coverage; the "
-        "Anthropic provider branch IS pinned at the unit level in "
-        "test_pure_seams.py::TestAnthropicNormalize (normalize_response + "
-        "map_finish_reason). Follow-up: add a second mock seam to characterize "
-        "this loop branch end-to-end."
-    ),
-)
 def test_anthropic_messages_single_tool():
+    # api_mode=anthropic_messages dispatches through the native
+    # ``_anthropic_messages_create`` seam (NOT the run_agent.OpenAI symbol).
+    # The harness's second mock seam scripts that method to return
+    # Anthropic-shaped responses (content blocks + stop_reason), so the same
+    # tool -> text loop the chat_completions scenarios pin is characterized
+    # end-to-end through the Anthropic provider branch with no network call.
     with ExitStack() as stack:
         agent = make_agent(
             script=[
@@ -409,9 +404,27 @@ def test_anthropic_messages_single_tool():
             stack=stack,
             tool_names=["read_file"],
             api_mode="anthropic_messages",
+            max_iterations=4,
         )
         result = run_scenario(agent, "anthropic path")
+
     assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert result["api_calls"] == 2
+    # Message ordering: assistant(tool_calls) -> tool result -> assistant text.
+    roles = [m.get("role") for m in result["messages"]]
+    assert "assistant" in roles and "tool" in roles
+    first_assistant_with_tc = next(
+        i for i, m in enumerate(result["messages"])
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    first_tool = next(
+        i for i, m in enumerate(result["messages"]) if m.get("role") == "tool"
+    )
+    assert first_assistant_with_tc < first_tool
+
+    fp = result_fingerprint(result, agent._characterization_client)
+    golden_compare(fp, "09_anthropic_single_tool")
 
 
 # ---------------------------------------------------------------------------
@@ -419,19 +432,14 @@ def test_anthropic_messages_single_tool():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason=(
-        "Layer-A codex_responses routes through _run_codex_stream (a streaming "
-        "Responses-API path), not the chat.completions.create seam the harness "
-        "scripts, so the loop blocks on a real call. With no per-test timeout on "
-        "Windows this HANGS rather than failing cleanly, which defeats xfail -- "
-        "hence skip. The Codex provider branch IS pinned at the unit level in "
-        "test_pure_seams.py::TestCodexNormalize (normalize_response + "
-        "map_finish_reason incl. incomplete->length). Follow-up: characterize this "
-        "loop branch via the streaming seam."
-    ),
-)
 def test_codex_responses_incomplete_continuation():
+    # api_mode=codex_responses dispatches through ``_run_codex_stream`` (the
+    # Responses-API path), which the harness's second mock seam scripts to
+    # return Codex-shaped responses.  The first response carries
+    # status="incomplete" -> _normalize_codex_response yields
+    # finish_reason="incomplete", firing the loop's codex continuation branch
+    # (run_agent.py:11088): the interim assistant message is appended and the
+    # turn continues; the second response (status="completed") finishes it.
     with ExitStack() as stack:
         agent = make_agent(
             script=[
@@ -441,6 +449,18 @@ def test_codex_responses_incomplete_continuation():
             stack=stack,
             tool_names=["read_file"],
             api_mode="codex_responses",
+            max_iterations=4,
         )
         result = run_scenario(agent, "codex path")
+
     assert result["completed"] is True
+    assert result["final_response"] == "complete"
+    # One incomplete continuation -> exactly two model calls.
+    assert result["api_calls"] == 2
+    # The interim (incomplete) assistant message was appended before the final.
+    assistant_msgs = [m for m in result["messages"] if m.get("role") == "assistant"]
+    assert any((m.get("content") or "") == "partial" for m in assistant_msgs)
+    assert result["messages"][-1].get("content") == "complete"
+
+    fp = result_fingerprint(result, agent._characterization_client)
+    golden_compare(fp, "10_codex_incomplete_continuation")
