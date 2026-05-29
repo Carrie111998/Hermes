@@ -110,6 +110,15 @@ EVENT_TYPE_EMOJI = {
     # honest and gives a fallback render if the guard ever regresses.
     EventType.NOTIFICATION_DELIVERED:   "📬",
     EventType.NOTIFICATION_FAILED:      "📭",
+    # Gateway lifecycle (boot/shutdown) -> watchdog_alerts. Green up / red down,
+    # mirroring the build up/down convention but for the gateway process itself.
+    EventType.GATEWAY_STARTED:          "🟢",
+    EventType.GATEWAY_STOPPED:          "🔴",
+    # Fork resilience signals emitted without an icon: backend-conformance
+    # canary (SR-470) + agent loop-fault loud-failure boundary (SR-471).
+    # 📐 = contract/conformance check; 💥 = loop fault at non-retryable abort.
+    EventType.BACKEND_CONTRACT_DRIFT:   "📐",
+    EventType.AGENT_LOOP_FAULT:         "💥",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

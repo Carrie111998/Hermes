@@ -82,6 +82,8 @@ TOPIC_ROUTING: Dict[str, str] = {
     'devflow.build_failed': 'devflow_decisions',
     # -> watchdog_alerts
     'gateway_health': 'watchdog_alerts',
+    'gateway_started': 'watchdog_alerts',  # gateway lifecycle (boot)
+    'gateway_stopped': 'watchdog_alerts',  # gateway lifecycle (shutdown / dead-pid)
     'agent_error': 'watchdog_alerts',
     'cron_started': 'watchdog_alerts',
     'cron_skipped': 'watchdog_alerts',  # added 2026-04-30 — cron-restart-catchup-gap
