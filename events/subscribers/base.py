@@ -147,6 +147,28 @@ class BaseSubscriber(ABC):
         # Tracks consecutive mark_handled failures per event so we can dead-letter
         # and advance past an event whose handle() succeeds but whose mark fails.
         self._mark_handled_failures: Dict[str, int] = {}
+        # Seed the cursor at construction to the current head so events emitted
+        # between construction and the first poll are not dropped (the first-poll
+        # head-jump gap, cf. audit_logger_first_poll_head_jump). INSERT OR IGNORE
+        # preserves an existing/persisted cursor (zero change on gateway restart),
+        # and a brand-new subscriber still starts at head — never replaying
+        # history, so the ADR-0018 scanner-flood mitigation stays intact.
+        # Best-effort: never breaks construction (falls back to the bus's
+        # first-poll head-default if the cursor table isn't writable yet).
+        if self.subscriber_id:
+            try:
+                self.bus._execute(
+                    "INSERT OR IGNORE INTO subscriber_cursors "
+                    "(subscriber_id, last_rowid, updated_at) "
+                    "VALUES (?, COALESCE((SELECT MAX(rowid) FROM events), 0), "
+                    "datetime('now'))",
+                    (self.subscriber_id,),
+                )
+            except Exception:
+                logger.debug(
+                    "cursor seed-at-registration skipped for %s",
+                    self.subscriber_id, exc_info=True,
+                )
 
     @abstractmethod
     def handle(self, event: Event) -> None:
