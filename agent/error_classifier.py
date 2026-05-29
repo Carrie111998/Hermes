@@ -891,3 +891,40 @@ def _extract_message(error: Exception, body: dict) -> str:
             return msg.strip()[:500]
     # Fallback to str(error)
     return str(error)[:500]
+
+
+def is_library_exception(exc: BaseException) -> bool:
+    """True if exc's DEEPEST traceback frame is inside a third-party LLM SDK
+    (openai / anthropic / httpx / httpcore), i.e. a library-internal fault
+    rather than a bug in Hermes's own code.
+
+    SR-493 (ADR-0024 §4): such exceptions — e.g. the R57 openai ``parse_response``
+    ``TypeError`` on ``output=None`` — must NOT be auto-bucketed as non-retryable
+    "programming bugs". They are transient backend-contract drift; the loop should
+    retry/fall back (failing loudly at the retry-exhaustion terminal if it persists)
+    rather than silently aborting on the first hit. (SR-471's AGENT_LOOP_FAULT fires
+    on the non-retryable abort path, which such an exception no longer enters.)
+    """
+    tb = getattr(exc, "__traceback__", None)
+    last = None
+    while tb is not None:
+        last = tb
+        tb = tb.tb_next
+    if last is None:
+        return False
+    try:
+        fn = last.tb_frame.f_code.co_filename.replace("\\", "/").lower()
+    except Exception:
+        return False
+    # Match only installed-SDK paths under site-packages — precise, and avoids
+    # false positives from repo paths that merely contain "openai"/"anthropic"
+    # (e.g. agent/openai_codex_compat.py, or a checkout dir named anthropic).
+    # site-packages/openai/ already subsumes openai/lib, openai/resources, etc.;
+    # the R57 frame (site-packages/openai/lib/_parsing/_responses.py) still matches.
+    markers = (
+        "/site-packages/openai/",
+        "/site-packages/anthropic/",
+        "/site-packages/httpx/",
+        "/site-packages/httpcore/",
+    )
+    return any(m in fn for m in markers)

@@ -261,3 +261,12 @@ def test_watchdog_burst_event_type_round_trips_via_from_string():
     from events.schema import EventType
 
     assert EventType.from_string("watchdog_burst") is EventType.WATCHDOG_BURST
+
+
+def test_r57_detection_event_types_exist():
+    from events.schema import EventType, Priority
+    assert EventType.from_string("backend_contract_drift") is EventType.BACKEND_CONTRACT_DRIFT
+    assert EventType.from_string("agent_loop_fault") is EventType.AGENT_LOOP_FAULT
+    # Both are HIGH so significant_only / digest_only verbosity surfaces them.
+    assert EventType.BACKEND_CONTRACT_DRIFT.default_priority is Priority.HIGH
+    assert EventType.AGENT_LOOP_FAULT.default_priority is Priority.HIGH

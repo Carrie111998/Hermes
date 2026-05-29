@@ -111,7 +111,6 @@ TOPIC_ROUTING: Dict[str, str] = {
     'watchdog_probe_transition': 'watchdog_alerts',
     'watchdog_silence_alert': 'watchdog_alerts',
     'watchdog_recovered': 'watchdog_alerts',
-    'watchdog_burst': 'watchdog_alerts',
     'watchdog_self_degraded': 'watchdog_alerts',
     # Once-per-day aggregate health heartbeat (2026-04-30) — see
     # EventType.WATCHDOG_DAILY docstring for the visibility-restoration
@@ -119,6 +118,9 @@ TOPIC_ROUTING: Dict[str, str] = {
     # cutover only has to update one block.
     'watchdog_daily': 'watchdog_alerts',
     'agent_failure_cluster': 'watchdog_alerts',
+    # R57 detection nets (ADR-0024 §2-3) — system-health alerts.
+    'backend_contract_drift': 'watchdog_alerts',
+    'agent_loop_fault': 'watchdog_alerts',
     # Notification delivery reverse-signal (2026-04-30). These entries
     # exist so test_all_event_types_have_routing covers them, but the
     # primary defense is the cycle guard in handle() — both delivery

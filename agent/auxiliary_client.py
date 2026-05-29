@@ -1212,6 +1212,40 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
     return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
 
 
+def build_codex_probe_client() -> "Optional[Tuple[OpenAI, str]]":
+    """Return a RAW OpenAI client + model for the backend-conformance canary
+    (SR-470), or None if no Codex OAuth credentials are available.
+
+    Delegates to _try_codex() so the canary resolves the EXACT same token /
+    base_url (credential-pool entry or auth.json fallback) the production
+    auxiliary path uses, then unwraps the CodexAuxiliaryClient shim to expose
+    the raw openai.OpenAI client. The canary needs the raw client so it can
+    issue its own responses.stream() and inspect the raw response.completed
+    snapshot the SDK parser chokes on. Read-only; one cheap request per run.
+    """
+    wrapped, model = _try_codex()
+    raw = getattr(wrapped, "_real_client", None)
+    if raw is None:
+        return None
+    return raw, model
+
+
+def build_anthropic_probe_client() -> "Optional[Tuple[Any, str]]":
+    """Return a native Anthropic client + model for the canary's mirror
+    shape-assert on the Messages endpoint, or None if Anthropic is not
+    configured.
+
+    Delegates to _try_anthropic() (same pool / config.yaml base_url resolution
+    as the production auxiliary path), then unwraps the AnthropicAuxiliaryClient
+    shim to expose the raw native client for client.messages.create().
+    """
+    wrapped, model = _try_anthropic()
+    raw = getattr(wrapped, "_real_client", None)
+    if raw is None:
+        return None
+    return raw, model
+
+
 def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token

@@ -1040,3 +1040,62 @@ class TestSSLTransientPatterns:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.timeout
         assert result.retryable is True
+
+
+# ── Test: is_library_exception ─────────────────────────────────────────
+
+def _exc_from_file(fake_filename):
+    # Raise from code whose co_filename we control, so the deepest traceback
+    # frame reports `fake_filename`.
+    code = compile("raise TypeError('boom')", fake_filename, "exec")
+    try:
+        exec(code, {})
+    except TypeError as exc:
+        return exc
+
+
+def test_is_library_exception_true_for_openai_frame():
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file(r"C:\py\Lib\site-packages\openai\lib\_parsing\_responses.py")
+    assert is_library_exception(exc) is True
+
+
+def test_is_library_exception_true_for_anthropic_frame():
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file("/usr/lib/python3.11/site-packages/anthropic/_base_client.py")
+    assert is_library_exception(exc) is True
+
+
+def test_is_library_exception_false_for_our_own_code():
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file(r"C:\Users\diego\.hermes\agent-src\run_agent.py")
+    assert is_library_exception(exc) is False
+
+
+def test_is_library_exception_false_for_similarly_named_agent_module():
+    # Guard against false positives: agent/openai_codex_compat.py and
+    # agent/anthropic_adapter.py must NOT be treated as library frames.
+    from agent.error_classifier import is_library_exception
+    exc1 = _exc_from_file(r"C:\Users\diego\.hermes\agent-src\agent\openai_codex_compat.py")
+    exc2 = _exc_from_file(r"C:\Users\diego\.hermes\agent-src\agent\anthropic_adapter.py")
+    assert is_library_exception(exc1) is False
+    assert is_library_exception(exc2) is False
+
+
+def test_is_library_exception_false_when_no_traceback():
+    from agent.error_classifier import is_library_exception
+    assert is_library_exception(TypeError("never raised")) is False
+
+
+def test_is_library_exception_false_for_repo_path_containing_anthropic():
+    # A repo/checkout path that merely contains "anthropic" must NOT be treated
+    # as a library frame — only installed SDKs under site-packages count.
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file(r"C:\projects\anthropic\agent\run_agent.py")
+    assert is_library_exception(exc) is False
+
+
+def test_is_library_exception_false_for_repo_path_containing_openai():
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file(r"C:\projects\openai\tools\helper.py")
+    assert is_library_exception(exc) is False
