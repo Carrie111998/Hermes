@@ -1085,3 +1085,17 @@ def test_is_library_exception_false_for_similarly_named_agent_module():
 def test_is_library_exception_false_when_no_traceback():
     from agent.error_classifier import is_library_exception
     assert is_library_exception(TypeError("never raised")) is False
+
+
+def test_is_library_exception_false_for_repo_path_containing_anthropic():
+    # A repo/checkout path that merely contains "anthropic" must NOT be treated
+    # as a library frame — only installed SDKs under site-packages count.
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file(r"C:\projects\anthropic\agent\run_agent.py")
+    assert is_library_exception(exc) is False
+
+
+def test_is_library_exception_false_for_repo_path_containing_openai():
+    from agent.error_classifier import is_library_exception
+    exc = _exc_from_file(r"C:\projects\openai\tools\helper.py")
+    assert is_library_exception(exc) is False
