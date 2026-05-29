@@ -265,6 +265,16 @@ class EventType(Enum):
     GATEWAY_STARTED = ("gateway_started", Priority.NORMAL)
     GATEWAY_STOPPED = ("gateway_stopped", Priority.NORMAL)
 
+    # R57 backend-drift detection nets (added 2026-05-29, ADR-0024 §2-3).
+    # BACKEND_CONTRACT_DRIFT: the synthetic canary (obs/backend_conformance_canary)
+    # found a Codex/Anthropic backend returning a shape the stock SDK parser
+    # cannot consume (the R57 output=None signature). AGENT_LOOP_FAULT: the agent
+    # loop hit an unhandled stream-accumulation exception that the classifier would
+    # otherwise have buried as a silent non-retryable "empty response" (SR-471).
+    # Both HIGH so they survive significant_only/digest_only verbosity.
+    BACKEND_CONTRACT_DRIFT = ("backend_contract_drift", Priority.HIGH)
+    AGENT_LOOP_FAULT = ("agent_loop_fault", Priority.HIGH)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority
