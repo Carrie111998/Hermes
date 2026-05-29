@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 # process restart — appropriate for a cron subprocess (one run) and benign for
 # the long-lived gateway (a handful of distinct fault signatures per restart).
 _RATE_CAP_MAX = 3
+# Not thread-safe by design: under gateway multi-threading, racing get->check->set
+# may over-emit by at most (N_threads - 1) per signature — acceptable for a small
+# cap, and a lock on the abort path is not worth the added latency.
 _emit_counts: dict[tuple[str, str], int] = {}
 
 
@@ -88,7 +91,6 @@ def emit_agent_loop_fault(
         if count >= _RATE_CAP_MAX:
             logger.debug("AGENT_LOOP_FAULT rate-capped for %s/%s", source, exc_type)
             return False
-        _emit_counts[key] = count + 1
 
         tb_tail = "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__)
@@ -114,6 +116,11 @@ def emit_agent_loop_fault(
             payload=payload,
             priority=Priority.HIGH,
         )
+        # Charge the budget only on a CONFIRMED emit: if bus.emit() above raised
+        # (swallowed by the outer except), we must not burn a slot and drop a
+        # later legitimate alert early. The cap bounds delivered notifications,
+        # not failed attempts.
+        _emit_counts[key] = count + 1
         logger.info("Emitted AGENT_LOOP_FAULT (%s) from %s", exc_type, source)
         return True
     except Exception:  # pragma: no cover - alerting must never break the loop

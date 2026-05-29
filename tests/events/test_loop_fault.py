@@ -64,3 +64,15 @@ def test_emit_never_raises_even_if_bus_explodes():
             raise RuntimeError("bus down")
 
     emit_agent_loop_fault(_make_exc(), source_hint="x", phase="y", bus=_Boom())
+
+
+def test_reset_rate_cap_clears_budget():
+    from events.loop_fault import emit_agent_loop_fault, reset_rate_cap, _RATE_CAP_MAX
+    reset_rate_cap()
+    bus = _FakeBus()
+    for _ in range(_RATE_CAP_MAX):
+        emit_agent_loop_fault(_make_exc(), source_hint="jobflow-scout", bus=bus)
+    assert len(bus.emitted) == _RATE_CAP_MAX
+    reset_rate_cap()
+    emit_agent_loop_fault(_make_exc(), source_hint="jobflow-scout", bus=bus)
+    assert len(bus.emitted) == _RATE_CAP_MAX + 1
