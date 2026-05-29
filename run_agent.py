@@ -63,6 +63,21 @@ else:
     logger.info("No .env file found. Using system environment variables.")
 
 
+# Guard the openai SDK against the ChatGPT Codex backend's
+# `response.completed` snapshot carrying `output=None` (real text arrives via
+# output_text.delta events). The SDK's parse_response iterates response.output
+# with no None-guard, raising TypeError mid-stream — which surfaces as
+# "Agent completed but produced empty response" on every Codex/gpt-5.5 cron.
+# Applied at import so it's live before the first responses.stream() call, and
+# it survives openai SDK reinstalls (it patches imported modules, not
+# site-packages). Idempotent. See agent/openai_codex_compat.py.
+try:
+    from agent.openai_codex_compat import apply_codex_output_none_guard
+    apply_codex_output_none_guard()
+except Exception:  # pragma: no cover - guard must never break agent startup
+    logger.debug("codex output=None guard not applied in run_agent", exc_info=True)
+
+
 # Import our tool system
 from model_tools import (
     get_tool_definitions,
@@ -10765,7 +10780,7 @@ class AIAgent:
                                     self._vprint(f"{self.log_prefix}      • Check credits: https://openrouter.ai/settings/credits", force=True)
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
-                        logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}")
+                        logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}", exc_info=True)
                         # Skip session persistence when the error is likely
                         # context-overflow related (status 400 + large session).
                         # Persisting the failed user message would make the

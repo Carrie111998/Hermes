@@ -52,6 +52,16 @@ from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_
 
 logger = logging.getLogger(__name__)
 
+# Guard the openai SDK against the ChatGPT Codex backend's response.output=None
+# completion snapshot, which crashes parse_response inside the responses.stream()
+# accumulator this module uses for codex calls (see line ~416). Idempotent;
+# applied at import. See agent/openai_codex_compat.py.
+try:
+    from agent.openai_codex_compat import apply_codex_output_none_guard
+    apply_codex_output_none_guard()
+except Exception:  # pragma: no cover - guard must never break host import
+    logger.debug("codex output=None guard not applied in auxiliary_client", exc_info=True)
+
 # Module-level flag: only warn once per process about stale OPENAI_BASE_URL.
 _stale_base_url_warned = False
 
@@ -428,9 +438,13 @@ class _CodexCompletionsAdapter:
                         has_function_calls = True
                 final = stream.get_final_response()
 
-            # Backfill empty output from collected stream events
+            # Backfill empty output from collected stream events.
+            # The Codex backend may return output as an empty list OR as None
+            # (newer chatgpt.com/backend-api responses) even when items were
+            # streamed — treat both the same so we recover the streamed content
+            # instead of crashing on `for item in None` below.
             _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            if not isinstance(_output, list) or not _output:
                 if collected_output_items:
                     final.output = list(collected_output_items)
                     logger.debug(
@@ -460,7 +474,7 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            for item in (getattr(final, "output", None) or []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):

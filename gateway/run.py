@@ -11379,8 +11379,31 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         )
         return False
     if not acquire_gateway_runtime_lock():
+        # [lock-reject diagnostic] — added 2026-05-07. After the boot-race
+        # fix (BOOT_GRACE_SECONDS=300 in gateway_watchdog.py + stale-pid
+        # cleanup in laptop-start.ps1), one stray "lock is already held"
+        # line still appears in hermes-gateway.err.log per reboot. Pairs
+        # with the [gateway-launch] tag in ~/laptop-start.ps1 so the next
+        # reboot's err.log self-identifies who lost the race.
+        _holder_pid = None
+        _holder_raw = None
+        try:
+            from gateway.status import _get_gateway_lock_path
+            _lock_path = _get_gateway_lock_path()
+            if _lock_path.exists():
+                _holder_raw = _lock_path.read_text(encoding="utf-8").strip()
+                try:
+                    _holder_pid = json.loads(_holder_raw).get("pid")
+                except (ValueError, TypeError, AttributeError):
+                    pass
+        except Exception:
+            pass
         logger.error(
-            "Gateway runtime lock is already held by another instance. Exiting."
+            "Gateway runtime lock is already held by another instance. Exiting. "
+            "[lock-reject ts=%s my_pid=%d my_ppid=%d argv=%r holder_pid=%s holder_raw=%r]",
+            datetime.now().isoformat(timespec="seconds"),
+            os.getpid(), os.getppid(), sys.argv,
+            _holder_pid, _holder_raw,
         )
         return False
     try:

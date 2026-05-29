@@ -43,6 +43,16 @@ _AGENT_SRC = Path.home() / ".hermes" / "agent-src"
 if str(_AGENT_SRC) not in sys.path:
     sys.path.insert(0, str(_AGENT_SRC))
 
+# Guard the openai SDK against the ChatGPT Codex backend's response.output=None
+# completion snapshot, which otherwise crashes parse_response inside the
+# responses.stream() accumulator used by codex_structured_invoke() below.
+# Idempotent; applied at import. See agent/openai_codex_compat.py.
+try:
+    from agent.openai_codex_compat import apply_codex_output_none_guard
+    apply_codex_output_none_guard()
+except Exception:  # pragma: no cover - guard must never break host import
+    logger.debug("codex output=None guard not applied in obs.oauth_llm", exc_info=True)
+
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 # Default model — Diego mandate 2026-04-24: ONLY gpt-5.5 via OAuth.
@@ -62,7 +72,10 @@ def _get_oauth_token() -> str:
       1. ~/.codex/auth.json (Codex CLI shared file) — fresh whenever Diego
          re-runs `hermes auth add openai-codex --type oauth`. This is where
          the fresh credential lands; the Hermes auth store top-level may lag.
-      2. credential_pool active entry in ~/.hermes/auth.json
+      2. credential_pool active entry in get_hermes_home()/auth.json — the
+         profile-scoped store (e.g. ~/.hermes/profiles/main) that `hermes auth
+         add` writes and the cron path (agent/credential_pool.py) reads. NOT
+         hardcoded root; see Step 2 comment for the 2026-05-28 split-brain.
       3. resolve_codex_runtime_credentials() (top-level providers section,
          with auto-refresh attempt; falls through if refresh_token is invalid)
       4. _read_codex_tokens() raw read of top-level (last-resort, may be stale)
@@ -92,9 +105,18 @@ def _get_oauth_token() -> str:
             except Exception as e:
                 logger.debug("oauth_llm: could not read %s: %s", codex_path, e)
 
-        # Step 2: credential_pool active entry
+        # Step 2: credential_pool active entry in the profile-scoped Hermes
+        # auth store. Resolve via get_hermes_home() (HERMES_HOME-aware — e.g.
+        # ~/.hermes/profiles/main when active_profile=main) so we read the SAME
+        # file `hermes auth add` writes and that agent/credential_pool.py +
+        # agent/auxiliary_client.py read. Hardcoding Path.home()/.hermes here
+        # was the 2026-05-28 split-brain: the gateway runs with
+        # HERMES_HOME=profiles/main, so the root store was stale and this path
+        # fell through to an expired token -> 401 token_expired.
         try:
-            hermes_auth_path = Path.home() / ".hermes" / "auth.json"
+            from hermes_constants import get_hermes_home  # type: ignore
+
+            hermes_auth_path = get_hermes_home() / "auth.json"
             if hermes_auth_path.is_file():
                 import json as _json
                 data = _json.loads(hermes_auth_path.read_text(encoding="utf-8"))

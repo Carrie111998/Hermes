@@ -76,7 +76,17 @@ STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
 CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 CODEX_OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
-CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+# Proactive refresh window (TASK 2, 2026-05-28): widened 120s -> 1h so the lazy
+# refresh fires WELL before hard expiry, giving many cron-driven retry attempts
+# instead of a single ~2-minute window. Tokens last ~10 days, so a wider skew
+# still rotates only ~once per token, just earlier. Override via
+# HERMES_CODEX_REFRESH_SKEW_SECONDS (floored at 120).
+try:
+    CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = max(
+        120, int(os.getenv("HERMES_CODEX_REFRESH_SKEW_SECONDS", "3600"))
+    )
+except ValueError:
+    CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 3600
 QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
@@ -1436,6 +1446,57 @@ def _is_remote_session() -> bool:
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
+# --- Codex refresh-failure sentinel (TASK 2, 2026-05-28) -------------------
+# The codex OAuth refresh is purely lazy (fires from credential_pool.select()
+# or resolve_codex_runtime_credentials, only within the refresh skew of expiry).
+# When the single-use refresh-token chain breaks it silently exhausts and stays
+# dead until a manual re-login — the 33-day freeze. These helpers make a failure
+# LOUD (WARNING) and leave a breadcrumb the health probe / `hermes status` can
+# surface. The marker is get_hermes_home()-scoped so it sits next to the auth
+# store it describes.
+
+def _codex_refresh_failure_marker_path() -> Path:
+    return get_hermes_home() / ".codex_refresh_failed"
+
+
+def note_codex_refresh_failure(exc: Exception, *, source: str) -> None:
+    """Surface a Codex OAuth refresh failure: WARNING log + sentinel marker file.
+
+    A ``relogin_required`` failure means the refresh-token chain is dead and the
+    token CANNOT self-renew — a human must run ``hermes auth add openai-codex``.
+    Observability must never break the refresh path, so all I/O is best-effort.
+    """
+    relogin = bool(getattr(exc, "relogin_required", False))
+    logger.warning(
+        "Codex OAuth refresh FAILED (source=%s, relogin_required=%s): %s. "
+        "Token cannot self-renew until `hermes auth add openai-codex` is run.",
+        source, relogin, exc,
+    )
+    try:
+        marker = _codex_refresh_failure_marker_path()
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "source": source,
+                "relogin_required": relogin,
+                "code": getattr(exc, "code", None),
+                "error": str(exc),
+            }),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def clear_codex_refresh_failure_marker() -> None:
+    """Remove the refresh-failure sentinel after a successful refresh / re-auth."""
+    try:
+        _codex_refresh_failure_marker_path().unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
@@ -1497,6 +1558,9 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         state["auth_mode"] = "chatgpt"
         _save_provider_state(auth_store, "openai-codex", state)
         _save_auth_store(auth_store)
+    # A successful token write means the refresh chain is healthy again — clear
+    # any prior failure sentinel (covers resolve-path refresh + manual re-auth).
+    clear_codex_refresh_failure_marker()
 
 
 def refresh_codex_oauth_pure(

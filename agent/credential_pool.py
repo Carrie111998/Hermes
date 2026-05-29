@@ -595,6 +595,12 @@ class CredentialPool:
                 return entry
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            # TASK 2 (2026-05-28): a codex refresh failure must NOT be silent.
+            # The lazy-refresh path used to log at DEBUG and exhaust the entry,
+            # so a dead single-use refresh-token chain went unnoticed for 33
+            # days. Surface it loudly + drop a sentinel the health probe reads.
+            if self.provider == "openai-codex":
+                auth_mod.note_codex_refresh_failure(exc, source="credential_pool")
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.
@@ -653,6 +659,9 @@ class CredentialPool:
         # _seed_from_singletons() on the next load_pool() sees fresh state
         # instead of re-seeding stale/consumed tokens.
         self._sync_device_code_entry_to_auth_store(updated)
+        if self.provider == "openai-codex":
+            # Healthy refresh — clear any prior failure sentinel (TASK 2).
+            auth_mod.clear_codex_refresh_failure_marker()
         return updated
 
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
