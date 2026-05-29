@@ -384,6 +384,27 @@ def make_agent(
     stack.enter_context(
         patch.object(run_agent, "handle_function_call", _fake_handle_function_call)
     )
+    # v0.15.1 catch-up: upstream's extracted agent_init / ContextCompressor query
+    # get_model_context_length during construction, which makes REAL network calls
+    # (Ollama /api/show POST + local-server-detect GET to base_url/api/v1/models)
+    # for models not in static metadata — that hangs the hermetic harness and
+    # trips the new 30s pytest-timeout. Patch the two network helpers inside
+    # model_metadata (called via the module's own namespace, so this covers every
+    # get_model_context_length caller incl. ContextCompressor) so resolution falls
+    # back to static/default with no I/O. Init-time context length is not the loop
+    # behavior these characterization tests pin.
+    # detect_local_server_type does the GET and is the common chokepoint for
+    # both _query_local_context_length and query_ollama_num_ctx; _query_ollama_api_show
+    # does the separate POST. Patching both eliminates all init-time network I/O.
+    stack.enter_context(
+        patch("agent.model_metadata.detect_local_server_type", lambda *a, **k: None)
+    )
+    stack.enter_context(
+        patch("agent.model_metadata._query_ollama_api_show", lambda *a, **k: None)
+    )
+    stack.enter_context(
+        patch("agent.model_metadata._query_local_context_length", lambda *a, **k: None)
+    )
 
     init_kwargs: Dict[str, Any] = dict(
         model=model,
