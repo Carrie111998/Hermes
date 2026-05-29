@@ -10781,6 +10781,23 @@ class AIAgent:
                         else:
                             self._vprint(f"{self.log_prefix}   💡 This type of error won't be fixed by retrying.", force=True)
                         logging.error(f"{self.log_prefix}Non-retryable client error: {api_error}", exc_info=True)
+                        # SR-471 (ADR-0024 §3): the alert half. Emit a loud
+                        # AGENT_LOOP_FAULT bus event for this unhandled
+                        # stream-accumulation exception, IGNORING the
+                        # non-retryable classification — silence is the R57 bug.
+                        # Best-effort; the helper never raises.
+                        try:
+                            from events.loop_fault import emit_agent_loop_fault
+                            emit_agent_loop_fault(
+                                api_error,
+                                source_hint=getattr(self, "log_prefix", "") or "",
+                                phase="stream_accumulation",
+                                provider=_provider,
+                                model=_model,
+                                status_code=status_code,
+                            )
+                        except Exception:
+                            logger.debug("AGENT_LOOP_FAULT emit skipped", exc_info=True)
                         # Skip session persistence when the error is likely
                         # context-overflow related (status 400 + large session).
                         # Persisting the failed user message would make the
