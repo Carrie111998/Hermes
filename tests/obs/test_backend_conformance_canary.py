@@ -90,13 +90,59 @@ def test_edge_trigger_emits_once_for_consecutive_drift(tmp_path, monkeypatch):
 
     class _Bus:
         def emit(self, *, event_type, source, payload, priority=None, **kw):
-            emitted.append((event_type, payload.get("backend"), payload.get("state")))
+            emitted.append((payload.get("backend"), payload.get("state")))
 
     state_file = tmp_path / "backend_conformance.json"
     monkeypatch.setattr(canary, "_sentinel_path", lambda: state_file)
 
     drift = canary.ProbeResult(healthy=False, detail="output is None")
-    canary._maybe_emit(_Bus(), "codex", drift, _load_prev=canary._load_state())
-    canary._write_sentinel({"codex": drift}, emit_meta=None)
-    canary._maybe_emit(_Bus(), "codex", drift, _load_prev=canary._load_state())
-    assert len([e for e in emitted if e[2] == "down"]) == 1
+    bus = _Bus()
+
+    # First drift -> emit "down".
+    meta = dict(canary._load_state().get("emit_meta", {}))
+    canary._maybe_emit(bus, "codex", drift, canary._load_state(), meta)
+    canary._write_sentinel({"codex": drift}, emit_meta=meta)
+
+    # Second consecutive drift (sentinel now records codex=down) -> NO new emit.
+    meta = dict(canary._load_state().get("emit_meta", {}))
+    canary._maybe_emit(bus, "codex", drift, canary._load_state(), meta)
+
+    assert [e for e in emitted if e[1] == "down"] == [("codex", "down")]
+
+
+def test_dual_backend_drift_preserves_each_emit_meta(tmp_path, monkeypatch):
+    # Regression: when BOTH backends change emit-state in one cycle, neither may
+    # revert the other's last_drift_emit (rate-cap integrity).
+    import json as _json
+    import obs.backend_conformance_canary as canary
+
+    class _Bus:
+        def __init__(self):
+            self.calls = []
+
+        def emit(self, *, event_type, source, payload, priority=None, **kw):
+            self.calls.append((payload.get("backend"), payload.get("state")))
+
+    state_file = tmp_path / "backend_conformance.json"
+    monkeypatch.setattr(canary, "_sentinel_path", lambda: state_file)
+
+    old = "2000-01-01T00:00:00+00:00"  # >1h ago -> codex re-pages this cycle
+    state_file.write_text(_json.dumps({
+        "ts": old,
+        "backends": {"codex": {"state": "down", "detail": "x"},
+                     "anthropic": {"state": "healthy", "detail": "ok"}},
+        "emit_meta": {"codex": {"last_drift_emit": old}},
+    }), encoding="utf-8")
+
+    bus = _Bus()
+    drift = canary.ProbeResult(healthy=False, detail="drift")
+    prev = canary._load_state()
+    emit_meta = dict(prev.get("emit_meta", {}))
+    # codex re-pages (was down, old emit); anthropic newly drifts -- SHARED dict.
+    canary._maybe_emit(bus, "codex", drift, prev, emit_meta)
+    canary._maybe_emit(bus, "anthropic", drift, prev, emit_meta)
+
+    # codex's re-page timestamp must NOT be reverted to `old`; anthropic recorded.
+    assert emit_meta["codex"]["last_drift_emit"] != old
+    assert emit_meta.get("anthropic", {}).get("last_drift_emit")
+    assert ("codex", "down") in bus.calls and ("anthropic", "down") in bus.calls

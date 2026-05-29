@@ -163,15 +163,19 @@ def _write_sentinel(results: dict, emit_meta: Optional[dict]) -> None:
     tmp.replace(path)
 
 
-def _maybe_emit(bus: Any, backend: str, res: ProbeResult, _load_prev: dict) -> Optional[dict]:
-    """Edge-trigger: emit BACKEND_CONTRACT_DRIFT on healthy->down and at most
-    one re-page/hour while down; emit a recovery on down->healthy. Returns the
-    updated emit_meta dict for this backend (or None to leave unchanged)."""
+def _maybe_emit(bus: Any, backend: str, res: ProbeResult, prev: dict, emit_meta: dict) -> None:
+    """Edge-trigger BACKEND_CONTRACT_DRIFT and update emit_meta IN PLACE.
+
+    Emits at Priority.HIGH on healthy->down, then at most one re-page per
+    _REPAGE_SECONDS while still down; emits a 'recovered' event on down->healthy.
+    Mutates the SHARED ``emit_meta`` dict in place (NOT a per-call copy) so that
+    when both backends change state in one cycle, neither reverts the other's
+    ``last_drift_emit`` (which would break the hourly re-page cap). ``prev`` is
+    the loaded prior sentinel (read-only, used only for prev_state)."""
     from events.schema import EventType, Priority
 
-    prev_backends = (_load_prev or {}).get("backends", {})
+    prev_backends = (prev or {}).get("backends", {})
     prev_state = (prev_backends.get(backend) or {}).get("state", "healthy")
-    emit_meta = dict((_load_prev or {}).get("emit_meta", {}))
     last_emit_iso = emit_meta.get(backend, {}).get("last_drift_emit")
 
     def _emit(state: str):
@@ -196,7 +200,6 @@ def _maybe_emit(bus: Any, backend: str, res: ProbeResult, _load_prev: dict) -> O
     elif res.state == "healthy" and prev_state == "down":
         _emit("recovered")
         emit_meta[backend] = {}
-    return emit_meta
 
 
 def run_canary(*, bus: Any = None) -> dict:
@@ -229,16 +232,14 @@ def run_canary(*, bus: Any = None) -> dict:
                             else ProbeResult(None, "Anthropic not configured"))
 
     prev = _load_state()
-    merged_meta = dict(prev.get("emit_meta", {}))
+    emit_meta = dict(prev.get("emit_meta", {}))
     if bus is not None:
         for backend, res in results.items():
             try:
-                m = _maybe_emit(bus, backend, res, _load_prev=prev)
-                if m is not None:
-                    merged_meta.update(m)
+                _maybe_emit(bus, backend, res, prev, emit_meta)
             except Exception:
                 logger.debug("emit failed for %s", backend, exc_info=True)
-    _write_sentinel(results, emit_meta=merged_meta)
+    _write_sentinel(results, emit_meta=emit_meta)
 
     for backend, res in results.items():
         logger.info("canary %s: %s — %s", backend, res.state, res.detail)
