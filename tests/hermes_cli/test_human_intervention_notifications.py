@@ -270,9 +270,9 @@ def test_notification_includes_remote_deny_extend_but_not_approve():
         risk_explanation="会递归删除目标目录，删除通常不可逆。",
     )
 
-    assert "/deny 7392" in body
-    assert "/extend 7392 15" in body
-    assert "/status 7392" in body
+    assert "/iv deny 7392" in body
+    assert "/iv extend 7392 15" in body
+    assert "/iv status 7392" in body
     assert "风险: high" in body
     assert "危险解释:" in body and "递归删除" in body
     assert "/approve" not in body

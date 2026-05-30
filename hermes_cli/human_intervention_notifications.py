@@ -64,9 +64,9 @@ def _redact_and_truncate(text: str, max_chars: int = 120) -> str:
 
 
 _REMOTE_ACTION_TEMPLATES: dict[str, str] = {
-    "deny": "/deny {code}",
-    "extend": "/extend {code} 15",
-    "status": "/status {code}",
+    "deny": "/iv deny {code}",
+    "extend": "/iv extend {code} 15",
+    "status": "/iv status {code}",
 }
 
 
