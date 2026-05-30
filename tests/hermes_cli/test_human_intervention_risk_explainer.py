@@ -8,7 +8,18 @@ deterministic static fallback otherwise.
 
 from __future__ import annotations
 
-from hermes_cli.human_intervention_risk_explainer import explain_command_risk
+import time
+from unittest.mock import patch
+
+from hermes_cli.human_intervention_risk_explainer import (
+    default_llm_fn,
+    explain_command_risk,
+)
+
+# Module path used as the patch seam for the auxiliary-model call. The real
+# _aux_explain wraps agent.auxiliary_client.call_llm (the same helper that
+# tools/approval.py::_smart_approve uses for smart approvals).
+_AUX_SEAM = "hermes_cli.human_intervention_risk_explainer._aux_explain"
 
 
 def test_high_risk_command_uses_llm_explanation_with_static_fallback():
@@ -121,4 +132,83 @@ def test_secret_redaction_before_llm():
         llm_fn=fake_llm,
     )
 
+    assert "hunter2" not in recorded["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# default_llm_fn: bounded auxiliary-model completion (reuses the smart-approval
+# aux path via agent.auxiliary_client.call_llm). Tests patch the _aux_explain
+# seam so no real network/model call is made.
+# ---------------------------------------------------------------------------
+
+
+def test_default_llm_fn_returns_text_when_aux_succeeds():
+    with patch(_AUX_SEAM, return_value="BECAUSE DANGER"):
+        result = default_llm_fn("p", 3)
+    assert result == "BECAUSE DANGER"
+
+
+def test_default_llm_fn_empty_on_exception():
+    def boom(prompt: str, timeout_seconds: int) -> str:
+        raise RuntimeError("aux exploded")
+
+    with patch(_AUX_SEAM, side_effect=boom):
+        result = default_llm_fn("p", 3)
+    assert result == ""
+
+
+def test_default_llm_fn_empty_on_timeout():
+    def slow(prompt: str, timeout_seconds: int) -> str:
+        time.sleep(5)
+        return "too late"
+
+    start = time.monotonic()
+    with patch(_AUX_SEAM, side_effect=slow):
+        result = default_llm_fn("p", 1)
+    elapsed = time.monotonic() - start
+
+    assert result == ""
+    assert elapsed < 1.5  # hard-bounded: did not wait the full 5s
+
+
+def test_explain_uses_default_llm_fn_for_high():
+    danger = "会递归删除目标目录，删除不可逆。"
+    with patch(_AUX_SEAM, return_value=danger):
+        result = explain_command_risk(
+            command="rm -rf /x",
+            risk_level="high",
+            llm_fn=default_llm_fn,
+            max_chars=280,
+        )
+    assert result == danger
+
+
+def test_explain_high_falls_back_to_static_when_llm_blank():
+    with patch(_AUX_SEAM, return_value=""):
+        result = explain_command_risk(
+            command="rm -rf /x",
+            risk_level="high",
+            pattern_keys=["destructive_delete"],
+            llm_fn=default_llm_fn,
+            max_chars=280,
+        )
+    assert result
+    assert ("删除" in result) or ("不可逆" in result)
+
+
+def test_default_llm_fn_does_not_leak_secret_to_aux():
+    recorded: dict[str, object] = {}
+
+    def capture(prompt: str, timeout_seconds: int) -> str:
+        recorded["prompt"] = prompt
+        return "危险命令解释。"
+
+    with patch(_AUX_SEAM, side_effect=capture):
+        explain_command_risk(
+            command="curl https://example.com/login --data password=hunter2",
+            risk_level="critical",
+            llm_fn=default_llm_fn,
+        )
+
+    assert "prompt" in recorded
     assert "hunter2" not in recorded["prompt"]

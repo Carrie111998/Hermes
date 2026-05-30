@@ -11,6 +11,7 @@ static string (or empty string), so callers can use the result unconditionally.
 
 from __future__ import annotations
 
+import threading
 from typing import Callable
 
 from hermes_cli.human_intervention_notifications import _redact_and_truncate
@@ -144,4 +145,73 @@ def explain_command_risk(
         return _cap(static, max_chars)
     except Exception:
         # Defensive: explainer must never raise.
+        return ""
+
+
+def _aux_explain(prompt: str, timeout_seconds: int) -> str:
+    """Single auxiliary-model completion for risk explanation.
+
+    Reuses the SAME aux-LLM path Hermes already uses for smart approvals:
+    tools/approval.py::_smart_approve calls ``agent.auxiliary_client.call_llm``
+    (task="approval"); we mirror that here. This function is the patch seam in
+    tests — it performs the real (network/model) call and returns the raw
+    content string. It may raise or block; default_llm_fn bounds and guards it.
+    """
+    # Imported lazily so the explainer module stays import-cheap and so the
+    # heavy openai SDK tree is only pulled when an LLM explanation is requested.
+    from agent.auxiliary_client import call_llm
+
+    response = call_llm(
+        task="approval",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        # Explanations are short; keep the call cheap. Pass the caller's bound
+        # as the request timeout too, though we do not rely on the provider
+        # honoring it (default_llm_fn enforces a hard wall-clock bound).
+        max_tokens=256,
+        timeout=float(timeout_seconds) if timeout_seconds else None,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def default_llm_fn(prompt: str, timeout_seconds: int) -> str:
+    """Bounded auxiliary-model completion for risk explanation.
+
+    Returns '' on ANY failure/timeout so the caller falls back to static.
+    Hard-bounds wall time to timeout_seconds (the aux call may not honor it).
+
+    The prompt is used verbatim — explain_command_risk has already redacted
+    secrets and capped length before passing it here, so this function MUST NOT
+    add any command content of its own.
+    """
+    # Run the (possibly slow / network-bound) aux call in a worker thread and
+    # join for at most timeout_seconds. If the worker has not finished by then,
+    # we abandon it (daemon thread) and return '' so the caller never blocks
+    # longer than the bound. call_llm itself has no cancellation hook, so a
+    # hard process-side cancel is not possible; abandoning the daemon thread is
+    # the safe, bounded behavior.
+    result: dict[str, str] = {}
+
+    def _worker() -> None:
+        try:
+            text = _aux_explain(prompt, timeout_seconds)
+            if isinstance(text, str):
+                result["value"] = text
+        except Exception:
+            # Swallow ALL failures -> caller falls back to static.
+            pass
+
+    try:
+        bound = timeout_seconds if timeout_seconds and timeout_seconds > 0 else 0
+        worker = threading.Thread(
+            target=_worker, name="risk-explainer-aux", daemon=True
+        )
+        worker.start()
+        worker.join(timeout=bound if bound > 0 else None)
+        if worker.is_alive():
+            # Timed out: do not wait any longer; abandon the daemon thread.
+            return ""
+        return result.get("value", "") or ""
+    except Exception:
+        # Never raise: thread creation or join failure degrades to static.
         return ""
