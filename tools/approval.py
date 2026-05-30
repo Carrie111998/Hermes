@@ -2398,6 +2398,7 @@ def save_permanent_allowlist(patterns: set):
 def prompt_dangerous_approval(command: str, description: str,
                               timeout_seconds: int | None = None,
                               allow_permanent: bool = True,
+                              risk_level: str = "",
                               approval_callback=None,
                               *, smart_denied: bool = False) -> str:
     """Prompt the user to approve a dangerous command (CLI only).
@@ -2408,11 +2409,14 @@ def prompt_dangerous_approval(command: str, description: str,
             is inappropriate for content-level security findings).
         smart_denied: When True, this is an owner override of a Smart DENY.
             Offer only one-operation approval or denial.
+        risk_level: Deterministic command risk ('critical'|'high'|'medium')
+            derived by the orchestration. Threaded through to the callback
+            so downstream (CLI) can tier remote approval. May be empty.
         approval_callback: Optional callback registered by the CLI for
-            prompt_toolkit integration. Signature:
-            (command, description, *, allow_permanent=True,
-            smart_denied=False) -> str. Legacy callback signatures remain
-            supported when ``smart_denied`` is false.
+        prompt_toolkit integration. Signature:
+        (command, description, *, allow_permanent=True,
+            smart_denied=False, risk_level="") -> str. Legacy callback
+            signatures remain supported when ``smart_denied`` is false.
 
     Returns: 'once', 'session', 'always', or 'deny'
     """
@@ -2429,11 +2433,28 @@ def prompt_dangerous_approval(command: str, description: str,
 
     if approval_callback is not None:
         try:
-            callback_kwargs = {"allow_permanent": allow_permanent}
+            callback_kwargs = {
+                "allow_permanent": allow_permanent,
+                "risk_level": risk_level,
+            }
             if smart_denied:
                 callback_kwargs["smart_denied"] = True
             return approval_callback(
                 display_command, display_description, **callback_kwargs
+            )
+        except TypeError:
+            # Older callbacks without a risk_level kwarg (e.g. delegate
+            # auto-approve, subagent callbacks). Do not drop smart_denied:
+            # that restriction is security-relevant for owner overrides.
+            if smart_denied:
+                logger.error(
+                    "Approval callback does not support security-relevant "
+                    "smart_denied restriction; denying"
+                )
+                return "deny"
+            return approval_callback(
+                display_command, display_description,
+                allow_permanent=allow_permanent,
             )
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
@@ -3332,6 +3353,49 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     return {"resolved": resolved, "choice": choice, "reason": entry.reason}
 
 
+def _derive_risk_level(tirith_result: dict, is_dangerous: bool,
+                       is_hardline: bool = False) -> str:
+    """Map available guard signals to critical|high|medium.
+
+    Deterministic mapping (a prompt is showing, so the floor is 'medium'):
+      - is_hardline                                  -> 'critical'
+      - any tirith finding severity == 'critical'    -> 'critical'
+      - tirith action == 'block' (non-critical)
+        OR any finding severity == 'high'            -> 'high'
+      - is_dangerous (pattern match), no escalation   -> 'high' (conservative)
+      - tirith 'warn' with only medium/low findings   -> 'medium'
+      - otherwise                                     -> 'medium'
+
+    Defensive: ``tirith_result`` may be ``{}`` or lack ``findings``; treat
+    missing signals as no tirith signal. Severities are read
+    case-insensitively.
+    """
+    if is_hardline:
+        return "critical"
+
+    tirith_result = tirith_result or {}
+    action = str(tirith_result.get("action", "") or "").lower()
+    findings = tirith_result.get("findings") or []
+    severities = {
+        str(f.get("severity", "") or "").lower()
+        for f in findings
+        if isinstance(f, dict)
+    }
+
+    if "critical" in severities:
+        return "critical"
+
+    if action == "block" or "high" in severities:
+        return "high"
+
+    if is_dangerous:
+        return "high"
+
+    # tirith 'warn' with only medium/low findings, or no signal at all:
+    # a prompt is showing, so at least medium.
+    return "medium"
+
+
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False) -> dict:
@@ -3749,10 +3813,12 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key,
         surface="cli",
     )
+    risk_level = _derive_risk_level(tirith_result, is_dangerous, is_hardline)
     choice = prompt_dangerous_approval(
         command,
         combined_desc,
         allow_permanent=has_permanent_capable and not smart_denied_for_owner,
+        risk_level=risk_level,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
     )
