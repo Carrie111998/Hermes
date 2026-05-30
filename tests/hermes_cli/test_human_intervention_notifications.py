@@ -15,6 +15,26 @@ def test_default_config_includes_disabled_human_intervention_notifications():
     assert cfg["command_preview_chars"] > 0
 
 
+def test_default_config_includes_remote_control_disabled():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    cfg = DEFAULT_CONFIG["notifications"]["human_intervention"]["remote_control"]
+
+    # Remote control is OFF by default and remote approval is never allowed.
+    assert cfg["enabled"] is False
+    assert cfg["allow_deny"] is True
+    assert cfg["allow_extend"] is True
+    assert cfg["allow_approve"] is False
+    assert cfg["max_total_wait_minutes"] == 15
+    assert cfg["max_extend_minutes"] == 15
+    assert isinstance(cfg["allowed_targets"], list)
+    # Advisory risk explanation defaults.
+    re_cfg = cfg["risk_explanation"]
+    assert re_cfg["enabled"] is True
+    assert "high" in re_cfg["only_for_risk_levels"]
+    assert re_cfg["max_chars"] > 0
+
+
 def test_redact_and_truncate_masks_secret_like_command_preview():
     from hermes_cli.human_intervention_notifications import _redact_and_truncate
 

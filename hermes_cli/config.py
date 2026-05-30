@@ -2818,6 +2818,28 @@ DEFAULT_CONFIG = {
             "repeat_before_timeout_seconds": 15,
             "include_command_preview": True,
             "command_preview_chars": 120,
+            # Mobile remote control of a pending CLI human-intervention prompt.
+            # Phase 1 supports remote DENY (cancel) and EXTEND only — never
+            # remote approve, never remote sudo password, never remote clarify
+            # answer. Disabled by default; delivery/parse failures never change
+            # local prompt semantics. Drives the /iv deny|extend|status command.
+            "remote_control": {
+                "enabled": False,
+                "allow_deny": True,
+                "allow_extend": True,
+                "allow_approve": False,
+                "code_ttl_seconds": 90,
+                "max_extend_minutes": 15,
+                "max_total_wait_minutes": 15,
+                "allowed_targets": ["telegram", "weixin"],
+                "risk_explanation": {
+                    "enabled": True,
+                    "only_for_risk_levels": ["high", "critical"],
+                    "max_chars": 280,
+                    "timeout_seconds": 3,
+                    "fallback_to_static": True,
+                },
+            },
         },
     },
 
