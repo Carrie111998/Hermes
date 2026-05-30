@@ -81,6 +81,8 @@ def _compose_message(
     remote_actions: list[str] | None = None,
     risk_level: str = "",
     risk_explanation: str = "",
+    approve_tier: str = "",
+    approve_token: str = "",
 ) -> str:
     lines = [f"{title}", "请回到 CLI 处理；此通知不会远程批准本地命令。"]
     if kind:
@@ -95,15 +97,29 @@ def _compose_message(
         lines.append("危险解释:")
         lines.append(risk_explanation)
     if remote_code and remote_actions:
-        command_lines = [
+        action_lines = [
             _REMOTE_ACTION_TEMPLATES[action].format(code=remote_code)
             for action in remote_actions
             if action in _REMOTE_ACTION_TEMPLATES
         ]
+        remote_approve_allowed = approve_tier in ("one_tap", "typed_confirm")
+        approve_line = ""
+        if approve_tier == "one_tap":
+            approve_line = f"/iv approve {remote_code}"
+        elif approve_tier == "typed_confirm":
+            approve_line = f"/iv approve {remote_code} {approve_token}"
+        # Approve is the primary action when allowed: list it first.
+        command_lines = ([approve_line] if approve_line else []) + action_lines
         if command_lines:
             lines.append("可远程操作:")
             lines.extend(command_lines)
-            lines.append("注意：当前阶段不支持远程批准。批准请回到 CLI。")
+            if remote_approve_allowed:
+                if approve_tier == "typed_confirm":
+                    lines.append("注意：高风险命令需输入确认令牌。")
+                else:
+                    lines.append("注意：远程批准等价于本地“仅此一次”。")
+            else:
+                lines.append("注意：当前阶段不支持远程批准。批准请回到 CLI。")
     preview = str(message or "").strip()
     if preview:
         lines.append(preview)
@@ -184,6 +200,8 @@ def notify_human_intervention(
     remote_actions: list[str] | None = None,
     risk_level: str = "",
     risk_explanation: str = "",
+    approve_tier: str = "",
+    approve_token: str = "",
 ) -> None:
     """Emit a best-effort human-intervention notification and never raise."""
     try:
@@ -222,6 +240,8 @@ def notify_human_intervention(
             remote_actions=remote_actions,
             risk_level=risk_level,
             risk_explanation=risk_explanation,
+            approve_tier=approve_tier,
+            approve_token=approve_token,
         )
 
         if "bell" in channels:

@@ -310,3 +310,85 @@ def test_compose_message_without_new_params_is_unchanged():
     assert "/deny" not in body
     assert "/extend" not in body
     assert "/approve" not in body
+
+
+def test_notification_medium_one_tap_approve():
+    from hermes_cli.human_intervention_notifications import _compose_message
+
+    body = _compose_message(
+        "approval",
+        "t",
+        "cmd",
+        remote_code="7392",
+        remote_actions=["deny", "extend", "status"],
+        risk_level="medium",
+        approve_tier="one_tap",
+    )
+
+    assert "/iv approve 7392" in body
+    # The approve line must be exactly '/iv approve 7392' with no trailing token.
+    approve_lines = [ln for ln in body.splitlines() if ln.startswith("/iv approve")]
+    assert approve_lines == ["/iv approve 7392"]
+    assert "/iv deny 7392" in body
+    # one_tap clarifying line present.
+    assert "仅此一次" in body
+    # The 'no remote approval' safety line must NOT be present.
+    assert "不支持远程批准" not in body
+
+
+def test_notification_high_typed_confirm_approve():
+    from hermes_cli.human_intervention_notifications import _compose_message
+
+    body = _compose_message(
+        "approval",
+        "t",
+        "cmd",
+        remote_code="7392",
+        remote_actions=["deny", "extend", "status"],
+        risk_level="high",
+        approve_tier="typed_confirm",
+        approve_token="4815",
+    )
+
+    assert "/iv approve 7392 4815" in body
+    assert "4815" in body
+    assert "/iv deny 7392" in body
+    assert "/iv extend 7392 15" in body
+    assert "/iv status 7392" in body
+    assert "不支持远程批准" not in body
+    # typed_confirm clarifying line mentions the confirmation token.
+    assert "确认令牌" in body
+
+
+def test_notification_critical_none_keeps_safety_line():
+    from hermes_cli.human_intervention_notifications import _compose_message
+
+    body = _compose_message(
+        "approval",
+        "t",
+        "cmd",
+        remote_code="7392",
+        remote_actions=["deny", "extend", "status"],
+        risk_level="critical",
+        approve_tier="none",
+    )
+
+    assert "/iv approve" not in body
+    assert "不支持远程批准" in body
+    assert "/iv deny 7392" in body
+    assert "/iv status 7392" in body
+
+
+def test_notification_no_tier_unchanged():
+    from hermes_cli.human_intervention_notifications import _compose_message
+
+    body = _compose_message(
+        "approval",
+        "t",
+        "cmd",
+        remote_code="7392",
+        remote_actions=["deny", "extend", "status"],
+    )
+
+    assert "/iv approve" not in body
+    assert "不支持远程批准" in body
