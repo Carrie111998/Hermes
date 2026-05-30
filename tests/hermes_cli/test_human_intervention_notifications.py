@@ -28,11 +28,18 @@ def test_default_config_includes_remote_control_disabled():
     assert cfg["max_total_wait_minutes"] == 15
     assert cfg["max_extend_minutes"] == 15
     assert isinstance(cfg["allowed_targets"], list)
+    # Phase-2 tiered-approve defaults: approve gated off, critical never approvable.
+    assert cfg["approve_medium"] is True
+    assert cfg["approve_high_typed_confirm"] is True
+    assert cfg["approve_token_len"] >= 4
+    assert "critical" in cfg["never_approve_levels"]
     # Advisory risk explanation defaults.
     re_cfg = cfg["risk_explanation"]
     assert re_cfg["enabled"] is True
     assert "high" in re_cfg["only_for_risk_levels"]
     assert re_cfg["max_chars"] > 0
+    # LLM danger explanation defaults off (opt-in).
+    assert re_cfg["use_llm"] is False
 
 
 def test_redact_and_truncate_masks_secret_like_command_preview():

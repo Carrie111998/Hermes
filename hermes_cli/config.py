@@ -2819,15 +2819,24 @@ DEFAULT_CONFIG = {
             "include_command_preview": True,
             "command_preview_chars": 120,
             # Mobile remote control of a pending CLI human-intervention prompt.
-            # Phase 1 supports remote DENY (cancel) and EXTEND only — never
-            # remote approve, never remote sudo password, never remote clarify
-            # answer. Disabled by default; delivery/parse failures never change
-            # local prompt semantics. Drives the /iv deny|extend|status command.
+            # Phase 1: remote DENY (cancel) and EXTEND. Phase 2: tiered remote
+            # APPROVE — medium risk one-tap (/iv approve <code>), high risk
+            # typed-confirm (/iv approve <code> <token>). critical/hardline is
+            # NEVER remotely approvable; remote sudo password / clarify answer
+            # are never allowed. Disabled by default; delivery/parse failures
+            # never change local prompt semantics. Drives /iv deny|extend|
+            # status|approve.
             "remote_control": {
                 "enabled": False,
                 "allow_deny": True,
                 "allow_extend": True,
+                # Master gate for ANY remote approve. Off by default.
                 "allow_approve": False,
+                # Tier rules (only consulted when allow_approve is True):
+                "approve_medium": True,            # one-tap approve for medium
+                "approve_high_typed_confirm": True,  # high needs a confirm token
+                "approve_token_len": 4,            # typed-confirm token length
+                "never_approve_levels": ["critical"],  # never remotely approvable
                 "code_ttl_seconds": 90,
                 "max_extend_minutes": 15,
                 "max_total_wait_minutes": 15,
@@ -2838,6 +2847,9 @@ DEFAULT_CONFIG = {
                     "max_chars": 280,
                     "timeout_seconds": 3,
                     "fallback_to_static": True,
+                    # Phase 2: use a bounded auxiliary-model call for the danger
+                    # explanation (static fallback on timeout/failure).
+                    "use_llm": False,
                 },
             },
         },
