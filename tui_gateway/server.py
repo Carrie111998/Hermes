@@ -13,7 +13,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional, cast
 
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -116,7 +116,7 @@ except Exception:
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
-_methods: dict[str, callable] = {}
+_methods: dict[str, Callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _answers: dict[str, str] = {}
 _db = None
@@ -232,8 +232,9 @@ class _SlashWorker:
         with self._lock:
             self._seq += 1
             rid = self._seq
-            self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
-            self.proc.stdin.flush()
+            if self.proc.stdin:
+                self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
+                self.proc.stdin.flush()
 
             while True:
                 try:
@@ -383,7 +384,7 @@ def write_json(obj: dict) -> bool:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
-    params = {"type": event, "session_id": sid}
+    params: dict[str, Any] = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
@@ -412,11 +413,12 @@ def _estimate_image_tokens(width: int, height: int) -> int:
 
 
 def _image_meta(path: Path) -> dict:
-    meta = {"name": path.name}
+    meta: dict[str, Any] = {"name": path.name}
     try:
-        from PIL import Image
+        # Use Any to avoid ty check failures on PIL which might not be installed
+        PIL_Image: Any = __import__("PIL.Image", fromlist=["Image"])
 
-        with Image.open(path) as img:
+        with PIL_Image.open(path) as img:
             width, height = img.size
         meta["width"] = int(width)
         meta["height"] = int(height)
@@ -845,7 +847,7 @@ def _coerce_statusbar(raw) -> str:
     return "top"
 
 
-def _display_mouse_tracking(display: dict) -> bool:
+def _display_mouse_tracking(display: Optional[dict]) -> bool:
     """Return canonical display.mouse_tracking with legacy tui_mouse fallback."""
     if not isinstance(display, dict):
         return True
@@ -908,13 +910,14 @@ def _load_enabled_toolsets() -> list[str] | None:
     cfg = None
     fallback_notice = None
 
+    _validate_toolset: Any = None
     try:
-        from toolsets import validate_toolset
+        from toolsets import validate_toolset as _validate_toolset
     except Exception:
-        validate_toolset = None
+        pass
 
-    if explicit and validate_toolset is not None:
-        built_in = [name for name in explicit if validate_toolset(name)]
+    if explicit and _validate_toolset is not None:
+        built_in = [name for name in explicit if _validate_toolset(name)]
         unresolved = [name for name in explicit if name not in built_in]
 
         if unresolved:
@@ -922,7 +925,7 @@ def _load_enabled_toolsets() -> list[str] | None:
                 from hermes_cli.plugins import discover_plugins
 
                 discover_plugins()
-                plugin_valid = [name for name in unresolved if validate_toolset(name)]
+                plugin_valid = [name for name in unresolved if _validate_toolset(name)]
             except Exception:
                 plugin_valid = []
 
@@ -951,12 +954,12 @@ def _load_enabled_toolsets() -> list[str] | None:
             from hermes_cli.tools_config import _parse_enabled_flag
 
             raw_cfg = read_raw_config()
-            mcp_servers = (
+            mcp_servers: Any = (
                 raw_cfg.get("mcp_servers")
                 if isinstance(raw_cfg.get("mcp_servers"), dict)
                 else {}
             )
-            for name, server_cfg in mcp_servers.items():
+            for name, server_cfg in cast(dict, mcp_servers).items():
                 if not isinstance(server_cfg, dict):
                     continue
                 if _parse_enabled_flag(server_cfg.get("enabled", True), default=True):
@@ -1100,8 +1103,8 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
 
     # Load user-defined providers so switch_model can resolve named custom
     # endpoints (e.g. "ollama-launch") and validate against saved model lists.
-    user_provs = None
-    custom_provs = None
+    user_provs: Any = None
+    custom_provs: Any = None
     try:
         from hermes_cli.config import get_compatible_custom_providers, load_config
 
@@ -1119,7 +1122,7 @@ def _apply_model_switch(sid: str, session: dict, raw_input: str) -> dict:
         current_api_key=current_api_key,
         is_global=persist_global,
         explicit_provider=explicit_provider,
-        user_providers=user_provs,
+        user_providers=user_provs or {},
         custom_providers=custom_provs,
     )
     if not result.success:
@@ -1473,11 +1476,11 @@ def _fmt_tool_duration(seconds: float | None) -> str:
 
 
 def _count_list(obj: object, *path: str) -> int | None:
-    cur = obj
+    cur: Any = obj
     for key in path:
         if not isinstance(cur, dict):
             return None
-        cur = cur.get(key)
+        cur = cast(dict, cur).get(key)
     return len(cur) if isinstance(cur, list) else None
 
 
@@ -1532,7 +1535,7 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
 
 
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
-    payload = {"tool_id": tool_call_id, "name": name}
+    payload: dict[str, Any] = {"tool_id": tool_call_id, "name": name}
     session = _sessions.get(sid)
     snapshot = None
     started_at = None
@@ -1587,7 +1590,7 @@ def _on_tool_progress(
         _emit("reasoning.available", sid, {"text": str(preview)})
         return
     if event_type.startswith("subagent."):
-        payload = {
+        payload: dict[str, Any] = {
             "goal": str(_kwargs.get("goal") or ""),
             "task_count": int(_kwargs.get("task_count") or 1),
             "task_index": int(_kwargs.get("task_index") or 0),
@@ -2875,7 +2878,8 @@ def _(rid, params: dict) -> dict:
     started_at = params.get("started_at")
     finished_at = params.get("finished_at") or time.time()
     label = str(params.get("label") or "")
-    ts = datetime.utcfromtimestamp(float(finished_at)).strftime("%Y%m%dT%H%M%S")
+    from datetime import timezone
+    ts = datetime.fromtimestamp(float(finished_at), timezone.utc).strftime("%Y%m%dT%H%M%S")
     fname = f"{ts}.json"
     d = _spawn_tree_session_dir(session_id or "default")
     path = d / fname
@@ -3858,7 +3862,7 @@ def _(rid, params: dict) -> dict:
             current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
             current_overrides.pop("service_tier", None)
             current_overrides.pop("speed", None)
-            if nv == "fast":
+            if nv == "fast" and isinstance(overrides, dict):
                 current_overrides.update(overrides)
             agent.request_overrides = current_overrides
             _emit(

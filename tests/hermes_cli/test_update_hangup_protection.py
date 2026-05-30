@@ -207,27 +207,33 @@ class TestInstallHangupProtection:
         if hasattr(_cfg, "_HERMES_HOME_CACHE"):
             _cfg._HERMES_HOME_CACHE = None  # type: ignore[attr-defined]
 
-        prev_out, prev_err = sys.stdout, sys.stderr
-        state = _install_hangup_protection(gateway_mode=False)
+        # Use patch.multiple to safely swap and restore sys.stdout/stderr.
+        # This prevents the test from permanently hijacking stdio if it
+        # crashes, and keeps it isolated from other tests in xdist.
+        with patch.multiple(sys, stdout=sys.stdout, stderr=sys.stderr):
+            prev_out, prev_err = sys.stdout, sys.stderr
+            state = _install_hangup_protection(gateway_mode=False)
 
-        try:
-            # On Windows (no SIGHUP) we still wrap stdio and create the log.
-            assert state["installed"] is True
-            assert isinstance(sys.stdout, _UpdateOutputStream)
-            assert isinstance(sys.stderr, _UpdateOutputStream)
-            assert state["log_file"] is not None
+            try:
+                # On Windows (no SIGHUP) we still wrap stdio and create the log.
+                assert state["installed"] is True
+                assert isinstance(sys.stdout, _UpdateOutputStream)
+                assert isinstance(sys.stderr, _UpdateOutputStream)
+                assert state["log_file"] is not None
 
-            sys.stdout.write("checking mirror\n")
-            sys.stdout.flush()
+                sys.stdout.write("checking mirror\n")
+                sys.stdout.flush()
 
-            log_path = tmp_path / "logs" / "update.log"
-            assert log_path.exists()
-            contents = log_path.read_text(encoding="utf-8")
-            assert "checking mirror" in contents
-            assert "hermes update started" in contents
-        finally:
-            _finalize_update_output(state)
-            # Sanity-check restoration
+                log_path = tmp_path / "logs" / "update.log"
+                assert log_path.exists()
+                contents = log_path.read_text(encoding="utf-8")
+                assert "checking mirror" in contents
+                assert "hermes update started" in contents
+            finally:
+                _finalize_update_output(state)
+
+            # Sanity-check restoration (within the patch block, _finalize_update_output
+            # should have restored the 'previous' streams that patch was tracking).
             assert sys.stdout is prev_out
             assert sys.stderr is prev_err
 
