@@ -63,14 +63,47 @@ def _redact_and_truncate(text: str, max_chars: int = 120) -> str:
     return value
 
 
-def _compose_message(kind: str, title: str, message: str, *, session_key: str = "", timeout_seconds: int | None = None) -> str:
+_REMOTE_ACTION_TEMPLATES: dict[str, str] = {
+    "deny": "/deny {code}",
+    "extend": "/extend {code} 15",
+    "status": "/status {code}",
+}
+
+
+def _compose_message(
+    kind: str,
+    title: str,
+    message: str,
+    *,
+    session_key: str = "",
+    timeout_seconds: int | None = None,
+    remote_code: str = "",
+    remote_actions: list[str] | None = None,
+    risk_level: str = "",
+    risk_explanation: str = "",
+) -> str:
     lines = [f"{title}", "请回到 CLI 处理；此通知不会远程批准本地命令。"]
     if kind:
         lines.append(f"类型: {kind}")
+    if risk_level:
+        lines.append(f"风险: {risk_level}")
     if timeout_seconds is not None:
         lines.append(f"超时: {timeout_seconds}s")
     if session_key:
         lines.append(f"会话: {session_key}")
+    if risk_explanation:
+        lines.append("危险解释:")
+        lines.append(risk_explanation)
+    if remote_code and remote_actions:
+        command_lines = [
+            _REMOTE_ACTION_TEMPLATES[action].format(code=remote_code)
+            for action in remote_actions
+            if action in _REMOTE_ACTION_TEMPLATES
+        ]
+        if command_lines:
+            lines.append("可远程操作:")
+            lines.extend(command_lines)
+            lines.append("注意：当前阶段不支持远程批准。批准请回到 CLI。")
     preview = str(message or "").strip()
     if preview:
         lines.append(preview)
@@ -147,6 +180,10 @@ def notify_human_intervention(
     severity: str = "warning",
     dedupe_key: str = "",
     timeout_seconds: int | None = None,
+    remote_code: str = "",
+    remote_actions: list[str] | None = None,
+    risk_level: str = "",
+    risk_explanation: str = "",
 ) -> None:
     """Emit a best-effort human-intervention notification and never raise."""
     try:
@@ -181,6 +218,10 @@ def notify_human_intervention(
             preview,
             session_key=session_key,
             timeout_seconds=timeout_seconds,
+            remote_code=remote_code,
+            remote_actions=remote_actions,
+            risk_level=risk_level,
+            risk_explanation=risk_explanation,
         )
 
         if "bell" in channels:

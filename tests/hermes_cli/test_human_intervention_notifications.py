@@ -253,3 +253,40 @@ def test_clarify_callback_notifies_once_without_changing_result(monkeypatch):
     assert args[0] == "clarify"
     assert "Deploy now?" in args[2]
     assert kwargs["timeout_seconds"] == 120
+
+
+def test_notification_includes_remote_deny_extend_but_not_approve():
+    from hermes_cli.human_intervention_notifications import _compose_message
+
+    body = _compose_message(
+        "approval",
+        "Approval needed",
+        "rm -rf /tmp/example",
+        session_key="sess-1",
+        timeout_seconds=60,
+        remote_code="7392",
+        remote_actions=["deny", "extend", "status"],
+        risk_level="high",
+        risk_explanation="会递归删除目标目录，删除通常不可逆。",
+    )
+
+    assert "/deny 7392" in body
+    assert "/extend 7392 15" in body
+    assert "/status 7392" in body
+    assert "风险: high" in body
+    assert "危险解释:" in body and "递归删除" in body
+    assert "/approve" not in body
+    assert "会话: sess-1" in body
+
+
+def test_compose_message_without_new_params_is_unchanged():
+    from hermes_cli.human_intervention_notifications import _compose_message
+
+    body = _compose_message("approval", "t", "m")
+
+    assert "可远程操作:" not in body
+    assert "风险:" not in body
+    assert "危险解释:" not in body
+    assert "/deny" not in body
+    assert "/extend" not in body
+    assert "/approve" not in body
