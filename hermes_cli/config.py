@@ -2845,10 +2845,19 @@ DEFAULT_CONFIG = {
                     "enabled": True,
                     "only_for_risk_levels": ["high", "critical"],
                     "max_chars": 280,
-                    "timeout_seconds": 3,
+                    # Wall-clock budget for the danger explanation. The real
+                    # default_llm_fn → call_llm path measures ~4s on a fast aux
+                    # model (higher than a bare HTTP probe due to client/config
+                    # setup), so 8s leaves jitter margin. Safe to keep generous:
+                    # cli.py computes the explanation AFTER painting the local
+                    # approval panel, so this only delays the mobile
+                    # notification, never the local prompt.
+                    "timeout_seconds": 8,
                     "fallback_to_static": True,
                     # Phase 2: use a bounded auxiliary-model call for the danger
-                    # explanation (static fallback on timeout/failure).
+                    # explanation (static fallback on timeout/failure). Off by
+                    # default — only enable with a FAST model at
+                    # auxiliary.approval (a slow reasoning model times out → static).
                     "use_llm": False,
                 },
             },

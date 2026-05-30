@@ -38,8 +38,10 @@ def test_default_config_includes_remote_control_disabled():
     assert re_cfg["enabled"] is True
     assert "high" in re_cfg["only_for_risk_levels"]
     assert re_cfg["max_chars"] > 0
-    # LLM danger explanation defaults off (opt-in).
+    # LLM danger explanation defaults off (opt-in); generous wall-clock budget
+    # so a fast aux model fits without delaying the (already-painted) local panel.
     assert re_cfg["use_llm"] is False
+    assert re_cfg["timeout_seconds"] >= 8
 
 
 def test_redact_and_truncate_masks_secret_like_command_preview():
