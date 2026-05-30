@@ -4,10 +4,19 @@ import pytest
 
 
 # ---- Fake stream plumbing (mimics openai responses.stream context manager) ----
+# Re-calibrated canary (2026-05-30): the probe now asserts the backend DELIVERS
+# CONTENT through the production output=None guard, not that the stock parser
+# survives an output=None aggregate. So the fake stream can carry
+# ``output_text.delta`` text and an optional message item, and its
+# ``get_final_response`` mirrors the GUARDED path (returns the coerced output
+# without raising) unless ``raise_on_final`` simulates a NEW unhandled shape.
 class _FakeStream:
-    def __init__(self, completed_output, raise_on_final=False):
+    def __init__(self, completed_output, raise_on_final=False, delta_text="",
+                 message_item=True):
         self._output = completed_output
         self._raise = raise_on_final
+        self._delta = delta_text
+        self._message_item = message_item
 
     def __enter__(self):
         return self
@@ -16,48 +25,82 @@ class _FakeStream:
         return False
 
     def __iter__(self):
-        yield SimpleNamespace(type="response.output_item.done",
-                              item=SimpleNamespace(type="message"))
+        if self._delta:
+            yield SimpleNamespace(type="response.output_text.delta", delta=self._delta)
+        if self._message_item:
+            yield SimpleNamespace(type="response.output_item.done",
+                                  item=SimpleNamespace(type="message"))
         yield SimpleNamespace(type="response.completed",
                               response=SimpleNamespace(output=self._output))
 
     def get_final_response(self):
         if self._raise:
             raise TypeError("'NoneType' object is not iterable")
-        return SimpleNamespace(output=self._output)
+        return SimpleNamespace(output=self._output, output_text=self._delta)
 
 
 class _FakeResponses:
-    def __init__(self, completed_output, raise_on_final=False):
+    def __init__(self, completed_output, raise_on_final=False, delta_text="",
+                 message_item=True):
         self._o = completed_output
         self._r = raise_on_final
+        self._d = delta_text
+        self._m = message_item
 
     def stream(self, **kw):
-        return _FakeStream(self._o, self._r)
+        return _FakeStream(self._o, self._r, self._d, self._m)
 
 
 class _FakeCodexClient:
-    def __init__(self, completed_output, raise_on_final=False):
-        self.responses = _FakeResponses(completed_output, raise_on_final)
+    def __init__(self, completed_output, raise_on_final=False, delta_text="",
+                 message_item=True):
+        self.responses = _FakeResponses(completed_output, raise_on_final,
+                                        delta_text, message_item)
 
 
-def test_codex_healthy_when_output_is_list():
+def test_codex_healthy_when_content_delivered_via_deltas_despite_output_none():
+    # THE re-calibration: backend streams the real text via output_text.delta but
+    # the final aggregate is None (the now-permanent, guard-handled Codex shape).
+    # Content arrived -> healthy, NOT drift.
     from obs.backend_conformance_canary import check_codex_conformance
-    res = check_codex_conformance(_FakeCodexClient([SimpleNamespace(type="message")]), "gpt-5.5")
+    res = check_codex_conformance(
+        _FakeCodexClient(None, delta_text="ok", message_item=True), "gpt-5.5")
+    assert res.healthy is True
+    assert "content" in res.detail.lower()
+
+
+def test_codex_healthy_when_output_is_nonempty_list():
+    from obs.backend_conformance_canary import check_codex_conformance
+    res = check_codex_conformance(
+        _FakeCodexClient([SimpleNamespace(type="message")], delta_text="ok"), "gpt-5.5")
     assert res.healthy is True
 
 
-def test_codex_drift_when_output_none_via_final():
+def test_codex_drift_when_no_content_at_all():
+    # Round-tripped but produced nothing: output=None, zero deltas, zero items.
+    # This is the genuinely-empty/blocked case the guard CANNOT backfill -> down.
     from obs.backend_conformance_canary import check_codex_conformance
-    res = check_codex_conformance(_FakeCodexClient(None), "gpt-5.5")
+    res = check_codex_conformance(
+        _FakeCodexClient(None, delta_text="", message_item=False), "gpt-5.5")
     assert res.healthy is False
-    assert "output" in res.detail.lower()
+    assert "no content" in res.detail.lower()
 
 
-def test_codex_drift_when_stock_parser_raises():
+def test_codex_drift_when_parser_raises_despite_guard():
+    # A TypeError even with the guard applied = a NEW shape the guard can't
+    # absorb -> drift (down), not inconclusive.
     from obs.backend_conformance_canary import check_codex_conformance
-    res = check_codex_conformance(_FakeCodexClient(None, raise_on_final=True), "gpt-5.5")
+    res = check_codex_conformance(
+        _FakeCodexClient(None, raise_on_final=True), "gpt-5.5")
     assert res.healthy is False
+
+
+def test_codex_drift_when_output_not_a_list():
+    from obs.backend_conformance_canary import check_codex_conformance
+    res = check_codex_conformance(
+        _FakeCodexClient("weird", delta_text="", message_item=False), "gpt-5.5")
+    assert res.healthy is False
+    assert "list" in res.detail.lower()
 
 
 def test_network_error_is_inconclusive_not_drift():
@@ -71,16 +114,6 @@ def test_network_error_is_inconclusive_not_drift():
 
     res = check_codex_conformance(_Boom(), "gpt-5.5")
     assert res.healthy is None  # inconclusive, NOT down
-
-
-def test_ensure_stock_parser_removes_guard():
-    import openai.lib._parsing._responses as r
-    from agent.openai_codex_compat import apply_codex_output_none_guard
-    from obs.backend_conformance_canary import _ensure_stock_parser
-    apply_codex_output_none_guard(force=True)
-    assert getattr(r.parse_response, "_hermes_codex_output_none_guard", False) is True
-    _ensure_stock_parser()
-    assert getattr(r.parse_response, "_hermes_codex_output_none_guard", False) is False
 
 
 def test_edge_trigger_emits_once_for_consecutive_drift(tmp_path, monkeypatch):
@@ -108,6 +141,34 @@ def test_edge_trigger_emits_once_for_consecutive_drift(tmp_path, monkeypatch):
     canary._maybe_emit(bus, "codex", drift, canary._load_state(), meta)
 
     assert [e for e in emitted if e[1] == "down"] == [("codex", "down")]
+
+
+def test_recovered_emits_on_down_to_healthy(tmp_path, monkeypatch):
+    # After re-calibration the canary should be ABLE to recover: a healthy probe
+    # following a down state emits a 'recovered' event and clears emit_meta.
+    import json as _json
+    import obs.backend_conformance_canary as canary
+
+    emitted = []
+
+    class _Bus:
+        def emit(self, *, event_type, source, payload, priority=None, **kw):
+            emitted.append((payload.get("backend"), payload.get("state")))
+
+    state_file = tmp_path / "backend_conformance.json"
+    monkeypatch.setattr(canary, "_sentinel_path", lambda: state_file)
+    state_file.write_text(_json.dumps({
+        "ts": "2000-01-01T00:00:00+00:00",
+        "backends": {"codex": {"state": "down", "detail": "x"}},
+        "emit_meta": {"codex": {"last_drift_emit": "2000-01-01T00:00:00+00:00"}},
+    }), encoding="utf-8")
+
+    healthy = canary.ProbeResult(healthy=True, detail="Codex delivers content")
+    prev = canary._load_state()
+    meta = dict(prev.get("emit_meta", {}))
+    canary._maybe_emit(_Bus(), "codex", healthy, prev, meta)
+    assert ("codex", "recovered") in emitted
+    assert meta.get("codex") == {}
 
 
 def test_dual_backend_drift_preserves_each_emit_meta(tmp_path, monkeypatch):

@@ -1,25 +1,38 @@
 """Synthetic backend-conformance canary (SR-470 / ADR-0024 §2).
 
 R57 (2026-05-28): the Codex /responses backend began streaming a
-``response.completed`` whose ``output`` is ``None``; the openai SDK parser
-crashed, the agent loop classified it non-retryable, and 14/31 crons went down
-for hours with no alert. Version-currency monitoring cannot catch this class —
-no component version changed. The only detector that would have caught it is a
-synthetic canary that issues one real round-trip and asserts on *shape*.
+``response.completed`` whose ``output`` is ``None`` (the model's real text
+arrives via ``response.output_text.delta`` events; only the final aggregate
+snapshot is ``None``). Unguarded, the openai SDK parser crashed, the agent loop
+classified it non-retryable, and 14/31 crons went down for hours with no alert.
+Version-currency monitoring cannot catch this class — no component version
+changed.
 
-This canary (run by a Windows Scheduled Task every ~10 min):
+The SR-467 output=None guard + run_agent's delta-backfill now absorb that shape
+transparently, so it became the *permanent, handled* steady state. A canary that
+asserted "the stock parser survives output=None" therefore fired permanently on
+an already-handled condition (alarm fatigue — it could no longer distinguish the
+known/handled drift from a genuinely new failure).
+
+Re-calibrated 2026-05-30 (ADR-0024 §2 addendum): this canary now applies the
+SAME guard production uses and asserts the backend actually DELIVERS CONTENT —
+not that the raw aggregate is non-None. It (run by a Windows Scheduled Task
+every ~10 min):
   1. builds a RAW Codex client + a native Anthropic client (read-only),
-  2. forces the STOCK (un-guarded) openai parser in-process so the SR-467
-     output=None guard cannot mask the drift,
-  3. issues one minimal request per backend and asserts ``output`` (Codex) /
-     ``content`` (Anthropic) is a non-None iterable,
+  2. issues one minimal request per backend through the production guard,
+  3. asserts usable content arrived: non-empty assistant text from
+     ``output_text.delta`` (or a message item / non-empty ``output`` list) for
+     Codex; a non-None ``content`` list for Anthropic,
   4. writes a sentinel JSON ``~/.hermes/canary/backend_conformance.json`` that
      laptop-monitor.ps1 surfaces as a probe, and
   5. EDGE-TRIGGERS a BACKEND_CONTRACT_DRIFT bus event on healthy->down (and at
      most one re-page/hour while down) so notification volume is bounded.
 
-A network/auth error is NOT contract drift (that is R20 OAuth) — it is reported
-``unknown`` (inconclusive), never ``down``.
+``healthy`` = content delivered (even if the aggregate is ``None`` — the guard
+handles it). ``down`` = a genuinely empty/blocked response the guard cannot
+backfill, OR a NEW shape that breaks even the guarded parser. A network/auth
+error is NOT contract drift (that is R20 OAuth) — it is reported ``unknown``
+(inconclusive), never ``down``.
 """
 
 from __future__ import annotations
@@ -61,39 +74,25 @@ def _sentinel_path() -> Path:
     return _hermes_root() / "canary" / "backend_conformance.json"
 
 
-# force stock parser so the SR-467 guard never masks real drift
-def _ensure_stock_parser() -> None:
-    """Undo any output=None guard installed in THIS process so the canary sees
-    the backend's raw shape through the SDK's OWN parser (ADR-0024 §2)."""
-    targets = (
-        "openai.lib._parsing._responses",
-        "openai.lib.streaming.responses._responses",
-        "openai.resources.responses.responses",
-    )
-    import importlib
-    base = None
-    try:
-        src = importlib.import_module("openai.lib._parsing._responses")
-        fn = getattr(src, "parse_response", None)
-        base = getattr(fn, "__wrapped__", None)
-    except Exception:
-        return
-    if base is None:
-        return  # already stock
-    import sys
-    for name in targets:
-        mod = sys.modules.get(name)
-        if mod is not None and getattr(getattr(mod, "parse_response", None),
-                                      "_hermes_codex_output_none_guard", False):
-            mod.parse_response = base
-
-
 # per-backend conformance checks
 def check_codex_conformance(client: Any, model: str) -> ProbeResult:
-    _ensure_stock_parser()
+    """Assert the Codex backend DELIVERS CONTENT through the production guard.
+
+    healthy = usable content arrived (non-empty assistant text via
+    ``output_text.delta``, a message item, or a non-empty ``output`` list) — even
+    when the aggregate ``output`` is ``None`` (the guard-handled steady state).
+    down = a genuinely empty/blocked response the guard cannot backfill, OR a NEW
+    shape that breaks the guarded parser. unknown = network/auth (R20).
+    """
+    # Mirror production: ensure the output=None guard is ACTIVE (do not strip it).
     try:
-        _UNSET = object()
-        raw_completed = _UNSET
+        from agent.openai_codex_compat import apply_codex_output_none_guard
+        apply_codex_output_none_guard()
+    except Exception:  # pragma: no cover - guard import must never break the probe
+        pass
+    try:
+        delta_text: list[str] = []
+        message_items = 0
         with client.responses.stream(
             model=model,
             instructions="Reply with the single token: ok",
@@ -101,21 +100,31 @@ def check_codex_conformance(client: Any, model: str) -> ProbeResult:
             store=False,
         ) as stream:
             for event in stream:
-                if getattr(event, "type", "") == "response.completed":
-                    raw_completed = getattr(getattr(event, "response", None),
-                                            "output", _UNSET)
-            final = stream.get_final_response()  # stock parser raises if output=None
+                etype = getattr(event, "type", "")
+                if etype == "response.output_text.delta":
+                    d = getattr(event, "delta", None)
+                    if isinstance(d, str) and d:
+                        delta_text.append(d)
+                elif etype == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    if getattr(item, "type", None) == "message":
+                        message_items += 1
+            final = stream.get_final_response()  # guarded: no crash on output=None
         out = getattr(final, "output", None)
-        if out is None or raw_completed is None:
-            return ProbeResult(False, "Codex /responses completed with output=None (R57 signature)")
-        if not isinstance(out, list):
+        if out is not None and not isinstance(out, list):
             return ProbeResult(False, f"Codex /responses output not a list: {type(out).__name__}")
-        return ProbeResult(True, f"Codex /responses output ok ({len(out)} items)")
+        list_items = len(out) if isinstance(out, list) else 0
+        text = "".join(delta_text) or (getattr(final, "output_text", "") or "")
+        if (isinstance(text, str) and text.strip()) or message_items or list_items:
+            shape = f"output[{list_items}]" if list_items else "output=None+deltas (guard active)"
+            return ProbeResult(True, f"Codex /responses delivers content ({len(text)} chars, {shape})")
+        # Round-tripped but produced nothing the guard can backfill.
+        return ProbeResult(False, "Codex /responses returned no content (empty output, 0 deltas/items)")
     except TypeError as exc:
-        # Stock parser choking on output=None — the exact R57 crash.
-        return ProbeResult(False, f"Codex stock parser crashed: {str(exc)[:160]}")
+        # A TypeError even WITH the guard applied = a NEW unhandled shape, not R57.
+        return ProbeResult(False, f"Codex parse failed despite output=None guard (new shape?): {str(exc)[:140]}")
     except Exception as exc:
-        return ProbeResult(None, f"Codex probe inconclusive: {type(exc).__name__}: {str(exc)[:160]}")
+        return ProbeResult(None, f"Codex probe inconclusive: {type(exc).__name__}: {str(exc)[:140]}")
 
 
 def check_anthropic_conformance(client: Any, model: str) -> ProbeResult:
