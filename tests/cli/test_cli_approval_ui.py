@@ -1049,3 +1049,278 @@ class TestApprovalRemoteControl:
         assert not thread.is_alive()
         assert result["value"] == "once"
         cli._rc_create_pending.assert_not_called()
+
+
+def _make_sudo_clarify_stub():
+    """CLI stub wired for sudo + clarify remote-control tests.
+
+    Adds the clarify state slots the callbacks expect and swaps the modal
+    snapshot helpers for mocks so no real prompt_toolkit app is touched.
+    """
+    cli = _make_cli_stub()
+    cli._clarify_state = None
+    cli._clarify_deadline = 0
+    cli._clarify_freetext = False
+    cli._capture_modal_input_snapshot = MagicMock()
+    cli._restore_modal_input_snapshot = MagicMock()
+    return cli
+
+
+_DENY_EXTEND_RC = {
+    "enabled": True,
+    "allow_deny": True,
+    "allow_extend": True,
+    "max_total_wait_minutes": 15,
+    "risk_explanation": {
+        "enabled": False,
+        "only_for_risk_levels": ["high", "critical"],
+    },
+}
+
+
+class TestSudoClarifyRemoteControl:
+    """Mobile deny/extend wiring for the sudo-password and clarify prompts.
+
+    HARD SAFETY: sudo must NEVER accept a password remotely (deny == cancel,
+    returns ""), and clarify must NEVER have an option chosen remotely (deny ==
+    timeout-equivalent best-judgement string). Remote can only deny or extend.
+    """
+
+    def _wait_for_sudo_state(self, cli, timeout=3.0):
+        deadline = time.time() + timeout
+        while cli._sudo_state is None and time.time() < deadline:
+            time.sleep(0.01)
+        assert cli._sudo_state is not None
+
+    def _wait_for_clarify_state(self, cli, timeout=3.0):
+        deadline = time.time() + timeout
+        while cli._clarify_state is None and time.time() < deadline:
+            time.sleep(0.01)
+        assert cli._clarify_state is not None
+
+    def test_sudo_remote_cancel_returns_empty_never_password(self):
+        cli = _make_sudo_clarify_stub()
+        cli._remote_intervention_settings = lambda: dict(_DENY_EXTEND_RC)
+        cli._rc_create_pending = MagicMock(
+            return_value=SimpleNamespace(code="5555")
+        )
+        cli._rc_cleanup = MagicMock(return_value=0)
+
+        calls = {"n": 0}
+
+        def _consume(code):
+            calls["n"] += 1
+            assert code == "5555"
+            if calls["n"] < 2:
+                return None
+            return SimpleNamespace(
+                decision="deny",
+                decision_source="telegram",
+                deadline_ts=time.time() + 45,
+            )
+
+        cli._rc_consume = MagicMock(side_effect=_consume)
+
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._sudo_password_callback()
+
+        import hermes_cli.human_intervention_notifications as notif_mod
+        with patch.object(cli_module, "_cprint"), \
+             patch.object(notif_mod, "notify_human_intervention",
+                          create=True):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+            # Remote deny lands on ~2nd poll (~2s) — far before the 45s timeout.
+            thread.join(timeout=4)
+
+        assert not thread.is_alive()
+        # The cardinal guarantee: a remote cancel NEVER yields a password.
+        assert result["value"] == ""
+        cli._rc_create_pending.assert_called_once()
+        cli._restore_modal_input_snapshot.assert_called()
+
+    def test_sudo_remote_extend_bumps_deadline(self):
+        cli = _make_sudo_clarify_stub()
+        cli._remote_intervention_settings = lambda: dict(_DENY_EXTEND_RC)
+        cli._rc_create_pending = MagicMock(
+            return_value=SimpleNamespace(code="6666")
+        )
+        cli._rc_cleanup = MagicMock(return_value=0)
+
+        calls = {"n": 0}
+
+        def _consume(code):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return SimpleNamespace(
+                    decision="extend",
+                    decision_source="telegram",
+                    deadline_ts=time.time() + 600,
+                )
+            return None
+
+        cli._rc_consume = MagicMock(side_effect=_consume)
+
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._sudo_password_callback()
+
+        import hermes_cli.human_intervention_notifications as notif_mod
+        with patch.object(cli_module, "_cprint"), \
+             patch.object(notif_mod, "notify_human_intervention",
+                          create=True):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+
+            self._wait_for_sudo_state(cli)
+            initial_deadline = cli._sudo_deadline
+
+            deadline = time.time() + 4
+            while (cli._sudo_deadline <= initial_deadline + 1
+                   and time.time() < deadline):
+                time.sleep(0.02)
+
+            assert cli._sudo_deadline > initial_deadline + 1, \
+                "extend should have increased the monotonic deadline"
+            assert thread.is_alive()
+            assert "value" not in result
+
+            # Finish locally with a real password — local always wins.
+            cli._sudo_state["response_queue"].put("hunter2")
+            thread.join(timeout=3)
+
+        assert not thread.is_alive()
+        assert result["value"] == "hunter2"
+
+    def test_clarify_remote_deny_returns_best_judgement(self):
+        cli = _make_sudo_clarify_stub()
+        cli._remote_intervention_settings = lambda: dict(_DENY_EXTEND_RC)
+        cli._rc_create_pending = MagicMock(
+            return_value=SimpleNamespace(code="7070")
+        )
+        cli._rc_cleanup = MagicMock(return_value=0)
+
+        calls = {"n": 0}
+
+        def _consume(code):
+            calls["n"] += 1
+            assert code == "7070"
+            if calls["n"] < 2:
+                return None
+            return SimpleNamespace(
+                decision="deny",
+                decision_source="telegram",
+                deadline_ts=time.time() + 120,
+            )
+
+        cli._rc_consume = MagicMock(side_effect=_consume)
+
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._clarify_callback("pick one", ["a", "b"])
+
+        import hermes_cli.human_intervention_notifications as notif_mod
+        with patch.object(cli_module, "_cprint"), \
+             patch.object(notif_mod, "notify_human_intervention",
+                          create=True):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+            thread.join(timeout=4)
+
+        assert not thread.is_alive()
+        # Remote deny == timeout-equivalent: agent decides, NO option selected.
+        assert "best judgement" in result["value"]
+        assert result["value"] not in ("a", "b")
+        cli._rc_create_pending.assert_called_once()
+
+    def test_clarify_remote_extend_bumps_deadline(self):
+        cli = _make_sudo_clarify_stub()
+        cli._remote_intervention_settings = lambda: dict(_DENY_EXTEND_RC)
+        cli._rc_create_pending = MagicMock(
+            return_value=SimpleNamespace(code="8080")
+        )
+        cli._rc_cleanup = MagicMock(return_value=0)
+
+        calls = {"n": 0}
+
+        def _consume(code):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return SimpleNamespace(
+                    decision="extend",
+                    decision_source="telegram",
+                    deadline_ts=time.time() + 600,
+                )
+            return None
+
+        cli._rc_consume = MagicMock(side_effect=_consume)
+
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._clarify_callback("pick one", ["a", "b"])
+
+        import hermes_cli.human_intervention_notifications as notif_mod
+        with patch.object(cli_module, "_cprint"), \
+             patch.object(notif_mod, "notify_human_intervention",
+                          create=True):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+
+            self._wait_for_clarify_state(cli)
+            initial_deadline = cli._clarify_deadline
+
+            deadline = time.time() + 4
+            while (cli._clarify_deadline <= initial_deadline + 1
+                   and time.time() < deadline):
+                time.sleep(0.02)
+
+            assert cli._clarify_deadline > initial_deadline + 1, \
+                "extend should have increased the monotonic deadline"
+            assert thread.is_alive()
+            assert "value" not in result
+
+            cli._clarify_state["response_queue"].put("a")
+            thread.join(timeout=3)
+
+        assert not thread.is_alive()
+        assert result["value"] == "a"
+
+    def test_sudo_remote_disabled_no_pending(self):
+        cli = _make_sudo_clarify_stub()
+        cli._remote_intervention_settings = lambda: {
+            "enabled": False,
+            "allow_deny": True,
+            "allow_extend": True,
+            "max_total_wait_minutes": 15,
+            "risk_explanation": {
+                "enabled": False,
+                "only_for_risk_levels": ["high", "critical"],
+            },
+        }
+        cli._rc_create_pending = MagicMock()
+        cli._rc_cleanup = MagicMock(return_value=0)
+        cli._rc_consume = MagicMock(return_value=None)
+
+        result = {}
+
+        def _run_callback():
+            result["value"] = cli._sudo_password_callback()
+
+        import hermes_cli.human_intervention_notifications as notif_mod
+        with patch.object(cli_module, "_cprint"), \
+             patch.object(notif_mod, "notify_human_intervention",
+                          create=True):
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+            self._wait_for_sudo_state(cli)
+            cli._sudo_state["response_queue"].put("pw")
+            thread.join(timeout=3)
+
+        assert not thread.is_alive()
+        assert result["value"] == "pw"
+        cli._rc_create_pending.assert_not_called()
