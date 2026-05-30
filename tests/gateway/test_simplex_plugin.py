@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -254,6 +255,67 @@ async def test_list_channels_returns_none_on_contacts_timeout():
 
     adapter._send_command = fake_send_command
     assert await adapter.list_channels() is None
+
+
+@pytest.mark.asyncio
+async def test_send_short_content_single_send():
+    """Content within the limit is delivered as exactly one WS send."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+
+    mock_ws = AsyncMock()
+    adapter._ws = mock_ws
+
+    result = await adapter.send("contact-42", "short message")
+    mock_ws.send.assert_called_once()
+    assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_send_long_content_chunks_into_ordered_sends():
+    """Content longer than the max is split into multiple ordered sends,
+    each chunk staying within the advertised limit."""
+    from gateway.config import PlatformConfig
+    cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    adapter = SimplexAdapter(cfg)
+
+    mock_ws = AsyncMock()
+    adapter._ws = mock_ws
+
+    max_len = _simplex.MAX_MESSAGE_LENGTH
+    # Plain text (no code fences) longer than the limit -> several chunks.
+    long_text = "word " * (max_len // 2)
+    assert len(long_text) > max_len
+
+    result = await adapter.send("contact-42", long_text)
+    assert result.success is True
+    assert mock_ws.send.call_count > 1
+
+    total = mock_ws.send.call_count
+    bodies = []
+    for i, call in enumerate(mock_ws.send.call_args_list):
+        payload = json.loads(call[0][0])
+        # Every chunk is addressed to the same contact, in order.
+        assert payload["cmd"].startswith("/_send @contact-42 json ")
+        chunk = json.loads(payload["cmd"].split(" json ", 1)[1])[0][
+            "msgContent"
+        ]["text"]
+        # Each chunk body must respect the per-message limit.
+        assert len(chunk) <= max_len
+        # Multi-part indicator appended by the base helper (whatever its exact
+        # spacing): a trailing "(n/N)" marker must be present, in send order.
+        assert re.search(r"\(\d+/\d+\)\s*$", chunk)
+        assert re.search(rf"\({i + 1}/{total}\)\s*$", chunk)
+        # Drop the trailing part-indicator to recover the original body text.
+        bodies.append(re.sub(r"\s*\(\d+/\d+\)\s*$", "", chunk))
+
+    # Content coverage: reassembling the indicator-stripped chunk bodies must
+    # account for every word of the original message. truncate_message splits
+    # on word boundaries and lstrips inter-chunk whitespace, so word-for-word
+    # reassembly is reliable even if exact byte concatenation is not.
+    reassembled = " ".join(bodies).split()
+    assert reassembled == long_text.split()
 
 
 @pytest.mark.asyncio

@@ -880,27 +880,25 @@ class SimplexAdapter(BasePlatformAdapter):
             content = re.sub(r"MEDIA:\S+", "", content).strip()
 
         if content:
-            corr_id = self._make_corr_id()
-            # Structured form: addresses by ID, and json.dumps escapes
-            # newlines + special chars correctly.  The bare @id text
-            # syntax is unreliable for DMs — the daemon silently drops
-            # messages when it cannot resolve the display name.
-            composed = json.dumps(
-                [{"msgContent": {"type": "text", "text": content}}]
-            )
-            if chat_id.startswith("group:"):
-                cmd_str = f"/_send #{chat_id[6:]} json {composed}"
-            else:
-                cmd_str = f"/_send @{chat_id} json {composed}"
-
-            ok = await self._send_ws({"corrId": corr_id, "cmd": cmd_str})
-            if not ok:
-                return SendResult(
-                    success=False,
-                    error="SimpleX WebSocket is unavailable or closed",
-                    retryable=True,
-                    error_kind="transient",
+            for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+                composed = json.dumps(
+                    [{"msgContent": {"type": "text", "text": chunk}}]
                 )
+                if chat_id.startswith("group:"):
+                    cmd_str = f"/_send #{chat_id[6:]} json {composed}"
+                else:
+                    cmd_str = f"/_send @{chat_id} json {composed}"
+
+                ok = await self._send_ws(
+                    {"corrId": self._make_corr_id(), "cmd": cmd_str}
+                )
+                if not ok:
+                    return SendResult(
+                        success=False,
+                        error="SimpleX WebSocket is unavailable or closed",
+                        retryable=True,
+                        error_kind="transient",
+                    )
 
         for path in media_paths:
             is_voice = os.path.splitext(path)[1].lower() in _voice_exts
@@ -910,7 +908,6 @@ class SimplexAdapter(BasePlatformAdapter):
                 media_result = await self.send_document(chat_id, path)
             if not media_result.success:
                 return media_result
-
         return SendResult(success=True)
 
     # ------------------------------------------------------------------
@@ -1323,22 +1320,23 @@ async def _standalone_send(
         composed = json.dumps(
             [{"msgContent": {"type": "text", "text": message}}]
         )
-        if chat_id.startswith("group:"):
-            group_id = chat_id[6:]
-            cmd_str = f"/_send #{group_id} json {composed}"
-        else:
-            cmd_str = f"/_send @{chat_id} json {composed}"
+        chunks = BasePlatformAdapter.truncate_message(message, MAX_MESSAGE_LENGTH)
 
-        payload = {
-            "corrId": f"{_CORR_PREFIX}snd-{int(time.time() * 1000)}",
-            "cmd": cmd_str,
-        }
-
-        async with _wsclient.connect(
-            ws_url, open_timeout=10, close_timeout=5
-        ) as ws:
-            await ws.send(json.dumps(payload))
-            # Give the daemon a moment to process the command before closing.
+        async with _wsclient.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
+            for i, chunk in enumerate(chunks):
+                composed = json.dumps(
+                    [{"msgContent": {"type": "text", "text": chunk}}]
+                )
+                if chat_id.startswith("group:"):
+                    cmd_str = f"/_send #{chat_id[6:]} json {composed}"
+                else:
+                    cmd_str = f"/_send @{chat_id} json {composed}"
+                payload = {
+                    "corrId": f"{_CORR_PREFIX}snd-{int(time.time() * 1000)}-{i}",
+                    "cmd": cmd_str,
+                }
+                await ws.send(json.dumps(payload))
+            # Give the daemon a moment to process the command(s) before closing.
             await asyncio.sleep(0.5)
 
         return {"success": True, "platform": "simplex", "chat_id": chat_id}
