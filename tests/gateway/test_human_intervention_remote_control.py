@@ -8,7 +8,8 @@ commands (which act on in-process approvals / session state).
 The handler must:
   * dispatch deny/extend/status to ``set_remote_decision`` /
     ``get_pending_intervention``;
-  * refuse remote ``approve`` without ever calling the store;
+  * dispatch ``approve`` (one-tap + typed-confirm) to ``set_remote_decision``,
+    while the store refuses critical/disabled tiers with a clear message;
   * be gated by ``remote_control.enabled`` and ``allowed_targets`` config.
 """
 
@@ -127,16 +128,87 @@ async def test_iv_status_reports_state():
 
 
 @pytest.mark.asyncio
-async def test_iv_approve_is_refused():
+async def test_iv_approve_one_tap_ok():
     runner = _make_runner()
     with patch("hermes_cli.config.load_config", return_value=_enabled_config()), \
          patch(
              "hermes_cli.human_intervention_remote_control.set_remote_decision",
+             return_value=(True, "ok", object()),
          ) as mock_set:
         result = await runner._handle_intervention_command(_make_event("approve 7392"))
 
-    assert mock_set.call_count == 0
+    assert mock_set.call_count == 1
+    args, kwargs = mock_set.call_args
+    assert args[0] == "7392"
+    assert args[1] == "approve"
+    assert kwargs.get("token") is None
+    assert "已批准" in result
+    assert "7392" in result
+
+
+@pytest.mark.asyncio
+async def test_iv_approve_typed_confirm_ok():
+    runner = _make_runner()
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), \
+         patch(
+             "hermes_cli.human_intervention_remote_control.set_remote_decision",
+             return_value=(True, "ok", object()),
+         ) as mock_set:
+        result = await runner._handle_intervention_command(
+            _make_event("approve 7392 4815")
+        )
+
+    assert mock_set.call_count == 1
+    args, kwargs = mock_set.call_args
+    assert args[0] == "7392"
+    assert args[1] == "approve"
+    assert kwargs.get("token") == "4815"
+    assert "已批准" in result
+
+
+@pytest.mark.asyncio
+async def test_iv_approve_bad_token():
+    runner = _make_runner()
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), \
+         patch(
+             "hermes_cli.human_intervention_remote_control.set_remote_decision",
+             return_value=(False, "bad_token", object()),
+         ):
+        result = await runner._handle_intervention_command(
+            _make_event("approve 7392 0000")
+        )
+
+    assert "令牌" in result
+
+
+@pytest.mark.asyncio
+async def test_iv_approve_not_allowed_critical():
+    runner = _make_runner()
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), \
+         patch(
+             "hermes_cli.human_intervention_remote_control.set_remote_decision",
+             return_value=(False, "approve_not_allowed", object()),
+         ):
+        result = await runner._handle_intervention_command(_make_event("approve 7392"))
+
     assert "不支持远程批准" in result
+
+
+@pytest.mark.asyncio
+async def test_iv_approve_auth_unchanged():
+    runner = _make_runner()
+    with patch(
+        "hermes_cli.config.load_config",
+        return_value=_enabled_config(allowed_targets=["telegram"]),
+    ), patch(
+        "hermes_cli.human_intervention_remote_control.set_remote_decision",
+    ) as mock_set:
+        result = await runner._handle_intervention_command(
+            _make_event("approve 7392", platform_value="discord")
+        )
+
+    assert mock_set.call_count == 0
+    assert "无权" in result
 
 
 @pytest.mark.asyncio

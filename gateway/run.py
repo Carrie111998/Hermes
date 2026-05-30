@@ -17084,22 +17084,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     async def _handle_intervention_command(self, event: MessageEvent) -> str:
-        """Handle /intervention (/iv) — deny/extend/status a REMOTE CLI prompt.
+        """Handle /intervention (/iv) — approve/deny/extend/status a REMOTE CLI prompt.
 
         This controls a pending human-intervention prompt living in a *different*
         CLI process (tracked in the shared human-interventions store), keyed by a
         short code. It is intentionally separate from the gateway's own /approve,
         /deny, /status commands (which act on in-process approvals).
 
-        Remote ``approve`` is never honoured — approvals stay local-only and the
-        user must return to the CLI. The handler is gated by the
-        ``notifications.human_intervention.remote_control`` config block
+        Remote ``approve`` is tiered: one-tap for low/medium-risk waits and a
+        typed confirm token for higher-risk ones, while the store still refuses
+        critical/disabled tiers (``approve_not_allowed``). The handler is gated by
+        the ``notifications.human_intervention.remote_control`` config block
         (``enabled`` + ``allowed_targets``) and never raises.
         """
         import time as _time
 
         source = event.source
-        usage = "用法: /iv <deny|extend|status> <审批码> [分钟]"
+        usage = "用法: /iv <approve|deny|extend|status> <审批码> [分钟/令牌]"
 
         args = (event.get_command_args() or "").strip()
         tokens = args.split()
@@ -17109,11 +17110,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         subcommand = tokens[0].lower()
         if subcommand not in {"deny", "extend", "status", "approve"}:
             return usage
-
-        # Remote approve is never supported — short-circuit BEFORE touching the
-        # store so the approval mechanism can never be driven remotely.
-        if subcommand == "approve":
-            return "当前阶段不支持远程批准；请回到 CLI。"
 
         code = tokens[1] if len(tokens) > 1 else ""
         if not code:
@@ -17153,6 +17149,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from hermes_cli.human_intervention_remote_control import (
                 set_remote_decision, get_pending_intervention,
             )
+
+            if subcommand == "approve":
+                # tokens[2] (if present) is the typed-confirm token, NOT minutes.
+                token = tokens[2] if len(tokens) > 2 else None
+                ok, reason, _rec = set_remote_decision(
+                    code, "approve", token=token, source=platform_name or "mobile"
+                )
+                if ok:
+                    return f"已批准 CLI 等待项 {code}。"
+                if reason == "approve_not_allowed":
+                    return "该命令不支持远程批准（高危/critical），请回到 CLI。"
+                if reason == "bad_token":
+                    return "确认令牌不正确或缺失：高风险命令需 /iv approve <审批码> <令牌>。"
+                return _map_error(reason)
 
             if subcommand == "status":
                 rec = get_pending_intervention(code)
