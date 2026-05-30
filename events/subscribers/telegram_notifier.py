@@ -121,7 +121,10 @@ TOPIC_ROUTING: Dict[str, str] = {
     'watchdog_daily': 'watchdog_alerts',
     'agent_failure_cluster': 'watchdog_alerts',
     # R57 detection nets (ADR-0024 §2-3) — system-health alerts.
-    'backend_contract_drift': 'watchdog_alerts',
+    # backend_contract_drift → security_and_system (2026-05-30, operator pref):
+    # the backend-conformance canary's drift pages land in the "Security &
+    # System" topic the operator watches. agent_loop_fault stays on watchdog.
+    'backend_contract_drift': 'security_and_system',
     'agent_loop_fault': 'watchdog_alerts',
     # Notification delivery reverse-signal (2026-04-30). These entries
     # exist so test_all_event_types_have_routing covers them, but the
