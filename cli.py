@@ -12504,6 +12504,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "allow_deny": True,
             "allow_extend": True,
             "allow_approve": False,
+            "approve_medium": True,
+            "approve_high_typed_confirm": True,
+            "approve_token_len": 4,
+            "never_approve_levels": ["critical"],
             "code_ttl_seconds": 90,
             "max_extend_minutes": 15,
             "max_total_wait_minutes": 15,
@@ -12514,6 +12518,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "max_chars": 280,
                 "timeout_seconds": 3,
                 "fallback_to_static": True,
+                "use_llm": False,
             },
         }
         try:
@@ -12557,16 +12562,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if normalized not in {str(x).strip().lower() for x in only_for}:
                 return ""
             # Lazy import keeps this cheap and lets tests patch the explainer.
-            # llm_fn=None → instant static explanation that never blocks the
-            # prompt; a future task may wire a bounded auxiliary model here.
-            from hermes_cli.human_intervention_risk_explainer import explain_command_risk
+            # When use_llm is configured, pass the bounded auxiliary-model
+            # explainer; otherwise llm_fn=None yields an instant static
+            # explanation that never blocks the prompt.
+            from hermes_cli import human_intervention_risk_explainer as _expl
             max_chars = int(re_cfg.get("max_chars", 280) or 280)
             timeout_seconds = int(re_cfg.get("timeout_seconds", 3) or 3)
-            return explain_command_risk(
+            use_llm = bool(re_cfg.get("use_llm", False))
+            llm_fn = _expl.default_llm_fn if use_llm else None
+            return _expl.explain_command_risk(
                 command=command,
                 description=description,
                 risk_level=risk_level,
-                llm_fn=None,
+                llm_fn=llm_fn,
                 max_chars=max_chars,
                 timeout_seconds=timeout_seconds,
             )
@@ -12587,6 +12595,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Thin patchable wrapper to reap expired pending interventions."""
         from hermes_cli.human_intervention_remote_control import cleanup_expired
         return cleanup_expired()
+
+    def _compute_approve_tier(self, risk_level, rc):
+        """Return (approve_tier, never_levels). tier in 'none'|'one_tap'|'typed_confirm'.
+
+        Decides whether (and how) a dangerous-command prompt may be approved
+        remotely. critical/hardline levels — and any level in
+        ``never_approve_levels`` — are NEVER remotely approvable, and approval
+        is disabled entirely unless ``allow_approve`` is set. medium maps to a
+        one-tap approve, high to a typed-confirm approve (token required).
+        """
+        never = rc.get("never_approve_levels") or ["critical"]
+        never = [str(x).strip().lower() for x in never]
+        lvl = str(risk_level or "").strip().lower()
+        if not bool(rc.get("allow_approve")):
+            return ("none", never)
+        if lvl in never:
+            return ("none", never)
+        if lvl == "medium" and bool(rc.get("approve_medium", True)):
+            return ("one_tap", never)
+        if lvl == "high" and bool(rc.get("approve_high_typed_confirm", True)):
+            return ("typed_confirm", never)
+        return ("none", never)
 
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
@@ -12638,10 +12668,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the command is denied on timeout without the user ever seeing it
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
-            # --- remote control wiring (mobile deny/extend; approval is local) ---
+            # --- remote control wiring (mobile deny/extend/approve) ---
             rc = self._remote_intervention_settings()
             remote_enabled = bool(rc.get("enabled"))
             risk_expl = self._explain_command_risk_for_notify(command, description, risk_level, rc)
+            # Decide whether this prompt may be remotely approved and how.
+            # critical/never levels (and allow_approve=False) yield "none" so
+            # no approve line/token is ever advertised or accepted.
+            approve_tier, _never = self._compute_approve_tier(risk_level, rc)
+            approve_token = ""
             remote_code = ""
             remote_actions = None
             if remote_enabled:
@@ -12651,6 +12686,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if rc.get("allow_extend", True):
                     allowed.append("extend")
                 try:
+                    # Always create the pending record when remote control is
+                    # enabled: even with no deny/extend actions, the approve
+                    # tier (handled separately) may still allow a remote approve.
                     rec = self._rc_create_pending(
                         kind=intervention_kind,
                         title="approval",
@@ -12659,14 +12697,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         timeout_seconds=timeout,
                         max_total_wait_minutes=int(rc.get("max_total_wait_minutes", 15)),
                         allowed_actions=allowed or None,
+                        risk_level=risk_level,
+                        approve_tier=approve_tier,
                     )
                     remote_code = rec.code
+                    # The store generates the typed-confirm token (if any).
+                    approve_token = getattr(rec, "approve_token", "") or ""
                     remote_actions = (allowed + ["status"]) if allowed else ["status"]
                     # Expose for tests + UI.
                     self._approval_state["remote_code"] = remote_code
                 except Exception:
                     remote_code = ""
                     remote_actions = None
+                    approve_token = ""
 
             try:
                 from hermes_cli.human_intervention_notifications import notify_human_intervention
@@ -12681,6 +12724,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     remote_actions=remote_actions,
                     risk_level=risk_level,
                     risk_explanation=risk_expl,
+                    approve_tier=approve_tier,
+                    approve_token=approve_token,
                 )
             except Exception:
                 pass
@@ -12725,6 +12770,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                     "⚠", "Approval", command, "denied remotely"
                                 )
                                 return "deny"
+                            if snap is not None and getattr(snap, "decision", None) == "approve":
+                                # Remote approve → behave like a local "once".
+                                # Only reachable when the store accepted an
+                                # approve (tier != none); critical/never levels
+                                # never produce an approve snapshot.
+                                self._approval_state = None
+                                self._approval_deadline = 0
+                                self._invalidate()
+                                _cprint(
+                                    f"\n{_DIM}  ✅ Approved remotely "
+                                    f"({snap.decision_source or 'mobile'}){_RST}"
+                                )
+                                return "once"
                             if snap is not None and snap.decision == "extend":
                                 # Translate the store's wall-clock deadline into
                                 # the CLI's monotonic clock; only ever increase.
