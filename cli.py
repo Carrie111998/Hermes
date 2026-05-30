@@ -12671,7 +12671,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # --- remote control wiring (mobile deny/extend/approve) ---
             rc = self._remote_intervention_settings()
             remote_enabled = bool(rc.get("enabled"))
-            risk_expl = self._explain_command_risk_for_notify(command, description, risk_level, rc)
             # Decide whether this prompt may be remotely approved and how.
             # critical/never levels (and allow_approve=False) yield "none" so
             # no approve line/token is ever advertised or accepted.
@@ -12711,6 +12710,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     remote_actions = None
                     approve_token = ""
 
+            # Compute the (possibly LLM-backed, ~seconds) danger explanation
+            # AFTER the local panel has been painted, so a slow auxiliary call
+            # never delays the local approval prompt. The explanation only
+            # enriches the mobile notification below.
+            risk_expl = self._explain_command_risk_for_notify(command, description, risk_level, rc)
             try:
                 from hermes_cli.human_intervention_notifications import notify_human_intervention
                 notify_human_intervention(
