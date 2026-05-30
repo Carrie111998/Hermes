@@ -885,10 +885,27 @@ class TestSendTelegramHtmlDetection:
         assert kwargs["parse_mode"] == "HTML"
 
     def test_closing_tag_detected(self, monkeypatch):
+        # A bare *closing* tag for a recognized Telegram tag still flips to
+        # HTML mode (exercises the ``</?`` branch of the allowlist regex).
+        # NB: only allowlisted tags count — a stray ``</div>`` no longer does,
+        # see test_non_telegram_tag_does_not_switch_to_html.
         bot = self._make_bot()
         _install_telegram_mock(monkeypatch, bot)
 
-        asyncio.run(_send_telegram("tok", "123", "text </div> more"))
+        asyncio.run(_send_telegram("tok", "123", "text </b> more"))
+
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["parse_mode"] == "HTML"
+
+    def test_anchor_with_href_uses_html_parse_mode(self, monkeypatch):
+        """A link tag with attributes still flips to HTML — exercises the
+        ``(\\s[^>]*)?`` attribute branch of the allowlist regex."""
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(
+            _send_telegram("tok", "123", 'See <a href="https://x.test/run">the run</a>')
+        )
 
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["parse_mode"] == "HTML"
@@ -902,6 +919,44 @@ class TestSendTelegramHtmlDetection:
 
         kwargs = bot.send_message.await_args.kwargs
         assert kwargs["parse_mode"] == "MarkdownV2"
+
+    def test_non_telegram_tag_does_not_switch_to_html(self, monkeypatch):
+        """A stray, non-Telegram tag like ``<foobar>`` must NOT switch to HTML.
+
+        The old catch-all regex matched any ``<tag>`` and flipped to
+        parse_mode=HTML; Telegram then rejected the unsupported tag
+        ("Can't parse entities: unsupported start tag …"), forcing a plain-text
+        fallback that logged "Parse mode HTML failed in _send_telegram" on every
+        such send.  The allowlist sends it down the MarkdownV2 path instead."""
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(_send_telegram("tok", "123", "Scan done <foobar> 23 new jobs"))
+
+        # Exactly one send via the MarkdownV2 path — no HTML-parse failure
+        # followed by a plain-text retry (the symptom this fix removes).
+        bot.send_message.assert_awaited_once()
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["parse_mode"] == "MarkdownV2"
+
+    def test_iteration_marker_tag_does_not_switch_to_html(self, monkeypatch):
+        """The concrete incident driver: a leaked cron iteration marker.  Even
+        if it slips past the source-level strip in cron/scheduler.py
+        (_strip_iteration_markers), the detector must not treat the
+        ``<AGENT_ITERATION_JSON>`` tag as HTML."""
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        message = (
+            "Scanned 4 sources, 23 new jobs.\n"
+            "<AGENT_ITERATION_JSON>\n"
+            '{"agent": "scout"}\n'
+            "</AGENT_ITERATION_JSON>"
+        )
+        asyncio.run(_send_telegram("tok", "123", message))
+
+        bot.send_message.assert_awaited_once()
+        assert bot.send_message.await_args.kwargs["parse_mode"] == "MarkdownV2"
 
     def test_html_parse_failure_falls_back_to_plain(self, monkeypatch):
         """If Telegram rejects the HTML, fall back to plain text."""

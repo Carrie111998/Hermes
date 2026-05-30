@@ -822,9 +822,26 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         from telegram import Bot
         from telegram.constants import ParseMode
 
-        # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
-        # Inspired by github.com/ashaney — PR #1568.
-        _has_html = bool(re.search(r'<[a-zA-Z/][^>]*>', message))
+        # Auto-detect HTML — if a *recognized* Telegram tag is present, skip
+        # MarkdownV2 and send as HTML.  Inspired by github.com/ashaney — PR #1568.
+        #
+        # Match ONLY the tags Telegram's Bot API supports.  A catch-all
+        # ``<...>`` match flips any stray angle-bracket tag — a leaked
+        # <thinking> block, a cron iteration marker like <AGENT_ITERATION_JSON>,
+        # or arbitrary agent output — into HTML mode, which Telegram then
+        # rejects ("Can't parse entities: unsupported start tag …").  The send
+        # falls back to plain text but logs "Parse mode HTML failed in
+        # _send_telegram" on every such message, spamming the error log.
+        # Restricting to the allowlist keeps genuine <b>/<a href> HTML working
+        # while stray tags take the MarkdownV2/plain path with no fallback.
+        _has_html = bool(
+            re.search(
+                r'</?(b|strong|i|em|u|ins|s|strike|del|a|code|pre|span'
+                r'|tg-spoiler|tg-emoji|blockquote)(\s[^>]*)?>',
+                message,
+                re.IGNORECASE,
+            )
+        )
 
         if _has_html:
             formatted = message
