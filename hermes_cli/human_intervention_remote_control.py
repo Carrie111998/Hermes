@@ -46,7 +46,12 @@ RESOLVED_TTL_SECONDS = 5 * 60
 # Default extension applied when a caller asks to extend without a duration.
 DEFAULT_EXTEND_MINUTES = 15
 
-# "approve" can never be driven remotely — approvals stay local-only.
+# Length (digits) of an auto-generated typed-confirm approval token.
+DEFAULT_APPROVE_TOKEN_LEN = 4
+
+# "deny"/"extend" are the always-available remote actions. "approve" is gated
+# on the per-record approve_tier rather than this tuple (it was never a member
+# of _REMOTE_ACTIONS and stays opt-in per intervention).
 _REMOTE_ACTIONS = ("deny", "extend")
 
 _STORE_LOCK = threading.Lock()
@@ -67,15 +72,20 @@ class PendingIntervention:
     title: str
     preview: str
     session_key: str
-    state: str           # "pending" | "denied" | "extended" | "expired" | "resolved"
+    state: str           # "pending" | "denied" | "extended" | "approved" | "expired" | "resolved"
     created_ts: float
     deadline_ts: float
     max_deadline_ts: float
-    decision: str | None = None        # "deny" | "extend" | None
+    decision: str | None = None        # "deny" | "extend" | "approve" | None
     decision_ts: float | None = None
     decision_source: str = ""
     # None => both deny and extend allowed. Otherwise only listed actions are.
     allowed_actions: list[str] | None = None
+    # Tiered remote approval. risk_level is advisory metadata; approve_tier
+    # gates whether approve can be driven remotely and how.
+    risk_level: str = ""
+    approve_tier: str = "none"          # "none" | "one_tap" | "typed_confirm"
+    approve_token: str = ""             # set only for the typed_confirm tier
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -139,6 +149,22 @@ def _generate_code(existing: dict) -> str:
     return f"{random.randint(0, 9999):04d}"
 
 
+def _generate_token(n: int = DEFAULT_APPROVE_TOKEN_LEN, *, avoid: str = "") -> str:
+    """Return a zero-padded numeric token of ``n`` digits.
+
+    Distinct from ``avoid`` (typically the record's code) so a single number
+    can't satisfy both the addressing code and the typed-confirm gate.
+    """
+    n = max(1, int(n))
+    high = 10**n - 1
+    for _ in range(10_000):
+        token = f"{random.randint(0, high):0{n}d}"
+        if token != avoid:
+            return token
+    # Astronomically unlikely; return whatever we have.
+    return f"{random.randint(0, high):0{n}d}"
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -154,8 +180,20 @@ def create_pending_intervention(
     max_total_wait_minutes: int = 15,
     code: str | None = None,
     allowed_actions: list[str] | None = None,
+    risk_level: str = "",
+    approve_tier: str = "none",
+    approve_token: str | None = None,
 ) -> PendingIntervention:
-    """Create and persist a new pending intervention, returning the record."""
+    """Create and persist a new pending intervention, returning the record.
+
+    Tiered remote approval is opt-in per record via ``approve_tier``:
+      * ``"none"``         — approve cannot be driven remotely (default).
+      * ``"one_tap"``      — a remote approve needs no token.
+      * ``"typed_confirm"``— a remote approve must echo ``approve_token``.
+                             When no token is supplied one is generated
+                             (``DEFAULT_APPROVE_TOKEN_LEN`` digits, distinct
+                             from the addressing ``code``).
+    """
     with _STORE_LOCK:
         records = _load_records()
         if code is None:
@@ -164,6 +202,14 @@ def create_pending_intervention(
             # Explicit code collision: overwrite is the caller's intent in
             # tests, but regenerate uniqueness only applies to auto codes.
             pass
+
+        # Resolve the approve token according to the tier.
+        if approve_tier == "typed_confirm":
+            token = approve_token if approve_token is not None else _generate_token(
+                DEFAULT_APPROVE_TOKEN_LEN, avoid=code
+            )
+        else:
+            token = ""
 
         now = _now()
         rec = PendingIntervention(
@@ -180,6 +226,9 @@ def create_pending_intervention(
             decision_ts=None,
             decision_source="",
             allowed_actions=list(allowed_actions) if allowed_actions is not None else None,
+            risk_level=risk_level,
+            approve_tier=approve_tier,
+            approve_token=token,
         )
         records[code] = rec.to_dict()
         _save_records(records)
@@ -211,12 +260,20 @@ def set_remote_decision(
     action: str,
     *,
     minutes: int | None = None,
+    token: str | None = None,
     source: str = "",
 ) -> tuple[bool, str, PendingIntervention | None]:
-    """Apply a remote ``deny``/``extend`` decision to a pending intervention.
+    """Apply a remote ``deny``/``extend``/``approve`` decision.
 
     Returns ``(ok, reason, record_or_None)``. On failure ``reason`` is one of
-    ``not_found`` / ``expired`` / ``action_not_allowed`` / ``already_resolved``.
+    ``not_found`` / ``expired`` / ``action_not_allowed`` / ``already_resolved``
+    / ``approve_not_allowed`` / ``bad_token``.
+
+    ``deny`` and ``extend`` keep the phase-1 ``_action_allowed`` gate.
+    ``approve`` is gated separately on the record's ``approve_tier`` (it is
+    never a member of ``_REMOTE_ACTIONS``): the ``one_tap`` tier needs no
+    token, while ``typed_confirm`` requires ``token`` to match the stored
+    ``approve_token``.
     """
     with _STORE_LOCK:
         records = _load_records()
@@ -225,6 +282,32 @@ def set_remote_decision(
             return (False, "not_found", None)
 
         rec = PendingIntervention.from_dict(raw)
+
+        if action == "approve":
+            # Tier gate — approve is opt-in per record, not via _action_allowed.
+            tier = getattr(rec, "approve_tier", "none") or "none"
+            if tier == "none":
+                return (False, "approve_not_allowed", rec)
+
+            if rec.state == "resolved":
+                return (False, "already_resolved", rec)
+
+            now = _now()
+            if now > rec.deadline_ts + GRACE_SECONDS:
+                return (False, "expired", rec)
+
+            if tier == "typed_confirm":
+                expected = rec.approve_token or ""
+                if not token or token != expected:
+                    return (False, "bad_token", rec)
+
+            rec.state = "approved"
+            rec.decision = "approve"
+            rec.decision_ts = now
+            rec.decision_source = source
+            records[code] = rec.to_dict()
+            _save_records(records)
+            return (True, "ok", rec)
 
         if not _action_allowed(rec, action):
             return (False, "action_not_allowed", rec)
@@ -270,6 +353,9 @@ def consume_remote_decision(code: str) -> PendingIntervention | None:
     Consumption semantics:
       * ``denied``   -> snapshot returned, stored record becomes ``resolved``
                         (a deny is terminal; further consumes return ``None``).
+      * ``approved`` -> snapshot returned (decision ``approve``), stored record
+                        becomes ``resolved`` (approve is one-shot/terminal;
+                        further consumes return ``None``).
       * ``extended`` -> snapshot returned (with the already-extended deadline),
                         stored record reset to ``pending`` with ``decision``
                         cleared so the CLI can apply the new deadline and keep
@@ -284,7 +370,7 @@ def consume_remote_decision(code: str) -> PendingIntervention | None:
 
         rec = PendingIntervention.from_dict(raw)
 
-        if rec.state == "denied":
+        if rec.state in ("denied", "approved"):
             snapshot = PendingIntervention.from_dict(rec.to_dict())
             rec.state = "resolved"
             records[code] = rec.to_dict()
