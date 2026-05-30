@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _strip_iteration_markers
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -617,6 +617,79 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_delivery_strips_agent_iteration_marker(self):
+        """The internal <AGENT_ITERATION_JSON> contract block must never reach
+        the delivered body. It is machine-only (consumed by the cron event-bus
+        extractors); leaking it makes Telegram's HTML parser reject the
+        unsupported <agent_iteration_json> tag and fall back to plain text on
+        every send (issue: 'Parse mode HTML failed in _send_telegram')."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        final_response = (
+            "Scanned 4 sources, 23 new jobs (11 deduped).\n\n"
+            "<AGENT_ITERATION_JSON>\n"
+            '{"agent": "scout", "summary": "Scanned 4 sources, 23 new jobs"}\n'
+            "</AGENT_ITERATION_JSON>"
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "scout-job",
+                "name": "scout-scan",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, final_response)
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        # Marker tag and its JSON payload are gone; user-facing preamble stays.
+        assert "AGENT_ITERATION_JSON" not in sent_content
+        assert '"agent": "scout"' not in sent_content
+        assert sent_content == "Scanned 4 sources, 23 new jobs (11 deduped)."
+
+    def test_delivery_strips_legacy_tailor_iteration_marker(self):
+        """The legacy Tailor-specific <TAILOR_ITERATION_JSON> block leaks the
+        same way and must also be stripped before delivery."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        final_response = (
+            "Tailored 3 of 5 eligible packets.\n\n"
+            "<TAILOR_ITERATION_JSON>\n"
+            '{"eligible_count": 5, "tailored_count": 3, "skipped_terminal_count": 2, '
+            '"skipped_other_count": 0, "reason": "tailored_some"}\n'
+            "</TAILOR_ITERATION_JSON>"
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}):
+            job = {
+                "id": "tailor-job",
+                "name": "jobflow-tailor",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, final_response)
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "TAILOR_ITERATION_JSON" not in sent_content
+        assert "eligible_count" not in sent_content
+        assert sent_content == "Tailored 3 of 5 eligible packets."
 
     def test_delivery_extracts_media_tags_before_send(self, tmp_path, monkeypatch):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
@@ -2692,6 +2765,72 @@ class TestSendMediaTimeoutCancelsFuture:
 # Tailor structured iteration event (2026-04-29)
 # Plan: docs/superpowers/plans/2026-04-29-tailor-structured-iteration-event.md
 # ============================================================================
+
+
+class TestStripIterationMarkers:
+    """Unit tests for _strip_iteration_markers — pure function, no side effects.
+
+    Guards the cron-delivery sanitizer that keeps internal iteration-tracking
+    blocks out of user-facing message bodies (Telegram HTML-parse-fallback
+    log spam, raw-JSON noise)."""
+
+    def test_no_marker_returned_unchanged(self):
+        # Critical no-op guarantee: a normal delivery (incl. trailing
+        # whitespace and legit angle brackets like "5 < 10") is untouched.
+        text = "All clear — 5 < 10 jobs left.\n\nNothing to do.\n"
+        assert _strip_iteration_markers(text) == text
+
+    def test_strips_agent_marker(self):
+        text = (
+            "Scanned 4 sources.\n\n"
+            '<AGENT_ITERATION_JSON>{"agent": "scout", "summary": "ok"}</AGENT_ITERATION_JSON>'
+        )
+        assert _strip_iteration_markers(text) == "Scanned 4 sources."
+
+    def test_strips_legacy_tailor_marker(self):
+        text = (
+            "Tailored some.\n\n"
+            '<TAILOR_ITERATION_JSON>{"eligible_count": 1}</TAILOR_ITERATION_JSON>'
+        )
+        assert _strip_iteration_markers(text) == "Tailored some."
+
+    def test_strips_multiline_json_block(self):
+        text = (
+            "Done.\n\n"
+            "<AGENT_ITERATION_JSON>\n"
+            "{\n"
+            '  "agent": "matcher",\n'
+            '  "summary": "scored 12"\n'
+            "}\n"
+            "</AGENT_ITERATION_JSON>"
+        )
+        assert _strip_iteration_markers(text) == "Done."
+
+    def test_strips_both_markers_if_present(self):
+        text = (
+            "Report.\n\n"
+            '<AGENT_ITERATION_JSON>{"agent": "a", "summary": "s"}</AGENT_ITERATION_JSON>\n'
+            '<TAILOR_ITERATION_JSON>{"eligible_count": 0}</TAILOR_ITERATION_JSON>'
+        )
+        result = _strip_iteration_markers(text)
+        assert "ITERATION_JSON" not in result
+        assert result == "Report."
+
+    def test_marker_in_middle_collapses_blank_gap(self):
+        text = (
+            "Header line.\n\n"
+            '<AGENT_ITERATION_JSON>{"agent": "a", "summary": "s"}</AGENT_ITERATION_JSON>\n\n'
+            "Footer line."
+        )
+        # No triple-newline gap should remain where the block was removed.
+        result = _strip_iteration_markers(text)
+        assert "ITERATION_JSON" not in result
+        assert "\n\n\n" not in result
+        assert result == "Header line.\n\nFooter line."
+
+    def test_empty_and_none_inputs(self):
+        assert _strip_iteration_markers("") == ""
+        assert _strip_iteration_markers(None) is None
 
 
 class TestExtractTailorIteration:

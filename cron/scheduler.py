@@ -591,6 +591,38 @@ AGENT_ITERATION_REASON_SCHEMA_MISMATCH = "agent_iteration_schema_mismatch"
 AGENT_ITERATION_SUMMARY_MAX_CHARS = 200
 
 
+def _strip_iteration_markers(text: str) -> str:
+    """Remove internal iteration-tracking marker blocks from agent output
+    before it is delivered to a user-facing channel.
+
+    Cron-driven agents emit ``<AGENT_ITERATION_JSON>{...}</AGENT_ITERATION_JSON>``
+    (and Tailor the legacy ``<TAILOR_ITERATION_JSON>{...}</TAILOR_ITERATION_JSON>``)
+    as a machine-only contract consumed by the event-bus extractors
+    (``_extract_agent_iteration`` / ``_extract_tailor_iteration``).  Those
+    extractors read the marker off the raw ``final_response`` in
+    ``_process_job`` and never see the delivered copy, so stripping the block
+    here leaves structured-event emission untouched.
+
+    The block must never reach the delivered body: Telegram's HTML parse mode
+    rejects the unsupported ``<agent_iteration_json>`` tag and falls back to
+    plain text on every send (high-frequency, cosmetic log spam), and the raw
+    JSON is noise to the user.
+
+    Marker-free text is returned unchanged (no whitespace normalization), so
+    this is a no-op for the vast majority of deliveries.
+    """
+    if not text:
+        return text
+    cleaned = AGENT_ITERATION_MARKER_RE.sub("", text)
+    cleaned = TAILOR_ITERATION_MARKER_RE.sub("", cleaned)
+    if cleaned == text:
+        return text
+    # A removed block typically leaves a trailing (or leading) blank-line gap.
+    # Collapse 3+ consecutive newlines to a paragraph break and trim the ends.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
 def _extract_agent_iteration(final_response: str):
     """Extract the generic agent-iteration block from any cron output.
 
@@ -1235,6 +1267,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None, skip_cron
 
     Returns None on success, or an error string on failure.
     """
+    # Strip internal iteration-tracking markers before they reach any
+    # user-facing channel. The event-bus extractors already consumed them
+    # from the raw final_response upstream; left in the delivered body they
+    # break Telegram HTML parsing and surface as raw JSON noise.
+    content = _strip_iteration_markers(content)
     targets = _resolve_delivery_targets(job)
     if not targets:
         if job.get("deliver", "local") != "local":
