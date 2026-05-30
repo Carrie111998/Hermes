@@ -12336,10 +12336,111 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
         return ""
 
+    def _remote_intervention_settings(self) -> dict:
+        """Return the notifications.human_intervention.remote_control config.
+
+        Reads ``notifications.human_intervention.remote_control`` from the live
+        config and merges it over safe defaults so callers can rely on every
+        key being present and well-typed. Any missing/oddly-typed key falls
+        back to its default; any error returns the all-default dict.
+
+        Keeping this a real method (not a closure) makes it trivially patchable
+        from tests and keeps Task 7 (config defaults) a one-line change.
+        """
+        defaults = {
+            "enabled": False,
+            "allow_deny": True,
+            "allow_extend": True,
+            "allow_approve": False,
+            "code_ttl_seconds": 90,
+            "max_extend_minutes": 15,
+            "max_total_wait_minutes": 15,
+            "allowed_targets": [],
+            "risk_explanation": {
+                "enabled": True,
+                "only_for_risk_levels": ["high", "critical"],
+                "max_chars": 280,
+                "timeout_seconds": 3,
+                "fallback_to_static": True,
+            },
+        }
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+            notifications = cfg.get("notifications") if isinstance(cfg, dict) else None
+            human = notifications.get("human_intervention") if isinstance(notifications, dict) else None
+            rc = human.get("remote_control") if isinstance(human, dict) else None
+            if not isinstance(rc, dict):
+                return defaults
+            merged = dict(defaults)
+            for key, value in rc.items():
+                if key == "risk_explanation":
+                    if isinstance(value, dict):
+                        re_merged = dict(defaults["risk_explanation"])
+                        re_merged.update(value)
+                        merged["risk_explanation"] = re_merged
+                else:
+                    merged[key] = value
+            return merged
+        except Exception:
+            return defaults
+
+    def _explain_command_risk_for_notify(self, command, description, risk_level, rc_settings) -> str:
+        """Return an advisory risk explanation for the notification body.
+
+        Gated to the configured risk levels (high/critical by default) and only
+        when explanation is enabled. Advisory only: it must never block or break
+        approval, so it is wrapped in try/except and returns "" on any issue.
+        """
+        try:
+            re_cfg = rc_settings.get("risk_explanation", {}) if isinstance(rc_settings, dict) else {}
+            if not isinstance(re_cfg, dict):
+                return ""
+            if not re_cfg.get("enabled", False):
+                return ""
+            only_for = re_cfg.get("only_for_risk_levels", ["high", "critical"])
+            if not isinstance(only_for, (list, tuple, set)):
+                only_for = ["high", "critical"]
+            normalized = str(risk_level or "").strip().lower()
+            if normalized not in {str(x).strip().lower() for x in only_for}:
+                return ""
+            # Lazy import keeps this cheap and lets tests patch the explainer.
+            # llm_fn=None → instant static explanation that never blocks the
+            # prompt; a future task may wire a bounded auxiliary model here.
+            from hermes_cli.human_intervention_risk_explainer import explain_command_risk
+            max_chars = int(re_cfg.get("max_chars", 280) or 280)
+            timeout_seconds = int(re_cfg.get("timeout_seconds", 3) or 3)
+            return explain_command_risk(
+                command=command,
+                description=description,
+                risk_level=risk_level,
+                llm_fn=None,
+                max_chars=max_chars,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            return ""
+
+    def _rc_create_pending(self, **kw):
+        """Thin patchable wrapper around the pending-intervention store."""
+        from hermes_cli.human_intervention_remote_control import create_pending_intervention
+        return create_pending_intervention(**kw)
+
+    def _rc_consume(self, code):
+        """Thin patchable wrapper to consume a remote deny/extend decision."""
+        from hermes_cli.human_intervention_remote_control import consume_remote_decision
+        return consume_remote_decision(code)
+
+    def _rc_cleanup(self):
+        """Thin patchable wrapper to reap expired pending interventions."""
+        from hermes_cli.human_intervention_remote_control import cleanup_expired
+        return cleanup_expired()
+
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
                            smart_denied: bool = False,
-                           intervention_kind: str = "approval") -> str:
+                           intervention_kind: str = "approval",
+                           risk_level: str = "") -> str:
         """
         Prompt for dangerous command approval through the prompt_toolkit UI.
 
@@ -12353,6 +12454,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Uses _approval_lock to serialize concurrent requests (e.g. from
         parallel delegation subtasks) so each prompt gets its own turn
         and the shared _approval_state / _approval_deadline aren't clobbered.
+
+        Remote control: when enabled, a pending-intervention record is created
+        so a mobile gateway command can DENY or EXTEND this prompt. Approval
+        itself stays local-only — there is no remote approve path. A local
+        answer always wins because response_queue.get() is checked first each
+        poll iteration, before any remote decision is consulted.
         """
         import time as _time
 
@@ -12379,6 +12486,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the command is denied on timeout without the user ever seeing it
             # (#41098). The countdown refreshes below paint the same way.
             self._paint_now()
+            # --- remote control wiring (mobile deny/extend; approval is local) ---
+            rc = self._remote_intervention_settings()
+            remote_enabled = bool(rc.get("enabled"))
+            risk_expl = self._explain_command_risk_for_notify(command, description, risk_level, rc)
+            remote_code = ""
+            remote_actions = None
+            if remote_enabled:
+                allowed = []
+                if rc.get("allow_deny", True):
+                    allowed.append("deny")
+                if rc.get("allow_extend", True):
+                    allowed.append("extend")
+                try:
+                    rec = self._rc_create_pending(
+                        kind=intervention_kind,
+                        title="approval",
+                        preview=command,
+                        session_key=getattr(self, "session_id", ""),
+                        timeout_seconds=timeout,
+                        max_total_wait_minutes=int(rc.get("max_total_wait_minutes", 15)),
+                        allowed_actions=allowed or None,
+                    )
+                    remote_code = rec.code
+                    remote_actions = (allowed + ["status"]) if allowed else ["status"]
+                    # Expose for tests + UI.
+                    self._approval_state["remote_code"] = remote_code
+                except Exception:
+                    remote_code = ""
+                    remote_actions = None
+
             try:
                 from hermes_cli.human_intervention_notifications import notify_human_intervention
                 notify_human_intervention(
@@ -12388,42 +12525,86 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     session_key=getattr(self, "session_id", ""),
                     dedupe_key=f"{intervention_kind}:{command}",
                     timeout_seconds=timeout,
+                    remote_code=remote_code,
+                    remote_actions=remote_actions,
+                    risk_level=risk_level,
+                    risk_explanation=risk_expl,
                 )
             except Exception:
                 pass
 
-            _last_countdown_refresh = _time.monotonic()
-            while True:
-                try:
-                    result = response_queue.get(timeout=1)
-                    self._approval_state = None
-                    self._approval_deadline = 0
-                    self._paint_now()
-                    _outcome_labels = {
-                        "once": "allowed once",
-                        "session": "allowed for session",
-                        "always": "added to allowlist",
-                        "deny": "denied",
-                    }
-                    self._persist_prompt_summary(
-                        "⚠", "Approval", command,
-                        _outcome_labels.get(result, str(result)),
-                    )
-                    return result
-                except queue.Empty:
-                    remaining = self._approval_deadline - _time.monotonic()
-                    if remaining <= 0:
-                        break
-                    now = _time.monotonic()
-                    if now - _last_countdown_refresh >= 1.0:
-                        _last_countdown_refresh = now
+            try:
+                _last_countdown_refresh = _time.monotonic()
+                _outcome_labels = {
+                    "once": "allowed once",
+                    "session": "allowed for session",
+                    "always": "added to allowlist",
+                    "deny": "denied",
+                }
+                while True:
+                    try:
+                        # Local answer is checked FIRST every iteration, so a
+                        # local choice always wins over a remote decision.
+                        result = response_queue.get(timeout=1)
+                        self._approval_state = None
+                        self._approval_deadline = 0
                         self._paint_now()
+                        self._persist_prompt_summary(
+                            "⚠", "Approval", command,
+                            _outcome_labels.get(result, str(result)),
+                        )
+                        return result
+                    except queue.Empty:
+                        remaining = self._approval_deadline - _time.monotonic()
+                        if remaining <= 0:
+                            break
+                        if remote_code:
+                            snap = self._rc_consume(remote_code)
+                            if snap is not None and snap.decision == "deny":
+                                # Remote deny → behave like a local deny.
+                                self._approval_state = None
+                                self._approval_deadline = 0
+                                self._paint_now()
+                                _cprint(
+                                    f"\n{_DIM}  ⏹ Denied remotely "
+                                    f"({snap.decision_source or 'mobile'}){_RST}"
+                                )
+                                self._persist_prompt_summary(
+                                    "⚠", "Approval", command, "denied remotely"
+                                )
+                                return "deny"
+                            if snap is not None and snap.decision == "extend":
+                                # Translate the store's wall-clock deadline into
+                                # the CLI's monotonic clock; only ever increase.
+                                import time as _t
+                                delta = max(0.0, snap.deadline_ts - _t.time())
+                                new_deadline = _time.monotonic() + delta
+                                if new_deadline > self._approval_deadline:
+                                    self._approval_deadline = new_deadline
+                                self._paint_now()
+                                # keep waiting
+                        now = _time.monotonic()
+                        if now - _last_countdown_refresh >= 1.0:
+                            _last_countdown_refresh = now
+                            self._paint_now()
 
-            self._approval_state = None
-            self._approval_deadline = 0
-            self._paint_now()
-            _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
-            return "deny"
+                self._approval_state = None
+                self._approval_deadline = 0
+                self._paint_now()
+                _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+                self._persist_prompt_summary("⚠", "Approval", command, "timed out / denied")
+                return "deny"
+            finally:
+                # Clear any pending record on every exit path. Consuming an
+                # already-resolved deny returns None, which is harmless.
+                # NOTE: never `return` inside this finally (avoids the
+                # SyntaxWarning that would otherwise swallow the verdict).
+                if remote_code:
+                    try:
+                        self._rc_consume(remote_code)
+                        self._rc_cleanup()
+                    except Exception:
+                        pass
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
                           smart_denied: bool = False) -> list[str]:
