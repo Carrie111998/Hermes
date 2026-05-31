@@ -54,12 +54,6 @@ const filterGroupClass =
 const segmentedClass =
   "w-fit max-w-full flex-wrap justify-start self-start";
 
-const filterGroupClass =
-  "flex min-w-0 w-full flex-col items-start gap-1.5 sm:w-auto sm:max-w-full sm:flex-row sm:items-center";
-
-const segmentedClass =
-  "w-fit max-w-full flex-wrap justify-start self-start";
-
 export default function LogsPage() {
   const [file, setFile] = useState<(typeof FILES)[number]>("agent");
   const [level, setLevel] = useState<(typeof LEVELS)[number]>("ALL");

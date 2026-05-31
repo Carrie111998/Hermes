@@ -6,7 +6,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-import { Typography } from "@/components/NouiTypography";
+import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
 
 const CLOSE_DRAG_MIN_PX = 72;
