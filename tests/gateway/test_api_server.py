@@ -1037,6 +1037,104 @@ class TestChatCompletionsEndpoint:
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
 
+    @pytest.mark.asyncio
+    async def test_stream_falls_back_to_final_response_when_no_deltas(self, adapter):
+        """Streaming clients receive final text when no text callback fires."""
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            assert kwargs.get("stream_delta_callback") is not None
+            return (
+                {"final_response": "pong", "messages": [], "api_calls": 1},
+                {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ") and line.strip() != "data: [DONE]"
+        ]
+        content_chunks = [
+            choice["delta"]["content"]
+            for chunk in chunks
+            for choice in chunk["choices"]
+            if choice.get("delta", {}).get("content")
+        ]
+        finish_chunks = [
+            chunk
+            for chunk in chunks
+            if chunk["choices"][0].get("finish_reason") == "stop"
+        ]
+
+        assert content_chunks == ["pong"]
+        assert len(finish_chunks) == 1
+        assert finish_chunks[0]["usage"] == {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+        }
+        assert body.endswith("data: [DONE]\n\n")
+
+    @pytest.mark.asyncio
+    async def test_stream_final_response_fallback_does_not_duplicate_deltas(self, adapter):
+        """A final response is not emitted again after a real text delta."""
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            kwargs["stream_delta_callback"]("Hello!")
+            return (
+                {"final_response": "Hello!", "messages": [], "api_calls": 1},
+                {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                body = await resp.text()
+
+        assert resp.status == 200
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: ") and line.strip() != "data: [DONE]"
+        ]
+        content_chunks = [
+            choice["delta"]["content"]
+            for chunk in chunks
+            for choice in chunk["choices"]
+            if choice.get("delta", {}).get("content")
+        ]
+        finish_reasons = [
+            choice["finish_reason"]
+            for chunk in chunks
+            for choice in chunk["choices"]
+            if choice.get("finish_reason") is not None
+        ]
+
+        assert content_chunks == ["Hello!"]
+        assert finish_reasons == ["stop"]
+        assert body.endswith("data: [DONE]\n\n")
+
 
     @pytest.mark.asyncio
     async def test_session_chat_stream_passes_request_model_provider_options(self, adapter):

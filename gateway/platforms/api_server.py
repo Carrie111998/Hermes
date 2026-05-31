@@ -5567,6 +5567,11 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             last_activity = time.monotonic()
 
+            # Track real text independently from tool-progress events so a
+            # normally completed run can fall back to its final response when
+            # the provider never invoked the text-delta callback.
+            emitted_text_delta = False
+
             # Role chunk
             role_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
@@ -5587,9 +5592,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
                 """
+                nonlocal emitted_text_delta
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
+                    if isinstance(item, str) and item:
+                        emitted_text_delta = True
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -5664,6 +5672,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 finish_reason = "error"
             else:
                 finish_reason = "stop"
+
+            final_response = result.get("final_response") if isinstance(result, dict) else None
+            if finish_reason == "stop" and not emitted_text_delta and isinstance(final_response, str) and final_response:
+                last_activity = await _emit(final_response)
 
             # Finish chunk
             finish_chunk = {
