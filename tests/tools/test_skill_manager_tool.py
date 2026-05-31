@@ -338,7 +338,10 @@ class TestFindSkillSymlinks:
             result = _find_skill("my-skill")
 
         assert result is not None, "Symlinked skill should be found"
-        assert result["path"] == real_category
+        # iter_skill_index_files returns the path through the symlink,
+        # not the symlink's target path
+        expected_path = skills_dir / "real_category" / "my-skill"
+        assert result["path"] == expected_path
 
     def test_nested_symlinked_skill_is_found(self, tmp_path):
         """Skills nested under multiple symlinked dirs must be discoverable."""
