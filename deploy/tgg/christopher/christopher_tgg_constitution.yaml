@@ -36,6 +36,16 @@ job_briefs:
       tgg_case_lookup. Do not treat unit numbers such as #11-109 or 11-109
       as job numbers.
     - >-
+      A job number is hard identity and is never interchangeable with a different
+      job number, even at the same block, unit, or address. If a message carries
+      an explicit job number (HDB or iLinked) and the exact lookup for THAT job
+      number returns no match in the operator DB, do NOT attach the message to
+      any other existing case that merely shares the address, block, or unit.
+      Preserve the explicit job identity: record it as a WhatsApp-only case
+      (provenance WA-only) OR flag needs_clarification, and list any
+      same-address cases only as review context -- never resolve to them. Same
+      address + different job number = a different case.
+    - >-
       Before any case lookup or create, extract structured anchors from the
       message: job number, block, street, unit, zone-text, sender, and
       work/status text. Use the job number as hard identity when present
