@@ -35,6 +35,14 @@ job_briefs:
       If a real job number is present (for example SK/JOB/2604/2376), use
       tgg_case_lookup. Do not treat unit numbers such as #11-109 or 11-109
       as job numbers.
+    - >-
+      Before any case lookup or create, extract structured anchors from the
+      message: job number, block, street, unit, zone-text, sender, and
+      work/status text. Use the job number as hard identity when present
+      (exact match). Use block + unit + street as strong identity. Treat
+      zone-text as a soft hint only (per the zone rule). If only block + unit
+      are present and they match multiple streets, towns, or zones, treat it
+      as ambiguous and clarify (record candidates) rather than create.
     - If address, unit, block/street, or work-type text is present without a
       real job number, use tgg_case_search before deciding whether an existing
       case matches.
@@ -46,23 +54,37 @@ job_briefs:
       as fallback search text only when no usable address or job number exists.
       Only run a second search for the same cluster if the first result is empty,
       ambiguous, or contradicts the message evidence.
-    - For clearly new case reports with zone, address, problem, and WhatsApp source,
-      call tgg_case_create only after tgg_case_search finds no safe existing
-      match. If address, problem, source, or confidence is unclear, do not
-      create; surface the missing facts for clarification.
-    - If an inbound WhatsApp operations message contains photos, worker updates, or
-      case evidence and a safe case match exists, call tgg_case_observation.
+    - >-
+      When searching for an existing case to match an inbound report, search by
+      job number, block, unit, and street/address text. Do NOT pass zone as a
+      search filter when the zone came from the WhatsApp message text -- zone
+      written in chat is a soft hint only. Only filter by zone when the zone is
+      sourced from the operator DB or iLinked. A "Zone: X" line in a chat must
+      never exclude an exact block/unit match that lives in a different zone.
+    - >-
+      Only create a new case when identity is strong: an explicit job number, OR
+      block + unit + street together with a clear problem and WhatsApp source.
+      When identity is ambiguous -- block + unit match more than one
+      street/town/zone, only partial anchors are present, or confidence is low
+      -- do NOT create a case and do NOT silently drop the message. Record it
+      as a case_observation flagged `needs_clarification`, listing the candidate
+      matches you found and what is missing, so the operator can resolve it.
+      Clarify; do not guess, and do not force a create-or-drop decision.
+    - >-
+      If an inbound WhatsApp operations message contains photos, worker updates,
+      or case evidence and a safe case match exists, call tgg_case_observation.
       Include source, notes, confidence, observedAt, mediaRefs/sourceRefs, and
-      fields containing message_text, sender_name, chat_name, photo_count, and
-      extracted case facts.
+      fields containing message_text, sender_name, sender_role, chat_name,
+      photo_count, and extracted case facts. When more than one existing case
+      plausibly matches an inbound report, record all candidate job numbers,
+      the one you chose (if any), and your confidence in the observation fields
+      -- never pick a single match silently when others are plausible.
     - >-
       For TGG case work in this ingest job, use only tgg_case_lookup,
       tgg_case_search, tgg_case_create, and tgg_case_observation. Do not call
       generic pa_business_read, pa_business_write, or agent config operations as
       a workaround when a lookup/search is unclear. Ask for clarification or
       create a WhatsApp-only case only when the tgg_case_* result supports it.
-    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
-      and report inability if the tool blocks it.
     - Route management questions out of ops ingest instead of answering them inline.
     enabled_toolsets:
     - memory
@@ -228,8 +250,6 @@ job_briefs:
       update questions, call pa_business_read with operation ilinked_status before
       summarizing and include source_system_requested=true in the payload.
       Include the result in Facts.
-    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
-      and report inability if the tool blocks it.
     - >
       Honor shortness signals. If the operator says "short", "brief", "tldr",
       "quick", "just", "simple", "summary", "short answer", or similar,
