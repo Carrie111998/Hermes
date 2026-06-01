@@ -770,12 +770,12 @@ def _prepare_hermes_home(
     )
 
     _set_nested(constitution, ["runtime", "provider"], provider_name)
-    _set_nested(constitution, ["runtime", "model"], model)
+    _set_nested(constitution, ["runtime", "model"], profile.model)
     for brief in (constitution.get("job_briefs") or {}).values():
         if isinstance(brief, dict):
             runtime = brief.setdefault("runtime", {})
             runtime["provider"] = provider_name
-            runtime["model"] = model
+            runtime["model"] = profile.model
 
     _write_yaml(hermes_home / "config.yaml", config)
     _write_yaml(local_constitution, constitution)
