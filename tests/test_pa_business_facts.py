@@ -747,13 +747,43 @@ def test_case_search_accepts_structured_fields_as_single_query(path_param_endpoi
     assert result["ok"] is True
     last = _PathParamHandler.last_request
     assert last["method"] == "GET"
-    assert "search=Blk+350+Anchorvale+Rd+%2311-109+window+grille+install" in last["path"]
+    assert "search=Blk+350+Anchorvale+Rd+%2311-109" in last["path"]
+    assert "window+grille+install" not in last["path"]
     assert "block=" not in last["path"]
     assert "street=" not in last["path"]
     assert "unit=" not in last["path"]
     assert "workType=" not in last["path"]
-    assert "zone=SK" in last["path"]
+    assert "zone=SK" not in last["path"]
     assert "limit=10" in last["path"]
+
+
+def test_case_search_uses_work_text_only_when_no_address(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_case_search": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "tgg_case_search",
+        {
+            "workType": "window grille install",
+            "limit": 10,
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    assert "search=window+grille+install" in last["path"]
+    assert "workType=" not in last["path"]
 
 
 def test_path_param_interpolation_patch_keeps_remaining_payload_in_body(path_param_endpoint):

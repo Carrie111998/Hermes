@@ -296,37 +296,22 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
     return {"result": parsed}
 
 
-CASE_SEARCH_TEXT_KEYS = (
+CASE_SEARCH_ADDRESS_KEYS = (
     "address",
     "block",
     "street",
     "unit",
+)
+CASE_SEARCH_WORK_KEYS = (
     "workType",
     "work_type",
     "problem",
     "issue",
 )
+CASE_SEARCH_TEXT_KEYS = CASE_SEARCH_ADDRESS_KEYS + CASE_SEARCH_WORK_KEYS
 
 
-def _case_search_text(payload: Mapping[str, Any]) -> str:
-    raw_parts: list[str] = []
-    address = str(payload.get("address") or "").strip()
-    if address:
-        raw_parts.append(address)
-    else:
-        block = str(payload.get("block") or "").strip()
-        street = str(payload.get("street") or "").strip()
-        unit = str(payload.get("unit") or "").strip()
-        if block:
-            raw_parts.append(f"Blk {block}" if not block.lower().startswith("blk") else block)
-        if street:
-            raw_parts.append(street)
-        if unit:
-            raw_parts.append(unit if unit.startswith("#") else f"#{unit}")
-    for key in ("workType", "work_type", "problem", "issue"):
-        value = str(payload.get(key) or "").strip()
-        if value:
-            raw_parts.append(value)
+def _dedupe_text_parts(raw_parts: list[str]) -> str:
     seen: set[str] = set()
     parts: list[str] = []
     for part in raw_parts:
@@ -341,14 +326,46 @@ def _case_search_text(payload: Mapping[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _case_search_address_text(payload: Mapping[str, Any]) -> str:
+    raw_parts: list[str] = []
+    address = str(payload.get("address") or "").strip()
+    if address:
+        raw_parts.append(address)
+    else:
+        block = str(payload.get("block") or "").strip()
+        street = str(payload.get("street") or "").strip()
+        unit = str(payload.get("unit") or "").strip()
+        if block:
+            raw_parts.append(f"Blk {block}" if not block.lower().startswith("blk") else block)
+        if street:
+            raw_parts.append(street)
+        if unit:
+            raw_parts.append(unit if unit.startswith("#") else f"#{unit}")
+    return _dedupe_text_parts(raw_parts)
+
+
+def _case_search_work_text(payload: Mapping[str, Any]) -> str:
+    raw_parts: list[str] = []
+    for key in ("workType", "work_type", "problem", "issue"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            raw_parts.append(value)
+    return _dedupe_text_parts(raw_parts)
+
+
 def _normalize_case_search_payload(clean: dict[str, Any]) -> dict[str, Any]:
     if "search" not in clean and clean.get("query") is not None:
         clean["search"] = clean["query"]
-    if not str(clean.get("search") or "").strip():
-        composed = _case_search_text(clean)
-        if composed:
-            clean["search"] = composed
+    address_text = _case_search_address_text(clean)
+    work_text = _case_search_work_text(clean)
+    has_address_terms = any(str(clean.get(key) or "").strip() for key in CASE_SEARCH_ADDRESS_KEYS)
+    has_work_terms = any(str(clean.get(key) or "").strip() for key in CASE_SEARCH_WORK_KEYS)
+    if address_text and has_address_terms:
+        clean["search"] = address_text
+    elif work_text and (has_work_terms or not str(clean.get("search") or "").strip()):
+        clean["search"] = work_text
     clean.pop("query", None)
+    clean.pop("zone", None)
     for key in CASE_SEARCH_TEXT_KEYS:
         clean.pop(key, None)
     return clean
@@ -829,7 +846,7 @@ def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
 def _handle_tgg_case_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload = _normalize_case_search_payload(dict(args))
     payload["limit"] = payload.get("limit", 12)
-    for key in ("zone", "serviceLine", "sourceStatus", "progressStatus", "state"):
+    for key in ("serviceLine", "sourceStatus", "progressStatus", "state"):
         if args.get(key) is not None:
             payload[key] = args.get(key)
     return _handle_tgg_read("tgg_case_search", payload)
@@ -959,22 +976,21 @@ TGG_CASE_LOOKUP_SCHEMA = {
 
 TGG_CASE_SEARCH_SCHEMA = {
     "name": "tgg_case_search",
-    "description": "Search TGG operator cases by address, unit, block, street, work type, or free text. Use once per distinct address/job cluster before creating a case when no exact job number is present.",
+    "description": "Search TGG operator cases. Prefer address fields first; workType/problem are reasoning hints and are only used as the search text when no address or job number is available.",
     "parameters": {
         "type": "object",
         "properties": {
             "search": {
                 "type": "string",
-                "description": "Address/unit/work text, e.g. 'Blk 350 Anchorvale Rd #11-109 window grille'.",
+                "description": "Free text fallback. If block/street/unit or address is known, keep this to address text only.",
             },
             "address": {"type": "string", "description": "Structured address if known, e.g. 'Blk 350 Anchorvale Rd #11-109'."},
             "block": {"type": "string", "description": "Structured block number if known, e.g. '350'."},
             "street": {"type": "string", "description": "Structured street/name if known, e.g. 'Anchorvale Rd'."},
             "unit": {"type": "string", "description": "Structured unit if known, e.g. '#11-109'."},
-            "workType": {"type": "string", "description": "Structured work type/problem if known, e.g. 'window grille install'."},
-            "problem": {"type": "string", "description": "Structured problem/work description if known."},
+            "workType": {"type": "string", "description": "Structured work type/problem if known. Used for reasoning after address candidates return, not mixed into address search."},
+            "problem": {"type": "string", "description": "Structured problem/work description if known. Used for reasoning after address candidates return, not mixed into address search."},
             "limit": {"type": "integer", "description": "Maximum candidates to return.", "default": 12},
-            "zone": {"type": "string", "description": "Optional TGG zone filter, e.g. SK, PG, AM."},
             "serviceLine": {"type": "string", "description": "Optional service line, usually maintenance or sprucing."},
             "sourceStatus": {"type": "string", "description": "Optional source status filter."},
             "progressStatus": {"type": "string", "description": "Optional progress status filter."},

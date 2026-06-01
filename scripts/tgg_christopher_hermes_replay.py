@@ -12,17 +12,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import html
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +40,91 @@ DEFAULT_SECRETS = Path.home() / ".marshal" / "secrets.env"
 TGG_CONFIG = REPO_ROOT / "deploy" / "tgg" / "christopher" / "config.yaml"
 TGG_CONSTITUTION = REPO_ROOT / "deploy" / "tgg" / "christopher" / "christopher_tgg_constitution.yaml"
 DOCS_DIR = Path.home() / "pcl-docs" / "records"
+LOCAL_BUSINESS_PREFIXES = ("http://127.0.0.1:", "http://localhost:")
+
+
+@dataclass(frozen=True)
+class ReplayProfile:
+    name: str
+    main_provider: str
+    model: str
+    transport: str
+    vision_enabled: bool
+    vision_provider: str | None
+    vision_model: str | None
+    vision_concurrency: int
+    business_mode: str
+    allow_prod_url: bool
+    debounce_seconds: int
+    direct_mention_immediate: bool
+    rotate_session_every_turns: int | None = None
+    require_pricing: bool = True
+
+
+REPLAY_PROFILES: dict[str, ReplayProfile] = {
+    "tgg-local-gpt54-mini-gemini-vision": ReplayProfile(
+        name="tgg-local-gpt54-mini-gemini-vision",
+        main_provider="openai-direct-primary",
+        model="gpt-5.4-mini",
+        transport="codex_responses",
+        vision_enabled=True,
+        vision_provider="gemini",
+        vision_model="gemini-3.1-flash-lite",
+        vision_concurrency=8,
+        business_mode="copied-db-local-operator",
+        allow_prod_url=False,
+        debounce_seconds=300,
+        direct_mention_immediate=True,
+    ),
+}
+
+
+def _infer_vision_provider(vision_provider: str | None, vision_model: str | None) -> str | None:
+    provider = (vision_provider or "").strip()
+    if provider:
+        return provider
+    model = (vision_model or "").strip().lower()
+    if model.startswith("gemini-") or model.startswith("google/"):
+        return "gemini"
+    return None
+
+
+def _validate_provider_model_args(*, vision_provider: str | None, vision_model: str | None) -> None:
+    model = (vision_model or "").strip().lower()
+    provider = (_infer_vision_provider(vision_provider, vision_model) or "main").strip().lower()
+    if model.startswith("gemini-") and provider not in {"gemini", "google", "google-gemini", "google-ai-studio"}:
+        raise ValueError(
+            f"vision model {vision_model!r} requires a Gemini vision provider; got {provider!r}"
+        )
+
+
+def _resolve_replay_profile(args: argparse.Namespace) -> ReplayProfile:
+    base = REPLAY_PROFILES.get(str(args.profile or ""))
+    if base is None:
+        known = ", ".join(sorted(REPLAY_PROFILES))
+        raise SystemExit(f"Unknown replay profile {args.profile!r}. Known profiles: {known}")
+    vision_provider = args.vision_provider if args.vision_provider is not None else base.vision_provider
+    vision_model = args.vision_model if args.vision_model is not None else base.vision_model
+    return ReplayProfile(
+        name=base.name,
+        main_provider=base.main_provider,
+        model=args.model if args.model is not None else base.model,
+        transport=base.transport,
+        vision_enabled=base.vision_enabled,
+        vision_provider=_infer_vision_provider(vision_provider, vision_model),
+        vision_model=vision_model,
+        vision_concurrency=args.vision_concurrency if args.vision_concurrency is not None else base.vision_concurrency,
+        business_mode="external-local-operator" if args.no_local_operator_backend else base.business_mode,
+        allow_prod_url=base.allow_prod_url,
+        debounce_seconds=args.debounce_seconds if args.debounce_seconds is not None else base.debounce_seconds,
+        direct_mention_immediate=base.direct_mention_immediate,
+        rotate_session_every_turns=(
+            args.rotate_session_every_turns
+            if args.rotate_session_every_turns is not None
+            else base.rotate_session_every_turns
+        ),
+        require_pricing=base.require_pricing,
+    )
 
 
 @dataclass
@@ -64,6 +156,8 @@ class PublishedTurn:
     output_tokens: int
     reasoning_output_tokens: int
     estimated_cost_usd: float
+    llm_call_count: int
+    llm_calls: list[dict[str, Any]]
     model: str
     provider: str
     assistant: str
@@ -138,6 +232,7 @@ def _prepare_env(hermes_home: Path, *, secrets: Path) -> None:
     os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "1"
     os.environ["HERMES_PA_AGENT_ACTION_DRY_RUN"] = "1"
     os.environ.setdefault("HERMES_OPENAI_CAPTURE_DIR", str(hermes_home / "openai-captures"))
+    os.environ.setdefault("HERMES_LLM_CALL_LOG", str(hermes_home / "llm-call-ledger.jsonl"))
     os.environ["HERMES_TIMEZONE"] = "Asia/Singapore"
     os.environ.setdefault("TERMINAL_CWD", str(REPO_ROOT))
 
@@ -158,6 +253,427 @@ def _write_yaml(path: Path, data: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
+def _validate_replay_args(args: argparse.Namespace) -> None:
+    profile = _resolve_replay_profile(args)
+    vision_model = str(profile.vision_model or "").strip().lower()
+    vision_provider = str(profile.vision_provider or "main").strip().lower()
+    if vision_model.startswith("gemini") and vision_provider not in {"gemini", "google", "google-gemini", "google-ai-studio"}:
+        raise SystemExit(
+            "--vision-model looks like Gemini but --vision-provider points elsewhere. "
+            "Refusing to route a Gemini model name through the main provider."
+        )
+    if args.business_base_url and not profile.allow_prod_url and not str(args.business_base_url).startswith(LOCAL_BUSINESS_PREFIXES):
+        raise SystemExit(
+            "--business-base-url must be localhost/127.0.0.1 for replay. "
+            "Use the local copied-DB backend; do not point replay at production."
+        )
+    if not Path(args.db).exists():
+        raise SystemExit(f"Replay DB does not exist: {args.db}")
+    sidecars = [Path(str(args.db) + suffix) for suffix in ("-wal", "-shm")]
+    existing_sidecars = [str(path) for path in sidecars if path.exists()]
+    if existing_sidecars:
+        raise SystemExit(
+            "Replay DB has SQLite sidecars. Restore the copied DB cleanly before replay: "
+            + ", ".join(existing_sidecars)
+        )
+    with sqlite3.connect(f"file:{Path(args.db)}?mode=ro", uri=True) as conn:
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+    if not result or str(result[0]).lower() != "ok":
+        raise SystemExit(f"Replay DB integrity check failed: {result[0] if result else 'no result'}")
+    if profile.business_mode != "copied-db-local-operator" and not args.business_base_url:
+        raise SystemExit(f"Replay profile {profile.name} requires an explicit business bridge URL")
+    if profile.require_pricing:
+        for provider, model in (
+            (profile.main_provider, profile.model),
+            (profile.vision_provider, profile.vision_model),
+        ):
+            if not model:
+                continue
+            if _estimate_cost_for_usage(
+                model=model,
+                provider=provider,
+                input_total=1,
+                cached_input=0,
+                output_tokens=1,
+            ) <= 0:
+                raise SystemExit(f"No pricing configured for {provider or 'main'} / {model}")
+
+
+def _normalize_job_no(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _first_nonempty(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, list):
+            value = "; ".join(str(v) for v in value if str(v).strip())
+        text = str(value or "").strip()
+        if text:
+            return text
+    return None
+
+
+def _split_address(value: str) -> tuple[str | None, str | None, str | None]:
+    text = " ".join(str(value or "").split())
+    block = None
+    street = None
+    unit = None
+    block_match = re.search(r"\b(?:BLK|BLOCK)\s+([A-Z0-9]+)", text, flags=re.I)
+    unit_match = re.search(r"#\s*([0-9]{1,3}\s*-\s*[0-9A-Z]+)", text, flags=re.I)
+    if block_match:
+        block = block_match.group(1).upper()
+    if unit_match:
+        unit = "#" + re.sub(r"\s+", "", unit_match.group(1)).upper()
+    if block_match:
+        street_end = unit_match.start() if unit_match else len(text)
+        street = text[block_match.end():street_end].strip(" ,")
+    return block, street or None, unit
+
+
+def _case_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "jobNo": row["job_no"],
+        "job_no": row["job_no"],
+        "wcNo": row["wc_no"],
+        "wc_no": row["wc_no"],
+        "zone": row["zone"],
+        "state": row["state"],
+        "source": row["source"],
+        "serviceLine": row["service_line"],
+        "service_line": row["service_line"],
+        "address": row["address"],
+        "block": row["block"],
+        "unit": row["unit"],
+        "streetName": row["street_name"],
+        "street_name": row["street_name"],
+        "problem": row["problem"],
+        "feedback": row["feedback"],
+        "typeOfWork": row["type_of_work"],
+        "type_of_work": row["type_of_work"],
+        "jobStatus": row["job_status"],
+        "job_status": row["job_status"],
+        "linkfmStatus": row["linkfm_status"],
+        "linkfm_status": row["linkfm_status"],
+    }
+
+
+def _case_search_tokens(search: str) -> list[str]:
+    stop = {"BLK", "BLOCK", "THE", "AND", "FOR", "TO", "A", "AN", "OF", "WORK", "CAST", "REQUEST"}
+    seen: set[str] = set()
+    out: list[str] = []
+    for token in re.findall(r"[A-Z0-9#]+", str(search or "").upper()):
+        if len(token) < 2 or token in stop:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def _case_search_anchors(search: str) -> tuple[str | None, str | None]:
+    text = str(search or "")
+    block_match = re.search(r"\b(?:BLK|BLOCK)\s+([A-Z0-9]+)", text, flags=re.I)
+    unit_match = re.search(r"#\s*([0-9]{1,3}\s*-\s*[0-9A-Z]+)", text, flags=re.I)
+    block = block_match.group(1).upper() if block_match else None
+    unit = "#" + re.sub(r"\s+", "", unit_match.group(1)).upper() if unit_match else None
+    return block, unit
+
+
+def _next_wa_job_no(conn: sqlite3.Connection, ts: int) -> str:
+    stamp = datetime.fromtimestamp(ts)
+    prefix = f"WA/JOB/{stamp:%y%m}/"
+    rows = conn.execute(
+        "SELECT job_no FROM cases WHERE job_no LIKE ? ORDER BY id DESC LIMIT 200",
+        (f"{prefix}%",),
+    ).fetchall()
+    max_suffix = 0
+    for row in rows:
+        suffix = str(row[0] or "")[len(prefix):]
+        if suffix.isdigit():
+            max_suffix = max(max_suffix, int(suffix))
+    return f"{prefix}{max_suffix + 1:04d}"
+
+
+class _ReplayOperatorBackend:
+    """Local operator API with the same route shape as the TGG portal."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+    def _handler(self):
+        backend = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                backend._handle(self)
+
+            def do_POST(self) -> None:
+                backend._handle(self)
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+        return Handler
+
+    def _reply(self, handler: BaseHTTPRequestHandler, body: dict[str, Any], status: int = 200) -> None:
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(raw)))
+        handler.end_headers()
+        handler.wfile.write(raw)
+
+    def _body(self, handler: BaseHTTPRequestHandler) -> dict[str, Any]:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+        if not length:
+            return {}
+        raw = handler.rfile.read(length).decode("utf-8")
+        try:
+            parsed = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            return {"_raw": raw}
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+
+    def _handle(self, handler: BaseHTTPRequestHandler) -> None:
+        parsed = urlparse(handler.path)
+        path = parsed.path
+        query = {key: values[-1] for key, values in parse_qs(parsed.query).items() if values}
+        try:
+            if handler.command == "GET" and path == "/api/operator/cases":
+                self._reply(handler, {"ok": True, "data": self._search_cases(query), "status_code": 200})
+                return
+            if handler.command == "GET" and path.startswith("/api/operator/cases/"):
+                job_no = unquote(path.removeprefix("/api/operator/cases/").split("/", 1)[0])
+                case = self._lookup_case(job_no)
+                if case is None:
+                    self._reply(
+                        handler,
+                        {"ok": False, "error": {"code": "CASE_NOT_FOUND", "message": "No case with that job number."}, "status_code": 404},
+                        status=404,
+                    )
+                    return
+                self._reply(handler, {"ok": True, "data": case, "status_code": 200})
+                return
+            if handler.command == "POST" and path in {"/api/operator/cases", "/api/operator/cases/create"}:
+                result = self._create_case(self._body(handler))
+                self._reply(handler, {"ok": True, "data": result, "status_code": 200})
+                return
+            if handler.command == "POST" and path.startswith("/api/operator/cases/") and path.endswith("/observations"):
+                job_no = unquote(path.removeprefix("/api/operator/cases/").removesuffix("/observations"))
+                result = self._add_observation(job_no, self._body(handler))
+                self._reply(handler, {"ok": True, "data": result, "status_code": 200})
+                return
+        except Exception as exc:
+            self._reply(handler, {"ok": False, "error": str(exc), "status_code": 500}, status=500)
+            return
+        self._reply(handler, {"ok": False, "error": "not found", "status_code": 404}, status=404)
+
+    def _lookup_case(self, job_no: str) -> dict[str, Any] | None:
+        with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT * FROM cases WHERE normalized_job_no = ? OR job_no = ? LIMIT 1",
+                (_normalize_job_no(job_no), job_no),
+            ).fetchone()
+        return _case_row_to_api(row) if row else None
+
+    def _search_cases(self, query: dict[str, Any]) -> list[dict[str, Any]]:
+        search = str(query.get("search") or "").strip()
+        limit = max(1, min(int(query.get("limit") or 12), 50))
+        tokens = _case_search_tokens(search)
+        query_block, query_unit = _case_search_anchors(search)
+        service_line = str(query.get("serviceLine") or query.get("service_line") or "").strip()
+        state = str(query.get("state") or "").strip()
+        source_status = str(query.get("sourceStatus") or query.get("source_status") or "").strip()
+        clauses: list[str] = []
+        binds: list[Any] = []
+        if query_block:
+            clauses.append("upper(coalesce(block, '')) = ?")
+            binds.append(query_block)
+        if query_unit:
+            clauses.append("upper(replace(coalesce(unit, ''), ' ', '')) = ?")
+            binds.append(query_unit)
+        if service_line:
+            clauses.append("coalesce(service_line, 'maintenance') = ?")
+            binds.append(service_line)
+        if state:
+            clauses.append("state = ?")
+            binds.append(state)
+        if source_status == "wa_only":
+            clauses.append("state = 'wa_only'")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"""
+                SELECT * FROM cases
+                {where}
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 5000
+                """,
+                binds,
+            ).fetchall()
+
+        def score(row: sqlite3.Row) -> tuple[int, int, int]:
+            haystack = " ".join(
+                str(row[key] or "")
+                for key in (
+                    "job_no",
+                    "wc_no",
+                    "address",
+                    "block",
+                    "unit",
+                    "street_name",
+                    "tenant_name",
+                    "problem",
+                    "feedback",
+                    "type_of_work",
+                )
+            ).upper()
+            matches = sum(1 for token in tokens if token in haystack)
+            anchor = 0
+            block = str(row["block"] or "").upper()
+            unit = str(row["unit"] or "").replace(" ", "").upper()
+            if query_block:
+                if block != query_block:
+                    return 0, 0, int(row["updated_at"] or 0)
+                anchor += 20
+            if query_unit:
+                if unit != query_unit:
+                    return 0, 0, int(row["updated_at"] or 0)
+                anchor += 30
+            if block and block in tokens:
+                anchor += 4
+            if unit and unit in tokens:
+                anchor += 8
+            return matches + anchor, anchor, int(row["updated_at"] or 0)
+
+        ranked = [(score(row), row) for row in rows]
+        if tokens:
+            ranked = [item for item in ranked if item[0][0] > 0]
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [_case_row_to_api(row) for _, row in ranked[:limit]]
+
+    def _create_case(self, payload: dict[str, Any]) -> dict[str, Any]:
+        evidence = payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {}
+        zone = _first_nonempty(payload.get("zone"), evidence.get("zone"))
+        address = _first_nonempty(payload.get("address"), evidence.get("address"))
+        problem = _first_nonempty(payload.get("problem"), evidence.get("problem"), evidence.get("remarks"))
+        source = _first_nonempty(payload.get("source"), evidence.get("source"))
+        if not zone or not address or not problem or not source:
+            raise ValueError("zone, address, problem, and source are required to create a new case")
+        confidence = _first_nonempty(payload.get("confidence"), evidence.get("confidence"))
+        if confidence and re.match(r"^(low|uncertain|guess|unknown)$", confidence, flags=re.I):
+            raise ValueError("case_create requires clear WhatsApp evidence; ask for clarification instead")
+        job_no = _first_nonempty(payload.get("jobNo"), payload.get("job_no"), evidence.get("jobNoProvided"))
+        block, street, unit = _split_address(address or "")
+        now_ts = int(time.time())
+        with sqlite3.connect(self.db_path) as conn:
+            if not job_no:
+                job_no = _next_wa_job_no(conn, now_ts)
+            norm = _normalize_job_no(job_no)
+            existing = conn.execute(
+                "SELECT id FROM cases WHERE normalized_job_no = ? OR job_no = ? LIMIT 1",
+                (norm, job_no),
+            ).fetchone()
+            if existing:
+                raise ValueError(f"A case with job number {job_no} already exists")
+            conn.execute(
+                """
+                INSERT INTO cases
+                  (job_no, wc_no, zone, state, priority, address, block, unit, street_name, problem,
+                   feedback, contact_name, contact_phone, service_line, normalized_job_no,
+                   wa_seen_at, created_at, updated_at, source)
+                VALUES (?, ?, ?, 'wa_only', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'replay_wa_scratch')
+                """,
+                (
+                    job_no,
+                    payload.get("wcNo") or payload.get("wc_no"),
+                    zone,
+                    payload.get("priority"),
+                    address,
+                    block,
+                    unit,
+                    street,
+                    problem,
+                    _first_nonempty(payload.get("feedback"), payload.get("notes")),
+                    _first_nonempty(payload.get("contactName"), evidence.get("contact")),
+                    payload.get("contactPhone"),
+                    payload.get("serviceLine") or payload.get("service_line") or "maintenance",
+                    norm,
+                    now_ts,
+                    now_ts,
+                    now_ts,
+                ),
+            )
+            row = conn.execute("SELECT id FROM cases WHERE normalized_job_no = ?", (norm,)).fetchone()
+            if row:
+                conn.execute(
+                    """
+                    INSERT INTO case_observations
+                      (case_id, source, source_ref, observed_at, fields, confidence, notes, created_at)
+                    VALUES (?, 'replay_wa_scratch', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(row[0]),
+                        _first_nonempty(evidence.get("source_message_id"), evidence.get("source_ref"), payload.get("sourceRef")),
+                        now_ts,
+                        json.dumps({"payload": payload}, ensure_ascii=False),
+                        confidence or "observed",
+                        _first_nonempty(payload.get("problem"), payload.get("notes")),
+                        now_ts,
+                    ),
+                )
+            conn.commit()
+        return self._lookup_case(job_no) or {"jobNo": job_no}
+
+    def _add_observation(self, job_no: str, payload: dict[str, Any]) -> dict[str, Any]:
+        case = self._lookup_case(job_no)
+        if not case:
+            raise ValueError(f"case not found: {job_no}")
+        now_ts = int(time.time())
+        fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+        source_refs = fields.get("source_refs") or fields.get("sourceRefs") or payload.get("sourceRefs")
+        source_ref = source_refs[0] if isinstance(source_refs, list) and source_refs else source_refs
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO case_observations
+                  (case_id, source, source_ref, observed_at, fields, confidence, notes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(case["id"]),
+                    payload.get("source") or "whatsapp",
+                    str(source_ref) if source_ref else None,
+                    int(payload.get("observedAt") or now_ts),
+                    json.dumps(fields or payload, ensure_ascii=False),
+                    payload.get("confidence"),
+                    payload.get("notes"),
+                    now_ts,
+                ),
+            )
+            conn.execute("UPDATE cases SET updated_at = ?, wa_seen_at = COALESCE(wa_seen_at, ?) WHERE id = ?", (now_ts, now_ts, int(case["id"])))
+            conn.commit()
+        return self._lookup_case(job_no) or case
+
+
 def _set_nested(mapping: dict[str, Any], keys: list[str], value: Any) -> None:
     current = mapping
     for key in keys[:-1]:
@@ -173,28 +689,24 @@ def _prepare_hermes_home(
     hermes_home: Path,
     *,
     chat_id: str,
-    model: str,
-    debounce_seconds: int,
+    profile: ReplayProfile,
     business_base_url: str | None,
-    vision_provider: str | None,
-    vision_model: str | None,
-    vision_concurrency: int,
 ) -> None:
     config = _load_yaml(TGG_CONFIG)
     constitution = _load_yaml(TGG_CONSTITUTION)
 
-    provider_name = "openai-direct-primary"
+    provider_name = profile.main_provider
     config["providers"] = {
         provider_name: {
             "name": "OpenAI Direct Primary",
             "api": "https://api.openai.com/v1",
             "key_env": "OPENAI_API_KEY",
-            "default_model": model,
-            "transport": "codex_responses",
+            "default_model": profile.model,
+            "transport": profile.transport,
         }
     }
     _set_nested(config, ["model", "provider"], provider_name)
-    _set_nested(config, ["model", "default"], model)
+    _set_nested(config, ["model", "default"], profile.model)
     _set_nested(config, ["agent", "profile"], "pa")
     _set_nested(config, ["agent", "max_turns"], 12)
     _set_nested(config, ["display", "tool_progress"], "off")
@@ -212,12 +724,12 @@ def _prepare_hermes_home(
         for value in auxiliary.values():
             if isinstance(value, dict):
                 value["provider"] = "main"
-                value["model"] = model
+                value["model"] = profile.model
         vision = auxiliary.setdefault("vision", {})
         if isinstance(vision, dict):
-            vision["provider"] = vision_provider or "main"
-            vision["model"] = vision_model or model
-            vision["max_concurrency"] = max(1, int(vision_concurrency or 1))
+            vision["provider"] = profile.vision_provider or "main"
+            vision["model"] = profile.vision_model or profile.model
+            vision["max_concurrency"] = max(1, int(profile.vision_concurrency or 1))
 
     if business_base_url:
         bridge = (
@@ -248,8 +760,8 @@ def _prepare_hermes_home(
             "turn_policy": {
                 chat_id: {
                     "process_all": True,
-                    "debounce_seconds": debounce_seconds,
-                    "direct_mention_immediate": True,
+                    "debounce_seconds": profile.debounce_seconds,
+                    "direct_mention_immediate": profile.direct_mention_immediate,
                 }
             },
             "pa_job_type": "tgg_ops_ingest",
@@ -666,6 +1178,8 @@ def _build_review_result(
                 "output_tokens": turn.output_tokens,
                 "reasoning_output_tokens": turn.reasoning_output_tokens,
                 "estimated_cost_usd": turn.estimated_cost_usd,
+                "llm_call_count": turn.llm_call_count,
+                "llm_calls": turn.llm_calls,
             },
             ensure_ascii=False,
         ),
@@ -719,6 +1233,136 @@ def _capture_response_usage(files: list[Path]) -> dict[str, int]:
     return usage
 
 
+def _pricing_provider(provider: str | None) -> str | None:
+    raw = (provider or "").strip().lower()
+    if not raw or raw in {"main", "openai-direct-primary"}:
+        return "openai"
+    if raw.startswith("openai"):
+        return "openai"
+    if raw.startswith("gemini") or raw.startswith("google"):
+        return "google"
+    return raw
+
+
+def _pricing_model(model: str) -> str:
+    return re.sub(r"-20\d\d-\d\d-\d\d$", "", str(model or "").strip())
+
+
+def _estimate_cost_for_usage(
+    *,
+    model: str,
+    provider: str | None,
+    input_total: int,
+    cached_input: int,
+    output_tokens: int,
+) -> float:
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+        cost = estimate_usage_cost(
+            _pricing_model(model),
+            CanonicalUsage(
+                input_tokens=max(0, input_total - cached_input),
+                cache_read_tokens=cached_input,
+                output_tokens=output_tokens,
+            ),
+            provider=_pricing_provider(provider),
+        )
+        return float(cost.amount_usd or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _capture_response_calls(
+    files: list[Path],
+    *,
+    model: str,
+    provider: str | None,
+) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    for idx, path in enumerate(files, start=1):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        payload = data.get("payload") if isinstance(data, dict) else {}
+        if not isinstance(payload, dict):
+            continue
+        raw_usage = payload.get("usage") if isinstance(payload, dict) else {}
+        if not isinstance(raw_usage, dict):
+            continue
+        input_total = _as_int(raw_usage.get("input_tokens") or raw_usage.get("prompt_tokens"))
+        cached_input = _as_int((raw_usage.get("input_tokens_details") or {}).get("cached_tokens"))
+        output_tokens = _as_int(raw_usage.get("output_tokens") or raw_usage.get("completion_tokens"))
+        reasoning_tokens = _as_int((raw_usage.get("output_tokens_details") or {}).get("reasoning_tokens"))
+        call_model = str(payload.get("model") or data.get("model") or model)
+        call_provider = str(payload.get("provider") or data.get("provider") or provider or "openai-direct-primary")
+        calls.append(
+            {
+                "index": idx,
+                "capture_file": str(path),
+                "model": call_model,
+                "provider": call_provider,
+                "input_tokens": input_total,
+                "cached_input_tokens": cached_input,
+                "output_tokens": output_tokens,
+                "reasoning_output_tokens": reasoning_tokens,
+                "estimated_cost_usd": _estimate_cost_for_usage(
+                    model=call_model,
+                    provider=call_provider,
+                    input_total=input_total,
+                    cached_input=cached_input,
+                    output_tokens=output_tokens,
+                ),
+            }
+        )
+    return calls
+
+
+def _capture_call_ledger(path: Path | None, start_offset: int) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    calls: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as fh:
+        fh.seek(start_offset)
+        for idx, line in enumerate(fh, start=1):
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            calls.append(
+                {
+                    "index": idx,
+                    "capture_file": str(path),
+                    "task": row.get("task"),
+                    "provider": row.get("provider"),
+                    "model": row.get("model"),
+                    "input_tokens": _as_int(row.get("input_tokens")),
+                    "cached_input_tokens": _as_int(row.get("cached_input_tokens")),
+                    "output_tokens": _as_int(row.get("output_tokens")),
+                    "reasoning_output_tokens": _as_int(row.get("reasoning_tokens")),
+                    "estimated_cost_usd": _as_number(row.get("cost_usd")),
+                    "cost_status": row.get("cost_status"),
+                    "latency_ms": _as_int(row.get("latency_ms")),
+                    "turn_id": row.get("turn_id"),
+                }
+            )
+    return calls
+
+
+def _summarize_llm_calls(calls: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "llm_call_count": len(calls),
+        "input_tokens": sum(_as_int(call.get("input_tokens")) for call in calls),
+        "cached_input_tokens": sum(_as_int(call.get("cached_input_tokens")) for call in calls),
+        "output_tokens": sum(_as_int(call.get("output_tokens")) for call in calls),
+        "reasoning_output_tokens": sum(_as_int(call.get("reasoning_output_tokens")) for call in calls),
+        "estimated_cost_usd": sum(_as_number(call.get("estimated_cost_usd")) for call in calls),
+    }
+
+
 def _publish_review_run(
     *,
     db_path: Path,
@@ -763,6 +1407,8 @@ def _publish_review_run(
                 output_tokens=_as_int(result.get("output_tokens")),
                 reasoning_output_tokens=_as_int(result.get("reasoning_output_tokens")),
                 estimated_cost_usd=_as_number(result.get("estimated_cost_usd")),
+                llm_call_count=_as_int(result.get("llm_call_count")),
+                llm_calls=result.get("llm_calls") if isinstance(result.get("llm_calls"), list) else [],
                 model=str(result.get("model") or model),
                 provider=str(result.get("provider") or "openai-direct-primary"),
                 assistant=str(result.get("assistant") or ""),
@@ -927,6 +1573,7 @@ def _publish_review_run(
                                 "output_tokens": turn.output_tokens,
                                 "reasoning_output_tokens": turn.reasoning_output_tokens,
                                 "estimated_cost_usd": turn.estimated_cost_usd,
+                                "llm_call_count": turn.llm_call_count,
                             },
                             ensure_ascii=False,
                         ),
@@ -1049,6 +1696,35 @@ def _as_int(value: Any) -> int:
     return int(_as_number(value, 0.0))
 
 
+def _llm_detail_html(calls: list[dict[str, Any]], fallback_count: int) -> str:
+    if not calls:
+        return f'<div class="llm-detail">main-model calls: {fallback_count or "unknown"} · per-call capture unavailable</div>'
+    rows = []
+    for call in calls:
+        rows.append(
+            f"""
+            <tr>
+              <td>{_as_int(call.get('index'))}</td>
+              <td>{html.escape(str(call.get('model') or ''))}</td>
+              <td>{_as_int(call.get('input_tokens')):,}</td>
+              <td>{_as_int(call.get('cached_input_tokens')):,}</td>
+              <td>{_as_int(call.get('output_tokens')):,}</td>
+              <td>{_as_int(call.get('reasoning_output_tokens')):,}</td>
+              <td>${_as_number(call.get('estimated_cost_usd')):.6f}</td>
+            </tr>
+            """
+        )
+    return f"""
+    <details class="llm-detail">
+      <summary>{len(calls)} main-model call(s) · ${sum(_as_number(call.get('estimated_cost_usd')) for call in calls):.6f}</summary>
+      <table>
+        <thead><tr><th>#</th><th>model</th><th>in</th><th>cached</th><th>out</th><th>reasoning</th><th>cost</th></tr></thead>
+        <tbody>{''.join(rows)}</tbody>
+      </table>
+    </details>
+    """
+
+
 def _html_report(
     *,
     output_path: Path,
@@ -1077,7 +1753,8 @@ def _html_report(
                 <span>turn {index}</span>
                 <span>{html.escape(str(event.message_id or ''))}</span>
               </div>
-              <div class="meta">{len(source_ids)} source message(s) · tools: {html.escape(', '.join(result['tools']) or 'none')} · {_as_int(result.get('input_tokens')):,} in ({_as_int(result.get('cached_input_tokens')):,} cached) / {_as_int(result.get('output_tokens')):,} out ({_as_int(result.get('reasoning_output_tokens')):,} reasoning) · ${_as_number(result.get('estimated_cost_usd')):.6f}</div>
+              <div class="meta">{len(source_ids)} source message(s) · tools: {html.escape(', '.join(result['tools']) or 'none')} · main-model calls: {_as_int(result.get('llm_call_count')) or 'unknown'} · {_as_int(result.get('input_tokens')):,} in ({_as_int(result.get('cached_input_tokens')):,} cached) / {_as_int(result.get('output_tokens')):,} out ({_as_int(result.get('reasoning_output_tokens')):,} reasoning) · ${_as_number(result.get('estimated_cost_usd')):.6f}</div>
+              {_llm_detail_html(result.get('llm_calls') if isinstance(result.get('llm_calls'), list) else [], _as_int(result.get('llm_call_count')))}
               <pre class="inbound">{html.escape(text)}</pre>
               <pre class="assistant">{html.escape(result['assistant'] or '[no assistant transcript row]')}</pre>
             </section>
@@ -1090,6 +1767,7 @@ def _html_report(
     total_out = sum(_as_int(r.get("output_tokens")) for r in turn_results)
     total_reasoning = sum(_as_int(r.get("reasoning_output_tokens")) for r in turn_results)
     total_cost = sum(_as_number(r.get("estimated_cost_usd")) for r in turn_results)
+    total_llm_calls = sum(_as_int(r.get("llm_call_count")) for r in turn_results)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         f"""<!doctype html>
@@ -1108,6 +1786,10 @@ def _html_report(
     .turn {{ background: white; border: 1px solid #dedbd2; border-radius: 8px; margin-bottom: 18px; overflow: hidden; }}
     .turn-head {{ display: flex; justify-content: space-between; gap: 16px; background: #e6eee9; padding: 10px 14px; font-weight: 700; }}
     .meta {{ padding: 8px 14px; color: #555; border-bottom: 1px solid #eee9df; }}
+    .llm-detail {{ padding: 8px 14px; color: #555; border-bottom: 1px solid #eee9df; }}
+    .llm-detail summary {{ cursor: pointer; color: #171717; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }}
+    th, td {{ text-align: left; padding: 5px 6px; border-bottom: 1px solid #eee9df; }}
     pre {{ margin: 0; padding: 14px; white-space: pre-wrap; word-break: break-word; font: 13px/1.42 ui-monospace, SFMono-Regular, Menlo, monospace; }}
     .inbound {{ background: #fff; border-bottom: 1px solid #eee9df; }}
     .assistant {{ background: #f4f0fb; }}
@@ -1116,12 +1798,13 @@ def _html_report(
 <body>
   <header>
     <h1>{html.escape(run_label)}</h1>
-    <div>actual Hermes gateway replay · dry-run business writes · no prod mutation</div>
+    <div>actual Hermes gateway replay · local copied-DB business writes · no prod mutation</div>
   </header>
   <section class="summary">
     <div><span>model</span><b>{html.escape(model)}</b></div>
     <div><span>messages</span><b>{len(records)}</b></div>
     <div><span>turns</span><b>{len(turn_results)}</b></div>
+    <div><span>main calls</span><b>{total_llm_calls or 'unknown'}</b></div>
     <div><span>window</span><b>{html.escape(first)} → {html.escape(last)}</b></div>
     <div><span>tokens</span><b>{total_in:,} in / {total_out:,} out</b></div>
     <div><span>cache</span><b>{total_cached:,} cached in / {total_reasoning:,} reasoning out</b></div>
@@ -1129,7 +1812,7 @@ def _html_report(
     <div><span>session</span><b>{html.escape(session_id)}</b></div>
   </section>
   <main>
-    <p><b>DB:</b> {html.escape(str(db_path))}<br><b>Hermes home:</b> {html.escape(str(hermes_home))}</p>
+    <p><b>DB:</b> {html.escape(str(db_path))}<br><b>Hermes home:</b> {html.escape(str(hermes_home))}<br><b>Cost note:</b> totals cover captured main-model calls. Native vision pre-analysis calls are logged separately until the provider-agnostic call ledger lands.</p>
     {''.join(rows)}
   </main>
 </body>
@@ -1193,6 +1876,7 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
     total_out = 0
     total_reasoning = 0
     total_cost = 0.0
+    total_llm_calls = 0
     session_ids: set[str] = set()
     row_html = []
     for index, turn in enumerate(turns, start=1):
@@ -1206,11 +1890,14 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
             model_input.get("reasoning_output_tokens") or summary.get("reasoning_output_tokens")
         )
         cost = _as_number(model_input.get("estimated_cost_usd") or summary.get("estimated_cost_usd"))
+        llm_calls = model_input.get("llm_calls") if isinstance(model_input.get("llm_calls"), list) else []
+        llm_call_count = _as_int(model_input.get("llm_call_count") or summary.get("llm_call_count") or len(llm_calls))
         total_in += input_tokens
         total_cached += cached_tokens
         total_out += output_tokens
         total_reasoning += reasoning_tokens
         total_cost += cost
+        total_llm_calls += llm_call_count
         session_id = str(summary.get("session_id") or "")
         if session_id:
             session_ids.add(session_id)
@@ -1251,8 +1938,11 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
               </div>
               <div class="meta">
                 tools: {html.escape(', '.join(tool_names) or 'none')} ·
-                {input_tokens:,} in ({cached_tokens:,} cached) / {output_tokens:,} out ({reasoning_tokens:,} reasoning)
+                main-model calls: {llm_call_count or 'unknown'} ·
+                {input_tokens:,} in ({cached_tokens:,} cached) / {output_tokens:,} out ({reasoning_tokens:,} reasoning) ·
+                {'$' + format(cost, '.6f') if cost else 'cost not computed'}
               </div>
+              {_llm_detail_html(llm_calls, llm_call_count)}
               <div class="cols">
                 <div>
                   <h2>WhatsApp input</h2>
@@ -1299,6 +1989,10 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
     .turn-head {{ display: flex; justify-content: space-between; gap: 16px; padding: 11px 14px; background: #e7f1ee; border-bottom: 1px solid var(--line); }}
     .turn-num {{ display: block; color: var(--muted); font-size: 12px; }}
     .meta {{ padding: 8px 14px; color: var(--muted); border-bottom: 1px solid #eee8dd; }}
+    .llm-detail {{ padding: 8px 14px; color: var(--muted); border-bottom: 1px solid #eee8dd; }}
+    .llm-detail summary {{ cursor: pointer; color: var(--ink); }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }}
+    th, td {{ text-align: left; padding: 5px 6px; border-bottom: 1px solid #eee8dd; }}
     .cols {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0; }}
     .cols > div {{ padding: 14px; }}
     .cols > div + div {{ border-left: 1px solid #eee8dd; background: var(--read); }}
@@ -1315,13 +2009,14 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
 <body>
   <header>
     <h1>Christopher replay review · MM2-SK</h1>
-    <div>Hermes replay path · dry-run business writes · copied database only</div>
+    <div>Hermes replay path · local copied-DB business writes · copied database only</div>
   </header>
   <section class="summary">
     <div><span>run</span><b>{html.escape(run_id)}</b></div>
     <div><span>model</span><b>{html.escape(str(run_meta.get('model') or 'gpt-5.4-mini'))}</b></div>
     <div><span>messages</span><b>{total_messages}</b></div>
     <div><span>turns</span><b>{len(turns)}</b></div>
+    <div><span>main calls</span><b>{total_llm_calls or 'unknown'}</b></div>
     <div><span>media</span><b>{total_media}</b></div>
     <div><span>window</span><b>{html.escape(first)} → {html.escape(last)}</b></div>
     <div><span>session</span><b>{html.escape(', '.join(sorted(session_ids)) or 'n/a')}</b></div>
@@ -1330,7 +2025,7 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
     <div><span>cost</span><b>{'$' + format(total_cost, '.6f') if total_cost else 'not computed'}</b></div>
   </section>
   <main>
-    <p class="note">Source DB: {html.escape(str(db_path))}. This is a local replay artifact; no production mutation.</p>
+    <p class="note">Source DB: {html.escape(str(db_path))}. This is a local replay artifact; no production mutation. Cost totals cover captured main-model calls. Native vision pre-analysis calls are logged separately until the provider-agnostic call ledger lands.</p>
     {''.join(row_html)}
   </main>
 </body>
@@ -1350,25 +2045,36 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
         "output_tokens": total_out,
         "reasoning_output_tokens": total_reasoning,
         "estimated_cost_usd": total_cost,
+        "llm_call_count": total_llm_calls,
     }
 
 
 async def _run(args: argparse.Namespace) -> int:
+    profile = _resolve_replay_profile(args)
+    _validate_provider_model_args(
+        vision_provider=profile.vision_provider,
+        vision_model=profile.vision_model,
+    )
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_label = args.run_label or f"tgg-hermes-replay-{args.chat_id.split('@', 1)[0]}-{run_stamp}"
     hermes_home = Path(args.hermes_home) if args.hermes_home else Path(tempfile.mkdtemp(prefix="tgg-hermes-replay-"))
     output_path = Path(args.output) if args.output else DOCS_DIR / f"{run_label}.html"
 
     _prepare_env(hermes_home, secrets=Path(args.secrets))
+    business_base_url = args.business_base_url
+    local_backend: _ReplayOperatorBackend | None = None
+    if not business_base_url and profile.business_mode == "copied-db-local-operator":
+        local_backend = _ReplayOperatorBackend(Path(args.db))
+        local_backend.start()
+        atexit.register(local_backend.stop)
+        business_base_url = local_backend.base_url
+        # Business writes are safe here: the bridge points at the copied local DB.
+        os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "0"
     _prepare_hermes_home(
         hermes_home,
         chat_id=args.chat_id,
-        model=args.model,
-        debounce_seconds=args.debounce_seconds,
-        business_base_url=args.business_base_url,
-        vision_provider=args.vision_provider,
-        vision_model=args.vision_model,
-        vision_concurrency=args.vision_concurrency,
+        profile=profile,
+        business_base_url=business_base_url,
     )
 
     if not os.environ.get("OPENAI_API_KEY"):
@@ -1429,9 +2135,14 @@ async def _run(args: argparse.Namespace) -> int:
         capture_dir_raw = os.environ.get("HERMES_OPENAI_CAPTURE_DIR") or ""
         capture_dir = Path(capture_dir_raw) if capture_dir_raw else None
         response_captures_before = set(capture_dir.glob("*-response.json")) if capture_dir else set()
+        ledger_raw = os.environ.get("HERMES_LLM_CALL_LOG") or ""
+        ledger_path = Path(ledger_raw) if ledger_raw else None
+        ledger_offset = ledger_path.stat().st_size if ledger_path and ledger_path.exists() else 0
+        turn_env_value = f"{args.publish_review_run or run_label}:turn:{args.turn_offset + handled_turns + 1:04d}"
+        previous_turn_env = os.environ.get("HERMES_LLM_TURN_ID")
         if source is not None:
             entry = runner.session_store.get_or_create_session(source)
-            if args.rotate_session_every_turns and handled_turns > 0 and handled_turns % args.rotate_session_every_turns == 0:
+            if profile.rotate_session_every_turns and handled_turns > 0 and handled_turns % profile.rotate_session_every_turns == 0:
                 runner.session_store.reset_session(entry.session_key, display_name=source.chat_name or source.chat_id)
                 runner._evict_cached_agent(entry.session_key)
                 runner._release_running_agent_state(entry.session_key)
@@ -1439,7 +2150,14 @@ async def _run(args: argparse.Namespace) -> int:
             session_id = entry.session_id
             before = runner.session_store.load_transcript(session_id)
         action_start = len(captured_agent_actions)
-        returned = await runner._handle_message(event)
+        os.environ["HERMES_LLM_TURN_ID"] = turn_env_value
+        try:
+            returned = await runner._handle_message(event)
+        finally:
+            if previous_turn_env is None:
+                os.environ.pop("HERMES_LLM_TURN_ID", None)
+            else:
+                os.environ["HERMES_LLM_TURN_ID"] = previous_turn_env
         after = runner.session_store.load_transcript(session_id) if session_id else []
         segment = after[len(before):]
         assistant = _extract_latest_assistant(after, start=len(before))
@@ -1447,15 +2165,32 @@ async def _run(args: argparse.Namespace) -> int:
         input_tokens, output_tokens = _result_usage(after, start=len(before))
         cached_input_tokens = 0
         reasoning_output_tokens = 0
-        if capture_dir:
+        llm_calls: list[dict[str, Any]] = []
+        llm_call_count = 0
+        ledger_calls = _capture_call_ledger(ledger_path, ledger_offset)
+        if ledger_calls:
+            llm_calls = ledger_calls
+            capture_usage = _summarize_llm_calls(llm_calls)
+            input_tokens = capture_usage["input_tokens"]
+            cached_input_tokens = capture_usage["cached_input_tokens"]
+            output_tokens = capture_usage["output_tokens"]
+            reasoning_output_tokens = capture_usage["reasoning_output_tokens"]
+            llm_call_count = _as_int(capture_usage.get("llm_call_count"))
+        elif capture_dir:
             response_captures_after = set(capture_dir.glob("*-response.json"))
             new_response_captures = sorted(response_captures_after - response_captures_before)
-            capture_usage = _capture_response_usage(new_response_captures)
+            llm_calls = _capture_response_calls(
+                new_response_captures,
+                model=profile.model,
+                provider=profile.main_provider,
+            )
+            capture_usage = _summarize_llm_calls(llm_calls)
             if capture_usage["input_tokens"] or capture_usage["output_tokens"]:
                 input_tokens = capture_usage["input_tokens"]
                 cached_input_tokens = capture_usage["cached_input_tokens"]
                 output_tokens = capture_usage["output_tokens"]
                 reasoning_output_tokens = capture_usage["reasoning_output_tokens"]
+            llm_call_count = _as_int(capture_usage.get("llm_call_count"))
         estimated_cost_usd = 0.0
         result_model = None
         result_provider = None
@@ -1465,6 +2200,9 @@ async def _run(args: argparse.Namespace) -> int:
             estimated_cost_usd = _as_number(returned.get("estimated_cost_usd"))
             result_model = returned.get("model")
             result_provider = returned.get("provider")
+            llm_call_count = max(llm_call_count, _as_int(returned.get("api_calls")))
+        if not estimated_cost_usd and llm_calls:
+            estimated_cost_usd = _as_number(capture_usage.get("estimated_cost_usd"))
         if not input_tokens and not output_tokens:
             for action in reversed(captured_agent_actions[action_start:]):
                 if action.get("action_type") != "dry-run-reply":
@@ -1473,6 +2211,8 @@ async def _run(args: argparse.Namespace) -> int:
                 output_tokens = _as_int(action.get("tokens_output"))
                 estimated_cost_usd = _as_number(action.get("cost_usd"))
                 break
+        if not llm_call_count and (input_tokens or output_tokens):
+            llm_call_count = 1
         turn_results.append(
             {
                 "event": event,
@@ -1485,6 +2225,8 @@ async def _run(args: argparse.Namespace) -> int:
                 "output_tokens": output_tokens,
                 "reasoning_output_tokens": reasoning_output_tokens,
                 "estimated_cost_usd": estimated_cost_usd,
+                "llm_call_count": llm_call_count,
+                "llm_calls": llm_calls,
                 "model": result_model,
                 "provider": result_provider,
                 "session_id": session_id,
@@ -1498,8 +2240,8 @@ async def _run(args: argparse.Namespace) -> int:
                 records=records,
                 turn_results=turn_results,
                 run_label=run_label,
-                model=args.model,
-                debounce_seconds=args.debounce_seconds,
+                model=profile.model,
+                debounce_seconds=profile.debounce_seconds,
                 turn_offset=args.turn_offset,
             )
 
@@ -1517,7 +2259,7 @@ async def _run(args: argparse.Namespace) -> int:
     _html_report(
         output_path=output_path,
         run_label=run_label,
-        model=args.model,
+        model=profile.model,
         db_path=Path(args.db),
         records=records,
         turn_results=turn_results,
@@ -1532,8 +2274,8 @@ async def _run(args: argparse.Namespace) -> int:
             records=records,
             turn_results=turn_results,
             run_label=run_label,
-            model=args.model,
-            debounce_seconds=args.debounce_seconds,
+            model=profile.model,
+            debounce_seconds=profile.debounce_seconds,
             turn_offset=args.turn_offset,
         )
 
@@ -1547,11 +2289,18 @@ async def _run(args: argparse.Namespace) -> int:
         "processed": processed,
         "turns": len(turn_results),
         "turn_offset": args.turn_offset,
-        "model": args.model,
+        "profile": profile.name,
+        "model": profile.model,
+        "vision_provider": profile.vision_provider,
+        "vision_model": profile.vision_model,
+        "vision_concurrency": profile.vision_concurrency,
+        "debounce_seconds": profile.debounce_seconds,
         "session_id": session_id,
         "session_ids": session_ids,
         "session_count": len(session_ids),
         "hermes_home": str(hermes_home),
+        "business_base_url": business_base_url,
+        "local_operator_backend": bool(local_backend),
         "openai_capture_dir": os.environ.get("HERMES_OPENAI_CAPTURE_DIR"),
         "html": str(output_path),
         "input_tokens": sum(_as_int(r.get("input_tokens")) for r in turn_results),
@@ -1559,6 +2308,7 @@ async def _run(args: argparse.Namespace) -> int:
         "output_tokens": sum(_as_int(r.get("output_tokens")) for r in turn_results),
         "reasoning_output_tokens": sum(_as_int(r.get("reasoning_output_tokens")) for r in turn_results),
         "estimated_cost_usd": sum(_as_number(r.get("estimated_cost_usd")) for r in turn_results),
+        "llm_call_count": sum(_as_int(r.get("llm_call_count")) for r in turn_results),
         "published": published,
     }
     print(json.dumps(summary, indent=2))
@@ -1569,6 +2319,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", default="tgg-local-gpt54-mini-gemini-vision", choices=sorted(REPLAY_PROFILES))
     parser.add_argument("--db", default=str(DEFAULT_DB))
     parser.add_argument("--chat-id", default=DEFAULT_CHAT)
     parser.add_argument("--since-sgt", default=DEFAULT_SINCE)
@@ -1576,15 +2327,16 @@ def main() -> int:
     parser.add_argument("--limit-messages", type=int)
     parser.add_argument("--skip-messages", type=int, default=0)
     parser.add_argument("--turn-offset", type=int, default=0)
-    parser.add_argument("--debounce-seconds", type=int, default=300)
-    parser.add_argument("--model", default="gpt-5.4-mini")
+    parser.add_argument("--debounce-seconds", type=int)
+    parser.add_argument("--model")
     parser.add_argument("--vision-provider")
     parser.add_argument("--vision-model")
-    parser.add_argument("--vision-concurrency", type=int, default=1)
+    parser.add_argument("--vision-concurrency", type=int)
     parser.add_argument("--run-label")
     parser.add_argument("--output")
     parser.add_argument("--hermes-home")
     parser.add_argument("--business-base-url")
+    parser.add_argument("--no-local-operator-backend", action="store_true")
     parser.add_argument("--publish-review-run")
     parser.add_argument("--publish-review-db")
     parser.add_argument("--render-review-run", help="Render a previously published tgg_christopher_* run without replaying")
@@ -1601,6 +2353,7 @@ def main() -> int:
         )
         print(json.dumps(summary, indent=2))
         return 0
+    _validate_replay_args(args)
     return asyncio.run(_run(args))
 
 
