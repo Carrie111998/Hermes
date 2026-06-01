@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 from pathlib import Path
@@ -478,6 +479,15 @@ def _finish_job(job_id: str, exit_code: int) -> None:
 
 
 def _launch(args: Dict[str, Any]) -> str:
+    from utils import env_var_enabled
+    if env_var_enabled("HERMES_CRON_SESSION"):
+        return _error(
+            "copilot_remote launch is not available in cron sessions. "
+            "Cron jobs run non-interactively and cannot supervise a Copilot "
+            "remote session. Send a message to Hermes interactively to launch "
+            "a Copilot job, or use the `terminal` tool for unattended scripting."
+        )
+
     prompt = str(args.get("prompt") or "").strip()
     if not prompt:
         return _error("prompt is required when launching a Copilot remote job")

@@ -2977,7 +2977,7 @@ class TestRunConversation:
             patch.object(agent, "_cleanup_task_resources"),
         ):
             result = agent.run_conversation(
-                "create a static webpage that displays a short bio on the Macy Conferences"
+                "use copilot to create a static webpage that displays a short bio on the Macy Conferences"
             )
 
         assert result["api_calls"] == 0
@@ -2989,6 +2989,82 @@ class TestRunConversation:
         tool_args = mock_handle_function_call.call_args.args[1]
         assert tool_args["action"] == "launch"
         assert "Macy Conferences" in tool_args["prompt"]
+
+    def test_implicit_implementation_request_does_not_auto_delegate(self, agent):
+        """Without an explicit trigger phrase, implementation requests go to the LLM."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        resp = _mock_response(content="I'll create that for you.", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "create a static webpage that displays a short bio on the Macy Conferences"
+            )
+
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "I'll create that for you."
+
+    def test_negated_copilot_directive_does_not_auto_delegate(self, agent):
+        """Negated directives like 'don't use copilot to...' should NOT auto-delegate."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        resp = _mock_response(content="OK, I'll handle it locally.", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "don't use copilot to create this, do it yourself"
+            )
+
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "OK, I'll handle it locally."
+
+    def test_question_about_copilot_does_not_auto_delegate(self, agent):
+        """Questions about copilot_remote should NOT trigger auto-delegation."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        resp = _mock_response(content="copilot_remote is a tool that...", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("what is copilot_remote?")
+
+        assert result["api_calls"] == 1
+
+    def test_cron_platform_does_not_auto_delegate_even_with_trigger(self, agent):
+        """Explicit Copilot directives should NOT auto-delegate in cron sessions."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("copilot_remote")
+        agent.platform = "cron"
+        resp = _mock_response(content="Here is the digest.", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=AssertionError("should not auto-delegate")),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("use copilot to create a webpage")
+
+        assert result["api_calls"] == 1
+        assert result["final_response"] == "Here is the digest."
 
     def test_explanation_request_does_not_auto_delegate_to_copilot_remote(self, agent):
         self._setup_agent(agent)
@@ -3010,9 +3086,8 @@ class TestRunConversation:
     def test_thread_context_prefix_does_not_block_auto_delegate(self, agent):
         """Slack injects a thread-context envelope with prior messages.
 
-        Words like "explain", "why", "tell me" inside that envelope must not
-        trip the skip-pattern check on the user's actual implementation
-        request.
+        The trigger phrase in the user's actual message (after the envelope)
+        must still be detected even when the envelope contains unrelated text.
         """
         self._setup_agent(agent)
         agent.valid_tool_names.add("copilot_remote")
@@ -3030,7 +3105,7 @@ class TestRunConversation:
             "[thread parent] ryan: tell me about why this works\n"
             "ryan: explain how copilot works\n"
             "[End of thread context]\n\n"
-            "<@U12345> create a static webpage that displays a short bio on the Macy Conferences"
+            "<@U12345> use copilot to create a static webpage that displays a short bio on the Macy Conferences"
         )
 
         with (
