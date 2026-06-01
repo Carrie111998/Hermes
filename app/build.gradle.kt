@@ -1,16 +1,18 @@
 // app/build.gradle.kts
 android {
-    // ... altre configurazioni
-
-    buildFeatures {
-        // Abilita la generazione della classe BuildConfig
-        buildConfig = true 
-    }
+    compileSdk = 34 // o la tua versione corrente
 
     defaultConfig {
-        // ...
-        // Definisce il campo API_KEY (recuperato da local.properties o env)
-        val apiKey = project.findProperty("API_KEY") as? String ?: "VALORE_DI_BACKUP"
+        applicationId = "com.example.haos"
+        // ... altre configurazioni ...
+
+        // Definisce la costante leggendola da variabili d'ambiente o fallback locale
+        val apiKey = System.getenv("API_KEY") ?: "CHIAVE_DI_TEST"
         buildConfigField("String", "API_KEY", "\"$apiKey\"")
+    }
+
+    buildFeatures {
+        // CORREZIONE: Abilita correttamente la generazione della classe BuildConfig
+        buildConfig = true
     }
 }
