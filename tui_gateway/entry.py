@@ -101,9 +101,11 @@ def _log_signal(signum: int, frame) -> None:
             # All live threads — signal may have been triggered by a
             # background thread (write to broken stdout from TTS, etc.).
             import threading as _threading
-            for tid, th in _threading._active.items():
+            for th in _threading.enumerate():
+                tid = th.ident
                 f.write(f"\n--- thread {th.name} (id={tid}) ---\n")
-                f.write("".join(traceback.format_stack(sys._current_frames().get(tid))))
+                if tid is not None:
+                    f.write("".join(traceback.format_stack(sys._current_frames().get(tid))))
     except Exception:
         pass
     print(f"[gateway-signal] {name}", file=sys.stderr, flush=True)

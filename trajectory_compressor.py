@@ -74,8 +74,8 @@ def _effective_temperature_for_model(
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
         return None  # caller must omit temperature
-    if fixed_temperature is not None:
-        return fixed_temperature
+    if isinstance(fixed_temperature, (int, float)):
+        return float(fixed_temperature)
     return requested_temperature
 
 
@@ -362,13 +362,15 @@ class TrajectoryCompressor:
     def _init_tokenizer(self):
         """Initialize HuggingFace tokenizer for token counting."""
         try:
-            from transformers import AutoTokenizer
+            # Use dynamic import to satisfy ty unresolved-import
+            AutoTokenizer: Any = __import__("transformers", fromlist=["AutoTokenizer"]).AutoTokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.config.tokenizer_name,
                 trust_remote_code=self.config.trust_remote_code
             )
             print(f"✅ Loaded tokenizer: {self.config.tokenizer_name}")
         except Exception as e:
+            self.tokenizer = None
             raise RuntimeError(f"Failed to load tokenizer '{self.config.tokenizer_name}': {e}")
     
     def _init_summarizer(self):
@@ -466,7 +468,9 @@ class TrajectoryCompressor:
         if not text:
             return 0
         try:
-            return len(self.tokenizer.encode(text))
+            if self.tokenizer is not None:
+                return len(self.tokenizer.encode(text))
+            return len(text) // 4
         except Exception:
             # Fallback to character estimate
             return len(text) // 4
@@ -607,21 +611,24 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 
                 if getattr(self, '_use_call_llm', False):
                     from agent.auxiliary_client import call_llm
+                    # call_llm expects float, not Optional[float]
                     response = call_llm(
                         provider=self._llm_provider,
                         model=self.config.summarization_model,
                         messages=[{"role": "user", "content": prompt}],
-                        temperature=summary_temperature,
+                        temperature=summary_temperature if summary_temperature is not None else self.config.temperature,
                         max_tokens=self.config.summary_target_tokens * 2,
                     )
                 else:
-                    _create_kwargs = {
+                    _create_kwargs: Dict[str, Any] = {
                         "model": self.config.summarization_model,
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": self.config.summary_target_tokens * 2,
                     }
                     if summary_temperature is not None:
                         _create_kwargs["temperature"] = summary_temperature
+
+                    assert self.client is not None
                     response = self.client.chat.completions.create(**_create_kwargs)
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
@@ -636,6 +643,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 else:
                     # Fallback: create a basic summary
                     return "[CONTEXT SUMMARY]: [Summary generation failed - previous turns contained tool calls and responses that have been compressed to save context space.]"
+
+        return "[CONTEXT SUMMARY]: [Summary generation failed - maximum retries exceeded.]"
     
     async def _generate_summary_async(self, content: str, metrics: TrajectoryMetrics) -> str:
         """
@@ -676,15 +685,16 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 
                 if getattr(self, '_use_call_llm', False):
                     from agent.auxiliary_client import async_call_llm
+                    # async_call_llm expects float, not Optional[float]
                     response = await async_call_llm(
                         provider=self._llm_provider,
                         model=self.config.summarization_model,
                         messages=[{"role": "user", "content": prompt}],
-                        temperature=summary_temperature,
+                        temperature=summary_temperature if summary_temperature is not None else self.config.temperature,
                         max_tokens=self.config.summary_target_tokens * 2,
                     )
                 else:
-                    _create_kwargs = {
+                    _create_kwargs: Dict[str, Any] = {
                         "model": self.config.summarization_model,
                         "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": self.config.summary_target_tokens * 2,
@@ -705,6 +715,8 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                 else:
                     # Fallback: create a basic summary
                     return "[CONTEXT SUMMARY]: [Summary generation failed - previous turns contained tool calls and responses that have been compressed to save context space.]"
+
+        return "[CONTEXT SUMMARY]: [Summary generation failed - maximum retries exceeded.]"
     
     def compress_trajectory(
         self,
@@ -1289,11 +1301,11 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
 
 def main(
     input: str,
-    output: str = None,
+    output: Optional[str] = None,
     config: str = "configs/trajectory_compression.yaml",
-    target_max_tokens: int = None,
-    tokenizer: str = None,
-    sample_percent: float = None,
+    target_max_tokens: Optional[int] = None,
+    tokenizer: Optional[str] = None,
+    sample_percent: Optional[float] = None,
     seed: int = 42,
     dry_run: bool = False,
 ):
