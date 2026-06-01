@@ -552,14 +552,22 @@ def test_bridge_module_does_not_import_or_call_hermes_state_writers():
 def test_pa_business_toolset_is_registered_without_all_tools():
     from toolsets import get_toolset, resolve_toolset
 
+    expected = {
+        "pa_business_read",
+        "pa_business_write",
+        "tgg_case_lookup",
+        "tgg_case_search",
+        "tgg_case_observation",
+        "tgg_case_create",
+    }
     toolset = get_toolset("pa-business")
     assert toolset is not None
-    assert set(toolset["tools"]) == {"pa_business_read", "pa_business_write"}
-    assert resolve_toolset("pa-business") == ["pa_business_read", "pa_business_write"]
+    assert set(toolset["tools"]) == expected
+    assert set(resolve_toolset("pa-business")) == expected
     custom = get_toolset("custom")
     assert custom is not None
-    assert set(custom["tools"]) == {"pa_business_read", "pa_business_write"}
-    assert resolve_toolset("custom") == ["pa_business_read", "pa_business_write"]
+    assert set(custom["tools"]) == expected
+    assert set(resolve_toolset("custom")) == expected
 
 
 def test_tenant_scoped_http_operation_injects_client_auth(fake_business_endpoint):
@@ -685,6 +693,69 @@ def test_path_param_interpolation_get(path_param_endpoint):
     assert last["ps_tenant"] == "tgg"
 
 
+def test_case_search_accepts_model_query_alias(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_case_search": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config, "tgg_case_search", {"query": "350 Anchorvale Rd", "limit": 10}
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    assert "search=350+Anchorvale+Rd" in last["path"]
+    assert "query=" not in last["path"]
+    assert "limit=10" in last["path"]
+
+
+def test_case_search_accepts_structured_fields_as_single_query(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_case_search": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "tgg_case_search",
+        {
+            "block": "350",
+            "street": "Anchorvale Rd",
+            "unit": "11-109",
+            "workType": "window grille install",
+            "zone": "SK",
+            "limit": 10,
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    assert "search=Blk+350+Anchorvale+Rd+%2311-109+window+grille+install" in last["path"]
+    assert "block=" not in last["path"]
+    assert "street=" not in last["path"]
+    assert "unit=" not in last["path"]
+    assert "workType=" not in last["path"]
+    assert "zone=SK" in last["path"]
+    assert "limit=10" in last["path"]
+
+
 def test_path_param_interpolation_patch_keeps_remaining_payload_in_body(path_param_endpoint):
     """PATCH with path param: jobNo goes in URL, remaining payload becomes JSON body."""
     config = {
@@ -764,6 +835,23 @@ def test_path_param_missing_from_payload_fails_loudly(path_param_endpoint):
     }
     with pytest.raises(ValueError, match="requires path_param 'jobNo'"):
         execute_business_operation(config, "case_lookup", {})
+
+
+def test_case_lookup_rejects_unit_as_job_number(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "case_lookup": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases/{{jobNo}}",
+                    "path_params": ["jobNo"],
+                }
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="INVALID_JOB_NO"):
+        execute_business_operation(config, "case_lookup", {"jobNo": "11-109"})
 
 
 def test_path_param_without_placeholder_fails_loudly(path_param_endpoint):

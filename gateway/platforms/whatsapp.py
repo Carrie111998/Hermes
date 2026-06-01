@@ -275,6 +275,21 @@ class WhatsAppAdapter(BasePlatformAdapter):
             or os.getenv("WHATSAPP_TURN_DEBOUNCE_MS", "1500")
             or 0
         )
+        self._turn_policy = self._config_json_object(
+            "turn_policy",
+            "WHATSAPP_TURN_POLICY_JSON",
+        )
+        self._ingest_chats = self._coerce_allow_list(
+            config.extra.get("ingest_chats")
+            or config.extra.get("capture_all_chats")
+            or os.getenv("WHATSAPP_INGEST_CHATS")
+            or os.getenv("WHATSAPP_CAPTURE_ALL_CHATS")
+        )
+        self._direct_mention_immediate = self._config_bool(
+            "direct_mention_immediate",
+            "WHATSAPP_DIRECT_MENTION_IMMEDIATE",
+            False,
+        )
         self._turn_buffers: Dict[str, List[MessageEvent]] = {}
         self._turn_tasks: Dict[str, asyncio.Task] = {}
         self._bridge_log_fh = None
@@ -288,6 +303,31 @@ class WhatsAppAdapter(BasePlatformAdapter):
         # "Fatal whatsapp adapter error" plus dispatch a fatal-error
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
+
+    def _config_bool(self, key: str, env_key: str, default: bool) -> bool:
+        configured = self.config.extra.get(key)
+        if configured is None:
+            configured = os.getenv(env_key)
+        if configured is None:
+            return default
+        if isinstance(configured, str):
+            return configured.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(configured)
+
+    def _config_json_object(self, key: str, env_key: str) -> Dict[str, Any]:
+        configured = self.config.extra.get(key)
+        if configured is None:
+            configured = os.getenv(env_key)
+        if not configured:
+            return {}
+        if isinstance(configured, dict):
+            return configured
+        try:
+            parsed = json.loads(str(configured))
+        except Exception:
+            logger.warning("[%s] Invalid %s JSON; ignoring", self.name, key)
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _effective_reply_prefix(self) -> str:
         """Return the prefix the Node bridge will add in self-chat mode."""
@@ -516,7 +556,44 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return f"Quoted WhatsApp message case refs: {', '.join(refs)}\n{quoted_text}"
         return quoted_text
 
-    def _should_process_message(self, data: Dict[str, Any]) -> bool:
+    def _turn_policy_for_chat(self, chat_id: str) -> Dict[str, Any]:
+        raw_policy = getattr(self, "_turn_policy", {}) or {}
+        if not isinstance(raw_policy, dict):
+            return {}
+        candidates = [
+            chat_id,
+            str(chat_id or "").split("@", 1)[0],
+            "*",
+        ]
+        for candidate in candidates:
+            value = raw_policy.get(candidate)
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    def _chat_processes_without_mention(self, chat_id: str) -> bool:
+        if chat_id in getattr(self, "_ingest_chats", set()):
+            return True
+        policy = self._turn_policy_for_chat(chat_id)
+        for key in ("process_all", "ingest", "capture_all"):
+            if key in policy:
+                value = policy.get(key)
+                if isinstance(value, str):
+                    return value.strip().lower() in {"true", "1", "yes", "on"}
+                return bool(value)
+        return False
+
+    def _message_is_direct_trigger(self, data: Dict[str, Any]) -> bool:
+        body = str(data.get("body") or "").strip()
+        if body.startswith("/"):
+            return True
+        if self._message_is_reply_to_bot(data):
+            return True
+        if self._message_mentions_bot(data):
+            return True
+        return self._message_matches_mention_patterns(data)
+
+    def _should_process_message(self, data: Dict[str, Any], *, bypass_require_mention: bool = False) -> bool:
         chat_id_raw = str(data.get("chatId") or "")
         # WhatsApp uses pseudo-chats for Status updates (Stories) and
         # Channel/Newsletter broadcasts. These are not real conversations
@@ -539,16 +616,11 @@ class WhatsAppAdapter(BasePlatformAdapter):
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
             return True
+        if bypass_require_mention or self._chat_processes_without_mention(chat_id):
+            return True
         if not self._whatsapp_require_mention():
             return True
-        body = str(data.get("body") or "").strip()
-        if body.startswith("/"):
-            return True
-        if self._message_is_reply_to_bot(data):
-            return True
-        if self._message_mentions_bot(data):
-            return True
-        return self._message_matches_mention_patterns(data)
+        return self._message_is_direct_trigger(data)
 
     @staticmethod
     def _bridge_chat_type(data: Dict[str, Any]) -> str:
@@ -583,6 +655,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("[%s] Failed to persist WhatsApp channel metadata: %s", self.name, e)
 
+    def _coerce_seconds(self, value: Any, *, default: Optional[float] = None) -> Optional[float]:
+        if value is None:
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, parsed)
+
     def _debounce_seconds(self) -> float:
         raw_ms = getattr(self, "_turn_debounce_ms", 0) or 0
         try:
@@ -591,9 +672,53 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return 0.0
         return max(0.0, ms / 1000.0)
 
+    def _debounce_seconds_for_event(self, event: MessageEvent) -> float:
+        source = event.source
+        chat_id = source.chat_id if source else ""
+        policy = self._turn_policy_for_chat(chat_id)
+        if "debounce_seconds" in policy:
+            return self._coerce_seconds(policy.get("debounce_seconds"), default=self._debounce_seconds()) or 0.0
+        if "quiet_seconds" in policy:
+            return self._coerce_seconds(policy.get("quiet_seconds"), default=self._debounce_seconds()) or 0.0
+        if "debounce_ms" in policy:
+            ms = self._coerce_seconds(policy.get("debounce_ms"), default=None)
+            if ms is not None:
+                return max(0.0, ms / 1000.0)
+        return self._debounce_seconds()
+
+    def _direct_mention_immediate_for_event(self, event: MessageEvent) -> bool:
+        source = event.source
+        chat_id = source.chat_id if source else ""
+        policy = self._turn_policy_for_chat(chat_id)
+        if "direct_mention_immediate" in policy:
+            value = policy.get("direct_mention_immediate")
+            if isinstance(value, str):
+                return value.strip().lower() in {"true", "1", "yes", "on"}
+            return bool(value)
+        return bool(getattr(self, "_direct_mention_immediate", False))
+
+    def _event_epoch_seconds(self, event: MessageEvent) -> Optional[float]:
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        timestamp = raw.get("timestamp")
+        if isinstance(timestamp, dict):
+            timestamp = timestamp.get("low") or timestamp.get("value")
+        try:
+            return float(timestamp)
+        except (TypeError, ValueError):
+            return None
+
+    def _should_flush_turn_immediately(self, event: MessageEvent) -> bool:
+        if not self._direct_mention_immediate_for_event(event):
+            return False
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        if raw.get("bundle"):
+            messages = raw.get("messages") or []
+            return any(isinstance(message, dict) and self._message_is_direct_trigger(message) for message in messages)
+        return self._message_is_direct_trigger(raw)
+
     async def _queue_or_handle_event(self, event: MessageEvent) -> None:
         """Debounce WhatsApp events into one turn per chat window."""
-        debounce_s = self._debounce_seconds()
+        debounce_s = self._debounce_seconds_for_event(event)
         if debounce_s <= 0:
             await self.handle_message(event)
             return
@@ -616,7 +741,41 @@ class WhatsAppAdapter(BasePlatformAdapter):
         existing = tasks.get(chat_id)
         if existing and not existing.done():
             existing.cancel()
+        if self._should_flush_turn_immediately(event):
+            tasks.pop(chat_id, None)
+            await self._flush_turn(chat_id)
+            return
         tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, debounce_s))
+
+    async def _queue_or_handle_replay_event(self, event: MessageEvent) -> None:
+        """Apply WhatsApp turn policy using message timestamps, not wall-clock sleeps."""
+        debounce_s = self._debounce_seconds_for_event(event)
+        if debounce_s <= 0:
+            await self.handle_message(event)
+            return
+
+        source = event.source
+        chat_id = source.chat_id if source else ""
+        if not chat_id:
+            await self.handle_message(event)
+            return
+
+        buffers = getattr(self, "_turn_buffers", None)
+        if buffers is None:
+            self._turn_buffers = {}
+            buffers = self._turn_buffers
+
+        current = buffers.get(chat_id) or []
+        if current:
+            last_ts = self._event_epoch_seconds(current[-1])
+            this_ts = self._event_epoch_seconds(event)
+            if last_ts is not None and this_ts is not None and this_ts - last_ts >= debounce_s:
+                await self._flush_turn(chat_id)
+                current = []
+
+        buffers.setdefault(chat_id, []).append(event)
+        if self._should_flush_turn_immediately(event):
+            await self._flush_turn(chat_id)
 
     async def _flush_turn_after(self, chat_id: str, debounce_s: float) -> None:
         try:
@@ -662,7 +821,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
             if event.source:
                 sender = event.source.user_name or event.source.user_id or sender
             message_id = event.message_id or raw.get("messageId") or f"message-{index}"
-            timestamp = raw.get("timestamp")
+            timestamp = raw.get("_tgg_sgt") or raw.get("sgt") or raw.get("timestamp")
             prefix = f"{index}. "
             if timestamp:
                 prefix += f"[{timestamp}] "
@@ -1384,10 +1543,44 @@ class WhatsAppAdapter(BasePlatformAdapter):
             
             await asyncio.sleep(1)  # Poll interval
     
-    async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
+    async def replay_bridge_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        bypass_require_mention: bool = True,
+    ) -> int:
+        """Replay raw bridge messages through the same MessageEvent/session path as live WA."""
+        processed = 0
+        touched_chats: set[str] = set()
+
+        def _sort_key(message: Dict[str, Any]) -> tuple:
+            ts = message.get("timestamp")
+            if isinstance(ts, dict):
+                ts = ts.get("low") or ts.get("value")
+            try:
+                ts_num = int(ts)
+            except Exception:
+                ts_num = 0
+            return (ts_num, str(message.get("messageId") or ""))
+
+        for msg_data in sorted((m for m in messages if isinstance(m, dict)), key=_sort_key):
+            event = await self._build_message_event(
+                msg_data,
+                bypass_require_mention=bypass_require_mention,
+            )
+            if event:
+                if event.source and event.source.chat_id:
+                    touched_chats.add(event.source.chat_id)
+                await self._queue_or_handle_replay_event(event)
+                processed += 1
+        for chat_id in list(touched_chats):
+            await self._flush_turn(chat_id)
+        return processed
+
+    async def _build_message_event(self, data: Dict[str, Any], *, bypass_require_mention: bool = False) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            if not self._should_process_message(data, bypass_require_mention=bypass_require_mention):
                 return None
 
             # Determine message type
@@ -1511,6 +1704,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 reply_to_text=self._reply_context_text(data),
                 media_urls=cached_urls,
                 media_types=media_types,
+                channel_prompt=data.get("_hermes_channel_prompt"),
+                pa_job_type=data.get("_hermes_pa_job_type"),
+                pa_context=data.get("_hermes_pa_context") if isinstance(data.get("_hermes_pa_context"), dict) else None,
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")

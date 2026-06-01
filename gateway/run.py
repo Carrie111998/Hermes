@@ -14075,6 +14075,18 @@ class GatewayRunner:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
+    def _vision_preanalysis_max_concurrency(self) -> int:
+        """Return configured concurrency for text-mode image pre-analysis."""
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            raw = cfg_get(cfg, "auxiliary", "vision", "max_concurrency", default=1)
+            value = int(raw or 1)
+        except Exception:
+            value = 1
+        return max(1, min(value, 16))
+
     async def _enrich_message_with_vision(
         self,
         user_text: str,
@@ -14105,36 +14117,46 @@ class GatewayRunner:
             "and any other notable visual information."
         )
 
-        enriched_parts = []
-        for path in image_paths:
+        max_concurrency = self._vision_preanalysis_max_concurrency()
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def analyze_one(path: str) -> str:
             try:
-                logger.debug("Auto-analyzing user image: %s", path)
-                result_json = await vision_analyze_tool(
-                    image_url=path,
-                    user_prompt=analysis_prompt,
-                )
+                async with semaphore:
+                    logger.debug("Auto-analyzing user image: %s", path)
+                    result_json = await vision_analyze_tool(
+                        image_url=path,
+                        user_prompt=analysis_prompt,
+                    )
                 result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
-                    enriched_parts.append(
+                    return (
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
                         f"image_url: {path} ~]"
                     )
-                else:
-                    enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
-                        "this time (>_<) You can try looking at it yourself "
-                        f"with vision_analyze using image_url: {path}]"
-                    )
+                return (
+                    "[The user sent an image but I couldn't quite see it "
+                    "this time (>_<) You can try looking at it yourself "
+                    f"with vision_analyze using image_url: {path}]"
+                )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
-                enriched_parts.append(
+                return (
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
                     f"with vision_analyze using image_url: {path}]"
                 )
+
+        if max_concurrency > 1 and len(image_paths) > 1:
+            logger.info(
+                "Image pre-analysis fan-out: %d image(s), max_concurrency=%d.",
+                len(image_paths),
+                max_concurrency,
+            )
+        enriched_parts = await asyncio.gather(*(analyze_one(path) for path in image_paths))
 
         # Combine: vision descriptions first, then the user's original text
         if enriched_parts:

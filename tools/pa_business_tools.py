@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.parse
@@ -30,6 +31,7 @@ ILINKED_ALLOW_PAYLOAD_KEYS = (
     "source_system_requested",
     "ilinked_requested",
 )
+JOB_NO_RE = r"^[A-Z]{2}/JOB/\d{4}/\d{4}$"
 
 
 @dataclass(frozen=True)
@@ -294,6 +296,95 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
     return {"result": parsed}
 
 
+CASE_SEARCH_TEXT_KEYS = (
+    "address",
+    "block",
+    "street",
+    "unit",
+    "workType",
+    "work_type",
+    "problem",
+    "issue",
+)
+
+
+def _case_search_text(payload: Mapping[str, Any]) -> str:
+    raw_parts: list[str] = []
+    address = str(payload.get("address") or "").strip()
+    if address:
+        raw_parts.append(address)
+    else:
+        block = str(payload.get("block") or "").strip()
+        street = str(payload.get("street") or "").strip()
+        unit = str(payload.get("unit") or "").strip()
+        if block:
+            raw_parts.append(f"Blk {block}" if not block.lower().startswith("blk") else block)
+        if street:
+            raw_parts.append(street)
+        if unit:
+            raw_parts.append(unit if unit.startswith("#") else f"#{unit}")
+    for key in ("workType", "work_type", "problem", "issue"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            raw_parts.append(value)
+    seen: set[str] = set()
+    parts: list[str] = []
+    for part in raw_parts:
+        normalized = " ".join(part.split())
+        if not normalized:
+            continue
+        marker = normalized.lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        parts.append(normalized)
+    return " ".join(parts)
+
+
+def _normalize_case_search_payload(clean: dict[str, Any]) -> dict[str, Any]:
+    if "search" not in clean and clean.get("query") is not None:
+        clean["search"] = clean["query"]
+    if not str(clean.get("search") or "").strip():
+        composed = _case_search_text(clean)
+        if composed:
+            clean["search"] = composed
+    clean.pop("query", None)
+    for key in CASE_SEARCH_TEXT_KEYS:
+        clean.pop(key, None)
+    return clean
+
+
+def _normalize_operation_payload(operation: str, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    clean = _json_payload(payload)
+    op = operation.strip().lower()
+    if op.endswith("case_search"):
+        clean = _normalize_case_search_payload(clean)
+    return clean
+
+
+def _validate_operation_payload(op: PABusinessOperation, payload: Mapping[str, Any] | None) -> None:
+    request_payload = _json_payload(payload)
+    if "jobNo" in request_payload:
+        value = str(request_payload.get("jobNo") or "").strip().upper()
+        if value and not re.match(JOB_NO_RE, value):
+            raise ValueError(
+                "INVALID_JOB_NO: jobNo must look like SK/JOB/2604/2376; "
+                f"{request_payload.get('jobNo')!r} looks like a unit or free-text reference. "
+                "Use case_search/tgg_case_search with search=<address, unit, or work text> first."
+            )
+    for param_name in op.path_params:
+        if param_name not in request_payload:
+            raise ValueError(f"operation {op.name!r} requires path_param {param_name!r} in payload")
+        if param_name == "jobNo":
+            value = str(request_payload.get(param_name) or "").strip().upper()
+            if not value or not re.match(JOB_NO_RE, value):
+                raise ValueError(
+                    "INVALID_JOB_NO: jobNo must look like SK/JOB/2604/2376; "
+                    f"{request_payload.get(param_name)!r} looks like a unit or free-text reference. "
+                    "Use case_search/tgg_case_search with search=<address, unit, or work text> first."
+                )
+
+
 def _execute_http_operation(
     op: PABusinessOperation,
     payload: Mapping[str, Any] | None,
@@ -396,10 +487,13 @@ def execute_business_operation(
             operation=operation,
         )
 
+    normalized_payload = _normalize_operation_payload(operation, payload)
+    _validate_operation_payload(op, normalized_payload)
+
     if op.kind == "http":
-        return _execute_http_operation(op, payload, bridge_config)
+        return _execute_http_operation(op, normalized_payload, bridge_config)
     if op.kind == "command":
-        return _execute_command_operation(op, payload)
+        return _execute_command_operation(op, normalized_payload)
     raise ValueError(f"unsupported PA business operation type {op.kind!r}")
 
 
@@ -452,6 +546,15 @@ AGENT_ACTION_STATUSES = {
 }
 
 
+def _env_truthy(*names: str) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
 def _resolve_bridge(
     config: Mapping[str, Any] | PABusinessBridgeConfig | None,
 ) -> PABusinessBridgeConfig | None:
@@ -482,6 +585,8 @@ def record_agent_action(
 ) -> bool:
     """Record an agent action to dev.agent_actions. Fails soft."""
     try:
+        if _env_truthy("HERMES_PA_AGENT_ACTION_DRY_RUN", "HERMES_PA_BUSINESS_DRY_RUN"):
+            return True
         if not agent_id or not engagement_id:
             return False
         if action_type not in AGENT_ACTION_TYPES or status not in AGENT_ACTION_STATUSES:
@@ -647,7 +752,117 @@ def _handle_business_read(args: Mapping[str, Any], **kwargs: Any) -> str:
 
 
 def _handle_business_write(args: Mapping[str, Any], **kwargs: Any) -> str:
+    if _env_truthy("HERMES_PA_BUSINESS_DRY_RUN"):
+        operation = str(args.get("operation") or "").strip()
+        if not operation:
+            return tool_error("operation is required")
+        payload = _normalize_operation_payload(operation, _strip_control_payload_keys(args.get("payload") or {}))
+        try:
+            bridge = _load_runtime_bridge_config()
+            op = bridge.operations.get(operation)
+            if op is None:
+                known = ", ".join(sorted(bridge.operations)) or "none configured"
+                return tool_error(f"unknown PA business operation {operation!r}; known: {known}")
+            _validate_operation_payload(op, payload)
+        except Exception as exc:
+            return tool_error(exc)
+        return tool_result({
+            "ok": True,
+            "dry_run": True,
+            "operation": operation,
+            "payload": payload,
+        })
     return _handle_business_call(args, user_task=kwargs.get("user_task"))
+
+
+def _dry_run_business_result(operation: str, payload: Mapping[str, Any]) -> str | None:
+    if not _env_truthy("HERMES_PA_BUSINESS_DRY_RUN"):
+        return None
+    try:
+        bridge = _load_runtime_bridge_config()
+        op = bridge.operations.get(operation)
+        if op is None:
+            known = ", ".join(sorted(bridge.operations)) or "none configured"
+            return tool_error(f"unknown PA business operation {operation!r}; known: {known}")
+        _validate_operation_payload(op, payload)
+    except Exception as exc:
+        return tool_error(exc)
+    return tool_result({
+        "ok": True,
+        "dry_run": True,
+        "operation": operation,
+        "payload": dict(payload),
+    })
+
+
+def _handle_tgg_read(operation: str, payload: Mapping[str, Any]) -> str:
+    try:
+        result = execute_business_operation(
+            _load_runtime_bridge_config(),
+            operation=operation,
+            payload=payload,
+        )
+    except Exception as exc:
+        return tool_error(exc)
+    return tool_result(result)
+
+
+def _handle_tgg_write(operation: str, payload: Mapping[str, Any]) -> str:
+    dry = _dry_run_business_result(operation, payload)
+    if dry is not None:
+        return dry
+    try:
+        result = execute_business_operation(
+            _load_runtime_bridge_config(),
+            operation=operation,
+            payload=payload,
+        )
+    except Exception as exc:
+        return tool_error(exc)
+    return tool_result(result)
+
+
+def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    return _handle_tgg_read("tgg_case_lookup", {"jobNo": args.get("jobNo")})
+
+
+def _handle_tgg_case_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    payload = _normalize_case_search_payload(dict(args))
+    payload["limit"] = payload.get("limit", 12)
+    for key in ("zone", "serviceLine", "sourceStatus", "progressStatus", "state"):
+        if args.get(key) is not None:
+            payload[key] = args.get(key)
+    return _handle_tgg_read("tgg_case_search", payload)
+
+
+def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    raw = dict(args)
+    fields = raw.get("fields") if isinstance(raw.get("fields"), Mapping) else {}
+    fields = dict(fields)
+    for source_key, field_key in (
+        ("observedAt", "observed_at"),
+        ("sourceRefs", "source_refs"),
+        ("mediaRefs", "media_refs"),
+        ("messageText", "message_text"),
+        ("senderName", "sender_name"),
+        ("chatName", "chat_name"),
+        ("photoCount", "photo_count"),
+    ):
+        if raw.get(source_key) is not None and field_key not in fields:
+            fields[field_key] = raw.get(source_key)
+    payload = {
+        "jobNo": raw.get("jobNo"),
+        "source": raw.get("source") or "whatsapp",
+        "fields": fields,
+        "notes": raw.get("notes"),
+        "confidence": raw.get("confidence"),
+    }
+    return _handle_tgg_write("tgg_case_observation", payload)
+
+
+def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    payload = dict(args)
+    return _handle_tgg_write("tgg_case_create", payload)
 
 
 def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> str:
@@ -725,6 +940,97 @@ PA_BUSINESS_WRITE_SCHEMA = {
 }
 
 
+TGG_CASE_LOOKUP_SCHEMA = {
+    "name": "tgg_case_lookup",
+    "description": "Look up exactly one TGG operator case by real job number, e.g. SK/JOB/2604/2376. Do not use for unit numbers.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "jobNo": {
+                "type": "string",
+                "description": "Exact TGG/HDB job number such as SK/JOB/2604/2376.",
+            },
+        },
+        "required": ["jobNo"],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CASE_SEARCH_SCHEMA = {
+    "name": "tgg_case_search",
+    "description": "Search TGG operator cases by address, unit, block, street, work type, or free text. Use once per distinct address/job cluster before creating a case when no exact job number is present.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "search": {
+                "type": "string",
+                "description": "Address/unit/work text, e.g. 'Blk 350 Anchorvale Rd #11-109 window grille'.",
+            },
+            "address": {"type": "string", "description": "Structured address if known, e.g. 'Blk 350 Anchorvale Rd #11-109'."},
+            "block": {"type": "string", "description": "Structured block number if known, e.g. '350'."},
+            "street": {"type": "string", "description": "Structured street/name if known, e.g. 'Anchorvale Rd'."},
+            "unit": {"type": "string", "description": "Structured unit if known, e.g. '#11-109'."},
+            "workType": {"type": "string", "description": "Structured work type/problem if known, e.g. 'window grille install'."},
+            "problem": {"type": "string", "description": "Structured problem/work description if known."},
+            "limit": {"type": "integer", "description": "Maximum candidates to return.", "default": 12},
+            "zone": {"type": "string", "description": "Optional TGG zone filter, e.g. SK, PG, AM."},
+            "serviceLine": {"type": "string", "description": "Optional service line, usually maintenance or sprucing."},
+            "sourceStatus": {"type": "string", "description": "Optional source status filter."},
+            "progressStatus": {"type": "string", "description": "Optional progress status filter."},
+            "state": {"type": "string", "description": "Optional raw case state filter."},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CASE_OBSERVATION_SCHEMA = {
+    "name": "tgg_case_observation",
+    "description": "Record WhatsApp evidence or worker updates against an existing TGG case. Requires a real job number; dry-run mode validates without writing.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "jobNo": {"type": "string", "description": "Exact job number to attach the observation to."},
+            "source": {"type": "string", "description": "Observation source, e.g. whatsapp."},
+            "observedAt": {"type": "string", "description": "Observed time in SGT or ISO format."},
+            "notes": {"type": "string", "description": "Short factual observation notes."},
+            "confidence": {"type": "string", "description": "Evidence confidence, e.g. observed, high, low."},
+            "fields": {"type": "object", "description": "Structured extracted facts.", "additionalProperties": True},
+            "messageText": {"type": "string", "description": "Original message text or bundled message summary."},
+            "senderName": {"type": "string", "description": "WhatsApp sender name/id."},
+            "chatName": {"type": "string", "description": "WhatsApp group/chat name."},
+            "photoCount": {"type": "integer", "description": "Number of attached photos."},
+            "sourceRefs": {"type": "array", "items": {"type": "string"}, "description": "Source WhatsApp message IDs/refs."},
+            "mediaRefs": {"type": "array", "items": {"type": "string"}, "description": "Attached media paths/refs."},
+        },
+        "required": ["jobNo", "source", "observedAt", "notes", "confidence"],
+        "additionalProperties": True,
+    },
+}
+
+
+TGG_CASE_CREATE_SCHEMA = {
+    "name": "tgg_case_create",
+    "description": "Create a genuinely new TGG case after search finds no matching existing case. Dry-run mode validates without writing.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "zone": {"type": "string", "description": "TGG zone if known."},
+            "serviceLine": {"type": "string", "description": "maintenance or sprucing."},
+            "address": {"type": "string", "description": "Case address."},
+            "problem": {"type": "string", "description": "Problem or work description."},
+            "source": {"type": "string", "description": "Source, e.g. whatsapp."},
+            "observedAt": {"type": "string", "description": "Observed time in SGT or ISO format."},
+            "evidence": {"type": "object", "description": "Evidence used to decide this is new.", "additionalProperties": True},
+        },
+        "required": ["zone", "address", "problem", "source"],
+        "additionalProperties": True,
+    },
+}
+
+
 registry.register(
     name="pa_business_read",
     toolset="pa-business",
@@ -738,5 +1044,37 @@ registry.register(
     toolset="pa-business",
     schema=PA_BUSINESS_WRITE_SCHEMA,
     handler=_handle_business_write,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_lookup",
+    toolset="pa-business",
+    schema=TGG_CASE_LOOKUP_SCHEMA,
+    handler=_handle_tgg_case_lookup,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_search",
+    toolset="pa-business",
+    schema=TGG_CASE_SEARCH_SCHEMA,
+    handler=_handle_tgg_case_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_observation",
+    toolset="pa-business",
+    schema=TGG_CASE_OBSERVATION_SCHEMA,
+    handler=_handle_tgg_case_observation,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_create",
+    toolset="pa-business",
+    schema=TGG_CASE_CREATE_SCHEMA,
+    handler=_handle_tgg_case_create,
     check_fn=_bridge_available,
 )

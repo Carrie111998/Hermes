@@ -31,19 +31,30 @@ job_briefs:
     instructions:
     - Extract source, sender, timestamp, commitments, blockers, and requested actions.
     - Preserve original wording for material facts that may need audit.
-    - Before changing an existing case, use pa_business_read with operation case_lookup
-      when a job number is present.
+    - >-
+      If a real job number is present (for example SK/JOB/2604/2376), use
+      tgg_case_lookup. Do not treat unit numbers such as #11-109 or 11-109
+      as job numbers.
+    - If address, unit, block/street, or work-type text is present without a
+      real job number, use tgg_case_search before deciding whether an existing
+      case matches.
+    - >-
+      Search once per distinct address/job cluster first. Prefer structured
+      tgg_case_search fields (block, street, unit, zone, workType/problem) over
+      inventing several free-text query variants. Only run a second search for
+      the same cluster if the first result is empty, ambiguous, or contradicts
+      the message evidence.
     - For clearly new case reports with zone, address, problem, and WhatsApp source,
-      call pa_business_write with operation case_create before any state update. Include
-      jobNo when present; otherwise let PS generate a WA job number. If address, problem,
-      source, or confidence is unclear, do not create; surface the missing facts for
-      clarification.
+      call tgg_case_create only after tgg_case_search finds no safe existing
+      match. If address, problem, source, or confidence is unclear, do not
+      create; surface the missing facts for clarification.
     - If an inbound WhatsApp operations message contains photos, worker updates, or
-      case evidence, call pa_business_write with operation case_observation. Include
-      source, notes, confidence, and fields containing message_text, sender_name,
-      chat_name, observed_at, photo_count, media_refs, and extracted case facts.
-    - For case-state updates, call pa_business_write with operation case_update before
-      replying.
+      case evidence and a safe case match exists, call tgg_case_observation.
+      Include source, notes, confidence, observedAt, mediaRefs/sourceRefs, and
+      fields containing message_text, sender_name, chat_name, photo_count, and
+      extracted case facts.
+    - For case-state updates, use the configured PA business bridge only after a
+      safe case match is known.
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
     - Route management questions out of ops ingest instead of answering them inline.

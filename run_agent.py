@@ -74,6 +74,22 @@ from hermes_constants import get_hermes_home
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
+def _json_capture_default(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    if isinstance(value, SimpleNamespace):
+        return vars(value)
+    if hasattr(value, "to_dict"):
+        try:
+            return value.to_dict()
+        except Exception:
+            pass
+    return repr(value)
+
+
 def _load_openai_cls() -> type:
     """Import and cache ``openai.OpenAI``."""
     global _OPENAI_CLS_CACHE
@@ -7722,6 +7738,51 @@ class AIAgent:
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
 
+        capture_dir_raw = os.environ.get("HERMES_OPENAI_CAPTURE_DIR", "").strip()
+        capture_dir = Path(capture_dir_raw).expanduser() if capture_dir_raw else None
+
+        def _write_api_capture(kind: str, payload: Any) -> None:
+            if capture_dir is None:
+                return
+            try:
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                seq = int(getattr(self, "_openai_capture_seq", 0)) + 1
+                setattr(self, "_openai_capture_seq", seq)
+                envelope = {
+                    "captured_at": datetime.now().isoformat(),
+                    "kind": kind,
+                    "api_mode": self.api_mode,
+                    "provider": self.provider,
+                    "model": api_kwargs.get("model", getattr(self, "model", None)),
+                    "payload": payload,
+                }
+                # Replays may intentionally reuse HERMES_HOME to keep the same
+                # session state across multiple invocations. Include time+pid so
+                # a later process cannot overwrite earlier request/response
+                # captures when its per-agent sequence restarts at 1.
+                path = capture_dir / f"{time.time_ns()}-{os.getpid()}-{seq:04d}-{kind}.json"
+                path.write_text(
+                    json.dumps(envelope, ensure_ascii=False, indent=2, default=_json_capture_default),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.debug("Failed to capture OpenAI API %s payload", kind, exc_info=True)
+
+        def _error_payload(exc: Exception) -> dict:
+            response = getattr(exc, "response", None)
+            response_text = getattr(response, "text", None)
+            response_status = getattr(response, "status_code", None)
+            return {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "status_code": getattr(exc, "status_code", response_status),
+                "request_id": getattr(exc, "request_id", None),
+                "body": getattr(exc, "body", None),
+                "response_text": response_text,
+            }
+
+        _write_api_capture("request", api_kwargs)
+
         def _call():
             try:
                 if self.api_mode == "codex_responses":
@@ -7767,6 +7828,7 @@ class AIAgent:
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
             except Exception as e:
                 result["error"] = e
+                _write_api_capture("error", _error_payload(e))
             finally:
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
@@ -7855,6 +7917,7 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
+        _write_api_capture("response", result["response"])
         return result["response"]
 
     # ── Unified streaming API call ─────────────────────────────────────────
