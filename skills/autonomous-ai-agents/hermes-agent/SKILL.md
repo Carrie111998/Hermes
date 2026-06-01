@@ -25,6 +25,7 @@ Use this skill before answering or changing Hermes Agent itself: CLI setup, conf
 Do not use this for Scaffolde projection/canonical-source questions unless the Hermes runtime is the target surface; pair with `scaffolde-platform-operations` for Scaffolde-owned projection work.
 
 ## Fast Path
+
 - Setup/status: `hermes setup`, `hermes setup tools`, `hermes status`.
 - Config: prefer `hermes config set ...` and `hermes config get ...` over hand-editing YAML.
 - Skills: built-in skill source lives under `skills/<category>/<name>/SKILL.md`; user-local skills live under `~/.hermes/skills/`.
@@ -40,8 +41,6 @@ Good verification targets:
 - CLI commands: `hermes --help`, `hermes <command> --help`, and `hermes_cli/main.py`
 - User documentation: https://hermes-agent.nousresearch.com/docs/
 - Source tree: https://github.com/NousResearch/hermes-agent
-
-## Quick Start
 
 ## References
 
