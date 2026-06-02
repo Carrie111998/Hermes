@@ -605,23 +605,31 @@ class SessionManager:
             "model": model or default_model,
         }
 
+        runtime: Dict[str, Any] = {}
         try:
             runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
-            kwargs.update(
-                {
-                    "provider": runtime.get("provider"),
-                    "api_mode": api_mode or runtime.get("api_mode"),
-                    "base_url": base_url or runtime.get("base_url"),
-                    "api_key": runtime.get("api_key"),
-                    "command": runtime.get("command"),
-                    "args": list(runtime.get("args") or []),
-                }
-            )
         except Exception:
             logger.debug("ACP session falling back to default provider resolution", exc_info=True)
 
         _register_task_cwd(session_id, cwd)
-        agent = AIAgent(**kwargs)
+
+        # Build AIAgent with explicit keyword arguments to satisfy strict type
+        # checkers that struggle with heterogeneous dictionary unpacking.
+        agent = AIAgent(
+            platform=str(kwargs.get("platform", "acp")),
+            enabled_toolsets=kwargs.get("enabled_toolsets"),  # type: ignore[arg-type]
+            quiet_mode=bool(kwargs.get("quiet_mode", True)),
+            session_id=str(kwargs.get("session_id", session_id)),
+            session_db=kwargs.get("session_db"),
+            model=str(kwargs.get("model") or model or default_model),
+            provider=runtime.get("provider"),
+            api_mode=api_mode or runtime.get("api_mode"),
+            base_url=base_url or runtime.get("base_url"),
+            api_key=runtime.get("api_key"),
+            command=runtime.get("command"),
+            args=list(runtime.get("args") or []),
+        )
+
         # ACP stdio transport requires stdout to remain protocol-only JSON-RPC.
         # Route any incidental human-readable agent output to stderr instead.
         agent._print_fn = _acp_stderr_print

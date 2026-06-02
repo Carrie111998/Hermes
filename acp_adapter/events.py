@@ -79,7 +79,7 @@ def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
         status = status_map.get(raw_status, "pending")
         if raw_status == "cancelled":
             content = f"[cancelled] {content}"
-        entries.append(PlanEntry(content=content, priority="medium", status=status))
+        entries.append(PlanEntry(content=content, priority="medium", status=status))  # type: ignore[arg-type]
 
     return AgentPlanUpdate(session_update="plan", entries=entries)
 
@@ -131,7 +131,7 @@ def make_tool_progress_cb(
     ``reasoning.available``) are silently ignored.
     """
 
-    def _tool_progress(event_type: str, name: str = None, preview: str = None, args: Any = None, **kwargs) -> None:
+    def _tool_progress(event_type: str, name: str | None = None, preview: str | None = None, args: Any = None, **kwargs) -> None:
         # Only emit ACP ToolCallStart for tool.started; ignore other event types
         if event_type != "tool.started":
             return
@@ -144,13 +144,14 @@ def make_tool_progress_cb(
             args = {}
 
         tc_id = make_tool_call_id()
-        queue = tool_call_ids.get(name)
+        effective_name = name or "unknown_tool"
+        queue = tool_call_ids.get(effective_name)
         if queue is None:
             queue = deque()
-            tool_call_ids[name] = queue
+            tool_call_ids[effective_name] = queue
         elif isinstance(queue, str):
             queue = deque([queue])
-            tool_call_ids[name] = queue
+            tool_call_ids[effective_name] = queue
         queue.append(tc_id)
 
         snapshot = None
@@ -176,7 +177,7 @@ def make_tool_progress_cb(
             except Exception:
                 logger.debug("Failed to prepare auto-approved ACP edit diff for %s", name, exc_info=True)
 
-        update = build_tool_start(tc_id, name, args, edit_diff=edit_diff)
+        update = build_tool_start(tc_id, effective_name, args, edit_diff=edit_diff)
         _send_update(conn, session_id, loop, update)
 
     return _tool_progress
@@ -237,7 +238,8 @@ def make_step_cb(
                 queue = tool_call_ids.get(tool_name or "")
                 if isinstance(queue, str):
                     queue = deque([queue])
-                    tool_call_ids[tool_name] = queue
+                    if tool_name:
+                        tool_call_ids[tool_name] = queue
                 if tool_name and queue:
                     tc_id = queue.popleft()
                     meta = tool_call_meta.pop(tc_id, {})

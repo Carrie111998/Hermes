@@ -51,7 +51,7 @@ import threading
 from types import SimpleNamespace
 import urllib.request
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -336,6 +336,8 @@ class AIAgent:
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
 
+    _print_fn: Callable[..., Any] | None
+
     @property
     def base_url(self) -> str:
         return self._base_url
@@ -354,7 +356,7 @@ class AIAgent:
         api_mode: str | None = None,
         acp_command: str | None = None,
         acp_args: list[str] | None = None,
-        command: str = None,
+        command: str | None = None,
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)

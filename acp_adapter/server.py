@@ -76,10 +76,12 @@ from acp_adapter.tools import build_tool_complete, build_tool_start
 
 logger = logging.getLogger(__name__)
 
+HERMES_VERSION: str = "0.0.0"
 try:
-    from hermes_cli import __version__ as HERMES_VERSION
+    from hermes_cli import __version__ as _V
+    HERMES_VERSION = _V
 except Exception:
-    HERMES_VERSION = "0.0.0"
+    pass
 
 # Thread pool for running AIAgent (synchronous) in parallel.
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
@@ -795,7 +797,7 @@ class HermesACPAgent(acp.Agent):
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
             state.agent.tools = get_tool_definitions(
                 enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
+                disabled_toolsets=disabled_toolsets,  # type: ignore[arg-type]
                 quiet_mode=True,
             )
             state.agent.valid_tool_names = {
@@ -953,7 +955,8 @@ class HermesACPAgent(acp.Agent):
     @staticmethod
     def _history_tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         """Extract function name/arguments from an OpenAI-style tool_call."""
-        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+        f_raw = tool_call.get("function")
+        function = f_raw if isinstance(f_raw, dict) else {}
         name = str(function.get("name") or tool_call.get("name") or "unknown_tool")
         raw_args = function.get("arguments") or tool_call.get("arguments") or tool_call.get("args") or {}
         if isinstance(raw_args, str):
@@ -995,6 +998,8 @@ class HermesACPAgent(acp.Agent):
         active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
 
         async def _send(update: Any) -> bool:
+            if self._conn is None:
+                return False
             try:
                 await self._conn.session_update(session_id=state.session_id, update=update)
                 return True
@@ -1250,6 +1255,7 @@ class HermesACPAgent(acp.Agent):
             | EmbeddedResourceContentBlock
         ],
         session_id: str,
+        message_id: str | None = None,
         **kwargs: Any,
     ) -> PromptResponse:
         """Run Hermes on the user's prompt and stream events back to the editor."""
@@ -1582,11 +1588,12 @@ class HermesACPAgent(acp.Agent):
         commands: list[AvailableCommand] = []
         for spec in cls._ADVERTISED_COMMANDS:
             input_hint = spec.get("input_hint")
+            from acp.schema import AvailableCommandInput
             commands.append(
                 AvailableCommand(
                     name=spec["name"],
                     description=spec["description"],
-                    input=UnstructuredCommandInput(hint=input_hint)
+                    input=AvailableCommandInput(UnstructuredCommandInput(hint=input_hint))
                     if input_hint
                     else None,
                 )
@@ -1926,7 +1933,7 @@ class HermesACPAgent(acp.Agent):
         return SetSessionModeResponse()
 
     async def set_config_option(
-        self, config_id: str, session_id: str, value: str, **kwargs: Any
+        self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
         """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
         state = self.session_manager.get_session(session_id)

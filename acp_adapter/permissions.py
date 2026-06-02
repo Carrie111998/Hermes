@@ -32,7 +32,7 @@ _PERMISSION_REQUEST_IDS = count(1)
 def _permission_option_supports_kind(kind: str) -> bool:
     """Return whether the installed ACP SDK accepts a permission option kind."""
     try:
-        PermissionOption(option_id="__probe__", kind=kind, name="probe")
+        PermissionOption(option_id="__probe__", kind=kind, name="probe")  # type: ignore[arg-type]
     except Exception:
         return False
     return True

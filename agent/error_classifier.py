@@ -427,15 +427,20 @@ def classify_api_error(
     model_lower = (model or "").strip().lower()
 
     def _result(reason: FailoverReason, **overrides) -> ClassifiedError:
-        defaults = {
-            "reason": reason,
-            "status_code": status_code,
-            "provider": provider,
-            "model": model,
-            "message": _extract_message(error, body),
-        }
-        defaults.update(overrides)
-        return ClassifiedError(**defaults)
+        # Build ClassifiedError with explicit arguments to satisfy strict
+        # type checkers that struggle with heterogeneous dictionary unpacking.
+        return ClassifiedError(
+            reason=reason,
+            status_code=status_code,
+            provider=provider,
+            model=model,
+            message=_extract_message(error, body),
+            retryable=bool(overrides.get("retryable", True)),
+            should_compress=bool(overrides.get("should_compress", False)),
+            should_rotate_credential=bool(overrides.get("should_rotate_credential", False)),
+            should_fallback=bool(overrides.get("should_fallback", False)),
+            error_context=overrides.get("error_context", {}),
+        )
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
 

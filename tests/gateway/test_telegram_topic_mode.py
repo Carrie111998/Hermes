@@ -226,6 +226,9 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
     tmp_path, monkeypatch
 ):
     import gateway.run as gateway_run
+    import hermes_cli.tips as tips
+
+    monkeypatch.setattr(tips, "get_random_tip", lambda: "mocked tip")
 
     session_db = SessionDB(db_path=tmp_path / "state.db")
     session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
