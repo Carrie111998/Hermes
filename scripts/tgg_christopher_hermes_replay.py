@@ -1267,7 +1267,7 @@ def _pricing_provider(provider: str | None) -> str | None:
     if raw.startswith("openai"):
         return "openai"
     if raw.startswith("gemini") or raw.startswith("google"):
-        return "google"
+        return "gemini"
     return raw
 
 
