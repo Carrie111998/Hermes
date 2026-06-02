@@ -600,7 +600,14 @@ class _ReplayOperatorBackend:
         confidence = _first_nonempty(payload.get("confidence"), evidence.get("confidence"))
         if confidence and re.match(r"^(low|uncertain|guess|unknown)$", confidence, flags=re.I):
             raise ValueError("case_create requires clear WhatsApp evidence; ask for clarification instead")
-        job_no = _first_nonempty(payload.get("jobNo"), payload.get("job_no"), evidence.get("jobNoProvided"))
+        # Preserve an explicit HDB/iLinked job number as the case identity wherever the model
+        # nests it. Models inconsistently pass it top-level OR under evidence.jobNo /
+        # evidence.job_no / evidence.jobNoProvided; reading only the first set silently
+        # dropped explicit identities and minted synthetic WA/JOB numbers (run-to-run luck).
+        job_no = _first_nonempty(
+            payload.get("jobNo"), payload.get("job_no"),
+            evidence.get("jobNoProvided"), evidence.get("jobNo"), evidence.get("job_no"),
+        )
         block, street, unit = _split_address(address or "")
         now_ts = int(time.time())
         with sqlite3.connect(self.db_path) as conn:
