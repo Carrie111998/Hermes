@@ -23,17 +23,22 @@ ports_description:
   8642/tcp: "Hermes Gateway API (OpenAI compatible)"
   9119/tcp: "Hermes Dashboard"
 map:
-  - type: addon_config
-    read_only: false
+  - addon_config:rw
+  - media:rw
+  - share:rw
 options:
   openrouter_api_key: ""
   openai_api_key: ""
   anthropic_api_key: ""
   enable_dashboard: true
+  enable_terminal: true
+  access_password: ""
   busy_input_mode: "interrupt"
 schema:
   openrouter_api_key: "password?"
   openai_api_key: "password?"
   anthropic_api_key: "password?"
   enable_dashboard: "bool"
+  enable_terminal: "bool"
+  access_password: "password?"
   busy_input_mode: "list(interrupt|queue|steer)"

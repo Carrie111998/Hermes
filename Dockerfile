@@ -20,7 +20,18 @@ RUN apk add --no-cache \
     docker-cli \
     tini \
     coreutils \
-    chromium
+    chromium \
+    nginx \
+    tmux \
+    ttyd \
+    openssl \
+    apache2-utils \
+    bash-completion \
+    jq
+
+# Nginx setup
+RUN mkdir -p /run/nginx /var/log/nginx /var/www && \
+    chown -R hermes:hermes /run/nginx /var/log/nginx /var/www /etc/nginx
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /usr/local/bin/
