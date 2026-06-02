@@ -242,6 +242,11 @@ def _prepare_env(hermes_home: Path, *, secrets: Path) -> None:
             legacy = os.environ.get("BOBBY_TGG_PS_SERVICE_TOKEN")
             if legacy:
                 os.environ["CHRISTOPHER_TGG_PS_SERVICE_TOKEN"] = legacy
+    if "GEMINI_API_KEY_PCL_PA_SHARED" not in os.environ and os.environ.get("GEMINI_API_KEY"):
+        # Local Studio replay secrets currently carry the shared PA Gemini key under
+        # the generic name; the deployed Christopher config references the tenant
+        # shared alias. Mirror it in-process so replay uses the live config shape.
+        os.environ["GEMINI_API_KEY_PCL_PA_SHARED"] = os.environ["GEMINI_API_KEY"]
     os.environ["HERMES_HOME"] = str(hermes_home)
     os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "1"
     os.environ["HERMES_PA_AGENT_ACTION_DRY_RUN"] = "1"
