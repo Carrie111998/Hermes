@@ -79,6 +79,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import contextlib
 import inspect
 import json
 import logging
@@ -710,6 +711,30 @@ def _resolve_context_templates(value: str) -> str:
     return _CONTEXT_TEMPLATE_RE.sub(_replace, value).strip()
 
 
+def _apply_resolved_headers(request, *, same_origin: bool, names, resolved: dict) -> None:
+    """Stamp already-resolved templated headers onto an outbound MCP request.
+
+    Unlike per-request ``${context:}`` resolution (which must happen in the
+    caller's task — see ``MCPServerTask._resolve_templated_headers``), this is
+    pure application of pre-resolved values, safe to run on the MCP background
+    loop. ``resolved`` maps header-name -> value (already non-empty); a name
+    absent from ``resolved`` means "drop this header" (don't send it blank).
+
+    Cross-origin safety: on a redirect to a different origin, identity-carrying
+    templated headers are stripped, never injected — same threat model as the
+    static-``Authorization`` cross-origin strip.
+    """
+    for name in names:
+        if not same_origin:
+            request.headers.pop(name, None)
+            continue
+        value = resolved.get(name, "")
+        if value:
+            request.headers[name] = value
+        else:
+            request.headers.pop(name, None)
+
+
 def _split_static_and_templated_headers(
     headers: Dict[str, Any],
 ) -> tuple[Dict[str, Any], Dict[str, str]]:
@@ -1139,6 +1164,7 @@ class MCPServerTask:
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
+        "_templated_headers", "_outbound_resolved_headers",
         "initialize_result",
     )
 
@@ -1170,12 +1196,59 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
+        # ${context:NAME} header templates for this server (HTTP transports),
+        # captured at connect time so the SYNC tool handler can resolve them
+        # against the caller's session context. The MCP request runs on a
+        # dedicated background loop whose task never sees those vars, so
+        # resolving in the request hook there always yielded empty — Z2O-1694.
+        # The handler resolves caller-side into _outbound_resolved_headers and
+        # the request hook (on the MCP loop) reads that instance attr.
+        self._templated_headers: dict[str, str] = {}
+        self._outbound_resolved_headers: dict[str, str] = {}
         # Captures the ``InitializeResult`` returned by
         # ``await session.initialize()`` so downstream code can inspect the
         # server's real advertised capabilities (``.capabilities.resources``,
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
         self.initialize_result: Optional[Any] = None
+
+    def _resolve_templated_headers(self) -> dict[str, str]:
+        """Resolve this server's ``${context:NAME}`` header templates against
+        the CURRENT task's session context, returning name -> value for every
+        template that resolved to a non-empty value.
+
+        Must be called on the caller's thread (the sync tool handler), where
+        the per-turn session vars set by plugin hooks (e.g. delegated
+        principal) are visible. The MCP request itself runs on a dedicated
+        background loop whose task never sees those vars, so resolution there
+        always yielded empty — Z2O-1694. The returned dict is bridged onto
+        ``self._outbound_resolved_headers`` and applied by the request hook.
+        """
+        out: dict[str, str] = {}
+        for name, template in self._templated_headers.items():
+            value = _resolve_context_templates(template)
+            if value:
+                out[name] = value
+        return out
+
+    @contextlib.asynccontextmanager
+    async def _rpc(self, resolved_headers: Optional[dict] = None):
+        """Serialize a single client-initiated RPC on this server and, for the
+        duration of the call, expose caller-resolved templated headers to the
+        request hook (which runs on the MCP background loop and cannot resolve
+        ``${context:}`` itself — Z2O-1694).
+
+        System RPCs (keepalive pings, discovery, refresh) pass no headers, so
+        they never carry a user's delegated principal. Holding ``_rpc_lock``
+        also guarantees a system ping can't overlap — and read — a user call's
+        stashed headers.
+        """
+        async with self._rpc_lock:
+            self._outbound_resolved_headers = resolved_headers or {}
+            try:
+                yield
+            finally:
+                self._outbound_resolved_headers = {}
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1341,10 +1414,14 @@ class MCPServerTask:
                 # to exercise the connection and detect stale sockets.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
-                            self.session.list_tools(),
-                            timeout=30.0,
-                        )
+                        # Hold _rpc_lock with NO templated headers so this
+                        # system keepalive can't overlap — and pick up — a
+                        # user call's stashed delegated principal (Z2O-1694).
+                        async with self._rpc():
+                            await asyncio.wait_for(
+                                self.session.list_tools(),
+                                timeout=30.0,
+                            )
                     except Exception as exc:
                         logger.warning(
                             "MCP server '%s' keepalive failed, "
@@ -1470,6 +1547,11 @@ class MCPServerTask:
         # headers are resolved per-request via a request event hook so each
         # outgoing MCP call sees the calling task's current session state.
         static_headers, templated_headers = _split_static_and_templated_headers(headers)
+        # Stash the templates so the SYNC tool handler can resolve them against
+        # the caller's session context and bridge the values onto this instance
+        # (Z2O-1694) — the request hook below runs on the MCP background loop
+        # and can't see the caller's contextvars.
+        self._templated_headers = dict(templated_headers)
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
 
@@ -1608,18 +1690,22 @@ class MCPServerTask:
             }
             if templated_headers:
                 async def _inject_templated_headers(request):
-                    """Resolve ``${context:NAME}`` templates against the
-                    *calling task's* session context on each outbound request.
+                    """Apply the delegated/templated headers that the SYNC tool
+                    handler resolved against the *caller's* session context and
+                    stashed on ``self._outbound_resolved_headers``.
+
+                    This hook runs on the MCP background loop (the SDK's
+                    post_writer spawns the request task there), whose context
+                    NEVER sees the per-turn session vars — so resolving
+                    ``${context:}`` here always yielded empty (Z2O-1694).
+                    Resolution happens caller-side; this only applies the
+                    bridged values, serialized per server by ``_rpc_lock``.
 
                     **Cross-origin safety:** the hook fires on EVERY outbound
-                    request, including redirects. If a redirect target is on
-                    a different origin than the configured MCP URL, we must
-                    NOT re-inject identity-carrying templated headers there
-                    — same threat model as the static-``Authorization``
-                    cross-origin strip. Without this guard, a malicious 302
-                    target could harvest delegated-principal claims even
-                    though the response hook stripped them off the
-                    next_request.
+                    request, including redirects. On a redirect to a different
+                    origin we strip identity-carrying templated headers rather
+                    than inject them — same threat model as the static
+                    ``Authorization`` cross-origin strip.
                     """
                     target = request.url
                     same_origin = (
@@ -1627,18 +1713,12 @@ class MCPServerTask:
                     ) == (
                         _original_url.scheme, _original_url.host, _original_url.port,
                     )
-                    for name in _templated_for_hook:
-                        if not same_origin:
-                            # Redirected away from the configured origin:
-                            # never inject identity headers, and proactively
-                            # strip any that survived for some reason.
-                            request.headers.pop(name, None)
-                            continue
-                        resolved = _resolve_context_templates(_templated_for_hook[name])
-                        if resolved:
-                            request.headers[name] = resolved
-                        elif name in request.headers:
-                            del request.headers[name]
+                    _apply_resolved_headers(
+                        request,
+                        same_origin=same_origin,
+                        names=_templated_for_hook,
+                        resolved=self._outbound_resolved_headers,
+                    )
 
                 event_hooks["request"] = [_inject_templated_headers]
 
@@ -2553,8 +2633,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        # Resolve ${context:} headers HERE — on the caller's thread, where the
+        # per-turn session context (delegated principal, set by plugin hooks)
+        # is visible. The actual call runs on the MCP background loop whose
+        # task never sees those vars, so the request hook there can only apply
+        # already-resolved values (Z2O-1694). We bridge via the server
+        # instance inside _rpc_lock so concurrent per-server calls can't race.
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.call_tool(tool_name, arguments=args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
@@ -2666,8 +2754,10 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.list_resources()
             resources = []
             for r in (result.resources if hasattr(result, "resources") else []):
@@ -2730,8 +2820,10 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
         if not uri:
             return tool_error("Missing required parameter 'uri'")
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
@@ -2784,8 +2876,10 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.list_prompts()
             prompts = []
             for p in (result.prompts if hasattr(result, "prompts") else []):
@@ -2854,8 +2948,10 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return tool_error("Missing required parameter 'name'")
         arguments = args.get("arguments", {})
 
+        _resolved_headers = server._resolve_templated_headers()
+
         async def _call():
-            async with server._rpc_lock:
+            async with server._rpc(_resolved_headers):
                 result = await server.session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
