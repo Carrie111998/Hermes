@@ -188,7 +188,7 @@ class TestInstallHangupProtection:
         # Clear cached get_hermes_home if present
         import hermes_cli.config as _cfg
         if hasattr(_cfg, "_HERMES_HOME_CACHE"):
-            _cfg._HERMES_HOME_CACHE = None  # type: ignore[attr-defined]
+            _cfg._HERMES_HOME_CACHE = None
 
         original_handler = signal.getsignal(signal.SIGHUP)
         state = _install_hangup_protection(gateway_mode=False)
@@ -205,7 +205,7 @@ class TestInstallHangupProtection:
         # Nuke any cached home path
         import hermes_cli.config as _cfg
         if hasattr(_cfg, "_HERMES_HOME_CACHE"):
-            _cfg._HERMES_HOME_CACHE = None  # type: ignore[attr-defined]
+            _cfg._HERMES_HOME_CACHE = None
 
         # Use patch.multiple to safely swap and restore sys.stdout/stderr.
         # This prevents the test from permanently hijacking stdio if it
@@ -217,8 +217,10 @@ class TestInstallHangupProtection:
             try:
                 # On Windows (no SIGHUP) we still wrap stdio and create the log.
                 assert state["installed"] is True
-                assert isinstance(sys.stdout, _UpdateOutputStream)
-                assert isinstance(sys.stderr, _UpdateOutputStream)
+                # Check class name string to avoid isinstance() failures in xdist
+                # if modules are reloaded in workers.
+                assert type(sys.stdout).__name__ == "_UpdateOutputStream"
+                assert type(sys.stderr).__name__ == "_UpdateOutputStream"
                 assert state["log_file"] is not None
 
                 sys.stdout.write("checking mirror\n")
@@ -241,7 +243,7 @@ class TestInstallHangupProtection:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import hermes_cli.config as _cfg
         if hasattr(_cfg, "_HERMES_HOME_CACHE"):
-            _cfg._HERMES_HOME_CACHE = None  # type: ignore[attr-defined]
+            _cfg._HERMES_HOME_CACHE = None
 
         # No logs/ dir yet.
         assert not (tmp_path / "logs").exists()
@@ -297,7 +299,7 @@ class TestFinalizeUpdateOutput:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import hermes_cli.config as _cfg
         if hasattr(_cfg, "_HERMES_HOME_CACHE"):
-            _cfg._HERMES_HOME_CACHE = None  # type: ignore[attr-defined]
+            _cfg._HERMES_HOME_CACHE = None
 
         prev_out = sys.stdout
         state = _install_hangup_protection(gateway_mode=False)
