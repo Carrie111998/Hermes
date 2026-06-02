@@ -76,6 +76,20 @@ REPLAY_PROFILES: dict[str, ReplayProfile] = {
         debounce_seconds=300,
         direct_mention_immediate=True,
     ),
+    "tgg-local-gemini-live": ReplayProfile(
+        name="tgg-local-gemini-live",
+        main_provider="gemini",
+        model="gemini-3.1-flash-lite",
+        transport="chat_completions",
+        vision_enabled=True,
+        vision_provider="gemini",
+        vision_model="gemini-3.1-flash-lite",
+        vision_concurrency=8,
+        business_mode="copied-db-local-operator",
+        allow_prod_url=False,
+        debounce_seconds=300,
+        direct_mention_immediate=True,
+    ),
 }
 
 
@@ -696,15 +710,28 @@ def _prepare_hermes_home(
     constitution = _load_yaml(TGG_CONSTITUTION)
 
     provider_name = profile.main_provider
-    config["providers"] = {
-        provider_name: {
-            "name": "OpenAI Direct Primary",
-            "api": "https://api.openai.com/v1",
-            "key_env": "OPENAI_API_KEY",
-            "default_model": profile.model,
-            "transport": profile.transport,
+    if provider_name == "gemini":
+        config["providers"] = {
+            provider_name: {
+                "name": "Gemini",
+                "api": "https://generativelanguage.googleapis.com/v1beta",
+                "key_env": "GEMINI_API_KEY_PCL_PA_SHARED",
+                "default_model": profile.model,
+                "transport": profile.transport,
+            }
         }
-    }
+        _set_nested(config, ["model", "base_url"], "https://generativelanguage.googleapis.com/v1beta")
+        _set_nested(config, ["model", "api_key_source"], {"type": "env", "secrets_env_key": "GEMINI_API_KEY_PCL_PA_SHARED"})
+    else:
+        config["providers"] = {
+            provider_name: {
+                "name": "OpenAI Direct Primary",
+                "api": "https://api.openai.com/v1",
+                "key_env": "OPENAI_API_KEY",
+                "default_model": profile.model,
+                "transport": profile.transport,
+            }
+        }
     _set_nested(config, ["model", "provider"], provider_name)
     _set_nested(config, ["model", "default"], profile.model)
     _set_nested(config, ["agent", "profile"], "pa")
@@ -2077,8 +2104,13 @@ async def _run(args: argparse.Namespace) -> int:
         business_base_url=business_base_url,
     )
 
-    if not os.environ.get("OPENAI_API_KEY"):
+    if profile.main_provider == "gemini":
+        if not os.environ.get("GEMINI_API_KEY_PCL_PA_SHARED"):
+            raise RuntimeError("GEMINI_API_KEY_PCL_PA_SHARED is not available in environment or secrets file")
+    elif not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not available in environment or secrets file")
+    if profile.vision_provider == "gemini" and not os.environ.get("GEMINI_API_KEY_PCL_PA_SHARED"):
+        raise RuntimeError("GEMINI_API_KEY_PCL_PA_SHARED is not available in environment or secrets file")
     if not os.environ.get("CHRISTOPHER_TGG_PS_SERVICE_TOKEN"):
         raise RuntimeError("CHRISTOPHER_TGG_PS_SERVICE_TOKEN/BOBBY_TGG_PS_SERVICE_TOKEN is not available")
 
