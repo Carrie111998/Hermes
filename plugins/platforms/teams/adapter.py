@@ -126,6 +126,63 @@ def _parse_bool(value: Any, *, default: bool = False) -> bool:
     return default
 
 
+def _read_payload_field(payload: Any, *names: str) -> Any:
+    """Read the first present field from a dict-or-object Bot Framework payload.
+
+    Inbound payloads reach the adapter in two shapes: SDK-deserialized objects
+    with snake_case attributes, and raw Bot Framework JSON with camelCase dict
+    keys. ``channelData`` is not guaranteed to be modelled by the SDK, so accept
+    both — the same reason the attachment path reads ``downloadUrl`` and
+    ``download_url``.
+    """
+    for name in names:
+        value = payload.get(name) if isinstance(payload, dict) else getattr(payload, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def extract_teams_graph_ids(
+    activity: Any,
+    *,
+    conversation_type: str,
+    conversation_id: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Parse Graph team/channel ids from Teams ``channelData`` on an inbound activity.
+
+    ``channelData`` carries ``team.aadGroupId`` (Graph team / AAD group id) and
+    ``channel.id`` (Graph channel id). There is no ``get_team_details`` helper on
+    the SDK App class — channelData is the zero-permission source of truth for
+    the current scope. Both the SDK's snake_case object shape and raw camelCase
+    JSON are accepted; see :func:`_read_payload_field`.
+
+    Returns ``(teams_graph_team_id, teams_graph_channel_id)``. Either value may
+    be ``None`` when channelData is absent (Web Chat / Emulator) or the message
+    is not in a team channel.
+    """
+    teams_graph_team_id: Optional[str] = None
+    teams_graph_channel_id: Optional[str] = None
+    try:
+        channel_data = _read_payload_field(activity, "channel_data", "channelData")
+        if channel_data is not None:
+            team = _read_payload_field(channel_data, "team")
+            raw_team = _read_payload_field(team, "aad_group_id", "aadGroupId")
+            if raw_team:
+                teams_graph_team_id = str(raw_team).strip() or None
+            channel_info = _read_payload_field(channel_data, "channel")
+            raw_channel = _read_payload_field(channel_info, "id")
+            if raw_channel:
+                teams_graph_channel_id = str(raw_channel).strip() or None
+        if conversation_type == "channel" and not teams_graph_channel_id and conversation_id:
+            teams_graph_channel_id = str(conversation_id).strip() or None
+    except Exception:
+        logger.debug(
+            "[teams] Failed to extract Graph ids from channelData; continuing without them",
+            exc_info=True,
+        )
+    return teams_graph_team_id, teams_graph_channel_id
+
+
 def _coerce_port(value: Any, *, default: int = _DEFAULT_PORT) -> int:
     try:
         return int(value)
@@ -885,6 +942,12 @@ class TeamsAdapter(BasePlatformAdapter):
         user_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
         user_name = getattr(from_account, "name", None) or ""
 
+        teams_graph_team_id, teams_graph_channel_id = extract_teams_graph_ids(
+            activity,
+            conversation_type=conv_type,
+            conversation_id=str(getattr(conv, "id", None) or ""),
+        )
+
         source = self.build_source(
             chat_id=conv.id,
             chat_name=getattr(conv, "name", None) or "",
@@ -892,6 +955,9 @@ class TeamsAdapter(BasePlatformAdapter):
             user_id=str(user_id),
             user_name=user_name,
             guild_id=getattr(conv, "tenant_id", None) or self._tenant_id,
+            teams_graph_team_id=teams_graph_team_id,
+            teams_graph_channel_id=teams_graph_channel_id,
+            message_id=str(msg_id) if msg_id else None,
         )
 
         # Handle attachments (images, documents, video, audio)

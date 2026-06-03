@@ -6571,6 +6571,8 @@ class BasePlatformAdapter(ABC):
         role_authorized: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
+        teams_graph_team_id: Optional[str] = None,
+        teams_graph_channel_id: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform.
 
@@ -6634,6 +6636,8 @@ class BasePlatformAdapter(ABC):
             role_authorized=role_authorized,
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
+            teams_graph_team_id=str(teams_graph_team_id) if teams_graph_team_id else None,
+            teams_graph_channel_id=str(teams_graph_channel_id) if teams_graph_channel_id else None,
         )
         # In-process transport provenance is deliberately not serialized by
         # SessionSource.to_dict(). The live receiving adapter is authoritative

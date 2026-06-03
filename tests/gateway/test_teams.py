@@ -408,6 +408,7 @@ class TestTeamsMessageHandling:
         tenant_id="tenant-789",
         activity_id="activity-001",
         attachments=None,
+        channel_data=None,
     ):
         activity = MagicMock()
         activity.text = text
@@ -422,6 +423,12 @@ class TestTeamsMessageHandling:
         activity.conversation.name = "Test Chat"
         activity.conversation.tenant_id = tenant_id
         activity.attachments = attachments or []
+        # Pin BOTH spellings: extraction accepts the SDK's snake_case attribute
+        # and raw camelCase JSON, and a bare MagicMock would auto-materialize
+        # whichever one we left unset. Web Chat / Emulator activities genuinely
+        # carry no channelData at all.
+        activity.channel_data = channel_data
+        activity.channelData = channel_data
         return activity
 
     def _make_ctx(self, activity):
@@ -459,6 +466,48 @@ class TestTeamsMessageHandling:
 
         event = adapter.handle_message.call_args[0][0]
         assert event.source.chat_type == "group"
+
+    @pytest.mark.anyio
+    async def test_channel_message_propagates_graph_ids_to_source(self):
+        """channelData must reach the emitted SessionSource end to end."""
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(
+            conversation_type="channel",
+            conversation_id="19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2",
+            channel_data=SimpleNamespace(
+                team=SimpleNamespace(aad_group_id="929251d7-2427-4a4a-a633-435589d4508c"),
+                channel=SimpleNamespace(id="19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2"),
+            ),
+        )
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.teams_graph_team_id == "929251d7-2427-4a4a-a633-435589d4508c"
+        assert event.source.teams_graph_channel_id == (
+            "19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2"
+        )
+
+    @pytest.mark.anyio
+    async def test_dm_without_channel_data_leaves_graph_ids_unset(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter.handle_message = AsyncMock()
+
+        activity = self._make_activity(conversation_type="personal")
+        await adapter._on_message(self._make_ctx(activity))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.source.teams_graph_team_id is None
+        assert event.source.teams_graph_channel_id is None
 
 
 class TestTeamsAttachmentClassification:
@@ -714,3 +763,74 @@ class TestTeamsMediaAttachments:
         adapter._app.send.assert_awaited_once()
 
 
+class TestExtractTeamsGraphIds:
+    def test_channel_activity_extracts_aad_group_and_channel(self):
+        activity = SimpleNamespace(
+            channel_data=SimpleNamespace(
+                team=SimpleNamespace(
+                    aad_group_id="929251d7-2427-4a4a-a633-435589d4508c",
+                ),
+                channel=SimpleNamespace(
+                    id="19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2",
+                ),
+            ),
+        )
+        team_id, channel_id = _teams_mod.extract_teams_graph_ids(
+            activity,
+            conversation_type="channel",
+            conversation_id="19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2",
+        )
+        assert team_id == "929251d7-2427-4a4a-a633-435589d4508c"
+        assert channel_id == "19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2"
+
+    def test_channel_falls_back_to_conversation_id_without_channel_info(self):
+        activity = SimpleNamespace(channel_data=SimpleNamespace(team=None, channel=None))
+        team_id, channel_id = _teams_mod.extract_teams_graph_ids(
+            activity,
+            conversation_type="channel",
+            conversation_id="19:abc@thread.tacv2",
+        )
+        assert team_id is None
+        assert channel_id == "19:abc@thread.tacv2"
+
+    def test_raw_camelcase_dict_channel_data_extracts_ids(self):
+        """Raw Bot Framework JSON: dict payload with camelCase keys."""
+        activity = SimpleNamespace(
+            channel_data={
+                "team": {"aadGroupId": "929251d7-2427-4a4a-a633-435589d4508c"},
+                "channel": {"id": "19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2"},
+            },
+        )
+        team_id, channel_id = _teams_mod.extract_teams_graph_ids(
+            activity,
+            conversation_type="channel",
+            conversation_id="19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2",
+        )
+        assert team_id == "929251d7-2427-4a4a-a633-435589d4508c"
+        assert channel_id == "19:44dcb7bdc60149c3b0a5a169cbeb98dc@thread.tacv2"
+
+    def test_fully_dict_activity_with_camelcase_channel_data(self):
+        """Activity itself as a dict — ``channelData`` never object-wrapped."""
+        activity = {
+            "channelData": {
+                "team": {"aadGroupId": "team-guid"},
+                "channel": {"id": "19:chan@thread.tacv2"},
+            },
+        }
+        team_id, channel_id = _teams_mod.extract_teams_graph_ids(
+            activity,
+            conversation_type="channel",
+            conversation_id="19:chan@thread.tacv2",
+        )
+        assert team_id == "team-guid"
+        assert channel_id == "19:chan@thread.tacv2"
+
+    def test_missing_channel_data_degrades_gracefully(self):
+        activity = SimpleNamespace()
+        team_id, channel_id = _teams_mod.extract_teams_graph_ids(
+            activity,
+            conversation_type="personal",
+            conversation_id="dm-id",
+        )
+        assert team_id is None
+        assert channel_id is None
