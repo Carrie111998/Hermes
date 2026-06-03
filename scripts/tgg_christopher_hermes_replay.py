@@ -349,6 +349,43 @@ def _split_address(value: str) -> tuple[str | None, str | None, str | None]:
     return block, street or None, unit
 
 
+def _norm_addr_token(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _assert_observation_address_matches(job_no: str, case: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Reject an observation whose stated address materially disagrees with the resolved
+    case's address. In dense WhatsApp turn bundles the model occasionally pairs the right
+    completion text with the wrong job number (e.g. a 986C #04-90 basin completion tagged
+    onto a Blk 25 Hougang case). The tool knows the case address at attach time; refuse the
+    mismatch so the agent re-resolves the job number instead of silently writing to the wrong
+    case. Acts only on positive evidence: both sides present and normalized-different."""
+    fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
+    stated_address = _first_nonempty(fields.get("address"), payload.get("address"))
+    split_block, _split_street, split_unit = _split_address(stated_address or "")
+    stated_block = _first_nonempty(fields.get("block"), payload.get("block"), split_block)
+    stated_unit = _first_nonempty(fields.get("unit"), payload.get("unit"), split_unit)
+    case_block = case.get("block")
+    case_unit = case.get("unit")
+    if stated_block and case_block and _norm_addr_token(stated_block) != _norm_addr_token(case_block):
+        raise ValueError(
+            f"address mismatch for {job_no}: this case is block {case_block} "
+            f"(unit {case_unit or 'n/a'}), but the observation states block {stated_block} "
+            f"(unit {stated_unit or 'n/a'}). Re-resolve the job number for the stated address "
+            f"before recording -- do not attach a completion to the wrong case."
+        )
+    same_or_unknown_block = (
+        (not stated_block) or (not case_block) or (_norm_addr_token(stated_block) == _norm_addr_token(case_block))
+    )
+    if stated_unit and case_unit and same_or_unknown_block and _norm_addr_token(stated_unit) != _norm_addr_token(case_unit):
+        raise ValueError(
+            f"address mismatch for {job_no}: this case is unit {case_unit} "
+            f"(block {case_block or 'n/a'}), but the observation states unit {stated_unit} "
+            f"(block {stated_block or 'n/a'}). Re-resolve the job number for the stated unit "
+            f"before recording -- do not attach a completion to the wrong case."
+        )
+
+
 def _case_row_to_api(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -673,6 +710,7 @@ class _ReplayOperatorBackend:
         case = self._lookup_case(job_no)
         if not case:
             raise ValueError(f"case not found: {job_no}")
+        _assert_observation_address_matches(job_no, case, payload)
         now_ts = int(time.time())
         fields = payload.get("fields") if isinstance(payload.get("fields"), dict) else {}
         source_refs = fields.get("source_refs") or fields.get("sourceRefs") or payload.get("sourceRefs")
