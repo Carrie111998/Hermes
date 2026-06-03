@@ -383,7 +383,7 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
+def _emit(event: str, sid: str, payload: dict[str, Any] | None = None):
     params: dict[str, Any] = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
@@ -726,7 +726,7 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+def _block(event: str, sid: str, payload: dict[str, Any], timeout: int = 300) -> str:
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     _pending[rid] = (sid, ev)
@@ -2884,7 +2884,7 @@ def _(rid, params: dict) -> dict:
     d = _spawn_tree_session_dir(session_id or "default")
     path = d / fname
     try:
-        payload = {
+        payload: dict[str, Any] = {
             "session_id": session_id,
             "started_at": float(started_at) if started_at else None,
             "finished_at": float(finished_at),
@@ -3267,7 +3267,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     run_message = _enrich_with_attached_images(prompt, images)
 
             def _stream(delta):
-                payload = {"text": delta}
+                payload: dict[str, Any] = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
                 _emit("message.delta", sid, payload)
@@ -3342,7 +3342,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 raw = str(result)
                 status = "complete"
 
-            payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            payload: dict[str, Any] = {"text": raw, "usage": _get_usage(agent), "status": status}
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -5611,7 +5611,7 @@ def _(rid, params: dict) -> dict:
     try:
         output = worker.run(cmd)
         warning = _mirror_slash_side_effects(params.get("session_id", ""), session, cmd)
-        payload = {"output": output or "(no output)"}
+        payload: dict[str, Any] = {"output": output or "(no output)"}
         if warning:
             payload["warning"] = warning
         return _ok(rid, payload)
@@ -5707,7 +5707,7 @@ def _(rid, params: dict) -> dict:
         # TUI can both bind it (frontend ``isVoiceToggleKey``) and display
         # it in /voice status — previously the TUI hardcoded Ctrl+B and
         # ignored the config (#18994).
-        payload: dict = {
+        payload: dict[str, Any] = {
             "enabled": _voice_mode_enabled(),
             "record_key": _voice_record_key(),
             "tts": _voice_tts_enabled(),
@@ -5992,7 +5992,7 @@ def _(rid, params: dict) -> dict:
             lambda mgr, cwd: mgr.diff(cwd, _resolve_checkpoint_hash(mgr, cwd, target)),
         )
         raw = r.get("diff", "")[:4000]
-        payload = {"stat": r.get("stat", ""), "diff": raw}
+        payload: dict[str, Any] = {"stat": r.get("stat", ""), "diff": raw}
         rendered = render_diff(raw, session.get("cols", 80))
         if rendered:
             payload["rendered"] = rendered

@@ -25,11 +25,13 @@ def get_env_value(name: str, default=None):
 
 def hermes_xai_user_agent() -> str:
     """Return a stable Hermes-specific User-Agent for xAI HTTP calls."""
+    version_str: str
     try:
         from hermes_cli import __version__
+        version_str = __version__
     except Exception:
-        __version__ = "unknown"
-    return f"Hermes-Agent/{__version__}"
+        version_str = "unknown"
+    return f"Hermes-Agent/{version_str}"
 
 
 def resolve_xai_http_credentials() -> Dict[str, str]:

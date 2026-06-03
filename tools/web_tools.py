@@ -491,7 +491,7 @@ Create a markdown summary that captures all key information in a well-organized,
             if aux_client is None or not effective_model:
                 logger.warning("No auxiliary model available for web content processing")
                 return None
-            call_kwargs = {
+            call_kwargs: Dict[str, Any] = {
                 "task": "web_extract",
                 "model": effective_model,
                 "messages": [
@@ -642,7 +642,7 @@ Create a single, unified markdown summary."""
                 fallback = fallback[:max_output_size] + "\n\n[... truncated ...]"
             return fallback
 
-        call_kwargs = {
+        call_kwargs: Dict[str, Any] = {
             "task": "web_extract",
             "model": effective_model,
             "messages": [
@@ -773,7 +773,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         limit = 5
     limit = min(max(limit, 1), 100)
 
-    debug_call_data = {
+    debug_call_data: Dict[str, Any] = {
         "parameters": {
             "query": query,
             "limit": limit
@@ -806,6 +806,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             # uninstalled plugin, or capability mismatch).
             provider = get_active_search_provider()
 
+        response_data: Dict[str, Any]
         if provider is None:
             response_data = {
                 "success": False,
@@ -841,7 +842,7 @@ def web_search_tool(query: str, limit: int = 5) -> str:
 
 async def web_extract_tool(
     urls: List[str],
-    format: str = None,
+    format: Optional[str] = None,
     use_llm_processing: bool = True,
     model: Optional[str] = None,
     min_length: int = DEFAULT_MIN_LENGTH_FOR_SUMMARIZATION
@@ -880,7 +881,7 @@ async def web_extract_tool(
                          "Secrets must not be sent in URLs.",
             })
 
-    debug_call_data = {
+    debug_call_data: Dict[str, Any] = {
         "parameters": {
             "urls": urls,
             "format": format,
@@ -1122,7 +1123,7 @@ async def web_extract_tool(
 
 async def web_crawl_tool(
     url: str, 
-    instructions: str = None, 
+    instructions: Optional[str] = None,
     depth: str = "basic", 
     use_llm_processing: bool = True,
     model: Optional[str] = None,
@@ -1150,7 +1151,7 @@ async def web_crawl_tool(
     Raises:
         Exception: If crawling fails or API key is not set
     """
-    debug_call_data = {
+    debug_call_data: Dict[str, Any] = {
         "parameters": {
             "url": url,
             "instructions": instructions,
@@ -1404,7 +1405,9 @@ if __name__ == "__main__":
         elif backend == "ddgs":
             print("   Using DuckDuckGo via ddgs package (search only)")
         elif firecrawl_url_available:
-            print(f"   Using self-hosted Firecrawl: {os.getenv('FIRECRAWL_API_URL').strip().rstrip('/')}")
+            firecrawl_url = os.getenv('FIRECRAWL_API_URL')
+            if firecrawl_url:
+                print(f"   Using self-hosted Firecrawl: {firecrawl_url.strip().rstrip('/')}")
         elif firecrawl_key_available:
             print("   Using direct Firecrawl cloud API")
         elif tool_gateway_available:
