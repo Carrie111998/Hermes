@@ -6872,244 +6872,64 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"failed": False, "state": state})
 @method("session.prompt_breakdown")
 def _(rid, params: dict) -> dict:
-    """Return a detailed breakdown of the session's system prompt components.
-
-    Sections: Persona, Memory, User Profile, Ephemeral Prompt, Active Skills.
-    Each section includes token count, char count, content preview, and
-    full content (capped at 10KB). Also returns tool definition and
-    conversation history token estimates.
-    """
+    """Return the session's system prompt decomposed into sections with token counts."""
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-
     agent = session.get("agent")
-    hermes_home = Path(get_hermes_home())
+    home = Path(get_hermes_home())
 
-    # ── Token counter helper ───────────────────────────────────────────
-    _tiktoken_enc = None
-
-    def _count_tokens(text: str) -> int:
-        nonlocal _tiktoken_enc
-        if not text:
-            return 0
-        if _tiktoken_enc is None:
-            try:
-                import tiktoken
-                _tiktoken_enc = tiktoken.get_encoding("cl100k_base")
-            except Exception:
-                _tiktoken_enc = False  # sentinel for unavailable
-        if _tiktoken_enc is False:
-            # Fallback: ~3.5 chars per token
-            return max(1, int(len(text) / 3.5))
-        try:
-            return len(_tiktoken_enc.encode(text))
-        except Exception:
-            return max(1, int(len(text) / 3.5))
-
-    def _strip_secrets(text: str) -> str:
-        """Strip API keys, tokens, and passwords from content."""
-        import re
-        # Strip common secret patterns
-        text = re.sub(r'(api[_-]?key|apikey|token|secret|password|passwd|auth)\s*[:=]\s*[\S]+',
-                       r'\1=***REDACTED***', text, flags=re.IGNORECASE)
-        text = re.sub(r'(?:sk-|pk-|rk-|ghp_|gho_|ghu_|ghs_|github_pat_)[A-Za-z0-9_-]{20,}',
-                       '***REDACTED***', text)
-        text = re.sub(r'x-api-key\s*[:=]\s*[\S]+',
-                       'x-api-key=***REDACTED***', text, flags=re.IGNORECASE)
-        text = re.sub(r'Bearer\s+[A-Za-z0-9_\-\.]+',
-                       'Bearer ***REDACTED***', text)
-        # Strip env-var style assignments
-        text = re.sub(r'(?:export\s+)?([A-Z_]+(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|AUTH)[A-Z_]*)\s*=\s*.+',
-                       r'\1=***REDACTED***', text, flags=re.IGNORECASE)
-        return text
-
-    # ── Build sections ─────────────────────────────────────────────────
-    sections = []
-
-    # 1. Persona — read from SOUL.md (primary) or persona.md
-    persona_content = ""
-    persona_source = ""
-    soul_path = hermes_home / "SOUL.md"
-    persona_path = hermes_home / "persona.md"
-    if soul_path.exists():
-        try:
-            persona_content = soul_path.read_text(encoding="utf-8").strip()
-            persona_source = str(soul_path)
-        except Exception:
-            pass
-    if not persona_content and persona_path.exists():
-        try:
-            persona_content = persona_path.read_text(encoding="utf-8").strip()
-            persona_source = str(persona_path)
-        except Exception:
-            pass
-    if not persona_content and agent is not None:
-        # Fallback to DEFAULT_AGENT_IDENTITY from prompt_builder
-        try:
-            from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
-            persona_content = DEFAULT_AGENT_IDENTITY
-            persona_source = "(built-in default)"
-        except Exception:
-            pass
-
-    persona_content_clean = _strip_secrets(persona_content)
-    sections.append({
-        "name": "Persona",
-        "source": persona_source,
-        "content_preview": persona_content_clean[:200] + ("..." if len(persona_content_clean) > 200 else ""),
-        "full_content": persona_content_clean[:10240],
-        "token_count": _count_tokens(persona_content),
-        "char_count": len(persona_content),
-        "color": "#7c7cff",
-    })
-
-    # 2. Memory — read from MEMORY.md
-    memory_content = ""
-    memory_path = hermes_home / "memories" / "MEMORY.md"
-    if memory_path.exists():
-        try:
-            memory_content = memory_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-    memory_content_clean = _strip_secrets(memory_content)
-    sections.append({
-        "name": "Memory",
-        "source": str(memory_path) if memory_path.exists() else "",
-        "content_preview": memory_content_clean[:200] + ("..." if len(memory_content_clean) > 200 else ""),
-        "full_content": memory_content_clean[:10240],
-        "token_count": _count_tokens(memory_content),
-        "char_count": len(memory_content),
-        "color": "#ff7c7c",
-    })
-
-    # 3. User Profile — read from USER.md
-    user_content = ""
-    user_path = hermes_home / "memories" / "USER.md"
-    if user_path.exists():
-        try:
-            user_content = user_path.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-    user_content_clean = _strip_secrets(user_content)
-    sections.append({
-        "name": "User Profile",
-        "source": str(user_path) if user_path.exists() else "",
-        "content_preview": user_content_clean[:200] + ("..." if len(user_content_clean) > 200 else ""),
-        "full_content": user_content_clean[:10240],
-        "token_count": _count_tokens(user_content),
-        "char_count": len(user_content),
-        "color": "#ffb87c",
-    })
-
-    # 4. Ephemeral Prompt — from agent.ephemeral_system_prompt
-    ephemeral_content = getattr(agent, "ephemeral_system_prompt", None) or ""
-    ephemeral_content = str(ephemeral_content).strip()
-    ephemeral_content_clean = _strip_secrets(ephemeral_content)
-    sections.append({
-        "name": "Ephemeral Prompt",
-        "source": "(set via session personality/prompt)",
-        "content_preview": ephemeral_content_clean[:200] + ("..." if len(ephemeral_content_clean) > 200 else ""),
-        "full_content": ephemeral_content_clean[:10240],
-        "token_count": _count_tokens(ephemeral_content),
-        "char_count": len(ephemeral_content),
-        "color": "#7cff7c",
-    })
-
-    # 5. Active Skills — build skills system prompt
-    skills_content = ""
-    if agent is not None:
-        try:
-            from agent.prompt_builder import build_skills_system_prompt
-            from run_agent import get_toolset_for_tool
-            has_skills_tools = any(
-                name in getattr(agent, "valid_tool_names", set())
-                for name in ["skills_list", "skill_view", "skill_manage"]
-            )
-            if has_skills_tools:
-                avail_toolsets = {
-                    toolset
-                    for toolset in (
-                        get_toolset_for_tool(tool_name)
-                        for tool_name in getattr(agent, "valid_tool_names", set())
-                    )
-                    if toolset
-                }
-                skills_content = build_skills_system_prompt(
-                    available_tools=getattr(agent, "valid_tool_names", set()),
-                    available_toolsets=avail_toolsets,
-                )
-        except Exception:
-            pass
-
-    skills_content = (skills_content or "").strip()
-    skills_content_clean = _strip_secrets(skills_content)
-    sections.append({
-        "name": "Active Skills",
-        "source": "~/.hermes/skills/",
-        "content_preview": skills_content_clean[:200] + ("..." if len(skills_content_clean) > 200 else ""),
-        "full_content": skills_content_clean[:10240],
-        "token_count": _count_tokens(skills_content),
-        "char_count": len(skills_content),
-        "color": "#ffd700",
-    })
-
-    # ── Tool definitions ───────────────────────────────────────────────
-    tools_json = ""
-    tool_count = 0
-    if agent is not None:
-        tools = getattr(agent, "tools", None) or []
-        tool_count = len(tools)
-        try:
-            tools_json = json.dumps(tools, ensure_ascii=False)
-        except Exception:
-            tools_json = "[]"
-
-    tool_def_tokens = _count_tokens(tools_json)
-
-    # ── Conversation history ───────────────────────────────────────────
-    history = list(session.get("history", []))
-    message_count = len(history)
-    history_json = ""
     try:
-        history_json = json.dumps(history, ensure_ascii=False)
+        import tiktoken
+        _enc = tiktoken.get_encoding("cl100k_base")
+        _count = lambda t: len(_enc.encode(t)) if t else 0
     except Exception:
-        pass
-    conv_tokens = _count_tokens(history_json)
+        _count = lambda t: max(1, int(len(t) / 3.5)) if t else 0
 
-    # ── Totals ─────────────────────────────────────────────────────────
-    total_system_tokens = sum(s["token_count"] for s in sections)
-    total_system_chars = sum(s["char_count"] for s in sections)
+    def _section(name, source, content, color):
+        text = (content or "").strip()
+        return dict(name=name, source=source,
+                    content_preview=text[:200], full_content=text[:10240],
+                    token_count=_count(text), char_count=len(text), color=color)
 
-    # ── Context limit ──────────────────────────────────────────────────
-    context_limit = 131072  # default for deepseek-v4-pro
-    if agent is not None:
-        try:
-            from agent.model_metadata import fetch_model_metadata
-            model = getattr(agent, "model", "") or _resolve_model()
-            meta = fetch_model_metadata(model) if model else {}
-            if meta and meta.get("context_length"):
-                context_limit = int(meta["context_length"])
-        except Exception:
-            pass
+    persona = ""
+    for p in [home / "SOUL.md", home / "persona.md"]:
+        if p.exists():
+            persona = p.read_text().strip()
+            break
+    memory = (home / "memories" / "MEMORY.md").read_text().strip() if (home / "memories" / "MEMORY.md").exists() else ""
+    user = (home / "memories" / "USER.md").read_text().strip() if (home / "memories" / "USER.md").exists() else ""
+    ephemeral = str(getattr(agent, "ephemeral_system_prompt", "") or "").strip()
 
-    return _ok(rid, {
-        "session_id": params.get("session_id", ""),
-        "model": getattr(agent, "model", "") or _resolve_model() if agent is not None else "",
-        "context_limit": context_limit,
-        "total_system_tokens": total_system_tokens,
-        "total_system_chars": total_system_chars,
-        "sections": sections,
-        "tool_definitions": {
-            "token_count": tool_def_tokens,
-            "count": tool_count,
-        },
-        "conversation_history": {
-            "token_count": conv_tokens,
-            "message_count": message_count,
-        },
-    })
+    skills = ""
+    if agent is not None and hasattr(agent, "tools"):
+        from run_agent import get_toolset_for_tool
+        toolsets = {ts for t in getattr(agent, "valid_tool_names", set()) if (ts := get_toolset_for_tool(t))}
+        if toolsets:
+            from agent.prompt_builder import build_skills_system_prompt
+            skills = build_skills_system_prompt(getattr(agent, "valid_tool_names", set()), toolsets)
 
+    tools_json = json.dumps(getattr(agent, "tools", []) or [], ensure_ascii=False)
+    history = list(session.get("history", []))
+    hist_json = json.dumps(history, ensure_ascii=False)
+
+    sections = [
+        _section("Persona", str(home / "SOUL.md"), persona, "#7c7cff"),
+        _section("Memory", str(home / "memories" / "MEMORY.md"), memory, "#ff7c7c"),
+        _section("User Profile", str(home / "memories" / "USER.md"), user, "#ffb87c"),
+        _section("Ephemeral Prompt", "(session personality/prompt)", ephemeral, "#7cff7c"),
+        _section("Active Skills", "~/.hermes/skills/", skills, "#ffd700"),
+    ]
+
+    return _ok(rid, dict(
+        session_id=params.get("session_id", ""),
+        model=getattr(agent, "model", "") if agent else "",
+        context_limit=131072,
+        total_system_tokens=sum(s["token_count"] for s in sections),
+        sections=sections,
+        tool_definitions=dict(token_count=_count(tools_json), count=len(getattr(agent, "tools", []) or [])),
+        conversation_history=dict(token_count=_count(hist_json), message_count=len(history)),
+    ))
 
 @method("session.usage")
 def _(rid, params: dict) -> dict:
@@ -8476,238 +8296,76 @@ def _(rid, params: dict) -> dict:
 
 @method("session.timeline")
 def _(rid, params: dict) -> dict:
-    """Return a temporally-structured session breakdown for the Swift TUI.
-
-    Walks the session's message store (live in-memory session first, then DB)
-    and groups entries into typed timeline events with timestamps, durations,
-    and token counts.  The response shape matches the ``SessionTimeline``
-    model on the Swift side.
-    """
-    # Resolve the session key used by the persistent DB.  Prefer the live
-    # in-memory session (it points us at the correct session_key), then fall
-    # back to treating the parameter directly as the DB session id.
+    """Return temporally-structured session events for playback visualization."""
     session, _ = _sess_nowait(params, rid)
-    session_key = None
-    if session is not None:
-        session_key = session.get("session_key") or params.get("session_id") or ""
-    else:
-        session_key = params.get("session_id") or ""
+    session_key = (session or {}).get("session_key") or params.get("session_id", "")
+    messages = list((session or {}).get("history", []))
 
     db = _get_db()
-    db_session = None
-    db_messages = []
-
-    if db is not None and session_key:
+    if db and session_key:
         try:
-            db_session = db.get_session(session_key)
-            if db_session is not None:
-                # Walk the session lineage (parent → child chains from
-                # compression) so the timeline covers the full conversation.
-                lineage = db._session_lineage_root_to_tip(session_key)
-                db_messages = []
-                seen_ids: set[int] = set()
-                for sid in lineage:
-                    for msg in db.get_messages(sid):
-                        mid = msg.get("id")
-                        if mid is not None and mid in seen_ids:
-                            continue
-                        seen_ids.add(mid)
-                        db_messages.append(msg)
-                # Re-sort by id to preserve insertion order across lineage.
-                db_messages.sort(key=lambda m: m.get("id", 0))
+            messages = db.get_messages_as_conversation(session_key, include_ancestors=True)
         except Exception:
             pass
 
-    # Fall back to the in-memory history when the DB is unavailable or the
-    # session is so fresh that messages haven't been persisted yet.  In-memory
-    # messages typically lack timestamps and token counts; the timeline will
-    # synthesize reasonable defaults where needed.
-    if db_messages:
-        messages = db_messages
-    elif session is not None:
-        messages = list(session.get("history", []))
-    else:
-        messages = []
+    events = []
+    tool_starts = {}
+    tool_count = 0
+    in_tokens = out_tokens = 0
 
-    if not messages:
-        return _ok(
-            rid,
-            {
-                "session_id": session_key,
-                "events": [],
-                "total_duration_seconds": 0,
-                "tool_calls": 0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-            },
-        )
-
-    events: list[dict] = []
-    tool_starts: dict[str, dict] = {}  # tc_id → event dict
-    prev_role: str | None = None
-    total_input_tokens = 0
-    total_output_tokens = 0
-    tool_calls_count = 0
-
-    # ── Walk messages and build typed timeline events ──────────────────
     for m in messages:
-        if not isinstance(m, dict):
-            continue
-
         role = m.get("role")
-        ts = m.get("timestamp")
-        # Synthesize a timestamp when the DB row has none (in-memory fallback).
-        if ts is None:
-            ts = time.time()
-
-        # Accumulate token counts from per-message metadata.
+        ts = m.get("timestamp") or time.time()
         tc = m.get("token_count")
         if isinstance(tc, (int, float)):
-            if role == "user":
-                total_input_tokens += int(tc)
-            elif role == "assistant":
-                total_output_tokens += int(tc)
+            if role == "user": in_tokens += int(tc)
+            elif role == "assistant": out_tokens += int(tc)
 
-        # ── user_message ──────────────────────────────────────────────
         if role == "user":
-            if prev_role is not None and prev_role != "user":
-                events.append({"type": "turn_boundary", "timestamp": ts})
-            content = _coerce_message_text(m.get("content"))
-            events.append(
-                {
-                    "type": "user_message",
-                    "timestamp": ts,
-                    "content": content,
-                    "token_count": m.get("token_count"),
-                }
-            )
-            prev_role = "user"
-            continue
-
-        # ── assistant_message / reasoning_block / tool_start ──────────
-        if role == "assistant":
-            # Reasoning block — surfaced before tool calls / text on the
-            # same message so the UI can render it as a collapsible group.
-            reasoning = (
-                m.get("reasoning")
-                or m.get("reasoning_content")
-                or m.get("reasoning_details")
-                or m.get("codex_reasoning_items")
-            )
-            if reasoning is not None and reasoning != "":
-                reasoning_str = (
-                    str(reasoning)
-                    if not isinstance(reasoning, list)
-                    else "\n".join(str(r) for r in reasoning)
-                )
-                events.append(
-                    {
-                        "type": "reasoning_block",
-                        "timestamp": ts,
-                        "content": reasoning_str,
-                        "summary": reasoning_str[:200],
-                    }
-                )
-
-            # Tool-call starts — one event per pending invocation.
-            tool_calls = m.get("tool_calls")
-            if isinstance(tool_calls, list):
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    tc_id = tc.get("id", "")
-                    name = fn.get("name", "")
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    evt: dict = {
-                        "type": "tool_start",
-                        "timestamp": ts,
-                        "tool_name": name,
-                        "tool_id": tc_id,
-                        "summary": _tool_ctx(name, args),
-                    }
-                    events.append(evt)
-                    if tc_id:
-                        tool_starts[tc_id] = evt
-                    tool_calls_count += 1
-
-            # Assistant text content.
+            if events and events[-1].get("type") != "turn_boundary":
+                events.append(dict(type="turn_boundary", timestamp=ts))
+            events.append(dict(type="user_message", timestamp=ts,
+                               content=_coerce_message_text(m.get("content")),
+                               token_count=tc))
+        elif role == "assistant":
+            for tc_item in m.get("tool_calls") or []:
+                fn = tc_item.get("function", {})
+                tid = tc_item.get("id", "")
+                name = fn.get("name", "")
+                evt = dict(type="tool_start", timestamp=ts, tool_name=name,
+                           tool_id=tid, summary=_tool_ctx(name, {}))
+                events.append(evt)
+                tool_starts[tid] = evt
+                tool_count += 1
             content = _coerce_message_text(m.get("content"))
             if content.strip():
-                events.append(
-                    {
-                        "type": "assistant_message",
-                        "timestamp": ts,
-                        "content": content,
-                        "token_count": m.get("token_count"),
-                    }
-                )
+                events.append(dict(type="assistant_message", timestamp=ts,
+                                   content=content, token_count=tc))
+        elif role == "tool":
+            tid = m.get("tool_call_id", "")
+            start = tool_starts.get(tid, {})
+            dur = round((ts - start.get("timestamp", ts)) * 1000) if start.get("timestamp") and ts else None
+            events.append(dict(type="tool_end", timestamp=ts,
+                               tool_name=m.get("tool_name", ""), tool_id=tid,
+                               content=_coerce_message_text(m.get("content"))[:300],
+                               duration_ms=dur))
 
-            prev_role = "assistant"
-            continue
-
-        # ── tool_end ──────────────────────────────────────────────────
-        if role == "tool":
-            tc_id = m.get("tool_call_id", "")
-            tool_name = m.get("tool_name", "")
-            content = _coerce_message_text(m.get("content"))
-
-            # Compute wall-clock duration when we have a paired tool_start.
-            start_evt = tool_starts.get(tc_id)
-            duration_ms = None
-            if start_evt is not None and ts and start_evt.get("timestamp"):
-                try:
-                    duration_ms = (ts - start_evt["timestamp"]) * 1000
-                except (TypeError, ValueError):
-                    duration_ms = None
-
-            events.append(
-                {
-                    "type": "tool_end",
-                    "timestamp": ts,
-                    "tool_name": tool_name,
-                    "tool_id": tc_id,
-                    "content": content[:300] if content else "",
-                    "duration_ms": round(duration_ms) if duration_ms is not None else None,
-                    "token_count": m.get("token_count"),
-                }
-            )
-            prev_role = "tool"
-            continue
-
-        # Skip system messages and other roles.
-        prev_role = role
-
-    # ── Aggregate session-level stats ─────────────────────────────────
-    # Prefer the sessions-table counters when available (they reflect the
-    # full turn, including subagents and compression), then fall back to
-    # summing per-message token_count fields from the messages table.
-    if db_session:
-        tool_calls_count = db_session.get("tool_call_count", tool_calls_count)
-        total_input_tokens = db_session.get("input_tokens") or total_input_tokens
-        total_output_tokens = db_session.get("output_tokens") or total_output_tokens
-        cost = db_session.get("actual_cost_usd") or db_session.get("estimated_cost_usd")
-    else:
-        cost = None
-
-    # Compute total wall-clock duration from first to last event.
     tss = [e["timestamp"] for e in events if isinstance(e.get("timestamp"), (int, float))]
-    total_duration = (tss[-1] - tss[0]) if len(tss) >= 2 else 0.0
+    total_duration = round(tss[-1] - tss[0], 1) if len(tss) >= 2 else 0.0
 
-    return _ok(
-        rid,
-        {
-            "session_id": session_key,
-            "events": events,
-            "total_duration_seconds": round(total_duration, 1),
-            "tool_calls": tool_calls_count,
-            "input_tokens": total_input_tokens,
-            "output_tokens": total_output_tokens,
-            "cost_usd": cost,
-        },
-    )
+    cost = None
+    if db and session_key:
+        try:
+            s = db.get_session(session_key) or {}
+            cost = s.get("actual_cost_usd") or s.get("estimated_cost_usd")
+        except Exception:
+            pass
 
+    return _ok(rid, dict(
+        session_id=session_key, events=events,
+        total_duration_seconds=total_duration, tool_calls=tool_count,
+        input_tokens=in_tokens, output_tokens=out_tokens, cost_usd=cost,
+    ))
 
 @method("session.undo")
 def _(rid, params: dict) -> dict:
