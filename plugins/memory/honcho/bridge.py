@@ -114,9 +114,12 @@ class GBrainAdapter:
 
     def put_page(self, slug: str, markdown: str) -> bool:
         try:
+            # Pass content via --content (argv), NOT piped stdin: `gbrain put`
+            # reads stdin by opening '/dev/stdin', which does not exist on
+            # Windows and fails with ENOENT. --content is cross-platform.
             r = subprocess.run(
-                ["gbrain", "put", slug],
-                input=markdown, capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
+                ["gbrain", "put", slug, "--content", markdown],
+                capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
             )
             return r.returncode == 0
         except (OSError, subprocess.TimeoutExpired) as e:

@@ -1174,6 +1174,24 @@ class HonchoSessionManager:
                 logger.warning("Could not resolve conclusion peer '%s' for session '%s'", peer, session_key)
                 return False
 
+            # Materialize a non-default target peer in the session before writing.
+            # get_or_create registers only the user + assistant peers (via
+            # add_peers); a conclusion about any other peer — e.g. the capture
+            # path's dedicated ``hermes-events`` peer — fails server-side
+            # ("Peer ... not found in workspace") unless that peer already
+            # exists. add_peers is idempotent, so this is a safe no-op for peers
+            # that are already registered.
+            if target_peer_id not in (session.user_peer_id, session.assistant_peer_id):
+                try:
+                    self.honcho.session(session.honcho_session_id).add_peers(
+                        [self._get_or_create_peer(target_peer_id)]
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not register conclusion peer '%s' in session '%s': %s",
+                        target_peer_id, session_key, e,
+                    )
+
             if target_peer_id == session.assistant_peer_id:
                 assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
                 conclusions_scope = assistant_peer.conclusions_of(session.assistant_peer_id)
