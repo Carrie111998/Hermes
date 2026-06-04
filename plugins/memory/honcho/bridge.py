@@ -10,7 +10,6 @@ import datetime as _dt
 import hashlib
 import json
 import logging
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -61,6 +60,43 @@ def save_state(path: Path, hashes: Iterable[str]) -> None:
 
 
 _TIMELINE_MARKER = "<!-- timeline -->"
+_SYNTHESIS_START = "<!-- honcho-synthesis:start -->"
+_SYNTHESIS_END = "<!-- honcho-synthesis:end -->"
+
+
+def merge_dialectic_synthesis(page_md: str, lines: list[str]) -> str:
+    """Replace the single Honcho dialectic-synthesis block with the latest lines.
+
+    Dialectic answers are non-deterministic — their content hash differs every
+    run, so they can never be deduped and would grow the timeline unbounded if
+    appended. Instead they live in ONE block (delimited by _SYNTHESIS_START /
+    _SYNTHESIS_END) in the compiled-truth area above the timeline marker. Each
+    run fully REPLACES the block, so it stays bounded to `len(lines)` entries.
+
+    An empty `lines` removes the block. The transform is idempotent: re-running
+    with identical lines returns an identical page.
+    """
+    if lines:
+        block = "\n".join([_SYNTHESIS_START]
+                          + [f"- {ln.strip()}" for ln in lines if ln.strip()]
+                          + [_SYNTHESIS_END])
+    else:
+        block = ""
+
+    if _SYNTHESIS_START in page_md and _SYNTHESIS_END in page_md:
+        start = page_md.index(_SYNTHESIS_START)
+        end = page_md.index(_SYNTHESIS_END) + len(_SYNTHESIS_END)
+        if block:
+            return page_md[:start] + block + page_md[end:]
+        # Removal: drop the block and collapse the surrounding blank lines.
+        return (page_md[:start].rstrip() + "\n\n" + page_md[end:].lstrip()).rstrip() + "\n"
+
+    if not block:
+        return page_md
+    if _TIMELINE_MARKER in page_md:
+        above, _, below = page_md.partition(_TIMELINE_MARKER)
+        return above.rstrip() + "\n\n" + block + "\n\n" + _TIMELINE_MARKER + below
+    return page_md.rstrip() + "\n\n" + block + "\n"
 
 
 def merge_compiled_truth(page_md: str, facts: list[str]) -> str:
@@ -183,26 +219,6 @@ class HonchoAdapter:
         return self._m.create_conclusion(self._key, content, peer=peer)
 
 
-def _write_mempalace_drawer(room: str, content: str) -> bool:
-    """Best-effort MemPalace drawer write into the honcho-conclusions wing."""
-    try:
-        from mempalace.palace import get_collection
-        from mempalace.miner import add_drawer
-        palace_root = os.environ.get("MEMPALACE_HOME") or str(
-            Path.home() / ".mempalace" / "palace"
-        )
-        collection = get_collection(palace_root)
-        add_drawer(
-            collection, wing="honcho-conclusions", room=room, content=content,
-            source_file=f"honcho:{fact_hash(content)}", chunk_index=0,
-            agent="honcho-bridge",
-        )
-        return True
-    except Exception as e:
-        logger.warning("MemPalace drawer write failed: %s", e)
-        return False
-
-
 def _compiled_state_path(state_path: Path) -> Path:
     """Sibling state file tracking which facts reached the compiled-truth block.
 
@@ -227,20 +243,22 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
     compiled_state_path = _compiled_state_path(state_path)
     timeline_seen = load_state(state_path)
     compiled_seen = load_state(compiled_state_path)
-    res = {"exported": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0}
+    res = {"exported": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0,
+           "synthesized": 0}
     new_timeline_hashes: set[str] = set()
     new_compiled_hashes: set[str] = set()
     compiled_facts: list[str] = []
+    synthesis_lines: list[str] = []
 
-    def _consider(text: str, high_conf: bool):
+    def _consider(text: str):
+        # Peer-card facts are high-confidence compiled truth: deduped by hash,
+        # written to both the timeline and the compiled-truth block.
         if has_source(text, "gbrain"):
             res["loop_skipped"] += 1
             return
         h = fact_hash(text)
         need_timeline = h not in timeline_seen and h not in new_timeline_hashes
-        need_compiled = (
-            high_conf and h not in compiled_seen and h not in new_compiled_hashes
-        )
+        need_compiled = h not in compiled_seen and h not in new_compiled_hashes
         if not need_timeline and not need_compiled:
             res["deduped"] += 1
             return
@@ -250,8 +268,6 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
                 if not gbrain.add_timeline(slug, date, tagged):
                     res["write_failed"] += 1
                     return  # transient failure — don't record hash, retry next run
-                if not high_conf:
-                    _write_mempalace_drawer(room="conclusion", content=tagged)
             new_timeline_hashes.add(h)
         if need_compiled:
             compiled_facts.append(tagged)
@@ -260,22 +276,37 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
 
     for fact in honcho.read_user_facts():
         if fact and fact.strip():
-            _consider(fact, high_conf=True)
+            _consider(fact)
+    # Dialectic answers are non-deterministic — their hash differs every run, so
+    # they can never be deduped and would grow the timeline (and MemPalace)
+    # unbounded if appended. Instead they fully REPLACE a single synthesis block
+    # on the page each run, keeping the "what changed recently" signal current
+    # without churn.
     for q in dialectic_queries:
         answer = honcho.run_dialectic(q)
-        if answer and answer.strip():
-            _consider(answer, high_conf=False)
+        if not (answer and answer.strip()):
+            continue
+        if has_source(answer, "gbrain"):
+            res["loop_skipped"] += 1
+            continue
+        synthesis_lines.append(tag_fact(answer, "honcho"))
+        res["synthesized"] += 1
 
     # The compiled-truth fold-in either fully succeeds (persist its hashes) or
     # fails/can't-read-page (leave compiled hashes unpersisted so it retries).
+    # The synthesis block is merged into the same put_page (replace, no hashes).
     compiled_ok = True
-    if compiled_facts and not dry_run:
+    if (compiled_facts or synthesis_lines) and not dry_run:
         page = gbrain.get_page(slug)
         if page is None:
             compiled_ok = False  # couldn't read page — retry the merge next run
-        elif not gbrain.put_page(slug, merge_compiled_truth(page, compiled_facts)):
-            compiled_ok = False
-            logger.warning("Honcho bridge: compiled-truth put_page failed for %s", slug)
+        else:
+            new_page = merge_compiled_truth(page, compiled_facts) if compiled_facts else page
+            if synthesis_lines:  # empty answer this run leaves any prior block intact
+                new_page = merge_dialectic_synthesis(new_page, synthesis_lines)
+            if new_page != page and not gbrain.put_page(slug, new_page):
+                compiled_ok = False
+                logger.warning("Honcho bridge: compiled-truth put_page failed for %s", slug)
 
     if not dry_run:
         if new_timeline_hashes:
@@ -301,6 +332,8 @@ def parse_compiled_facts(page_md: str) -> list[str]:
             continue
         if in_frontmatter or not line or line.startswith("#"):
             continue
+        if line.startswith("<!--"):
+            continue  # skip block markers (e.g. the honcho-synthesis delimiters)
         text = line[2:].strip() if line.startswith("- ") else line
         if text and not has_source(text, "honcho"):
             facts.append(text)

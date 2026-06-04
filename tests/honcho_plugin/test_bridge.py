@@ -79,6 +79,74 @@ def test_merge_idempotent_across_reruns():
     assert once == twice  # re-adding the same bulleted fact is a no-op
 
 
+SYNTH_PAGE = """---
+type: concept
+title: Diego
+---
+
+# Diego
+
+Existing compiled fact one.
+
+<!-- timeline -->
+
+- 2026-06-01 old timeline entry
+"""
+
+
+def test_merge_synthesis_inserts_block_above_timeline():
+    out = bridge.merge_dialectic_synthesis(SYNTH_PAGE, ["[source:honcho] synthesis A"])
+    above, _, below = out.partition("<!-- timeline -->")
+    assert bridge._SYNTHESIS_START in above
+    assert bridge._SYNTHESIS_END in above
+    assert "- [source:honcho] synthesis A" in above
+    assert "synthesis A" not in below            # not leaked into the timeline section
+    assert "Existing compiled fact one." in above  # compiled truth preserved
+
+
+def test_merge_synthesis_replaces_old_block():
+    once = bridge.merge_dialectic_synthesis(SYNTH_PAGE, ["[source:honcho] old synth"])
+    twice = bridge.merge_dialectic_synthesis(once, ["[source:honcho] new synth"])
+    assert "new synth" in twice
+    assert "old synth" not in twice
+    assert twice.count(bridge._SYNTHESIS_START) == 1
+    assert twice.count(bridge._SYNTHESIS_END) == 1
+
+
+def test_merge_synthesis_idempotent_same_content():
+    once = bridge.merge_dialectic_synthesis(SYNTH_PAGE, ["[source:honcho] s"])
+    twice = bridge.merge_dialectic_synthesis(once, ["[source:honcho] s"])
+    assert once == twice
+
+
+def test_merge_synthesis_empty_removes_existing_block():
+    once = bridge.merge_dialectic_synthesis(SYNTH_PAGE, ["[source:honcho] s"])
+    cleared = bridge.merge_dialectic_synthesis(once, [])
+    assert bridge._SYNTHESIS_START not in cleared
+    assert bridge._SYNTHESIS_END not in cleared
+    assert "Existing compiled fact one." in cleared
+    assert "<!-- timeline -->" in cleared
+
+
+def test_merge_synthesis_empty_with_no_block_is_noop():
+    assert bridge.merge_dialectic_synthesis(SYNTH_PAGE, []) == SYNTH_PAGE
+
+
+def test_merge_synthesis_without_timeline_marker_appends():
+    out = bridge.merge_dialectic_synthesis("# Diego\n\nbody\n", ["[source:honcho] x"])
+    assert bridge._SYNTHESIS_START in out
+    assert "- [source:honcho] x" in out
+
+
+def test_parse_compiled_facts_excludes_synthesis_markers():
+    page = bridge.merge_dialectic_synthesis(SYNTH_PAGE, ["[source:honcho] s"])
+    facts = bridge.parse_compiled_facts(page)
+    assert all(bridge._SYNTHESIS_START not in f for f in facts)
+    assert all(bridge._SYNTHESIS_END not in f for f in facts)
+    assert all(not f.startswith("<!--") for f in facts)
+    assert "Existing compiled fact one." in facts
+
+
 def test_gbrain_get_returns_stdout():
     gb = bridge.GBrainAdapter()
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="PAGE", stderr="")
@@ -152,17 +220,14 @@ def test_honcho_adapter_run_dialectic():
     m.get_or_create.assert_called_once_with("hermes-autonomous")
 
 
-def test_export_skips_gbrain_sourced_and_writes_new(tmp_path, monkeypatch):
+def test_export_skips_gbrain_sourced_and_writes_new(tmp_path):
     ha = mock.Mock()
     ha.read_user_facts.return_value = ["new pref", "[source:gbrain] echo"]
-    ha.run_dialectic.return_value = ""  # no low-conf conclusions this run
+    ha.run_dialectic.return_value = ""  # no dialectic synthesis this run
     gb = mock.Mock()
     gb.get_page.return_value = PAGE
     gb.put_page.return_value = True
     gb.add_timeline.return_value = True
-    drawers = []
-    monkeypatch.setattr(bridge, "_write_mempalace_drawer",
-                        lambda room, content: drawers.append((room, content)) or True)
 
     res = bridge.run_export(
         ha, gb, slug="hindsight/diego", date="2026-06-04",
@@ -197,16 +262,17 @@ def test_export_dry_run_writes_nothing(tmp_path):
     assert bridge.load_state(tmp_path / "exp.json") == set()
 
 
-def test_export_low_conf_writes_mempalace_drawer_not_compiled(tmp_path, monkeypatch):
+def test_export_dialectic_replaces_synthesis_not_timeline(tmp_path):
+    # Dialectic answers are non-deterministic, so they are NEVER deduped by hash.
+    # To avoid unbounded daily growth they go into a single replaced synthesis
+    # block on the page — NOT an appended timeline entry (and no MemPalace write).
     ha = mock.Mock()
     ha.read_user_facts.return_value = []
     ha.run_dialectic.return_value = "synthesized insight"
     gb = mock.Mock()
     gb.get_page.return_value = PAGE
+    gb.put_page.return_value = True
     gb.add_timeline.return_value = True
-    drawers = []
-    monkeypatch.setattr(bridge, "_write_mempalace_drawer",
-                        lambda room, content: drawers.append((room, content)) or True)
 
     res = bridge.run_export(
         ha, gb, slug="hindsight/diego", date="2026-06-04",
@@ -214,11 +280,74 @@ def test_export_low_conf_writes_mempalace_drawer_not_compiled(tmp_path, monkeypa
         state_path=tmp_path / "exp.json", dry_run=False,
     )
 
-    assert res["exported"] == 1
-    assert len(drawers) == 1
-    assert drawers[0][0] == "conclusion"
-    assert bridge.has_source(drawers[0][1], "honcho")
-    gb.put_page.assert_not_called()  # low-conf must NOT hit compiled-truth
+    assert res["synthesized"] == 1
+    gb.add_timeline.assert_not_called()   # no appended timeline entry
+    gb.put_page.assert_called_once()      # synthesis written into the page
+    written = gb.put_page.call_args.args[1]
+    assert bridge._SYNTHESIS_START in written
+    assert "synthesized insight" in written
+    # dialectic must NOT pollute the hash-dedup state file
+    assert bridge.load_state(tmp_path / "exp.json") == set()
+
+
+def test_export_dialectic_dry_run_writes_nothing(tmp_path):
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = []
+    ha.run_dialectic.return_value = "synthesized insight"
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    res = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=["what changed?"],
+        state_path=tmp_path / "exp.json", dry_run=True,
+    )
+    assert res["synthesized"] == 1
+    gb.put_page.assert_not_called()
+    gb.add_timeline.assert_not_called()
+
+
+def test_export_dialectic_bounded_across_runs(tmp_path):
+    # Three back-to-back runs with different synthesis text must leave exactly
+    # one synthesis block holding only the latest answer (the activation bug:
+    # export state grew 22->23->24 from dialectic answers alone).
+    state = {"page": PAGE}
+    gb = mock.Mock()
+    gb.get_page.side_effect = lambda slug: state["page"]
+
+    def _put(slug, md):
+        state["page"] = md
+        return True
+    gb.put_page.side_effect = _put
+
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = []
+    for day, answer in enumerate(["day one synth", "day two synth", "day three synth"]):
+        ha.run_dialectic.return_value = answer
+        bridge.run_export(
+            ha, gb, slug="hindsight/diego", date=f"2026-06-0{day + 4}",
+            dialectic_queries=["q"], state_path=tmp_path / "exp.json", dry_run=False,
+        )
+
+    assert state["page"].count(bridge._SYNTHESIS_START) == 1
+    assert state["page"].count(bridge._SYNTHESIS_END) == 1
+    assert "day three synth" in state["page"]
+    assert "day one synth" not in state["page"]
+    assert "day two synth" not in state["page"]
+
+
+def test_export_dialectic_skips_gbrain_sourced_answer(tmp_path):
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = []
+    ha.run_dialectic.return_value = "[source:gbrain] echoed back"
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    res = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=["q"], state_path=tmp_path / "exp.json", dry_run=False,
+    )
+    assert res["synthesized"] == 0
+    assert res["loop_skipped"] == 1
+    gb.put_page.assert_not_called()
 
 
 def test_export_failed_timeline_write_not_recorded(tmp_path):
@@ -238,7 +367,7 @@ def test_export_failed_timeline_write_not_recorded(tmp_path):
     assert bridge.load_state(tmp_path / "exp.json") == set()  # nothing recorded
 
 
-def test_export_failed_put_page_retries_compiled_without_duplicate_timeline(tmp_path, monkeypatch):
+def test_export_failed_put_page_retries_compiled_without_duplicate_timeline(tmp_path):
     # The sticky-failure bug: a high-conf fact's timeline-add succeeds but the
     # single compiled-truth put_page fails. The compiled hash must NOT be
     # persisted (so the merge retries next run), while the timeline entry must
@@ -250,7 +379,6 @@ def test_export_failed_put_page_retries_compiled_without_duplicate_timeline(tmp_
     gb.get_page.return_value = PAGE
     gb.add_timeline.return_value = True
     gb.put_page.return_value = False  # compiled-truth merge FAILS this run
-    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
 
     sp = tmp_path / "exp.json"
     res1 = bridge.run_export(
@@ -280,7 +408,7 @@ def test_export_failed_put_page_retries_compiled_without_duplicate_timeline(tmp_
     assert gb.put_page.call_count == 2  # no further compiled put
 
 
-def test_export_unreadable_page_retries_compiled_without_duplicate_timeline(tmp_path, monkeypatch):
+def test_export_unreadable_page_retries_compiled_without_duplicate_timeline(tmp_path):
     # get_page returning None (gbrain unreadable) also leaves the compiled merge
     # undone -> the compiled hash must not be persisted, but the timeline entry
     # already landed and must not repeat.
@@ -290,7 +418,6 @@ def test_export_unreadable_page_retries_compiled_without_duplicate_timeline(tmp_
     gb = mock.Mock()
     gb.get_page.return_value = None  # page unreadable this run
     gb.add_timeline.return_value = True
-    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
 
     sp = tmp_path / "exp.json"
     bridge.run_export(
@@ -309,36 +436,34 @@ def test_export_unreadable_page_retries_compiled_without_duplicate_timeline(tmp_
     gb.put_page.assert_called_once()        # compiled merge happened on retry
 
 
-def test_export_timeline_persisted_even_when_compiled_fails(tmp_path, monkeypatch):
-    # A low-conf fact (timeline only) processed in the same run as a failing
-    # compiled merge must still be recorded -> not re-exported next run.
+def test_export_timeline_persisted_even_when_compiled_fails(tmp_path):
+    # A high-conf fact's timeline-add and the dialectic synthesis share one
+    # put_page. When that put_page fails, the already-landed timeline entry must
+    # still be recorded (not re-added next run) while the compiled merge retries.
     ha = mock.Mock()
     ha.read_user_facts.return_value = ["high conf fact"]
-    ha.run_dialectic.return_value = "low conf insight"
+    ha.run_dialectic.return_value = "synth insight"
     gb = mock.Mock()
     gb.get_page.return_value = PAGE
     gb.add_timeline.return_value = True
-    gb.put_page.return_value = False  # compiled merge fails
-    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
+    gb.put_page.return_value = False  # page write (compiled + synthesis) fails
 
     sp = tmp_path / "exp.json"
     res1 = bridge.run_export(
         ha, gb, slug="hindsight/diego", date="2026-06-04",
         dialectic_queries=["q"], state_path=sp, dry_run=False,
     )
-    assert res1["exported"] == 2  # one high-conf + one low-conf
+    assert res1["exported"] == 1     # the high-conf peer fact
+    assert res1["synthesized"] == 1  # the dialectic answer (no timeline append)
+    assert gb.add_timeline.call_count == 1
 
-    # Next run: low-conf timeline fact is settled (deduped); only the high-conf
-    # compiled retry remains.
+    # Next run: timeline fact is settled (not re-added); the compiled merge retries.
     gb.put_page.return_value = True
-    res2 = bridge.run_export(
+    bridge.run_export(
         ha, gb, slug="hindsight/diego", date="2026-06-04",
         dialectic_queries=["q"], state_path=sp, dry_run=False,
     )
-    # add_timeline ran twice total (once per fact in run1), never re-run for the
-    # already-settled low-conf fact.
-    assert gb.add_timeline.call_count == 2
-    assert res2["deduped"] >= 1
+    assert gb.add_timeline.call_count == 1  # never re-added for the settled fact
 
 
 SEED_PAGE = """# Diego
@@ -424,7 +549,6 @@ def test_two_cycle_no_echo(tmp_path, monkeypatch):
     ha.read_user_facts.return_value = ["honcho-derived fact"]
     ha.run_dialectic.return_value = ""
     ha.write_conclusion.return_value = True
-    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
 
     cfg = {"enabled": True, "diegoPageSlug": "hindsight/diego", "dialecticQueries": [],
            "export": {"enabled": True}, "seed": {"enabled": True}}
