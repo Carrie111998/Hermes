@@ -272,7 +272,7 @@ def parse_compiled_facts(page_md: str) -> list[str]:
 def run_seed(honcho, gbrain, *, slug, state_path, dry_run):
     """Seed GBrain compiled-truth facts into the Honcho user peer."""
     seen = load_state(state_path)
-    res = {"seeded": 0, "deduped": 0, "loop_skipped": 0}
+    res = {"seeded": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0}
     new_hashes: set[str] = set()
 
     page = gbrain.get_page(slug)
@@ -280,6 +280,9 @@ def run_seed(honcho, gbrain, *, slug, state_path, dry_run):
         return res
 
     for fact in parse_compiled_facts(page):
+        # Defensive backstop: parse_compiled_facts already filters [source:honcho]
+        # lines, so this guard is normally a no-op — it protects against direct
+        # callers that bypass parse_compiled_facts.
         if has_source(fact, "honcho"):
             res["loop_skipped"] += 1
             continue
@@ -288,7 +291,9 @@ def run_seed(honcho, gbrain, *, slug, state_path, dry_run):
             res["deduped"] += 1
             continue
         if not dry_run:
-            honcho.write_conclusion(tag_fact(fact, "gbrain"), peer="user")
+            if not honcho.write_conclusion(tag_fact(fact, "gbrain"), peer="user"):
+                res["write_failed"] += 1
+                continue  # transient failure — don't record hash, retry next run
         new_hashes.add(h)
         res["seeded"] += 1
 

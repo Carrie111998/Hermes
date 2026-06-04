@@ -269,3 +269,27 @@ def test_seed_writes_new_user_conclusions(tmp_path):
         ha, gb, slug="hindsight/diego", state_path=tmp_path / "seed.json", dry_run=False,
     )
     assert res2["seeded"] == 0
+
+
+def test_seed_failed_write_not_recorded(tmp_path):
+    ha = mock.Mock()
+    ha.write_conclusion.return_value = False  # simulate Honcho write failure
+    gb = mock.Mock()
+    gb.get_page.return_value = SEED_PAGE
+    res = bridge.run_seed(
+        ha, gb, slug="hindsight/diego", state_path=tmp_path / "seed.json", dry_run=False,
+    )
+    assert res["seeded"] == 0
+    assert res["write_failed"] == 2  # both non-honcho facts failed to write
+    assert bridge.load_state(tmp_path / "seed.json") == set()
+
+
+def test_seed_missing_page_returns_zero(tmp_path):
+    ha = mock.Mock()
+    gb = mock.Mock()
+    gb.get_page.return_value = None  # page unreadable / gbrain unavailable
+    res = bridge.run_seed(
+        ha, gb, slug="hindsight/diego", state_path=tmp_path / "seed.json", dry_run=False,
+    )
+    assert res == {"seeded": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0}
+    ha.write_conclusion.assert_not_called()
