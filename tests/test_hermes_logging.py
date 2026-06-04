@@ -1204,3 +1204,52 @@ class TestWindowsSafeRollover:
             assert handler._rollover_blocked_until == 0.0
         finally:
             handler.close()
+
+
+class TestPerRoleRotationIsolation:
+    """A daemon's per-role catch-all rotates even while the shared agent.log
+    is held open by another process — the regression the per-role split fixes.
+    """
+
+    def _role_handler(self, tmp_path, monkeypatch, role):
+        monkeypatch.setattr(hermes_logging, "_ROLLOVER_RETRY_DELAY_SEC", 0)
+        base = tmp_path / f"agent-{role}.log"
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(base), maxBytes=200, backupCount=3, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return base, handler
+
+    def test_role_file_rotates_crossplatform(self, tmp_path, monkeypatch):
+        """Sanity: with no lock at all, the per-role file rotates normally."""
+        base, handler = self._role_handler(tmp_path, monkeypatch, "dashboard")
+        try:
+            (tmp_path / "agent-dashboard.log.1").write_text("OLD-1", encoding="utf-8")
+            handler.emit(logging.makeLogRecord({"msg": "current"}))
+            handler.doRollover()
+            assert "current" in (tmp_path / "agent-dashboard.log.1").read_text(encoding="utf-8")
+            assert (tmp_path / "agent-dashboard.log.2").read_text(encoding="utf-8") == "OLD-1"
+            assert base.exists()
+            assert handler._rollover_blocked_until == 0.0
+        finally:
+            handler.close()
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only file-lock semantics")
+    def test_role_file_rotates_while_shared_agent_log_is_pinned(self, tmp_path, monkeypatch):
+        """The acceptance scenario: another process pins the SHARED agent.log;
+        the daemon's private agent-<role>.log must still rotate cleanly
+        (different file => no cross-process lock).
+        """
+        base, handler = self._role_handler(tmp_path, monkeypatch, "dashboard")
+        shared = tmp_path / "agent.log"
+        shared.write_text("shared-held-open", encoding="utf-8")
+        try:
+            handler.emit(logging.makeLogRecord({"msg": "role-line"}))
+            with open(shared, "a", encoding="utf-8"):
+                handler.doRollover()
+                assert "role-line" in (tmp_path / "agent-dashboard.log.1").read_text(encoding="utf-8")
+                assert base.exists()
+                assert handler.stream is not None
+                assert handler._rollover_blocked_until == 0.0  # NOT deferred
+        finally:
+            handler.close()
