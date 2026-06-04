@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import re
+import subprocess
 from pathlib import Path
 from typing import Iterable
 
@@ -86,3 +87,43 @@ def merge_compiled_truth(page_md: str, facts: list[str]) -> str:
     if additions:
         above = above.rstrip() + "\n" + "\n".join(additions) + "\n\n"
     return f"{above}{_TIMELINE_MARKER}{below}"
+
+
+_GBRAIN_TIMEOUT = 15
+
+
+class GBrainAdapter:
+    """Thin wrapper over the `gbrain` CLI. All methods are best-effort."""
+
+    def get_page(self, slug: str) -> str | None:
+        try:
+            r = subprocess.run(
+                ["gbrain", "get", slug],
+                capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
+            )
+            return r.stdout if r.returncode == 0 else None
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning("gbrain get %s failed: %s", slug, e)
+            return None
+
+    def put_page(self, slug: str, markdown: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["gbrain", "put", slug],
+                input=markdown, capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
+            )
+            return r.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning("gbrain put %s failed: %s", slug, e)
+            return False
+
+    def add_timeline(self, slug: str, date: str, text: str) -> bool:
+        try:
+            r = subprocess.run(
+                ["gbrain", "timeline-add", slug, date, text],
+                capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
+            )
+            return r.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            logger.warning("gbrain timeline-add %s failed: %s", slug, e)
+            return False

@@ -74,3 +74,41 @@ def test_merge_idempotent_across_reruns():
     once = bridge.merge_compiled_truth(PAGE, ["[source:honcho] new fact"])
     twice = bridge.merge_compiled_truth(once, ["[source:honcho] new fact"])
     assert once == twice  # re-adding the same bulleted fact is a no-op
+
+
+import subprocess
+from unittest import mock
+
+
+def test_gbrain_get_returns_stdout():
+    gb = bridge.GBrainAdapter()
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="PAGE", stderr="")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        assert gb.get_page("hindsight/diego") == "PAGE"
+        run.assert_called_once()
+        assert run.call_args.args[0] == ["gbrain", "get", "hindsight/diego"]
+
+
+def test_gbrain_get_missing_cli_returns_none():
+    gb = bridge.GBrainAdapter()
+    with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+        assert gb.get_page("hindsight/diego") is None
+
+
+def test_gbrain_timeline_add_invokes_cli():
+    gb = bridge.GBrainAdapter()
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        assert gb.add_timeline("hindsight/diego", "2026-06-04", "[source:honcho] x") is True
+        assert run.call_args.args[0] == [
+            "gbrain", "timeline-add", "hindsight/diego", "2026-06-04", "[source:honcho] x",
+        ]
+
+
+def test_gbrain_put_passes_markdown_on_stdin():
+    gb = bridge.GBrainAdapter()
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with mock.patch("subprocess.run", return_value=completed) as run:
+        assert gb.put_page("hindsight/diego", "# Diego\n") is True
+        assert run.call_args.kwargs["input"] == "# Diego\n"
+        assert run.call_args.args[0] == ["gbrain", "put", "hindsight/diego"]
