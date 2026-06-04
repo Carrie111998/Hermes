@@ -674,8 +674,8 @@ CLI_CONFIG = load_cli_config()
 # Initialize centralized logging early — agent.log + errors.log in ~/.hermes/logs/.
 # This ensures CLI sessions produce a log trail even before AIAgent is instantiated.
 try:
-    from hermes_logging import setup_logging
-    setup_logging(mode="cli")
+    from hermes_logging import setup_logging, infer_daemon_role
+    setup_logging(mode="cli", role=infer_daemon_role())
 except Exception:
     pass  # Logging setup is best-effort — don't crash the CLI
 

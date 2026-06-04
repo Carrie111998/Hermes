@@ -343,8 +343,9 @@ except Exception:
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 try:
     from hermes_logging import setup_logging as _setup_logging
+    from hermes_logging import infer_daemon_role as _infer_daemon_role
 
-    _setup_logging(mode="cli")
+    _setup_logging(mode="cli", role=_infer_daemon_role())
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
