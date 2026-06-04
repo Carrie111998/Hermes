@@ -63,19 +63,25 @@ _TIMELINE_MARKER = "<!-- timeline -->"
 def merge_compiled_truth(page_md: str, facts: list[str]) -> str:
     """Insert facts into the compiled-truth block (above the timeline marker).
 
-    Facts already present (by exact line match) are skipped. If the page has no
-    timeline marker, one is appended and facts go above it. Each new fact is
-    added as its own bullet line.
+    Facts already present (by exact line match, ignoring a leading bullet) are
+    skipped. If the page has no timeline marker, one is appended and facts go
+    above it. Each new fact is added as its own bullet line.
     """
     if _TIMELINE_MARKER in page_md:
         above, _, below = page_md.partition(_TIMELINE_MARKER)
     else:
         above, below = page_md.rstrip() + "\n\n", "\n"
-    existing = above
+
+    def _unbullet(s: str) -> str:
+        s = s.strip()
+        return s[2:].strip() if s.startswith("- ") else s
+
+    seen = {_unbullet(ln) for ln in above.splitlines()}
     additions = []
     for fact in facts:
         line = fact.strip()
-        if line and line not in existing:
+        if line and line not in seen:
+            seen.add(line)
             additions.append(f"- {line}")
     if additions:
         above = above.rstrip() + "\n" + "\n".join(additions) + "\n\n"

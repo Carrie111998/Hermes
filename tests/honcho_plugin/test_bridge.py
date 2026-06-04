@@ -61,3 +61,16 @@ def test_merge_without_marker_appends_marker_then_fact():
     assert "<!-- timeline -->" in out
     above, _, _ = out.partition("<!-- timeline -->")
     assert "[source:honcho] x" in above
+
+
+def test_merge_does_not_substring_dedup():
+    # "fact" is a substring of "Existing compiled fact one." but is a distinct
+    # fact and must NOT be dropped.
+    out = bridge.merge_compiled_truth(PAGE, ["fact"])
+    assert "- fact" in out
+
+
+def test_merge_idempotent_across_reruns():
+    once = bridge.merge_compiled_truth(PAGE, ["[source:honcho] new fact"])
+    twice = bridge.merge_compiled_truth(once, ["[source:honcho] new fact"])
+    assert once == twice  # re-adding the same bulleted fact is a no-op
