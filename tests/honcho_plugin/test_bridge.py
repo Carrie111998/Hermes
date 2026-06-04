@@ -137,6 +137,7 @@ def test_honcho_adapter_write_conclusion_targets_named_peer():
     m.create_conclusion.assert_called_once_with(
         "hermes-autonomous", "[source:gbrain] x", peer="user",
     )
+    m.get_or_create.assert_called_once_with("hermes-autonomous")
 
 
 def test_honcho_adapter_run_dialectic():
@@ -144,3 +145,4 @@ def test_honcho_adapter_run_dialectic():
     ha = bridge.HonchoAdapter(manager=m, session_key="hermes-autonomous")
     assert ha.run_dialectic("what changed?") == "a synthesized conclusion"
     m.dialectic_query.assert_called_once_with("hermes-autonomous", "what changed?", peer="user")
+    m.get_or_create.assert_called_once_with("hermes-autonomous")
