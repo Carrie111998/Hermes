@@ -323,6 +323,15 @@ def _load_bridge_config() -> dict:
         return {}
 
 
+def _load_capture_config() -> dict:
+    """Return the honcho.json `capture` config block, {} on any error."""
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig
+        return (HonchoClientConfig.from_global_config().raw or {}).get("capture", {}) or {}
+    except Exception:
+        return {}
+
+
 def run_bridge(dry_run: bool = False) -> dict:
     """Run a full bidirectional reconciliation cycle. Best-effort, idempotent."""
     bcfg = _load_bridge_config()
