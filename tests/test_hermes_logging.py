@@ -1065,6 +1065,21 @@ class TestRoleScopedCatchAll:
         assert "proxy role line" in agent_proxy.read_text()
 
 
+class TestLogsKnownFiles:
+    """hermes_cli.logs.LOG_FILES exposes the per-role daemon catch-all files."""
+
+    def test_role_files_registered(self):
+        from hermes_cli.logs import LOG_FILES
+        assert LOG_FILES["agent-gateway"] == "agent-gateway.log"
+        assert LOG_FILES["agent-dashboard"] == "agent-dashboard.log"
+        assert LOG_FILES["agent-proxy"] == "agent-proxy.log"
+        assert LOG_FILES["agent-devflow-bridge"] == "agent-devflow-bridge.log"
+
+    def test_default_agent_still_present(self):
+        from hermes_cli.logs import LOG_FILES
+        assert LOG_FILES["agent"] == "agent.log"
+
+
 class TestWindowsSafeRollover:
     """_ManagedRotatingFileHandler tolerates a Windows file lock at rollover.
 

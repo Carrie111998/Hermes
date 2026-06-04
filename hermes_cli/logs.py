@@ -31,6 +31,13 @@ LOG_FILES = {
     "agent": "agent.log",
     "errors": "errors.log",
     "gateway": "gateway.log",
+    # Per-role daemon catch-all files (see hermes_logging.infer_daemon_role):
+    # each long-lived daemon owns its own catch-all so Windows rotation is not
+    # blocked by a sibling's open handle.
+    "agent-gateway": "agent-gateway.log",
+    "agent-dashboard": "agent-dashboard.log",
+    "agent-proxy": "agent-proxy.log",
+    "agent-devflow-bridge": "agent-devflow-bridge.log",
 }
 
 # Log line timestamp regex — matches "2026-04-05 22:35:00,123" or
