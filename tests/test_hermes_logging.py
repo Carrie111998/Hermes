@@ -971,3 +971,129 @@ class TestReadLoggingConfig:
 
         level, max_size, backup = hermes_logging._read_logging_config()
         assert level is None
+
+
+class TestWindowsSafeRollover:
+    """_ManagedRotatingFileHandler tolerates a Windows file lock at rollover.
+
+    Regression for the gateway log-rotation bug: a sibling Hermes process (or
+    a log reader) holding agent.log open made os.rename fail with
+    PermissionError [WinError 32]. The stdlib handler then raised on every
+    emit (traceback storm to stderr) AND destroyed the backup chain because
+    it shuffles/removes .1/.2 BEFORE the failing base→.1 rename.
+    """
+
+    def _make_handler(self, tmp_path, monkeypatch, **kwargs):
+        # No real sleeping between retries — keep the suite fast.
+        monkeypatch.setattr(hermes_logging, "_ROLLOVER_RETRY_DELAY_SEC", 0)
+        base = tmp_path / "agent.log"
+        handler = hermes_logging._ManagedRotatingFileHandler(
+            str(base), maxBytes=kwargs.get("max_bytes", 200),
+            backupCount=kwargs.get("backup_count", 3), encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        return base, handler
+
+    def test_locked_rollover_is_nonfatal_and_preserves_backups(self, tmp_path, monkeypatch):
+        base, handler = self._make_handler(tmp_path, monkeypatch)
+        try:
+            # Pre-existing rotated history that must NOT be destroyed.
+            (tmp_path / "agent.log.1").write_text("BACKUP-1", encoding="utf-8")
+            (tmp_path / "agent.log.2").write_text("BACKUP-2", encoding="utf-8")
+            handler.emit(logging.makeLogRecord({"msg": "live-content"}))
+
+            # Simulate another process holding the file: every os.replace
+            # raises, exactly like WinError 32 on a locked rename.
+            def _boom(src, dst, *a, **k):
+                raise PermissionError(32, "The process cannot access the file")
+            monkeypatch.setattr(os, "replace", _boom)
+
+            # MUST NOT raise (stdlib would, dumping a traceback per emit).
+            handler.doRollover()
+
+            # Backups untouched — the bug erased these.
+            assert (tmp_path / "agent.log.1").read_text(encoding="utf-8") == "BACKUP-1"
+            assert (tmp_path / "agent.log.2").read_text(encoding="utf-8") == "BACKUP-2"
+            # Stream reopened → logging keeps working through the lock.
+            assert handler.stream is not None
+            handler.emit(logging.makeLogRecord({"msg": "after-lock"}))
+            # Rotation is deferred: shouldRollover stays quiet during cooldown,
+            # so the per-emit traceback storm cannot happen.
+            big = logging.makeLogRecord({"msg": "x" * 1000})
+            assert handler.shouldRollover(big) is False
+        finally:
+            handler.close()
+
+    def test_rollover_succeeds_and_shifts_backups_when_unlocked(self, tmp_path, monkeypatch):
+        base, handler = self._make_handler(tmp_path, monkeypatch)
+        try:
+            (tmp_path / "agent.log.1").write_text("OLD-1", encoding="utf-8")
+            handler.emit(logging.makeLogRecord({"msg": "current-line"}))
+
+            handler.doRollover()
+
+            # Base content rotated into .1 …
+            assert "current-line" in (tmp_path / "agent.log.1").read_text(encoding="utf-8")
+            # … and the old .1 shifted to .2.
+            assert (tmp_path / "agent.log.2").read_text(encoding="utf-8") == "OLD-1"
+            # Fresh base + live stream.
+            assert base.exists()
+            assert handler.stream is not None
+            assert handler._rollover_blocked_until == 0.0
+        finally:
+            handler.close()
+
+    def test_recovers_after_lock_clears(self, tmp_path, monkeypatch):
+        base, handler = self._make_handler(tmp_path, monkeypatch)
+        try:
+            handler.emit(logging.makeLogRecord({"msg": "first"}))
+
+            def _boom(src, dst, *a, **k):
+                raise PermissionError(32, "in use")
+            monkeypatch.setattr(os, "replace", _boom)
+            handler.doRollover()  # deferred
+            assert handler._rollover_blocked_until > 0.0
+
+            # Lock clears: restore real os.replace and bypass the cooldown
+            # (as time would do after _ROLLOVER_COOLDOWN_SEC).
+            monkeypatch.undo()
+            monkeypatch.setattr(hermes_logging, "_ROLLOVER_RETRY_DELAY_SEC", 0)
+            handler._rollover_blocked_until = 0.0
+            handler.emit(logging.makeLogRecord({"msg": "second"}))
+
+            handler.doRollover()
+            assert (tmp_path / "agent.log.1").exists()
+            assert handler._rollover_blocked_until == 0.0
+        finally:
+            handler.close()
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows-only file-lock semantics")
+    def test_real_windows_lock_is_nonfatal(self, tmp_path, monkeypatch):
+        """End-to-end with a REAL second handle (no mocks).
+
+        On Windows, a second open handle on the base file makes the real
+        os.replace fail with PermissionError [WinError 32] — exactly the
+        gateway failure. Asserts the handler survives it without mocks.
+        """
+        base, handler = self._make_handler(tmp_path, monkeypatch)
+        try:
+            (tmp_path / "agent.log.1").write_text("KEEP-1", encoding="utf-8")
+            handler.emit(logging.makeLogRecord({"msg": "live"}))
+
+            # A sibling process holding agent.log open == another open handle.
+            with open(base, "a", encoding="utf-8"):
+                handler.doRollover()  # real os.replace → WinError 32
+
+                assert handler.stream is not None
+                assert (tmp_path / "agent.log.1").read_text(encoding="utf-8") == "KEEP-1"
+                assert handler._rollover_blocked_until > 0.0
+                handler.emit(logging.makeLogRecord({"msg": "through-lock"}))
+
+            # Lock released → rotation resumes.
+            handler._rollover_blocked_until = 0.0
+            handler.emit(logging.makeLogRecord({"msg": "after"}))
+            handler.doRollover()
+            assert "live" in (tmp_path / "agent.log.1").read_text(encoding="utf-8")
+            assert handler._rollover_blocked_until == 0.0
+        finally:
+            handler.close()

@@ -35,6 +35,7 @@ Session context:
 import logging
 import os
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
@@ -360,19 +361,59 @@ def setup_verbose_logging() -> None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-class _ManagedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that ensures group-writable perms in managed mode.
+# --- Rollover resilience tuning --------------------------------------------
+# agent.log is opened by EVERY Hermes process: the gateway, plus each
+# ``hermes`` CLI/cron subprocess (setup_logging(mode="cli") runs at
+# hermes_cli/main.py import) and any log reader/tail. On Windows an open
+# handle in *any* process makes ``os.rename`` fail with PermissionError
+# [WinError 32]. We retry briefly to ride out transient sibling holds, and if
+# the file stays locked we defer rotation for a cooldown instead of
+# re-attempting (and dumping a traceback to stderr) on every single emit.
+_ROLLOVER_RETRY_ATTEMPTS = 4
+_ROLLOVER_RETRY_DELAY_SEC = 0.05
+_ROLLOVER_COOLDOWN_SEC = 30.0
 
-    In managed mode (NixOS), the stateDir uses setgid (2770) so new files
-    inherit the hermes group. However, both _open() (initial creation) and
-    doRollover() create files via open(), which uses the process umask —
-    typically 0022, producing 0644. This subclass applies chmod 0660 after
-    both operations so the gateway and interactive users can share log files.
+
+class _ManagedRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler hardened for managed perms AND Windows log sharing.
+
+    Two behaviours layered on the stdlib handler:
+
+    1. **Managed-mode perms.** In managed mode (NixOS), the stateDir uses
+       setgid (2770) so new files inherit the hermes group. However both
+       _open() (initial creation) and doRollover() create files via open(),
+       which uses the process umask — typically 0022, producing 0644. This
+       subclass applies chmod 0660 after both operations so the gateway and
+       interactive users can share log files.
+
+    2. **Windows-safe rotation.** The stdlib ``doRollover`` shuffles and
+       removes the backup chain (``.2``→``.3``, ``.1``→``.2``, ``rm .1``)
+       *before* the ``base``→``.1`` rename. On Windows that rename fails with
+       PermissionError [WinError 32] whenever another process/reader holds
+       the file open — and the stdlib then (a) raises, so ``logging`` dumps a
+       full traceback to stderr on EVERY emit once the file is pinned at
+       maxBytes, and (b) leaves the stream closed, while the backups it has
+       already shuffled are lost. Observed live: agent.log pinned at 5 MB
+       with agent.log.1/.2 erased.
+
+       This override instead moves the *base* file aside to a temp name
+       FIRST — the only step that can hit the cross-process lock — and only
+       touches the backup chain once that succeeds. On a persistent lock it
+       reopens the stream (logging never stops), leaves the backups
+       untouched, defers further attempts for a cooldown, and logs ONE
+       concise warning rather than a traceback storm. Rotation simply resumes
+       the next time the lock clears.
     """
 
     def __init__(self, *args, **kwargs):
         from hermes_cli.config import is_managed
         self._managed = is_managed()
+        # Monotonic deadline before which shouldRollover() stays quiet after a
+        # locked rollover (0.0 == not deferred), plus a one-warning-per-window
+        # latch and the last lock error for the warning message.
+        self._rollover_blocked_until = 0.0
+        self._rollover_warned = False
+        self._last_rollover_error: Optional[BaseException] = None
         super().__init__(*args, **kwargs)
 
     def _chmod_if_managed(self):
@@ -387,9 +428,116 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._chmod_if_managed()
         return stream
 
+    # -- Windows-safe rotation ------------------------------------------
+
+    def shouldRollover(self, record):
+        # While a previous rollover is locked out, keep appending rather than
+        # re-attempting (and re-failing) on every record.
+        if self._rollover_blocked_until and time.monotonic() < self._rollover_blocked_until:
+            return False
+        return super().shouldRollover(record)
+
     def doRollover(self):
-        super().doRollover()
+        # Close our own handle first so this process isn't the blocker.
+        if self.stream:
+            try:
+                self.stream.close()
+            finally:
+                self.stream = None
+
+        rotated = self._rotate_lock_safe()
+
+        # ALWAYS reopen so logging keeps working, rotated or not. (The stdlib
+        # only reopens after a successful rename; on failure it leaves the
+        # stream closed, which is what turned the lock into a traceback storm.)
+        if not self.delay:
+            try:
+                self.stream = self._open()
+            except OSError:
+                self.stream = None
         self._chmod_if_managed()
+
+        if rotated:
+            self._rollover_blocked_until = 0.0
+            self._rollover_warned = False
+        else:
+            self._rollover_blocked_until = time.monotonic() + _ROLLOVER_COOLDOWN_SEC
+            self._warn_rollover_deferred()
+
+    def _rotate_lock_safe(self) -> bool:
+        """Rotate the base file without ever corrupting the backup chain.
+
+        Returns True if rotation completed, False if the base file is held
+        open by another process/reader (rotation deferred; on-disk backups
+        left exactly as they were).
+        """
+        if self.backupCount <= 0:
+            # No backups requested → the stdlib just reopens in append mode,
+            # which does not shrink the file. Nothing to rotate.
+            return True
+        if not os.path.exists(self.baseFilename):
+            return True  # nothing written yet
+
+        # Step 1: move the base aside to a temp name. This is the ONLY step
+        # that hits the cross-process Windows lock, and it touches no backups,
+        # so a failure here leaves agent.log.1..N untouched.
+        tmp = self.baseFilename + ".rotating"
+        if not self._replace_with_retry(self.baseFilename, tmp):
+            return False  # locked → defer; backups intact
+
+        # Step 2: the base is now free. Shuffle the backup chain and drop the
+        # rotated content into .1. These files were just created/owned by us,
+        # so they don't hit the cross-process lock; os.replace overwrites
+        # atomically (no remove-then-rename gap).
+        for i in range(self.backupCount - 1, 0, -1):
+            sfn = self.rotation_filename("%s.%d" % (self.baseFilename, i))
+            dfn = self.rotation_filename("%s.%d" % (self.baseFilename, i + 1))
+            if os.path.exists(sfn):
+                try:
+                    os.replace(sfn, dfn)
+                except OSError:
+                    pass  # a held backup is non-fatal; .1 still lands below
+        dfn = self.rotation_filename(self.baseFilename + ".1")
+        try:
+            os.replace(tmp, dfn)
+        except OSError:
+            # Extremely unlikely (tmp is ours). Restore the live content so we
+            # don't lose it, and report the rollover as deferred.
+            try:
+                os.replace(tmp, self.baseFilename)
+            except OSError:
+                pass
+            return False
+        return True
+
+    def _replace_with_retry(self, src: str, dst: str) -> bool:
+        """``os.replace(src, dst)`` with bounded retry for transient locks."""
+        self._last_rollover_error = None
+        for attempt in range(_ROLLOVER_RETRY_ATTEMPTS):
+            try:
+                os.replace(src, dst)
+                return True
+            except (PermissionError, OSError) as exc:
+                self._last_rollover_error = exc
+                if attempt < _ROLLOVER_RETRY_ATTEMPTS - 1:
+                    time.sleep(_ROLLOVER_RETRY_DELAY_SEC)
+        return False
+
+    def _warn_rollover_deferred(self):
+        # _rollover_blocked_until is already set, so this warning's own emit
+        # cannot re-enter doRollover. Warn once per cooldown window.
+        if self._rollover_warned:
+            return
+        self._rollover_warned = True
+        logging.getLogger(__name__).warning(
+            "Log rotation for %s deferred ~%.0fs: file held open by another "
+            "process or reader (%s). It may exceed %d bytes until the lock "
+            "clears; rotated backups are untouched.",
+            self.baseFilename,
+            _ROLLOVER_COOLDOWN_SEC,
+            self._last_rollover_error,
+            self.maxBytes,
+        )
 
 
 def _add_rotating_handler(
