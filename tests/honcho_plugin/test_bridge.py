@@ -104,13 +104,17 @@ def test_gbrain_timeline_add_invokes_cli():
         ]
 
 
-def test_gbrain_put_passes_markdown_on_stdin():
+def test_gbrain_put_passes_markdown_via_content_argv():
+    # Content goes via --content (argv), NOT piped stdin: `gbrain put` reads
+    # stdin by opening '/dev/stdin', which does not exist on Windows (ENOENT).
     gb = bridge.GBrainAdapter()
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     with mock.patch("subprocess.run", return_value=completed) as run:
         assert gb.put_page("hindsight/diego", "# Diego\n") is True
-        assert run.call_args.kwargs["input"] == "# Diego\n"
-        assert run.call_args.args[0] == ["gbrain", "put", "hindsight/diego"]
+        assert "input" not in run.call_args.kwargs  # never piped on stdin
+        assert run.call_args.args[0] == [
+            "gbrain", "put", "hindsight/diego", "--content", "# Diego\n",
+        ]
 
 
 def _fake_manager():
@@ -232,6 +236,109 @@ def test_export_failed_timeline_write_not_recorded(tmp_path):
     assert res["exported"] == 0
     assert res["write_failed"] == 1
     assert bridge.load_state(tmp_path / "exp.json") == set()  # nothing recorded
+
+
+def test_export_failed_put_page_retries_compiled_without_duplicate_timeline(tmp_path, monkeypatch):
+    # The sticky-failure bug: a high-conf fact's timeline-add succeeds but the
+    # single compiled-truth put_page fails. The compiled hash must NOT be
+    # persisted (so the merge retries next run), while the timeline entry must
+    # NOT be re-added (it already succeeded; gbrain appends -> would duplicate).
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["sticky compiled fact"]
+    ha.run_dialectic.return_value = ""
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    gb.add_timeline.return_value = True
+    gb.put_page.return_value = False  # compiled-truth merge FAILS this run
+    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
+
+    sp = tmp_path / "exp.json"
+    res1 = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=sp, dry_run=False,
+    )
+    assert res1["exported"] == 1
+    assert gb.add_timeline.call_count == 1
+    gb.put_page.assert_called_once()
+
+    # Second run: put_page now succeeds. Timeline must NOT be re-added; the
+    # compiled merge MUST be retried.
+    gb.put_page.return_value = True
+    bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=sp, dry_run=False,
+    )
+    assert gb.add_timeline.call_count == 1  # no duplicate timeline entry
+    assert gb.put_page.call_count == 2      # compiled merge retried
+
+    # Third run: fully settled -> nothing retried.
+    bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=sp, dry_run=False,
+    )
+    assert gb.add_timeline.call_count == 1
+    assert gb.put_page.call_count == 2  # no further compiled put
+
+
+def test_export_unreadable_page_retries_compiled_without_duplicate_timeline(tmp_path, monkeypatch):
+    # get_page returning None (gbrain unreadable) also leaves the compiled merge
+    # undone -> the compiled hash must not be persisted, but the timeline entry
+    # already landed and must not repeat.
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["needs compiled merge"]
+    ha.run_dialectic.return_value = ""
+    gb = mock.Mock()
+    gb.get_page.return_value = None  # page unreadable this run
+    gb.add_timeline.return_value = True
+    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
+
+    sp = tmp_path / "exp.json"
+    bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=sp, dry_run=False,
+    )
+    assert gb.add_timeline.call_count == 1
+
+    gb.get_page.return_value = PAGE
+    gb.put_page.return_value = True
+    bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=sp, dry_run=False,
+    )
+    assert gb.add_timeline.call_count == 1  # no duplicate timeline entry
+    gb.put_page.assert_called_once()        # compiled merge happened on retry
+
+
+def test_export_timeline_persisted_even_when_compiled_fails(tmp_path, monkeypatch):
+    # A low-conf fact (timeline only) processed in the same run as a failing
+    # compiled merge must still be recorded -> not re-exported next run.
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["high conf fact"]
+    ha.run_dialectic.return_value = "low conf insight"
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    gb.add_timeline.return_value = True
+    gb.put_page.return_value = False  # compiled merge fails
+    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
+
+    sp = tmp_path / "exp.json"
+    res1 = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=["q"], state_path=sp, dry_run=False,
+    )
+    assert res1["exported"] == 2  # one high-conf + one low-conf
+
+    # Next run: low-conf timeline fact is settled (deduped); only the high-conf
+    # compiled retry remains.
+    gb.put_page.return_value = True
+    res2 = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=["q"], state_path=sp, dry_run=False,
+    )
+    # add_timeline ran twice total (once per fact in run1), never re-run for the
+    # already-settled low-conf fact.
+    assert gb.add_timeline.call_count == 2
+    assert res2["deduped"] >= 1
 
 
 SEED_PAGE = """# Diego

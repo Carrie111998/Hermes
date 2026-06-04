@@ -203,11 +203,33 @@ def _write_mempalace_drawer(room: str, content: str) -> bool:
         return False
 
 
+def _compiled_state_path(state_path: Path) -> Path:
+    """Sibling state file tracking which facts reached the compiled-truth block.
+
+    Timeline-add and the single compiled-truth put_page have independent failure
+    modes: the timeline append can succeed while the compiled merge fails. They
+    therefore need separate seen-sets so a failed compiled put_page can retry
+    next run WITHOUT re-adding (duplicating) the timeline entry that already
+    landed. The original `state_path` keeps tracking timeline-add for backward
+    compatibility (existing hashes are interpreted as timeline-seen).
+    """
+    return state_path.with_name(state_path.stem + "_compiled" + state_path.suffix)
+
+
 def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry_run):
-    """Export Honcho conclusions to GBrain (timeline + compiled) and MemPalace."""
-    seen = load_state(state_path)
+    """Export Honcho conclusions to GBrain (timeline + compiled) and MemPalace.
+
+    Timeline-seen and compiled-seen hashes are tracked separately so a failed
+    compiled-truth put_page retries on the next run without re-adding the
+    already-written timeline entries (gbrain timeline-add appends — it would
+    duplicate). Compiled hashes are persisted ONLY after a successful put_page.
+    """
+    compiled_state_path = _compiled_state_path(state_path)
+    timeline_seen = load_state(state_path)
+    compiled_seen = load_state(compiled_state_path)
     res = {"exported": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0}
-    new_hashes: set[str] = set()
+    new_timeline_hashes: set[str] = set()
+    new_compiled_hashes: set[str] = set()
     compiled_facts: list[str] = []
 
     def _consider(text: str, high_conf: bool):
@@ -215,21 +237,25 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
             res["loop_skipped"] += 1
             return
         h = fact_hash(text)
-        if h in seen or h in new_hashes:
+        need_timeline = h not in timeline_seen and h not in new_timeline_hashes
+        need_compiled = (
+            high_conf and h not in compiled_seen and h not in new_compiled_hashes
+        )
+        if not need_timeline and not need_compiled:
             res["deduped"] += 1
             return
         tagged = tag_fact(text, "honcho")
-        if not dry_run:
-            if not gbrain.add_timeline(slug, date, tagged):
-                res["write_failed"] += 1
-                return  # transient failure — don't record hash, retry next run
-            if high_conf:
-                compiled_facts.append(tagged)
-            else:
-                _write_mempalace_drawer(room="conclusion", content=tagged)
-        elif high_conf:
+        if need_timeline:
+            if not dry_run:
+                if not gbrain.add_timeline(slug, date, tagged):
+                    res["write_failed"] += 1
+                    return  # transient failure — don't record hash, retry next run
+                if not high_conf:
+                    _write_mempalace_drawer(room="conclusion", content=tagged)
+            new_timeline_hashes.add(h)
+        if need_compiled:
             compiled_facts.append(tagged)
-        new_hashes.add(h)
+            new_compiled_hashes.add(h)
         res["exported"] += 1
 
     for fact in honcho.read_user_facts():
@@ -240,14 +266,22 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
         if answer and answer.strip():
             _consider(answer, high_conf=False)
 
+    # The compiled-truth fold-in either fully succeeds (persist its hashes) or
+    # fails/can't-read-page (leave compiled hashes unpersisted so it retries).
+    compiled_ok = True
     if compiled_facts and not dry_run:
         page = gbrain.get_page(slug)
-        if page is not None:
-            if not gbrain.put_page(slug, merge_compiled_truth(page, compiled_facts)):
-                logger.warning("Honcho bridge: compiled-truth put_page failed for %s", slug)
+        if page is None:
+            compiled_ok = False  # couldn't read page — retry the merge next run
+        elif not gbrain.put_page(slug, merge_compiled_truth(page, compiled_facts)):
+            compiled_ok = False
+            logger.warning("Honcho bridge: compiled-truth put_page failed for %s", slug)
 
-    if not dry_run and new_hashes:
-        save_state(state_path, seen | new_hashes)
+    if not dry_run:
+        if new_timeline_hashes:
+            save_state(state_path, timeline_seen | new_timeline_hashes)
+        if compiled_ok and new_compiled_hashes:
+            save_state(compiled_state_path, compiled_seen | new_compiled_hashes)
     return res
 
 
