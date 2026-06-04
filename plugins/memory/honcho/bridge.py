@@ -176,3 +176,69 @@ class HonchoAdapter:
     def write_conclusion(self, content: str, peer: str = "user") -> bool:
         self._ensure()
         return self._m.create_conclusion(self._key, content, peer=peer)
+
+
+def _write_mempalace_drawer(room: str, content: str) -> bool:
+    """Best-effort MemPalace drawer write into the honcho-conclusions wing."""
+    try:
+        import os
+        from mempalace.palace import get_collection
+        from mempalace.miner import add_drawer
+        palace_root = os.environ.get("MEMPALACE_HOME") or str(
+            Path.home() / ".mempalace" / "palace"
+        )
+        collection = get_collection(palace_root)
+        add_drawer(
+            collection, wing="honcho-conclusions", room=room, content=content,
+            source_file=f"honcho:{fact_hash(content)}", chunk_index=0,
+            agent="honcho-bridge",
+        )
+        return True
+    except Exception as e:
+        logger.warning("MemPalace drawer write failed: %s", e)
+        return False
+
+
+def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry_run):
+    """Export Honcho conclusions to GBrain (timeline + compiled) and MemPalace."""
+    seen = load_state(state_path)
+    res = {"exported": 0, "deduped": 0, "loop_skipped": 0}
+    new_hashes: set[str] = set()
+    compiled_facts: list[str] = []
+
+    def _consider(text: str, high_conf: bool):
+        if has_source(text, "gbrain"):
+            res["loop_skipped"] += 1
+            return
+        h = fact_hash(text)
+        if h in seen or h in new_hashes:
+            res["deduped"] += 1
+            return
+        tagged = tag_fact(text, "honcho")
+        if not dry_run:
+            gbrain.add_timeline(slug, date, tagged)
+            if high_conf:
+                compiled_facts.append(tagged)
+            else:
+                _write_mempalace_drawer(room="conclusion", content=tagged)
+        elif high_conf:
+            compiled_facts.append(tagged)
+        new_hashes.add(h)
+        res["exported"] += 1
+
+    for fact in honcho.read_user_facts():
+        if fact and fact.strip():
+            _consider(fact, high_conf=True)
+    for q in dialectic_queries:
+        answer = honcho.run_dialectic(q)
+        if answer and answer.strip():
+            _consider(answer, high_conf=False)
+
+    if compiled_facts and not dry_run:
+        page = gbrain.get_page(slug)
+        if page is not None:
+            gbrain.put_page(slug, merge_compiled_truth(page, compiled_facts))
+
+    if not dry_run and new_hashes:
+        save_state(state_path, seen | new_hashes)
+    return res

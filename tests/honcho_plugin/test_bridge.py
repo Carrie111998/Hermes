@@ -146,3 +146,48 @@ def test_honcho_adapter_run_dialectic():
     assert ha.run_dialectic("what changed?") == "a synthesized conclusion"
     m.dialectic_query.assert_called_once_with("hermes-autonomous", "what changed?", peer="user")
     m.get_or_create.assert_called_once_with("hermes-autonomous")
+
+
+def test_export_skips_gbrain_sourced_and_writes_new(tmp_path, monkeypatch):
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["new pref", "[source:gbrain] echo"]
+    ha.run_dialectic.return_value = ""  # no low-conf conclusions this run
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    gb.put_page.return_value = True
+    gb.add_timeline.return_value = True
+    drawers = []
+    monkeypatch.setattr(bridge, "_write_mempalace_drawer",
+                        lambda room, content: drawers.append((room, content)) or True)
+
+    res = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=tmp_path / "exp.json", dry_run=False,
+    )
+
+    assert res["exported"] == 1
+    assert res["loop_skipped"] == 1
+    tl_texts = [c.args[2] for c in gb.add_timeline.call_args_list]
+    assert any(bridge.has_source(t, "honcho") and "new pref" in t for t in tl_texts)
+    gb.put_page.assert_called_once()  # compiled-truth merge written
+    res2 = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=tmp_path / "exp.json", dry_run=False,
+    )
+    assert res2["exported"] == 0
+
+
+def test_export_dry_run_writes_nothing(tmp_path):
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["new pref"]
+    ha.run_dialectic.return_value = ""
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    res = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=tmp_path / "exp.json", dry_run=True,
+    )
+    assert res["exported"] == 1
+    gb.add_timeline.assert_not_called()
+    gb.put_page.assert_not_called()
+    assert bridge.load_state(tmp_path / "exp.json") == set()
