@@ -973,6 +973,44 @@ class TestReadLoggingConfig:
         assert level is None
 
 
+class TestInferDaemonRole:
+    """infer_daemon_role() maps a process's argv to a daemon role or None."""
+
+    def test_gateway_subcommand(self):
+        assert hermes_logging.infer_daemon_role(["hermes", "gateway", "run"]) == "gateway"
+
+    def test_dashboard_subcommand(self):
+        assert hermes_logging.infer_daemon_role(["hermes", "dashboard"]) == "dashboard"
+
+    def test_proxy_subcommand(self):
+        assert hermes_logging.infer_daemon_role(
+            ["hermes", "proxy", "start", "--provider", "nous"]
+        ) == "proxy"
+
+    def test_global_flags_before_subcommand(self):
+        assert hermes_logging.infer_daemon_role(
+            ["hermes", "--profile", "main", "gateway", "run"]
+        ) == "gateway"
+
+    def test_devflow_bridge_runner_by_argv0(self):
+        assert hermes_logging.infer_daemon_role(
+            ["/x/profiles/main/scripts/devflow_bridge_runner.py"]
+        ) == "devflow-bridge"
+
+    def test_transient_chat_is_none(self):
+        assert hermes_logging.infer_daemon_role(["hermes", "chat"]) is None
+
+    def test_logs_gateway_is_not_gateway_daemon(self):
+        assert hermes_logging.infer_daemon_role(["hermes", "logs", "gateway"]) is None
+
+    def test_empty_argv_is_none(self):
+        assert hermes_logging.infer_daemon_role([]) is None
+
+    def test_defaults_to_sys_argv(self, monkeypatch):
+        monkeypatch.setattr(hermes_logging.sys, "argv", ["hermes", "dashboard"])
+        assert hermes_logging.infer_daemon_role() == "dashboard"
+
+
 class TestWindowsSafeRollover:
     """_ManagedRotatingFileHandler tolerates a Windows file lock at rollover.
 

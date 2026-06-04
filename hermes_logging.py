@@ -34,6 +34,7 @@ Session context:
 
 import logging
 import os
+import sys
 import threading
 import time
 from logging.handlers import RotatingFileHandler
@@ -157,6 +158,54 @@ COMPONENT_PREFIXES = {
     "cli": ("hermes_cli", "cli"),
     "cron": ("cron",),
 }
+
+
+# ---------------------------------------------------------------------------
+# Daemon role inference
+# ---------------------------------------------------------------------------
+
+# Long-lived singleton daemons that each hold the catch-all log open for their
+# whole lifetime. On Windows that shared handle blocks log rotation, so each
+# gets its own per-role catch-all file (see setup_logging ``role``). Keyed by
+# the process *subcommand* (first positional argv token) so that tailing
+# commands like ``hermes logs gateway`` are NOT misclassified as the daemon.
+_DAEMON_SUBCOMMAND_ROLES = {
+    "gateway": "gateway",
+    "dashboard": "dashboard",
+    "proxy": "proxy",
+}
+
+
+def infer_daemon_role(argv: Optional[Sequence[str]] = None) -> Optional[str]:
+    """Best-effort daemon role from a process's argv, else ``None``.
+
+    Pure (argv-only) so it is deterministic and unit-testable; production
+    callers pass the result to ``setup_logging(role=...)``. Returns ``None``
+    for transient ``cli``/``cron`` processes, which keep the shared
+    ``agent.log``.
+    """
+    argv = list(sys.argv if argv is None else argv)
+    if argv:
+        prog = os.path.basename(argv[0])
+        if prog.startswith("devflow_bridge_runner"):
+            return "devflow-bridge"
+    # Walk argv[1:] skipping flag tokens (starting with "-") and the value
+    # token that immediately follows a long flag (e.g. ``--profile main``).
+    # This ensures ``hermes --profile main gateway run`` resolves to "gateway"
+    # rather than "main".
+    skip_next = False
+    for tok in argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith("-"):
+            # Long flag without inline value (``--flag``, not ``--flag=val``)?
+            # If so, the *next* positional is its value — skip it too.
+            if tok.startswith("--") and "=" not in tok:
+                skip_next = True
+            continue
+        return _DAEMON_SUBCOMMAND_ROLES.get(tok)
+    return None
 
 
 # ---------------------------------------------------------------------------
