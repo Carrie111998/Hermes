@@ -218,8 +218,13 @@ class MemoryWriter(BaseSubscriber):
             return
         try:
             mgr.get_or_create(BRIDGE_SESSION)
-            mgr.create_conclusion(BRIDGE_SESSION, content, peer=EVENTS_PEER)
-            logger.info("MemoryWriter: wrote Honcho event conclusion")
+            if mgr.create_conclusion(BRIDGE_SESSION, content, peer=EVENTS_PEER):
+                logger.info("MemoryWriter: wrote Honcho event conclusion")
+            else:
+                logger.warning(
+                    "MemoryWriter: Honcho create_conclusion returned False "
+                    "(peer resolution failed or empty content?)"
+                )
         except Exception as e:
             logger.warning("MemoryWriter: Honcho write failed: %s", e)
 

@@ -1,11 +1,13 @@
 """Tests for events.subscribers.memory_writer -- routes events to memory layers."""
 
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
+from events.subscribers import memory_writer as mw
 from events.subscribers.memory_writer import MemoryWriter, MEMORY_ROUTING
 
 
@@ -202,15 +204,10 @@ class TestCorrelationIdDedup:
 # ---------------------------------------------------------------------------
 # Honcho routing tests
 # ---------------------------------------------------------------------------
-from unittest import mock
-from events.subscribers import memory_writer as mw
 
 
-def _make_writer(tmp_path=None):
+def _make_writer(tmp_path):
     """Construct a MemoryWriter with a temporary EventBus (matches existing pattern)."""
-    import tempfile, pathlib
-    if tmp_path is None:
-        tmp_path = pathlib.Path(tempfile.mkdtemp())
     bus = EventBus(db_path=tmp_path / "events" / "test.db")
     return mw.MemoryWriter(bus)
 
@@ -255,3 +252,14 @@ def test_write_honcho_unavailable_is_silent(tmp_path):
                     return_value={"enabled": True}):
         with mock.patch.object(w, "_get_honcho_manager", return_value=None):
             w._write_honcho(content="x")  # must not raise
+
+
+def test_write_honcho_false_return_is_silent(tmp_path):
+    w = _make_writer(tmp_path)
+    fake_mgr = mock.Mock()
+    fake_mgr.create_conclusion.return_value = False
+    with mock.patch("plugins.memory.honcho.bridge._load_capture_config",
+                    return_value={"enabled": True}):
+        with mock.patch.object(w, "_get_honcho_manager", return_value=fake_mgr):
+            w._write_honcho(content="x")  # must not raise
+    fake_mgr.create_conclusion.assert_called_once()
