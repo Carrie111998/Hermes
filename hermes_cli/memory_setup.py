@@ -445,6 +445,142 @@ def cmd_status(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Seed / dream — provider-agnostic memstore bootstrapping
+# ---------------------------------------------------------------------------
+
+def _build_active_memory_sink():
+    """Construct a MemoryManager wired to the active external provider.
+
+    Returns ``(manager, provider_name)``. ``provider_name`` is empty when no
+    external provider is active — seeding/dreaming still runs (the built-in
+    provider mirrors writes to MEMORY.md/USER.md), but nothing is fanned out
+    to an external backend.
+    """
+    from agent.memory_manager import MemoryManager
+    from plugins.memory import _get_active_memory_provider, load_memory_provider
+
+    manager = MemoryManager()
+    provider_name = _get_active_memory_provider() or ""
+    if provider_name:
+        provider = load_memory_provider(provider_name)
+        if provider is not None and provider.is_available():
+            manager.add_provider(provider)
+            try:
+                manager.initialize_all(session_id="seed-session", platform="cli")
+            except Exception as exc:  # noqa: BLE001 — best-effort init
+                print(f"  ⚠ Provider '{provider_name}' failed to initialize: {exc}")
+        else:
+            print(f"  ⚠ Provider '{provider_name}' is configured but not available.")
+            provider_name = ""
+    return manager, provider_name
+
+
+def cmd_seed(args) -> None:
+    """Seed the active memstore from persona docs and conversation transcripts."""
+    from agent.memstore_seeding import (
+        DreamConsolidator,
+        build_corpus_from_sources,
+        seed_and_dream,
+    )
+
+    persona = list(getattr(args, "persona", None) or [])
+    transcripts = list(getattr(args, "transcript", None) or [])
+    if not persona and not transcripts:
+        print("\n  Nothing to seed. Provide at least one source:")
+        print("    hermes memory seed --persona about-me.md")
+        print("    hermes memory seed --transcript session.json\n")
+        return
+
+    corpus = build_corpus_from_sources(persona_paths=persona, transcript_paths=transcripts)
+    if not corpus:
+        print("\n  No memory-worthy facts found in the provided sources.\n")
+        return
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    do_dream = not bool(getattr(args, "no_dream", False))
+    manager, provider_name = _build_active_memory_sink()
+
+    print(f"\n  Extracted {len(corpus)} candidate fact(s) from "
+          f"{len(persona)} persona doc(s) + {len(transcripts)} transcript(s).")
+    print(f"  Target provider: {provider_name or '(built-in only)'}")
+    if dry_run:
+        print("  Mode: dry-run (no writes)\n")
+
+    seed_report, dream_report = seed_and_dream(
+        manager, corpus, dream=do_dream, dry_run=dry_run,
+        consolidator=DreamConsolidator() if do_dream else None,
+    )
+
+    if dream_report is not None:
+        print(f"  Dreams: {dream_report.summary()}")
+    print(f"  {seed_report.summary()}")
+    if seed_report.errors:
+        print(f"  ⚠ {len(seed_report.errors)} write error(s); first: {seed_report.errors[0]}")
+    try:
+        manager.shutdown_all()
+    except Exception:
+        pass
+    print()
+
+
+def cmd_dream(args) -> None:
+    """Run an offline consolidation ('dream') over a fact corpus file.
+
+    Reads a JSONL corpus (as produced by ``--export``), consolidates it, and
+    either writes the refined facts to the active provider or re-exports them.
+    """
+    from pathlib import Path
+
+    from agent.memstore_seeding import (
+        DreamConsolidator,
+        FactCorpus,
+        MemstoreSeeder,
+    )
+
+    corpus_path = getattr(args, "corpus", None)
+    if not corpus_path:
+        print("\n  Provide a corpus file: hermes memory dream --corpus facts.jsonl\n")
+        return
+    try:
+        text = Path(corpus_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"\n  Could not read corpus: {exc}\n")
+        return
+
+    corpus = FactCorpus.from_jsonl(text)
+    if not corpus:
+        print("\n  Corpus is empty or unparseable.\n")
+        return
+
+    consolidator = DreamConsolidator(
+        min_trust=float(getattr(args, "min_trust", 0.25)),
+        decay_factor=float(getattr(args, "decay", 1.0)),
+    )
+    refined, report = consolidator.consolidate(corpus)
+    print(f"\n  Dreamed over {len(corpus)} fact(s): {report.summary()}")
+
+    export = getattr(args, "export", None)
+    if export:
+        Path(export).write_text(refined.to_jsonl(), encoding="utf-8")
+        print(f"  Refined corpus written to {export}\n")
+        return
+
+    if getattr(args, "dry_run", False):
+        print("  Dry-run: refined corpus not written to provider.\n")
+        return
+
+    manager, provider_name = _build_active_memory_sink()
+    seed_report = MemstoreSeeder(manager).seed(refined)
+    print(f"  Target provider: {provider_name or '(built-in only)'}")
+    print(f"  {seed_report.summary()}")
+    try:
+        manager.shutdown_all()
+    except Exception:
+        pass
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -455,5 +591,9 @@ def memory_command(args) -> None:
         cmd_setup(args)
     elif sub == "status":
         cmd_status(args)
+    elif sub == "seed":
+        cmd_seed(args)
+    elif sub == "dream":
+        cmd_dream(args)
     else:
         cmd_status(args)

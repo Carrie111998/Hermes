@@ -12785,6 +12785,65 @@ Examples:
     )
     memory_sub.add_parser("status", help="Show current memory provider config")
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
+
+    _seed_parser = memory_sub.add_parser(
+        "seed",
+        help="Seed the active memstore from persona docs and transcripts",
+        description=(
+            "Bootstrap the active memory provider with knowledge before the\n"
+            "first conversation. Sources are parsed into facts and written\n"
+            "through the provider-agnostic memory-write contract.\n\n"
+            "By default the facts are first consolidated by a 'dream' pass\n"
+            "(dedupe, contradiction check, insight synthesis); use --no-dream\n"
+            "to seed the raw extraction."
+        ),
+    )
+    _seed_parser.add_argument(
+        "--persona", action="append", metavar="FILE",
+        help="Markdown 'about the user/project' doc (repeatable)",
+    )
+    _seed_parser.add_argument(
+        "--transcript", action="append", metavar="FILE",
+        help="Conversation transcript JSON/JSONL to mine for facts (repeatable)",
+    )
+    _seed_parser.add_argument(
+        "--no-dream", action="store_true",
+        help="Skip the consolidation pass; seed the raw extracted facts",
+    )
+    _seed_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be written without writing to any provider",
+    )
+
+    _dream_parser = memory_sub.add_parser(
+        "dream",
+        help="Consolidate a fact corpus (dedupe, de-conflict, synthesise)",
+        description=(
+            "Run an offline 'dream' over an exported JSONL fact corpus:\n"
+            "merge near-duplicates, flag contradictions, decay/prune stale\n"
+            "facts, and synthesise higher-level insights. Writes the refined\n"
+            "facts to the active provider, or re-exports them with --export."
+        ),
+    )
+    _dream_parser.add_argument(
+        "--corpus", metavar="FILE", help="JSONL fact corpus to consolidate",
+    )
+    _dream_parser.add_argument(
+        "--export", metavar="FILE",
+        help="Write the refined corpus to FILE instead of the provider",
+    )
+    _dream_parser.add_argument(
+        "--min-trust", type=float, default=0.25, dest="min_trust",
+        help="Prune facts whose trust falls below this (default: 0.25)",
+    )
+    _dream_parser.add_argument(
+        "--decay", type=float, default=1.0,
+        help="Multiply every fact's trust by this factor (default: 1.0 = none)",
+    )
+    _dream_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Consolidate and report without writing to any provider",
+    )
     _reset_parser = memory_sub.add_parser(
         "reset",
         help="Erase all built-in memory (MEMORY.md and USER.md)",

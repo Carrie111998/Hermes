@@ -544,6 +544,54 @@ Each provider's data is isolated per [profile](/user-guide/profiles):
 - **Cloud providers** (RetainDB) auto-derive profile-scoped project names
 - **Env var providers** (OpenViking) are configured via each profile's `.env` file
 
+## Seeding & Dreams
+
+You don't have to start every provider cold. The **memstore seeding** workflow
+bootstraps the active provider with knowledge *before* the first conversation,
+and an offline **dream** pass consolidates what the agent already knows. Both
+write through the provider-agnostic `on_memory_write` contract, so the same
+seed runs against Honcho, Supermemory, Holographic — whichever provider is
+active.
+
+### Seed from persona docs and transcripts
+
+```bash
+# Preview (no writes):
+hermes memory seed --persona about-me.md --transcript last-session.json --dry-run
+
+# Seed the active provider (consolidates with a dream pass first):
+hermes memory seed --persona about-me.md
+
+# Seed the raw extraction, skipping consolidation:
+hermes memory seed --persona about-me.md --no-dream
+```
+
+- **Persona docs** — a markdown "about the user/project" file. Headings set
+  the category (`user_pref`, `project`, `tool`, …), bullets and sentences
+  become individual facts.
+- **Transcripts** — prior conversation JSON/JSONL. The seeder mines user turns
+  for preferences (`I always …`), identity (`my name is …`), decisions
+  (`we decided …`), and explicit `remember that …` cues.
+
+### Dreams: offline consolidation
+
+A dream reviews a fact corpus the way sleep consolidates memory — it
+de-duplicates near-identical facts, flags contradictions about the same entity
+(demoting the weaker fact), optionally decays and prunes low-trust facts, and
+synthesises higher-level `insight` facts from clusters of related observations.
+
+```bash
+# Consolidate an exported corpus and write the refined facts to the provider:
+hermes memory dream --corpus corpus.jsonl --min-trust 0.3 --decay 0.95
+
+# Or run the whole pipeline standalone (handy for CI / cron):
+python scripts/seed_memstore.py --persona about-me.md --export corpus.jsonl
+```
+
+See [`examples/memstore-seed/`](https://github.com/hermes-ai/hermes-agent/tree/main/examples/memstore-seed)
+for runnable sample inputs and the programmatic API
+(`agent.memstore_seeding`).
+
 ## Building a Memory Provider
 
 See the [Developer Guide: Memory Provider Plugins](/developer-guide/memory-provider-plugin) for how to create your own.
