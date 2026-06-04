@@ -246,7 +246,7 @@ class TestGatewayMode:
         gw_handlers = [
             h for h in root.handlers
             if isinstance(h, RotatingFileHandler)
-            and "gateway.log" in getattr(h, "baseFilename", "")
+            and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
         ]
         assert len(gw_handlers) == 1
 
@@ -270,7 +270,7 @@ class TestGatewayMode:
         gw_handlers = [
             h for h in root.handlers
             if isinstance(h, RotatingFileHandler)
-            and "gateway.log" in getattr(h, "baseFilename", "")
+            and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
         ]
         assert len(gw_handlers) == 1
 
@@ -293,7 +293,7 @@ class TestGatewayMode:
         gw_handlers = [
             h for h in root.handlers
             if isinstance(h, RotatingFileHandler)
-            and "gateway.log" in getattr(h, "baseFilename", "")
+            and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
         ]
         assert len(gw_handlers) == 1
 
@@ -331,7 +331,11 @@ class TestGatewayMode:
             assert "compressing context" not in content
 
     def test_agent_log_still_receives_all(self, hermes_home):
-        """agent.log (catch-all) still receives gateway AND tool records."""
+        """The catch-all log still receives gateway AND tool records.
+
+        With mode="gateway" the catch-all is agent-gateway.log (per-role
+        routing so the gateway process is the sole holder of that file).
+        """
         hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
 
         gw_logger = logging.getLogger("gateway.run")
@@ -349,7 +353,8 @@ class TestGatewayMode:
         for h in logging.getLogger().handlers:
             h.flush()
 
-        agent_log = hermes_home / "logs" / "agent.log"
+        # mode="gateway" routes the catch-all to agent-gateway.log.
+        agent_log = hermes_home / "logs" / "agent-gateway.log"
         content = agent_log.read_text()
         assert "gateway msg" in content
         assert "file msg" in content
@@ -1009,6 +1014,53 @@ class TestInferDaemonRole:
     def test_defaults_to_sys_argv(self, monkeypatch):
         monkeypatch.setattr(hermes_logging.sys, "argv", ["hermes", "dashboard"])
         assert hermes_logging.infer_daemon_role() == "dashboard"
+
+
+class TestRoleScopedCatchAll:
+    """role= routes the catch-all logs to per-role filenames."""
+
+    def _rotating(self, name):
+        return [
+            h for h in logging.getLogger().handlers
+            if isinstance(h, RotatingFileHandler)
+            and Path(getattr(h, "baseFilename", "")).name == name
+        ]
+
+    def test_transient_uses_shared_agent_log(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home)  # role=None
+        assert len(self._rotating("agent.log")) == 1
+        assert len(self._rotating("errors.log")) == 1
+
+    def test_role_uses_per_role_files(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, role="dashboard")
+        assert len(self._rotating("agent-dashboard.log")) == 1
+        assert len(self._rotating("errors-dashboard.log")) == 1
+        assert len(self._rotating("agent.log")) == 0
+        assert len(self._rotating("errors.log")) == 0
+
+    def test_gateway_mode_defaults_role_to_gateway(self, hermes_home, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="gateway")
+        assert len(self._rotating("agent-gateway.log")) == 1
+        assert len(self._rotating("errors-gateway.log")) == 1
+        assert len(self._rotating("agent.log")) == 0
+        assert len(self._rotating("gateway.log")) == 1
+
+    def test_explicit_role_overrides_gateway_mode_default(self, hermes_home, monkeypatch):
+        monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
+        hermes_logging.setup_logging(
+            hermes_home=hermes_home, mode="gateway", role="gateway"
+        )
+        assert len(self._rotating("agent-gateway.log")) == 1
+
+    def test_role_catch_all_actually_writes(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, role="proxy")
+        logging.getLogger("test.proxy_role").info("proxy role line")
+        for h in logging.getLogger().handlers:
+            h.flush()
+        agent_proxy = hermes_home / "logs" / "agent-proxy.log"
+        assert agent_proxy.exists()
+        assert "proxy role line" in agent_proxy.read_text()
 
 
 class TestWindowsSafeRollover:

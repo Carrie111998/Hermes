@@ -219,6 +219,7 @@ def setup_logging(
     max_size_mb: Optional[int] = None,
     backup_count: Optional[int] = None,
     mode: Optional[str] = None,
+    role: Optional[str] = None,
     force: bool = False,
 ) -> Path:
     """Configure the Hermes logging subsystem.
@@ -245,6 +246,12 @@ def setup_logging(
         Caller context: ``"cli"``, ``"gateway"``, ``"cron"``.
         When ``"gateway"``, an additional ``gateway.log`` file is created
         that receives only gateway-component records.
+    role
+        Per-role catch-all routing. When set, ``agent.log``/``errors.log``
+        become ``agent-<role>.log``/``errors-<role>.log`` so a long-lived
+        daemon owns its own files and Windows rotation is never blocked by a
+        sibling's open handle. ``None`` (transient cli/cron) keeps the shared
+        files. ``mode="gateway"`` defaults this to ``"gateway"``.
     force
         Re-run setup even if it has already been called.
 
@@ -256,6 +263,16 @@ def setup_logging(
     global _logging_initialized
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
+
+    # Daemon processes route their catch-all logs to per-role files so each
+    # is the sole long-lived holder and rotation is not blocked by a sibling
+    # process's open handle (Windows). mode="gateway" implies the gateway
+    # role unless an explicit role was passed.
+    if role is None and mode == "gateway":
+        role = "gateway"
+    _role_suffix = f"-{role}" if role else ""
+    agent_log_path = log_dir / f"agent{_role_suffix}.log"
+    errors_log_path = log_dir / f"errors{_role_suffix}.log"
 
     # Lazy import to avoid circular dependency at module load time.
     from agent.redact import RedactingFormatter
@@ -280,7 +297,7 @@ def setup_logging(
         # --- agent.log (INFO+) — the main activity log ---------------------
         _add_rotating_handler(
             root,
-            log_dir / "agent.log",
+            agent_log_path,
             level=level,
             max_bytes=max_bytes,
             backup_count=backups,
@@ -290,7 +307,7 @@ def setup_logging(
         # --- errors.log (WARNING+) — quick triage log ----------------------
         _add_rotating_handler(
             root,
-            log_dir / "errors.log",
+            errors_log_path,
             level=logging.WARNING,
             max_bytes=2 * 1024 * 1024,
             backup_count=2,
