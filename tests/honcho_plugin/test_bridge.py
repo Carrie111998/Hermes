@@ -191,3 +191,44 @@ def test_export_dry_run_writes_nothing(tmp_path):
     gb.add_timeline.assert_not_called()
     gb.put_page.assert_not_called()
     assert bridge.load_state(tmp_path / "exp.json") == set()
+
+
+def test_export_low_conf_writes_mempalace_drawer_not_compiled(tmp_path, monkeypatch):
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = []
+    ha.run_dialectic.return_value = "synthesized insight"
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    gb.add_timeline.return_value = True
+    drawers = []
+    monkeypatch.setattr(bridge, "_write_mempalace_drawer",
+                        lambda room, content: drawers.append((room, content)) or True)
+
+    res = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=["what changed?"],
+        state_path=tmp_path / "exp.json", dry_run=False,
+    )
+
+    assert res["exported"] == 1
+    assert len(drawers) == 1
+    assert drawers[0][0] == "conclusion"
+    assert bridge.has_source(drawers[0][1], "honcho")
+    gb.put_page.assert_not_called()  # low-conf must NOT hit compiled-truth
+
+
+def test_export_failed_timeline_write_not_recorded(tmp_path):
+    # add_timeline fails -> fact is NOT marked seen, retried next run.
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["transient fail fact"]
+    ha.run_dialectic.return_value = ""
+    gb = mock.Mock()
+    gb.get_page.return_value = PAGE
+    gb.add_timeline.return_value = False  # simulate CLI failure
+    res = bridge.run_export(
+        ha, gb, slug="hindsight/diego", date="2026-06-04",
+        dialectic_queries=[], state_path=tmp_path / "exp.json", dry_run=False,
+    )
+    assert res["exported"] == 0
+    assert res["write_failed"] == 1
+    assert bridge.load_state(tmp_path / "exp.json") == set()  # nothing recorded

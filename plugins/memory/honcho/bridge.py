@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -181,7 +182,6 @@ class HonchoAdapter:
 def _write_mempalace_drawer(room: str, content: str) -> bool:
     """Best-effort MemPalace drawer write into the honcho-conclusions wing."""
     try:
-        import os
         from mempalace.palace import get_collection
         from mempalace.miner import add_drawer
         palace_root = os.environ.get("MEMPALACE_HOME") or str(
@@ -202,7 +202,7 @@ def _write_mempalace_drawer(room: str, content: str) -> bool:
 def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry_run):
     """Export Honcho conclusions to GBrain (timeline + compiled) and MemPalace."""
     seen = load_state(state_path)
-    res = {"exported": 0, "deduped": 0, "loop_skipped": 0}
+    res = {"exported": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0}
     new_hashes: set[str] = set()
     compiled_facts: list[str] = []
 
@@ -216,7 +216,9 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
             return
         tagged = tag_fact(text, "honcho")
         if not dry_run:
-            gbrain.add_timeline(slug, date, tagged)
+            if not gbrain.add_timeline(slug, date, tagged):
+                res["write_failed"] += 1
+                return  # transient failure — don't record hash, retry next run
             if high_conf:
                 compiled_facts.append(tagged)
             else:
@@ -237,7 +239,8 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
     if compiled_facts and not dry_run:
         page = gbrain.get_page(slug)
         if page is not None:
-            gbrain.put_page(slug, merge_compiled_truth(page, compiled_facts))
+            if not gbrain.put_page(slug, merge_compiled_truth(page, compiled_facts)):
+                logger.warning("Honcho bridge: compiled-truth put_page failed for %s", slug)
 
     if not dry_run and new_hashes:
         save_state(state_path, seen | new_hashes)
