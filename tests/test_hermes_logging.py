@@ -257,7 +257,7 @@ class TestGatewayMode:
         gw_handlers = [
             h for h in root.handlers
             if isinstance(h, RotatingFileHandler)
-            and "gateway.log" in getattr(h, "baseFilename", "")
+            and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
         ]
         assert len(gw_handlers) == 0
 
@@ -1049,9 +1049,11 @@ class TestRoleScopedCatchAll:
     def test_explicit_role_overrides_gateway_mode_default(self, hermes_home, monkeypatch):
         monkeypatch.delenv("HERMES_GATEWAY_LOG_FILE", raising=False)
         hermes_logging.setup_logging(
-            hermes_home=hermes_home, mode="gateway", role="gateway"
+            hermes_home=hermes_home, mode="gateway", role="proxy"
         )
-        assert len(self._rotating("agent-gateway.log")) == 1
+        # Explicit role wins over the mode="gateway" default.
+        assert len(self._rotating("agent-proxy.log")) == 1
+        assert len(self._rotating("agent-gateway.log")) == 0
 
     def test_role_catch_all_actually_writes(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, role="proxy")

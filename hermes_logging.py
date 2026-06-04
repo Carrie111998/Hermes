@@ -179,8 +179,8 @@ _DAEMON_SUBCOMMAND_ROLES = {
 def infer_daemon_role(argv: Optional[Sequence[str]] = None) -> Optional[str]:
     """Best-effort daemon role from a process's argv, else ``None``.
 
-    Pure (argv-only) so it is deterministic and unit-testable; production
-    callers pass the result to ``setup_logging(role=...)``. Returns ``None``
+    Pure (argv-only) so it is deterministic and unit-testable; the CLI import
+    sites pass the result to ``setup_logging(role=...)``. Returns ``None``
     for transient ``cli``/``cron`` processes, which keep the shared
     ``agent.log``.
     """
@@ -193,6 +193,9 @@ def infer_daemon_role(argv: Optional[Sequence[str]] = None) -> Optional[str]:
     # token that immediately follows a long flag (e.g. ``--profile main``).
     # This ensures ``hermes --profile main gateway run`` resolves to "gateway"
     # rather than "main".
+    # Best-effort: short flags (single dash) are treated as valueless;
+    # only ``--long value`` pairs consume the following token. Real daemon
+    # launch commands put the subcommand first, so this suffices.
     skip_next = False
     for tok in argv[1:]:
         if skip_next:
