@@ -55,3 +55,28 @@ def save_state(path: Path, hashes: Iterable[str]) -> None:
     p = path
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(sorted(hashes)), encoding="utf-8")
+
+
+_TIMELINE_MARKER = "<!-- timeline -->"
+
+
+def merge_compiled_truth(page_md: str, facts: list[str]) -> str:
+    """Insert facts into the compiled-truth block (above the timeline marker).
+
+    Facts already present (by exact line match) are skipped. If the page has no
+    timeline marker, one is appended and facts go above it. Each new fact is
+    added as its own bullet line.
+    """
+    if _TIMELINE_MARKER in page_md:
+        above, _, below = page_md.partition(_TIMELINE_MARKER)
+    else:
+        above, below = page_md.rstrip() + "\n\n", "\n"
+    existing = above
+    additions = []
+    for fact in facts:
+        line = fact.strip()
+        if line and line not in existing:
+            additions.append(f"- {line}")
+    if additions:
+        above = above.rstrip() + "\n" + "\n".join(additions) + "\n\n"
+    return f"{above}{_TIMELINE_MARKER}{below}"

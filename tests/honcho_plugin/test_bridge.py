@@ -26,3 +26,38 @@ def test_state_roundtrip(tmp_path):
 def test_fact_hash_stable_for_tagged_empty_body():
     assert bridge.fact_hash("[source:honcho] ") == bridge.fact_hash("")
     assert bridge.fact_hash("[source:gbrain-v2] x") == bridge.fact_hash("x")
+
+
+PAGE = """---
+type: concept
+title: Diego
+---
+
+# Diego
+
+Existing compiled fact one.
+
+<!-- timeline -->
+
+- 2026-06-01 old timeline entry
+"""
+
+
+def test_merge_inserts_above_timeline_marker():
+    out = bridge.merge_compiled_truth(PAGE, ["[source:honcho] new fact"])
+    above, _, below = out.partition("<!-- timeline -->")
+    assert "[source:honcho] new fact" in above
+    assert "new fact" not in below  # not duplicated into timeline section
+    assert "old timeline entry" in below
+
+
+def test_merge_dedups_existing_fact():
+    out = bridge.merge_compiled_truth(PAGE, ["Existing compiled fact one."])
+    assert out.count("Existing compiled fact one.") == 1
+
+
+def test_merge_without_marker_appends_marker_then_fact():
+    out = bridge.merge_compiled_truth("# Diego\n\nbody\n", ["[source:honcho] x"])
+    assert "<!-- timeline -->" in out
+    above, _, _ = out.partition("<!-- timeline -->")
+    assert "[source:honcho] x" in above
