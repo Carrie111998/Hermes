@@ -327,7 +327,7 @@ def run_bridge(dry_run: bool = False) -> dict:
     """Run a full bidirectional reconciliation cycle. Best-effort, idempotent."""
     bcfg = _load_bridge_config()
     if not bcfg.get("enabled"):
-        return {"status": "disabled"}
+        return {"status": "disabled", "dry_run": dry_run}
 
     slug = bcfg.get("diegoPageSlug", "hindsight/diego")
     queries = bcfg.get("dialecticQueries", []) or []
@@ -336,7 +336,7 @@ def run_bridge(dry_run: bool = False) -> dict:
 
     manager = build_manager()
     if manager is None:
-        return {"status": "honcho-unavailable"}
+        return {"status": "honcho-unavailable", "dry_run": dry_run}
     honcho = HonchoAdapter(manager)
     gbrain = GBrainAdapter()
 

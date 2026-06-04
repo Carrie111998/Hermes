@@ -333,6 +333,9 @@ def test_two_cycle_no_echo(tmp_path, monkeypatch):
 
     assert c1["export"]["exported"] == 1
     assert c1["seed"]["seeded"] == 1
+    # The honcho fact was filtered by parse_compiled_facts (parse layer),
+    # not the defensive backstop, so seed's loop_skipped stays 0.
+    assert c1["seed"]["loop_skipped"] == 0
     assert c2["export"]["exported"] == 0
     assert c2["seed"]["seeded"] == 0
     seeded_contents = [c.args[0] for c in ha.write_conclusion.call_args_list]
