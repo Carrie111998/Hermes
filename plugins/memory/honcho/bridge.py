@@ -131,3 +131,48 @@ class GBrainAdapter:
         except (OSError, subprocess.TimeoutExpired) as e:
             logger.warning("gbrain timeline-add %s failed: %s", slug, e)
             return False
+
+
+BRIDGE_SESSION = "hermes-autonomous"
+EVENTS_PEER = "hermes-events"
+
+
+def build_manager():
+    """Construct a HonchoSessionManager from the active honcho.json config.
+
+    Returns None if Honcho is not configured/available — callers skip.
+    """
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
+        from plugins.memory.honcho.session import HonchoSessionManager
+        cfg = HonchoClientConfig.from_global_config()
+        if not cfg.enabled or not (cfg.api_key or cfg.base_url):
+            return None
+        client = get_honcho_client(cfg)
+        return HonchoSessionManager(honcho=client, config=cfg)
+    except Exception as e:  # SDK missing, paused backend, bad config
+        logger.warning("Honcho manager unavailable for bridge: %s", e)
+        return None
+
+
+class HonchoAdapter:
+    """Read/write wrapper over HonchoSessionManager for the bridge."""
+
+    def __init__(self, manager, session_key: str = BRIDGE_SESSION):
+        self._m = manager
+        self._key = session_key
+
+    def _ensure(self) -> None:
+        self._m.get_or_create(self._key)
+
+    def read_user_facts(self) -> list[str]:
+        self._ensure()
+        return self._m.get_peer_card(self._key, peer="user")
+
+    def run_dialectic(self, query: str) -> str:
+        self._ensure()
+        return self._m.dialectic_query(self._key, query, peer="user")
+
+    def write_conclusion(self, content: str, peer: str = "user") -> bool:
+        self._ensure()
+        return self._m.create_conclusion(self._key, content, peer=peer)

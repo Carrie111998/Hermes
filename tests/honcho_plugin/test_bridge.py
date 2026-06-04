@@ -111,3 +111,36 @@ def test_gbrain_put_passes_markdown_on_stdin():
         assert gb.put_page("hindsight/diego", "# Diego\n") is True
         assert run.call_args.kwargs["input"] == "# Diego\n"
         assert run.call_args.args[0] == ["gbrain", "put", "hindsight/diego"]
+
+
+def _fake_manager():
+    m = mock.Mock()
+    m.get_peer_card.return_value = ["fact a", "[source:gbrain] fact b"]
+    m.dialectic_query.return_value = "a synthesized conclusion"
+    m.create_conclusion.return_value = True
+    return m
+
+
+def test_honcho_adapter_read_user_facts_calls_get_or_create_first():
+    m = _fake_manager()
+    ha = bridge.HonchoAdapter(manager=m, session_key="hermes-autonomous")
+    facts = ha.read_user_facts()
+    m.get_or_create.assert_called_once_with("hermes-autonomous")
+    m.get_peer_card.assert_called_once_with("hermes-autonomous", peer="user")
+    assert facts == ["fact a", "[source:gbrain] fact b"]
+
+
+def test_honcho_adapter_write_conclusion_targets_named_peer():
+    m = _fake_manager()
+    ha = bridge.HonchoAdapter(manager=m, session_key="hermes-autonomous")
+    assert ha.write_conclusion("[source:gbrain] x", peer="user") is True
+    m.create_conclusion.assert_called_once_with(
+        "hermes-autonomous", "[source:gbrain] x", peer="user",
+    )
+
+
+def test_honcho_adapter_run_dialectic():
+    m = _fake_manager()
+    ha = bridge.HonchoAdapter(manager=m, session_key="hermes-autonomous")
+    assert ha.run_dialectic("what changed?") == "a synthesized conclusion"
+    m.dialectic_query.assert_called_once_with("hermes-autonomous", "what changed?", peer="user")
