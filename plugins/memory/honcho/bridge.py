@@ -96,13 +96,17 @@ class GBrainAdapter:
     """Thin wrapper over the `gbrain` CLI. All methods are best-effort."""
 
     def get_page(self, slug: str) -> str | None:
+        """Return the page markdown, or None if the page/CLI is unavailable.
+
+        Note: an existing-but-empty page yields "" (falsy), not None.
+        """
         try:
             r = subprocess.run(
                 ["gbrain", "get", slug],
                 capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
             )
             return r.stdout if r.returncode == 0 else None
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        except (OSError, subprocess.TimeoutExpired) as e:
             logger.warning("gbrain get %s failed: %s", slug, e)
             return None
 
@@ -113,7 +117,7 @@ class GBrainAdapter:
                 input=markdown, capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
             )
             return r.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        except (OSError, subprocess.TimeoutExpired) as e:
             logger.warning("gbrain put %s failed: %s", slug, e)
             return False
 
@@ -124,6 +128,6 @@ class GBrainAdapter:
                 capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
             )
             return r.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        except (OSError, subprocess.TimeoutExpired) as e:
             logger.warning("gbrain timeline-add %s failed: %s", slug, e)
             return False

@@ -1,4 +1,7 @@
 import json
+import subprocess
+from unittest import mock
+
 from plugins.memory.honcho import bridge
 
 
@@ -74,10 +77,6 @@ def test_merge_idempotent_across_reruns():
     once = bridge.merge_compiled_truth(PAGE, ["[source:honcho] new fact"])
     twice = bridge.merge_compiled_truth(once, ["[source:honcho] new fact"])
     assert once == twice  # re-adding the same bulleted fact is a no-op
-
-
-import subprocess
-from unittest import mock
 
 
 def test_gbrain_get_returns_stdout():
