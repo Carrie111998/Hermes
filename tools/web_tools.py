@@ -53,7 +53,7 @@ import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_t
 # code, integration tests, and unit-test patches reach for so the public
 # surface stays stable.
 if TYPE_CHECKING:
-    from firecrawl import Firecrawl  # noqa: F401 — type hints only
+    from firecrawl import Firecrawl  # type: ignore[import-unresolved]  # noqa: F401
 from plugins.web.firecrawl.provider import (
     Firecrawl,
     _FirecrawlProxy,
@@ -230,7 +230,7 @@ def _ddgs_package_importable() -> bool:
     (and tests can monkeypatch a single symbol).
     """
     try:
-        import ddgs  # noqa: F401
+        import ddgs  # type: ignore[import-unresolved]  # noqa: F401
         return True
     except ImportError:
         return False
