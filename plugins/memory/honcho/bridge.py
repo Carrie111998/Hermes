@@ -245,3 +245,53 @@ def run_export(honcho, gbrain, *, slug, date, dialectic_queries, state_path, dry
     if not dry_run and new_hashes:
         save_state(state_path, seen | new_hashes)
     return res
+
+
+def parse_compiled_facts(page_md: str) -> list[str]:
+    """Return compiled-truth fact lines (above the timeline marker).
+
+    Includes bullet lines ('- ...') and non-empty prose lines, excluding the
+    H1 title, frontmatter, and anything tagged [source:honcho].
+    """
+    above = page_md.split(_TIMELINE_MARKER, 1)[0]
+    facts: list[str] = []
+    in_frontmatter = False
+    for raw in above.splitlines():
+        line = raw.strip()
+        if line == "---":
+            in_frontmatter = not in_frontmatter
+            continue
+        if in_frontmatter or not line or line.startswith("#"):
+            continue
+        text = line[2:].strip() if line.startswith("- ") else line
+        if text and not has_source(text, "honcho"):
+            facts.append(text)
+    return facts
+
+
+def run_seed(honcho, gbrain, *, slug, state_path, dry_run):
+    """Seed GBrain compiled-truth facts into the Honcho user peer."""
+    seen = load_state(state_path)
+    res = {"seeded": 0, "deduped": 0, "loop_skipped": 0}
+    new_hashes: set[str] = set()
+
+    page = gbrain.get_page(slug)
+    if page is None:
+        return res
+
+    for fact in parse_compiled_facts(page):
+        if has_source(fact, "honcho"):
+            res["loop_skipped"] += 1
+            continue
+        h = fact_hash(fact)
+        if h in seen or h in new_hashes:
+            res["deduped"] += 1
+            continue
+        if not dry_run:
+            honcho.write_conclusion(tag_fact(fact, "gbrain"), peer="user")
+        new_hashes.add(h)
+        res["seeded"] += 1
+
+    if not dry_run and new_hashes:
+        save_state(state_path, seen | new_hashes)
+    return res

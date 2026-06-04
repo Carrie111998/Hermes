@@ -232,3 +232,40 @@ def test_export_failed_timeline_write_not_recorded(tmp_path):
     assert res["exported"] == 0
     assert res["write_failed"] == 1
     assert bridge.load_state(tmp_path / "exp.json") == set()  # nothing recorded
+
+
+SEED_PAGE = """# Diego
+
+- a genuine gbrain fact
+- [source:honcho] exported echo
+plain compiled sentence.
+
+<!-- timeline -->
+
+- 2026-06-01 should-not-be-seeded timeline line
+"""
+
+
+def test_parse_compiled_facts_excludes_timeline_and_honcho():
+    facts = bridge.parse_compiled_facts(SEED_PAGE)
+    assert "a genuine gbrain fact" in facts
+    assert "plain compiled sentence." in facts
+    assert all(not bridge.has_source(f, "honcho") for f in facts)
+    assert all("should-not-be-seeded" not in f for f in facts)
+
+
+def test_seed_writes_new_user_conclusions(tmp_path):
+    ha = mock.Mock()
+    ha.write_conclusion.return_value = True
+    gb = mock.Mock()
+    gb.get_page.return_value = SEED_PAGE
+    res = bridge.run_seed(
+        ha, gb, slug="hindsight/diego", state_path=tmp_path / "seed.json", dry_run=False,
+    )
+    assert res["seeded"] == 2  # two non-honcho compiled facts
+    written = [c.args[0] for c in ha.write_conclusion.call_args_list]
+    assert all(bridge.has_source(w, "gbrain") for w in written)
+    res2 = bridge.run_seed(
+        ha, gb, slug="hindsight/diego", state_path=tmp_path / "seed.json", dry_run=False,
+    )
+    assert res2["seeded"] == 0
