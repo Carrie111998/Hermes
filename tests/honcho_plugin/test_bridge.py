@@ -21,3 +21,8 @@ def test_state_roundtrip(tmp_path):
     bridge.save_state(p, {"a", "b"})
     assert bridge.load_state(p) == {"a", "b"}
     assert bridge.load_state(tmp_path / "missing.json") == set()
+
+
+def test_fact_hash_stable_for_tagged_empty_body():
+    assert bridge.fact_hash("[source:honcho] ") == bridge.fact_hash("")
+    assert bridge.fact_hash("[source:gbrain-v2] x") == bridge.fact_hash("x")

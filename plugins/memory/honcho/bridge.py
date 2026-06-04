@@ -15,12 +15,12 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-_TAG_RE = re.compile(r"^\s*\[source:(?P<src>[a-z]+)\]\s*")
+_TAG_RE = re.compile(r"^\s*\[source:(?P<src>[a-z0-9_-]+)\]\s*")
 
 
 def tag_fact(text: str, source: str) -> str:
     """Prefix a fact with a provenance tag, e.g. '[source:honcho] ...'."""
-    return f"[source:{source}] {strip_tag(text)}"
+    return f"[source:{source.lower()}] {strip_tag(text)}"
 
 
 def has_source(text: str, source: str) -> bool:
@@ -40,15 +40,18 @@ def fact_hash(text: str) -> str:
 
 
 def load_state(path: Path) -> set[str]:
-    """Load a set of seen hashes from a JSON file ([] if missing/unreadable)."""
+    """Load a set of seen hashes from a JSON file (empty set if missing/unreadable/wrong-type)."""
     try:
-        return set(json.loads(Path(path).read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
         return set()
+    if not isinstance(data, list):
+        return set()
+    return set(data)
 
 
 def save_state(path: Path, hashes: Iterable[str]) -> None:
     """Persist a set of seen hashes to a JSON file."""
-    p = Path(path)
+    p = path
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(sorted(hashes)), encoding="utf-8")
