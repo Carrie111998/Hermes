@@ -1,11 +1,13 @@
 """Tests for events.subscribers.memory_writer -- routes events to memory layers."""
 
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from events.bus import EventBus
 from events.schema import Event, EventType, Priority
+from events.subscribers import memory_writer as mw
 from events.subscribers.memory_writer import MemoryWriter, MEMORY_ROUTING
 
 
@@ -197,3 +199,80 @@ class TestCorrelationIdDedup:
 
         # Both should have triggered writes (2 gbrain entries in rate counters)
         assert len(writer._rate_counters.get("gbrain", [])) == 2
+
+
+# ---------------------------------------------------------------------------
+# Honcho routing tests
+# ---------------------------------------------------------------------------
+
+
+def _make_writer(tmp_path):
+    """Construct a MemoryWriter with a temporary EventBus (matches existing pattern)."""
+    bus = EventBus(db_path=tmp_path / "events" / "test.db")
+    return mw.MemoryWriter(bus)
+
+
+def test_honcho_is_routed_for_meaningful_events():
+    assert "honcho" in mw.MEMORY_ROUTING[EventType.JOB_HIGH_SCORE]["targets"]
+    assert "honcho" in mw.MEMORY_ROUTING[EventType.INTERVIEW_SIGNAL]["targets"]
+    assert "honcho" not in mw.MEMORY_ROUTING[EventType.GATEWAY_HEALTH]["targets"]
+    assert "honcho" not in mw.MEMORY_ROUTING[EventType.CRON_FAILED_CONSECUTIVE]["targets"]
+
+
+def test_honcho_rate_limit_present():
+    assert mw.RATE_LIMITS["honcho"]["max_per_hour"] == 30
+
+
+def test_write_honcho_targets_events_peer_not_user(tmp_path):
+    w = _make_writer(tmp_path)
+    fake_mgr = mock.Mock()
+    fake_mgr.create_conclusion.return_value = True
+    with mock.patch("plugins.memory.honcho.bridge._load_capture_config",
+                    return_value={"enabled": True}):
+        with mock.patch.object(w, "_get_honcho_manager", return_value=fake_mgr):
+            w._write_honcho(content="High-score job at Acme")
+    fake_mgr.get_or_create.assert_called_once_with("hermes-autonomous")
+    fake_mgr.create_conclusion.assert_called_once_with(
+        "hermes-autonomous", "High-score job at Acme", peer="hermes-events",
+    )
+
+
+def test_write_honcho_respects_capture_flag(tmp_path):
+    w = _make_writer(tmp_path)
+    with mock.patch("plugins.memory.honcho.bridge._load_capture_config",
+                    return_value={"enabled": False}):
+        with mock.patch.object(w, "_get_honcho_manager") as gm:
+            w._write_honcho("x")
+            gm.assert_not_called()
+
+
+def test_write_honcho_unavailable_is_silent(tmp_path):
+    w = _make_writer(tmp_path)
+    with mock.patch("plugins.memory.honcho.bridge._load_capture_config",
+                    return_value={"enabled": True}):
+        with mock.patch.object(w, "_get_honcho_manager", return_value=None):
+            w._write_honcho(content="x")  # must not raise
+
+
+def test_write_honcho_false_return_is_silent(tmp_path):
+    w = _make_writer(tmp_path)
+    fake_mgr = mock.Mock()
+    fake_mgr.create_conclusion.return_value = False
+    with mock.patch("plugins.memory.honcho.bridge._load_capture_config",
+                    return_value={"enabled": True}):
+        with mock.patch.object(w, "_get_honcho_manager", return_value=fake_mgr):
+            w._write_honcho(content="x")  # must not raise
+    fake_mgr.create_conclusion.assert_called_once()
+
+
+def test_build_content_honcho_uses_rich_phrasing(tmp_path):
+    """_build_content for honcho should use the same rich phrasing as gbrain, not the raw fallback."""
+    w = _make_writer(tmp_path)
+    ev = Event.create(
+        EventType.JOB_HIGH_SCORE, "scout",
+        {"title": "Staff Eng", "company": "Acme", "score": 95},
+    )
+    content = w._build_content(ev, "honcho")
+    assert "Staff Eng" in content and "Acme" in content
+    assert "High-score job" in content            # rich gbrain phrasing reused
+    assert not content.startswith("JOB_HIGH_SCORE:")  # NOT the raw fallback dump

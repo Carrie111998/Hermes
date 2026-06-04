@@ -22,27 +22,27 @@ logger = logging.getLogger(__name__)
 # Maps EventType -> {targets: [layer], action: str}
 MEMORY_ROUTING: Dict[EventType, Dict[str, Any]] = {
     EventType.JOB_HIGH_SCORE: {
-        "targets": ["gbrain"],
+        "targets": ["gbrain", "honcho"],
         "action": "put_page_and_timeline",
     },
     EventType.APPLICATION_SUBMITTED: {
-        "targets": ["gbrain"],
+        "targets": ["gbrain", "honcho"],
         "action": "add_timeline_entry",
     },
     EventType.APPLICATION_FAILED: {
-        "targets": ["gbrain", "memory_md"],
+        "targets": ["gbrain", "memory_md", "honcho"],
         "action": "add_timeline_and_note",
     },
     EventType.INTERVIEW_SIGNAL: {
-        "targets": ["gbrain", "mempalace"],
+        "targets": ["gbrain", "mempalace", "honcho"],
         "action": "timeline_and_evidence",
     },
     EventType.OFFER_SIGNAL: {
-        "targets": ["gbrain", "mempalace"],
+        "targets": ["gbrain", "mempalace", "honcho"],
         "action": "timeline_and_evidence",
     },
     EventType.STAGE_TRANSITION: {
-        "targets": ["gbrain"],
+        "targets": ["gbrain", "honcho"],
         "action": "add_timeline_entry",
     },
     EventType.CRON_FAILED_CONSECUTIVE: {
@@ -54,7 +54,7 @@ MEMORY_ROUTING: Dict[EventType, Dict[str, Any]] = {
         "action": "operational_note",
     },
     EventType.FOLLOWUP_DUE: {
-        "targets": ["mempalace"],
+        "targets": ["mempalace", "honcho"],
         "action": "add_drawer",
     },
 }
@@ -63,6 +63,7 @@ RATE_LIMITS = {
     "gbrain": {"max_per_hour": 10, "window": 3600},
     "mempalace": {"max_per_hour": 5, "window": 3600},
     "memory_md": {"max_per_hour": 20, "window": 3600},
+    "honcho": {"max_per_hour": 30, "window": 3600},
 }
 
 
@@ -88,6 +89,7 @@ class MemoryWriter(BaseSubscriber):
         # Cached MemPalace Chroma collection — None means "not loaded yet".
         # False means "mempalace is not installed; don't try again".
         self._mempalace_collection: Any = None
+        self._honcho_manager: Any = None
 
     def handle(self, event: Event) -> None:
         routing = MEMORY_ROUTING.get(event.event_type)
@@ -141,7 +143,7 @@ class MemoryWriter(BaseSubscriber):
         p = event.payload
         et = event.event_type
 
-        if target == "gbrain":
+        if target in ("gbrain", "honcho"):
             if et == EventType.JOB_HIGH_SCORE:
                 return (f"High-score job discovered: {p.get('title', '?')} at "
                         f"{p.get('company', '?')} (score: {p.get('score', '?')})")
@@ -186,6 +188,45 @@ class MemoryWriter(BaseSubscriber):
             self._write_mempalace(event, content)
         elif target == "memory_md":
             self._write_memory_md(event, content)
+        elif target == "honcho":
+            self._write_honcho(content)
+
+    def _get_honcho_manager(self):
+        """Lazily build + cache the bridge HonchoSessionManager. None if unavailable."""
+        if self._honcho_manager is None:
+            try:
+                from plugins.memory.honcho.bridge import build_manager
+                self._honcho_manager = build_manager() or False
+            except Exception as e:
+                logger.warning("MemoryWriter: honcho manager init failed: %s", e)
+                self._honcho_manager = False
+        return self._honcho_manager or None
+
+    def _write_honcho(self, content: str) -> None:
+        """Record an autonomous event as a conclusion on the hermes-events peer.
+
+        Gated behind honcho.json `capture.enabled` (ships disabled). Writes to a
+        dedicated agent peer/session so the personal `diego` peer-model stays clean.
+        """
+        from plugins.memory.honcho.bridge import (
+            BRIDGE_SESSION, EVENTS_PEER, _load_capture_config,
+        )
+        if not _load_capture_config().get("enabled"):
+            return
+        mgr = self._get_honcho_manager()
+        if mgr is None:
+            return
+        try:
+            mgr.get_or_create(BRIDGE_SESSION)
+            if mgr.create_conclusion(BRIDGE_SESSION, content, peer=EVENTS_PEER):
+                logger.info("MemoryWriter: wrote Honcho event conclusion")
+            else:
+                logger.warning(
+                    "MemoryWriter: Honcho create_conclusion returned False "
+                    "(empty content or session unavailable)"
+                )
+        except Exception as e:
+            logger.warning("MemoryWriter: Honcho write failed: %s", e)
 
     def _write_gbrain(self, event: Event, content: str) -> None:
         """Write to GBrain via MCP tools (best-effort)."""
