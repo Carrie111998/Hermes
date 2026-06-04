@@ -1223,6 +1223,196 @@ class TestHTTPConfig:
 
         asyncio.run(_test())
 
+    def test_http_protocol_version_hook_behavior(self):
+        """The new-SDK path injects mcp-protocol-version via a request hook,
+        skipping the header on the initialize request and adding it on all
+        subsequent requests. User-pinned versions are never overwritten.
+        """
+        import json as _json
+        from tools.mcp_tool import LATEST_PROTOCOL_VERSION, MCPServerTask
+
+        server = MCPServerTask("remote")
+        captured = {}
+
+        class DummyAsyncClient:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummyTransportCtx:
+            async def __aenter__(self):
+                return MagicMock(), MagicMock(), (lambda: None)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class DummySession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def initialize(self):
+                return None
+
+        class DummyLegacyTransportCtx:
+            def __init__(self, **kwargs):
+                captured["legacy_headers"] = kwargs.get("headers")
+
+            async def __aenter__(self):
+                return MagicMock(), MagicMock(), (lambda: None)
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def _discover_tools(self):
+            self._shutdown_event.set()
+
+        async def _run(config, *, new_http):
+            captured.clear()
+            with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", True), \
+                 patch("tools.mcp_tool._MCP_NEW_HTTP", new_http), \
+                 patch("httpx.AsyncClient", DummyAsyncClient), \
+                 patch("tools.mcp_tool.streamable_http_client", return_value=DummyTransportCtx()), \
+                 patch("tools.mcp_tool.streamablehttp_client", side_effect=lambda url, **kwargs: DummyLegacyTransportCtx(**kwargs)), \
+                 patch("tools.mcp_tool.ClientSession", DummySession), \
+                 patch.object(MCPServerTask, "_discover_tools", _discover_tools):
+                await server._run_http(config)
+
+        # --- new-SDK path: hook is registered, no static header in client_kwargs ---
+
+        asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=True))
+        hooks = captured.get("event_hooks", {})
+        request_hooks = hooks.get("request", [])
+        # One hook added when user hasn't pinned a version.
+        assert len(request_hooks) == 1, "expected exactly one request hook"
+        hook = request_hooks[0]
+        # Static client-level header must NOT be present.
+        client_headers = captured.get("headers", {})
+        assert "mcp-protocol-version" not in client_headers
+
+        # Hook skips initialize requests.
+        init_body = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode()
+        tools_body = _json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).encode()
+
+        class _FakeHeaders(dict):
+            pass
+
+        class _FakeRequest:
+            def __init__(self, body):
+                self.content = body
+                self.headers = _FakeHeaders()
+
+        init_req = _FakeRequest(init_body)
+        asyncio.run(hook(init_req))
+        assert "mcp-protocol-version" not in init_req.headers, \
+            "hook must not add header to initialize request"
+
+        tools_req = _FakeRequest(tools_body)
+        asyncio.run(hook(tools_req))
+        assert tools_req.headers.get("mcp-protocol-version") == LATEST_PROTOCOL_VERSION, \
+            "hook must add header to non-initialize requests"
+
+        # User-pinned version: no hook registered, caller's header preserved as-is.
+        asyncio.run(_run({
+            "url": "https://example.com/mcp",
+            "headers": {"mcp-protocol-version": "custom-version"},
+        }, new_http=True))
+        hooks = captured.get("event_hooks", {})
+        assert hooks.get("request", []) == [], "no hook when user pins version"
+        assert captured["headers"]["mcp-protocol-version"] == "custom-version"
+
+        asyncio.run(_run({
+            "url": "https://example.com/mcp",
+            "headers": {"MCP-Protocol-Version": "custom-version"},
+        }, new_http=True))
+        hooks = captured.get("event_hooks", {})
+        assert hooks.get("request", []) == [], "no hook when user pins version (alt casing)"
+        assert captured["headers"]["MCP-Protocol-Version"] == "custom-version"
+        assert "mcp-protocol-version" not in captured["headers"]
+
+        # --- legacy path: header seeded statically (no per-request hook available) ---
+
+        asyncio.run(_run({"url": "https://example.com/mcp"}, new_http=False))
+        assert captured["legacy_headers"]["mcp-protocol-version"] == LATEST_PROTOCOL_VERSION
+
+        asyncio.run(_run({
+            "url": "https://example.com/mcp",
+            "headers": {"MCP-Protocol-Version": "custom-version"},
+        }, new_http=False))
+        assert captured["legacy_headers"]["MCP-Protocol-Version"] == "custom-version"
+        assert "mcp-protocol-version" not in captured["legacy_headers"]
+
+
+# ---------------------------------------------------------------------------
+# _is_initialize_request helper
+# ---------------------------------------------------------------------------
+
+class TestIsInitializeRequest:
+    """Unit tests for the _is_initialize_request helper."""
+
+    def test_falsy_bodies(self):
+        from tools.mcp_tool import _is_initialize_request
+        assert _is_initialize_request(None) is False
+        assert _is_initialize_request(b"") is False
+        assert _is_initialize_request("") is False
+
+    def test_non_json_body(self):
+        from tools.mcp_tool import _is_initialize_request
+        assert _is_initialize_request(b"not json") is False
+        assert _is_initialize_request("not json") is False
+
+    def test_initialize_method_dict(self):
+        import json as _json
+        from tools.mcp_tool import _is_initialize_request
+        body = _json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+        assert _is_initialize_request(body) is True
+        assert _is_initialize_request(body.encode()) is True
+
+    def test_non_initialize_method(self):
+        import json as _json
+        from tools.mcp_tool import _is_initialize_request
+        body = _json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        assert _is_initialize_request(body) is False
+        assert _is_initialize_request(body.encode()) is False
+
+    def test_batch_with_initialize(self):
+        import json as _json
+        from tools.mcp_tool import _is_initialize_request
+        batch = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        ]
+        assert _is_initialize_request(_json.dumps(batch)) is True
+
+    def test_batch_without_initialize(self):
+        import json as _json
+        from tools.mcp_tool import _is_initialize_request
+        batch = [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {}},
+        ]
+        assert _is_initialize_request(_json.dumps(batch)) is False
+
+    def test_invalid_utf8_bytes(self):
+        from tools.mcp_tool import _is_initialize_request
+        assert _is_initialize_request(b"\xff\xfe") is False
+
+    def test_non_dict_non_list_json(self):
+        from tools.mcp_tool import _is_initialize_request
+        assert _is_initialize_request(b'"initialize"') is False
+        assert _is_initialize_request(b"42") is False
+
+
 # ---------------------------------------------------------------------------
 # Reconnection logic
 # ---------------------------------------------------------------------------
