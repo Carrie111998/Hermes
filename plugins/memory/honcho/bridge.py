@@ -6,6 +6,7 @@ Loop prevention: bidirectional provenance tags + per-direction state hashes.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import json
 import logging
@@ -300,3 +301,55 @@ def run_seed(honcho, gbrain, *, slug, state_path, dry_run):
     if not dry_run and new_hashes:
         save_state(state_path, seen | new_hashes)
     return res
+
+
+def _today() -> str:
+    return _dt.date.today().isoformat()
+
+
+def _state_dir() -> Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "state"
+
+
+def _load_bridge_config() -> dict:
+    try:
+        from plugins.memory.honcho.client import HonchoClientConfig
+        cfg = HonchoClientConfig.from_global_config()
+        raw = cfg.raw or {}
+        return raw.get("bridge", {}) or {}
+    except Exception as e:
+        logger.warning("Could not load bridge config: %s", e)
+        return {}
+
+
+def run_bridge(dry_run: bool = False) -> dict:
+    """Run a full bidirectional reconciliation cycle. Best-effort, idempotent."""
+    bcfg = _load_bridge_config()
+    if not bcfg.get("enabled"):
+        return {"status": "disabled"}
+
+    slug = bcfg.get("diegoPageSlug", "hindsight/diego")
+    queries = bcfg.get("dialecticQueries", []) or []
+    sdir = _state_dir()
+    out: dict = {"status": "ok", "dry_run": dry_run, "export": {}, "seed": {}}
+
+    manager = build_manager()
+    if manager is None:
+        return {"status": "honcho-unavailable"}
+    honcho = HonchoAdapter(manager)
+    gbrain = GBrainAdapter()
+
+    if bcfg.get("export", {}).get("enabled"):
+        out["export"] = run_export(
+            honcho, gbrain, slug=slug, date=_today(),
+            dialectic_queries=queries,
+            state_path=sdir / "honcho_bridge_export.json", dry_run=dry_run,
+        )
+    if bcfg.get("seed", {}).get("enabled"):
+        out["seed"] = run_seed(
+            honcho, gbrain, slug=slug,
+            state_path=sdir / "honcho_bridge_seed.json", dry_run=dry_run,
+        )
+    logger.info("Honcho bridge: %s", out)
+    return out

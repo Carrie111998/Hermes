@@ -293,3 +293,47 @@ def test_seed_missing_page_returns_zero(tmp_path):
     )
     assert res == {"seeded": 0, "deduped": 0, "loop_skipped": 0, "write_failed": 0}
     ha.write_conclusion.assert_not_called()
+
+
+def test_run_bridge_disabled_returns_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(bridge, "_load_bridge_config", lambda: {"enabled": False})
+    out = bridge.run_bridge(dry_run=False)
+    assert out["status"] == "disabled"
+
+
+def test_two_cycle_no_echo(tmp_path, monkeypatch):
+    """Full export+seed run twice must not loop facts across the boundary."""
+    state = {"page": "# Diego\n\n- seeded truth\n\n<!-- timeline -->\n"}
+    gb = mock.Mock()
+    gb.get_page.side_effect = lambda slug: state["page"]
+    gb.add_timeline.return_value = True
+
+    def _put(slug, md):
+        state["page"] = md
+        return True
+    gb.put_page.side_effect = _put
+
+    ha = mock.Mock()
+    ha.read_user_facts.return_value = ["honcho-derived fact"]
+    ha.run_dialectic.return_value = ""
+    ha.write_conclusion.return_value = True
+    monkeypatch.setattr(bridge, "_write_mempalace_drawer", lambda room, content: True)
+
+    cfg = {"enabled": True, "diegoPageSlug": "hindsight/diego", "dialecticQueries": [],
+           "export": {"enabled": True}, "seed": {"enabled": True}}
+    monkeypatch.setattr(bridge, "_load_bridge_config", lambda: cfg)
+    monkeypatch.setattr(bridge, "_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(bridge, "build_manager", lambda: object())
+    monkeypatch.setattr(bridge, "HonchoAdapter", lambda manager, session_key=bridge.BRIDGE_SESSION: ha)
+    monkeypatch.setattr(bridge, "GBrainAdapter", lambda: gb)
+    monkeypatch.setattr(bridge, "_today", lambda: "2026-06-04")
+
+    c1 = bridge.run_bridge(dry_run=False)
+    c2 = bridge.run_bridge(dry_run=False)
+
+    assert c1["export"]["exported"] == 1
+    assert c1["seed"]["seeded"] == 1
+    assert c2["export"]["exported"] == 0
+    assert c2["seed"]["seeded"] == 0
+    seeded_contents = [c.args[0] for c in ha.write_conclusion.call_args_list]
+    assert all("honcho-derived fact" not in s for s in seeded_contents)
