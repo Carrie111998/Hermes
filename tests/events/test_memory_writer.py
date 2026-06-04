@@ -263,3 +263,16 @@ def test_write_honcho_false_return_is_silent(tmp_path):
         with mock.patch.object(w, "_get_honcho_manager", return_value=fake_mgr):
             w._write_honcho(content="x")  # must not raise
     fake_mgr.create_conclusion.assert_called_once()
+
+
+def test_build_content_honcho_uses_rich_phrasing(tmp_path):
+    """_build_content for honcho should use the same rich phrasing as gbrain, not the raw fallback."""
+    w = _make_writer(tmp_path)
+    ev = Event.create(
+        EventType.JOB_HIGH_SCORE, "scout",
+        {"title": "Staff Eng", "company": "Acme", "score": 95},
+    )
+    content = w._build_content(ev, "honcho")
+    assert "Staff Eng" in content and "Acme" in content
+    assert "High-score job" in content            # rich gbrain phrasing reused
+    assert not content.startswith("JOB_HIGH_SCORE:")  # NOT the raw fallback dump

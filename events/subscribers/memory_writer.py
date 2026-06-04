@@ -143,7 +143,7 @@ class MemoryWriter(BaseSubscriber):
         p = event.payload
         et = event.event_type
 
-        if target == "gbrain":
+        if target in ("gbrain", "honcho"):
             if et == EventType.JOB_HIGH_SCORE:
                 return (f"High-score job discovered: {p.get('title', '?')} at "
                         f"{p.get('company', '?')} (score: {p.get('score', '?')})")
@@ -223,7 +223,7 @@ class MemoryWriter(BaseSubscriber):
             else:
                 logger.warning(
                     "MemoryWriter: Honcho create_conclusion returned False "
-                    "(peer resolution failed or empty content?)"
+                    "(empty content or session unavailable)"
                 )
         except Exception as e:
             logger.warning("MemoryWriter: Honcho write failed: %s", e)
