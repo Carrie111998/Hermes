@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ops Overview</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; background: #0b0d10; color: #e6e8eb; margin: 0; padding: 20px; }
+    h2 { font-size: 14px; color: #8b949e; text-transform: uppercase; letter-spacing: .04em; margin: 24px 0 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #1f242b; }
+    .bad { color: #f87171; } .ok { color: #34d399; }
+  </style>
+</head>
+<body>
+  <h1>Ops Overview</h1>
+  <div id="updated" style="color:#8b949e;font-size:12px"></div>
+
+  <h2>Cron jobs</h2>
+  <table><thead><tr><th>Name</th><th>State</th><th>Next run</th><th>Errors</th></tr></thead>
+    <tbody id="cron"></tbody></table>
+
+  <h2>Recent events</h2>
+  <table><thead><tr><th>Type</th><th>Source</th><th>When</th></tr></thead>
+    <tbody id="events"></tbody></table>
+
+  <script src="/static/hermes-live.js"></script>
+  <script>
+    function td(v) { return "<td>" + (v == null ? "" : String(v)) + "</td>"; }
+    hermesLive.poll("/api/cron", function (rows) {
+      document.getElementById("cron").innerHTML = rows.map(function (j) {
+        var err = (j.consecutive_errors || 0) > 0;
+        return "<tr>" + td(j.name) + td(j.state) + td((j.next_run_at || "").slice(0, 16)) +
+          "<td class='" + (err ? "bad" : "ok") + "'>" + (j.consecutive_errors || 0) + "</td></tr>";
+      }).join("");
+      document.getElementById("updated").textContent = "updated " + new Date().toLocaleTimeString();
+    }, { everySecs: 15 });
+    hermesLive.poll("/api/events", function (rows) {
+      document.getElementById("events").innerHTML = rows.slice(0, 25).map(function (e) {
+        return "<tr>" + td(e.event_type) + td(e.source) + td((e.created_at || "").slice(0, 19)) + "</tr>";
+      }).join("");
+    }, { everySecs: 20 });
+  </script>
+</body>
+</html>
