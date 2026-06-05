@@ -33,3 +33,18 @@ def test_malformed_sidecar_falls_back(tmp_path):
     bad.write_text("{not json", encoding="utf-8")
     m = parse_manifest(bad, html_path=html)
     assert m.id == "x"  # falls back to filename
+
+
+def test_pinned_defaults_false(tmp_path):
+    html = tmp_path / "x.html"
+    html.write_text("<p>x</p>", encoding="utf-8")
+    m = parse_manifest(html.with_suffix(".json"), html_path=html)
+    assert m.pinned is False
+
+
+def test_parse_pinned_true(tmp_path):
+    p = tmp_path / "ops.json"
+    p.write_text(json.dumps({"id": "ops", "title": "Ops", "pinned": True}), encoding="utf-8")
+    m = parse_manifest(p)
+    assert m.pinned is True
+    assert m.to_dict()["pinned"] is True

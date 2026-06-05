@@ -47,3 +47,19 @@ def test_emit_rejects_unsafe_explicit_id(artdir):
 def test_emit_safe_explicit_id_ok(artdir):
     slug = hermes_artifacts.emit("<p>x</p>", title="X", source="s", id="ok.id-1")
     assert slug == "ok.id-1"
+
+
+def test_emit_pinned_defaults_false(artdir):
+    hermes_artifacts.emit("<p>x</p>", title="Plain", source="s")
+    manifest = json.loads((artdir / "plain.json").read_text(encoding="utf-8"))
+    assert manifest["pinned"] is False
+
+
+def test_emit_pinned_true_persists(artdir):
+    hermes_artifacts.emit("<p>x</p>", title="Keep Me", source="s", pinned=True)
+    manifest = json.loads((artdir / "keep-me.json").read_text(encoding="utf-8"))
+    assert manifest["pinned"] is True
+    # and retention must protect it
+    from artifact_surface import retention
+    result = retention.prune(artdir, max_age_days=0)
+    assert "keep-me" not in result.deleted
