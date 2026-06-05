@@ -1907,13 +1907,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 _started_tool_call_ids.add(tool_call_id)
                 from agent.display import build_tool_preview, get_tool_emoji
                 label = build_tool_preview(function_name, function_args) or function_name
-                _stream_q.put(("__tool_progress__", {
+                progress = {
                     "tool": function_name,
                     "emoji": get_tool_emoji(function_name),
                     "label": label,
                     "toolCallId": tool_call_id,
                     "status": "running",
-                }))
+                }
+                # Omnia structured-interaction protocol: the ask_user tool (shipped
+                # by the omnio_interaction plugin) carries its prompt args so the
+                # Omnia chat can render clickable buttons. Gated on the tool name so
+                # no other tool's args ever reach the wire. The turn is ended in
+                # _on_tool_complete (non-blocking); the user's click is the next turn.
+                if function_name == "ask_user" and isinstance(function_args, dict):
+                    progress["interaction"] = {
+                        "question": function_args.get("question"),
+                        "kind": function_args.get("kind"),
+                        "options": function_args.get("options"),
+                        "allow_freeform": function_args.get("allow_freeform"),
+                    }
+                _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
                 """Emit the matching ``status: completed`` event.
@@ -1930,6 +1943,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }))
+                # ask_user is non-blocking and turn-ending: stop the agent loop now
+                # so the SSE stream closes and the user's selection becomes the next
+                # turn. interrupt() makes the loop return cleanly (the streaming
+                # writer still finalizes finish_reason="stop"), unlike a raised error.
+                if function_name == "ask_user" and agent_ref[0] is not None:
+                    try:
+                        agent_ref[0].interrupt("awaiting user interaction (ask_user)")
+                    except Exception:
+                        pass
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
