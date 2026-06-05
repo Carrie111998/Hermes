@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Hermes Canvas</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0b0d10; color: #e6e8eb; }
+    header { padding: 16px 24px; border-bottom: 1px solid #1f242b; }
+    h1 { font-size: 18px; margin: 0; }
+    .meta { color: #8b949e; font-size: 12px; }
+    input { background: #11151a; border: 1px solid #1f242b; color: #e6e8eb; padding: 6px 10px; border-radius: 6px; width: 280px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; padding: 24px; }
+    a.card { display: block; text-decoration: none; color: inherit; background: #11151a; border: 1px solid #1f242b; border-radius: 10px; padding: 14px; }
+    a.card:hover { border-color: #3b82f6; }
+    .title { font-weight: 600; margin-bottom: 4px; }
+    .summary { color: #8b949e; font-size: 13px; }
+    .tags { margin-top: 8px; }
+    .tag { display: inline-block; font-size: 11px; background: #1f242b; padding: 2px 7px; border-radius: 999px; margin-right: 4px; color: #b9c0c8; }
+    .empty { padding: 48px; text-align: center; color: #8b949e; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Hermes Canvas</h1>
+    <div class="meta">{{ artifacts|length }} artifact(s) · loopback :9121</div>
+    <div style="margin-top:10px"><input id="q" placeholder="filter by title / source / tag…" oninput="filterCards()" /></div>
+  </header>
+  {% if artifacts %}
+  <div class="grid" id="grid">
+    {% for a in artifacts %}
+    <a class="card" href="/a/{{ a.id }}" data-text="{{ (a.title ~ ' ' ~ a.source ~ ' ' ~ a.tags|join(' '))|lower }}">
+      <div class="title">{{ a.title }}</div>
+      <div class="summary">{{ a.summary }}</div>
+      <div class="meta">{{ a.source }} · {{ a.created_at[:16] }}</div>
+      <div class="tags">{% for t in a.tags %}<span class="tag">{{ t }}</span>{% endfor %}</div>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty">No artifacts yet. Agents write <code>&lt;id&gt;.html</code> to <code>~/.hermes/artifacts/</code>.</div>
+  {% endif %}
+  <script>
+    function filterCards() {
+      var q = document.getElementById('q').value.toLowerCase();
+      document.querySelectorAll('#grid .card').forEach(function (c) {
+        c.style.display = c.getAttribute('data-text').indexOf(q) >= 0 ? '' : 'none';
+      });
+    }
+  </script>
+</body>
+</html>
