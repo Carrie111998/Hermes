@@ -12,7 +12,8 @@ import {
   progressPreviewServerRestart,
   requestPreviewReload,
   setCurrentSessionPreviewTarget,
-  setPreviewTarget
+  setPreviewTarget,
+  syncFilePreviewTabsForSession
 } from '@/store/preview'
 import { $currentCwd } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
@@ -63,6 +64,8 @@ export function usePreviewRouting({
 
       return
     }
+
+    syncFilePreviewTabsForSession(previewSessionId)
 
     const record = getSessionPreviewRecord(previewSessionId)
 
