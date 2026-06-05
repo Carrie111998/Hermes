@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   deploy-vercel:
-    if: github.event_name == 'release'
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Vercel Deploy
