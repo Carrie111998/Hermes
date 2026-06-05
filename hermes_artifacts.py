@@ -20,6 +20,7 @@ from typing import Iterable, Optional
 from hermes_constants import get_default_hermes_root
 
 _SLUG = re.compile(r"[^a-z0-9]+")
+_SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def artifacts_dir() -> Path:
@@ -43,6 +44,11 @@ def emit(html: str, *, title: str, source: str, id: Optional[str] = None,
          data_endpoints: Iterable[str] = ()) -> str:
     """Write an artifact + manifest; return the artifact id (slug)."""
     slug = id or _slugify(title)
+    if not _SAFE_ID.match(slug) or slug in {".", ".."}:
+        raise ValueError(
+            f"unsafe artifact id {slug!r}: must match [A-Za-z0-9._-]+ "
+            "(the viewer store will not serve other ids)"
+        )
     d = artifacts_dir()
     d.mkdir(parents=True, exist_ok=True)
     _atomic_write(d / f"{slug}.html", html)

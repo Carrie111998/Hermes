@@ -34,3 +34,16 @@ def test_emitted_artifact_is_listed_by_store(artdir):
     hermes_artifacts.emit("<p>x</p>", title="Listed", source="scout")
     ids = [m.id for m in store.list_artifacts()]
     assert "listed" in ids
+
+
+def test_emit_rejects_unsafe_explicit_id(artdir):
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        hermes_artifacts.emit("<p>x</p>", title="X", source="s", id="../evil")
+    with _pytest.raises(ValueError):
+        hermes_artifacts.emit("<p>x</p>", title="X", source="s", id="a/b")
+
+
+def test_emit_safe_explicit_id_ok(artdir):
+    slug = hermes_artifacts.emit("<p>x</p>", title="X", source="s", id="ok.id-1")
+    assert slug == "ok.id-1"
