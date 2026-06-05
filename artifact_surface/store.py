@@ -33,7 +33,10 @@ def list_artifacts() -> list[Manifest]:
     out: list[Manifest] = []
     for html in d.glob("*.html"):
         out.append(parse_manifest(html.with_suffix(".json"), html_path=html))
+    # Newest-first, then a stable sort floats pinned artifacts to the top while
+    # preserving newest-first order within each group (Python sort is stable).
     out.sort(key=lambda m: m.created_at or "", reverse=True)
+    out.sort(key=lambda m: not m.pinned)
     return out
 
 
