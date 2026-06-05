@@ -22,6 +22,17 @@ def test_list_artifacts_newest_first(artifacts):
     assert [m.id for m in items] == ["b", "a"]
 
 
+def test_list_artifacts_pinned_first_then_newest(artifacts):
+    # Non-pinned: b is newer than a. Pinned: c (newer) and d (older).
+    _write(artifacts, "a", "<p>a</p>", {"id": "a", "title": "A", "created_at": "2026-06-01T00:00:00+00:00"})
+    _write(artifacts, "b", "<p>b</p>", {"id": "b", "title": "B", "created_at": "2026-06-05T00:00:00+00:00"})
+    _write(artifacts, "c", "<p>c</p>", {"id": "c", "title": "C", "created_at": "2026-06-03T00:00:00+00:00", "pinned": True})
+    _write(artifacts, "d", "<p>d</p>", {"id": "d", "title": "D", "created_at": "2026-06-02T00:00:00+00:00", "pinned": True})
+    items = store.list_artifacts()
+    # pinned group first (newest-first within group), then non-pinned (newest-first)
+    assert [m.id for m in items] == ["c", "d", "b", "a"]
+
+
 def test_get_artifact_html(artifacts):
     _write(artifacts, "a", "<p>hello</p>", {"id": "a", "title": "A"})
     assert store.get_artifact_html("a") == "<p>hello</p>"

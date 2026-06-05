@@ -17,6 +17,7 @@
     .summary { color: #8b949e; font-size: 13px; }
     .tags { margin-top: 8px; }
     .tag { display: inline-block; font-size: 11px; background: #1f242b; padding: 2px 7px; border-radius: 999px; margin-right: 4px; color: #b9c0c8; }
+    .pin { float: right; font-size: 11px; background: #1f2b1f; color: #6ee7a8; padding: 2px 7px; border-radius: 999px; }
     .empty { padding: 48px; text-align: center; color: #8b949e; }
   </style>
 </head>
@@ -30,6 +31,7 @@
   <div class="grid" id="grid">
     {% for a in artifacts %}
     <a class="card" href="/a/{{ a.id }}" data-text="{{ (a.title ~ ' ' ~ a.source ~ ' ' ~ a.tags|join(' '))|lower }}">
+      {% if a.pinned %}<span class="pin">📌 pinned</span>{% endif %}
       <div class="title">{{ a.title }}</div>
       <div class="summary">{{ a.summary }}</div>
       <div class="meta">{{ a.source }} · {{ a.created_at[:16] }}</div>

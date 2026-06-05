@@ -26,6 +26,22 @@ def test_index_lists_artifacts(client):
     assert "Ops Overview" in r.text
 
 
+def test_index_shows_pin_badge_for_pinned(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "artifacts_dir", lambda: tmp_path)
+    (tmp_path / "pinned.html").write_text("<h1>P</h1>", encoding="utf-8")
+    (tmp_path / "pinned.json").write_text(json.dumps(
+        {"id": "pinned", "title": "Pinned Card", "pinned": True}), encoding="utf-8")
+    (tmp_path / "plain.html").write_text("<h1>X</h1>", encoding="utf-8")
+    (tmp_path / "plain.json").write_text(json.dumps(
+        {"id": "plain", "title": "Plain Card"}), encoding="utf-8")
+    r = TestClient(app).get("/")
+    assert r.status_code == 200
+    # the pinned card carries a visible pin indicator; the plain one does not
+    assert 'class="pin"' in r.text
+    # pinned card renders before the plain card (pinned-first ordering)
+    assert r.text.index("Pinned Card") < r.text.index("Plain Card")
+
+
 def test_raw_artifact_served_with_csp(client):
     r = client.get("/raw/ops")
     assert r.status_code == 200
