@@ -52,3 +52,16 @@ def test_api_cron_endpoint_present(client):
     r = client.get("/api/cron")
     assert r.status_code == 200
     assert isinstance(r.json(), list)
+
+
+from pathlib import Path
+import artifact_surface
+
+
+def test_reference_artifact_exists_and_wires_endpoints():
+    p = Path(artifact_surface.__file__).parent / "examples" / "ops_overview.html"
+    assert p.exists(), "reference artifact missing"
+    text = p.read_text(encoding="utf-8")
+    assert "/static/hermes-live.js" in text
+    assert "/api/cron" in text
+    assert "/api/events" in text
