@@ -24,13 +24,14 @@ class Manifest:
     summary: str = ""
     refresh_secs: Optional[int] = None
     data_endpoints: list[str] = field(default_factory=list)
+    pinned: bool = False
 
     def to_dict(self) -> dict:
         return {
             "id": self.id, "title": self.title, "source": self.source,
             "created_at": self.created_at, "tags": self.tags,
             "summary": self.summary, "refresh_secs": self.refresh_secs,
-            "data_endpoints": self.data_endpoints,
+            "data_endpoints": self.data_endpoints, "pinned": self.pinned,
         }
 
 
@@ -66,4 +67,5 @@ def parse_manifest(sidecar_path: Path, html_path: Optional[Path] = None) -> Mani
         summary=str(data.get("summary") or ""),
         refresh_secs=data.get("refresh_secs"),
         data_endpoints=list(data.get("data_endpoints") or []),
+        pinned=bool(data.get("pinned", False)),
     )

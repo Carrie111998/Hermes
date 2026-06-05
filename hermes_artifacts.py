@@ -41,8 +41,12 @@ def _atomic_write(path: Path, text: str) -> None:
 def emit(html: str, *, title: str, source: str, id: Optional[str] = None,
          tags: Iterable[str] = (), summary: str = "",
          refresh_secs: Optional[int] = None,
-         data_endpoints: Iterable[str] = ()) -> str:
-    """Write an artifact + manifest; return the artifact id (slug)."""
+         data_endpoints: Iterable[str] = (), pinned: bool = False) -> str:
+    """Write an artifact + manifest; return the artifact id (slug).
+
+    Set ``pinned=True`` to protect the artifact from the retention cron
+    (``artifact_surface.retention``), e.g. a long-lived reference page.
+    """
     slug = id or _slugify(title)
     if not _SAFE_ID.match(slug) or slug in {".", ".."}:
         raise ValueError(
@@ -57,6 +61,7 @@ def emit(html: str, *, title: str, source: str, id: Optional[str] = None,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "tags": list(tags), "summary": summary,
         "refresh_secs": refresh_secs, "data_endpoints": list(data_endpoints),
+        "pinned": pinned,
     }
     _atomic_write(d / f"{slug}.json", json.dumps(manifest, indent=2))
     return slug
