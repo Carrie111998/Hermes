@@ -6578,7 +6578,8 @@ def _client_is_closed(client: Any) -> bool:
     for obj in candidates:
         if obj is None:
             continue
-        if bool(getattr(obj, "is_closed", False)):
+        closed = getattr(obj, "is_closed", False)
+        if isinstance(closed, bool) and closed:
             return True
     return False
 
