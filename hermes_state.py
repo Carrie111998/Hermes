@@ -1063,6 +1063,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     model_config TEXT,
     system_prompt TEXT,
     parent_session_id TEXT,
+    delegated_role TEXT,
+    delegated_profile TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
     end_reason TEXT,
@@ -3561,6 +3563,8 @@ class SessionDB:
         chat_type: str = None,
         thread_id: str = None,
         parent_session_id: str = None,
+        delegated_role: str = None,
+        delegated_profile: str = None,
         cwd: str = None,
         profile_name: str = None,
         git_repo_root: str = None,
@@ -3604,10 +3608,11 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd,
-                   profile_name, git_repo_root, started_at
+                   model, model_config, system_prompt, parent_session_id,
+                   delegated_role, delegated_profile, cwd, profile_name,
+                   git_repo_root, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -3617,6 +3622,8 @@ class SessionDB:
                        chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                       delegated_role = COALESCE(sessions.delegated_role, excluded.delegated_role),
+                       delegated_profile = COALESCE(sessions.delegated_profile, excluded.delegated_profile),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
                        git_repo_root = COALESCE(sessions.git_repo_root, excluded.git_repo_root)""",
@@ -3632,6 +3639,8 @@ class SessionDB:
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
+                    delegated_role,
+                    delegated_profile,
                     cwd,
                     profile_name,
                     git_repo_root,
@@ -4097,6 +4106,8 @@ class SessionDB:
         model: str = None,
         model_config: Dict[str, Any] = None,
         system_prompt: str = None,
+        delegated_role: str = None,
+        delegated_profile: str = None,
         cwd: str = None,
         profile_name: str = None,
         compression_lock_holder: str = None,
@@ -4125,7 +4136,8 @@ class SessionDB:
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, display_name, origin_json, profile_name,
+                          delegated_role, delegated_profile
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -4139,10 +4151,11 @@ class SessionDB:
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, model, model_config, system_prompt,
-                   parent_session_id, cwd, git_branch, git_repo_root,
-                   profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   parent_session_id, delegated_role, delegated_profile, cwd,
+                   git_branch, git_repo_root, profile_name, user_id, session_key,
+                   chat_id, chat_type, thread_id, display_name, origin_json,
+                   started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -4150,6 +4163,16 @@ class SessionDB:
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
                     parent_session_id,
+                    (
+                        delegated_role
+                        if delegated_role is not None
+                        else parent["delegated_role"]
+                    ),
+                    (
+                        delegated_profile
+                        if delegated_profile is not None
+                        else parent["delegated_profile"]
+                    ),
                     cwd or parent["cwd"],
                     parent["git_branch"],
                     parent["git_repo_root"],
