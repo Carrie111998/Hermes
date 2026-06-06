@@ -31,18 +31,18 @@ job_briefs:
     instructions:
     - Extract source, sender, timestamp, commitments, blockers, and requested actions.
     - Preserve original wording for material facts that may need audit.
-    - Before changing an existing case, use pa_business_read with operation case_lookup
+    - Before changing an existing case, use pa_business_read with operation tgg_case_lookup
       when a job number is present.
     - For clearly new case reports with zone, address, problem, and WhatsApp source,
-      call pa_business_write with operation case_create before any state update. Include
+      call pa_business_write with operation tgg_case_create before any state update. Include
       jobNo when present; otherwise let PS generate a WA job number. If address, problem,
       source, or confidence is unclear, do not create; surface the missing facts for
       clarification.
     - If an inbound WhatsApp operations message contains photos, worker updates, or
-      case evidence, call pa_business_write with operation case_observation. Include
+      case evidence, call pa_business_write with operation tgg_case_observation. Include
       source, notes, confidence, and fields containing message_text, sender_name,
       chat_name, observed_at, photo_count, media_refs, and extracted case facts.
-    - For case-state updates, call pa_business_write with operation case_update before
+    - For case-state updates, call pa_business_write with operation tgg_case_update before
       replying.
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
@@ -115,14 +115,14 @@ job_briefs:
       operator asks what to chase, phrase the answer as the target/outcome,
       not an instruction to the operator.
     - For exact operator-cases job numbers (for example AM/JOB/2601/0361),
-      call pa_business_read with operation case_lookup before summarizing.
+      call pa_business_read with operation tgg_case_lookup before summarizing.
       If the returned case has workCostingRefs/workCostings, mention only that
       a WC is attached by default. Do not expand WC scope, amount, vendor, or
       line items unless the operator asks for costing/scope/claim/WC details.
     - >
       For normal operator questions about outstanding/open/pending cases by block,
       street, unit, zone, or address, use the operator DB only. Call
-      pa_business_read with operation case_search and payload search=<operator text>,
+      pa_business_read with operation tgg_case_search and payload search=<operator text>,
       limit=20. Do not send a state filter for "outstanding" because the operator
       DB stores in-progress jobs under source-specific states such as hdb_confirmed.
       This is the default for Sky-style questions such as "223A got what outstanding?".
@@ -132,11 +132,11 @@ job_briefs:
       issue, status, received age. Do not mention WC refs in general lists
       unless the operator asks about costing/scope/claim/WC.
       For exact count questions ("how many", "count only", "maint vs sprucing"),
-      call pa_business_read with operation case_search using the same search,
+      call pa_business_read with operation tgg_case_search using the same search,
       state, zone, serviceLine, and sourceStatus filters you would normally use,
       with a small limit such as 1. Answer counts from resultTotal,
       resultServiceLineSplit, and resultStateSplit on the returned rows. Do NOT
-      infer totals by counting returned rows; case_search is paginated and may
+      infer totals by counting returned rows; tgg_case_search is paginated and may
       be partial.
       Use serviceLine/serviceLineLabel from the tool when present. If a mixed
       result contains both Maintenance and Sprucing/EASE cases, you MUST group
@@ -147,10 +147,10 @@ job_briefs:
       "WhatsApp-only item", never write a WA-ONLY identifier. Describe it as
       "WhatsApp-only item" plus the unit/problem/source status.
       If the operator asks "maintenance only" or "sprucing only", pass
-      serviceLine=maintenance or serviceLine=sprucing in the case_search
+      serviceLine=maintenance or serviceLine=sprucing in the tgg_case_search
       payload.
       For oldest/long-outstanding or other broad mixed case lists, do not rely
-      on one mixed search. Run separate case_search calls for
+      on one mixed search. Run separate tgg_case_search calls for
       serviceLine=maintenance and serviceLine=sprucing, then answer under the
       two headings. Sort each section by receivedAgeDays descending before
       summarizing.

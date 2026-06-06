@@ -238,11 +238,11 @@
     },
     {
       "name": "live-config-case-create",
-      "command": "grep -q 'case_create:' /home/pclaw/.hermes-christopher-tgg-state/config.yaml && grep -q 'url: https://systems.papercut-labs.com/api/operator/cases/create' /home/pclaw/.hermes-christopher-tgg-state/config.yaml"
+      "command": "grep -q 'tgg_case_create:' /home/pclaw/.hermes-christopher-tgg-state/config.yaml && grep -q 'url: https://systems.papercut-labs.com/api/operator/cases/create' /home/pclaw/.hermes-christopher-tgg-state/config.yaml"
     },
     {
       "name": "live-constitution-custom-create",
-      "command": "grep -q 'operation case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -Eq '^[[:space:]]*- custom$' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
+      "command": "grep -q 'operation tgg_case_create' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'ilinked_wc_lookup' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -q 'operation ilinked_status' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml && grep -Eq '^[[:space:]]*- custom$' /home/pclaw/.hermes-christopher-tgg-state/christopher_tgg_constitution.yaml"
     },
     {
       "name": "outbound-policy-check",

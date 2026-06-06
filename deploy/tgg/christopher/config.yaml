@@ -27,66 +27,6 @@ pa:
           type: bearer
           token_env: CHRISTOPHER_TGG_PS_SERVICE_TOKEN
         operations:
-          case_create:
-            type: http
-            tenant: tgg
-            method: POST
-            url: https://systems.papercut-labs.com/api/operator/cases/create
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
-          case_lookup:
-            type: http
-            tenant: tgg
-            method: GET
-            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}
-            path_params:
-            - jobNo
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
-          case_list:
-            type: http
-            tenant: tgg
-            method: GET
-            url: https://systems.papercut-labs.com/api/operator/cases
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
-          case_search:
-            type: http
-            tenant: tgg
-            method: GET
-            url: https://systems.papercut-labs.com/api/operator/cases
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
-          case_update:
-            type: http
-            tenant: tgg
-            method: PATCH
-            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/state
-            path_params:
-            - jobNo
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
-          case_observation:
-            type: http
-            tenant: tgg
-            method: POST
-            url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/observations
-            path_params:
-            - jobNo
-            headers:
-              X-PS-Tenant: tgg
-              User-Agent: curl/8.7.1
-            timeout: 10
           tgg_case_create:
             type: http
             tenant: tgg
