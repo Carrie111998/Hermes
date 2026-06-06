@@ -150,7 +150,6 @@ function MediaAttachment({ path }: { path: string }) {
     let objectUrl = ''
 
     setFailed(false)
-    setSrc('')
 
     if (kind === 'file') {
       setFailed(true)
