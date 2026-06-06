@@ -24,26 +24,6 @@
       "owner": "pclaw:pclaw"
     },
     {
-      "sourcePath": "scripts/whatsapp-bridge/allowlist.js",
-      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/allowlist.js",
-      "owner": "pclaw:pclaw"
-    },
-    {
-      "sourcePath": "scripts/whatsapp-bridge/bridge.js",
-      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/bridge.js",
-      "owner": "pclaw:pclaw"
-    },
-    {
-      "sourcePath": "scripts/whatsapp-bridge/package.json",
-      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/package.json",
-      "owner": "pclaw:pclaw"
-    },
-    {
-      "sourcePath": "scripts/whatsapp-bridge/package-lock.json",
-      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/package-lock.json",
-      "owner": "pclaw:pclaw"
-    },
-    {
       "sourcePath": "scripts/whatsapp-bridge-v2/allowlist.js",
       "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge-v2/allowlist.js",
       "owner": "pclaw:pclaw"
@@ -151,11 +131,6 @@
       "targetPath": "etc/systemd/system/wa-pair-server.service",
       "mode": "644",
       "owner": "root:root"
-    },
-    {
-      "sourcePath": "scripts/whatsapp-bridge/allowlist.test.mjs",
-      "targetPath": "home/pclaw/apps/hermes-pcl/scripts/whatsapp-bridge/allowlist.test.mjs",
-      "owner": "pclaw:pclaw"
     },
     {
       "sourcePath": "scripts/whatsapp-bridge-v2/christopher-tgg-whatsapp-v2.service",
