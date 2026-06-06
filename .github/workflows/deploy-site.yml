@@ -22,7 +22,6 @@ concurrency:
 
 jobs:
   deploy-vercel:
-    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Trigger Vercel Deploy

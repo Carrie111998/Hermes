@@ -28,6 +28,7 @@ Usage::
 
 import logging
 import os
+import sys
 import shlex
 import shutil
 import subprocess
@@ -67,7 +68,7 @@ def _safe_find_spec(module_name: str) -> bool:
     try:
         return _ilu.find_spec(module_name) is not None
     except (ImportError, ValueError):
-        return module_name in globals() or module_name in os.sys.modules
+        return module_name in globals() or module_name in sys.modules
 
 
 _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
@@ -101,7 +102,7 @@ OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
 GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-large-v3-en"}
 
 # Singleton for the local model — loaded once, reused across calls
-_local_model: Optional[object] = None
+_local_model: Any = None
 _local_model_name: Optional[str] = None
 
 # ---------------------------------------------------------------------------
@@ -418,11 +419,12 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
-        transcribe_kwargs = {"beam_size": 5}
+        transcribe_kwargs: Dict[str, Any] = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
         try:
+            assert _local_model is not None
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
             transcript = " ".join(segment.text.strip() for segment in segments)
         except Exception as exc:
@@ -506,6 +508,7 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             if prep_error:
                 return {"success": False, "transcript": "", "error": prep_error}
 
+            assert prepared_input is not None
             command = command_template.format(
                 input_path=shlex.quote(prepared_input),
                 output_dir=shlex.quote(output_dir),
