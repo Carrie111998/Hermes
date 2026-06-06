@@ -1,0 +1,17 @@
+[Unit]
+Description=SingPass QR pair server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SINGPASS_PAIR_HOST=0.0.0.0
+Environment=SINGPASS_PAIR_PORT=8090
+Environment=SINGPASS_RELAY_URL_DNC=http://100.67.121.52:8091
+Environment=SINGPASS_RELAY_URL_ILINKED=http://100.67.121.52:8093
+ExecStart=/usr/bin/python3 /usr/local/bin/singpass-pair-server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

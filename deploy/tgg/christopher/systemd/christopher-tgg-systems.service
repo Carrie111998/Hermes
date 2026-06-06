@@ -1,0 +1,32 @@
+[Unit]
+Description=Christopher/TGG systems.papercut-labs runtime
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pclaw
+Group=pclaw
+WorkingDirectory=/home/pclaw/apps/systems-papercut-labs
+Environment=HOME=/home/pclaw
+Environment=USER=pclaw
+Environment=LOGNAME=pclaw
+Environment=NODE_ENV=production
+Environment=PORT=5191
+Environment=HOST=127.0.0.1
+Environment=PS_DATA_DIR=/home/pclaw/.systems-pcl/data
+Environment=PS_APEX_DEFAULT_TENANT=tgg
+# Live unit carries TGG_OPERATOR_PASSWORD and TGG_VIEWER_PASSWORD on-host.
+# Credential literals are intentionally not committed to source.
+EnvironmentFile=-/home/pclaw/.systems-pcl/tgg-systems.env
+ExecStart=/usr/bin/node dist/server/server/main.js
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
