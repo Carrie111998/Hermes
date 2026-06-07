@@ -1,46 +1,54 @@
-# Feature Development Workflow — 9-Phase Fleet Pipeline
+# Feature Development Workflow — Fleet Project Pipeline
 #
-# Trigger events: pr_opened, branch_created
-# Board: fleet-workflow
+# Derived from:
+#   - CI-TEMPLATE.md (canonical, 2026-06-03) — PR lifecycle, dual-approval gate, post-merge actions
+#   - delivery-pipeline.md (canonical, 2026-05-23) — branching model, deploy, Raven QA gate
+#   - pr-review-pipeline.md (2026-03-31) — Nikola spec gate replaced by Sherlock per CI template
 #
 # DAG:
-#   Edison (spec) ──┬── Newton (build) ──┬── Raven (QA) ── Ada (security) ── Sherlock (gate)
-#                   └── Sprite (assets) ─┘
-#
-# Sprite and Newton run in parallel after Edison completes.
-# Raven waits for BOTH Newton AND Sprite.
-# Ada waits for Raven.
-# Sherlock (merge gate) waits for Ada.
+#   edison-spec ──┬── newton-build ──┬── ci-green ──┬── sherlock-review ──┬── merge ──┬── nikola-state
+#                 └── sprite-assets ─┘              └── raven-review ─────┘           ├── raven-regression
+#                                                                                     ├── newton-teardown
+#                                                                                     └── ada-security
 
 name: feature-dev
 description: >
-  9-phase fleet pipeline from spec to merge. Edison writes the spec,
-  Newton builds and Sprite creates assets in parallel, Raven reviews,
-  Ada audits security, Sherlock gates the merge.
+  Fleet project pipeline from spec to merge. Edison writes the spec,
+  Newton builds and Sprite creates assets in parallel. CI gates build
+  quality. Sherlock (spec/scope) and Raven (product/regression) approve
+  in parallel. Post-merge: Nikola folds state, Raven smoke-tests,
+  Newton tears down, Ada security-scans.
 
 trigger_events:
   - pr_opened
   - branch_created
+  - workflow_dispatch
 
 nodes:
 
-  # ── Phase 1: Specification ──
+  # ── Phase 1: Specification (pre-PR) ──
+  # Edison owns architecture. Spec is the contract Newton implements against.
   edison-spec:
     agent: edison
     task: >
-      Write the implementation spec for this feature. Output to
-      docs/specs/{feature}.md. Define interfaces, data flow, edge cases,
-      and acceptance criteria. Flag any breaking changes or dependencies.
+      Write the implementation spec. Reference the project's existing SPEC.md
+      or create one if new. Define: architecture decisions, data flow, interfaces,
+      edge cases, acceptance criteria, and any breaking changes. Output to
+      docs/specs/{feature}.md or update the project SPEC.md directly.
     timeout_minutes: 45
     channel: orchestration
 
-  # ── Phase 2: Build + Assets (parallel) ──
+  # ── Phase 2: Build + Assets (parallel, pre-PR) ──
+  # Newton implements. Sprite creates visuals. Both depend on Edison's spec.
+
   newton-build:
     agent: newton
     task: >
-      Implement the feature per Edison's spec at docs/specs/{feature}.md.
-      Write tests, ensure CI passes, and push to the feature branch.
-      Follow TDD — tests before implementation.
+      Implement the feature per Edison's spec. Branch from development:
+      feat/{feature}. Follow TDD — tests before implementation. Ensure CI
+      passes locally before pushing. Open PR to development with auto-merge
+      enabled. Do NOT tag Raven directly — the pipeline routes through
+      Sherlock and Nikola.
     depends_on:
       - edison-spec
     timeout_minutes: 120
@@ -49,48 +57,119 @@ nodes:
   sprite-assets:
     agent: sprite
     task: >
-      Create any visual assets, diagrams, or UI components needed for
-      the feature per Edison's spec at docs/specs/{feature}.md.
-      Export to assets/{feature}/.
+      Create visual assets, diagrams, UI components, or design elements
+      needed for this feature per Edison's spec. Export to assets/{feature}/.
+      If the feature has no visual surface, confirm and exit.
     depends_on:
       - edison-spec
     timeout_minutes: 60
     channel: orchestration
 
-  # ── Phase 3: QA Review ──
-  raven-qa:
-    agent: raven
+  # ── Phase 3: CI Gate (mechanical) ──
+  # CI runs on PR. CI bot notifies Sherlock + Raven on green.
+  # On failure: routes back to Newton. This node represents "CI passed."
+  ci-green:
+    agent: sherlock  # Sherlock monitors CI, triggers next phase on green
     task: >
-      Review Newton's implementation and Sprite's assets against Edison's spec.
-      Run the test suite. Check for: spec compliance, code quality, test coverage,
-      edge case handling, performance regressions. Approve or request changes.
+      Monitor CI for this PR. On green: advance to review phase.
+      On failure: route back to Newton with failure details.
+      On conflict: flag Newton for rebase.
     depends_on:
       - newton-build
+    timeout_minutes: 30
+    channel: orchestration
+
+  # ── Phase 4: Dual Approval Gate (parallel) ──
+  # Sherlock checks spec compliance + scope. Raven checks product reality + regression.
+  # Both must approve. They work in parallel.
+
+  sherlock-review:
+    agent: sherlock
+    task: >
+      Review PR for spec compliance and scope. Check: does the implementation
+      match Edison's spec? Are acceptance criteria satisfied? Is the scope correct
+      (no creeping features, no missing requirements)? Approve or request changes.
+      If approving and Raven hasn't approved yet: tag Raven with signal.
+    depends_on:
+      - ci-green
+      - sprite-assets  # Assets must be done before visual review
+    timeout_minutes: 30
+    channel: orchestration
+
+  raven-review:
+    agent: raven
+    task: >
+      Review PR for product reality and regression. Check: code quality, test
+      coverage, edge cases, UI consistency (against Sprite's assets if applicable),
+      performance regressions. Run E2E via Playwright if PR touches UI.
+      Approve or request changes. Both Sherlock AND Raven must approve for merge.
+      Wait for BOTH signals: Sherlock's approval + CI green.
+    depends_on:
+      - ci-green
       - sprite-assets
     timeout_minutes: 45
     channel: orchestration
 
-  # ── Phase 4: Security Audit ──
-  ada-security:
-    agent: ada
+  # ── Phase 5: Merge Gate ──
+  # Both approvals in → auto-merge fires (branch protection: 2 required reviewers).
+  # This node represents the merge-complete signal.
+  merge:
+    agent: sherlock
     task: >
-      Security review of the implementation. Check for: credential exposure,
-      injection vectors, path traversal, unsafe dependencies, auth bypass.
-      Run security linting. Approve or block with findings.
+      Verify both approvals received (Sherlock + Raven). Confirm CI green.
+      Auto-merge fires when both conditions met. Mark PR as complete.
+      Trigger post-merge actions.
     depends_on:
-      - raven-qa
+      - sherlock-review
+      - raven-review
+    timeout_minutes: 10
+    channel: orchestration
+
+  # ── Phase 6: Post-Merge Actions (parallel) ──
+  # Four agents each have post-merge responsibilities per CI template.
+  # All fire in parallel after merge.
+
+  nikola-state:
+    agent: nikola
+    task: >
+      Fold the completed work into STATE.md and the relevant domain _index.md.
+      Update project documentation to reflect the merged changes. This is
+      librarian motion — no code changes, documentation only.
+    depends_on:
+      - merge
+    timeout_minutes: 20
+    channel: orchestration
+
+  raven-regression:
+    agent: raven
+    task: >
+      Run regression / smoke pass against the merged change. Hit the dev
+      environment (dev.<project>.mcclean.codes). Verify no regressions
+      in primary user flows. File issues for any failures.
+    depends_on:
+      - merge
     timeout_minutes: 30
     channel: orchestration
 
-  # ── Phase 5: Merge Gate ──
-  sherlock-gate:
-    agent: sherlock
+  newton-teardown:
+    agent: newton
     task: >
-      Final gate before merge. Verify all prior phases passed:
-      spec approved, build green, assets complete, QA approved,
-      security cleared. If all clear, approve merge to main.
-      If any phase failed, reject and route back to the failing agent.
+      Tear down the worktree and any project-side scaffolding created during
+      this feature. Clean up feature branch (delete after merge). Remove
+      temporary assets, test fixtures, or debug artifacts.
     depends_on:
-      - ada-security
+      - merge
     timeout_minutes: 15
+    channel: orchestration
+
+  ada-security:
+    agent: ada
+    task: >
+      Run dependency scan and secret scan on the merge diff. Check for:
+      new dependencies with known vulnerabilities, accidentally committed
+      secrets, unsafe patterns introduced in the PR. File issues for
+      any findings.
+    depends_on:
+      - merge
+    timeout_minutes: 20
     channel: orchestration
