@@ -18,15 +18,13 @@ Design notes
 
 from __future__ import annotations
 
-import json
 import logging
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-logger = logging.getLogger(__name__)
+from hermes_cli.llm_utils import extract_json_blob
 
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+logger = logging.getLogger(__name__)
 
 
 # ── Mode: escalation analysis ─────────────────────────────────────
@@ -287,7 +285,7 @@ def _invoke(
     except Exception:
         raw = ""
 
-    parsed = _extract_json_blob(raw)
+    parsed = extract_json_blob(raw)
     if parsed is None:
         return AnalystOutcome(
             mode=mode, success=False,
@@ -296,20 +294,3 @@ def _invoke(
         )
 
     return AnalystOutcome(mode=mode, success=True, result=parsed, raw_response=raw)
-
-
-def _extract_json_blob(raw: str) -> Optional[dict]:
-    """Extract a JSON object from an LLM response, tolerating fences."""
-    stripped = raw.strip()
-    # Strip ```json / ``` fences
-    stripped = _FENCE_RE.sub("", stripped).strip()
-    # Find the outermost { ... }
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    candidate = stripped[start:end + 1]
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None

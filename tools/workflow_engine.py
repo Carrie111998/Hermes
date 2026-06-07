@@ -72,6 +72,7 @@ class NodeState:
     attempts: int = 0
     error: Optional[str] = None
     loop_count: int = 0           # Number of revision loops for this verify node
+    loop_history: list[str] = field(default_factory=list)  # Full history of LOOP rejections
 
 # ── Engine core ──────────────────────────────────────────────────
 
@@ -301,8 +302,11 @@ class WorkflowEngine:
         except Exception:
             return  # Auxiliary module not available
 
-        # Build loop history from the verify node's error (last LOOP message)
-        loop_history = verify_state.error or "No loop history available"
+        # Build loop history from the full list of LOOP rejections
+        if verify_state.loop_history:
+            loop_history = "\n".join(verify_state.loop_history)
+        else:
+            loop_history = verify_state.error or "No loop history available"
         project = (context or {}).get("project", "unknown")
 
         outcome = analyze_escalation(
@@ -775,6 +779,9 @@ class WorkflowEngine:
                             if revision_node:
                                 state.status = "revision_needed"
                                 state.loop_count += 1
+                                state.loop_history.append(
+                                    f"Round {state.loop_count}: {body[:200]}"
+                                )
                                 state.error = f"LOOP #{state.loop_count}: {body[:100]}"
                                 results[nid] = "revision_needed"
                                 print(f"   ↩  {nid} → LOOP:{target} "
