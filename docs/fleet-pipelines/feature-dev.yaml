@@ -1,0 +1,96 @@
+# Feature Development Workflow — 9-Phase Fleet Pipeline
+#
+# Trigger events: pr_opened, branch_created
+# Board: fleet-workflow
+#
+# DAG:
+#   Edison (spec) ──┬── Newton (build) ──┬── Raven (QA) ── Ada (security) ── Sherlock (gate)
+#                   └── Sprite (assets) ─┘
+#
+# Sprite and Newton run in parallel after Edison completes.
+# Raven waits for BOTH Newton AND Sprite.
+# Ada waits for Raven.
+# Sherlock (merge gate) waits for Ada.
+
+name: feature-dev
+description: >
+  9-phase fleet pipeline from spec to merge. Edison writes the spec,
+  Newton builds and Sprite creates assets in parallel, Raven reviews,
+  Ada audits security, Sherlock gates the merge.
+
+trigger_events:
+  - pr_opened
+  - branch_created
+
+nodes:
+
+  # ── Phase 1: Specification ──
+  edison-spec:
+    agent: edison
+    task: >
+      Write the implementation spec for this feature. Output to
+      docs/specs/{feature}.md. Define interfaces, data flow, edge cases,
+      and acceptance criteria. Flag any breaking changes or dependencies.
+    timeout_minutes: 45
+    channel: orchestration
+
+  # ── Phase 2: Build + Assets (parallel) ──
+  newton-build:
+    agent: newton
+    task: >
+      Implement the feature per Edison's spec at docs/specs/{feature}.md.
+      Write tests, ensure CI passes, and push to the feature branch.
+      Follow TDD — tests before implementation.
+    depends_on:
+      - edison-spec
+    timeout_minutes: 120
+    channel: orchestration
+
+  sprite-assets:
+    agent: sprite
+    task: >
+      Create any visual assets, diagrams, or UI components needed for
+      the feature per Edison's spec at docs/specs/{feature}.md.
+      Export to assets/{feature}/.
+    depends_on:
+      - edison-spec
+    timeout_minutes: 60
+    channel: orchestration
+
+  # ── Phase 3: QA Review ──
+  raven-qa:
+    agent: raven
+    task: >
+      Review Newton's implementation and Sprite's assets against Edison's spec.
+      Run the test suite. Check for: spec compliance, code quality, test coverage,
+      edge case handling, performance regressions. Approve or request changes.
+    depends_on:
+      - newton-build
+      - sprite-assets
+    timeout_minutes: 45
+    channel: orchestration
+
+  # ── Phase 4: Security Audit ──
+  ada-security:
+    agent: ada
+    task: >
+      Security review of the implementation. Check for: credential exposure,
+      injection vectors, path traversal, unsafe dependencies, auth bypass.
+      Run security linting. Approve or block with findings.
+    depends_on:
+      - raven-qa
+    timeout_minutes: 30
+    channel: orchestration
+
+  # ── Phase 5: Merge Gate ──
+  sherlock-gate:
+    agent: sherlock
+    task: >
+      Final gate before merge. Verify all prior phases passed:
+      spec approved, build green, assets complete, QA approved,
+      security cleared. If all clear, approve merge to main.
+      If any phase failed, reject and route back to the failing agent.
+    depends_on:
+      - ada-security
+    timeout_minutes: 15
+    channel: orchestration
