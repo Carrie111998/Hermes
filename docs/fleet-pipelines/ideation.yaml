@@ -26,6 +26,8 @@
 #                                              ↓
 #   edison-revise-cards ──┘ (loop: back to edison-verify-cards if rejected)
 #
+#   sherlock-handoff ──▶ Implementation (Newton picks up cards from Kanban)
+#
 # Output: Security-approved task cards organized by domain, ready for Newton.
 
 name: ideation
@@ -34,8 +36,8 @@ description: >
   artifacts. Edison writes the domain-organized spec. Nikola verifies.
   Ada gates the spec for security. Sprite generates visual designs
   from approved domain specs. Nikola decomposes into task cards with
-  stitch_project IDs. Edison verifies the cards. Output: design-complete,
-  security-approved task cards ready for Newton.
+  stitch_screen_ids. Edison verifies the cards. Sherlock receives the
+  handoff and dispatches Newton via Kanban.
 
 trigger_events:
   - project_start     # Triggered when Randy says "start"
@@ -225,5 +227,27 @@ nodes:
       If cards were approved, confirm and exit.
     depends_on:
       - edison-verify-cards
+    timeout_minutes: 15
+    channel: orchestration
+
+  # ── Handoff: Ideation → Implementation ──
+  # When all cards are verified and approved, Sherlock receives the baton.
+  # The Kanban board is populated. It's time to dispatch Newton.
+  sherlock-handoff:
+    agent: sherlock
+    task: >
+      Ideation pipeline is complete. The Kanban board now has domain-organized,
+      security-approved, design-complete task cards ready for Newton.
+      Your job:
+      1. Verify all domain _index.md files exist (one per domain with cards)
+      2. Confirm the Kanban board reflects the ## Domain Dependency Graph ordering
+      3. Dispatch Newton via Kanban: assign the first layer of task cards
+         (domains with no unmet dependencies per the graph)
+      4. For each domain layer: run feature-dev pipeline or create Kanban cards
+         for Newton to pick up. Non-dependent domains can fire in parallel.
+      5. Monitor Newton's progress — as each card completes, advance to the
+         next dependent card in that domain
+    depends_on:
+      - edison-revise-cards
     timeout_minutes: 15
     channel: orchestration
