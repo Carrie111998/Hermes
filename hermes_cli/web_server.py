@@ -11602,6 +11602,28 @@ def _open_session_db_for_profile(profile: Optional[str]):
     return SessionDB(db_path=Path(home) / "state.db")
 
 
+def _new_stored_session_key() -> str:
+    import uuid as _uuid
+
+    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+
+
+def _decorate_session_row(
+    session: Dict[str, Any],
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    row = dict(session)
+    now = time.time()
+    row["is_active"] = (
+        row.get("ended_at") is None
+        and (now - row.get("last_active", row.get("started_at", 0))) < 300
+    )
+    row["archived"] = bool(row.get("archived"))
+    if profile:
+        row["profile"] = _cron_profile_home(profile)[0]
+    return row
+
+
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
 # profile. Bounds the config.yaml read to at most once per this window per
 # profile; the actual sweep is throttled far more coarsely by state_meta
@@ -11738,6 +11760,41 @@ async def get_session_messages(
             "returned": len(messages),
         },
     }
+
+
+class SessionFork(BaseModel):
+    id: Optional[str] = None
+    profile: Optional[str] = None
+    title: Optional[str] = None
+    until_message_id: Optional[int] = None
+
+
+@app.post("/api/sessions/{session_id}/fork")
+async def fork_session_endpoint(session_id: str, body: SessionFork):
+    def _fork():
+        db = _open_session_db_for_profile(body.profile)
+        try:
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                return None
+            sid = db.resolve_resume_session_id(sid)
+            fork_id = (body.id or "").strip() or _new_stored_session_key()
+            return db.fork_session(
+                sid,
+                fork_id,
+                title=body.title,
+                until_message_id=body.until_message_id,
+            )
+        finally:
+            db.close()
+
+    try:
+        forked = await asyncio.to_thread(_fork)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if forked is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return _decorate_session_row(forked, body.profile)
 
 
 @app.delete("/api/sessions/{session_id}")

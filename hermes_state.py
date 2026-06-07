@@ -5604,6 +5604,159 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
+    @staticmethod
+    def _decode_model_config_blob(model_config: Any) -> Dict[str, Any]:
+        """Deserialize a stored model_config JSON blob into a dict."""
+        if isinstance(model_config, dict):
+            return dict(model_config)
+        if not model_config:
+            return {}
+        try:
+            parsed = json.loads(model_config)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @staticmethod
+    def _next_title_in_lineage_for_conn(
+        conn: sqlite3.Connection,
+        base_title: str,
+    ) -> str:
+        """Conn-local version of :meth:`get_next_title_in_lineage`."""
+        match = re.match(r"^(.*?) #(\d+)$", base_title)
+        base = match.group(1) if match else base_title
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        cursor = conn.execute(
+            "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
+            (base, f"{escaped} #%"),
+        )
+        existing = [row["title"] for row in cursor.fetchall()]
+        if not existing:
+            return base
+
+        max_num = 1
+        for title in existing:
+            numbered = re.match(r"^.* #(\d+)$", title)
+            if numbered:
+                max_num = max(max_num, int(numbered.group(1)))
+        return f"{base} #{max_num + 1}"
+
+    def fork_session(
+        self,
+        source_session_id: str,
+        fork_session_id: str,
+        *,
+        title: Optional[str] = None,
+        until_message_id: Optional[int] = None,
+        source: Optional[str] = None,
+        cwd: Optional[str] = None,
+        end_parent: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a child session from a stored transcript prefix.
+
+        ``until_message_id`` is inclusive and must identify an active message
+        in the source session. The child records both ``parent_session_id`` and
+        a durable ``_branched_from`` model-config marker.
+        """
+        if not source_session_id:
+            raise ValueError("source session id is required")
+        if not fork_session_id:
+            raise ValueError("fork session id is required")
+        if until_message_id is not None and until_message_id <= 0:
+            raise ValueError("until_message_id must be a positive integer")
+
+        requested_title = self.sanitize_title(title) if title is not None else None
+
+        def _do(conn):
+            source_row = conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (source_session_id,),
+            ).fetchone()
+            if source_row is None:
+                raise ValueError(f"source session not found: {source_session_id}")
+
+            existing = conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?",
+                (fork_session_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(f"target session already exists: {fork_session_id}")
+
+            rows = list(
+                conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (source_session_id,),
+                ).fetchall()
+            )
+            copied_rows = rows
+            if until_message_id is not None:
+                copied_rows = []
+                for row in rows:
+                    copied_rows.append(row)
+                    if row["id"] == until_message_id:
+                        break
+                else:
+                    raise ValueError(
+                        f"until_message_id {until_message_id} not found in "
+                        f"source session {source_session_id}"
+                    )
+
+            model_config = self._decode_model_config_blob(source_row["model_config"])
+            model_config["_branched_from"] = source_session_id
+            child_title = requested_title or self._next_title_in_lineage_for_conn(
+                conn,
+                source_row["title"] or "branch",
+            )
+            child_cwd = cwd if cwd is not None else source_row["cwd"]
+            child_source = source or source_row["source"] or "tui"
+
+            conn.execute(
+                """INSERT INTO sessions (
+                       id, source, user_id, model, model_config, system_prompt,
+                       parent_session_id, cwd, started_at, title,
+                       billing_provider, billing_base_url, billing_mode
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fork_session_id,
+                    child_source,
+                    source_row["user_id"],
+                    source_row["model"],
+                    json.dumps(model_config),
+                    source_row["system_prompt"],
+                    source_session_id,
+                    child_cwd,
+                    time.time(),
+                    child_title,
+                    source_row["billing_provider"],
+                    source_row["billing_base_url"],
+                    source_row["billing_mode"],
+                ),
+            )
+
+            message_count, tool_call_count = self._copy_message_rows(
+                conn,
+                fork_session_id,
+                copied_rows,
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (message_count, tool_call_count, fork_session_id),
+            )
+
+            if end_parent:
+                conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = ? "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (time.time(), "branched", source_session_id),
+                )
+
+        self._execute_write(_do)
+        forked = self._get_session_rich_row(fork_session_id)
+        if forked is None:
+            raise ValueError(f"forked session not found after create: {fork_session_id}")
+        return forked
+
     def get_compression_tip(self, session_id: str) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
@@ -6415,6 +6568,49 @@ class SessionDB:
             return True
 
         return bool(self._execute_write(_do))
+
+    @staticmethod
+    def _copy_message_rows(
+        conn: sqlite3.Connection,
+        target_session_id: str,
+        rows: List[sqlite3.Row],
+    ) -> tuple[int, int]:
+        """Copy stored message rows without maintaining a second field list.
+
+        Database identity belongs to the child, while every other message
+        column is copied verbatim. Deriving the insert columns from ``SELECT
+        *`` keeps this primitive lossless when the message schema grows.
+        """
+        if not rows:
+            return 0, 0
+
+        copied_columns = [
+            column for column in rows[0].keys() if column not in {"id", "session_id"}
+        ]
+        insert_columns = ["session_id", *copied_columns]
+        quoted_columns = ", ".join(f'"{column}"' for column in insert_columns)
+        placeholders = ", ".join("?" for _ in insert_columns)
+        sql = f"INSERT INTO messages ({quoted_columns}) VALUES ({placeholders})"
+
+        tool_call_count = 0
+        for row in rows:
+            conn.execute(
+                sql,
+                (target_session_id, *(row[column] for column in copied_columns)),
+            )
+            raw_tool_calls = row["tool_calls"]
+            if raw_tool_calls:
+                try:
+                    parsed_tool_calls = json.loads(raw_tool_calls)
+                except (TypeError, ValueError):
+                    tool_call_count += 1
+                else:
+                    tool_call_count += (
+                        len(parsed_tool_calls)
+                        if isinstance(parsed_tool_calls, list)
+                        else 1
+                    )
+        return len(rows), tool_call_count
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
