@@ -99,6 +99,8 @@ nodes:
       edge cases, acceptance criteria, constraints, breaking changes.
       The spec must be implementable without re-litigating intent.
       Output: SPEC.md in the project's spec directory.
+      STANDARD: Load docs/references/spec-writing-standard.md — follow
+      spec conventions and quality rubric (10 criteria).
     depends_on:
       - nikola-artifacts
     timeout_minutes: 60
@@ -112,6 +114,8 @@ nodes:
       a corresponding spec section? Are edge cases covered? Are
       acceptance criteria testable? Return APPROVED (proceed to
       security review) or REVISIONS (back to Edison with specifics).
+      STANDARD: Use the spec quality rubric (10 criteria) from
+      docs/references/spec-writing-standard.md. Any ❌ = REVISIONS.
     depends_on:
       - edison-spec
     timeout_minutes: 30
@@ -145,6 +149,9 @@ nodes:
       spec would make all task cards invalid. Return APPROVED or
       BLOCKED with specific architecture-level findings. Nikola
       must not begin decomposition until this gate clears.
+      STANDARD: Follow docs/references/security-review-standard.md —
+      use severity levels, output template, and approval threshold.
+      Phase 5a mode: spec-level review of architecture only.
     depends_on:
       - edison-revise-spec
     timeout_minutes: 30
