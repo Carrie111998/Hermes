@@ -1,102 +1,179 @@
-# Ideation Pipeline — Spec → Validate → Decompose → Task Cards
+# Ideation Pipeline — Research → Spec → Decompose → Security Gate
 #
-# This is the discovery/planning phase. The spec is the contract.
-# Once the spec is solid and decomposed into tasks, Newton implements.
+# Derived from: docs/agents/hopper/reports/fleet-project-pipeline.md (canonical, 2026-06-06)
 #
-# Pipeline:
-#   edison-spec → ada-security → nikola-validate → edison-revise → nikola-decompose → edison-verify
+# Phases 1-7 of the 9-phase fleet pipeline. Ends when task cards pass
+# security review. Then Phase 8 (implementation) begins via feature-dev.
+#
+# DAG:
+#   nikola-research ──┐
+#   sherlock-setup ───┼── nikola-artifacts ── edison-spec ── nikola-verify-spec ──┐
+#                     │                                                          │
+#                     └──────────────────────────────────────────────────────────┘
+#                                              ↓
+#   edison-revise-spec ──┘ (loop: back to nikola-verify-spec if rejected)
+#
+#   nikola-decompose ── edison-verify-cards ── ada-security ──┐
+#                                              ↓               │
+#   edison-revise-cards ──┘ (loop: back to edison-verify-cards if rejected)
+#
+# Output: Approved task cards, gate cleared for Newton.
 
 name: ideation
 description: >
-  Ideation pipeline from concept to task cards. Edison writes the spec.
-  Ada reviews for security standards. Nikola validates against requirements.
-  Edison revises. Nikola decomposes into task cards. Edison verifies the
-  cards. Output: validated spec + decomposed task cards ready for Newton.
+  Phases 2-7 of the fleet project pipeline. Nikola researches and produces
+  artifacts. Edison writes the spec. Nikola verifies and decomposes into
+  task cards. Edison verifies the cards. Ada gates with security review.
+  Output: approved task cards ready for Newton implementation.
 
 trigger_events:
-  - project_start
-  - feature_request
+  - project_start     # Triggered when Randy says "start"
   - workflow_dispatch
 
 nodes:
 
-  # ── Phase 1: Draft Spec ──
-  edison-spec:
-    agent: edison
+  # ── Phase 2: Research ──
+  # Happens in parallel with ideation. By the time Randy says "start,"
+  # Nikola's research is ready for synthesis.
+  nikola-research:
+    agent: nikola
     task: >
-      Write the implementation spec. Reference the project requirements
-      and any existing SPEC.md. Define: architecture decisions, data flow,
-      interfaces, edge cases, acceptance criteria, constraints, and any
-      breaking changes. This spec is the contract — all subsequent phases
-      measure against it. Output to docs/specs/{feature}.md.
+      Research the tools, technologies, and patterns in the project context.
+      Investigate: what frameworks are appropriate? What APIs exist?
+      What are competitors using? What are the technical constraints?
+      Produce research findings for synthesis into reference.md.
+      This phase can begin during ideation — research in parallel.
+    timeout_minutes: 45
+    channel: orchestration
+
+  # ── Phase 3: Project Setup ──
+  # Sherlock creates the channel (if new), synthesizes all notes from
+  # ideation, and prepares context for Nikola. Triggered ONLY by Randy's
+  # "start" signal — never from Penny relay.
+  sherlock-setup:
+    agent: sherlock
+    task: >
+      Project setup. Create project channel if new. Synthesize all ideation
+      context (Penny's intent summaries, research findings, Randy's voice
+      messages). Prepare the full context package for Nikola. Verify the
+      "start" signal came directly from Randy — not relayed through Penny.
+    timeout_minutes: 30
+    channel: orchestration
+
+  # ── Phase 4: Artifact Generation ──
+  # Nikola produces reference.md (external research, relevant information,
+  # requirements) and project.md (problem statement, target users, goals).
+  nikola-artifacts:
+    agent: nikola
+    task: >
+      Produce two artifacts from the synthesized context and research:
+      1. reference.md — external research, relevant information, technical
+         requirements, constraints, API documentation references.
+      2. project.md — problem statement, target users, what the project aims
+         to solve, success criteria.
+      Output to the project's spec directory. These artifacts are the
+      foundation for Edison's spec.
+    depends_on:
+      - nikola-research
+      - sherlock-setup
     timeout_minutes: 60
     channel: orchestration
 
-  # ── Phase 2: Security Review ──
-  ada-security-review:
-    agent: ada
+  # ── Phase 5: Specification ──
+  # Edison generates the formal SPEC.md from Nikola's artifacts.
+  # Nikola verifies it against original requirements.
+  # Back-and-forth revision until the spec matches requirements.
+
+  edison-spec:
+    agent: edison
     task: >
-      Review Edison's spec for security implications. Check: authentication
-      patterns, data exposure, injection vectors, dependency risks, secret
-      handling, network egress, WAF posture. File findings. The spec should
-      not proceed to Nikola with unresolved security concerns.
+      Generate the formal SPEC.md from Nikola's reference.md and project.md.
+      Define: architecture decisions, data flow, component interfaces,
+      edge cases, acceptance criteria, constraints, breaking changes.
+      The spec must be implementable without re-litigating intent.
+      Output: SPEC.md in the project's spec directory.
+    depends_on:
+      - nikola-artifacts
+    timeout_minutes: 60
+    channel: orchestration
+
+  nikola-verify-spec:
+    agent: nikola
+    task: >
+      Verify Edison's SPEC.md against the original requirements in
+      reference.md and project.md. Check: does every requirement have
+      a corresponding spec section? Are edge cases covered? Are
+      acceptance criteria testable? Return APPROVED (proceed to
+      decompose) or REVISIONS (back to Edison with specifics).
     depends_on:
       - edison-spec
     timeout_minutes: 30
     channel: orchestration
 
-  # ── Phase 3: Validate Spec ──
-  nikola-validate:
-    agent: nikola
-    task: >
-      Validate Edison's spec against the project requirements (reference.md,
-      project charter, or stated goals). Check: does the spec address every
-      requirement? Are edge cases covered? Are acceptance criteria testable?
-      Is scope correct (no gold-plating, no missing features)? Return one of:
-      APPROVED (proceed to decompose) or REVISIONS (back to Edison with
-      specific feedback).
-    depends_on:
-      - ada-security-review
-    timeout_minutes: 30
-    channel: orchestration
-
-  # ── Phase 4: Revise Spec (conditional) ──
-  edison-revise:
+  edison-revise-spec:
     agent: edison
     task: >
-      Revise the spec per Nikola's feedback. Address every item in the
-      revision request. If no revisions requested (Nikola approved),
-      confirm and exit. Resubmit to Nikola for re-validation.
+      Revise SPEC.md per Nikola's feedback. Address every item in the
+      revision request. If Nikola approved (no revisions), confirm
+      and exit. Resubmit to Nikola for re-verification.
     depends_on:
-      - nikola-validate
+      - nikola-verify-spec
     timeout_minutes: 30
     channel: orchestration
 
-  # ── Phase 5: Decompose into Task Cards ──
+  # ── Phase 6: Task Decomposition ──
+  # Nikola decomposes the finalized spec into implementable task cards.
+  # Edison verifies the cards against the spec.
+  # Back-and-forth until cards match spec.
+
   nikola-decompose:
     agent: nikola
     task: >
-      Decompose the approved spec into discrete task cards. Each card must:
-      - Be independently completable by Newton
-      - Have clear acceptance criteria from the spec
-      - Be sized to fit within a single PR
-      - Include dependencies on other cards if applicable
-      Output: kanban board populated with task cards, each referencing
-      the spec section it implements.
+      Decompose the finalized SPEC.md into discrete, implementable task
+      cards. Each card must: be independently completable, have clear
+      acceptance criteria from the spec, be sized for a single PR,
+      include dependencies. Populate the project's kanban board.
     depends_on:
-      - edison-revise
+      - edison-revise-spec
     timeout_minutes: 45
     channel: orchestration
 
-  # ── Phase 6: Verify Task Cards ──
-  edison-verify:
+  edison-verify-cards:
     agent: edison
     task: >
-      Verify Nikola's task decomposition against the spec. Check: do the
-      cards cover every section of the spec? Is the dependency order
-      correct? Are acceptance criteria faithfully translated? Approve
-      or flag gaps. Once approved, Newton can begin implementation.
+      Verify Nikola's task cards against the SPEC.md. Check: do the cards
+      cover every section of the spec? Is dependency order correct? Are
+      acceptance criteria faithfully translated? Return APPROVED
+      (proceed to security review) or REVISIONS (back to Nikola).
     depends_on:
       - nikola-decompose
     timeout_minutes: 20
+    channel: orchestration
+
+  edison-revise-cards:
+    agent: edison
+    task: >
+      Request card revisions from Nikola per verification findings.
+      Address gaps, ordering issues, or acceptance criteria mismatches.
+      If cards were approved, confirm and exit.
+    depends_on:
+      - edison-verify-cards
+    timeout_minutes: 15
+    channel: orchestration
+
+  # ── Phase 7: Security Review ──
+  # Ada reviews the spec + task cards for security issues.
+  # Gate: must pass before implementation begins (Phase 8).
+  ada-security:
+    agent: ada
+    task: >
+      Security review of the spec and task cards. Check: dependency audit
+      (known vulnerabilities), data flow analysis (PII exposure, encryption),
+      authentication/authorization patterns, secret handling, input
+      validation, API endpoint security, deployment surface.
+      Return APPROVED or BLOCKED with specific findings. Implementation
+      cannot begin until this gate clears.
+    depends_on:
+      - edison-revise-cards
+    timeout_minutes: 30
     channel: orchestration
