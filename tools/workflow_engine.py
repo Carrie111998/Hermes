@@ -174,16 +174,18 @@ class WorkflowEngine:
     # ── Dependency lookup ─────────────────────────────────────
 
     def _find_revision_node(self, workflow: Workflow, verify_node_id: str) -> Optional[str]:
-        """Find the revision node that depends on a verify node."""
+        """
+        Find the revision node that depends on a verify node.
+
+        Assumes a single-revision pattern: each verify node has exactly
+        one revision node that depends on it. If future pipelines have
+        multiple revision nodes for one verify node, this returns the
+        first one encountered — upgrade to return a list when needed.
+        """
         for nid, node in workflow.nodes.items():
             if verify_node_id in node.depends_on:
                 return nid
         return None
-
-    def _find_dependents(self, workflow: Workflow, node_id: str) -> list[str]:
-        """Find all nodes that depend on the given node."""
-        return [nid for nid, node in workflow.nodes.items()
-                if node_id in node.depends_on]
 
     def _find_layer_for_node(self, layers: list[list[str]], node_id: str) -> int:
         """Find which layer a node belongs to."""
@@ -219,6 +221,11 @@ class WorkflowEngine:
             raise RuntimeError(f"Kanban card creation failed: {result.stderr}")
 
         # Parse card ID from output (format: "Created card <id>")
+        # Use regex for robustness — preserves correctness if CLI format changes
+        match = re.match(r'Created\s+card\s+(\S+)', result.stdout.strip())
+        if match:
+            return match.group(1)
+        # Fallback: try last token (fragile but works for legacy output)
         card_id = result.stdout.strip().split()[-1]
         return card_id
 
@@ -347,6 +354,29 @@ class WorkflowEngine:
                         f"Revision node '{nid}' should depend on a gate node "
                         f"(verify/security/review), got: {node.depends_on}"
                     )
+
+        # Check gate→revision pairs: each gate node that IS referenced by
+        # a revision node's depends_on should have a dependent. This catches
+        # misconfigured LOOP pairs without flagging post-merge tasks.
+        verify_patterns = ("verify", "security", "review")
+        revision_nodes = [nid for nid in workflow.nodes if "revise" in nid.lower()]
+        referenced_gates = set()
+        for rnid in revision_nodes:
+            for dep in workflow.nodes[rnid].depends_on:
+                if any(p in dep.lower() for p in verify_patterns):
+                    referenced_gates.add(dep)
+
+        for gate_id in referenced_gates:
+            has_dependent = any(
+                gate_id in other.depends_on
+                for other_id, other in workflow.nodes.items()
+                if other_id != gate_id
+            )
+            if not has_dependent:
+                result["issues"].append(
+                    f"Gate node '{gate_id}' is referenced by a revision node "
+                    f"but has no dependents — LOOP detection will find no revision node"
+                )
 
         return result
 
@@ -649,6 +679,12 @@ class WorkflowEngine:
                                 print(f"   ↩  {nid} → LOOP:{target} "
                                       f"(#{state.loop_count}, revision: {revision_node})")
                                 pending.discard(nid)
+
+                                # Warn if LOOP target doesn't match blocked node
+                                if target not in workflow.nodes:
+                                    print(f"   ⚠  LOOP target '{target}' not a valid node — "
+                                          f"falling back to blocked node '{nid}'")
+
                                 # Return immediately — caller handles loop
                                 return {
                                     "verify_node": target if target in workflow.nodes else nid,
