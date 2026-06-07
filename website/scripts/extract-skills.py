@@ -262,9 +262,10 @@ def extract_cached_index_skills():
 
     for s in skills:
         if not s["categoryLabel"]:
+            cat = s["category"]
             s["categoryLabel"] = CATEGORY_LABELS.get(
-                s["category"],
-                s["category"].replace("-", " ").title() if s["category"] else "Uncategorized",
+                cat,
+                str(cat).replace("-", " ").title() if cat else "Uncategorized",
             )
 
     return skills

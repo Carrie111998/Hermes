@@ -2978,7 +2978,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4030, f"path outside spawn-trees root: {exc}")
 
     try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
+        payload: dict[str, Any] = json.loads(resolved.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         return _err(rid, 5000, f"spawn_tree.load failed: {exc}")
 
@@ -5334,7 +5334,7 @@ def _(rid, params: dict) -> dict:
         # Curated model lists are preserved — list_authenticated_providers
         # populates `models` from the curated catalog, not provider_model_ids
         # (which would pull non-agentic models like TTS/embeddings/etc.).
-        payload = build_models_payload(
+        payload: dict[str, Any] = build_models_payload(
             ctx,
             include_unconfigured=True,
             picker_hints=True,
@@ -5404,7 +5404,7 @@ def _(rid, params: dict) -> dict:
             ),
             current_base_url=getattr(agent, "base_url", "") if agent else "",
         )
-        payload = build_models_payload(
+        payload: dict[str, Any] = build_models_payload(
             ctx, picker_hints=True, max_models=50,
         )
         provider_data = next(
