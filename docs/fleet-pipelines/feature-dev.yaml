@@ -39,8 +39,8 @@ nodes:
     agent: newton
     task: >
       Implement the feature per the task cards from ideation. Task cards
-      from Nikola already include stitch_project IDs and screen URLs.
-      Extract HTML/CSS from Stitch via get_screen_code before building.
+      from Nikola already include stitch_project + stitch_screen_id.
+      Extract HTML/CSS from Stitch via get_screen_code(screen_id) before building.
       Branch from development: feat/{feature}. Follow TDD — tests before
       implementation. Ensure CI passes locally before pushing. Open PR
       to development with auto-merge enabled. Do NOT tag Raven directly —
