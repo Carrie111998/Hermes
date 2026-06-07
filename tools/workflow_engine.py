@@ -289,6 +289,102 @@ class WorkflowEngine:
         if path.exists():
             path.unlink()
 
+    # ── Auxiliary analyst (LLM-backed, best-effort) ──────────────
+
+    def _try_escalation_analysis(self, workflow: Workflow,
+                                  verify_nid: str, verify_state: NodeState,
+                                  context: dict = None):
+        """Try LLM analysis of a deadlocked revision loop. Best-effort —
+        failure is silent; the engine continues with mechanical escalation."""
+        try:
+            from hermes_cli.workflow_analyst import analyze_escalation
+        except Exception:
+            return  # Auxiliary module not available
+
+        # Build loop history from the verify node's error (last LOOP message)
+        loop_history = verify_state.error or "No loop history available"
+        project = (context or {}).get("project", "unknown")
+
+        outcome = analyze_escalation(
+            project=project,
+            gate=verify_nid,
+            verify_node=verify_nid,
+            loop_history=loop_history,
+        )
+
+        if outcome.success and outcome.result:
+            summary = outcome.result.get("summary", "")
+            sticking = outcome.result.get("sticking_point", "")
+            actions = outcome.result.get("suggested_actions", [])
+            escalation = outcome.result.get("recommended_escalation", "sherlock_can_resolve")
+
+            print(f"   🧠 Escalation analysis: {summary}")
+            if sticking:
+                print(f"      Sticking point: {sticking}")
+            for i, action in enumerate(actions[:3], 1):
+                print(f"      Option {i}: {action}")
+            if escalation == "needs_randy":
+                print(f"   ⚠  Analyst recommends Randy involvement")
+        else:
+            print(f"   ⚠  Escalation analysis unavailable — "
+                  f"Sherlock must review manually")
+
+    def _try_failure_analysis(self, node: WorkflowNode, state: NodeState,
+                               elapsed_sec: float):
+        """Try LLM diagnosis of a node failure. Best-effort — silent on failure."""
+        try:
+            from hermes_cli.workflow_analyst import analyze_failure
+        except Exception:
+            return
+
+        outcome = analyze_failure(
+            node_id=node.id,
+            agent=node.agent,
+            task=node.task[:500],
+            timeout_minutes=node.timeout_minutes,
+            elapsed=f"{elapsed_sec:.0f}s",
+            error=state.error or "No error details",
+        )
+
+        if outcome.success and outcome.result:
+            cause = outcome.result.get("likely_cause", "unknown")
+            category = outcome.result.get("cause_category", "unknown")
+            fix = outcome.result.get("suggested_fix", "")
+            retry = outcome.result.get("should_retry", False)
+
+            print(f"   🧠 Failure diagnosis [{category}]: {cause}")
+            if fix:
+                print(f"      Fix: {fix}")
+            if retry:
+                print(f"      Analyst suggests retry")
+        # Silent on failure — mechanical handling continues
+
+    def _try_status_summary(self, workflow_name: str,
+                             saved_state: dict) -> Optional[str]:
+        """Try LLM summary of pipeline state. Returns summary text or None."""
+        try:
+            from hermes_cli.workflow_analyst import analyze_status
+        except Exception:
+            return None
+
+        outcome = analyze_status(
+            pipeline_name=workflow_name,
+            state_json=json.dumps(saved_state, indent=2)[:8000],
+        )
+
+        if outcome.success and outcome.result:
+            status = outcome.result.get("overall_status", "unknown")
+            alerts = outcome.result.get("attention_needed", [])
+            eta = outcome.result.get("estimated_completion", "")
+
+            lines = [f"Pipeline: {workflow_name} | Status: {status}"]
+            if eta:
+                lines.append(f"Estimated: {eta}")
+            for alert in alerts:
+                lines.append(f"⚠ {alert}")
+            return "\n".join(lines)
+        return None
+
     # ── Validation ─────────────────────────────────────────────
 
     def validate(self, workflow_name: str) -> dict:
@@ -528,6 +624,10 @@ class WorkflowEngine:
                     results[verify_nid] = "blocked"
                     print(f"   🚫 {verify_nid} exceeded {self.MAX_REVISION_LOOPS} "
                           f"revision loops — escalating to Sherlock")
+                    # Try LLM analysis of the deadlock
+                    self._try_escalation_analysis(
+                        workflow, verify_nid, verify_state, context
+                    )
                     layer_idx += 1  # Advance past this layer
                 else:
                     # Run the revision node
@@ -632,6 +732,7 @@ class WorkflowEngine:
                     state.error = f"Exceeded {node.timeout_minutes}min timeout"
                     results[nid] = "timed_out"
                     print(f"   ⏰ {nid} timed out after {elapsed:.0f}s")
+                    self._try_failure_analysis(node, state, elapsed)
                     pending.discard(nid)
                     continue
 
@@ -718,6 +819,7 @@ class WorkflowEngine:
             results[nid] = "timed_out"
             pending.discard(nid)
             print(f"   ⏰ {nid} timed out (layer poll exhausted)")
+            self._try_failure_analysis(node, state, max_polls * self.POLL_INTERVAL)
 
         return None  # No loop detected
 
@@ -728,7 +830,7 @@ class WorkflowEngine:
         if workflow_name:
             saved = self._load_state(workflow_name)
             if saved:
-                return {
+                result = {
                     "workflow": workflow_name,
                     "current_layer": saved["current_layer"],
                     "total_layers": len(saved["layers"]),
@@ -736,6 +838,11 @@ class WorkflowEngine:
                     "results": saved["results"],
                     "updated_at": saved.get("updated_at"),
                 }
+                # Try LLM summary
+                summary = self._try_status_summary(workflow_name, saved)
+                if summary:
+                    result["summary"] = summary
+                return result
             return {"workflow": workflow_name, "status": "no saved state"}
 
         # List all saved states
