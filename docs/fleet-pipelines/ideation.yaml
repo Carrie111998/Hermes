@@ -1,10 +1,11 @@
-# Ideation Pipeline — Research → Spec → Security → Decompose
+# Ideation Pipeline — Research → Spec → Security → Domain Decomposition
 #
 # Derived from: docs/agents/hopper/reports/fleet-project-pipeline.md (canonical, 2026-06-06)
 # Updated: Ada security moved to Phase 5a — gate after spec, before decomposition.
+# Updated: Domain-organized specs (v3) — decomposition follows domain boundaries.
 #
-# Phases 1-7 of the 9-phase fleet pipeline. Ends when task cards pass
-# security review and are ready for Newton.
+# Phases 1-7 of the 9-phase fleet pipeline. Domain parallelism emerges
+# naturally from the ## Domain Dependency Graph in SPEC.md.
 #
 # DAG:
 #   nikola-research ──┐
@@ -14,15 +15,14 @@
 #                                              ↓
 #   edison-revise-spec ──┘ (loop: back to nikola-verify-spec if rejected)
 #
-#   ada-security ──┐  ← NEW: security gate on the SPEC itself, BEFORE decomposition
-#                  │     If the spec has fundamental security flaws, catch them
-#                  │     before Nikola spends time decomposing into task cards.
+#   ada-security ──┐  ← Security gate on cross-cutting + per-domain specs
+#                  │     Review both SPEC.md and domains/*/SPEC.md.
 #                  │
 #   nikola-decompose ── edison-verify-cards ──┐
 #                                              ↓
 #   edison-revise-cards ──┘ (loop: back to edison-verify-cards if rejected)
 #
-# Output: Security-approved task cards, gate cleared for Newton.
+# Output: Security-approved task cards organized by domain, ready for Newton.
 
 name: ideation
 description: >
@@ -138,19 +138,17 @@ nodes:
   ada-security:
     agent: ada
     task: >
-      Security review of Edison's finalized SPEC.md. Check at the
-      architecture level: dependency audit (known vulnerabilities in
-      chosen packages), data flow analysis (PII exposure, encryption
-      boundaries, storage decisions), authentication/authorization
-      patterns, secret handling strategy, input validation approach,
-      API endpoint security, deployment surface and attack vectors.
+      Security review of Edison's finalized spec. Review at two levels:
+      1. Cross-cutting (SPEC.md): dependency audit, auth strategy, tooling,
+         API conventions, deployment surface, secret handling.
+      2. Per-domain (domains/*/SPEC.md): domain-specific data flow, interfaces,
+         PII exposure per domain, domain-specific attack surface.
       This review gates before decomposition — security flaws in the
       spec would make all task cards invalid. Return APPROVED or
-      BLOCKED with specific architecture-level findings. Nikola
+      BLOCKED with specific findings per domain. Nikola
       must not begin decomposition until this gate clears.
-      STANDARD: Follow docs/references/security-review-standard.md —
-      use severity levels, output template, and approval threshold.
-      Phase 5a mode: spec-level review of architecture only.
+      STANDARD: Per your AGENTS.md. Use severity levels, output template,
+      and approval threshold. Phase 5a mode: spec-level review.
     depends_on:
       - edison-revise-spec
     timeout_minutes: 30
@@ -158,16 +156,22 @@ nodes:
 
   # ── Phase 6: Task Decomposition ──
   # Nikola decomposes the security-approved spec into implementable
-  # task cards. Edison verifies the cards against the spec.
-  # Back-and-forth until cards match spec.
+  # task cards, one domain at a time. Domain parallelism emerges from
+  # the ## Domain Dependency Graph in SPEC.md.
+  # Edison verifies the cards against domain specs.
+  # Back-and-forth until cards match specs.
 
   nikola-decompose:
     agent: nikola
     task: >
-      Decompose the security-approved SPEC.md into discrete, implementable
-      task cards. Each card must: be independently completable, have clear
-      acceptance criteria from the spec, be sized for a single PR,
-      include dependencies. Populate the project's kanban board.
+      Decompose the security-approved spec into task cards, organized by
+      domain per the ## Domain Dependency Graph in SPEC.md. For each domain:
+      read domains/<name>/SPEC.md, produce task cards into
+      domains/<name>/tasks/TASK-<N>.md. Each card must: be independently
+      completable, have clear acceptance criteria from the domain spec,
+      be sized for a single PR, declare intra-domain dependencies.
+      Reference the domain scope — Newton should never load other domains.
+      Populate the project's kanban board with domain-grouped cards.
     depends_on:
       - ada-security
     timeout_minutes: 45
@@ -176,10 +180,11 @@ nodes:
   edison-verify-cards:
     agent: edison
     task: >
-      Verify Nikola's task cards against the SPEC.md. Check: do the cards
-      cover every section of the spec? Is dependency order correct? Are
-      acceptance criteria faithfully translated? Return APPROVED
-      (proceed) or REVISIONS (back to Nikola).
+      Verify Nikola's task cards against the domain specs. Per domain:
+      do the task cards cover every section of domains/<name>/SPEC.md?
+      Is intra-domain dependency order correct? Are acceptance criteria
+      faithfully translated from the domain spec? Return APPROVED
+      (proceed) or REVISIONS (back to Nikola with per-domain specifics).
     depends_on:
       - nikola-decompose
     timeout_minutes: 20
