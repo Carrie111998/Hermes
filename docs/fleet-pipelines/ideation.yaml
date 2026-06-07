@@ -17,6 +17,9 @@
 #
 #   ada-security ──┐  ← Security gate on cross-cutting + per-domain specs
 #                  │     Review both SPEC.md and domains/*/SPEC.md.
+#                  │     APPROVED → sprite-designs. BLOCKED → edison-revise-for-security.
+#                  │
+#   edison-revise-for-security ──┘  ← Revision loop (back to ada-security)
 #                  │
 #   sprite-designs ──┐  ← Frontend design gate (skipped for backend-only projects)
 #                    │     Generates Stitch screens from approved domain specs.
@@ -159,6 +162,26 @@ nodes:
       - edison-revise-spec
     timeout_minutes: 30
     channel: orchestration
+
+  # Ada → Edison revision loop. When Ada blocks the spec for security
+  # reasons, Edison must address findings and resubmit for re-review.
+  edison-revise-for-security:
+    agent: edison
+    task: >
+      Ada blocked the spec on security grounds. Read Ada's findings
+      (BLOCKER + CRITICAL items). Address each finding in the relevant
+      domain spec or cross-cutting SPEC.md. For BLOCKERs: fix the
+      architecture (e.g., change auth strategy, add encryption boundary,
+      remove PII exposure). For CRITICALs: commit to revision with
+      a concrete fix plan. Resubmit to Ada for re-review.
+      STANDARD: Per your AGENTS.md — the security-review-standard defines
+      the severity levels. BLOCKERs require architecture changes.
+    depends_on:
+      - ada-security
+    timeout_minutes: 45
+    channel: orchestration
+    # This node triggers a LOOP back to ada-security when complete.
+    # The engine detects the retry pattern and re-runs ada-security.
 
   # ── Phase 5b: Visual Design (Frontend Projects) ──
   # Sprite generates Stitch screens from the finalized domain specs.
