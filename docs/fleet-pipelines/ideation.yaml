@@ -272,5 +272,6 @@ nodes:
          next dependent card in that domain
     depends_on:
       - edison-revise-cards
+      - ada-security
     timeout_minutes: 15
     channel: orchestration
