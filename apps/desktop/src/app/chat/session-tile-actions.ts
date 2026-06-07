@@ -226,7 +226,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current)
+        await sessionTileDelegate()?.executeSlash(visibleText, runtimeIdRef.current, storedIdRef.current)
 
         return true
       }

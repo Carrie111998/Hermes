@@ -757,7 +757,7 @@ function toolPartFromStoredCall(call: unknown, fallbackIndex: number): ChatMessa
   }
 }
 
-function applyStoredToolResult(messages: ChatMessage[], toolMessage: SessionMessage): boolean {
+function applyStoredToolResult(messages: ChatMessage[], toolMessage: SessionMessage): null | number {
   const toolCallId = toolMessage.tool_call_id || undefined
   const toolName = toolMessage.tool_name || toolMessage.name || 'tool'
   const content = toolMessage.content || toolMessage.text || toolMessage.context || toolMessage.name
@@ -788,10 +788,10 @@ function applyStoredToolResult(messages: ChatMessage[], toolMessage: SessionMess
     } as ChatMessagePart
     messages[i] = { ...message, parts }
 
-    return true
+    return i
   }
 
-  return false
+  return null
 }
 
 function applyStoredToolResultToParts(parts: ChatMessagePart[], toolMessage: SessionMessage): ChatMessagePart[] | null {
@@ -872,18 +872,40 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   })
 }
 
-export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+interface ChatMessageBuildResult {
+  lastSourceMessageIdByChatId: Map<string, number>
+  messages: ChatMessage[]
+}
+
+function storedMessageSourceId(message: SessionMessage): null | number {
+  return typeof message.id === 'number' ? message.id : null
+}
+
+export function toChatMessagesWithSourceMap(messages: SessionMessage[]): ChatMessageBuildResult {
   const result: ChatMessage[] = []
+  const lastSourceMessageIdByChatId = new Map<string, number>()
   let pendingToolParts: ChatMessagePart[] = []
   let pendingToolTimestamp: number | undefined
+  let pendingToolSourceMessageId: null | number = null
   let activeAssistantIndex: null | number = null
 
   const clearPendingTools = () => {
     pendingToolParts = []
     pendingToolTimestamp = undefined
+    pendingToolSourceMessageId = null
   }
 
-  const appendPartsToActiveAssistant = (parts: ChatMessagePart[], timestamp?: number): boolean => {
+  const noteSourceMessage = (chatMessageId: string, sourceMessageId: null | number) => {
+    if (sourceMessageId !== null) {
+      lastSourceMessageIdByChatId.set(chatMessageId, sourceMessageId)
+    }
+  }
+
+  const appendPartsToActiveAssistant = (
+    parts: ChatMessagePart[],
+    timestamp?: number,
+    sourceMessageId?: null | number
+  ): boolean => {
     if (activeAssistantIndex === null) {
       return false
     }
@@ -898,6 +920,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     active.parts = [...active.parts, ...parts]
     active.timestamp = timestamp ?? active.timestamp
+    noteSourceMessage(active.id, sourceMessageId ?? null)
 
     return true
   }
@@ -907,7 +930,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return
     }
 
-    if (!appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp)) {
+    if (!appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp, pendingToolSourceMessageId)) {
       result.push({
         id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
         role: 'assistant',
@@ -915,27 +938,40 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
         timestamp: pendingToolTimestamp
       })
       activeAssistantIndex = result.length - 1
+      noteSourceMessage(result[activeAssistantIndex].id, pendingToolSourceMessageId)
     }
 
     clearPendingTools()
   }
 
   messages.forEach((message, index) => {
+    const sourceMessageId = storedMessageSourceId(message)
+
     if (message.role === 'tool') {
       const updatedPendingToolParts = applyStoredToolResultToParts(pendingToolParts, message)
 
       if (updatedPendingToolParts) {
         pendingToolParts = updatedPendingToolParts
+        pendingToolSourceMessageId = sourceMessageId ?? pendingToolSourceMessageId
 
         return
       }
 
-      if (applyStoredToolResult(result, message)) {
+      const updatedAssistantIndex = applyStoredToolResult(result, message)
+
+      if (updatedAssistantIndex !== null) {
+        const updatedAssistant = result[updatedAssistantIndex]
+
+        if (updatedAssistant) {
+          noteSourceMessage(updatedAssistant.id, sourceMessageId)
+        }
+
         return
       }
 
       pendingToolParts = [...pendingToolParts, storedToolMessagePart(message, index)]
       pendingToolTimestamp ??= message.timestamp
+      pendingToolSourceMessageId = sourceMessageId ?? pendingToolSourceMessageId
 
       return
     }
@@ -999,13 +1035,20 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     if (isToolOnlyAssistant) {
       pendingToolParts = [...pendingToolParts, ...parts]
       pendingToolTimestamp ??= message.timestamp
+      pendingToolSourceMessageId = sourceMessageId ?? pendingToolSourceMessageId
 
       return
     }
 
     if (message.role === 'assistant') {
       if (pendingToolParts.length) {
-        if (!appendPartsToActiveAssistant(pendingToolParts, message.timestamp ?? pendingToolTimestamp)) {
+        if (
+          !appendPartsToActiveAssistant(
+            pendingToolParts,
+            message.timestamp ?? pendingToolTimestamp,
+            pendingToolSourceMessageId
+          )
+        ) {
           parts.unshift(...pendingToolParts)
         }
 
@@ -1023,6 +1066,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       if (activeAssistant && (currentHasToolCall || activeHasToolCall)) {
         activeAssistant.parts = [...activeAssistant.parts, ...parts]
         activeAssistant.timestamp = message.timestamp ?? activeAssistant.timestamp
+        noteSourceMessage(activeAssistant.id, sourceMessageId)
 
         return
       }
@@ -1037,6 +1081,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       timestamp: message.timestamp,
       ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
     })
+    noteSourceMessage(result[result.length - 1].id, sourceMessageId)
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null
   })
@@ -1046,11 +1091,27 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     message.role === 'assistant' ? { ...message, parts: dedupeGeneratedImageEchoesInParts(message.parts) } : message
   )
 
-  return withUniqueToolCallIds(
+  const nextMessages = withUniqueToolCallIds(
     withoutGeneratedImageEchoes.filter(
       m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text') || m.attachmentRefs?.length
     )
   )
+
+  const nextSourceMap = new Map<string, number>()
+
+  for (const message of nextMessages) {
+    const sourceMessageId = lastSourceMessageIdByChatId.get(message.id)
+
+    if (sourceMessageId !== undefined) {
+      nextSourceMap.set(message.id, sourceMessageId)
+    }
+  }
+
+  return { lastSourceMessageIdByChatId: nextSourceMap, messages: nextMessages }
+}
+
+export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
+  return toChatMessagesWithSourceMap(messages).messages
 }
 
 export function preserveLocalAssistantErrors(

@@ -75,6 +75,7 @@ interface HarnessHandle {
   activeSessionIdRef: MutableRefObject<string | null>
   cancelRun: () => Promise<void>
   editMessage: (edited: Parameters<ReturnType<typeof usePromptActions>['editMessage']>[0]) => Promise<void>
+  executeSlashCommand: (...args: Parameters<ReturnType<typeof usePromptActions>['executeSlashCommand']>) => Promise<void>
   reloadFromMessage: (parentId: null | string) => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   redirectPrompt: (text: string) => Promise<boolean>
@@ -86,6 +87,8 @@ interface HarnessHandle {
 
 function Harness({
   activeSessionIdRef: activeSessionIdRefProp,
+  branchCurrentSession,
+  branchStoredSession,
   busyRef,
   getRoutedStoredSessionId,
   getRuntimeIdForStoredSession,
@@ -104,6 +107,8 @@ function Harness({
   createBackendSessionForSend
 }: {
   activeSessionIdRef?: MutableRefObject<string | null>
+  branchCurrentSession?: () => Promise<boolean>
+  branchStoredSession?: (storedSessionId: string) => Promise<boolean>
   busyRef?: MutableRefObject<boolean>
   getRoutedStoredSessionId?: () => null | string
   getRuntimeIdForStoredSession?: (storedSessionId: string) => null | string
@@ -147,7 +152,8 @@ function Harness({
   const actions = usePromptActions({
     activeSessionId: activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId,
     activeSessionIdRef,
-    branchCurrentSession: async () => true,
+    branchCurrentSession: branchCurrentSession ?? (async () => true),
+    branchStoredSession: branchStoredSession ?? (async () => true),
     busyRef: localBusyRef,
     createBackendSessionForSend: createBackendSessionForSend ?? (async () => RUNTIME_SESSION_ID),
     getRoutedStoredSessionId: getRoutedStoredSessionId ?? (() => null),
@@ -172,39 +178,102 @@ function Harness({
     }
   })
 
+  const {
+    cancelRun,
+    editMessage,
+    executeSlashCommand,
+    reloadFromMessage,
+    redirectPrompt,
+    restoreToMessage,
+    steerPrompt,
+    submitText
+  } = actions
+
   useEffect(() => {
     onReady({
       activeSessionIdRef,
-      cancelRun: (...args: Parameters<typeof actions.cancelRun>) =>
-        act(async () => actions.cancelRun(...args)) as Promise<void>,
-      editMessage: (...args: Parameters<typeof actions.editMessage>) =>
-        act(async () => actions.editMessage(...args)) as Promise<void>,
-      reloadFromMessage: (...args: Parameters<typeof actions.reloadFromMessage>) =>
-        act(async () => actions.reloadFromMessage(...args)) as Promise<void>,
-      restoreToMessage: (...args: Parameters<typeof actions.restoreToMessage>) =>
-        act(async () => actions.restoreToMessage(...args)) as Promise<void>,
-      redirectPrompt: (...args: Parameters<typeof actions.redirectPrompt>) =>
-        act(async () => actions.redirectPrompt(...args)) as Promise<boolean>,
-      steerPrompt: (...args: Parameters<typeof actions.steerPrompt>) =>
-        act(async () => actions.steerPrompt(...args)) as Promise<boolean>,
-      submitTextRaw: actions.submitText,
-      submitText: (...args: Parameters<typeof actions.submitText>) =>
-        act(async () => actions.submitText(...args)) as Promise<boolean>
+      cancelRun: (...args: Parameters<typeof cancelRun>) => act(async () => cancelRun(...args)) as Promise<void>,
+      editMessage: (...args: Parameters<typeof editMessage>) => act(async () => editMessage(...args)) as Promise<void>,
+      executeSlashCommand: (...args: Parameters<typeof executeSlashCommand>) =>
+        act(async () => executeSlashCommand(...args)) as Promise<void>,
+      reloadFromMessage: (...args: Parameters<typeof reloadFromMessage>) =>
+        act(async () => reloadFromMessage(...args)) as Promise<void>,
+      restoreToMessage: (...args: Parameters<typeof restoreToMessage>) =>
+        act(async () => restoreToMessage(...args)) as Promise<void>,
+      redirectPrompt: (...args: Parameters<typeof redirectPrompt>) =>
+        act(async () => redirectPrompt(...args)) as Promise<boolean>,
+      steerPrompt: (...args: Parameters<typeof steerPrompt>) =>
+        act(async () => steerPrompt(...args)) as Promise<boolean>,
+      submitTextRaw: submitText,
+      submitText: (...args: Parameters<typeof submitText>) => act(async () => submitText(...args)) as Promise<boolean>
     })
   }, [
-    actions.cancelRun,
-    actions.editMessage,
-    actions.reloadFromMessage,
-    actions.restoreToMessage,
-    actions.redirectPrompt,
-    actions.steerPrompt,
-    actions.submitText,
     activeSessionIdRef,
-    onReady
+    cancelRun,
+    editMessage,
+    executeSlashCommand,
+    reloadFromMessage,
+    onReady,
+    redirectPrompt,
+    restoreToMessage,
+    steerPrompt,
+    submitText
   ])
 
   return null
 }
+
+describe('usePromptActions /branch target', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('branches the invoking tile instead of the selected main conversation', async () => {
+    const branchCurrentSession = vi.fn(async () => true)
+    const branchStoredSession = vi.fn(async () => true)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        branchCurrentSession={branchCurrentSession}
+        branchStoredSession={branchStoredSession}
+        onReady={h => (handle = h)}
+        refreshSessions={vi.fn(async () => undefined)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+      />
+    )
+
+    await handle!.executeSlashCommand('/branch', {
+      sessionId: 'runtime-child',
+      storedSessionId: 'stored-child'
+    })
+
+    expect(branchStoredSession).toHaveBeenCalledWith('stored-child')
+    expect(branchCurrentSession).not.toHaveBeenCalled()
+  })
+
+  it('keeps main-surface /branch on the current conversation', async () => {
+    const branchCurrentSession = vi.fn(async () => true)
+    const branchStoredSession = vi.fn(async () => true)
+    let handle: HarnessHandle | null = null
+
+    await actRender(
+      <Harness
+        branchCurrentSession={branchCurrentSession}
+        branchStoredSession={branchStoredSession}
+        onReady={h => (handle = h)}
+        refreshSessions={vi.fn(async () => undefined)}
+        requestGateway={vi.fn(async () => ({}) as never)}
+      />
+    )
+
+    await handle!.executeSlashCommand('/branch')
+
+    expect(branchCurrentSession).toHaveBeenCalledOnce()
+    expect(branchStoredSession).not.toHaveBeenCalled()
+  })
+})
 
 describe('usePromptActions /title', () => {
   beforeEach(() => {

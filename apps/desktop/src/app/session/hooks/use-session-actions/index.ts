@@ -3,9 +3,14 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
-import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, forkSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  preserveLocalAssistantErrors,
+  toChatMessages,
+  toChatMessagesWithSourceMap
+} from '@/lib/chat-messages'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -44,6 +49,7 @@ import {
   setCurrentCwdTransient,
   setCurrentServiceTier,
   setCurrentUsage,
+  setForkOriginNotice,
   setFreshDraftReady,
   setIntroSeed,
   setMessages,
@@ -67,7 +73,13 @@ import {
 } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
-import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionMessage,
+  SessionResumeResponse,
+  UsageStats
+} from '@/types/hermes'
 
 import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
@@ -77,17 +89,14 @@ import {
   appendLiveSessionProjection,
   applyRuntimeInfo,
   applyStoredSessionPreviewRuntimeInfo,
-  type BranchMessage,
   chatMessageArraysEquivalent,
   isSessionGoneError,
   patchSessionWorkspace,
   preserveLocalPendingTurnMessages,
   reconcileResumeMessages,
-  resolveSessionProfile,
   resolveStoredSession,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
-  toBranchMessages,
   upsertOptimisticSession
 } from './utils'
 
@@ -131,6 +140,14 @@ function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?
   const output = stored.output_tokens || 0
 
   setCurrentUsage(current => ({ ...current, input, output, total: input + output }))
+}
+
+function visibleBranchableMessages(messages: ChatMessage[]): ChatMessage[] {
+  return messages.filter(message => !message.hidden && (message.role === 'assistant' || message.role === 'user'))
+}
+
+function upsertForkedSession(session: SessionInfo) {
+  setSessions(previous => [session, ...previous.filter(existing => existing.id !== session.id)])
 }
 
 function reconcileAuthoritativeMessages(
@@ -1096,85 +1113,85 @@ export function useSessionActions({
     ]
   )
 
-  // Shared fork: create a child session seeded with `branchMessages`, linked to
-  // `parentStoredId` so it nests under its parent, then open it as its own tab
-  // and switch to it — the parent chat stays put (mirrors openNewSessionTile).
-  const forkBranch = useCallback(
-    async (
-      branchMessages: BranchMessage[],
-      parentStoredId: null | string,
-      cwd?: string,
+  const forkStoredTranscript = useCallback(
+    async ({
+      messageId,
+      profile,
+      runtimeMessages,
+      sourceSessionId
+    }: {
+      messageId?: string
       profile?: null | string
-    ): Promise<boolean> => {
+      runtimeMessages?: ChatMessage[]
+      sourceSessionId: string
+    }): Promise<boolean> => {
       creatingSessionRef.current = true
 
       try {
-        // A branch belongs to its parent's OWNING profile. Swapping the live
-        // gateway first AND passing `profile` on the create mirrors
-        // desktopSessionCreateParams/resumeSession: in app-global remote mode
-        // one backend serves every profile, so an omitted profile silently
-        // lands the branch on the launch (default) profile — the "session
-        // jumps between profiles after branching" bug. The swap also makes
-        // upsertOptimisticSession's $activeGatewayProfile stamp correct.
         await ensureGatewayProfile(profile)
+        const stored = await getSessionMessages(sourceSessionId, profile)
+        const { lastSourceMessageIdByChatId, messages } = toChatMessagesWithSourceMap(stored.messages)
+        const branchableMessages = visibleBranchableMessages(messages)
 
-        // No title: the backend auto-names the branch from its parent's lineage.
-        const branched = await requestGateway<SessionCreateResponse>('session.create', {
-          cols: 96,
-          source: 'desktop',
-          ...(cwd && { cwd }),
-          ...(profile ? { profile } : {}),
-          messages: branchMessages.map(({ content, role }) => ({ content, role })),
-          ...(parentStoredId && { parent_session_id: parentStoredId })
-        })
+        if (!branchableMessages.length) {
+          notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoStoredMessage })
 
-        const routedSessionId = branched.stored_session_id ?? branched.session_id
-        const preview = branchMessages.map(({ content }) => content).find(Boolean) ?? null
-        // Draft until submit: nest under the parent at the parent's recency so it
-        // doesn't bubble to the top until a real message lands (backend persists
-        // + auto-names it then). The selected row survives refreshes (sessionsToKeep).
-        const rows = $sessions.get()
-        const parent = parentStoredId ? rows.find(session => sessionMatchesStoredId(session, parentStoredId)) : null
-
-        const siblings = parentStoredId
-          ? rows.filter(session => session.parent_session_id?.trim() === parentStoredId).length
-          : 0
-
-        setFreshDraftReady(false)
-        upsertOptimisticSession(
-          branched,
-          routedSessionId,
-          copy.branchTitle(siblings + 1).toLowerCase(),
-          preview,
-          parentStoredId,
-          parent ? parent.last_active || parent.started_at : undefined
-        )
-        ensureSessionState(branched.session_id, routedSessionId)
-        updateSessionState(
-          branched.session_id,
-          state => ({
-            ...state,
-            messages: branchMessages.map(({ source }) => source),
-            busy: false,
-            awaitingResponse: false
-          }),
-          routedSessionId
-        )
-
-        const runtimeInfo = applyRuntimeInfo(branched.info)
-        patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
-
-        if (runtimeInfo) {
-          updateSessionState(branched.session_id, state => ({ ...state, ...runtimeInfo }), routedSessionId)
+          return false
         }
 
-        // Open the branch as its own tab and switch to it, leaving the parent
-        // chat exactly where it is. Prime the tile with the create runtime so it
-        // skips a redundant resume. Do NOT select it as the primary session
-        // first — openSessionTile no-ops when the id is already primary.
-        openSessionTile(routedSessionId, 'center')
-        patchSessionTile(routedSessionId, { runtimeId: branched.session_id })
-        revealTreePane(`session-tile:${routedSessionId}`)
+        if (branchableMessages.some(message => !lastSourceMessageIdByChatId.has(message.id))) {
+          notify({
+            kind: 'warning',
+            title: copy.branchMessageUnavailable,
+            message: copy.branchMessageNotMapped
+          })
+
+          return false
+        }
+
+        let branchMessageOrdinal = messageId
+          ? branchableMessages.findIndex(message => message.id === messageId)
+          : branchableMessages.length - 1
+
+        if (messageId && branchMessageOrdinal < 0) {
+          const visibleRuntimeMessages = visibleBranchableMessages(runtimeMessages ?? [])
+          const runtimeOrdinal = visibleRuntimeMessages.findIndex(message => message.id === messageId)
+
+          if (
+            runtimeOrdinal >= 0 &&
+            runtimeOrdinal < branchableMessages.length &&
+            visibleRuntimeMessages
+              .slice(0, runtimeOrdinal + 1)
+              .every((message, index) => message.role === branchableMessages[index]?.role)
+          ) {
+            branchMessageOrdinal = runtimeOrdinal
+          }
+        }
+
+        const targetMessage = branchableMessages[branchMessageOrdinal]
+        const untilMessageId = targetMessage ? lastSourceMessageIdByChatId.get(targetMessage.id) : undefined
+
+        if (!targetMessage || untilMessageId === undefined || branchMessageOrdinal < 0) {
+          notify({
+            kind: 'warning',
+            title: copy.branchMessageUnavailable,
+            message: messageId ? copy.branchMessageNotMapped : copy.branchMessageNotStored
+          })
+
+          return false
+        }
+
+        clearNotifications()
+        const forked = await forkSession(sourceSessionId, { until_message_id: untilMessageId }, profile)
+        const child = profile && !forked.profile ? { ...forked, profile } : forked
+
+        upsertForkedSession(child)
+        setForkOriginNotice(child.id, sourceSessionId, branchMessageOrdinal)
+
+        // Current main opens branches as sibling tabs. The tile mounts from the
+        // stored id and resumes the copied child through the existing delegate.
+        openSessionTile(child.id, 'center')
+        revealTreePane(`session-tile:${child.id}`)
         broadcastSessionsChanged()
 
         return true
@@ -1188,13 +1205,16 @@ export function useSessionActions({
         }, 0)
       }
     },
-    [copy, creatingSessionRef, ensureSessionState, requestGateway, updateSessionState]
+    [copy, creatingSessionRef]
   )
 
-  // Branch the open chat — optionally from a specific message — off its live transcript.
+  // Branch the open chat at a visible runtime bubble, resolving that bubble
+  // back to an exact stored SQLite message boundary before copying anything.
   const branchCurrentSession = useCallback(
     async (messageId?: string): Promise<boolean> => {
-      if (!activeSessionIdRef.current) {
+      const sourceSessionId = selectedStoredSessionIdRef.current
+
+      if (!activeSessionIdRef.current || !sourceSessionId) {
         notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNeedsChat })
 
         return false
@@ -1206,69 +1226,37 @@ export function useSessionActions({
         return false
       }
 
-      const messages = $messages.get()
+      const source = await resolveStoredSession(sourceSessionId)
 
-      const at = messageId
-        ? messages.findIndex(message => message.id === messageId)
-        : messages.findLastIndex(message => message.role === 'assistant' || message.role === 'user')
-
-      const start = at >= 0 ? at : Math.max(messages.length - 1, 0)
-      const end = at >= 0 ? at + 1 : messages.length
-      const branchMessages = toBranchMessages(messages.slice(start, end))
-
-      if (!branchMessages.length) {
-        notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoText })
-
+      if (selectedStoredSessionIdRef.current !== sourceSessionId || busyRef.current) {
         return false
       }
 
-      clearNotifications()
-
-      // The open chat's owning profile, NOT the picker's / launch profile —
-      // /profile only retargets new chats, so a branch of an existing thread
-      // must stay on that thread's backend (cache hit for an open session).
-      const profile = await resolveSessionProfile(selectedStoredSessionIdRef.current)
-
-      return forkBranch(branchMessages, selectedStoredSessionIdRef.current, $currentCwd.get().trim(), profile)
+      return forkStoredTranscript({
+        messageId,
+        profile: source?.profile,
+        runtimeMessages: $messages.get(),
+        sourceSessionId: source?.id ?? sourceSessionId
+      })
     },
-    [activeSessionIdRef, busyRef, copy, forkBranch, selectedStoredSessionIdRef]
+    [activeSessionIdRef, busyRef, copy, forkStoredTranscript, selectedStoredSessionIdRef]
   )
 
-  // Branch any listed session, not just the open one. Reads the target's stored
-  // transcript directly (no resume/active-session dependency), so it works on
-  // right-click and nests under its parent.
+  // Branch any listed session at its latest stored user/assistant boundary.
   const branchStoredSession = useCallback(
     async (storedSessionId: string, sessionProfile?: string | null): Promise<boolean> => {
       clearNotifications()
 
-      // Right-clicking a session outside the paginated sidebar window is a cache
-      // miss: resolve it (cache → active backend → cross-profile) so the branch
-      // is created on the parent's OWNING profile, not whichever is live (#67603).
-      const stored =
+      const source =
         $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
         (sessionProfile ? undefined : await resolveStoredSession(storedSessionId))
 
-      const profile = sessionProfile ?? stored?.profile
-
-      try {
-        await ensureGatewayProfile(profile)
-        const { messages } = await getSessionMessages(storedSessionId, profile)
-        const branchMessages = toBranchMessages(toChatMessages(messages))
-
-        if (!branchMessages.length) {
-          notify({ kind: 'warning', title: copy.nothingToBranch, message: copy.branchNoText })
-
-          return false
-        }
-
-        return await forkBranch(branchMessages, stored?.id ?? storedSessionId, stored?.cwd?.trim(), profile)
-      } catch (err) {
-        notifyError(err, copy.branchFailed)
-
-        return false
-      }
+      return forkStoredTranscript({
+        profile: sessionProfile ?? source?.profile,
+        sourceSessionId: source?.id ?? storedSessionId
+      })
     },
-    [copy, forkBranch]
+    [forkStoredTranscript]
   )
 
   const removeSession = useCallback(

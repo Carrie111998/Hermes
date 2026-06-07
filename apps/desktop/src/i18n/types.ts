@@ -1579,6 +1579,11 @@ export interface Translations {
     }
   }
 
+  chat: {
+    forkOriginNotice: string
+    openSourceConversation: (title: string) => string
+  }
+
   composer: {
     message: string
     wakingProfile: (profile: string) => string
@@ -2365,11 +2370,15 @@ export interface Translations {
     resumeRetry: string
     nothingToBranch: string
     branchNeedsChat: string
+    branchNoStoredMessage: string
     sessionBusy: string
     branchStopCurrent: string
     branchNoText: string
     branchTitle: (n: number) => string
     branchFailed: string
+    branchMessageUnavailable: string
+    branchMessageNotStored: string
+    branchMessageNotMapped: string
     deleteFailed: string
     archived: string
     archiveFailed: string

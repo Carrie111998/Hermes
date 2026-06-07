@@ -66,6 +66,7 @@ interface SlashActionCtx {
   name: string
   recordInput: boolean
   sessionHint?: string
+  storedSessionHint?: string
 }
 
 interface SlashCommandDeps {
@@ -77,6 +78,7 @@ interface SlashCommandDeps {
     storedSessionId?: string | null
   ) => void
   branchCurrentSession: () => Promise<boolean>
+  branchStoredSession: (storedSessionId: string) => Promise<boolean>
   busyRef: MutableRefObject<boolean>
   copy: Translations['desktop']
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
@@ -107,6 +109,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
     activeSessionIdRef,
     appendSessionTextMessage,
     branchCurrentSession,
+    branchStoredSession,
     busyRef,
     copy,
     createBackendSessionForSend,
@@ -127,7 +130,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
   const compressInFlightRef = useRef(new Set<string>())
 
   return useCallback(
-    async (rawCommand: string, options?: { sessionId?: string; recordInput?: boolean }) => {
+    async (rawCommand: string, options?: { recordInput?: boolean; sessionId?: string; storedSessionId?: string }) => {
       // Resolve the session this command targets through the SHARED ladder that
       // submit.ts uses. A slash command runs backend commands against a runtime
       // session, and per-session state (`/goal`, `/usage`, `/status`) is keyed by
@@ -215,7 +218,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           }
 
           if (dispatch.type === 'alias') {
-            await runSlash(`/${dispatch.target}${arg ? ` ${arg}` : ''}`, sessionId, false)
+            await runSlash(`/${dispatch.target}${arg ? ` ${arg}` : ''}`, sessionId, false, ctx.storedSessionHint)
 
             return
           }
@@ -393,8 +396,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         new: async () => {
           startFreshSessionDraft()
         },
-        branch: async () => {
-          await branchCurrentSession()
+        branch: async ctx => {
+          if (ctx.storedSessionHint) {
+            await branchStoredSession(ctx.storedSessionHint)
+          } else {
+            await branchCurrentSession()
+          }
         },
         // /compress (alias /compact) runs the gateway's dedicated
         // session.compress RPC — the TUI's path
@@ -866,7 +873,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
       // The whole dispatcher: resolve the command's desktop surface, then act on
       // its kind. No per-command ladder — behavior lives in the registry.
-      async function runSlash(commandText: string, sessionHint?: string, recordInput = true): Promise<void> {
+      async function runSlash(
+        commandText: string,
+        sessionHint?: string,
+        recordInput = true,
+        storedSessionHint?: string
+      ): Promise<void> {
         const command = commandText.trim()
         const { name, arg } = parseSlashCommand(command)
 
@@ -888,7 +900,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return
         }
 
-        const ctx: SlashActionCtx = { arg, command, name, recordInput, sessionHint }
+        const ctx: SlashActionCtx = { arg, command, name, recordInput, sessionHint, storedSessionHint }
         const surface = resolveDesktopCommand(`/${name}`)?.surface
 
         switch (surface?.kind) {
@@ -914,12 +926,13 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         }
       }
 
-      await runSlash(rawCommand, options?.sessionId, options?.recordInput ?? true)
+      await runSlash(rawCommand, options?.sessionId, options?.recordInput ?? true, options?.storedSessionId)
     },
     [
       activeSessionIdRef,
       appendSessionTextMessage,
       branchCurrentSession,
+      branchStoredSession,
       busyRef,
       copy,
       createBackendSessionForSend,

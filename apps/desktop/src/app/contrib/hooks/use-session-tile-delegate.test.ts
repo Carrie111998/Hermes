@@ -33,12 +33,15 @@ const row = (over: Partial<SessionInfo>): SessionInfo =>
     ...over
   }) as SessionInfo
 
-function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
+function renderTile(
+  requestGateway: ReturnType<typeof vi.fn>,
+  executeSlashCommand: ReturnType<typeof vi.fn> = vi.fn(async () => undefined)
+) {
   renderHook(() =>
     useSessionTileDelegate({
       archiveSession: vi.fn(async () => undefined),
       branchStoredSession: vi.fn(async () => undefined),
-      executeSlashCommand: vi.fn(async () => undefined) as never,
+      executeSlashCommand: executeSlashCommand as never,
       removeSession: vi.fn(async () => undefined),
       requestGateway: requestGateway as never,
       runtimeIdByStoredSessionIdRef: { current: new Map() },
@@ -95,6 +98,21 @@ describe('useSessionTileDelegate resumeTile', () => {
       session_id: 'stored-y',
       cols: 96,
       profile: 'default'
+    })
+  })
+
+  it('carries a tile durable id into slash dispatch', async () => {
+    const executeSlashCommand = vi.fn(async () => undefined)
+
+    renderTile(
+      vi.fn(async () => ({}) as never),
+      executeSlashCommand
+    )
+    await sessionTileDelegate()!.executeSlash('/branch', 'runtime-child', 'stored-child')
+
+    expect(executeSlashCommand).toHaveBeenCalledWith('/branch', {
+      sessionId: 'runtime-child',
+      storedSessionId: 'stored-child'
     })
   })
 })

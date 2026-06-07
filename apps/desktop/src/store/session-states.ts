@@ -427,9 +427,8 @@ export interface SessionTileDelegate {
   branchSession(storedSessionId: string): Promise<void>
   /** Delete a stored session (the sidebar's delete, incl. tile cleanup). */
   deleteSession(storedSessionId: string): Promise<void>
-  /** Run a slash command against a tile's session (app-level effects — e.g.
-   *  branch/handoff — act on the main surface, as they should). */
-  executeSlash(rawCommand: string, sessionId: string): Promise<void>
+  /** Run a slash command against a tile's runtime + durable session identity. */
+  executeSlash(rawCommand: string, sessionId: string, storedSessionId: string): Promise<void>
   /** Interrupt a tile's running turn. */
   interruptSession(runtimeId: string): Promise<void>
   /** Bind a live runtime id for a stored session (resume without touching

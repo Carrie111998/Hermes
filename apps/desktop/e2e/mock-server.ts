@@ -32,6 +32,7 @@ verificationWritePath?: string
 export interface MockServer {
   port: number
   url: string
+  receivedRequests: Record<string, unknown>[]
   receivedPrompts: string[]
   waitForHeldStream: () => Promise<void>
   waitForHeldCompletion: () => Promise<void>
@@ -281,6 +282,7 @@ function includesBlockingClarifyTrigger(value: unknown): boolean {
  */
 export function startMockServer(options: MockServerOptions = {}): Promise<MockServer> {
   return new Promise((resolve, reject) => {
+    const receivedRequests: Record<string, unknown>[] = []
     const receivedPrompts: string[] = []
     let resolveHeldStreamStarted: (() => void) | null = null
     let releaseHeldStream: (() => void) | null = null
@@ -338,6 +340,10 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
             parsed = JSON.parse(body)
           } catch {
             // malformed JSON — treat as non-streaming with defaults
+          }
+
+          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+            receivedRequests.push(parsed as Record<string, unknown>)
           }
 
           const lastUserMessage = [...(parsed.messages ?? [])]
@@ -507,6 +513,7 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
       resolve({
         port,
         url,
+        receivedRequests,
         receivedPrompts,
         waitForHeldStream: () => heldStreamStarted,
         waitForHeldCompletion: () => heldStreamStarted,
