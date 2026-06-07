@@ -5,21 +5,23 @@
 #   - delivery-pipeline.md (canonical, 2026-05-23) — branching model, deploy, Raven QA gate
 #   - pr-review-pipeline.md (2026-03-31) — Nikola spec gate replaced by Sherlock per CI template
 #
-# Preceded by: ideation pipeline (edison-spec → ada-security → nikola-validate →
-#   edison-revise → nikola-decompose → edison-verify)
+# Preceded by: ideation pipeline (edison-spec → ada-security → sprite-designs →
+#   nikola-decompose → edison-verify). Sprite's design work is complete —
+#   stitch_project IDs are in task cards. Newton extracts HTML/CSS from Stitch.
 #
 # Newton starts when task cards from ideation are ready.
 #
 # DAG:
-#   newton-build ──┬── ci-green ──┬── sherlock-review ──┬── merge ──┬── nikola-state
-#   sprite-assets ─┘              └── raven-review ─────┘           ├── raven-regression
-#                                                                    ├── newton-teardown
-#                                                                    └── ada-security
+#   newton-build ── ci-green ── sherlock-review ──┬── merge ──┬── nikola-state
+#                             └── raven-review ───┘           ├── raven-regression
+#                                                              ├── newton-teardown
+#                                                              └── ada-security
 
 name: feature-dev
 description: >
-  Execution pipeline from task cards to merge. Newton builds, Sprite creates
-  assets, CI gates quality, Sherlock+Raven dual-approve, post-merge quartet
+  Execution pipeline from task cards to merge. Newton builds from
+  design-complete task cards (stitch_project IDs included from ideation).
+  CI gates quality, Sherlock+Raven dual-approve, post-merge quartet
   handles state/regression/teardown/security. Preceded by ideation pipeline.
 
 trigger_events:
@@ -28,32 +30,25 @@ trigger_events:
 
 nodes:
 
-  # ── Phase 1: Build + Assets (parallel) ──
-  # Newton implements from task cards. Sprite creates visuals.
-  # Both start when ideation pipeline produces verified task cards.
+  # ── Phase 1: Build ──
+  # Newton implements from task cards. Sprite's design work was completed
+  # during ideation Phase 5b — stitch_project IDs are already in task cards.
+  # Newton extracts HTML/CSS from Stitch via get_screen_code.
 
   newton-build:
     agent: newton
     task: >
-      Implement the feature per the task cards from ideation. Branch from
-      development: feat/{feature}. Follow TDD — tests before implementation.
-      Ensure CI passes locally before pushing. Open PR to development with
-      auto-merge enabled. Do NOT tag Raven directly — the pipeline routes
-      through Sherlock and Nikola.
+      Implement the feature per the task cards from ideation. Task cards
+      from Nikola already include stitch_project IDs and screen URLs.
+      Extract HTML/CSS from Stitch via get_screen_code before building.
+      Branch from development: feat/{feature}. Follow TDD — tests before
+      implementation. Ensure CI passes locally before pushing. Open PR
+      to development with auto-merge enabled. Do NOT tag Raven directly —
+      the pipeline routes through Sherlock and Nikola.
     timeout_minutes: 120
     channel: orchestration
 
-  sprite-assets:
-    agent: sprite
-    task: >
-      Create visual assets, diagrams, UI components, or design elements
-      needed for this feature per the spec from ideation. Export to
-      assets/{feature}/. If the feature has no visual surface, confirm
-      and exit.
-    timeout_minutes: 60
-    channel: orchestration
-
-  # ── Phase 3: CI Gate (mechanical) ──
+  # ── Phase 2: CI Gate (mechanical) ──
   # CI runs on PR. CI bot notifies Sherlock + Raven on green.
   # On failure: routes back to Newton. This node represents "CI passed."
   ci-green:
@@ -67,7 +62,7 @@ nodes:
     timeout_minutes: 30
     channel: orchestration
 
-  # ── Phase 4: Dual Approval Gate (parallel) ──
+  # ── Phase 3: Dual Approval Gate (parallel) ──
   # Sherlock checks spec compliance + scope. Raven checks product reality + regression.
   # Both must approve. They work in parallel.
 
@@ -80,7 +75,6 @@ nodes:
       If approving and Raven hasn't approved yet: tag Raven with signal.
     depends_on:
       - ci-green
-      - sprite-assets  # Assets must be done before visual review
     timeout_minutes: 30
     channel: orchestration
 
@@ -88,17 +82,16 @@ nodes:
     agent: raven
     task: >
       Review PR for product reality and regression. Check: code quality, test
-      coverage, edge cases, UI consistency (against Sprite's assets if applicable),
+      coverage, edge cases, UI consistency (against domain spec acceptance criteria),
       performance regressions. Run E2E via Playwright if PR touches UI.
       Approve or request changes. Both Sherlock AND Raven must approve for merge.
       Wait for BOTH signals: Sherlock's approval + CI green.
     depends_on:
       - ci-green
-      - sprite-assets
     timeout_minutes: 45
     channel: orchestration
 
-  # ── Phase 5: Merge Gate ──
+  # ── Phase 4: Merge Gate ──
   # Both approvals in → auto-merge fires (branch protection: 2 required reviewers).
   # This node represents the merge-complete signal.
   merge:
@@ -113,7 +106,7 @@ nodes:
     timeout_minutes: 10
     channel: orchestration
 
-  # ── Phase 6: Post-Merge Actions (parallel) ──
+  # ── Phase 5: Post-Merge Actions (parallel) ──
   # Four agents each have post-merge responsibilities per CI template.
   # All fire in parallel after merge.
 

@@ -18,6 +18,10 @@
 #   ada-security ──┐  ← Security gate on cross-cutting + per-domain specs
 #                  │     Review both SPEC.md and domains/*/SPEC.md.
 #                  │
+#   sprite-designs ──┐  ← Frontend design gate (skipped for backend-only projects)
+#                    │     Generates Stitch screens from approved domain specs.
+#                    │     Nikola needs stitch_project IDs for task cards.
+#                    │
 #   nikola-decompose ── edison-verify-cards ──┐
 #                                              ↓
 #   edison-revise-cards ──┘ (loop: back to edison-verify-cards if rejected)
@@ -26,12 +30,12 @@
 
 name: ideation
 description: >
-  Phases 2-7 of the fleet project pipeline. Nikola researches and produces
-  artifacts. Edison writes the spec. Nikola verifies. Ada gates the spec
-  for security before decomposition. Nikola decomposes into task cards.
-  Edison verifies the cards. Output: approved task cards ready for Newton.
-  Ada reviews the SPEC (architecture, data flow, auth, encryption) before
-  any decomposition — catching security flaws early avoids wasted work.
+  Phases 2-6 of the fleet project pipeline. Nikola researches and produces
+  artifacts. Edison writes the domain-organized spec. Nikola verifies.
+  Ada gates the spec for security. Sprite generates visual designs
+  from approved domain specs. Nikola decomposes into task cards with
+  stitch_project IDs. Edison verifies the cards. Output: design-complete,
+  security-approved task cards ready for Newton.
 
 trigger_events:
   - project_start     # Triggered when Randy says "start"
@@ -154,10 +158,31 @@ nodes:
     timeout_minutes: 30
     channel: orchestration
 
+  # ── Phase 5b: Visual Design (Frontend Projects) ──
+  # Sprite generates Stitch screens from the finalized domain specs.
+  # This runs AFTER security review (domains are locked) and BEFORE
+  # Nikola decomposes (cards need stitch_project IDs). For backend-only
+  # projects, Sprite reports "no frontend domains" and exits.
+  sprite-designs:
+    agent: sprite
+    task: >
+      Generate visual designs from the security-approved domain specs.
+      For each domain with UI surfaces: read domains/<name>/SPEC.md, 
+      identify screens/components, generate Stitch screens with proper
+      design tokens. Output stitch_project IDs and screen URLs.
+      For backend-only domains: report "no UI surfaces — skipping."
+      Nikola needs stitch_project IDs before writing task cards
+      so Newton can extract HTML/CSS during implementation.
+    depends_on:
+      - ada-security
+    timeout_minutes: 60
+    channel: orchestration
+
   # ── Phase 6: Task Decomposition ──
-  # Nikola decomposes the security-approved spec into implementable
-  # task cards, one domain at a time. Domain parallelism emerges from
-  # the ## Domain Dependency Graph in SPEC.md.
+  # Nikola decomposes the security-approved, design-complete spec into
+  # implementable task cards, one domain at a time. Domain parallelism
+  # emerges from the ## Domain Dependency Graph in SPEC.md.
+  # Nikola includes stitch_project IDs from Sprite in frontend cards.
   # Edison verifies the cards against domain specs.
   # Back-and-forth until cards match specs.
 
@@ -173,7 +198,7 @@ nodes:
       Reference the domain scope — Newton should never load other domains.
       Populate the project's kanban board with domain-grouped cards.
     depends_on:
-      - ada-security
+      - sprite-designs
     timeout_minutes: 45
     channel: orchestration
 
