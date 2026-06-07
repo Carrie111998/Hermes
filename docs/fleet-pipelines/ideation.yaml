@@ -1,9 +1,10 @@
-# Ideation Pipeline — Research → Spec → Decompose → Security Gate
+# Ideation Pipeline — Research → Spec → Security → Decompose
 #
 # Derived from: docs/agents/hopper/reports/fleet-project-pipeline.md (canonical, 2026-06-06)
+# Updated: Ada security moved to Phase 5a — gate after spec, before decomposition.
 #
 # Phases 1-7 of the 9-phase fleet pipeline. Ends when task cards pass
-# security review. Then Phase 8 (implementation) begins via feature-dev.
+# security review and are ready for Newton.
 #
 # DAG:
 #   nikola-research ──┐
@@ -13,18 +14,24 @@
 #                                              ↓
 #   edison-revise-spec ──┘ (loop: back to nikola-verify-spec if rejected)
 #
-#   nikola-decompose ── edison-verify-cards ── ada-security ──┐
-#                                              ↓               │
+#   ada-security ──┐  ← NEW: security gate on the SPEC itself, BEFORE decomposition
+#                  │     If the spec has fundamental security flaws, catch them
+#                  │     before Nikola spends time decomposing into task cards.
+#                  │
+#   nikola-decompose ── edison-verify-cards ──┐
+#                                              ↓
 #   edison-revise-cards ──┘ (loop: back to edison-verify-cards if rejected)
 #
-# Output: Approved task cards, gate cleared for Newton.
+# Output: Security-approved task cards, gate cleared for Newton.
 
 name: ideation
 description: >
   Phases 2-7 of the fleet project pipeline. Nikola researches and produces
-  artifacts. Edison writes the spec. Nikola verifies and decomposes into
-  task cards. Edison verifies the cards. Ada gates with security review.
-  Output: approved task cards ready for Newton implementation.
+  artifacts. Edison writes the spec. Nikola verifies. Ada gates the spec
+  for security before decomposition. Nikola decomposes into task cards.
+  Edison verifies the cards. Output: approved task cards ready for Newton.
+  Ada reviews the SPEC (architecture, data flow, auth, encryption) before
+  any decomposition — catching security flaws early avoids wasted work.
 
 trigger_events:
   - project_start     # Triggered when Randy says "start"
@@ -104,7 +111,7 @@ nodes:
       reference.md and project.md. Check: does every requirement have
       a corresponding spec section? Are edge cases covered? Are
       acceptance criteria testable? Return APPROVED (proceed to
-      decompose) or REVISIONS (back to Edison with specifics).
+      security review) or REVISIONS (back to Edison with specifics).
     depends_on:
       - edison-spec
     timeout_minutes: 30
@@ -121,20 +128,42 @@ nodes:
     timeout_minutes: 30
     channel: orchestration
 
+  # ── Phase 5a: Security Review of the Spec ──
+  # Ada reviews the SPEC for security before any task cards exist.
+  # This gates decomposition: if the spec has architectural security
+  # flaws, catch them here — not after cards are written.
+  ada-security:
+    agent: ada
+    task: >
+      Security review of Edison's finalized SPEC.md. Check at the
+      architecture level: dependency audit (known vulnerabilities in
+      chosen packages), data flow analysis (PII exposure, encryption
+      boundaries, storage decisions), authentication/authorization
+      patterns, secret handling strategy, input validation approach,
+      API endpoint security, deployment surface and attack vectors.
+      This review gates before decomposition — security flaws in the
+      spec would make all task cards invalid. Return APPROVED or
+      BLOCKED with specific architecture-level findings. Nikola
+      must not begin decomposition until this gate clears.
+    depends_on:
+      - edison-revise-spec
+    timeout_minutes: 30
+    channel: orchestration
+
   # ── Phase 6: Task Decomposition ──
-  # Nikola decomposes the finalized spec into implementable task cards.
-  # Edison verifies the cards against the spec.
+  # Nikola decomposes the security-approved spec into implementable
+  # task cards. Edison verifies the cards against the spec.
   # Back-and-forth until cards match spec.
 
   nikola-decompose:
     agent: nikola
     task: >
-      Decompose the finalized SPEC.md into discrete, implementable task
-      cards. Each card must: be independently completable, have clear
+      Decompose the security-approved SPEC.md into discrete, implementable
+      task cards. Each card must: be independently completable, have clear
       acceptance criteria from the spec, be sized for a single PR,
       include dependencies. Populate the project's kanban board.
     depends_on:
-      - edison-revise-spec
+      - ada-security
     timeout_minutes: 45
     channel: orchestration
 
@@ -144,7 +173,7 @@ nodes:
       Verify Nikola's task cards against the SPEC.md. Check: do the cards
       cover every section of the spec? Is dependency order correct? Are
       acceptance criteria faithfully translated? Return APPROVED
-      (proceed to security review) or REVISIONS (back to Nikola).
+      (proceed) or REVISIONS (back to Nikola).
     depends_on:
       - nikola-decompose
     timeout_minutes: 20
@@ -159,21 +188,4 @@ nodes:
     depends_on:
       - edison-verify-cards
     timeout_minutes: 15
-    channel: orchestration
-
-  # ── Phase 7: Security Review ──
-  # Ada reviews the spec + task cards for security issues.
-  # Gate: must pass before implementation begins (Phase 8).
-  ada-security:
-    agent: ada
-    task: >
-      Security review of the spec and task cards. Check: dependency audit
-      (known vulnerabilities), data flow analysis (PII exposure, encryption),
-      authentication/authorization patterns, secret handling, input
-      validation, API endpoint security, deployment surface.
-      Return APPROVED or BLOCKED with specific findings. Implementation
-      cannot begin until this gate clears.
-    depends_on:
-      - edison-revise-cards
-    timeout_minutes: 30
     channel: orchestration
