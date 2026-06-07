@@ -1,56 +1,45 @@
-# Feature Development Workflow — Fleet Project Pipeline
+# Feature Development Workflow — Execution Pipeline (post-ideation)
 #
 # Derived from:
 #   - CI-TEMPLATE.md (canonical, 2026-06-03) — PR lifecycle, dual-approval gate, post-merge actions
 #   - delivery-pipeline.md (canonical, 2026-05-23) — branching model, deploy, Raven QA gate
 #   - pr-review-pipeline.md (2026-03-31) — Nikola spec gate replaced by Sherlock per CI template
 #
+# Preceded by: ideation pipeline (edison-spec → ada-security → nikola-validate →
+#   edison-revise → nikola-decompose → edison-verify)
+#
+# Newton starts when task cards from ideation are ready.
+#
 # DAG:
-#   edison-spec ──┬── newton-build ──┬── ci-green ──┬── sherlock-review ──┬── merge ──┬── nikola-state
-#                 └── sprite-assets ─┘              └── raven-review ─────┘           ├── raven-regression
-#                                                                                     ├── newton-teardown
-#                                                                                     └── ada-security
+#   newton-build ──┬── ci-green ──┬── sherlock-review ──┬── merge ──┬── nikola-state
+#   sprite-assets ─┘              └── raven-review ─────┘           ├── raven-regression
+#                                                                    ├── newton-teardown
+#                                                                    └── ada-security
 
 name: feature-dev
 description: >
-  Fleet project pipeline from spec to merge. Edison writes the spec,
-  Newton builds and Sprite creates assets in parallel. CI gates build
-  quality. Sherlock (spec/scope) and Raven (product/regression) approve
-  in parallel. Post-merge: Nikola folds state, Raven smoke-tests,
-  Newton tears down, Ada security-scans.
+  Execution pipeline from task cards to merge. Newton builds, Sprite creates
+  assets, CI gates quality, Sherlock+Raven dual-approve, post-merge quartet
+  handles state/regression/teardown/security. Preceded by ideation pipeline.
 
 trigger_events:
   - pr_opened
-  - branch_created
-  - workflow_dispatch
+  - workflow_dispatch  # Triggered when ideation pipeline completes
 
 nodes:
 
-  # ── Phase 1: Specification (pre-PR) ──
-  # Edison owns architecture. Spec is the contract Newton implements against.
-  edison-spec:
-    agent: edison
-    task: >
-      Write the implementation spec. Reference the project's existing SPEC.md
-      or create one if new. Define: architecture decisions, data flow, interfaces,
-      edge cases, acceptance criteria, and any breaking changes. Output to
-      docs/specs/{feature}.md or update the project SPEC.md directly.
-    timeout_minutes: 45
-    channel: orchestration
-
-  # ── Phase 2: Build + Assets (parallel, pre-PR) ──
-  # Newton implements. Sprite creates visuals. Both depend on Edison's spec.
+  # ── Phase 1: Build + Assets (parallel) ──
+  # Newton implements from task cards. Sprite creates visuals.
+  # Both start when ideation pipeline produces verified task cards.
 
   newton-build:
     agent: newton
     task: >
-      Implement the feature per Edison's spec. Branch from development:
-      feat/{feature}. Follow TDD — tests before implementation. Ensure CI
-      passes locally before pushing. Open PR to development with auto-merge
-      enabled. Do NOT tag Raven directly — the pipeline routes through
-      Sherlock and Nikola.
-    depends_on:
-      - edison-spec
+      Implement the feature per the task cards from ideation. Branch from
+      development: feat/{feature}. Follow TDD — tests before implementation.
+      Ensure CI passes locally before pushing. Open PR to development with
+      auto-merge enabled. Do NOT tag Raven directly — the pipeline routes
+      through Sherlock and Nikola.
     timeout_minutes: 120
     channel: orchestration
 
@@ -58,10 +47,9 @@ nodes:
     agent: sprite
     task: >
       Create visual assets, diagrams, UI components, or design elements
-      needed for this feature per Edison's spec. Export to assets/{feature}/.
-      If the feature has no visual surface, confirm and exit.
-    depends_on:
-      - edison-spec
+      needed for this feature per the spec from ideation. Export to
+      assets/{feature}/. If the feature has no visual surface, confirm
+      and exit.
     timeout_minutes: 60
     channel: orchestration
 
