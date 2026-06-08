@@ -7373,6 +7373,8 @@ class GatewayRunner:
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        # Turn-start timestamp for PA universal turn-recording latency.
+        _pa_turn_started_at = time.time()
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
@@ -7404,6 +7406,33 @@ class GatewayRunner:
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
+
+            # ── PA universal turn-recording (PA-portal observability) ──────
+            # After the turn completes and the response is delivered, write a
+            # universal, agent-keyed record of what the agent did (turn +
+            # tool-calls + events) to the SessionDB. Entirely best-effort and
+            # non-blocking — wrapped in try/except + bounded executor timeout so
+            # a recording failure can NEVER break live processing or the reply.
+            try:
+                _pa_final_text = ""
+                if isinstance(_agent_result, dict):
+                    _pa_final_text = str(_agent_result.get("final_response") or "")
+                elif isinstance(_agent_result, str):
+                    _pa_final_text = _agent_result
+                try:
+                    _pa_session_entry = self.session_store.get_or_create_session(source)
+                except Exception:
+                    _pa_session_entry = None
+                await self._record_pa_turn_safe(
+                    source=source,
+                    session_entry=_pa_session_entry,
+                    agent_result=_agent_result,
+                    final_response=_pa_final_text,
+                    started_at=_pa_turn_started_at,
+                )
+            except Exception as _pa_rec_exc:
+                logger.debug("PA turn-record hook failed (non-fatal): %s", _pa_rec_exc)
+
             return _agent_result
         finally:
             # If _run_agent replaced the sentinel with a real agent and
@@ -10628,6 +10657,129 @@ class GatewayRunner:
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
+
+    def _resolve_pa_agent_id_safe(self, source: Any) -> Optional[str]:
+        """Best-effort resolve the PA agent_id for the turn-recording label.
+
+        Heavyweight (resolves the PA context), but runs only off the reply
+        path inside the wrapped/fire-and-forget recording, so a slow or failing
+        resolve never affects live processing.  Returns None when PA is not
+        enabled or the agent_id cannot be determined.
+        """
+        try:
+            user_config = _load_gateway_config()
+            platform_key = _platform_config_key(source.platform)
+            platform_extra = (user_config.get("platforms") or {}).get(platform_key) or {}
+            metadata = _source_pa_metadata(source)
+            pa_context = _resolve_pa_context(user_config, platform_extra, metadata)
+            return _pa_action_agent_id(pa_context)
+        except Exception as exc:
+            logger.debug("PA turn-record: agent_id resolve failed: %s", exc)
+            return None
+
+    def _record_pa_turn_blocking(
+        self,
+        *,
+        session_id: Optional[str],
+        agent_id: Optional[str],
+        chat_id: Optional[str],
+        agent_result: Any,
+        final_response: str,
+        started_at: Optional[float],
+    ) -> None:
+        """Synchronous body of PA turn-recording. Runs in an executor.
+
+        Builds the universal record and writes the three tables. Wrapped in
+        try/except by the async caller; ALSO guards itself so a partial failure
+        is swallowed (observability is best-effort; the live agent is never
+        affected).
+        """
+        try:
+            from gateway import pa_observability
+
+            result_dict = agent_result if isinstance(agent_result, dict) else None
+            record = pa_observability.build_turn_record(
+                session_id=session_id,
+                agent_id=agent_id,
+                chat_id=chat_id,
+                agent_result=result_dict,
+                final_response=final_response,
+                started_at=started_at,
+                completed_at=time.time(),
+            )
+            session_db = getattr(self, "_session_db", None)
+            turn_id = pa_observability.safe_record_turn(session_db, record)
+            if turn_id:
+                logger.debug(
+                    "PA turn-record: wrote turn %s (agent=%s chat=%s tools=%d events=%d)",
+                    turn_id, agent_id, chat_id,
+                    len(record.tool_calls), len(record.events),
+                )
+        except Exception as exc:
+            logger.debug("PA turn-record: write failed (non-fatal): %s", exc)
+
+    async def _record_pa_turn_safe(
+        self,
+        *,
+        source: Any,
+        session_entry: Any,
+        agent_result: Any,
+        final_response: str,
+        started_at: Optional[float],
+    ) -> None:
+        """Record a universal PA turn after the turn-boundary.
+
+        SAFETY (both hard requirements from the build contract):
+          (i)  The entire call is wrapped in try/except so a recording failure
+               can never break live processing or the agent's reply.
+          (ii) The DB write runs in an executor with a bounded timeout so a
+               slow / contended write can never backpressure the agent loop.
+
+        On any error or timeout the recording is dropped silently; the live
+        agent path is unaffected.
+        """
+        try:
+            # Skip recording entirely when there is no SessionDB (degraded mode)
+            # — nothing to write to.
+            if getattr(self, "_session_db", None) is None:
+                return
+
+            session_id = getattr(session_entry, "session_id", None) or None
+            chat_id = getattr(source, "chat_id", None)
+            agent_id = self._resolve_pa_agent_id_safe(source)
+
+            # Only record for PA-deployed agents. Without an agent_id this is a
+            # non-PA session (TUI, plain DM) and universal PA observability does
+            # not apply. Clear any staged events so they don't leak into a later
+            # turn, then return.
+            if not agent_id:
+                if session_id:
+                    try:
+                        from gateway.pa_observability import drain_agent_events
+                        drain_agent_events(session_id)
+                    except Exception:
+                        pass
+                return
+
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    None,
+                    lambda: self._record_pa_turn_blocking(
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        chat_id=chat_id,
+                        agent_result=agent_result,
+                        final_response=final_response,
+                        started_at=started_at,
+                    ),
+                ),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("PA turn-record: write timed out (non-fatal)")
+        except Exception as exc:
+            logger.debug("PA turn-record hook failed (non-fatal): %s", exc)
 
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo command - remove the last user/assistant exchange."""

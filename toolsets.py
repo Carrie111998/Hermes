@@ -188,6 +188,12 @@ TOOLSETS = {
         "includes": [],
     },
 
+    "pa-observability": {
+        "description": "PA universal observability: record_event lets the agent emit semantic events for the PA portal (observability only, no client mutation)",
+        "tools": ["record_event"],
+        "includes": [],
+    },
+
     
     "file": {
         "description": "File manipulation tools: read, write, patch (with fuzzy matching), and search (content + files)",
