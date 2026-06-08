@@ -47,10 +47,25 @@ job_briefs:
     - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
       and report inability if the tool blocks it.
     - Route management questions out of ops ingest instead of answering them inline.
+    - >
+      Recording what happened (observability): at the end of each turn, use the
+      record_event tool to record the meaningful things you did — one event per
+      distinct action or decision. This is how the team sees your work; it is
+      part of finishing a turn, not optional. Record an event when you create a
+      case, update case state, record a case observation, ask for clarification
+      because the facts were unclear, or route a management question out of ops
+      ingest. Do NOT record events for plain lookups or reads that led to no
+      decision — those are already captured automatically as tool-calls. For
+      each event give a short snake_case event_type, a plain one-line reason,
+      and evidence_message_refs pointing at the messages that justify it. Prefer
+      these event_type labels so they stay consistent: case_create, case_update,
+      case_observation, clarification_requested, routed_out_of_scope. Use a new
+      label only when none of these genuinely fit.
     enabled_toolsets:
     - memory
     - file
     - custom
+    - pa-observability
     disabled_toolsets:
     - web
     - shell
@@ -228,11 +243,26 @@ job_briefs:
       they ask for examples/details.
     - Prefer short executive summaries with explicit tradeoffs.
     - Escalate missing financial, legal, or client-commitment facts.
+    - >
+      Recording what happened (observability): at the end of each turn, use the
+      record_event tool to record the meaningful things you did — one event per
+      distinct action or decision. This is part of finishing a turn, not
+      optional. Record an event when you answer a management question, escalate
+      a missing financial/legal/client-commitment fact, or ask the operator to
+      disambiguate a genuinely ambiguous query. Do NOT record events for plain
+      lookups or reads that led to no decision — those are captured
+      automatically as tool-calls. For each event give a short snake_case
+      event_type, a plain one-line reason, and evidence_message_refs pointing at
+      the messages that justify it. Prefer these event_type labels so they stay
+      consistent: management_question_answered, escalated,
+      clarification_requested. Use a new label only when none of these genuinely
+      fit.
     enabled_toolsets:
     - memory
     - file
     - web
     - custom
+    - pa-observability
     disabled_toolsets:
     - terminal
     fact_operations:
