@@ -9,6 +9,11 @@ on:
       - 'tests/integration/test_ha_integration.py'
       - 'tests/fakes/fake_ha_server.py'
       - '.github/workflows/ha-integration.yml'
+      - 'run.sh'
+      - 'profile-init.sh'
+      - 'nginx-render.sh'
+      - 'Dockerfile'
+      - 'config.yaml'
   pull_request:
     branches: [main]
     paths:
@@ -17,6 +22,11 @@ on:
       - 'tests/integration/test_ha_integration.py'
       - 'tests/fakes/fake_ha_server.py'
       - '.github/workflows/ha-integration.yml'
+      - 'run.sh'
+      - 'profile-init.sh'
+      - 'nginx-render.sh'
+      - 'Dockerfile'
+      - 'config.yaml'
 
 permissions:
   contents: read

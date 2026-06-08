@@ -18,7 +18,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set
 
 try:
@@ -312,7 +312,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             message_type=MessageType.TEXT,
             source=source,
             message_id=f"ha_{entity_id}_{int(now)}",
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
         )
 
         await self.handle_message(msg_event)

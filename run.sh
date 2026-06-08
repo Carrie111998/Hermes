@@ -94,7 +94,7 @@ if [ "$ENABLE_DASHBOARD" = "true" ]; then
     # Wait for dashboard and extract token
     bashio::log.info "Waiting for Dashboard token..."
     for i in {1..30}; do
-        DASHBOARD_TOKEN=$(curl -s http://127.0.0.1:${DASHBOARD_PORTS[0]}/ | grep -oP '__HERMES_SESSION_TOKEN__="\K[^"]+' || true)
+        DASHBOARD_TOKEN=$(curl -s http://127.0.0.1:${DASHBOARD_PORTS[0]}/ | sed -n 's/.*__HERMES_SESSION_TOKEN__="\([^"]*\)".*/\1/p' || true)
         if [ -n "$DASHBOARD_TOKEN" ]; then
             DASHBOARD_TOKENS=("$DASHBOARD_TOKEN")
             break;

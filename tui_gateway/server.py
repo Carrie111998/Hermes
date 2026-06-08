@@ -1387,7 +1387,7 @@ def _current_profile_name() -> str:
         return "default"
 
 
-def _session_info(agent) -> dict:
+def _session_info(agent) -> dict[str, Any]:
     reasoning_config = getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
     if (
@@ -1396,7 +1396,7 @@ def _session_info(agent) -> dict:
     ):
         reasoning_effort = str(reasoning_config.get("effort", "") or "")
     service_tier = getattr(agent, "service_tier", None) or ""
-    info: dict = {
+    info: dict[str, Any] = {
         "model": getattr(agent, "model", ""),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
@@ -5631,7 +5631,7 @@ _voice_sid_lock = threading.Lock()
 _voice_event_sid: str = ""
 
 
-def _voice_emit(event: str, payload: dict | None = None) -> None:
+def _voice_emit(event: str, payload: dict[str, Any] | None = None) -> None:
     """Emit a voice event toward the session that most recently turned the
     mode on. Voice is process-global (one microphone), so there's only ever
     one sid to target; the TUI handler treats an empty sid as "active
@@ -6220,7 +6220,7 @@ def _browser_connect(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5031, str(e))
 
-    payload: dict[str, object] = {"connected": True, "url": normalized}
+    payload: dict[str, Any] = {"connected": True, "url": normalized}
     if messages:
         payload["messages"] = messages
     return _ok(rid, payload)
