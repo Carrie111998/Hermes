@@ -15,6 +15,7 @@ profile create/delete hooks (Phase 4) and the s6 dispatch path in
 ``hermes gateway start/stop/restart`` when running inside a container.
 """
 from __future__ import annotations
+import shutil
 
 import re
 from pathlib import Path
@@ -123,6 +124,8 @@ def detect_service_manager() -> ServiceManagerKind:
         return "launchd"
     if supports_systemd_services():
         return "systemd"
+    if _openrc_available():
+        return "openrc"
     return "none"
 
 
@@ -157,6 +160,14 @@ def _s6_running() -> bool:
     if comm != "s6-svscan":
         return False
     return Path("/run/s6/basedir").is_dir()
+
+
+def _openrc_available() -> bool:
+    """Check if OpenRC’s rc-service is available."""
+    try:
+        return shutil.which("rc-service") is not None
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +311,32 @@ class WindowsServiceManager(_RegistrationUnsupportedMixin):
         return bool(find_gateway_pids())
 
 
+class OpenRCServiceManager(_RegistrationUnsupportedMixin):
+    """Thin wrapper around the ``openrc_*`` functions in hermes_cli.gateway.
+    Only supports lifecycle operations (start/stop/restart/is_running).
+    Runtime registration not implemented.
+    """
+
+    kind: ServiceManagerKind = "openrc"
+
+    def start(self, name: str) -> None:
+        from hermes_cli.gateway import openrc_start
+        openrc_start()
+
+    def stop(self, name: str) -> None:
+        from hermes_cli.gateway import openrc_stop
+        openrc_stop()
+
+    def restart(self, name: str) -> None:
+        from hermes_cli.gateway import openrc_restart
+        openrc_restart()
+
+    def is_running(self, name: str) -> bool:
+        from hermes_cli.gateway import openrc_is_running
+        return openrc_is_running()
+
+
+
 def get_service_manager() -> ServiceManager:
     """Return the ServiceManager instance for the current environment.
 
@@ -313,6 +350,8 @@ def get_service_manager() -> ServiceManager:
         return LaunchdServiceManager()
     if kind == "windows":
         return WindowsServiceManager()
+    if kind == "openrc":
+        return OpenRCServiceManager()
     if kind == "s6":
         return S6ServiceManager()
     raise RuntimeError("no supported service manager detected")
