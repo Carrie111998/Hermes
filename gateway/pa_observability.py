@@ -49,8 +49,13 @@ the caller in run.py:
 
 The event buffer below lets the ``record_event`` agent-facing tool stage
 semantic events mid-turn; the turn-boundary hook drains them with the correct
-turn_id, plus synthesizes one deterministic ``derived`` event so EVERY turn
-gets >= 1 event even when the agent never calls record_event.
+turn_id and writes them to ``pa_events``.
+
+Events are PURELY agent-recorded: the agent decides what is meaningful and
+calls ``record_event`` itself. There is NO mechanical floor synthesising
+events — a turn where the agent records nothing simply has zero events (its
+tool-calls are still captured). Coverage (events-per-turn) is monitored so a
+drop in agent recording is visible.
 """
 
 from __future__ import annotations
@@ -87,9 +92,10 @@ class PaToolCall:
 class PaEvent:
     """A semantic event — the agent's account of what happened in the turn.
 
-    ``source`` is 'agent_recorded' (emitted by the agent via the record_event
-    tool) or 'derived' (synthesized deterministically at the turn-boundary so
-    every turn has >= 1 event).
+    ``source`` is 'agent_recorded' for live events emitted by the agent via the
+    record_event tool. The column is kept for future provenance (e.g. a Phase-3
+    replay/backfill may mark records with a different source); live recording
+    only ever writes 'agent_recorded'.
     """
 
     event_type: Optional[str] = None
@@ -285,52 +291,6 @@ def extract_tool_calls(messages: Optional[List[Dict[str, Any]]]) -> List[PaToolC
     return calls
 
 
-def _truncate(text: Optional[str], limit: int = 280) -> str:
-    if not text:
-        return ""
-    text = str(text).strip().replace("\n", " ")
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def synthesize_derived_event(
-    *,
-    final_response: Optional[str],
-    tool_calls: List[PaToolCall],
-    turn_status: Optional[str],
-) -> PaEvent:
-    """Build the deterministic ``derived`` event for a turn.
-
-    The reliability spine: EVERY turn gets >= 1 event even when the agent never
-    calls record_event.  This is a cheap deterministic one-liner (no extra LLM
-    call needed — the goal-judge already runs at this boundary; this synthesizes
-    from the turn outcome we already hold).  When a richer LLM summary is wired
-    in later it can replace ``reason`` here without changing the shape.
-    """
-    tool_names = [tc.tool_name for tc in tool_calls if tc.tool_name]
-    if turn_status and turn_status not in ("ok", "completed", "success"):
-        event_type = "turn_failed"
-        reason = f"Turn ended with status={turn_status}."
-    elif tool_names:
-        event_type = "turn_completed"
-        reason = (
-            f"Agent used {len(tool_names)} tool(s): "
-            f"{', '.join(tool_names[:6])}"
-            + ("..." if len(tool_names) > 6 else "")
-            + f". Reply: {_truncate(final_response)}"
-        )
-    else:
-        event_type = "turn_completed"
-        reason = f"Agent replied with no tool use. Reply: {_truncate(final_response)}"
-
-    return PaEvent(
-        event_type=event_type,
-        reason=reason,
-        evidence_message_refs=None,
-        source="derived",
-        recorded_at=time.time(),
-    )
-
-
 def build_turn_record(
     *,
     session_id: Optional[str],
@@ -367,17 +327,12 @@ def build_turn_record(
     if started is not None:
         latency_ms = int(max(0.0, (completed - started)) * 1000)
 
-    # Events: agent-recorded (drained from buffer) + the deterministic spine.
+    # Events: PURELY agent-recorded — drained from the buffer the record_event
+    # tool stages into. No mechanical floor: a turn the agent records nothing
+    # for has zero events (its tool-calls are still captured).
     events: List[PaEvent] = []
     if session_id:
         events.extend(drain_agent_events(session_id))
-    events.append(
-        synthesize_derived_event(
-            final_response=final_response,
-            tool_calls=tool_calls,
-            turn_status=turn_status,
-        )
-    )
 
     # message_refs: ids of the conversation messages this turn produced, if the
     # messages carry ids; otherwise a count marker.  Best-effort, universal.

@@ -2,8 +2,10 @@
 
 The agent calls this mid- or end-turn to emit a SEMANTIC event: the agent's own
 account of what it did and why, with pointers to the messages that are evidence.
-These become ``agent_recorded`` events on the turn (the richer enrichment layer
-on top of the deterministic ``derived`` event spine).
+These are the ONLY source of events on a turn — there is no mechanical fallback,
+so recording is the agent's responsibility (see the constitution directive). A
+turn the agent records nothing for has no events; its tool-calls are still
+captured separately.
 
 The event does not know the turn_id (minted at the turn-boundary), so this tool
 STAGES the event into a per-session buffer keyed by the live HERMES_SESSION_ID;

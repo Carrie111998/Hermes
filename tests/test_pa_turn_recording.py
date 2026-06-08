@@ -5,8 +5,8 @@ Covers:
       are created;
   (b) recording a synthetic turn writes pa_turns + pa_tool_calls + pa_events
       rows with the correct universal fields;
-  (c) the derived-event path produces >= 1 event even when record_event is NOT
-      called;
+  (c) events are PURELY agent-recorded — a turn the agent records nothing for
+      has zero events (no mechanical floor), tool-calls still captured;
   (d) the record_event safety wrapper swallows a recording exception and does
       NOT propagate it (the live agent path must never break).
 
@@ -166,7 +166,7 @@ def test_record_pa_turn_idempotent_on_same_turn_id(tmp_path):
                 chat_id="c1",
                 session_id="s1",
                 tool_calls=[{"tool_name": "t"}],
-                events=[{"event_type": "e", "source": "derived"}],
+                events=[{"event_type": "e", "source": "agent_recorded"}],
             )
         turns = db.list_pa_turns(agent_id="a1")
         assert len(turns) == 1  # not duplicated
@@ -248,13 +248,15 @@ def test_build_turn_record_extracts_tool_calls_and_writes(tmp_path):
         db.close()
 
 
-# ── (c) derived-event spine: every turn gets >= 1 event w/o record_event ──
+# ── (c) pure agent-recorded events: no mechanical floor ──
 
 
-def test_derived_event_present_when_record_event_not_called(tmp_path):
+def test_no_events_when_record_event_not_called(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        # No agent-recorded events staged for this session.
+        # No agent-recorded events staged for this session. With the pure
+        # agent-recorded model (no mechanical floor) the turn records with
+        # ZERO events — its tool-calls are still captured separately.
         agent_result = {
             "final_response": "Here is the answer.",
             "completed": True,
@@ -269,26 +271,24 @@ def test_derived_event_present_when_record_event_not_called(tmp_path):
             started_at=1.0,
             completed_at=1.2,
         )
-        # At least one event, and it is the deterministic derived one.
-        assert len(record.events) >= 1
-        sources = {e.source for e in record.events}
-        assert "derived" in sources
+        assert record.events == []
 
         po.write_turn_record(db, record)
         turns = db.list_pa_turns(agent_id="christopher")
-        assert len(turns[0]["events"]) >= 1
-        assert any(e["source"] == "derived" for e in turns[0]["events"])
+        # The turn still persists with zero events.
+        assert len(turns) == 1
+        assert turns[0]["events"] == []
     finally:
         db.close()
 
 
-def test_agent_recorded_and_derived_event_both_present(tmp_path):
+def test_agent_recorded_events_present(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         # Stage an agent-recorded event via the public staging API.
         po.stage_agent_event(
             "sess-mixed",
-            event_type="escalated_to_human",
+            event_type="escalated",
             reason="needs operator",
             evidence_message_refs=["m5"],
         )
@@ -301,19 +301,21 @@ def test_agent_recorded_and_derived_event_both_present(tmp_path):
             started_at=1.0,
             completed_at=1.1,
         )
-        sources = sorted(e.source for e in record.events)
-        assert "agent_recorded" in sources
-        assert "derived" in sources
+        # Only the agent-recorded event — no derived/mechanical events.
+        assert [e.source for e in record.events] == ["agent_recorded"]
+        assert record.events[0].event_type == "escalated"
 
         po.write_turn_record(db, record)
         turns = db.list_pa_turns(agent_id="christopher")
         ev_sources = {e["source"] for e in turns[0]["events"]}
-        assert ev_sources == {"agent_recorded", "derived"}
+        assert ev_sources == {"agent_recorded"}
     finally:
         db.close()
 
 
-def test_derived_event_reflects_failed_turn(tmp_path):
+def test_failed_turn_status_captured_without_events(tmp_path):
+    # A failed turn still captures turn_status; with no agent-recorded events
+    # it has zero events (no mechanical floor synthesising a turn_failed event).
     record = po.build_turn_record(
         session_id="sess-fail",
         agent_id="a",
@@ -324,8 +326,7 @@ def test_derived_event_reflects_failed_turn(tmp_path):
         completed_at=1.1,
     )
     assert record.turn_status == "failed"
-    derived = [e for e in record.events if e.source == "derived"]
-    assert derived and derived[0].event_type == "turn_failed"
+    assert record.events == []
 
 
 def test_drain_clears_buffer_between_turns(tmp_path):
