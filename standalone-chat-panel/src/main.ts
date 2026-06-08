@@ -546,7 +546,7 @@ function render(): void {
   refs.model.textContent = info.model || "pending";
   refs.provider.textContent = info.provider || "gateway";
   refs.session.textContent = sid ? sid.slice(0, 10) : "pending";
-  refs.send.disabled = conn !== "open" || !sid || run || (!refs.input.value.trim() && !attached.length);
+  renderInputState();
   refs.stop.disabled = !run || !sid;
   refs.error.hidden = !errorText;
   refs.error.textContent = errorText;
@@ -762,9 +762,12 @@ function resizeInput(): void {
   refs.input.style.height = "0px";
   refs.input.style.height = `${Math.min(180, refs.input.scrollHeight)}px`;
 }
+function renderInputState(): void {
+  refs.send.disabled = conn !== "open" || !sid || run || (!refs.input.value.trim() && !attached.length);
+}
 
 refs.form.addEventListener("submit", (event) => { event.preventDefault(); void submit(); });
-refs.input.addEventListener("input", () => { resizeInput(); render(); });
+refs.input.addEventListener("input", () => { resizeInput(); renderInputState(); });
 refs.input.addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submit(); } });
 refs.attach.addEventListener("click", () => refs.file.click());
 refs.file.addEventListener("change", () => { const file = refs.file.files?.[0]; refs.file.value = ""; if (file) void upload(file); });
