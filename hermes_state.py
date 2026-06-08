@@ -259,6 +259,51 @@ CREATE TABLE IF NOT EXISTS pa_behavior_events (
     metadata TEXT
 );
 
+-- ── PA universal turn-recording (PA-portal observability, Phase 1) ──
+-- Universal, agent-keyed record of what a deployed PA agent did per turn.
+-- NOT TGG-specific: agent_id keys the rows so future agents appear with zero
+-- rebuild.  See gateway/pa_observability.py for the shared shape contract that
+-- the TS replay harness (christopher-processor.ts) must reproduce identically.
+CREATE TABLE IF NOT EXISTS pa_turns (
+    turn_id TEXT PRIMARY KEY,
+    agent_id TEXT,
+    chat_id TEXT,
+    session_id TEXT,
+    message_refs_json TEXT,
+    model TEXT,
+    provider TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_usd REAL,
+    turn_status TEXT,
+    error_json TEXT,
+    latency_ms INTEGER,
+    raw_turn_envelope_json TEXT,
+    started_at REAL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS pa_tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id TEXT NOT NULL,
+    tool_name TEXT,
+    input_json TEXT,
+    result_json TEXT,
+    cost_usd REAL,
+    duration_ms INTEGER,
+    client_entity_pointer TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pa_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id TEXT NOT NULL,
+    event_type TEXT,
+    reason TEXT,
+    evidence_message_refs_json TEXT,
+    source TEXT,
+    recorded_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -266,6 +311,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_session ON pa_behavior_events(session_id, timestamp, id);
 CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_job_type ON pa_behavior_events(job_type, timestamp, id);
 CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_timestamp ON pa_behavior_events(timestamp, id);
+CREATE INDEX IF NOT EXISTS idx_pa_turns_agent ON pa_turns(agent_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pa_turns_chat ON pa_turns(agent_id, chat_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pa_turns_session ON pa_turns(session_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pa_tool_calls_turn ON pa_tool_calls(turn_id, id);
+CREATE INDEX IF NOT EXISTS idx_pa_events_turn ON pa_events(turn_id, id);
 """
 
 FTS_SQL = """
@@ -980,6 +1030,223 @@ class SessionDB:
                             event.get("id"),
                         )
         return events
+
+    # ── PA universal turn-recording (PA-portal observability) ───────────
+    # Universal, agent-keyed record of what a deployed PA agent did per turn.
+    # The three writes (turn + tool-calls + events) are performed atomically
+    # in a single transaction so an observer never sees a turn row without its
+    # children.  Callers (the gateway turn-boundary hook) wrap the whole thing
+    # in try/except + a timeout so a recording failure can never break the
+    # live agent loop or the user-facing reply.
+
+    def record_pa_turn(
+        self,
+        *,
+        turn_id: str,
+        agent_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        message_refs: Optional[List[Any]] = None,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        cost_usd: Optional[float] = None,
+        turn_status: Optional[str] = None,
+        error: Optional[Any] = None,
+        latency_ms: Optional[int] = None,
+        raw_turn_envelope: Optional[Any] = None,
+        started_at: Optional[float] = None,
+        completed_at: Optional[float] = None,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        events: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Atomically record a universal PA turn + its tool-calls + events.
+
+        ``tool_calls`` items: ``{tool_name, input, result, cost_usd,
+        duration_ms, client_entity_pointer}`` (all optional except presence).
+        ``events`` items: ``{event_type, reason, evidence_message_refs,
+        source, recorded_at}``.  All complex fields are JSON-encoded here so
+        callers pass plain Python objects.
+
+        Returns the ``turn_id``.  Uses INSERT OR REPLACE on pa_turns so a
+        retried recording (same turn_id) is idempotent rather than duplicated.
+        """
+        now = time.time()
+        ts_started = now if started_at is None else started_at
+        ts_completed = now if completed_at is None else completed_at
+
+        message_refs_json = (
+            json.dumps(message_refs, sort_keys=True, default=str)
+            if message_refs is not None
+            else None
+        )
+        error_json = (
+            json.dumps(error, sort_keys=True, default=str)
+            if error is not None
+            else None
+        )
+        raw_envelope_json = (
+            json.dumps(raw_turn_envelope, sort_keys=True, default=str)
+            if raw_turn_envelope is not None
+            else None
+        )
+
+        tool_call_rows: List[tuple] = []
+        for tc in (tool_calls or []):
+            tool_call_rows.append(
+                (
+                    turn_id,
+                    tc.get("tool_name"),
+                    json.dumps(tc.get("input"), sort_keys=True, default=str)
+                    if tc.get("input") is not None
+                    else None,
+                    json.dumps(tc.get("result"), sort_keys=True, default=str)
+                    if tc.get("result") is not None
+                    else None,
+                    tc.get("cost_usd"),
+                    tc.get("duration_ms"),
+                    tc.get("client_entity_pointer"),
+                )
+            )
+
+        event_rows: List[tuple] = []
+        for ev in (events or []):
+            event_rows.append(
+                (
+                    turn_id,
+                    ev.get("event_type"),
+                    ev.get("reason"),
+                    json.dumps(ev.get("evidence_message_refs"), sort_keys=True, default=str)
+                    if ev.get("evidence_message_refs") is not None
+                    else None,
+                    ev.get("source"),
+                    ev.get("recorded_at") if ev.get("recorded_at") is not None else now,
+                )
+            )
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO pa_turns (
+                    turn_id, agent_id, chat_id, session_id, message_refs_json,
+                    model, provider, input_tokens, output_tokens, cost_usd,
+                    turn_status, error_json, latency_ms, raw_turn_envelope_json,
+                    started_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    turn_id,
+                    agent_id,
+                    chat_id,
+                    session_id,
+                    message_refs_json,
+                    model,
+                    provider,
+                    input_tokens,
+                    output_tokens,
+                    cost_usd,
+                    turn_status,
+                    error_json,
+                    latency_ms,
+                    raw_envelope_json,
+                    ts_started,
+                    ts_completed,
+                ),
+            )
+            # Clear any prior children for an idempotent re-record of the turn.
+            conn.execute("DELETE FROM pa_tool_calls WHERE turn_id = ?", (turn_id,))
+            conn.execute("DELETE FROM pa_events WHERE turn_id = ?", (turn_id,))
+            if tool_call_rows:
+                conn.executemany(
+                    """INSERT INTO pa_tool_calls (
+                        turn_id, tool_name, input_json, result_json,
+                        cost_usd, duration_ms, client_entity_pointer
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    tool_call_rows,
+                )
+            if event_rows:
+                conn.executemany(
+                    """INSERT INTO pa_events (
+                        turn_id, event_type, reason,
+                        evidence_message_refs_json, source, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    event_rows,
+                )
+            return turn_id
+
+        return str(self._execute_write(_do))
+
+    def list_pa_turns(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return universal PA turns (newest first), with children attached.
+
+        Each turn dict carries ``tool_calls`` and ``events`` lists in the
+        universal shape.  JSON columns are decoded back to Python objects.
+        """
+        where: List[str] = []
+        params: List[Any] = []
+        if agent_id is not None:
+            where.append("agent_id = ?")
+            params.append(agent_id)
+        if chat_id is not None:
+            where.append("chat_id = ?")
+            params.append(chat_id)
+        if session_id is not None:
+            where.append("session_id = ?")
+            params.append(session_id)
+
+        sql = "SELECT * FROM pa_turns"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY started_at DESC, turn_id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+
+        with self._lock:
+            turn_rows = self._conn.execute(sql, params).fetchall()
+            turns = [dict(r) for r in turn_rows]
+            for turn in turns:
+                tid = turn["turn_id"]
+                tc_rows = self._conn.execute(
+                    "SELECT * FROM pa_tool_calls WHERE turn_id = ? ORDER BY id ASC",
+                    (tid,),
+                ).fetchall()
+                ev_rows = self._conn.execute(
+                    "SELECT * FROM pa_events WHERE turn_id = ? ORDER BY id ASC",
+                    (tid,),
+                ).fetchall()
+                turn["tool_calls"] = [dict(r) for r in tc_rows]
+                turn["events"] = [dict(r) for r in ev_rows]
+
+        for turn in turns:
+            for field in ("message_refs_json", "error_json", "raw_turn_envelope_json"):
+                if turn.get(field):
+                    try:
+                        turn[field[:-5]] = json.loads(turn[field])
+                    except (json.JSONDecodeError, TypeError):
+                        turn[field[:-5]] = None
+            for tc in turn["tool_calls"]:
+                for field in ("input_json", "result_json"):
+                    if tc.get(field):
+                        try:
+                            tc[field[:-5]] = json.loads(tc[field])
+                        except (json.JSONDecodeError, TypeError):
+                            tc[field[:-5]] = None
+            for ev in turn["events"]:
+                if ev.get("evidence_message_refs_json"):
+                    try:
+                        ev["evidence_message_refs"] = json.loads(
+                            ev["evidence_message_refs_json"]
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        ev["evidence_message_refs"] = None
+        return turns
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
