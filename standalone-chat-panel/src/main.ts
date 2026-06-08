@@ -2,6 +2,10 @@ import {
   createPanelHistoryController,
   type PanelHistoryActivation,
 } from "./panelHistory";
+import {
+  createPanelModelController,
+  type PanelModelInfo,
+} from "./panelModels";
 
 type Conn = "idle" | "connecting" | "open" | "closed" | "error";
 type Role = "user" | "assistant" | "system" | "tool";
@@ -24,16 +28,12 @@ interface PanelPending<T> { resolve: (value: T) => void; reject: (error: Error) 
 
 const refs = {
   messages: el("messages"),
-  tools: el("tools-list"),
   pending: el("pending-panel"),
   error: el("error-banner"),
   statusPill: el("status-pill"),
   statusLabel: el("status-label"),
-  connection: el("connection-state"),
-  model: el("model-label"),
-  session: el("session-label"),
-  provider: el("provider-label"),
-  run: el("run-state"),
+  modelSelect: el("model-select") as HTMLSelectElement,
+  modelStatus: el("model-switch-status"),
   input: el("prompt-input") as HTMLTextAreaElement,
   form: el("composer") as HTMLFormElement,
   send: el("send-button") as HTMLButtonElement,
@@ -72,6 +72,18 @@ const history = createPanelHistoryController({
   getMessages: () => msgs,
   isRunning: () => run,
   activate: activateHistory,
+  onError: showError,
+});
+const modelPicker = createPanelModelController({
+  select: refs.modelSelect,
+  status: refs.modelStatus,
+  request: (method, params, timeoutMs) => {
+    if (!gw) throw new Error("gateway not connected");
+    return gw.request(method, params, timeoutMs);
+  },
+  getSessionId: () => sid,
+  isRunning: () => run,
+  onInfo: updateModelInfo,
   onError: showError,
 });
 
@@ -221,9 +233,11 @@ async function connect(): Promise<void> {
     sid = created.session_id;
     history.setActive(sid);
     info = created.info ?? {};
+    modelPicker.setInfo(info);
     runStatus = "idle";
     render();
     void history.refresh();
+    void modelPicker.refresh();
   } catch (err) {
     conn = "error";
     showError(err instanceof Error ? err.message : String(err));
@@ -253,6 +267,7 @@ function onEvent(event: PanelEvent): void {
       if (event.session_id) sid = event.session_id;
       if (event.session_id) history.ensureActive(event.session_id);
       info = { ...info, ...payload };
+      modelPicker.setInfo(info);
       runStatus = "idle";
       return render();
     case "message.start":
@@ -524,6 +539,7 @@ function activateHistory(view: PanelHistoryActivation): void {
   sid = view.sessionId;
   history.setActive(view.activeId);
   info = rec(view.info) ? { provider: str(view.info, "provider"), model: str(view.info, "model") } : {};
+  modelPicker.setInfo(info);
   msgs = view.messages;
   tools = [];
   pendingPrompt = null;
@@ -535,24 +551,24 @@ function activateHistory(view: PanelHistoryActivation): void {
   errorText = "";
   renderAttachments();
   render();
+  void modelPicker.refresh();
+}
+
+function updateModelInfo(next: PanelModelInfo): void {
+  info = { ...info, ...next };
 }
 
 function render(): void {
-  refs.connection.textContent = conn;
   const displayStatus = run ? phaseStatusLabel(runStatus) : runStatus;
-  refs.run.textContent = displayStatus;
   refs.statusLabel.textContent = run ? displayStatus : conn;
   refs.statusPill.dataset.state = conn;
-  refs.model.textContent = info.model || "pending";
-  refs.provider.textContent = info.provider || "gateway";
-  refs.session.textContent = sid ? sid.slice(0, 10) : "pending";
   renderInputState();
   refs.stop.disabled = !run || !sid;
   refs.error.hidden = !errorText;
   refs.error.textContent = errorText;
   history.render();
+  modelPicker.render();
   renderMessages();
-  renderTools();
   renderPrompt();
 }
 function renderMessages(): void {
@@ -671,23 +687,6 @@ function mediaKind(url: string): "image" | "video" | null {
   if (/\.(mp4|webm|mov)$/.test(path)) return "video";
   if (/\.(png|jpe?g|webp|gif)$/.test(path)) return "image";
   return null;
-}
-function renderTools(): void {
-  refs.tools.replaceChildren();
-  if (!tools.length) return refs.tools.append(div("empty-tools", "Idle"));
-  for (const tool of [...tools].reverse()) {
-    const card = document.createElement("article");
-    card.className = "tool-card";
-    card.dataset.status = tool.status;
-    card.append(div("tool-title", tool.name), div("tool-meta", tool.context || tool.status));
-    const detail = tool.error || tool.summary || tool.preview;
-    if (detail) {
-      const body = document.createElement("p");
-      body.textContent = detail;
-      card.append(body);
-    }
-    refs.tools.append(card);
-  }
 }
 function renderAttachments(): void {
   refs.shelf.replaceChildren();

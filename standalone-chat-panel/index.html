@@ -34,8 +34,8 @@
       button { cursor: pointer; }
       button:disabled { cursor: not-allowed; opacity: .45; }
       svg { width: 1.1rem; height: 1.1rem; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.9; }
-      .shell { display: grid; grid-template-columns: minmax(14rem,17rem) minmax(0,1fr) minmax(16rem,21rem); min-height: 100vh; }
-      .rail, .inspector { background: var(--rail); border-color: var(--line); backdrop-filter: blur(16px); }
+      .shell { display: grid; grid-template-columns: minmax(14rem,17rem) minmax(0,1fr); min-height: 100vh; }
+      .rail { background: var(--rail); border-color: var(--line); backdrop-filter: blur(16px); }
       .rail { display: flex; flex-direction: column; gap: 1.2rem; padding: 1.2rem; border-right: 1px solid var(--line); }
       .brand { display: flex; min-width: 0; align-items: center; gap: .8rem; }
       .brand-mark { flex: 0 0 auto; width: 3.5rem; height: 3.5rem; padding: .16rem; background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.48); border-radius: .7rem; box-shadow: 0 .7rem 1.8rem rgba(0,0,0,.38); }
@@ -61,10 +61,7 @@
       .history-title { color: var(--ink); font-size: .78rem; }
       .history-preview { font-size: .7rem; }
       .history-meta { color: var(--dim); font-size: .64rem; }
-      .session-facts { display: grid; gap: .75rem; margin: 0; }
-      .session-facts div, .meter { min-width: 0; padding: .8rem; background: rgba(255,255,255,.035); border: 1px solid var(--line); border-radius: .45rem; }
-      .session-facts dt, .meter span, .eyebrow { margin: 0 0 .4rem; color: var(--dim); font-size: .68rem; text-transform: uppercase; }
-      .session-facts dd, .meter strong { display: block; min-width: 0; margin: 0; overflow: hidden; color: var(--ink); font-size: .86rem; text-overflow: ellipsis; white-space: nowrap; }
+      .eyebrow { margin: 0 0 .4rem; color: var(--dim); font-size: .68rem; text-transform: uppercase; }
       .workspace { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
       .topbar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.2rem 1.4rem; border-bottom: 1px solid var(--line); }
       .topbar h1 { margin: 0; font-size: clamp(1.25rem,2vw,1.75rem); letter-spacing: 0; }
@@ -76,14 +73,14 @@
       .icon-button { display: inline-grid; width: 2.55rem; height: 2.55rem; place-items: center; }
       .error-banner { margin: 1rem 1.4rem 0; padding: .8rem 1rem; overflow-wrap: anywhere; color: #ffd2cc; background: rgba(225,97,79,.13); border: 1px solid rgba(225,97,79,.38); border-radius: .45rem; }
       .messages { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: .75rem; padding: 1.4rem; overflow-y: auto; }
-      .empty-state, .empty-tools { display: grid; min-height: 10rem; place-items: center; color: var(--dim); border: 1px dashed var(--line); border-radius: .5rem; }
+      .empty-state { display: grid; min-height: 10rem; place-items: center; color: var(--dim); border: 1px dashed var(--line); border-radius: .5rem; }
       .message { width: min(48rem,92%); padding: .85rem .95rem; background: rgba(255,255,255,.045); border: 1px solid var(--line); border-radius: .55rem; }
       .message.user { align-self: flex-end; border-color: rgba(139,221,227,.3); background: rgba(139,221,227,.08); }
       .message.assistant { align-self: flex-start; border-color: rgba(215,169,78,.24); }
       .message.system, .message.tool { width: min(40rem,86%); color: var(--muted); background: rgba(127,109,242,.08); }
       .message[data-streaming="true"] { border-color: rgba(159,209,139,.35); }
       .message-label { margin-bottom: .45rem; color: var(--dim); font-size: .68rem; text-transform: uppercase; }
-      .message-body, .message-copy, .tool-card p, .pending-panel p { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.58; }
+      .message-body, .message-copy, .pending-panel p { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.58; }
       .message-copy { min-width: 0; }
       .message-link { color: var(--cyan); text-decoration: none; border-bottom: 1px solid rgba(139,221,227,.35); }
       .message-link:hover { border-bottom-color: var(--cyan); }
@@ -103,23 +100,19 @@
       .composer-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: end; gap: .55rem; }
       .composer textarea { width: 100%; min-height: 2.55rem; max-height: 11.25rem; padding: .7rem .15rem; resize: none; color: var(--ink); background: transparent; border: 0; outline: none; line-height: 1.45; }
       .composer textarea::placeholder { color: var(--dim); }
+      .composer-footer { display: flex; align-items: center; gap: .7rem; min-width: 0; padding: .45rem .1rem 0; border-top: 1px solid rgba(243,239,228,.08); }
+      .model-switch { display: inline-flex; min-width: 0; align-items: center; gap: .45rem; color: var(--muted); font-size: .72rem; }
+      .model-switch span { color: var(--dim); text-transform: uppercase; }
+      .model-switch select { max-width: min(32rem,58vw); min-width: 12rem; padding: .35rem 1.8rem .35rem .55rem; color: var(--ink); background: rgba(255,255,255,.045); border: 1px solid var(--line); border-radius: .45rem; outline: none; }
+      .model-switch select:focus { border-color: rgba(139,221,227,.55); }
+      .model-switch-status { min-width: 0; overflow: hidden; color: var(--dim); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
       .icon-button.send { color: #071113; background: var(--cyan); border-color: var(--cyan); }
       .attachment-shelf { display: flex; flex-wrap: wrap; gap: .55rem; padding: 0 0 .6rem; }
       .attachment-chip { display: inline-flex; align-items: center; min-width: 0; max-width: 100%; gap: .55rem; padding: .4rem .5rem; background: rgba(139,221,227,.08); border: 1px solid rgba(139,221,227,.28); border-radius: .45rem; }
       .attachment-chip img { width: 2rem; height: 2rem; object-fit: cover; border-radius: .3rem; }
       .attachment-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .attachment-chip button { width: 1.45rem; height: 1.45rem; color: var(--muted); background: transparent; border: 0; }
-      .inspector { display: flex; flex-direction: column; gap: 1rem; min-width: 0; padding: 1.2rem; border-left: 1px solid var(--line); overflow-y: auto; }
-      .inspector h2 { margin: 0 0 .7rem; color: var(--muted); font-size: .76rem; text-transform: uppercase; }
-      .inspector section:first-child, .tools-list { display: grid; gap: .65rem; }
-      .tool-card { min-width: 0; padding: .75rem; background: rgba(255,255,255,.04); border: 1px solid var(--line); border-left: 3px solid var(--brass); border-radius: .45rem; }
-      .tool-card[data-status="done"] { border-left-color: var(--green); }
-      .tool-card[data-status="error"] { border-left-color: var(--red); }
-      .tool-title, .tool-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .tool-title { font-size: .85rem; }
-      .tool-meta { margin: .35rem 0; color: var(--dim); font-size: .72rem; }
-      .tool-card p { color: var(--muted); font-size: .78rem; }
-      @media (max-width: 1040px) { .shell { grid-template-columns: minmax(12rem,15rem) minmax(0,1fr); } .inspector { display: none; } }
+      @media (max-width: 1040px) { .shell { grid-template-columns: minmax(12rem,15rem) minmax(0,1fr); } }
       @media (max-width: 760px) { .shell { display: block; } .rail { display: none; } .workspace { height: 100vh; } .topbar { align-items: flex-start; padding: 1rem; } .runtime-strip { flex-wrap: wrap; justify-content: flex-end; } .messages { padding: 1rem; } .message, .message.system, .message.tool { width: 100%; } .composer { margin: 0 1rem 1rem; } }
     </style>
   </head>
@@ -156,20 +149,6 @@
           <div id="history-list" class="history-list"></div>
         </section>
 
-        <dl class="session-facts">
-          <div>
-            <dt>Transport</dt>
-            <dd id="connection-state">idle</dd>
-          </div>
-          <div>
-            <dt>Model</dt>
-            <dd id="model-label">pending</dd>
-          </div>
-          <div>
-            <dt>Session</dt>
-            <dd id="session-label">pending</dd>
-          </div>
-        </dl>
       </aside>
 
       <main class="workspace">
@@ -216,27 +195,16 @@
               </svg>
             </button>
           </div>
+          <div class="composer-footer">
+            <label class="model-switch" for="model-select">
+              <span>Model</span>
+              <select id="model-select"></select>
+            </label>
+            <span id="model-switch-status" class="model-switch-status">Model pending</span>
+          </div>
           <input id="image-input" type="file" accept="image/*" hidden />
         </form>
       </main>
-
-      <aside class="inspector">
-        <section>
-          <h2>Run</h2>
-          <div class="meter">
-            <span>State</span>
-            <strong id="run-state">idle</strong>
-          </div>
-          <div class="meter">
-            <span>Provider</span>
-            <strong id="provider-label">gateway</strong>
-          </div>
-        </section>
-        <section>
-          <h2>Tools</h2>
-          <div id="tools-list" class="tools-list"></div>
-        </section>
-      </aside>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
