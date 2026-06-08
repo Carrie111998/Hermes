@@ -1,0 +1,7 @@
+name: atlas
+version: 1.0.0
+description: "AtlasCloud video generation backend. Routes Hermes video_generate to Atlas text-to-video and image-to-video models through the async prediction API."
+author: NousResearch
+kind: backend
+requires_env:
+  - ATLAS_API_KEY

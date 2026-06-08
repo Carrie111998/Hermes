@@ -321,7 +321,9 @@ async function attachPath(path: string, file?: File): Promise<void> {
   const realPath = result.path || path;
   const name = result.name || file?.name || basename(realPath);
   const meta = attachMeta(result);
-  attached.push({ id: id("attach"), name, path: realPath, text: result.text || `[User attached image: ${name}]`, meta, previewUrl: file ? URL.createObjectURL(file) : undefined });
+  const label = result.text || `[User attached image: ${name}]`;
+  const toolHint = `[Attached image path for tools: ${realPath}]`;
+  attached.push({ id: id("attach"), name, path: realPath, text: `${label}\n${toolHint}`, meta, previewUrl: file ? URL.createObjectURL(file) : undefined });
   renderAttachments();
   render();
 }
