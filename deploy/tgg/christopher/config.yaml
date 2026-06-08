@@ -201,6 +201,19 @@ platforms:
       - 120363407433776639@g.us
       - 120363426509183563@g.us
       - 120363407903158826@g.us
+  # GATE 1 observability probe — loopback-only (127.0.0.1) so only an on-VPS
+  # SSH caller can trigger it; no public exposure. Routes to tgg_ops_ingest via
+  # a webhook selector so a test turn exercises the real case-writing +
+  # turn-recording path. Reversible: set enabled:false or delete this block.
+  webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8644
+      routes:
+        gate1-probe:
+          secret: INSECURE_NO_AUTH
+          prompt: '{text}'
 whatsapp:
   require_mention: true
   dm_policy: allowlist
