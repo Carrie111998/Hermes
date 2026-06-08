@@ -341,11 +341,3 @@ selectors:
   match:
     source.platform: telegram
     source.chat_id: '-5295904349'
-# GATE 1 observability probe: route the loopback webhook test message to the
-# real ops-ingest brief so a test turn exercises the live case-writing +
-# turn-recording path. Reversible: delete this selector + the webhook platform
-# block in config.yaml.
-- job_type: tgg_ops_ingest
-  match:
-    source.platform: webhook
-    source.user_id: webhook:gate1-probe
