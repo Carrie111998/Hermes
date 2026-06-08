@@ -7,6 +7,7 @@ interface PanelModelProvider {
   name: string;
   slug: string;
   models: string[];
+  warning: string;
 }
 
 interface PanelModelOptionsResponse {
@@ -71,7 +72,7 @@ export function createPanelModelController(options: PanelModelControllerOptions)
     renderModelControls();
     try {
       const result = await options.request<PanelModelOptionsResponse>("model.options", { session_id: sid }, 30_000);
-      const next = normalizeProviders(result.providers).flatMap((provider) =>
+      const next = normalizeProviders(result.providers).filter((provider) => !provider.warning).flatMap((provider) =>
         provider.models.map((model) => ({
           value: modelKey(provider.slug, model),
           label: `${model} / ${provider.slug}`,
@@ -130,7 +131,7 @@ function normalizeProviders(input: unknown): PanelModelProvider[] {
     const slug = fieldText(item.slug);
     const models = strings(item.models);
     if (!slug || !models.length) continue;
-    providers.push({ name: fieldText(item.name) || slug, slug, models });
+    providers.push({ name: fieldText(item.name) || slug, slug, models, warning: fieldText(item.warning) });
   }
   return providers;
 }
