@@ -65,7 +65,13 @@
       .message.system, .message.tool { width: min(40rem,86%); color: var(--muted); background: rgba(127,109,242,.08); }
       .message[data-streaming="true"] { border-color: rgba(159,209,139,.35); }
       .message-label { margin-bottom: .45rem; color: var(--dim); font-size: .68rem; text-transform: uppercase; }
-      .message p, .tool-card p, .pending-panel p { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.58; }
+      .message-body, .message-copy, .tool-card p, .pending-panel p { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.58; }
+      .message-copy { min-width: 0; }
+      .message-link { color: var(--cyan); text-decoration: none; border-bottom: 1px solid rgba(139,221,227,.35); }
+      .message-link:hover { border-bottom-color: var(--cyan); }
+      .stream-placeholder { display: inline-flex; align-items: center; gap: .35rem; color: var(--muted); }
+      .stream-placeholder::after { content: ""; width: .45rem; height: .45rem; background: var(--green); border-radius: 999px; animation: pulse 1s ease-in-out infinite; }
+      @keyframes pulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
       .media-preview { display: grid; gap: .45rem; margin-top: .7rem; }
       .media-preview video, .media-preview img { max-width: min(28rem,100%); max-height: 18rem; background: #000; border: 1px solid var(--line); border-radius: .45rem; object-fit: contain; }
       .message-attachments { display: flex; flex-wrap: wrap; gap: .35rem; margin-bottom: .55rem; }

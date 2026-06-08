@@ -6,8 +6,9 @@ interface PanelEvent { type: string; session_id?: string; payload?: unknown }
 interface PanelInfo { provider?: string; model?: string }
 interface PanelCreate { session_id: string; info?: PanelInfo }
 interface PanelAttach { id: string; name: string; path: string; text: string; meta?: string; previewUrl?: string }
-interface PanelMsg { id: string; role: Role; text: string; status: "streaming" | "complete"; attachments?: PanelAttach[] }
+interface PanelMsg { id: string; role: Role; text: string; status: "streaming" | "complete"; attachments?: PanelAttach[]; toolId?: string; toolName?: string }
 interface PanelTool { id: string; toolId?: string; name: string; context?: string; preview?: string; summary?: string; error?: string; status: ToolState }
+interface MediaRef { url: string; kind: "image" | "video"; alt?: string }
 type PanelPrompt =
   | { kind: "clarify"; requestId: string; question: string; choices?: string[] }
   | { kind: "approval"; command: string; description: string }
@@ -271,14 +272,33 @@ function showError(message: string): void {
 function startTool(payload: Record<string, unknown>): void {
   const toolId = str(payload, "tool_id");
   if (!toolId) return;
-  tools.push({ id: id("tool"), toolId, name: str(payload, "name") || "tool", context: str(payload, "context"), status: "running" });
+  const name = str(payload, "name") || "tool";
+  const context = str(payload, "context");
+  tools.push({ id: id("tool"), toolId, name, context, status: "running" });
   tools = tools.slice(-24);
-  renderTools();
+  msgs.push({
+    id: id("toolmsg"),
+    role: "tool",
+    text: [`Running ${name}`, context].filter(Boolean).join("\n"),
+    status: "streaming",
+    toolId,
+    toolName: name,
+  });
+  render();
 }
 function updateTool(payload: Record<string, unknown>): void {
-  const match = tools.findLast((tool) => tool.toolId === str(payload, "tool_id"));
-  if (match) match.preview = str(payload, "preview") || match.preview;
-  renderTools();
+  const toolId = str(payload, "tool_id");
+  const name = str(payload, "name");
+  const preview = str(payload, "preview");
+  const match = toolId
+    ? tools.findLast((tool) => tool.toolId === toolId)
+    : tools.findLast((tool) => tool.name === name && tool.status === "running");
+  if (match) match.preview = preview || match.preview;
+  const msg = toolId
+    ? msgs.find((entry) => entry.toolId === toolId)
+    : msgs.findLast((entry) => entry.role === "tool" && entry.toolName === name && entry.status === "streaming");
+  if (msg && preview) msg.text = [`Running ${msg.toolName || name || "tool"}`, preview].join("\n");
+  render();
 }
 function finishTool(payload: Record<string, unknown>): void {
   const match = tools.findLast((tool) => tool.toolId === str(payload, "tool_id"));
@@ -286,7 +306,14 @@ function finishTool(payload: Record<string, unknown>): void {
   match.summary = str(payload, "summary");
   match.error = str(payload, "error");
   match.status = match.error ? "error" : "done";
-  renderTools();
+  const msg = msgs.find((entry) => entry.toolId === match.toolId);
+  if (msg) {
+    msg.status = "complete";
+    msg.text = match.error
+      ? `${match.name} failed\n${match.error}`
+      : match.summary || `${match.name} complete`;
+  }
+  render();
 }
 
 async function upload(file: File): Promise<void> {
@@ -460,8 +487,16 @@ function renderMessages(): void {
       for (const item of msg.attachments) list.append(div("", item.name, "span"));
       card.append(list);
     }
-    const body = document.createElement("p");
-    body.textContent = msg.text || (msg.status === "streaming" ? " " : "");
+    const body = document.createElement("div");
+    body.className = "message-body";
+    if (msg.text) {
+      appendRichText(body, msg.text);
+    } else if (msg.status === "streaming") {
+      const placeholder = document.createElement("span");
+      placeholder.className = "stream-placeholder";
+      placeholder.textContent = "Working";
+      body.append(placeholder);
+    }
     card.append(body);
     const media = mediaPreview(msg.text);
     if (media) card.append(media);
@@ -469,13 +504,44 @@ function renderMessages(): void {
   }
   refs.messages.scrollTop = refs.messages.scrollHeight;
 }
+function appendRichText(container: HTMLElement, text: string): void {
+  const copy = text.replace(/!\[([^\]]*)]\((https?:\/\/[^)\s]+)\)/g, (_all, alt) => String(alt || "").trim());
+  if (!copy.trim()) return;
+  const block = document.createElement("p");
+  block.className = "message-copy";
+  appendInlineText(block, copy);
+  container.append(block);
+}
+function appendInlineText(container: HTMLElement, text: string): void {
+  const pattern = /\[([^\]]+)]\((https?:\/\/[^)\s]+)\)|(https?:\/\/[^\s<>"']+)/g;
+  let index = 0;
+  for (const match of text.matchAll(pattern)) {
+    const start = match.index ?? 0;
+    if (start > index) container.append(document.createTextNode(text.slice(index, start)));
+    const markdownUrl = match[2];
+    const bareUrl = match[3];
+    const rawUrl = markdownUrl || bareUrl || "";
+    const cleanUrl = normalizeUrl(rawUrl);
+    const label = markdownUrl ? match[1] : cleanUrl;
+    const link = document.createElement("a");
+    link.className = "message-link";
+    link.href = cleanUrl;
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.textContent = label;
+    container.append(link);
+    if (bareUrl && rawUrl.length > cleanUrl.length) container.append(document.createTextNode(rawUrl.slice(cleanUrl.length)));
+    index = start + match[0].length;
+  }
+  if (index < text.length) container.append(document.createTextNode(text.slice(index)));
+}
 function mediaPreview(text: string): HTMLElement | null {
-  const urls = [...text.matchAll(/https?:\/\/[^\s)]+/g)].map((match) => match[0]);
-  const mediaUrls = urls.filter((url) => /\.(mp4|webm|mov|png|jpe?g|webp|gif)(\?|#|$)/i.test(url));
-  if (!mediaUrls.length) return null;
+  const mediaRefs = extractMedia(text).slice(0, 4);
+  if (!mediaRefs.length) return null;
   const wrap = div("media-preview", "");
-  for (const url of mediaUrls.slice(0, 4)) {
-    if (/\.(mp4|webm|mov)(\?|#|$)/i.test(url)) {
+  for (const media of mediaRefs) {
+    const url = media.url;
+    if (media.kind === "video") {
       const video = document.createElement("video");
       video.src = url;
       video.controls = true;
@@ -484,11 +550,41 @@ function mediaPreview(text: string): HTMLElement | null {
     } else {
       const image = document.createElement("img");
       image.src = url;
-      image.alt = "";
+      image.alt = media.alt || "";
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.referrerPolicy = "no-referrer";
+      image.addEventListener("load", () => {
+        refs.messages.scrollTop = refs.messages.scrollHeight;
+      });
       wrap.append(image);
     }
   }
   return wrap;
+}
+function extractMedia(text: string): MediaRef[] {
+  const refs: MediaRef[] = [];
+  const seen = new Set<string>();
+  const add = (rawUrl: string, alt?: string) => {
+    const url = normalizeUrl(rawUrl);
+    const kind = mediaKind(url);
+    if (!kind || seen.has(url)) return;
+    seen.add(url);
+    refs.push({ url, kind, alt });
+  };
+  for (const match of text.matchAll(/!\[([^\]]*)]\((https?:\/\/[^)\s]+)\)/g)) add(match[2], match[1]);
+  for (const match of text.matchAll(/\[([^\]]+)]\((https?:\/\/[^)\s]+)\)/g)) add(match[2], match[1]);
+  for (const match of text.matchAll(/https?:\/\/[^\s<>"']+/g)) add(match[0]);
+  return refs;
+}
+function normalizeUrl(raw: string): string {
+  return raw.trim().replace(/[),.;!?\uFF0C\u3002\uFF1B\uFF01\uFF1F]+$/u, "");
+}
+function mediaKind(url: string): "image" | "video" | null {
+  const path = url.split(/[?#]/, 1)[0].toLowerCase();
+  if (/\.(mp4|webm|mov)$/.test(path)) return "video";
+  if (/\.(png|jpe?g|webp|gif)$/.test(path)) return "image";
+  return null;
 }
 function renderTools(): void {
   refs.tools.replaceChildren();
