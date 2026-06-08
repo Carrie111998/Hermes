@@ -27,6 +27,12 @@ class PAJobBrief:
     disabled_toolsets: tuple[str, ...] = field(default_factory=tuple)
     fact_operations: Mapping[str, Any] = field(default_factory=dict)
     response_policy: Mapping[str, Any] = field(default_factory=dict)
+    # Optional per-chat gate / debounce overrides. ``None`` means "not set by
+    # this brief" — the caller falls back to global config / universal default
+    # so today's behaviour is preserved when a brief sets nothing.
+    require_mention: bool | None = None
+    debounce_passive_ms: int | None = None
+    debounce_addressed_ms: int | None = None
     hash: str = ""
 
 
@@ -264,6 +270,18 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         raw_brief.get("disabled_toolsets", ()),
         f"{source}.job_briefs.{job_type}.disabled_toolsets",
     )
+    require_mention = _optional_bool(
+        raw_brief.get("require_mention"),
+        f"{source}.job_briefs.{job_type}.require_mention",
+    )
+    debounce_passive_ms = _optional_int(
+        raw_brief.get("debounce_passive_ms"),
+        f"{source}.job_briefs.{job_type}.debounce_passive_ms",
+    )
+    debounce_addressed_ms = _optional_int(
+        raw_brief.get("debounce_addressed_ms"),
+        f"{source}.job_briefs.{job_type}.debounce_addressed_ms",
+    )
     payload = {
         "job_type": job_type,
         "title": title,
@@ -274,6 +292,9 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         "disabled_toolsets": disabled_toolsets,
         "fact_operations": fact_operations,
         "response_policy": response_policy,
+        "require_mention": require_mention,
+        "debounce_passive_ms": debounce_passive_ms,
+        "debounce_addressed_ms": debounce_addressed_ms,
     }
     return PAJobBrief(
         job_type=job_type,
@@ -285,6 +306,9 @@ def _load_job_brief(job_type: str, raw_brief: Mapping[str, Any], source: str) ->
         disabled_toolsets=disabled_toolsets,
         fact_operations=dict(fact_operations),
         response_policy=dict(response_policy),
+        require_mention=require_mention,
+        debounce_passive_ms=debounce_passive_ms,
+        debounce_addressed_ms=debounce_addressed_ms,
         hash=behavior_hash(payload),
     )
 
@@ -423,6 +447,42 @@ def _as_optional_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _optional_bool(value: Any, source: str) -> bool | None:
+    """Parse an optional brief bool leniently; absent / None -> None."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "on"}:
+            return True
+        if text in {"false", "0", "no", "off"}:
+            return False
+    raise ValueError(f"{source}: must be a boolean")
+
+
+def _optional_int(value: Any, source: str) -> int | None:
+    """Parse an optional brief int leniently; absent / None -> None."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        # bool is a subclass of int; reject to avoid True->1 ms surprises.
+        raise ValueError(f"{source}: must be an integer")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{source}: must be an integer") from exc
+    raise ValueError(f"{source}: must be an integer")
+
+
 def _required_mapping(data: Mapping[str, Any], key: str, source: str) -> Mapping[str, Any]:
     value = data.get(key)
     if not isinstance(value, Mapping):
@@ -473,6 +533,9 @@ def _normalize(value: Any) -> Any:
             "disabled_toolsets": value.disabled_toolsets,
             "fact_operations": value.fact_operations,
             "response_policy": value.response_policy,
+            "require_mention": value.require_mention,
+            "debounce_passive_ms": value.debounce_passive_ms,
+            "debounce_addressed_ms": value.debounce_addressed_ms,
             "hash": value.hash,
         }
     if isinstance(value, PAResolvedContext):

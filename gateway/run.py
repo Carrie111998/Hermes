@@ -1060,6 +1060,52 @@ def _resolve_pa_context(
         raise
 
 
+def _make_whatsapp_pa_brief_resolver():
+    """Return a ``(chat_id) -> dict | None`` resolver for WhatsApp brief settings.
+
+    The closure resolves the PA job brief assigned to a WhatsApp chat (via the
+    constitution's selectors on ``source.platform`` + ``source.chat_id``) and
+    returns only the per-chat gate / debounce settings the adapter needs:
+    ``require_mention`` / ``debounce_passive_ms`` / ``debounce_addressed_ms``.
+
+    Returns ``None`` when no PA constitution is configured, no brief matches the
+    chat, or resolution fails — the adapter then falls back to global config /
+    universal defaults, preserving today's behaviour. This is delivery-only
+    wiring: it does not move or change any gate, it only lets the existing gate
+    read the brief.
+    """
+
+    def _resolve(chat_id: str):
+        if not chat_id:
+            return None
+        try:
+            user_config = _load_gateway_config()
+            platform_key = Platform.WHATSAPP.value
+            platform_extra = (user_config.get("platforms") or {}).get(platform_key) or {}
+            metadata = {
+                "source": {
+                    "platform": platform_key,
+                    "chat_id": chat_id,
+                }
+            }
+            pa_context = _resolve_pa_context(user_config, platform_extra, metadata)
+        except Exception as exc:
+            logger.debug("WhatsApp PA brief resolve failed for %s: %s", chat_id, exc)
+            return None
+        if pa_context is None:
+            return None
+        brief = getattr(pa_context, "job_brief", None)
+        if brief is None:
+            return None
+        return {
+            "require_mention": getattr(brief, "require_mention", None),
+            "debounce_passive_ms": getattr(brief, "debounce_passive_ms", None),
+            "debounce_addressed_ms": getattr(brief, "debounce_addressed_ms", None),
+        }
+
+    return _resolve
+
+
 def _merge_pa_toolsets(
     enabled_toolsets: list[str] | None,
     disabled_toolsets: list[str] | None,
@@ -5854,6 +5900,16 @@ class GatewayRunner:
             if not check_whatsapp_requirements():
                 logger.warning("WhatsApp: Node.js not installed or bridge not configured")
                 return None
+            # Hand the adapter a minimal resolver so its existing gate +
+            # debounce can read per-chat brief settings (require_mention /
+            # debounce windows) from the chat's assigned PA brief. None ->
+            # the adapter falls back to global config / universal defaults,
+            # preserving today's behaviour when no brief sets them.
+            if hasattr(config, "extra") and isinstance(config.extra, dict):
+                config.extra.setdefault(
+                    "pa_brief_resolver",
+                    _make_whatsapp_pa_brief_resolver(),
+                )
             return WhatsAppAdapter(config)
         
         elif platform == Platform.SLACK:

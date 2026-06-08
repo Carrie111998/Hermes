@@ -275,6 +275,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
             or os.getenv("WHATSAPP_TURN_DEBOUNCE_MS", "1500")
             or 0
         )
+        # Conditional-window defaults (used when neither brief nor config sets a
+        # value). Addressed = short (respond promptly); passive = long (patient
+        # batch while only observing). The passive value is the testing default;
+        # the live value is a one-line config / brief flip.
+        self._debounce_addressed_ms_default: int = 1500
+        self._debounce_passive_ms_default: int = 10000
+        # Optional resolver injected by the gateway: ``(chat_id) -> dict | None``
+        # returning the chat's brief settings (require_mention / debounce
+        # windows). ``None`` everywhere falls back to config / defaults so
+        # today's behaviour is preserved. Results are cached per chat_id.
+        self._pa_brief_resolver = config.extra.get("pa_brief_resolver")
+        self._pa_brief_settings_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self._turn_buffers: Dict[str, List[MessageEvent]] = {}
         self._turn_tasks: Dict[str, asyncio.Task] = {}
         self._bridge_log_fh = None
@@ -308,7 +320,43 @@ class WhatsAppAdapter(BasePlatformAdapter):
         # code-fence repair even if a user configures a very long prefix.
         return max(1024, self.MAX_MESSAGE_LENGTH - prefix_len)
 
-    def _whatsapp_require_mention(self) -> bool:
+    def _brief_settings_for_chat(self, chat_id: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Resolve (and cache) the chat's brief settings, or None.
+
+        Uses the gateway-injected ``pa_brief_resolver`` to fetch the per-chat
+        brief gate / debounce settings. None when no resolver is wired, no brief
+        matches, or resolution fails — callers then fall back to config /
+        defaults. Never raises into the message path.
+        """
+        if not chat_id:
+            return None
+        resolver = getattr(self, "_pa_brief_resolver", None)
+        if not callable(resolver):
+            return None
+        cache = self._pa_brief_settings_cache
+        if chat_id in cache:
+            return cache[chat_id]
+        settings: Optional[Dict[str, Any]] = None
+        try:
+            result = resolver(chat_id)
+            if isinstance(result, dict):
+                settings = result
+        except Exception as exc:
+            logger.debug("[%s] WhatsApp brief resolve failed for %s: %s", self.name, chat_id, exc)
+            settings = None
+        cache[chat_id] = settings
+        return settings
+
+    def _whatsapp_require_mention(self, chat_id: Optional[str] = None) -> bool:
+        # Brief wins when it sets require_mention (not None); else fall back to
+        # config.extra, then env — today's behaviour.
+        brief = self._brief_settings_for_chat(chat_id)
+        if brief is not None:
+            brief_value = brief.get("require_mention")
+            if brief_value is not None:
+                if isinstance(brief_value, str):
+                    return brief_value.lower() in {"true", "1", "yes", "on"}
+                return bool(brief_value)
         configured = self.config.extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
@@ -539,7 +587,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         chat_id = str(data.get("chatId") or "")
         if chat_id in self._whatsapp_free_response_chats():
             return True
-        if not self._whatsapp_require_mention():
+        if not self._whatsapp_require_mention(chat_id):
             return True
         body = str(data.get("body") or "").strip()
         if body.startswith("/"):
@@ -591,10 +639,74 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return 0.0
         return max(0.0, ms / 1000.0)
 
+    @staticmethod
+    def _coerce_window_ms(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            ms = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ms if ms >= 0 else None
+
+    def _debounce_window_ms(self, chat_id: Optional[str], addressed: bool) -> int:
+        """Resolve the debounce window (ms) for a burst in this chat.
+
+        addressed -> short (addressed) window; otherwise -> long (passive)
+        window. Resolution per window: brief value (if set) -> config.extra ->
+        env -> universal default. Preserves today's single-window behaviour when
+        a brief/config sets nothing (passive default = testing 10s; addressed
+        default = 1500ms).
+        """
+        brief = self._brief_settings_for_chat(chat_id)
+        if addressed:
+            ms = self._coerce_window_ms(brief.get("debounce_addressed_ms")) if brief else None
+            if ms is None:
+                ms = self._coerce_window_ms(self.config.extra.get("debounce_addressed_ms"))
+            if ms is None:
+                ms = self._coerce_window_ms(os.getenv("WHATSAPP_DEBOUNCE_ADDRESSED_MS"))
+            if ms is None:
+                ms = self._debounce_addressed_ms_default
+        else:
+            ms = self._coerce_window_ms(brief.get("debounce_passive_ms")) if brief else None
+            if ms is None:
+                ms = self._coerce_window_ms(self.config.extra.get("debounce_passive_ms"))
+            if ms is None:
+                ms = self._coerce_window_ms(os.getenv("WHATSAPP_DEBOUNCE_PASSIVE_MS"))
+            if ms is None:
+                ms = self._debounce_passive_ms_default
+        return ms
+
+    def _debounce_disabled(self) -> bool:
+        """True only when debounce is explicitly turned off.
+
+        Off = the single-window switch ``turn_debounce_ms`` is explicitly 0 AND
+        no conditional-window override is configured. Conditional windows
+        (brief or config) keep debounce on regardless of the legacy switch.
+        """
+        if self._debounce_seconds() > 0:
+            return False
+        # Legacy switch is 0; conditional windows can still enable debounce.
+        if self.config.extra.get("debounce_passive_ms") is not None:
+            return False
+        if self.config.extra.get("debounce_addressed_ms") is not None:
+            return False
+        if os.getenv("WHATSAPP_DEBOUNCE_PASSIVE_MS") is not None:
+            return False
+        if os.getenv("WHATSAPP_DEBOUNCE_ADDRESSED_MS") is not None:
+            return False
+        return True
+
     async def _queue_or_handle_event(self, event: MessageEvent) -> None:
-        """Debounce WhatsApp events into one turn per chat window."""
-        debounce_s = self._debounce_seconds()
-        if debounce_s <= 0:
+        """Debounce WhatsApp events into one turn per chat window.
+
+        Window is conditional on burst addressed-ness: any addressed event in
+        the accumulating burst selects the short (addressed) window; a purely
+        passive burst uses the long (passive) window. Mid-burst collapse: when
+        an addressed event lands in a passive burst, the window switches to the
+        short value and the flush is cancelled + rescheduled on it.
+        """
+        if self._debounce_disabled():
             await self.handle_message(event)
             return
 
@@ -613,10 +725,23 @@ class WhatsAppAdapter(BasePlatformAdapter):
             tasks = self._turn_tasks
 
         buffers.setdefault(chat_id, []).append(event)
+        # Addressed over the WHOLE buffered burst: a single mention/reply pulls
+        # the chat out of passive patience.
+        burst_addressed = any(
+            getattr(buffered, "addressed", False) for buffered in buffers[chat_id]
+        )
+        window_ms = self._debounce_window_ms(chat_id, burst_addressed)
+        window_s = max(0.0, window_ms / 1000.0)
+
         existing = tasks.get(chat_id)
         if existing and not existing.done():
+            # Cancel + reschedule. When a new addressed event collapses a
+            # passive burst, this reschedules on the (shorter) addressed window.
             existing.cancel()
-        tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, debounce_s))
+        if window_s <= 0:
+            await self._flush_turn(chat_id)
+            return
+        tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, window_s))
 
     async def _flush_turn_after(self, chat_id: str, debounce_s: float) -> None:
         try:
@@ -698,6 +823,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
             message_id="+".join(ids) if ids else first.message_id,
             media_urls=media_urls,
             media_types=media_types,
+            # Bundle is addressed if any constituent event addressed the bot —
+            # the synthetic bundle raw_message loses per-event mention/reply
+            # detection, so carry the flag through explicitly.
+            addressed=any(getattr(event, "addressed", False) for event in events),
         )
     
     async def connect(self) -> bool:
@@ -1501,6 +1630,14 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         except Exception as e:
                             print(f"[{self.name}] Failed to read document text: {e}", flush=True)
 
+            # Addressed-ness for the conditional turn-debounce: a reply to one
+            # of the bot's messages OR an @-mention of the bot. Reuses the same
+            # detection the require_mention gate uses.
+            addressed = bool(
+                self._message_is_reply_to_bot(data)
+                or self._message_mentions_bot(data)
+            )
+
             return MessageEvent(
                 text=body,
                 message_type=msg_type,
@@ -1511,6 +1648,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 reply_to_text=self._reply_context_text(data),
                 media_urls=cached_urls,
                 media_types=media_types,
+                addressed=addressed,
             )
         except Exception as e:
             print(f"[{self.name}] Error building event: {e}")

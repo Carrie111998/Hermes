@@ -26,6 +26,12 @@ job_briefs:
     title: TGG Operations Ingest
     purpose: Turn inbound operational messages into structured facts and follow-up
       actions.
+    # Per-chat gate / debounce settings (read by the WhatsApp adapter).
+    # Passive ingest: observe quietly, batch a long window; respond promptly
+    # only when Christopher is addressed.
+    require_mention: false
+    debounce_passive_ms: 10000
+    debounce_addressed_ms: 1500
     runtime:
       model: gemini-3.1-flash-lite
     instructions:
@@ -93,6 +99,10 @@ job_briefs:
   tgg_management:
     title: TGG Management Brief
     purpose: Prepare decision-oriented management summaries from known facts.
+    # Management chats address Christopher directly; only respond when mentioned
+    # or replied-to. Debounce windows fall back to the global / universal
+    # defaults (addressed-style) when unset.
+    require_mention: true
     runtime:
       model: gemini-3.1-flash-lite
     instructions:

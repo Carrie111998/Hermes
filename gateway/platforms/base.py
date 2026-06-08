@@ -1025,6 +1025,13 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Whether this inbound event addresses the bot directly — an @-mention of
+    # the bot OR a reply to one of the bot's messages. Used by the WhatsApp
+    # conditional turn-debounce to pick the short (addressed) window over the
+    # long (passive) one. Adapters that compute addressed-ness stamp it here;
+    # default False means "not addressed / unknown".
+    addressed: bool = False
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
