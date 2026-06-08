@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Hermes Live Panel</title>
+    <title>Ultra Studio Agent</title>
     <style>
       :root {
         color-scheme: dark;
@@ -20,6 +20,7 @@
         --brass: #d7a94e;
         --red: #e1614f;
         --plum: #7f6df2;
+        --lime: #b7ff2a;
       }
       * { box-sizing: border-box; }
       html, body { margin: 0; min-height: 100%; color: var(--ink); background:
@@ -36,13 +37,30 @@
       .shell { display: grid; grid-template-columns: minmax(14rem,17rem) minmax(0,1fr) minmax(16rem,21rem); min-height: 100vh; }
       .rail, .inspector { background: var(--rail); border-color: var(--line); backdrop-filter: blur(16px); }
       .rail { display: flex; flex-direction: column; gap: 1.2rem; padding: 1.2rem; border-right: 1px solid var(--line); }
-      .brand { display: flex; align-items: center; gap: .8rem; }
-      .brand-mark { display: grid; width: 2.75rem; height: 2.75rem; place-items: center; color: var(--cyan); background: linear-gradient(145deg, rgba(139,221,227,.18), rgba(215,169,78,.12)); border: 1px solid var(--line2); border-radius: .5rem; }
+      .brand { display: flex; min-width: 0; align-items: center; gap: .8rem; }
+      .brand-mark { flex: 0 0 auto; width: 3.5rem; height: 3.5rem; padding: .16rem; background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.48); border-radius: .7rem; box-shadow: 0 .7rem 1.8rem rgba(0,0,0,.38); }
+      .brand-mark img { display: block; width: 100%; height: 100%; object-fit: cover; border-radius: .55rem; }
+      .brand-copy { min-width: 0; }
       .brand strong, .brand small { display: block; }
-      .brand small { margin-top: .2rem; color: var(--muted); font-size: .78rem; }
+      .brand strong { color: #d8d7d4; font-size: 1.12rem; line-height: 1.05; white-space: nowrap; }
+      .brand strong span { color: var(--lime); }
+      .brand small { margin-top: .28rem; color: var(--muted); font-size: .72rem; }
       .rail-action, .icon-button, .prompt-action { color: var(--ink); background: rgba(255,255,255,.055); border: 1px solid var(--line); border-radius: .5rem; }
       .rail-action { display: flex; align-items: center; gap: .7rem; width: 100%; padding: .8rem .85rem; }
       .rail-action:hover, .icon-button:hover:not(:disabled), .prompt-action:hover { color: var(--cyan); border-color: rgba(139,221,227,.5); }
+      .history-panel { display: flex; min-height: 0; flex-direction: column; gap: .55rem; }
+      .history-head { display: flex; align-items: center; justify-content: space-between; gap: .6rem; }
+      .history-head h2 { margin: 0; color: var(--dim); font-size: .68rem; text-transform: uppercase; }
+      .history-refresh { display: inline-grid; width: 1.9rem; height: 1.9rem; place-items: center; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: .45rem; }
+      .history-refresh svg { width: .95rem; height: .95rem; }
+      .history-list { display: grid; max-height: min(42vh,22rem); gap: .45rem; overflow-y: auto; }
+      .history-empty { padding: .7rem; color: var(--dim); border: 1px dashed var(--line); border-radius: .45rem; font-size: .72rem; }
+      .history-item { display: grid; width: 100%; gap: .24rem; padding: .65rem .7rem; color: var(--muted); text-align: left; background: rgba(255,255,255,.035); border: 1px solid var(--line); border-radius: .45rem; }
+      .history-item:hover:not(:disabled), .history-item[data-active="true"] { color: var(--ink); border-color: rgba(183,255,42,.42); background: rgba(183,255,42,.07); }
+      .history-title, .history-preview, .history-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .history-title { color: var(--ink); font-size: .78rem; }
+      .history-preview { font-size: .7rem; }
+      .history-meta { color: var(--dim); font-size: .64rem; }
       .session-facts { display: grid; gap: .75rem; margin: 0; }
       .session-facts div, .meter { min-width: 0; padding: .8rem; background: rgba(255,255,255,.035); border: 1px solid var(--line); border-radius: .45rem; }
       .session-facts dt, .meter span, .eyebrow { margin: 0 0 .4rem; color: var(--dim); font-size: .68rem; text-transform: uppercase; }
@@ -109,14 +127,12 @@
     <div id="app" class="shell">
       <aside class="rail">
         <div class="brand">
-          <span class="brand-mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" focusable="false">
-              <path d="M5 15.5c3.2 3.2 7.4 3.2 10.6 0l2.8-2.8a4 4 0 0 0-5.7-5.7l-7.1 7.1a2.4 2.4 0 0 0 3.4 3.4l6.4-6.4" />
-            </svg>
+          <span class="brand-mark">
+            <img src="/atlas-avatar.png" alt="" />
           </span>
-          <span>
-            <strong>Hermes</strong>
-            <small>Live Panel</small>
+          <span class="brand-copy">
+            <strong><span>Bringing</span> it to life</strong>
+            <small>Ultra Studio Agent</small>
           </span>
         </div>
 
@@ -126,6 +142,19 @@
           </svg>
           <span>New Session</span>
         </button>
+
+        <section class="history-panel" aria-labelledby="history-heading">
+          <div class="history-head">
+            <h2 id="history-heading">History</h2>
+            <button id="refresh-history" class="history-refresh" type="button" title="Refresh history">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4" />
+                <path d="M7 18H4v3M17 6h3V3" />
+              </svg>
+            </button>
+          </div>
+          <div id="history-list" class="history-list"></div>
+        </section>
 
         <dl class="session-facts">
           <div>
@@ -146,8 +175,8 @@
       <main class="workspace">
         <header class="topbar">
           <div>
-            <p class="eyebrow">Hermes Gateway</p>
-            <h1>Conversation</h1>
+            <p class="eyebrow">Ultra Studio Agent</p>
+            <h1>Creative Session</h1>
           </div>
           <div class="runtime-strip">
             <span id="status-pill" class="status-pill" data-state="idle">

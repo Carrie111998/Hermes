@@ -1,3 +1,8 @@
+import {
+  createPanelHistoryController,
+  type PanelHistoryActivation,
+} from "./panelHistory";
+
 type Conn = "idle" | "connecting" | "open" | "closed" | "error";
 type Role = "user" | "assistant" | "system" | "tool";
 type ToolState = "running" | "done" | "error";
@@ -38,6 +43,8 @@ const refs = {
   stop: el("interrupt-button") as HTMLButtonElement,
   reconnect: el("reconnect-button") as HTMLButtonElement,
   fresh: el("new-session") as HTMLButtonElement,
+  history: el("history-list"),
+  historyRefresh: el("refresh-history") as HTMLButtonElement,
 };
 
 let conn: Conn = "idle";
@@ -53,6 +60,20 @@ let pendingPrompt: PanelPrompt | null = null;
 let activeAssistant: string | null = null;
 let seq = 0;
 let gw: PanelGatewayClient | null = null;
+const history = createPanelHistoryController({
+  listElement: refs.history,
+  refreshButton: refs.historyRefresh,
+  request: (method, params, timeoutMs) => {
+    if (!gw) throw new Error("gateway not connected");
+    return gw.request(method, params, timeoutMs);
+  },
+  makeId: id,
+  getSessionId: () => sid,
+  getMessages: () => msgs,
+  isRunning: () => run,
+  activate: activateHistory,
+  onError: showError,
+});
 
 class PanelGatewayClient {
   private ws: WebSocket | null = null;
@@ -136,16 +157,53 @@ function str(record: Record<string, unknown>, key: string): string {
   const value = record[key];
   return typeof value === "string" ? value : "";
 }
-function num(record: Record<string, unknown>, key: string): number | undefined {
-  const value = record[key];
-  return typeof value === "number" ? value : undefined;
-}
 function id(prefix: string): string {
   seq += 1;
   return `${prefix}-${Date.now().toString(36)}-${seq}`;
 }
 function basename(path: string): string {
   return path.split(/[\\/]/).filter(Boolean).pop() || path;
+}
+const TOOL_STATUS_LABELS: Record<string, string> = {
+  image_generate: "Creating image",
+  video_generate: "Creating video",
+  vision_analyze: "Inspecting image",
+  browser_navigate: "Opening page",
+  browser_vision: "Inspecting page",
+  web_search: "Searching web",
+  search_files: "Searching files",
+  read_file: "Reading file",
+  write_file: "Writing file",
+  patch: "Applying patch",
+  terminal: "Executing command",
+  process: "Running process",
+  execute_code: "Executing code",
+  skill_view: "Loading skill",
+  skills_list: "Loading skills",
+  todo: "Updating plan",
+};
+function phaseStatusLabel(value: string): string {
+  const phase = (value || "").trim().toLowerCase();
+  if (!phase || phase === "running") return "Thinking";
+  if (phase.includes("upload")) return "Uploading image";
+  if (phase.includes("tool")) return "Using tools";
+  if (phase.includes("reason")) return "Reasoning";
+  if (phase.includes("think")) return "Thinking";
+  if (phase.includes("generat") || phase.includes("creat")) return "Creating";
+  if (phase.includes("final") || phase.includes("complete")) return "Finalizing";
+  return value;
+}
+function toolStatusLabel(name: string): string {
+  if (TOOL_STATUS_LABELS[name]) return TOOL_STATUS_LABELS[name];
+  if (name.includes("search")) return "Searching";
+  if (name.includes("image")) return "Creating image";
+  if (name.includes("video")) return "Creating video";
+  if (name.includes("file")) return "Working with files";
+  return `Running ${name || "tool"}`;
+}
+function toolMessageText(name: string, context = "", detail = ""): string {
+  const label = toolStatusLabel(name);
+  return [detail ? `${label}: ${detail}` : label, context].filter(Boolean).join("\n");
 }
 
 async function connect(): Promise<void> {
@@ -161,9 +219,11 @@ async function connect(): Promise<void> {
     await client.connect();
     const created = await client.request<PanelCreate>("session.create", {});
     sid = created.session_id;
+    history.setActive(sid);
     info = created.info ?? {};
     runStatus = "idle";
     render();
+    void history.refresh();
   } catch (err) {
     conn = "error";
     showError(err instanceof Error ? err.message : String(err));
@@ -173,6 +233,7 @@ async function connect(): Promise<void> {
 function reset(): void {
   gw?.close();
   sid = null;
+  history.setActive("");
   info = {};
   run = false;
   runStatus = "connecting";
@@ -190,6 +251,7 @@ function onEvent(event: PanelEvent): void {
   switch (event.type) {
     case "session.info":
       if (event.session_id) sid = event.session_id;
+      if (event.session_id) history.ensureActive(event.session_id);
       info = { ...info, ...payload };
       runStatus = "idle";
       return render();
@@ -261,6 +323,7 @@ function completeAssistant(text?: string): void {
   activeAssistant = null;
   run = false;
   runStatus = "idle";
+  history.remember();
   render();
 }
 function showError(message: string): void {
@@ -274,12 +337,13 @@ function startTool(payload: Record<string, unknown>): void {
   if (!toolId) return;
   const name = str(payload, "name") || "tool";
   const context = str(payload, "context");
+  runStatus = toolStatusLabel(name);
   tools.push({ id: id("tool"), toolId, name, context, status: "running" });
   tools = tools.slice(-24);
   msgs.push({
     id: id("toolmsg"),
     role: "tool",
-    text: [`Running ${name}`, context].filter(Boolean).join("\n"),
+    text: toolMessageText(name, context),
     status: "streaming",
     toolId,
     toolName: name,
@@ -294,10 +358,11 @@ function updateTool(payload: Record<string, unknown>): void {
     ? tools.findLast((tool) => tool.toolId === toolId)
     : tools.findLast((tool) => tool.name === name && tool.status === "running");
   if (match) match.preview = preview || match.preview;
+  if (match) runStatus = toolStatusLabel(match.name);
   const msg = toolId
     ? msgs.find((entry) => entry.toolId === toolId)
     : msgs.findLast((entry) => entry.role === "tool" && entry.toolName === name && entry.status === "streaming");
-  if (msg && preview) msg.text = [`Running ${msg.toolName || name || "tool"}`, preview].join("\n");
+  if (msg && preview) msg.text = toolMessageText(msg.toolName || name || "tool", "", preview);
   render();
 }
 function finishTool(payload: Record<string, unknown>): void {
@@ -306,6 +371,7 @@ function finishTool(payload: Record<string, unknown>): void {
   match.summary = str(payload, "summary");
   match.error = str(payload, "error");
   match.status = match.error ? "error" : "done";
+  runStatus = match.error ? "Tool error" : "Finalizing";
   const msg = msgs.find((entry) => entry.toolId === match.toolId);
   if (msg) {
     msg.status = "complete";
@@ -372,6 +438,7 @@ async function submit(): Promise<void> {
   attached = [];
   renderAttachments();
   addMsg("user", text || "[attachment]", outboundAttachments);
+  history.remember(text || outboundAttachments[0]?.name || "New session");
   errorText = "";
   run = true;
   runStatus = "running";
@@ -453,10 +520,28 @@ async function answerSecret(value: string): Promise<void> {
   render();
 }
 
+function activateHistory(view: PanelHistoryActivation): void {
+  sid = view.sessionId;
+  history.setActive(view.activeId);
+  info = rec(view.info) ? { provider: str(view.info, "provider"), model: str(view.info, "model") } : {};
+  msgs = view.messages;
+  tools = [];
+  pendingPrompt = null;
+  activeAssistant = null;
+  for (const item of attached) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+  attached = [];
+  run = false;
+  runStatus = "idle";
+  errorText = "";
+  renderAttachments();
+  render();
+}
+
 function render(): void {
   refs.connection.textContent = conn;
-  refs.run.textContent = run ? "running" : runStatus;
-  refs.statusLabel.textContent = run ? runStatus : conn;
+  const displayStatus = run ? phaseStatusLabel(runStatus) : runStatus;
+  refs.run.textContent = displayStatus;
+  refs.statusLabel.textContent = run ? displayStatus : conn;
   refs.statusPill.dataset.state = conn;
   refs.model.textContent = info.model || "pending";
   refs.provider.textContent = info.provider || "gateway";
@@ -465,6 +550,7 @@ function render(): void {
   refs.stop.disabled = !run || !sid;
   refs.error.hidden = !errorText;
   refs.error.textContent = errorText;
+  history.render();
   renderMessages();
   renderTools();
   renderPrompt();
@@ -494,7 +580,7 @@ function renderMessages(): void {
     } else if (msg.status === "streaming") {
       const placeholder = document.createElement("span");
       placeholder.className = "stream-placeholder";
-      placeholder.textContent = "Working";
+      placeholder.textContent = phaseStatusLabel(runStatus);
       body.append(placeholder);
     }
     card.append(body);
