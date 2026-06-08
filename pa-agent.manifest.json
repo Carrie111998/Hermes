@@ -9,6 +9,26 @@
       "owner": "pclaw:pclaw"
     },
     {
+      "sourcePath": "gateway/platforms/base.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/platforms/base.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "gateway/pa_observability.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/gateway/pa_observability.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "tools/pa_record_event.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/tools/pa_record_event.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
+      "sourcePath": "hermes_state.py",
+      "targetPath": "home/pclaw/apps/hermes-pcl/hermes_state.py",
+      "owner": "pclaw:pclaw"
+    },
+    {
       "sourcePath": "gateway/channel_directory.py",
       "targetPath": "home/pclaw/apps/hermes-pcl/gateway/channel_directory.py",
       "owner": "pclaw:pclaw"
