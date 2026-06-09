@@ -1527,7 +1527,11 @@ class HonchoMemoryProvider(MemoryProvider):
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
-                    return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})
+                    # Report the *resolved* peer, not the requested one: an
+                    # unrecognized name collapses to the user, so echoing `peer`
+                    # would falsely confirm a write to a peer that doesn't exist.
+                    target = self._manager.resolved_peer_label(self._session_key, peer)
+                    return json.dumps({"result": f"Conclusion saved for {target}: {conclusion}"})
                 return tool_error("Failed to save conclusion.")
 
             return tool_error(f"Unknown tool: {tool_name}")
