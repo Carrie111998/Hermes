@@ -1914,18 +1914,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "running",
                 }
-                # Omnia structured-interaction protocol: the ask_user tool (shipped
-                # by the omnio_interaction plugin) carries its prompt args so the
-                # Omnia chat can render clickable buttons. Gated on the tool name so
-                # no other tool's args ever reach the wire. The turn is ended in
-                # _on_tool_complete (non-blocking); the user's click is the next turn.
-                if function_name == "ask_user" and isinstance(function_args, dict):
-                    progress["interaction"] = {
-                        "question": function_args.get("question"),
-                        "kind": function_args.get("kind"),
-                        "options": function_args.get("options"),
-                        "allow_freeform": function_args.get("allow_freeform"),
-                    }
+                # Omnia structured-interaction protocol: the request_input tool
+                # (shipped by the omnio_interaction plugin) carries its prompt args
+                # so the Omnia chat can render a proper form control. We forward the
+                # args verbatim under "interaction" — the per-kind shape lives in the
+                # plugin schema and the Omnia frontend, so new kinds need no change
+                # here. Gated on the tool name so no other tool's args reach the
+                # wire; request_input never receives a secret as an arg (it asks FOR
+                # one), so nothing sensitive crosses the wire. The turn is ended in
+                # _on_tool_complete (non-blocking); the user's answer is the next turn.
+                if function_name == "request_input" and isinstance(function_args, dict):
+                    progress["interaction"] = function_args
                 _stream_q.put(("__tool_progress__", progress))
 
             def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
@@ -1943,13 +1942,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }))
-                # ask_user is non-blocking and turn-ending: stop the agent loop now
-                # so the SSE stream closes and the user's selection becomes the next
+                # request_input is non-blocking and turn-ending: stop the agent loop
+                # now so the SSE stream closes and the user's answer becomes the next
                 # turn. interrupt() makes the loop return cleanly (the streaming
                 # writer still finalizes finish_reason="stop"), unlike a raised error.
-                if function_name == "ask_user" and agent_ref[0] is not None:
+                if function_name == "request_input" and agent_ref[0] is not None:
                     try:
-                        agent_ref[0].interrupt("awaiting user interaction (ask_user)")
+                        agent_ref[0].interrupt("awaiting user interaction (request_input)")
                     except Exception:
                         pass
 
