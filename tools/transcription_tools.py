@@ -508,7 +508,13 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
             if prep_error:
                 return {"success": False, "transcript": "", "error": prep_error}
 
-            assert prepared_input is not None
+            if prepared_input is None:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": "Failed to prepare local audio: input is None",
+                }
+
             command = command_template.format(
                 input_path=shlex.quote(prepared_input),
                 output_dir=shlex.quote(output_dir),

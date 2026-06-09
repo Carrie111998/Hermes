@@ -263,8 +263,10 @@ def extract_cached_index_skills():
     for s in skills:
         if not s["categoryLabel"]:
             cat = s["category"]
+            # Explicitly cast cat to str to satisfy ty's overload resolution
+            # for dict.get() when the key type might be inferred as Any/Unknown.
             s["categoryLabel"] = CATEGORY_LABELS.get(
-                cat,
+                str(cat),
                 str(cat).replace("-", " ").title() if cat else "Uncategorized",
             )
 

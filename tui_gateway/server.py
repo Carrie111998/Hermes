@@ -383,14 +383,14 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
-def _emit(event: str, sid: str, payload: dict[str, Any] | None = None):
+def _emit(event: str, sid: str, payload: dict[str, Any] | None = None) -> None:
     params: dict[str, Any] = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
-def _status_update(sid: str, kind: str, text: str | None = None):
+def _status_update(sid: str, kind: str, text: str | None = None) -> None:
     body = (text if text is not None else kind).strip()
     if not body:
         return
@@ -587,7 +587,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
             _notify_session_boundary("on_session_reset", key)
 
-            info = _session_info(agent)
+            info: dict[str, Any] = _session_info(agent)
             warn = _probe_credentials(agent)
             if warn:
                 info["credential_warning"] = warn
