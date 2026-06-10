@@ -478,7 +478,13 @@ def _case_search_anchors(search: str) -> tuple[str | None, str | None]:
     block_match = re.search(r"\b(?:BLK|BLOCK)\s+([A-Z0-9]+)", text, flags=re.I)
     unit_match = re.search(r"#\s*([0-9]{1,3}\s*-\s*[0-9A-Z]+)", text, flags=re.I)
     block = block_match.group(1).upper() if block_match else None
-    unit = "#" + re.sub(r"\s+", "", unit_match.group(1)).upper() if unit_match else None
+    # Unit anchor is normalized WITHOUT the '#': stored units are inconsistent
+    # ('11-109' from master imports vs '#11-109' from WA-created cases), so all
+    # unit comparisons strip '#' + spaces on both sides. A '#'-prefixed anchor
+    # hard-filtered every master-seeded case to zero results (2026-06-10 day-25
+    # finding: SK/JOB/2604/2376 existed, search returned [], Christopher minted
+    # a WA-only duplicate).
+    unit = re.sub(r"\s+", "", unit_match.group(1)).upper() if unit_match else None
     return block, unit
 
 
@@ -608,7 +614,7 @@ class _ReplayOperatorBackend:
             clauses.append("upper(coalesce(block, '')) = ?")
             binds.append(query_block)
         if query_unit:
-            clauses.append("upper(replace(coalesce(unit, ''), ' ', '')) = ?")
+            clauses.append("replace(upper(replace(coalesce(unit, ''), ' ', '')), '#', '') = ?")
             binds.append(query_unit)
         if service_line:
             clauses.append("coalesce(service_line, 'maintenance') = ?")
@@ -650,7 +656,7 @@ class _ReplayOperatorBackend:
             matches = sum(1 for token in tokens if token in haystack)
             anchor = 0
             block = str(row["block"] or "").upper()
-            unit = str(row["unit"] or "").replace(" ", "").upper()
+            unit = str(row["unit"] or "").replace(" ", "").replace("#", "").upper()
             if query_block:
                 if block != query_block:
                     return 0, 0, int(row["updated_at"] or 0)
