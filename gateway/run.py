@@ -8402,6 +8402,26 @@ class GatewayRunner:
 
             response = agent_result.get("final_response") or ""
 
+            # PA universal turn-recording needs the FULL agent_result dict
+            # (messages, api_calls, tool_calls, model/provider). This method's
+            # public contract is to return the response STRING, and it has
+            # several early-return paths (notably PA `never_send_replies` ->
+            # `return None`, plus already-sent/streaming/voice paths) that never
+            # reach the final `return response`. Stash the rich dict HERE — right
+            # after a non-stale agent_result exists — keyed by (quick_key,
+            # run_generation), so the turn-recording boundary in _handle_message
+            # can read it regardless of which return path this method takes.
+            # Without this, build_turn_record received a str/None -> result_dict
+            # None -> empty pa_tool_calls + null message_refs + skeletal envelope.
+            try:
+                _rec_stash = getattr(self, "_last_agent_result_by_run", None)
+                if _rec_stash is None:
+                    _rec_stash = {}
+                    self._last_agent_result_by_run = _rec_stash
+                _rec_stash[(_quick_key, run_generation)] = agent_result
+            except Exception:
+                pass
+
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
             # produce visible content after exhausting all retries (nudge,
@@ -8786,23 +8806,11 @@ class GatewayRunner:
                     status="executed",
                     turn_id=_pa_action_turn_id,
                 )
-            # PA universal turn-recording needs the FULL agent_result dict
-            # (messages, api_calls, tool_calls, model/provider) — but this
-            # method's public contract is to return the response STRING (the
-            # adapters, retry paths, and discord caller all consume a string).
-            # Stash the rich dict keyed by (quick_key, run_generation) so the
-            # turn-boundary recording site in _handle_message can read it
-            # instead of reconstructing a skeletal envelope from the string.
-            # Without this, build_turn_record received a str -> result_dict=None
-            # -> empty pa_tool_calls + null message_refs + skeletal envelope.
-            try:
-                stash = getattr(self, "_last_agent_result_by_run", None)
-                if stash is None:
-                    stash = {}
-                    self._last_agent_result_by_run = stash
-                stash[(_quick_key, run_generation)] = agent_result
-            except Exception:
-                pass
+            # NB: the agent_result stash for PA turn-recording is set EARLIER
+            # (right after the non-stale agent_result is obtained), so it is
+            # captured on every return path — including the PA
+            # `never_send_replies` / already-sent / voice early returns that
+            # never reach this final `return response`.
             return response
 
         except Exception as e:
