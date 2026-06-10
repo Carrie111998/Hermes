@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
+from cron.audit import audit_event, completion_details, removal_details, update_details
 
 # ``croniter`` compiles ~15 ms of regexes at import and only matters for
 # 5-field cron expressions. Resolve lazily; ``HAS_CRONITER`` stays a module
@@ -1870,6 +1871,12 @@ def create_job(
         jobs = load_jobs()
         jobs.append(job)
         save_jobs(jobs)
+    audit_event(
+        job["id"],
+        job.get("name", ""),
+        "created",
+        {"schedule": job.get("schedule_display", ""), "deliver": job.get("deliver")},
+    )
 
     return job
 
@@ -1937,7 +1944,13 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
-def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_job(
+    job_id: str,
+    updates: Dict[str, Any],
+    *,
+    audit_action: str = "updated",
+    audit_details: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
@@ -2059,7 +2072,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
-            return _normalize_job_record(jobs[i])
+            normalized = _normalize_job_record(jobs[i])
+            audit_event(
+                normalized["id"],
+                normalized.get("name", ""),
+                audit_action,
+                audit_details if audit_details is not None else update_details(updates),
+            )
+            return normalized
     return None
 
 
@@ -2076,6 +2096,8 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
             "paused_at": _hermes_now().isoformat(),
             "paused_reason": reason,
         },
+        audit_action="paused",
+        audit_details={"reason": reason} if reason else {},
     )
 
 
@@ -2101,6 +2123,8 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_reason": None,
             "next_run_at": next_run_at,
         },
+        audit_action="resumed",
+        audit_details={},
     )
 
 
@@ -2118,6 +2142,8 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
         },
+        audit_action="triggered",
+        audit_details={},
     )
 
 
@@ -2156,6 +2182,7 @@ def remove_job(job_id: str) -> bool:
             _fence_key = f"{_current_cron_store().cron_dir.resolve()}::{canonical_id}"
             with _fire_fence_locks_guard:
                 _fire_fence_locks.pop(_fence_key, None)
+            audit_event(canonical_id, job.get("name", ""), "removed", removal_details("manual"))
             return True
     return False
 
@@ -2329,6 +2356,7 @@ def _mark_job_run_locked(
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
+                        audit_event(job_id, job.get("name", ""), "completed" if success else "failed", completion_details(success, error, delivery_error))
                         return True
                 
                 # Compute next run
@@ -2360,10 +2388,12 @@ def _mark_job_run_locked(
                     else:
                         job["enabled"] = False
                         job["state"] = "completed"
+                        audit_event(job_id, job.get("name", ""), "disabled", removal_details("oneshot_completed"))
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
+                audit_event(job_id, job.get("name", ""), "completed" if success else "failed", completion_details(success, error, delivery_error))
                 return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)

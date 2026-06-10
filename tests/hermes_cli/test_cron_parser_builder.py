@@ -25,12 +25,56 @@ def _build():
 
 def test_cron_subactions_present():
     parser = _build()
-    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick"):
-        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick")
+    for action in ("list", "create", "edit", "pause", "resume", "run", "remove", "status", "runs", "tick", "audit"):
+        ns = parser.parse_args(["cron", action] if action in ("list", "status", "runs", "tick", "audit")
                                else ["cron", action, "jobid"] if action in ("pause", "resume", "run", "remove", "edit")
                                else ["cron", "create", "30m"])
         assert ns.command == "cron"
         assert ns.cron_command == action
+
+
+
+
+def test_cron_audit_options():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "audit", "--limit", "10", "--job-id", "abc123", "--action", "paused"
+    ])
+    assert ns.cron_command == "audit"
+    assert ns.limit == 10
+    assert ns.job_id == "abc123"
+    assert ns.action == "paused"
+
+
+def test_cron_aliases():
+    parser = _build()
+    # create has alias "add"
+    ns = parser.parse_args(["cron", "add", "30m"])
+    assert ns.cron_command == "add"
+    # remove has aliases rm / delete
+    for alias in ("rm", "delete"):
+        ns = parser.parse_args(["cron", alias, "jid"])
+        assert ns.cron_command == alias
+
+
+def test_cron_create_options():
+    parser = _build()
+    ns = parser.parse_args([
+        "cron", "create", "0 9 * * *", "do the thing",
+        "--name", "daily", "--deliver", "origin", "--repeat", "3",
+        "--skill", "a", "--skill", "b", "--no-agent",
+        "--workdir", "/tmp/x", "--profile", "work",
+    ])
+    assert ns.schedule == "0 9 * * *"
+    assert ns.prompt == "do the thing"
+    assert ns.name == "daily"
+    assert ns.deliver == "origin"
+    assert ns.repeat == 3
+    assert ns.skills == ["a", "b"]
+    assert ns.no_agent is True
+    assert ns.workdir == "/tmp/x"
+    assert ns.profile == "work"
+
 
 
 def test_cron_edit_no_agent_tristate():
