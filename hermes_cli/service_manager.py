@@ -104,9 +104,10 @@ def detect_service_manager() -> ServiceManagerKind:
     # whole gateway dependency graph for callers that only need the
     # Protocol type or validate_profile_name().
     from hermes_cli.gateway import (
-        is_macos,
-        is_windows,
-        supports_systemd_services,
+    is_macos,
+    is_windows,
+    supports_systemd_services,
+    _openrc_available,
     )
 
     # Gate on _s6_running() alone (PID 1 comm == s6-svscan AND /run/s6/basedir),
@@ -162,12 +163,6 @@ def _s6_running() -> bool:
     return Path("/run/s6/basedir").is_dir()
 
 
-def _openrc_available() -> bool:
-    """Check if OpenRC’s rc-service is available."""
-    try:
-        return shutil.which("rc-service") is not None
-    except Exception:
-        return False
 
 
 # Compatibility note
