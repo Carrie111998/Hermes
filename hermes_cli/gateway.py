@@ -97,9 +97,6 @@ class ProfileGatewayProcess:
     pid: int
 
 
-
-
-
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
