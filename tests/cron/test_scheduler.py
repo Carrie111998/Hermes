@@ -2247,7 +2247,7 @@ class TestRunJobWakeGate:
         import cron.scheduler as scheduler
 
         call_count = 0
-        def _script_stub(path):
+        def _script_stub(path, timeout_s=None):
             nonlocal call_count
             call_count += 1
             return (True, "regular output")
@@ -4388,15 +4388,24 @@ class TestPerJobSoftDeadline:
         assert marked == []
 
     def test_release_started_before_protects_successor_record(self):
-        import time as _t
         from cron import scheduler as sched
 
+        # Deterministic: pin record start times explicitly instead of
+        # relying on wall-clock ordering (fragile under a loaded suite).
+        cutoff = 1000.0
         assert sched._try_register_in_flight("guard-job", "guard") is None
-        cutoff = _t.monotonic()
-        _t.sleep(0.01)
-        # Successor registers after the cutoff (deadline handler's view).
-        sched._release_in_flight("guard-job")
+        with sched._in_flight_lock:
+            sched._in_flight["guard-job"].start_monotonic = cutoff - 10
+        # A record that started before the cutoff (the runaway) is popped.
+        sched._release_in_flight_started_before("guard-job", cutoff)
+        with sched._in_flight_lock:
+            assert "guard-job" not in sched._in_flight
+
+        # A record that started after the cutoff (a successor fire that
+        # raced in) must survive the deadline handler's release.
         assert sched._try_register_in_flight("guard-job", "guard") is None
+        with sched._in_flight_lock:
+            sched._in_flight["guard-job"].start_monotonic = cutoff + 10
         sched._release_in_flight_started_before("guard-job", cutoff)
         with sched._in_flight_lock:
             assert "guard-job" in sched._in_flight, (
