@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultra Studio Agent Architecture</title>
+<style>
+:root {
+  --bg: #f6f8f7;
+  --panel: #ffffff;
+  --ink: #182320;
+  --muted: #60706d;
+  --line: #d5dfdc;
+  --ok: #1d7a53;
+  --planned: #9a6a14;
+  --missing: #9b3848;
+  --blue: #22679a;
+  --soft-ok: #e9f6ef;
+  --soft-plan: #fff5dc;
+  --soft-miss: #fff0f2;
+  --soft-blue: #edf5fb;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.55;
+  letter-spacing: 0;
+}
+.wrap { max-width: 1220px; margin: 0 auto; padding: 28px; }
+header { background: #fff; border-bottom: 1px solid var(--line); }
+.kicker { color: var(--blue); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+h1 { margin: 8px 0 8px; font-size: 34px; line-height: 1.15; }
+h2 { margin: 34px 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 22px; }
+h3 { margin: 16px 0 8px; font-size: 16px; }
+p { margin: 8px 0; }
+code { background: #eef3f2; border: 1px solid #dbe5e2; border-radius: 5px; padding: 1px 5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .92em; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.pill { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 5px 10px; color: #31403d; font-size: 13px; }
+.legend { display: flex; flex-wrap: wrap; gap: 12px; margin: 22px 0 4px; }
+.tag { display: inline-flex; align-items: center; gap: 8px; border-radius: 999px; padding: 8px 13px; font-size: 13px; font-weight: 700; border: 1px solid var(--line); background: #fff; }
+.dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.ok { --c: var(--ok); --s: var(--soft-ok); }
+.planned { --c: var(--planned); --s: var(--soft-plan); }
+.missing { --c: var(--missing); --s: var(--soft-miss); }
+.external { --c: var(--blue); --s: var(--soft-blue); }
+.tag .dot { background: var(--c); }
+.note { border-left: 5px solid var(--blue); background: #edf5fb; border-radius: 8px; padding: 14px 16px; }
+.editor-toolbar {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 20;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-width: 520px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .94);
+  box-shadow: 0 18px 46px rgba(24, 35, 32, .15);
+  backdrop-filter: blur(12px);
+}
+.editor-toolbar button, .editor-toolbar label, .editor-select {
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  font: 700 12px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  padding: 7px 10px;
+}
+.editor-toolbar button.primary {
+  border-color: #8ac057;
+  background: #dff7c6;
+}
+.editor-toolbar input { display: none; }
+.edit-hint {
+  display: none;
+  width: 100%;
+  color: var(--muted);
+  font-size: 12px;
+}
+body.editing .edit-hint { display: block; }
+[contenteditable="true"] {
+  outline: 2px dashed rgba(34, 103, 154, .35);
+  outline-offset: 3px;
+  border-radius: 5px;
+}
+body.editing .box { position: relative; padding-bottom: 42px; }
+.box-tools {
+  display: none;
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  gap: 6px;
+}
+body.editing .box-tools { display: inline-flex; }
+.box-tools button, .box-tools select, .add-box {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  padding: 5px 7px;
+}
+.add-box { display: none; }
+body.editing .add-box { display: inline-flex; }
+body.editing svg text { cursor: pointer; }
+.save-state { color: var(--muted); font-size: 12px; align-self: center; }
+.diagram { display: grid; gap: 14px; }
+.layer {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 14px;
+  box-shadow: 0 10px 30px rgba(30, 45, 41, .06);
+}
+.layer-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.layer-title strong { font-size: 15px; }
+.lane { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+.box {
+  min-height: 94px;
+  border: 1px solid color-mix(in srgb, var(--c) 42%, var(--line));
+  background: var(--s);
+  border-radius: 8px;
+  padding: 11px;
+}
+.box strong { display: block; margin-bottom: 5px; font-size: 14px; }
+.box span { display: block; color: var(--muted); font-size: 12px; }
+.flow {
+  width: 100%;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 10px 30px rgba(30, 45, 41, .06);
+}
+svg { display: block; min-width: 1060px; width: 100%; height: auto; }
+.node { fill: #fff; stroke: #cad7d3; stroke-width: 1.2; }
+.node.ok { fill: var(--soft-ok); stroke: #78b692; }
+.node.planned { fill: var(--soft-plan); stroke: #d1aa58; }
+.node.missing { fill: var(--soft-miss); stroke: #d48a96; }
+.node.external { fill: var(--soft-blue); stroke: #83b2d1; }
+.label { fill: var(--ink); font: 700 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+.sub { fill: var(--muted); font: 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+.arrow { stroke: #697b77; stroke-width: 1.5; fill: none; marker-end: url(#arrow); }
+table { width: 100%; border-collapse: collapse; margin: 14px 0; background: #fff; font-size: 14px; }
+th, td { border: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; }
+th { background: #eef4f2; }
+.split { display: grid; grid-template-columns: 1.1fr .9fr; gap: 14px; align-items: start; }
+ul { margin: 8px 0; padding-left: 20px; }
+li { margin: 5px 0; }
+footer { margin-top: 34px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; padding-top: 16px; }
+@media (max-width: 820px) {
+  html, body { width: 100vw; max-width: 100vw; overflow-x: hidden; }
+  .wrap { width: 100%; max-width: 100%; min-width: 0; padding: 20px 14px; overflow-x: hidden; }
+  h1 { font-size: 27px; overflow-wrap: anywhere; }
+  .split { grid-template-columns: 1fr; }
+  .lane { grid-template-columns: 1fr; }
+  .layer-title { align-items: flex-start; flex-direction: column; }
+  .box, .layer { min-width: 0; }
+  table, thead, tbody, tr, th, td { display: block; width: 100%; }
+  thead { display: none; }
+  tr { border: 1px solid var(--line); margin-bottom: 10px; background: #fff; }
+  th, td { border: 0; border-bottom: 1px solid var(--line); }
+  th:last-child, td:last-child { border-bottom: 0; }
+  .note, .pill, .tag, p, li, a, code, th, td { overflow-wrap: anywhere; word-break: break-word; }
+  svg { min-width: 980px; }
+  .editor-toolbar { left: 10px; right: 10px; bottom: 10px; max-width: none; }
+}
+</style>
+</head>
+<body>
+<div class="editor-toolbar" aria-label="architecture editor toolbar">
+  <button class="primary" id="toggleEdit" type="button">开启编辑</button>
+  <button id="saveDoc" type="button">保存本地</button>
+  <button id="exportJson" type="button">导出 JSON</button>
+  <label for="importJson">导入 JSON</label>
+  <input id="importJson" type="file" accept="application/json">
+  <button id="resetDoc" type="button">重置</button>
+  <span class="save-state" id="saveState">未编辑</span>
+  <span class="edit-hint">编辑态：直接点文字修改；点卡片下方选择状态或删除；每层右上角可加模块；SVG 时序图文字点击后输入。</span>
+</div>
+<header>
+  <div class="wrap">
+    <div class="kicker">Current Whole-Agent Architecture</div>
+    <h1>Ultra Studio Agent 总体架构图</h1>
+    <p>这张图描述当前 Hermes fork 的目标形态：一个 Atlas-first 创作型 Agent。它把聊天 UI、Edge/Gateway、Sandbox VM、Hermes runtime、Skill、Prompt 编译、TokenRouter 控制面、CometAPI 媒体数据面、GPU worker、资产库和 Atlas provider 分开看。</p>
+    <div class="meta">
+      <span class="pill">日期：2026-06-10</span>
+      <a class="pill" href="ultra-studio-agent-research-appendix.html">完整调研附录</a>
+      <span class="pill">范围：Web Chat + Sandbox + TokenRouter + CometAPI + Skill + Media + Asset Library</span>
+      <span class="pill">原则：真实工具、真实资产、真实错误，不做 fake demo</span>
+    </div>
+    <div class="legend" aria-label="color legend">
+      <span class="tag ok"><span class="dot"></span>绿色：已有代码 / 已落地</span>
+      <span class="tag planned"><span class="dot"></span>黄色：已有文档或原型，待接入 runtime</span>
+      <span class="tag missing"><span class="dot"></span>红色：P0/P1 缺口，需要实现</span>
+      <span class="tag external"><span class="dot"></span>蓝色：外部服务 / provider 边界</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="note">
+    <strong>读图方式：</strong>Notion/Lark 主链路不是“一个前端调模型”。用户先进入 Web/Edge 实时会话，后端挂接 Sandbox 并注入短期 <code>HF_JWT_TOKEN</code>；Agent 在沙箱里跑推理-工具循环；TokenRouter 处理控制面、JWT、quota、vault key exchange 和审计；CometAPI 处理视频/音频/图像的媒体数据面；生成结果进入资产库。
+  </section>
+
+  <section>
+    <h2>1. 总体分层图</h2>
+    <div class="diagram">
+      <div class="layer">
+        <div class="layer-title"><strong>Experience Layer</strong><span class="tag planned"><span class="dot"></span>Web 原型 + 真实 chat 设计</span></div>
+        <div class="lane">
+          <div class="box planned"><strong>Creative Chat UI</strong><span>聊天、上传、历史、模型选择、媒体卡片、状态流。</span></div>
+          <div class="box planned"><strong>Asset Library UI</strong><span>全部资产、智能分组、普通合集、角色资产、详情和复用动作。</span></div>
+          <div class="box planned"><strong>Inspector / Live Panel</strong><span>当前 job、选中资产、QA、下载、转 Element、建角色。</span></div>
+          <div class="box ok"><strong>CLI / TUI Heritage</strong><span>Hermes 原有会话、工具、Skill、gateway 事件基础。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Session / Sandbox Control Plane</strong><span class="tag planned"><span class="dot"></span>Notion/Lark 主链路</span></div>
+        <div class="lane">
+          <div class="box planned"><strong>Edge Gateway</strong><span>SSE/WebSocket 入口；解析用户、workspace、订阅计划和请求限制。</span></div>
+          <div class="box planned"><strong>Backend Orchestrator</strong><span>按会话冷启动或热挂接 Sandbox，不让重型 VM 常驻所有用户。</span></div>
+          <div class="box planned"><strong>Sandbox VM</strong><span>独立 RootFS、namespace、cgroup；terminal/process 限制在当前沙箱。</span></div>
+          <div class="box planned"><strong>Volume Mounter</strong><span>挂载用户数据、<code>.memories/</code>、<code>AGENTS.md</code>、<code>project.md</code>。</span></div>
+          <div class="box planned"><strong>HF_JWT_TOKEN Injection</strong><span>沙箱只拿短期受限 JWT，不持有 Google/Anthropic/AWS/Atlas 静态 key。</span></div>
+          <div class="box missing"><strong>Hermes Cloud Attach</strong><span>本 fork 还没有把 web session 与真实 sandbox lifecycle 完整打通。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Dual Gateway / Media Execution Plane</strong><span class="tag planned"><span class="dot"></span>TokenRouter + CometAPI 必经层</span></div>
+        <div class="lane">
+          <div class="box planned"><strong>TokenRouter Control Plane</strong><span>控制面：JWT 校验、claims、quota、Boost 并发、audit、provider key blind-state。</span></div>
+          <div class="box planned"><strong>Vault Key Exchange</strong><span>用 <code>HF_JWT_TOKEN</code> 盲态兑换真实上游 key，真实 key 不进入 Sandbox。</span></div>
+          <div class="box planned"><strong>Redis Quota / Boost</strong><span>余额、并发槽、text2image/image2video limits、Boost Speed 状态。</span></div>
+          <div class="box planned"><strong>CometAPI Media Plane</strong><span>媒体数据面：外部视频/音频/图片抓取、抽帧、裁剪、降采样、ASR/帧序列对齐。</span></div>
+          <div class="box planned"><strong>Async Event Bus</strong><span><code>higgsfield_generate async=true</code>、job fanout、进度和状态事件回流。</span></div>
+          <div class="box planned"><strong>GPU Render Workers</strong><span>图片、视频、音频重任务由后端 worker 消费，不阻塞 Agent 主会话。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Production Agent Primitives</strong><span class="tag missing"><span class="dot"></span>Manus / E2B / Browserbase / Temporal 调研补充</span></div>
+        <div class="lane">
+          <div class="box missing"><strong>Task Computer Service</strong><span>沙箱生命周期、任务文件树、进程日志、artifact bundle、promote to asset。</span></div>
+          <div class="box missing"><strong>Browser Context Store</strong><span>持久 cookie/localStorage/登录态，workspace scoped，可撤销。</span></div>
+          <div class="box missing"><strong>Human Approval Gateway</strong><span>credits、Boost、私有上传、登录态浏览、本地命令、发布动作审批。</span></div>
+          <div class="box missing"><strong>Durable Workflow Engine</strong><span>长媒体 job checkpoint、resume、retry、cancel、approval pause。</span></div>
+          <div class="box missing"><strong>Provider Constraint Registry</strong><span>生成前暴露模型输入限制、URL/上传/尺寸/参考图能力给 prompt compiler。</span></div>
+          <div class="box missing"><strong>Observation / Provenance Ledger</strong><span>记录 action 前后证据、job id、model、prompt hash、input refs、worker log。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Hermes Agent Runtime</strong><span class="tag ok"><span class="dot"></span>核心 runtime 已存在</span></div>
+        <div class="lane">
+          <div class="box ok"><strong>Gateway / Session</strong><span>TUI gateway 已有 <code>session.create</code>、<code>session.resume</code>、<code>prompt.submit</code>、事件流。</span></div>
+          <div class="box ok"><strong>Model Loop</strong><span>Agent run、tool call、message delta、tool progress、errors。</span></div>
+          <div class="box planned"><strong>Ultra Identity Prompt</strong><span>Atlas-first 创作助理；不伪造 job、URL、模型能力。</span></div>
+          <div class="box missing"><strong>Ultra Skill Allowlist Bootstrap</strong><span>启动时把 Ultra creative allowlist 写进 Hermes profile/config，避免继续暴露 87 个泛用 Skill。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Skill / Planning Layer</strong><span class="tag ok"><span class="dot"></span>第一批 Skill 已有</span></div>
+        <div class="lane">
+          <div class="box planned"><strong>workflow-router</strong><span><code>SKILL.md</code> 已有；intent、asset roles、missing fields、workflow_skill 的自动 runtime 接入待做。</span></div>
+          <div class="box ok"><strong>infographic-md-flow</strong><span>数据主体视频：foundation -> 6-panel storyboard -> video variants。</span></div>
+          <div class="box ok"><strong>media-qa</strong><span>生成后 QA，不能编造视觉观察。</span></div>
+          <div class="box ok"><strong>prompt-repair</strong><span>根据 provider 限制和失败证据生成 retry plan。</span></div>
+          <div class="box missing"><strong>Product / UGC / Cinematic Skills</strong><span>productMD、product-photoshoot、ugc-flow、cinematic-flow 待补。</span></div>
+          <div class="box missing"><strong>Skill references/</strong><span>每个复杂 workflow 的 schema、prompt compiler、QA rubric 冷层资料。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Tool Orchestration Layer</strong><span class="tag missing"><span class="dot"></span>高层工具待实现</span></div>
+        <div class="lane">
+          <div class="box ok"><strong>image_generate</strong><span>已有统一图片工具；Atlas image provider 可用。</span></div>
+          <div class="box ok"><strong>video_generate</strong><span>已有统一视频工具；Atlas video provider 可用。</span></div>
+          <div class="box missing"><strong>ultra_asset_*</strong><span>upload/list/inspect/download， typed asset refs。</span></div>
+          <div class="box missing"><strong>ultra_media_job_*</strong><span>create/status/cancel/finalize，异步 job 状态流。</span></div>
+          <div class="box missing"><strong>ultra_model_catalog</strong><span>把 Atlas 模型能力、输入限制暴露给 router/UI。</span></div>
+          <div class="box missing"><strong>ultra_prompt_compile</strong><span>把 workflow plan 编译成 provider-aware payload。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Asset / Knowledge Plane</strong><span class="tag planned"><span class="dot"></span>资产库设计已成形</span></div>
+        <div class="lane">
+          <div class="box planned"><strong>Asset Service</strong><span>assets、lineage、ACL、audit、状态所有权。</span></div>
+          <div class="box planned"><strong>Collections</strong><span>用户手动创建的静态资产 ID 列表。</span></div>
+          <div class="box planned"><strong>Smart Groups</strong><span>保存 query_json 的动态规则分组。</span></div>
+          <div class="box planned"><strong>Characters / Elements / Soul IDs</strong><span>角色、道具、环境、身份一致性资产。</span></div>
+          <div class="box missing"><strong>Search Indexer</strong><span>prompt embedding、关键词、endpoint 硬划分、语义聚类。</span></div>
+          <div class="box missing"><strong>Object Storage</strong><span>真实二进制、缩略图、manifest、短期预览 URL。</span></div>
+        </div>
+      </div>
+
+      <div class="layer">
+        <div class="layer-title"><strong>Provider / Control / Execution Plane</strong><span class="tag external"><span class="dot"></span>TokenRouter + CometAPI 边界</span></div>
+        <div class="lane">
+          <div class="box ok"><strong>Atlas Image Provider</strong><span><code>nano-banana-2</code> 等图片模型路由。</span></div>
+          <div class="box ok"><strong>Atlas Video Provider</strong><span>Wan / Seedance / Kling / Veo / Sora 路由；当前不承诺多 reference。</span></div>
+          <div class="box planned"><strong>Sandbox Boundary</strong><span>执行环境不持有 provider key，不可直接导出 protected references。</span></div>
+          <div class="box planned"><strong>Audit / Usage</strong><span>run、tool call、job、asset access、usage event 可追踪。</span></div>
+          <div class="box missing"><strong>Reusable Media Cache</strong><span>media hash、zero-upload、feature reuse、重复 URL 抽帧缓存待接入。</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 一次生成请求的时序图</h2>
+    <section class="note">
+      <strong>Notion 原始主链路：</strong>Browser/Web App 建立 SSE 或 WebSocket；Edge Gateway 解析 JWT 与 workspace；Backend Orchestrator 挂接 Sandbox；Volume Mounter 挂载用户数据和项目上下文；Sandbox 注入 <code>HF_JWT_TOKEN</code>；Hermes Agent 调默认工具和 Skill；TokenRouter 做四阶段零信任凭证流；异步生成进 Event Bus/GPU workers；CometAPI 只负责媒体数据面，不替代 TokenRouter。
+    </section>
+    <div class="flow">
+      <svg viewBox="0 0 1120 430" role="img" aria-label="generation request flow">
+        <defs>
+          <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+            <path d="M0,0 L10,4 L0,8 Z" fill="#697b77"></path>
+          </marker>
+        </defs>
+        <rect class="node planned" x="35" y="35" width="150" height="70" rx="8"></rect>
+        <text class="label" x="55" y="64">Web Chat</text>
+        <text class="sub" x="55" y="84">text + uploads</text>
+
+        <rect class="node ok" x="230" y="35" width="150" height="70" rx="8"></rect>
+        <text class="label" x="252" y="64">Gateway</text>
+        <text class="sub" x="252" y="84">session + events</text>
+
+        <rect class="node ok" x="425" y="35" width="150" height="70" rx="8"></rect>
+        <text class="label" x="447" y="64">Agent Loop</text>
+        <text class="sub" x="447" y="84">model + tools</text>
+
+        <rect class="node ok" x="620" y="35" width="150" height="70" rx="8"></rect>
+        <text class="label" x="641" y="64">workflow-router</text>
+        <text class="sub" x="641" y="84">intent + assets</text>
+
+        <rect class="node ok" x="815" y="35" width="150" height="70" rx="8"></rect>
+        <text class="label" x="836" y="64">Workflow Skill</text>
+        <text class="sub" x="836" y="84">plan / QA / repair</text>
+
+        <path class="arrow" d="M185 70 H230"></path>
+        <path class="arrow" d="M380 70 H425"></path>
+        <path class="arrow" d="M575 70 H620"></path>
+        <path class="arrow" d="M770 70 H815"></path>
+
+        <rect class="node missing" x="815" y="160" width="150" height="70" rx="8"></rect>
+        <text class="label" x="834" y="189">Prompt Compile</text>
+        <text class="sub" x="834" y="209">provider payload</text>
+
+        <rect class="node missing" x="620" y="160" width="150" height="70" rx="8"></rect>
+        <text class="label" x="640" y="189">Media Job</text>
+        <text class="sub" x="640" y="209">create / status</text>
+
+        <rect class="node external" x="425" y="160" width="150" height="70" rx="8"></rect>
+        <text class="label" x="447" y="189">TokenRouter</text>
+        <text class="sub" x="447" y="209">ACL + quota</text>
+
+        <rect class="node ok" x="230" y="160" width="150" height="70" rx="8"></rect>
+        <text class="label" x="250" y="189">Atlas Provider</text>
+        <text class="sub" x="250" y="209">image / video</text>
+
+        <rect class="node planned" x="35" y="160" width="150" height="70" rx="8"></rect>
+        <text class="label" x="56" y="189">Output Asset</text>
+        <text class="sub" x="56" y="209">url + metadata</text>
+
+        <path class="arrow" d="M890 105 V160"></path>
+        <path class="arrow" d="M815 195 H770"></path>
+        <path class="arrow" d="M620 195 H575"></path>
+        <path class="arrow" d="M425 195 H380"></path>
+        <path class="arrow" d="M230 195 H185"></path>
+
+        <rect class="node planned" x="35" y="285" width="150" height="70" rx="8"></rect>
+        <text class="label" x="55" y="314">Asset Service</text>
+        <text class="sub" x="55" y="334">register lineage</text>
+
+        <rect class="node planned" x="230" y="285" width="150" height="70" rx="8"></rect>
+        <text class="label" x="252" y="314">Search Index</text>
+        <text class="sub" x="252" y="334">prompt + embedding</text>
+
+        <rect class="node planned" x="425" y="285" width="150" height="70" rx="8"></rect>
+        <text class="label" x="447" y="314">Collections</text>
+        <text class="sub" x="447" y="334">manual members</text>
+
+        <rect class="node planned" x="620" y="285" width="150" height="70" rx="8"></rect>
+        <text class="label" x="640" y="314">Smart Groups</text>
+        <text class="sub" x="640" y="334">dynamic query</text>
+
+        <rect class="node planned" x="815" y="285" width="150" height="70" rx="8"></rect>
+        <text class="label" x="838" y="314">Reuse</text>
+        <text class="sub" x="838" y="334">element / character</text>
+
+        <path class="arrow" d="M110 230 V285"></path>
+        <path class="arrow" d="M185 320 H230"></path>
+        <path class="arrow" d="M380 320 H425"></path>
+        <path class="arrow" d="M575 320 H620"></path>
+        <path class="arrow" d="M770 320 H815"></path>
+      </svg>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. 双网关与沙箱边界</h2>
+    <table>
+      <thead><tr><th>组件</th><th>负责什么</th><th>不能做什么</th><th>文档依据</th></tr></thead>
+      <tbody>
+        <tr><td>Sandbox VM</td><td>运行 Agent、terminal/process、临时 RootFS、workspace/project 挂载、短期 <code>HF_JWT_TOKEN</code>。</td><td>不能持有真实 provider key；不能直接访问其他用户文件、metadata service 或 protected skill references。</td><td>Lark 架构页 4.2/4.3；Notion TokenRouter TOKEN 注入。</td></tr>
+        <tr><td>TokenRouter</td><td>控制面：JWT 校验、claims 提取、Redis quota/Boost 并发、Vault key exchange、负载均衡、安全门禁、计量审计。</td><td>不传输大型二进制媒体；不把真实 key 暴露给 sandbox；cloud mode 不允许本地 key fallback。</td><td><code>docs/notion-source/hermes/pages/06-tokenrouter.md</code></td></tr>
+        <tr><td>CometAPI</td><td>媒体数据面：外部 URL 抓取、视频剪切、FPS 抽帧、分辨率降采样、音频/字幕/帧序列对齐、多模态 token packaging。</td><td>不做通用凭证控制面；不替代 quota/billing/key exchange；失败要暴露给 Agent/UI。</td><td><code>docs/notion-source/hermes/pages/07-cometapi.md</code></td></tr>
+        <tr><td>Async Event Bus / GPU Workers</td><td>承接 <code>higgsfield_generate async=true</code>、job status、GPU 重任务、thumbnail/asset registration。</td><td>不阻塞 Agent 会话；不绕过 TokenRouter 的 quota 和 audit。</td><td>Lark 架构页端到端阶段 9-11。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>4. 资产库与 Reference 模型</h2>
+    <div class="split">
+      <div class="flow">
+        <svg viewBox="0 0 680 390" role="img" aria-label="asset reference model">
+          <defs>
+            <marker id="arrow2" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto">
+              <path d="M0,0 L10,4 L0,8 Z" fill="#697b77"></path>
+            </marker>
+          </defs>
+          <rect class="node planned" x="35" y="35" width="150" height="64" rx="8"></rect>
+          <text class="label" x="55" y="63">Uploads</text>
+          <text class="sub" x="55" y="82">media_input</text>
+
+          <rect class="node ok" x="265" y="35" width="150" height="64" rx="8"></rect>
+          <text class="label" x="285" y="63">Generated Jobs</text>
+          <text class="sub" x="285" y="82">image_job / video_job</text>
+
+          <rect class="node planned" x="495" y="35" width="150" height="64" rx="8"></rect>
+          <text class="label" x="515" y="63">Object Storage</text>
+          <text class="sub" x="515" y="82">binary + thumbnail</text>
+
+          <rect class="node planned" x="265" y="150" width="150" height="64" rx="8"></rect>
+          <text class="label" x="285" y="178">Asset Service</text>
+          <text class="sub" x="285" y="197">ACL + lineage</text>
+
+          <rect class="node planned" x="35" y="270" width="150" height="64" rx="8"></rect>
+          <text class="label" x="55" y="298">Collections</text>
+          <text class="sub" x="55" y="317">static asset ids</text>
+
+          <rect class="node planned" x="265" y="270" width="150" height="64" rx="8"></rect>
+          <text class="label" x="285" y="298">Smart Groups</text>
+          <text class="sub" x="285" y="317">query_json</text>
+
+          <rect class="node planned" x="495" y="270" width="150" height="64" rx="8"></rect>
+          <text class="label" x="515" y="298">Characters</text>
+          <text class="sub" x="515" y="317">element / soul_id</text>
+
+          <path class="arrow" marker-end="url(#arrow2)" d="M185 67 H265"></path>
+          <path class="arrow" marker-end="url(#arrow2)" d="M415 67 H495"></path>
+          <path class="arrow" marker-end="url(#arrow2)" d="M340 99 V150"></path>
+          <path class="arrow" marker-end="url(#arrow2)" d="M265 182 H185 Q110 182 110 270"></path>
+          <path class="arrow" marker-end="url(#arrow2)" d="M340 214 V270"></path>
+          <path class="arrow" marker-end="url(#arrow2)" d="M415 182 H570 V270"></path>
+        </svg>
+      </div>
+      <div>
+        <h3>三类 reference 必须分开</h3>
+        <ul>
+          <li><strong>Skill 内部 references：</strong><code>skills/&lt;skill&gt;/references/*</code>，是受保护冷层知识，不给普通用户导出。</li>
+          <li><strong>用户上传 references：</strong>图片、视频、音频、PDF，进入 <code>media_input</code>。</li>
+          <li><strong>媒体生成 references：</strong><code>image_job</code>、<code>video_job</code>、<code>element</code>、<code>character</code>、<code>soul_id</code>，用于后续生成。</li>
+        </ul>
+        <h3>Collection 和 Smart Group</h3>
+        <ul>
+          <li><strong>Collection：</strong>手动维护的静态资产成员表。</li>
+          <li><strong>Smart Group：</strong>保存查询规则，打开时实时查符合条件的资产。</li>
+          <li><strong>Character：</strong>一级资产，不是普通 group，因为它要参与生成控制。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>5. 当前缺口清单</h2>
+    <table>
+      <thead><tr><th>优先级</th><th>缺口</th><th>为什么挡路</th><th>建议落点</th></tr></thead>
+      <tbody>
+        <tr><td>P0</td><td>Profile/bootstrap 接入 allowlist</td><td>否则 87 个旧 Skill 仍可能出现在用户视野。</td><td><code>hermes_cli/ultra_studio_skills.py</code> -> CLI/profile setup。</td></tr>
+        <tr><td>P0</td><td>Sandbox lifecycle 接入</td><td>真实 Agent 不是裸前端请求，需要 session -> sandbox attach、volume mount、短期 token 注入。</td><td>Backend Orchestrator + Sandbox Runtime。</td></tr>
+        <tr><td>P0</td><td>TokenRouter-compatible proxy</td><td>Atlas/API key 不能进入 sandbox；必须有 JWT、quota、vault exchange、audit 和 no-fallback 行为。</td><td>TokenRouter control plane。</td></tr>
+        <tr><td>P0</td><td>Task Computer Service</td><td>Manus/E2B 类 agent 必须有任务电脑：sandbox lifecycle、文件树、日志和 artifact bundle。</td><td>Sandbox lifecycle + Task files。</td></tr>
+        <tr><td>P0</td><td>Human Approval Gateway</td><td>花钱、Boost、私有媒体、登录态浏览、本地命令和发布动作不能自动执行。</td><td>approval policy + pause/resume。</td></tr>
+        <tr><td>P0</td><td>真实上传和资产入库</td><td>没有它，reference 只能是 UI 假数据。</td><td><code>ultra_asset_upload</code> + Asset Service。</td></tr>
+        <tr><td>P0</td><td>高层媒体 job 工具</td><td>低层 provider 工具不能表达 job、lineage、状态、下载、复用。</td><td><code>tools/ultra_media_*.py</code>。</td></tr>
+        <tr><td>P0</td><td>Provider Constraint Registry</td><td>Runway/fal/Atlas 这类媒体 API 都有输入、上传、队列和 webhook 限制，prompt compiler 必须预先知道。</td><td>model catalog + constraints。</td></tr>
+        <tr><td>P0</td><td>Observation / Provenance Ledger</td><td>防止 fake completion；每步 action 和媒体结果都要有可追踪证据。</td><td>run trace + asset lineage。</td></tr>
+        <tr><td>P0</td><td>Async Event Bus / worker contract</td><td>视频生成、抽帧、转码和注册资产都应是异步 job，不应该卡住聊天主循环。</td><td>Job Manager / worker / status stream。</td></tr>
+        <tr><td>P0</td><td>前端媒体渲染</td><td>用户现在只能看到 markdown URL，体验断裂。</td><td>Chat renderer image/video card。</td></tr>
+        <tr><td>P0</td><td>Prompt compiler</td><td>workflow Skill 需要把 plan 编译成模型可执行 payload。</td><td><code>ultra_prompt_compile</code> + skill references。</td></tr>
+        <tr><td>P1</td><td>CometAPI media gateway</td><td>视频分析、外部 URL 抓取、抽帧/降采样/ASR 对齐不该塞进 TokenRouter 或 Agent prompt。</td><td>CometAPI-compatible media data plane。</td></tr>
+        <tr><td>P1</td><td>Product / UGC / Cinematic Skill</td><td>目前只有 infographic 细流程，视频 agent 覆盖面还窄。</td><td><code>skills/creative/*</code>。</td></tr>
+        <tr><td>P1</td><td>Search Indexer</td><td>资产库缺语义搜索、智能分组动态计算。</td><td>assets index worker + embeddings。</td></tr>
+        <tr><td>P1</td><td>TokenRouter-style policy</td><td>资产和 provider key 需要统一策略边界。</td><td>ACL/quota/model allowlist/audit。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>6. 代码/文档落点</h2>
+    <table>
+      <thead><tr><th>区域</th><th>当前落点</th><th>状态</th></tr></thead>
+      <tbody>
+        <tr><td>Ultra 设计</td><td><code>docs/ultra-studio-agent-skill-tool-prompt-design.md</code></td><td>已提交</td></tr>
+        <tr><td>Manus-style gap research</td><td><code>docs/ultra-studio-agent-manus-gap-research.md</code></td><td>未提交文档</td></tr>
+        <tr><td>Notion PRD</td><td><code>docs/hermes-notion-implementation-prd.html</code></td><td>未提交文档</td></tr>
+        <tr><td>Asset backend design</td><td><code>docs/hermes-asset-library-backend-design.md</code></td><td>未提交文档</td></tr>
+        <tr><td>Asset UI demo</td><td><code>/Users/lifcc/Desktop/code/work/infra/her/asset-library-demo.html</code></td><td>静态 demo</td></tr>
+        <tr><td>TokenRouter source</td><td><code>docs/notion-source/hermes/pages/06-tokenrouter.md</code>、<code>docs/hermes-tokenrouter-credential-flow.md</code></td><td>Notion 源 + 拆分文档</td></tr>
+        <tr><td>CometAPI source</td><td><code>docs/notion-source/hermes/pages/07-cometapi.md</code>、<code>docs/hermes-cometapi-media-gateway.md</code></td><td>Notion 源 + 拆分文档</td></tr>
+        <tr><td>Lark architecture source</td><td><code>docs/lark-source/wiki-docs/00-higgsfield-hermes-agent-architecture.body.html</code></td><td>端到端主链路</td></tr>
+        <tr><td>Skill allowlist</td><td><code>hermes_cli/ultra_studio_skills.py</code></td><td>已提交</td></tr>
+        <tr><td>Creative Skills</td><td><code>skills/creative/workflow-router</code>、<code>infographic-md-flow</code>、<code>media-qa</code>、<code>prompt-repair</code></td><td>已提交</td></tr>
+        <tr><td>Atlas providers</td><td><code>plugins/image_gen/atlas</code>、<code>plugins/video_gen/atlas</code></td><td>已有代码</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p>本图是当前 Hermes fork 的整体 Agent 架构视图。它刻意把 UI、Agent runtime、Skill、工具、资产、provider、安全控制面分开，避免把所有能力塞进一个 plugin 或一个 prompt。</p>
+  </footer>
+</main>
+<script>
+(() => {
+  const STORE_KEY = "ultra-studio-agent-architecture:v2";
+  const editor = {
+    editing: false,
+    saveTimer: 0,
+    els: {}
+  };
+
+  function qs(selector, root = document) {
+    return root.querySelector(selector);
+  }
+
+  function qsa(selector, root = document) {
+    return Array.from(root.querySelectorAll(selector));
+  }
+
+  function setStatus(message) {
+    editor.els.saveState.textContent = message;
+  }
+
+  function cleanClone(node) {
+    const clone = node.cloneNode(true);
+    qsa(".editor-only, .box-tools, .add-box", clone).forEach((item) => item.remove());
+    qsa("[contenteditable]", clone).forEach((item) => item.removeAttribute("contenteditable"));
+    return clone.innerHTML;
+  }
+
+  function snapshot() {
+    return {
+      savedAt: new Date().toISOString(),
+      header: cleanClone(qs("header")),
+      main: cleanClone(qs("main"))
+    };
+  }
+
+  function saveLocal(reason = "已保存") {
+    localStorage.setItem(STORE_KEY, JSON.stringify(snapshot()));
+    setStatus(`${reason} ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`);
+  }
+
+  function scheduleSave() {
+    clearTimeout(editor.saveTimer);
+    editor.saveTimer = setTimeout(() => saveLocal("已自动暂存"), 650);
+  }
+
+  function restoreLocal() {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return;
+    try {
+      const data = JSON.parse(raw);
+      if (data.header && data.main) {
+        qs("header").innerHTML = data.header;
+        qs("main").innerHTML = data.main;
+        setStatus(`已恢复 ${new Date(data.savedAt).toLocaleString("zh-CN", { hour12: false })}`);
+      }
+    } catch (error) {
+      console.error("Failed to restore architecture document", error);
+      setStatus("本地草稿损坏，已忽略");
+    }
+  }
+
+  function editableTargets() {
+    return qsa("h1, h2, h3, p, li, th, td, .kicker, .pill, .note strong, .layer-title strong, .box strong, .box span");
+  }
+
+  function setEditable(enabled) {
+    editableTargets().forEach((node) => {
+      node.setAttribute("contenteditable", enabled ? "true" : "false");
+      node.setAttribute("spellcheck", "false");
+    });
+    document.body.classList.toggle("editing", enabled);
+    editor.els.toggleEdit.textContent = enabled ? "关闭编辑" : "开启编辑";
+  }
+
+  function ensureLayerControls() {
+    qsa(".layer").forEach((layer) => {
+      const title = qs(".layer-title", layer);
+      const lane = qs(".lane", layer);
+      if (!title || !lane || qs(".add-box", title)) return;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "add-box editor-only";
+      button.textContent = "+ 模块";
+      button.addEventListener("click", () => {
+        const box = document.createElement("div");
+        box.className = "box planned";
+        box.innerHTML = "<strong>New Module</strong><span>描述这个模块的职责、输入和输出。</span>";
+        lane.appendChild(box);
+        decorateBox(box);
+        setEditable(editor.editing);
+        scheduleSave();
+      });
+      title.appendChild(button);
+    });
+  }
+
+  function decorateBox(box) {
+    if (qs(".box-tools", box)) return;
+    const tools = document.createElement("div");
+    tools.className = "box-tools editor-only";
+
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "模块状态");
+    ["ok", "planned", "missing", "external"].forEach((status) => {
+      const option = document.createElement("option");
+      option.value = status;
+      option.textContent = {
+        ok: "已落地",
+        planned: "计划",
+        missing: "缺口",
+        external: "外部"
+      }[status];
+      select.appendChild(option);
+    });
+    const active = ["ok", "planned", "missing", "external"].find((status) => box.classList.contains(status)) || "planned";
+    select.value = active;
+    select.addEventListener("change", () => {
+      box.classList.remove("ok", "planned", "missing", "external");
+      box.classList.add(select.value);
+      scheduleSave();
+    });
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "删除";
+    remove.addEventListener("click", () => {
+      box.remove();
+      scheduleSave();
+    });
+
+    tools.append(select, remove);
+    box.appendChild(tools);
+  }
+
+  function decorateBoxes() {
+    qsa(".box").forEach(decorateBox);
+  }
+
+  function bindSvgTextEditing() {
+    qsa("svg text.label, svg text.sub").forEach((text) => {
+      text.addEventListener("click", () => {
+        if (!editor.editing) return;
+        const next = prompt("修改 SVG 文本", text.textContent.trim());
+        if (next === null) return;
+        text.textContent = next.trim();
+        scheduleSave();
+      });
+    });
+  }
+
+  function bootstrapDynamicControls() {
+    ensureLayerControls();
+    decorateBoxes();
+    bindSvgTextEditing();
+    setEditable(editor.editing);
+  }
+
+  function exportJson() {
+    const blob = new Blob([JSON.stringify(snapshot(), null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `ultra-studio-agent-architecture-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setStatus("JSON 已导出");
+  }
+
+  function importJson(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(String(reader.result));
+        if (!data.header || !data.main) throw new Error("missing header/main");
+        qs("header").innerHTML = data.header;
+        qs("main").innerHTML = data.main;
+        saveLocal("已导入");
+        bootstrapDynamicControls();
+      } catch (error) {
+        console.error("Failed to import architecture JSON", error);
+        setStatus("导入失败：JSON 格式不对");
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function bindToolbar() {
+    editor.els.toggleEdit = qs("#toggleEdit");
+    editor.els.saveDoc = qs("#saveDoc");
+    editor.els.exportJson = qs("#exportJson");
+    editor.els.importJson = qs("#importJson");
+    editor.els.resetDoc = qs("#resetDoc");
+    editor.els.saveState = qs("#saveState");
+
+    editor.els.toggleEdit.addEventListener("click", () => {
+      editor.editing = !editor.editing;
+      setEditable(editor.editing);
+      if (!editor.editing) saveLocal("已保存");
+    });
+    editor.els.saveDoc.addEventListener("click", () => saveLocal("已保存"));
+    editor.els.exportJson.addEventListener("click", exportJson);
+    editor.els.importJson.addEventListener("change", (event) => {
+      const [file] = event.target.files || [];
+      if (file) importJson(file);
+      event.target.value = "";
+    });
+    editor.els.resetDoc.addEventListener("click", () => {
+      if (!confirm("确定清除本地编辑草稿并恢复文件默认内容？")) return;
+      localStorage.removeItem(STORE_KEY);
+      location.reload();
+    });
+
+    document.addEventListener("input", () => {
+      if (editor.editing) scheduleSave();
+    });
+  }
+
+  bindToolbar();
+  restoreLocal();
+  bootstrapDynamicControls();
+})();
+</script>
+</body>
+</html>
