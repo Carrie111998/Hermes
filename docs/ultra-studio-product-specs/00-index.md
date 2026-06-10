@@ -30,6 +30,7 @@ document without reading everything.
 Use these as the current source material:
 
 - [Ultra Studio architecture diagram](../ultra-studio-agent-architecture.html)
+- [Infrastructure design research pack](../ultra-studio-infra-design/00-index.md)
 - [Full research appendix](../ultra-studio-agent-research-appendix.html)
 - [Manus gap research](../ultra-studio-agent-manus-gap-research.md)
 - [Skill/tool/prompt specification](../ultra-studio-agent-skill-tool-prompt-design.md)
@@ -79,4 +80,3 @@ The product is real enough when:
 - Public marketing site.
 - Provider onboarding outside Atlas, unless used as constraints research.
 - Fake demo flows.
-
