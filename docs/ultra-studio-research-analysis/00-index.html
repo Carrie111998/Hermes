@@ -36,6 +36,8 @@
 <tr><td>P0 agent, skill, tool, media contracts</td><td><a href="02-p0-agent-skill-tool-media-contracts.md">02-p0-agent-skill-tool-media-contracts.md</a></td><td><a href="02-p0-agent-skill-tool-media-contracts.html">02-p0-agent-skill-tool-media-contracts.html</a></td><td>Canonical endpoints, events, state enums, typed errors, and Atlas tool contract.</td></tr>
 <tr><td>P0 security and credential boundaries</td><td><a href="03-p0-security-credential-boundaries.md">03-p0-security-credential-boundaries.md</a></td><td><a href="03-p0-security-credential-boundaries.html">03-p0-security-credential-boundaries.html</a></td><td>Minimal security needed for P0 without overbuilding cloud infra.</td></tr>
 <tr><td>Later cloud infra roadmap</td><td><a href="04-later-cloud-infra-roadmap.md">04-later-cloud-infra-roadmap.md</a></td><td><a href="04-later-cloud-infra-roadmap.html">04-later-cloud-infra-roadmap.html</a></td><td>What moves to P1/P2 and why it is not P0.</td></tr>
+<tr><td>Complete system perspective</td><td><a href="05-complete-system-perspective.md">05-complete-system-perspective.md</a></td><td><a href="05-complete-system-perspective.html">05-complete-system-perspective.html</a></td><td>Full product/system map so future features have a stable slot.</td></tr>
+<tr><td>Extension seams and migration plan</td><td><a href="06-extension-seams-migration-plan.md">06-extension-seams-migration-plan.md</a></td><td><a href="06-extension-seams-migration-plan.html">06-extension-seams-migration-plan.html</a></td><td>Interfaces P0 must reserve so later infra can be added without rewrites.</td></tr>
 <tr><td>Research appendix and open questions</td><td><a href="90-research-appendix-open-questions.md">90-research-appendix-open-questions.md</a></td><td><a href="90-research-appendix-open-questions.html">90-research-appendix-open-questions.html</a></td><td>Threads findings, external references, drift list, and open decisions.</td></tr>
 </tbody></table>
 <h2>Authoritative Sources</h2>
@@ -44,6 +46,8 @@
 <p>2. <a href="02-p0-agent-skill-tool-media-contracts.md">02-p0-agent-skill-tool-media-contracts.md</a></p>
 <p>3. <a href="03-p0-security-credential-boundaries.md">03-p0-security-credential-boundaries.md</a></p>
 <p>4. <a href="04-later-cloud-infra-roadmap.md">04-later-cloud-infra-roadmap.md</a></p>
+<p>5. <a href="05-complete-system-perspective.md">05-complete-system-perspective.md</a></p>
+<p>6. <a href="06-extension-seams-migration-plan.md">06-extension-seams-migration-plan.md</a></p>
 <p>The earlier documents remain source material, not final P0 authority:</p>
 <ul>
 <li><a href="../ultra-studio-product-specs/00-index.md">Ultra Studio product specs</a></li>
@@ -88,6 +92,7 @@
 <li>media job and asset schemas are concrete;</li>
 <li>security boundaries are enough to prevent fake outputs and provider-key leakage;</li>
 <li>P1/P2 infrastructure is clearly separated from P0;</li>
+<li>future features have a named owner, state boundary, event path, and migration seam;</li>
 <li>each acceptance case can become a test or smoke command.</li>
 </ul>
 </main></div>

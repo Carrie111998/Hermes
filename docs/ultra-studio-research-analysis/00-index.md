@@ -33,6 +33,8 @@ Each result has both Markdown and HTML.
 | P0 agent, skill, tool, media contracts | [02-p0-agent-skill-tool-media-contracts.md](02-p0-agent-skill-tool-media-contracts.md) | [02-p0-agent-skill-tool-media-contracts.html](02-p0-agent-skill-tool-media-contracts.html) | Canonical endpoints, events, state enums, typed errors, and Atlas tool contract. |
 | P0 security and credential boundaries | [03-p0-security-credential-boundaries.md](03-p0-security-credential-boundaries.md) | [03-p0-security-credential-boundaries.html](03-p0-security-credential-boundaries.html) | Minimal security needed for P0 without overbuilding cloud infra. |
 | Later cloud infra roadmap | [04-later-cloud-infra-roadmap.md](04-later-cloud-infra-roadmap.md) | [04-later-cloud-infra-roadmap.html](04-later-cloud-infra-roadmap.html) | What moves to P1/P2 and why it is not P0. |
+| Complete system perspective | [05-complete-system-perspective.md](05-complete-system-perspective.md) | [05-complete-system-perspective.html](05-complete-system-perspective.html) | Full product/system map so future features have a stable slot. |
+| Extension seams and migration plan | [06-extension-seams-migration-plan.md](06-extension-seams-migration-plan.md) | [06-extension-seams-migration-plan.html](06-extension-seams-migration-plan.html) | Interfaces P0 must reserve so later infra can be added without rewrites. |
 | Research appendix and open questions | [90-research-appendix-open-questions.md](90-research-appendix-open-questions.md) | [90-research-appendix-open-questions.html](90-research-appendix-open-questions.html) | Threads findings, external references, drift list, and open decisions. |
 
 ## Authoritative Sources
@@ -43,6 +45,8 @@ For implementation, read in this order:
 2. [02-p0-agent-skill-tool-media-contracts.md](02-p0-agent-skill-tool-media-contracts.md)
 3. [03-p0-security-credential-boundaries.md](03-p0-security-credential-boundaries.md)
 4. [04-later-cloud-infra-roadmap.md](04-later-cloud-infra-roadmap.md)
+5. [05-complete-system-perspective.md](05-complete-system-perspective.md)
+6. [06-extension-seams-migration-plan.md](06-extension-seams-migration-plan.md)
 
 The earlier documents remain source material, not final P0 authority:
 
@@ -95,5 +99,5 @@ Documentation is complete enough when:
 - media job and asset schemas are concrete;
 - security boundaries are enough to prevent fake outputs and provider-key leakage;
 - P1/P2 infrastructure is clearly separated from P0;
+- future features have a named owner, state boundary, event path, and migration seam;
 - each acceptance case can become a test or smoke command.
-
