@@ -1640,8 +1640,13 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
+
+    ``timeout_s`` (per-job ``script_timeout_seconds`` field) overrides the
+    global env/config script timeout when it is a positive number — long
+    deterministic jobs like the nightly test gate need more than the
+    120s default without raising the ceiling for every script.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
     absolute paths are resolved and validated against this directory to
@@ -1692,7 +1697,16 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
-    script_timeout = _get_script_timeout()
+    script_timeout = None
+    if timeout_s is not None:
+        try:
+            script_timeout = int(float(timeout_s))
+        except (TypeError, ValueError):
+            script_timeout = None
+        if script_timeout is not None and script_timeout <= 0:
+            script_timeout = None
+    if script_timeout is None:
+        script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
@@ -1813,7 +1827,9 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(
+                script_path, timeout_s=job.get("script_timeout_seconds")
+            )
         if success:
             if script_output:
                 prompt = (
@@ -2048,7 +2064,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(
+                script_path, timeout_s=job.get("script_timeout_seconds")
+            )
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2137,7 +2155,9 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(
+            script_path, timeout_s=job.get("script_timeout_seconds")
+        )
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(

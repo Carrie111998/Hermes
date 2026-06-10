@@ -4403,6 +4403,29 @@ class TestPerJobSoftDeadline:
                 "a record started after the cutoff must survive"
             )
 
+    def test_per_job_script_timeout_overrides_global(self):
+        import time as _t
+        from cron import scheduler as sched
+
+        sdir = sched._get_hermes_home() / "scripts"
+        sdir.mkdir(parents=True, exist_ok=True)
+        slow = sdir / "slow_gate_probe.py"
+        slow.write_text(
+            "import time\ntime.sleep(8)\nprint('done')\n", encoding="utf-8"
+        )
+        t0 = _t.monotonic()
+        ok, out = sched._run_job_script("slow_gate_probe.py", timeout_s=1)
+        elapsed = _t.monotonic() - t0
+        assert ok is False
+        assert "timed out after 1s" in out
+        assert elapsed < 6, "per-job timeout must override the 120s global"
+        # Invalid / non-positive overrides fall back to the global default
+        # (probe a fast script so the global never actually elapses).
+        fast = sdir / "fast_gate_probe.py"
+        fast.write_text("print('ok')\n", encoding="utf-8")
+        ok2, out2 = sched._run_job_script("fast_gate_probe.py", timeout_s="bogus")
+        assert ok2 is True and out2 == "ok"
+
     def test_timeout_resolution_priority(self, monkeypatch):
         from cron import scheduler as sched
 
