@@ -7414,11 +7414,25 @@ class GatewayRunner:
             # non-blocking — wrapped in try/except + bounded executor timeout so
             # a recording failure can NEVER break live processing or the reply.
             try:
+                # _handle_message_with_agent returns the response STRING for
+                # backward-compat, but stashes the full agent_result dict keyed
+                # by (quick_key, run_generation). Prefer the rich dict so the
+                # turn record carries messages/tool_calls/api_calls instead of a
+                # skeletal string-derived envelope.
+                _pa_record_result = _agent_result
+                try:
+                    _stash = getattr(self, "_last_agent_result_by_run", None)
+                    if isinstance(_stash, dict):
+                        _stashed = _stash.pop((_quick_key, _run_generation), None)
+                        if isinstance(_stashed, dict):
+                            _pa_record_result = _stashed
+                except Exception:
+                    pass
                 _pa_final_text = ""
-                if isinstance(_agent_result, dict):
-                    _pa_final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _pa_final_text = _agent_result
+                if isinstance(_pa_record_result, dict):
+                    _pa_final_text = str(_pa_record_result.get("final_response") or "")
+                elif isinstance(_pa_record_result, str):
+                    _pa_final_text = _pa_record_result
                 try:
                     _pa_session_entry = self.session_store.get_or_create_session(source)
                 except Exception:
@@ -7426,7 +7440,7 @@ class GatewayRunner:
                 await self._record_pa_turn_safe(
                     source=source,
                     session_entry=_pa_session_entry,
-                    agent_result=_agent_result,
+                    agent_result=_pa_record_result,
                     final_response=_pa_final_text,
                     started_at=_pa_turn_started_at,
                 )
@@ -8772,8 +8786,25 @@ class GatewayRunner:
                     status="executed",
                     turn_id=_pa_action_turn_id,
                 )
+            # PA universal turn-recording needs the FULL agent_result dict
+            # (messages, api_calls, tool_calls, model/provider) — but this
+            # method's public contract is to return the response STRING (the
+            # adapters, retry paths, and discord caller all consume a string).
+            # Stash the rich dict keyed by (quick_key, run_generation) so the
+            # turn-boundary recording site in _handle_message can read it
+            # instead of reconstructing a skeletal envelope from the string.
+            # Without this, build_turn_record received a str -> result_dict=None
+            # -> empty pa_tool_calls + null message_refs + skeletal envelope.
+            try:
+                stash = getattr(self, "_last_agent_result_by_run", None)
+                if stash is None:
+                    stash = {}
+                    self._last_agent_result_by_run = stash
+                stash[(_quick_key, run_generation)] = agent_result
+            except Exception:
+                pass
             return response
-            
+
         except Exception as e:
             # Stop typing indicator on error too
             try:
