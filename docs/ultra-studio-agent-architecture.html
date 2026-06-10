@@ -191,11 +191,11 @@ footer { margin-top: 34px; border-top: 1px solid var(--line); color: var(--muted
   <div class="wrap">
     <div class="kicker">Current Whole-Agent Architecture</div>
     <h1>Ultra Studio Agent 总体架构图</h1>
-    <p>这张图描述当前 Hermes fork 的目标形态：一个 Atlas-first 创作型 Agent。它把聊天 UI、Edge/Gateway、Sandbox VM、Hermes runtime、Skill、Prompt 编译、TokenRouter 控制面、CometAPI 媒体数据面、GPU worker、资产库和 Atlas provider 分开看。</p>
+    <p>这张图描述当前 Hermes fork 的目标形态：一个 Atlas-first 创作型 Agent。它把左侧导航、聊天 UI、Edge/Gateway、Sandbox VM、Hermes runtime、Skill、Prompt 编译、TokenRouter 控制面、CometAPI 媒体数据面、GPU worker、资产库和 Atlas provider 分开看。</p>
     <div class="meta">
       <span class="pill">日期：2026-06-10</span>
       <a class="pill" href="ultra-studio-agent-research-appendix.html">完整调研附录</a>
-      <span class="pill">范围：Web Chat + Sandbox + TokenRouter + CometAPI + Skill + Media + Asset Library</span>
+      <span class="pill">范围：Web Chat + Marketplace + Memory + Sandbox + TokenRouter + CometAPI + Skill + Media + Asset Library</span>
       <span class="pill">原则：真实工具、真实资产、真实错误，不做 fake demo</span>
     </div>
     <div class="legend" aria-label="color legend">
@@ -218,6 +218,7 @@ footer { margin-top: 34px; border-top: 1px solid var(--line); color: var(--muted
       <div class="layer">
         <div class="layer-title"><strong>Experience Layer</strong><span class="tag planned"><span class="dot"></span>Web 原型 + 真实 chat 设计</span></div>
         <div class="lane">
+          <div class="box planned"><strong>Left Nav Shell</strong><span>New task、Search、Marketplace、Files、Memory、Tasks 历史入口。</span></div>
           <div class="box planned"><strong>Creative Chat UI</strong><span>聊天、上传、历史、模型选择、媒体卡片、状态流。</span></div>
           <div class="box planned"><strong>Asset Library UI</strong><span>全部资产、智能分组、普通合集、角色资产、详情和复用动作。</span></div>
           <div class="box planned"><strong>Inspector / Live Panel</strong><span>当前 job、选中资产、QA、下载、转 Element、建角色。</span></div>
