@@ -512,6 +512,58 @@ class TestSubscribeUnknownEventType:
         events2 = _subscribe(bus,"test-sub")
         assert events2 == []
 
+    def test_all_poison_batch_advances_cursor_and_dead_letters(self, bus):
+        """POISON-BATCH GUARD (2026-06-10): when EVERY row in a poll is
+        unparseable the caller has nothing to ack, so subscribe() itself
+        must advance the cursor past the batch (dead-lettering the rows) —
+        otherwise the subscriber re-reads the same capped batch forever."""
+        for i in range(3):
+            self._insert_unknown_row(bus, event_id=f"poison-{i}")
+
+        assert _subscribe(bus, "test-sub") == []
+
+        # Every poison row is dead-lettered for triage.
+        letters = bus._get_conn().execute(
+            "SELECT event_id, error FROM dead_letters WHERE subscriber_id = ?",
+            ("test-sub",),
+        ).fetchall()
+        assert {r["event_id"] for r in letters} == {"poison-0", "poison-1", "poison-2"}
+        assert all("unparseable_event" in r["error"] for r in letters)
+
+        # Cursor advanced past the batch: a later valid event is delivered
+        # and the poison rows never re-appear.
+        valid_id = bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        events2 = _subscribe(bus, "test-sub")
+        assert [e.event_id for e in events2] == [valid_id]
+
+    def test_all_poison_batch_sets_cursor_to_batch_max_rowid(self, bus):
+        self._insert_unknown_row(bus, event_id="poison-solo")
+        assert _subscribe(bus, "test-sub") == []
+
+        conn = bus._get_conn()
+        head = conn.execute("SELECT MAX(rowid) FROM events").fetchone()[0]
+        cursor = conn.execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            ("test-sub",),
+        ).fetchone()["last_rowid"]
+        assert cursor == head
+
+    def test_mixed_batch_does_not_trigger_poison_guard(self, bus):
+        """One valid event in the batch means the normal ack path owns the
+        cursor — the guard must NOT advance it (the subscriber may still be
+        processing and crash before ack)."""
+        self._insert_unknown_row(bus, event_id="poison-mixed")
+        bus.emit(EventType.CRON_STARTED, "scout", {})
+
+        events = _subscribe(bus, "test-sub")
+        assert len(events) == 1
+
+        cursor = bus._get_conn().execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            ("test-sub",),
+        ).fetchone()["last_rowid"]
+        assert cursor == 0  # untouched until the caller acks
+
     def test_subscribe_logs_warning_for_unknown_event_type(self, bus, caplog):
         import logging
         caplog.set_level(logging.WARNING, logger="events.bus")

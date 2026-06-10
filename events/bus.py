@@ -247,6 +247,7 @@ class EventBus:
         ).fetchall()
 
         events: List[Event] = []
+        unparseable: List[tuple] = []
         for r in rows:
             try:
                 events.append(self._row_to_event(r))
@@ -259,6 +260,41 @@ class EventBus:
                     "subscribe(%s): skipping unparseable event %s (rowid=%s): %s",
                     subscriber_id, r["event_id"], r["rowid"], e,
                 )
+                unparseable.append((r, str(e)))
+
+        if rows and not events:
+            # POISON-BATCH GUARD (2026-06-10 audit M1): every row in this
+            # capped batch failed to parse. The caller then has nothing to
+            # ack, so the cursor would pin at this batch and the subscriber
+            # would re-read the same rows on every poll — the skip comment
+            # above relies on "a valid event in this batch or a later one",
+            # but with a full batch of poison rows (LIMIT 2000) a later
+            # batch is never reached. Dead-letter each row for triage, then
+            # advance the cursor past the batch so the subscriber drains.
+            max_rowid = max(r["rowid"] for r in rows)
+            logger.error(
+                "subscribe(%s): poison batch — all %d rows unparseable; "
+                "advancing cursor %s -> %s (rows dead-lettered)",
+                subscriber_id, len(rows), last_rowid, max_rowid,
+            )
+            for r, err in unparseable:
+                try:
+                    self.record_dead_letter(
+                        subscriber_id, r["event_id"], f"unparseable_event: {err}"
+                    )
+                except Exception:
+                    logger.exception(
+                        "subscribe(%s): failed to dead-letter %s",
+                        subscriber_id, r["event_id"],
+                    )
+            self._execute(
+                """INSERT INTO subscriber_cursors (subscriber_id, last_rowid, updated_at)
+                   VALUES (?, ?, datetime('now'))
+                   ON CONFLICT(subscriber_id)
+                   DO UPDATE SET last_rowid = excluded.last_rowid,
+                                updated_at = excluded.updated_at""",
+                (subscriber_id, max_rowid),
+            )
         return events
 
     def ack(self, subscriber_id: str, event_ids: List[str]) -> None:
