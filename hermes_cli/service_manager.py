@@ -107,7 +107,7 @@ def detect_service_manager() -> ServiceManagerKind:
     is_macos,
     is_windows,
     supports_systemd_services,
-    _openrc_available,
+    supports_openrc_services,
     )
 
     # Gate on _s6_running() alone (PID 1 comm == s6-svscan AND /run/s6/basedir),
@@ -125,7 +125,7 @@ def detect_service_manager() -> ServiceManagerKind:
         return "launchd"
     if supports_systemd_services():
         return "systemd"
-    if _openrc_available():
+    if supports_openrc_services():
         return "openrc"
     return "none"
 
