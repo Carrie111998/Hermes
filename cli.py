@@ -7190,7 +7190,252 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
 
+    def _preload_resumed_session(self) -> bool:
+        """Load a resumed session's history from the DB early (before first chat).
 
+        Called from run() so the conversation history is available for display
+        before the user sends their first message.  Sets
+        ``self.conversation_history`` and prints the one-liner status.  Returns
+        True if history was loaded, False otherwise.
+
+        The corresponding block in ``_init_agent()`` checks whether history is
+        already populated and skips the DB round-trip.
+        """
+        if not self._resumed or not self._session_db:
+            return False
+
+        session_meta = self._session_db.get_session(self.session_id)
+        if not session_meta:
+            self._console_print(
+                f"[bold red]Session not found: {self.session_id}[/]"
+            )
+            self._console_print(
+                "[dim]Use a session ID from a previous CLI run "
+                "(hermes sessions list).[/]"
+            )
+            return False
+
+        # If the requested session is the (empty) head of a compression chain,
+        # walk to the descendant that actually holds the messages. See #15000.
+        try:
+            resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
+        except Exception:
+            resolved_id = self.session_id
+        if resolved_id and resolved_id != self.session_id:
+            self._console_print(
+                f"[dim]Session {self.session_id} was compressed into "
+                f"{resolved_id}; resuming the descendant with your transcript.[/]"
+            )
+            self.session_id = resolved_id
+            resolved_meta = self._session_db.get_session(self.session_id)
+            if resolved_meta:
+                session_meta = resolved_meta
+
+        restored = self._session_db.get_messages_as_conversation(self.session_id)
+        if restored:
+            restored = [m for m in restored if m.get("role") != "session_meta"]
+            self.conversation_history = restored
+            msg_count = len([m for m in restored if m.get("role") == "user"])
+            title_part = ""
+            if session_meta.get("title"):
+                title_part = f' "{session_meta["title"]}"'
+            accent_color = _accent_hex()
+            self._console_print(
+                f"[{accent_color}]↻ Resumed session [bold]{self.session_id}[/bold]"
+                f"{title_part} "
+                f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
+                f"{len(restored)} total messages)[/]"
+            )
+            self._restore_session_cwd(session_meta)
+        else:
+            accent_color = _accent_hex()
+            self._console_print(
+                f"[{accent_color}]Session {self.session_id} found but has no "
+                f"messages. Starting fresh.[/]"
+            )
+            return False
+
+        # Re-open the session (clear ended_at so it's active again)
+        try:
+            self._session_db._conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                "WHERE id = ?",
+                (self.session_id,),
+            )
+            self._session_db._conn.commit()
+        except Exception:
+            pass
+
+        return True
+
+    def _display_resumed_history(self):
+        """Render a compact recap of previous conversation messages.
+
+        Uses Rich markup with dim/muted styling so the recap is visually
+        distinct from the active conversation.  Caps the display at the
+        last ``MAX_DISPLAY_EXCHANGES`` user/assistant exchanges and shows
+        an indicator for earlier hidden messages.
+        """
+        if not self.conversation_history:
+            return
+
+        # Check config: resume_display setting
+        if self.resume_display == "minimal":
+            return
+
+        # Read limits from config (with hardcoded defaults)
+        _disp = CLI_CONFIG.get("display", {})
+        MAX_DISPLAY_EXCHANGES = int(_disp.get("resume_exchanges", 10))
+        MAX_USER_LEN = int(_disp.get("resume_max_user_chars", 300))
+        MAX_ASST_LEN = int(_disp.get("resume_max_assistant_chars", 200))
+        MAX_ASST_LINES = int(_disp.get("resume_max_assistant_lines", 3))
+        SKIP_TOOL_ONLY = _disp.get("resume_skip_tool_only", True)
+
+        # Collect displayable entries (skip system, tool-result messages)
+        entries = []  # list of (role, display_text)
+        _last_asst_idx = None       # index of last assistant entry
+        _last_asst_full = None      # un-truncated display text for last assistant
+        for msg in self.conversation_history:
+            role = msg.get("role", "")
+            content = msg.get("content")
+            tool_calls = msg.get("tool_calls") or []
+
+            if role == "system":
+                continue
+            if role == "tool":
+                continue
+
+            if role == "user":
+                text = "" if content is None else str(content)
+                # Handle multimodal content (list of dicts)
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            parts.append(part.get("text", ""))
+                        elif isinstance(part, dict) and part.get("type") == "image_url":
+                            parts.append("[image]")
+                    text = " ".join(parts)
+                if len(text) > MAX_USER_LEN:
+                    text = text[:MAX_USER_LEN] + "..."
+                entries.append(("user", text))
+
+            elif role == "assistant":
+                text = "" if content is None else str(content)
+                text = _strip_reasoning_tags(text)
+                parts = []
+                full_parts = []  # un-truncated version
+                if text:
+                    full_parts.append(text)
+                    lines = text.splitlines()
+                    if len(lines) > MAX_ASST_LINES:
+                        text = "\n".join(lines[:MAX_ASST_LINES]) + " ..."
+                    if len(text) > MAX_ASST_LEN:
+                        text = text[:MAX_ASST_LEN] + "..."
+                    parts.append(text)
+                if tool_calls:
+                    tc_count = len(tool_calls)
+                    # Extract tool names
+                    names = []
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "unknown") if isinstance(fn, dict) else "unknown"
+                        if name not in names:
+                            names.append(name)
+                    names_str = ", ".join(names[:4])
+                    if len(names) > 4:
+                        names_str += ", ..."
+                    noun = "call" if tc_count == 1 else "calls"
+                    tc_summary = f"[{tc_count} tool {noun}: {names_str}]"
+                    parts.append(tc_summary)
+                    full_parts.append(tc_summary)
+                if not parts:
+                    # Skip pure-reasoning messages that have no visible output
+                    continue
+                # Skip tool-call-only entries when SKIP_TOOL_ONLY is enabled
+                has_text = bool(text)
+                if SKIP_TOOL_ONLY and not has_text and tool_calls:
+                    continue
+                entries.append(("assistant", " ".join(parts)))
+                _last_asst_idx = len(entries) - 1
+                _last_asst_full = " ".join(full_parts)
+
+        if not entries:
+            return
+
+        # Determine if we need to truncate
+        skipped = 0
+        if len(entries) > MAX_DISPLAY_EXCHANGES * 2:
+            skipped = len(entries) - MAX_DISPLAY_EXCHANGES * 2
+            entries = entries[skipped:]
+
+        # Replace last assistant entry with full (un-truncated) text
+        # so the user can see where they left off without wasting tokens.
+        if _last_asst_idx is not None and _last_asst_full:
+            adj_idx = _last_asst_idx - skipped
+            if 0 <= adj_idx < len(entries):
+                entries[adj_idx] = ("assistant_last", _last_asst_full)
+
+        # Build the display using Rich
+        from rich.panel import Panel
+        from rich.text import Text
+
+        try:
+            from hermes_cli.skin_engine import get_active_skin
+            _skin = get_active_skin()
+            _history_text_c = _skin.get_color("banner_text", "#FFF8DC")
+            _session_label_c = _skin.get_color("session_label", "#DAA520")
+            _session_border_c = _skin.get_color("session_border", "#8B8682")
+            _assistant_label_c = _skin.get_color("ui_ok", "#8FBC8F")
+            _agent_label = _skin.get_branding("agent_name") or "Hermes"
+        except Exception:
+            _history_text_c = "#FFF8DC"
+            _session_label_c = "#DAA520"
+            _session_border_c = "#8B8682"
+            _assistant_label_c = "#8FBC8F"
+            _agent_label = "Hermes"
+
+        lines = Text()
+        if skipped:
+            lines.append(
+                f"  ... {skipped} earlier messages ...\n\n",
+                style="dim italic",
+            )
+
+        for i, (role, text) in enumerate(entries):
+            if role == "user":
+                lines.append("  ● You: ", style=f"dim bold {_session_label_c}")
+                # Show first line inline, indent rest
+                msg_lines = text.splitlines()
+                lines.append(msg_lines[0] + "\n", style="dim")
+                for ml in msg_lines[1:]:
+                    lines.append(f"         {ml}\n", style="dim")
+            elif role == "assistant_last":
+                # Last assistant response shown in full, non-dim
+                lines.append(f"  ◆ {_agent_label}: ", style=f"bold {_assistant_label_c}")
+                msg_lines = text.splitlines()
+                lines.append(msg_lines[0] + "\n", style="")
+                for ml in msg_lines[1:]:
+                    lines.append(f"            {ml}\n", style="")
+            else:
+                lines.append(f"  ◆ {_agent_label}: ", style=f"dim bold {_assistant_label_c}")
+                msg_lines = text.splitlines()
+                lines.append(msg_lines[0] + "\n", style="dim")
+                for ml in msg_lines[1:]:
+                    lines.append(f"            {ml}\n", style="dim")
+            if i < len(entries) - 1:
+                lines.append("")  # small gap
+
+        panel = Panel(
+            lines,
+            title=f"[dim {_session_label_c}]Previous Conversation[/]",
+            border_style=f"dim {_session_border_c}",
+            padding=(0, 1),
+            style=_history_text_c,
+        )
+        _record_output_history_entry(lambda: self._render_resume_history_panel_lines(panel))
+        with _suspend_output_history():
+            self._console_print(panel)
 
     def _render_resume_history_panel_lines(self, panel) -> list[str]:
         """Render the resume panel at the current terminal width for resize replay."""
