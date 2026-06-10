@@ -1099,8 +1099,8 @@ class TestRecoveryPolicy:
         assert entry["schedule_kind"] == "cron"
 
     def test_skip_only_recovery_policy_blocks_fire_once(self, tmp_cron_dir, monkeypatch):
-        """Daily cron missed by 1h with recovery_policy=skip_only → skip + emit."""
-        now = datetime(2026, 4, 30, 0, 0, 0, tzinfo=timezone.utc)
+        """Daily cron missed by 3h (past 2h grace) with skip_only → skip + emit."""
+        now = datetime(2026, 4, 30, 2, 0, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
 
         job = create_job(prompt="anchored daily", schedule="0 23 * * *")
@@ -1115,8 +1115,8 @@ class TestRecoveryPolicy:
         assert skip_entries[0]["reason"] == "skip_only"
 
     def test_weekly_cron_default_skip(self, tmp_cron_dir, monkeypatch):
-        """Weekly cron (period >86400s) missed by 1h → never fire-once → skip + emit."""
-        now = datetime(2026, 4, 27, 10, 0, 0, tzinfo=timezone.utc)  # Monday
+        """Weekly cron missed by 3h (past 2h grace) → never fire-once → skip + emit."""
+        now = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)  # Monday
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
 
         job = create_job(prompt="weekly retro", schedule="0 9 * * 1")
@@ -1128,6 +1128,49 @@ class TestRecoveryPolicy:
         skip_entries = [s for s in skipped if s["job_id"] == job["id"]]
         assert len(skip_entries) == 1
         assert skip_entries[0]["reason"] == "default_period_cap"
+
+    def test_weekly_cron_within_grace_fires_on_time(self, tmp_cron_dir, monkeypatch):
+        """Weekly cron observed 12s after its instant is an ON-TIME fire, not a miss.
+
+        Regression for security-audit-weekly (9225c1940fdd): the sequential
+        scheduler tick always observes a due job some seconds late, so a
+        period-cap that treats ANY positive lateness as a missed window makes
+        every weekly cron permanently unable to fire (2026-06-01 and
+        2026-06-08 skips, missed_seconds 12/27, reason=default_period_cap).
+        Within grace (period/2 clamped to [120s, 7200s]) the job must fire.
+        """
+        now = datetime(2026, 4, 27, 9, 0, 12, tzinfo=timezone.utc)  # Monday 09:00:12
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="weekly audit", schedule="0 9 * * 1")
+        _set_next_run(job["id"], "2026-04-27T09:00:00+00:00")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert any(j["id"] == job["id"] for j in due), \
+            "weekly cron within grace must fire on time"
+        assert not any(s["job_id"] == job["id"] for s in skipped), \
+            "on-time fire must not emit cron_skipped"
+
+    def test_skip_only_within_grace_fires_on_time(self, tmp_cron_dir, monkeypatch):
+        """skip_only governs miss RECOVERY, not normal operation.
+
+        A skip_only daily observed 30s after its instant (tick jitter) is an
+        on-time fire — without this, skip_only crons (scribe-am/pm,
+        learning-loop, ...) never fire at all.
+        """
+        now = datetime(2026, 4, 29, 23, 0, 30, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="anchored daily", schedule="0 23 * * *")
+        _set_next_run(job["id"], "2026-04-29T23:00:00+00:00")
+        _set_recovery_policy(job["id"], "skip_only")
+
+        due, skipped = get_due_and_skipped_jobs()
+
+        assert any(j["id"] == job["id"] for j in due), \
+            "skip_only cron within grace must fire on time"
+        assert not any(s["job_id"] == job["id"] for s in skipped)
 
     def test_short_period_within_grace_unchanged(self, tmp_cron_dir, monkeypatch):
         """10-min interval missed by 4 min stays in due (existing path), no skip emit."""

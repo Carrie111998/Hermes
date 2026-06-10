@@ -1188,13 +1188,24 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # the next future occurrence instead of firing a stale run.
             missed_seconds = int((now - next_run_dt).total_seconds())
             if kind in ("cron", "interval"):
-                # Eligibility decision tree for missed recurring jobs.
-                # Compute reason/skip-decision FIRST so that opt-outs
-                # (skip_only) and non-fire-once-eligible periods (weekly,
-                # missed >24h) are honored regardless of the grace window.
-                # Short-period fire-once-eligible jobs that are still WITHIN
-                # grace fall through to the existing `due.append` path with
-                # no log line and no skipped emission.
+                # ON-TIME GATE (2026-06-10). The sequential scheduler tick
+                # always observes a due job some seconds after its scheduled
+                # instant, so lateness within grace (period/2 clamped to
+                # [120s, 7200s]) is normal operation — NOT a missed window.
+                # Without this gate the miss-recovery tree below ran on every
+                # ordinary fire, which made weekly (default_period_cap) and
+                # skip_only crons permanently unable to fire (e.g.
+                # security-audit-weekly skipped at 12s/27s late on
+                # 2026-06-01/06-08). recovery_policy and the period caps
+                # govern miss RECOVERY only and apply past grace.
+                grace = _compute_grace_seconds(schedule)
+                if missed_seconds <= grace:
+                    due.append(job)
+                    continue
+
+                # Eligibility decision tree for missed recurring jobs
+                # (past grace — a genuinely missed window, e.g. gateway
+                # downtime across the fire instant).
                 period_seconds = _compute_period_seconds(schedule)
                 # recovery_policy is currently a flag-style string. The only recognized
                 # value is "skip_only"; anything else (None, missing, or other strings)
@@ -1248,21 +1259,18 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         })
                     continue  # Don't fall through to due.append
 
-                # Fire-once eligible. If past grace, log explicitly so the
-                # gateway-restart catch-up is visible. If within grace, this
-                # is the existing fire-on-next-tick behavior — stay silent.
-                # In BOTH cases we leave next_run_at alone so the scheduler's
-                # advance_next_run() (called before each run) handles
-                # advancement and prevents double-firing.
-                grace = _compute_grace_seconds(schedule)
-                if missed_seconds > grace:
-                    logger.info(
-                        "Job '%s' missed at %s (by %ds) — firing once on recovery; "
-                        "scheduler will advance next_run_at before run.",
-                        job.get("name", job["id"]),
-                        next_run,
-                        missed_seconds,
-                    )
+                # Fire-once eligible (always past grace here — the on-time
+                # gate above handled within-grace fires silently). Log so the
+                # gateway-restart catch-up is visible. next_run_at is left
+                # alone so the scheduler's advance_next_run() (called before
+                # each run) handles advancement and prevents double-firing.
+                logger.info(
+                    "Job '%s' missed at %s (by %ds) — firing once on recovery; "
+                    "scheduler will advance next_run_at before run.",
+                    job.get("name", job["id"]),
+                    next_run,
+                    missed_seconds,
+                )
 
             due.append(job)
 
