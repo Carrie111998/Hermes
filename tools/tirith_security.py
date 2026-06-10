@@ -456,7 +456,7 @@ def _resolve_tirith_path(configured_path: str) -> str:
     global _resolved_path, _install_failure_reason
 
     # Fast path: successfully resolved on a previous call.
-    if _resolved_path is not None and _resolved_path is not _INSTALL_FAILED:
+    if isinstance(_resolved_path, str):
         return _resolved_path
 
     expanded = os.path.expanduser(configured_path)
@@ -592,7 +592,7 @@ def ensure_installed(*, log_failures: bool = True):
         return None
 
     # Already resolved from a previous call
-    if _resolved_path is not None and _resolved_path is not _INSTALL_FAILED:
+    if isinstance(_resolved_path, str):
         path = _resolved_path
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
