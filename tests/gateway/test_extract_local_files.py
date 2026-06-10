@@ -60,6 +60,16 @@ class TestBasicDetection:
         assert paths == ["/home/user/photos/cat.jpg"]
         assert "~/photos/cat.jpg" not in cleaned
 
+    def test_windows_drive_path_image(self):
+        paths, cleaned = _extract("Saved to C:\\Users\\diego\\shots\\game.png enjoy")
+        assert paths == ["C:\\Users\\diego\\shots\\game.png"]
+        assert "C:\\Users\\diego\\shots\\game.png" not in cleaned
+        assert "Saved to" in cleaned
+
+    def test_windows_drive_path_not_matched_inside_url(self):
+        paths, _ = _extract("see file://C:/x/y.png for details")
+        assert paths == []
+
     def test_video_extensions(self):
         for ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
             text = f"Video at /tmp/clip{ext} here"
@@ -337,10 +347,12 @@ class TestEdgeCases:
         paths, _ = _extract("File at /tmp/my file.png here")
         assert paths == []
 
-    def test_windows_path_not_matched(self):
-        """Windows-style paths should not match."""
+    def test_windows_path_matched(self):
+        """Windows drive-letter paths match since 2026-06-10 (this fork's
+        production platform is Windows); candidates still pass through
+        os.path.isfile + validate_media_delivery_path."""
         paths, _ = _extract("See C:\\Users\\test\\image.png")
-        assert paths == []
+        assert paths == ["C:\\Users\\test\\image.png"]
 
     def test_relative_path_not_matched(self):
         """Relative paths like ./image.png should not match."""

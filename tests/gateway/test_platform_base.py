@@ -259,6 +259,21 @@ class TestExtractImages:
 
 
 class TestExtractMedia:
+    def test_windows_drive_path_backslashes(self):
+        # Drive-letter paths must extract on Windows — the prefix alternation
+        # accepted only ~/ and / until 2026-06-10, so cron media replies on
+        # Windows delivered the raw MEDIA: tag as text instead of a file.
+        content = "Done.\nMEDIA:C:\\Users\\diego\\media-cache\\voice.ogg"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("C:\\Users\\diego\\media-cache\\voice.ogg", False)]
+        assert "MEDIA:" not in cleaned
+
+    def test_windows_drive_path_forward_slashes(self):
+        content = "MEDIA:C:/Users/diego/media-cache/clip.mp4"
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        assert media == [("C:/Users/diego/media-cache/clip.mp4", False)]
+        assert "MEDIA:" not in cleaned
+
     def test_no_media(self):
         media, cleaned = BasePlatformAdapter.extract_media("Just text.")
         assert media == []
@@ -505,6 +520,8 @@ class TestMediaDeliveryPathValidation:
         secret = ssh_dir / "id_rsa.txt"
         secret.write_bytes(b"-----BEGIN ...")  # mtime = now
         monkeypatch.setenv("HOME", str(fake_home))
+        # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
@@ -599,6 +616,8 @@ class TestMediaDeliveryDefaultMode:
         secret = ssh_dir / "id_rsa"
         secret.write_bytes(b"-----BEGIN ...")
         monkeypatch.setenv("HOME", str(fake_home))
+        # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
@@ -634,6 +653,8 @@ class TestMediaDeliveryDefaultMode:
         env_file = hermes_dir / ".env"
         env_file.write_text("OPENAI_API_KEY=sk-...")
         monkeypatch.setenv("HOME", str(fake_home))
+        # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
         monkeypatch.setattr(
             "gateway.platforms.base._HERMES_HOME",
             hermes_dir,
