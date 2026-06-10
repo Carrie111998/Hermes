@@ -162,22 +162,6 @@ def _s6_running() -> bool:
     return Path("/run/s6/basedir").is_dir()
 
 
-
-
-# Compatibility note
-# ----------------
-# The OpenRC backend shipped in this module as an upstream addition. On
-# Alpine Linux the gateway process is launched through ``supervise-daemon``/
-# ``rc-service`` in ``/etc/init.d/hermes-gateway``. In that launch path the
-# import machinery resolves ``gateway.slash_access`` differently from a plain
-# interactive Python run, so `ModuleNotFoundError: No module named 'gateway.slash_access'`
-# can appear if the working directory / ``PYTHONPATH`` is not set for the
-# editable install. This does NOT change the public interface of
-# ``OpenRCServiceManager``; it documents that operators may need to set
-# PYTHONPATH in the init script env or otherwise ensure the editable finder
-# is included on sys.path so submodules are importable in the service process.
-
-
 # ---------------------------------------------------------------------------
 # Backend wrappers
 #
@@ -318,6 +302,17 @@ class WindowsServiceManager(_RegistrationUnsupportedMixin):
             return False
         return bool(find_gateway_pids())
 
+
+# Compatibility note
+# ----------------
+# On Alpine Linux the gateway process is launched through ``supervise-daemon``/
+# ``rc-service`` in ``/etc/init.d/hermes-gateway``. In that launch path the
+# import machinery resolves ``gateway.slash_access`` differently from a plain
+# interactive Python run, so `ModuleNotFoundError: No module named 'gateway.slash_access'`
+# can appear if the working directory / ``PYTHONPATH`` is not set for the
+# editable install. Thus, operators may need to set PYTHONPATH in the init
+# script env or otherwise ensure the editable finder is included on sys.path
+# so that submodules are importable in the service process.
 
 class OpenRCServiceManager(_RegistrationUnsupportedMixin):
     """Thin wrapper around the ``openrc_*`` functions in hermes_cli.gateway.
