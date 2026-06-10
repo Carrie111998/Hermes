@@ -37,6 +37,17 @@ DEFAULT_DB = Path("/tmp/tgg-christopher-replay-69533/tenants/tgg.db")
 DEFAULT_CHAT = "120363403845802098@g.us"
 DEFAULT_SINCE = "2026-05-24 00:00:00 SGT"
 DEFAULT_SECRETS = Path.home() / ".marshal" / "secrets.env"
+
+# Media-root remap (Problem 1): bridge_message_log.media_refs[].local_path was
+# captured against a now-DELETED spec dir (.../2026-05-30-tgg-post24-ledger/
+# live-bridge/media/<file>.jpg). When the harness feeds those dead paths to
+# hermes, vision pre-analysis (text mode) fails -> the model gets the
+# "couldn't quite see it" placeholder and never sees the image. We DO NOT
+# mutate the sandbox DB rows; instead we remap at the read layer: if a media
+# path doesn't exist on disk, try <MEDIA_ROOT>/<basename>. Set via the
+# --media-root CLI flag or TGG_REPLAY_MEDIA_ROOT env var; any sandbox copy of
+# the DB then resolves against the restored flat media dir.
+_MEDIA_ROOT: "Path | None" = None
 TGG_CONFIG = REPO_ROOT / "deploy" / "tgg" / "christopher" / "config.yaml"
 TGG_CONSTITUTION = REPO_ROOT / "deploy" / "tgg" / "christopher" / "christopher_tgg_constitution.yaml"
 DOCS_DIR = Path.home() / "pcl-docs" / "records"
@@ -936,6 +947,34 @@ def _load_records(
     return rows
 
 
+def _remap_media_path(candidate: str) -> str:
+    """Resolve a media path, remapping dead prefixes to the configured root.
+
+    If ``candidate`` already exists on disk, it is returned unchanged. Otherwise
+    — and only when a media root is configured — we try ``<MEDIA_ROOT>/<base>``
+    where ``base`` is the candidate's filename. The restored media dir is flat
+    and keyed by the same basenames the dead paths carry, so this resolves the
+    deleted-spec-dir breakage without touching the sandbox DB rows. If neither
+    exists we return the original candidate (callers/hermes report it skipped).
+    """
+    if not candidate:
+        return candidate
+    try:
+        if Path(candidate).exists():
+            return candidate
+    except Exception:
+        pass
+    root = _MEDIA_ROOT
+    if root is not None:
+        try:
+            remapped = root / Path(candidate).name
+            if remapped.exists():
+                return str(remapped)
+        except Exception:
+            pass
+    return candidate
+
+
 def _media_paths(refs: list[dict[str, Any]]) -> list[str]:
     paths = []
     for ref in refs:
@@ -943,7 +982,7 @@ def _media_paths(refs: list[dict[str, Any]]) -> list[str]:
             continue
         candidate = ref.get("local_path") or ref.get("path") or ref.get("file_path")
         if candidate:
-            paths.append(str(candidate))
+            paths.append(_remap_media_path(str(candidate)))
     return paths
 
 
@@ -2425,7 +2464,22 @@ def main() -> int:
     parser.add_argument("--rotate-session-every-turns", type=int)
     parser.add_argument("--secrets", default=str(DEFAULT_SECRETS))
     parser.add_argument("--cleanup-hermes-home", action="store_true")
+    parser.add_argument(
+        "--media-root",
+        default=os.environ.get("TGG_REPLAY_MEDIA_ROOT"),
+        help=(
+            "Directory of restored media files (flat, keyed by basename). When a "
+            "bridge_message_log media path no longer exists on disk (e.g. its "
+            "originating spec dir was pruned), the harness remaps it to "
+            "<media-root>/<basename>. Defaults to $TGG_REPLAY_MEDIA_ROOT."
+        ),
+    )
     args = parser.parse_args()
+    global _MEDIA_ROOT
+    if args.media_root:
+        _MEDIA_ROOT = Path(args.media_root).expanduser().resolve()
+        if not _MEDIA_ROOT.is_dir():
+            raise SystemExit(f"--media-root is not a directory: {_MEDIA_ROOT}")
     if args.render_review_run:
         output_path = Path(args.output) if args.output else DOCS_DIR / f"{args.render_review_run}.html"
         summary = _html_report_from_published_run(
