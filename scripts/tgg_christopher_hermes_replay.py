@@ -70,6 +70,12 @@ class ReplayProfile:
     direct_mention_immediate: bool
     rotate_session_every_turns: int | None = None
     require_pricing: bool = True
+    # When set, force agent.image_input_mode so user-attached images route the
+    # given way regardless of model capability metadata / aux-vision override.
+    # "native" attaches pixels inline on the main model turn (vision-capable
+    # main model, no separate vision backend / key required). "text" runs the
+    # vision_analyze pre-analysis pipeline. None => auto (model-capability based).
+    image_input_mode: str | None = None
 
 
 REPLAY_PROFILES: dict[str, ReplayProfile] = {
@@ -86,6 +92,28 @@ REPLAY_PROFILES: dict[str, ReplayProfile] = {
         allow_prod_url=False,
         debounce_seconds=300,
         direct_mention_immediate=True,
+    ),
+    # Native-vision variant: same model + constitution as the gemini-vision
+    # profile, but images are attached inline to the gpt-5.4-mini turn (OpenAI
+    # direct) instead of being pre-analyzed by a separate gemini vision backend.
+    # gpt-5.4-mini accepts image input, so the model sees the pixels directly —
+    # no GEMINI_API_KEY_PCL_PA_SHARED required. This is the right path when only
+    # OPENAI_API_KEY is provisioned, and it gives higher image fidelity than the
+    # lossy text pre-analysis summary.
+    "tgg-local-gpt54-mini-native-vision": ReplayProfile(
+        name="tgg-local-gpt54-mini-native-vision",
+        main_provider="openai-direct-primary",
+        model="gpt-5.4-mini",
+        transport="codex_responses",
+        vision_enabled=True,
+        vision_provider=None,
+        vision_model=None,
+        vision_concurrency=8,
+        business_mode="copied-db-local-operator",
+        allow_prod_url=False,
+        debounce_seconds=300,
+        direct_mention_immediate=True,
+        image_input_mode="native",
     ),
     "tgg-local-gemini-live": ReplayProfile(
         name="tgg-local-gemini-live",
@@ -149,6 +177,7 @@ def _resolve_replay_profile(args: argparse.Namespace) -> ReplayProfile:
             else base.rotate_session_every_turns
         ),
         require_pricing=base.require_pricing,
+        image_input_mode=base.image_input_mode,
     )
 
 
@@ -797,6 +826,11 @@ def _prepare_hermes_home(
     _set_nested(config, ["model", "default"], profile.model)
     _set_nested(config, ["agent", "profile"], "pa")
     _set_nested(config, ["agent", "max_turns"], 12)
+    # Force image-input routing when the profile pins it. "native" attaches
+    # pixels inline on the vision-capable main model (no separate vision
+    # backend / key); "text" runs the vision_analyze pre-analysis pipeline.
+    if profile.image_input_mode:
+        _set_nested(config, ["agent", "image_input_mode"], profile.image_input_mode)
     _set_nested(config, ["display", "tool_progress"], "off")
     _set_nested(config, ["streaming", "enabled"], False)
     # Christopher reasons about a maintenance group as one conversation.
