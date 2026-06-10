@@ -243,10 +243,13 @@ class TestTickWorkdirPartition:
         # Workdir jobs always come before parallel jobs.
         assert ids.index("a") < ids.index("b")
 
-        # The workdir job must run on the main thread (sequential pass).
-        main_thread_name = threading.current_thread().name
+        # Since the per-job soft deadline (2026-06-10), the sequential pass
+        # runs each job on a dedicated "cron-job-<id>" worker thread that
+        # the ticker JOINS before starting the next — serialization is
+        # guaranteed by the join (the ordering assertion above), not by
+        # main-thread affinity.
         workdir_thread_name = next(t for jid, t in calls if jid == "a")
-        assert workdir_thread_name == main_thread_name
+        assert workdir_thread_name.startswith("cron-job-")
 
 
 # ---------------------------------------------------------------------------

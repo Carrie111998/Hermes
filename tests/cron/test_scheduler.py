@@ -4250,3 +4250,172 @@ class TestMinIntervalGuard:
         assert _job_min_seconds_between_fires(
             {"min_seconds_between_fires": -100}
         ) == 0
+
+
+class TestPerJobSoftDeadline:
+    """Per-job soft deadline (2026-06-10 audit M1 T1.4).
+
+    A hung LLM job used to block its worker forever — and in the
+    sequential bucket, every later job in the tick. The deadline wrapper
+    bounds the WAIT (threads can't be killed): parallel-safe jobs are
+    marked failed + slot-released + abandoned; sequential jobs alert and
+    keep waiting (abandoning them would race os.environ restore).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):
+        from cron import scheduler as sched
+        yield
+        with sched._in_flight_lock:
+            sched._in_flight.clear()
+
+    def _stub_emitter(self, monkeypatch):
+        from cron import scheduler as sched
+        calls = []
+
+        class _Emitter:
+            def on_job_completed(self, **kw):
+                calls.append(kw)
+
+        monkeypatch.setattr(sched, "_get_event_emitter", lambda: _Emitter())
+        return calls
+
+    def test_fast_job_returns_result_unchanged(self, monkeypatch):
+        import contextvars
+        from cron import scheduler as sched
+        calls = self._stub_emitter(monkeypatch)
+
+        def fn(job, _abandoned=None):
+            return True
+
+        job = {"id": "fast-job", "name": "fast", "timeout_seconds": 5}
+        assert sched._run_callable_with_deadline(
+            job, fn, True, contextvars.copy_context()
+        ) is True
+        assert calls == []
+
+    def test_zero_timeout_disables_deadline(self, monkeypatch):
+        import contextvars
+        from cron import scheduler as sched
+        self._stub_emitter(monkeypatch)
+        seen = []
+
+        def fn(job, _abandoned="not-passed"):
+            seen.append(_abandoned)
+            return True
+
+        job = {"id": "off-job", "name": "off", "timeout_seconds": 0}
+        assert sched._run_callable_with_deadline(
+            job, fn, True, contextvars.copy_context()
+        ) is True
+        # Disabled path runs process_fn directly, no abandon plumbing.
+        assert seen == ["not-passed"]
+
+    def test_parallel_timeout_marks_releases_and_abandons(self, monkeypatch):
+        import contextvars
+        import threading
+        import time as _t
+        from cron import scheduler as sched
+
+        calls = self._stub_emitter(monkeypatch)
+        marked = []
+        monkeypatch.setattr(
+            sched, "mark_job_run",
+            lambda job_id, success, error, **kw: marked.append((job_id, success, error)),
+        )
+        runaway_done = threading.Event()
+        saw_abandoned = []
+
+        def fn(job, _abandoned=None):
+            _t.sleep(1.2)  # well past the 0.2s deadline
+            saw_abandoned.append(_abandoned.is_set())
+            runaway_done.set()
+            return True
+
+        job = {"id": "hung-job", "name": "hung", "timeout_seconds": 0.2}
+        # Simulate the worker's Guard #3 registration.
+        assert sched._try_register_in_flight("hung-job", "hung") is None
+
+        t0 = _t.monotonic()
+        result = sched._run_callable_with_deadline(
+            job, fn, True, contextvars.copy_context()
+        )
+        elapsed = _t.monotonic() - t0
+
+        assert result is False
+        assert elapsed < 1.0, "must return at the deadline, not at completion"
+        assert marked == [("hung-job", False, marked[0][2])]
+        assert "soft deadline exceeded" in marked[0][2]
+        assert len(calls) == 1 and calls[0]["success"] is False
+        # Slot released at the deadline so the next fire can register…
+        assert sched._try_register_in_flight("hung-job", "hung") is None
+        # …and the runaway finishing later must NOT pop the new record.
+        assert runaway_done.wait(3), "runaway worker never finished"
+        _t.sleep(0.1)
+        with sched._in_flight_lock:
+            assert "hung-job" in sched._in_flight
+        assert saw_abandoned == [True]
+
+    def test_sequential_timeout_alerts_but_waits_for_completion(self, monkeypatch):
+        import contextvars
+        import time as _t
+        from cron import scheduler as sched
+
+        calls = self._stub_emitter(monkeypatch)
+        marked = []
+        monkeypatch.setattr(
+            sched, "mark_job_run",
+            lambda *a, **kw: marked.append(a),
+        )
+
+        def fn(job, _abandoned=None):
+            _t.sleep(0.7)
+            return True
+
+        job = {"id": "seq-job", "name": "seq", "timeout_seconds": 0.2}
+        t0 = _t.monotonic()
+        result = sched._run_callable_with_deadline(
+            job, fn, False, contextvars.copy_context()
+        )
+        elapsed = _t.monotonic() - t0
+
+        assert result is True, "sequential path must wait for the real result"
+        assert elapsed >= 0.65
+        # Alert fired at the deadline…
+        assert len(calls) == 1 and calls[0]["success"] is False
+        assert "sequential job" in calls[0]["error"]
+        # …but the run was NOT marked failed (it's still owned by _process_job).
+        assert marked == []
+
+    def test_release_started_before_protects_successor_record(self):
+        import time as _t
+        from cron import scheduler as sched
+
+        assert sched._try_register_in_flight("guard-job", "guard") is None
+        cutoff = _t.monotonic()
+        _t.sleep(0.01)
+        # Successor registers after the cutoff (deadline handler's view).
+        sched._release_in_flight("guard-job")
+        assert sched._try_register_in_flight("guard-job", "guard") is None
+        sched._release_in_flight_started_before("guard-job", cutoff)
+        with sched._in_flight_lock:
+            assert "guard-job" in sched._in_flight, (
+                "a record started after the cutoff must survive"
+            )
+
+    def test_timeout_resolution_priority(self, monkeypatch):
+        from cron import scheduler as sched
+
+        monkeypatch.setenv("HERMES_CRON_JOB_TIMEOUT_SECONDS", "111")
+        assert sched._job_timeout_seconds({"timeout_seconds": 42}) == 42.0
+        assert sched._job_timeout_seconds({}) == 111.0
+        monkeypatch.delenv("HERMES_CRON_JOB_TIMEOUT_SECONDS")
+        monkeypatch.setattr(
+            sched, "load_config",
+            lambda: {"cron": {"job_timeout_seconds": 77}},
+        )
+        assert sched._job_timeout_seconds({}) == 77.0
+        monkeypatch.setattr(sched, "load_config", lambda: {})
+        assert sched._job_timeout_seconds({}) == sched._DEFAULT_JOB_TIMEOUT_S
+        # Per-job <= 0 disables.
+        assert sched._job_timeout_seconds({"timeout_seconds": 0}) == 0.0

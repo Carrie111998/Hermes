@@ -436,6 +436,9 @@ class TestTickProfilePartition:
         assert n == 2
         ids = [job_id for job_id, _thread_name in calls]
         assert ids.index("a") < ids.index("b")
-        main_thread_name = threading.current_thread().name
+        # Since the per-job soft deadline (2026-06-10), every job runs on a
+        # dedicated "cron-job-<id>" worker thread; sequential jobs are still
+        # serialized because the ticker JOINS each worker before starting
+        # the next (the ordering assertion above is the real invariant).
         profile_thread_name = next(thread for job_id, thread in calls if job_id == "a")
-        assert profile_thread_name == main_thread_name
+        assert profile_thread_name.startswith("cron-job-")

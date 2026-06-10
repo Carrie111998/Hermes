@@ -357,6 +357,144 @@ def _release_in_flight(job_id: str) -> None:
         _in_flight.pop(job_id, None)
 
 
+def _release_in_flight_started_before(job_id: str, started_before: float) -> None:
+    """Release the slot only if it belongs to a run that started before
+    ``started_before`` (monotonic).
+
+    Used by the soft-deadline handler when it abandons a runaway worker:
+    by Guard #3 the registry can only hold the runaway's record at that
+    moment, but if the runaway finished in the join/is_alive race window
+    a SUCCESSOR fire may already have registered — its fresh record must
+    not be popped by the deadline handler.
+    """
+    with _in_flight_lock:
+        rec = _in_flight.get(job_id)
+        if rec is not None and rec.start_monotonic <= started_before:
+            _in_flight.pop(job_id, None)
+
+
+# === Per-job soft deadline (2026-06-10 audit M1 T1.4) =======================
+#
+# LLM cron jobs had NO wall-clock bound: a hung run_job blocked its worker
+# forever — and in the sequential bucket that blocked every later job in
+# the tick (observed incident class: one slow LLM job stalls all crons).
+# Python threads cannot be killed, so "timeout" means: stop WAITING, mark
+# the run failed, surface an event, and (where safe) free the schedule.
+_DEFAULT_JOB_TIMEOUT_S = 1800.0  # matches _DEFAULT_DUP_GUARD_TIMEOUT_S
+
+
+def _job_timeout_seconds(job: dict) -> float:
+    """Soft wall-clock deadline for one cron job run.
+
+    Priority: per-job ``timeout_seconds`` field >
+    ``HERMES_CRON_JOB_TIMEOUT_SECONDS`` env var > config
+    ``cron.job_timeout_seconds`` > 1800s default. A value <= 0 disables
+    the deadline for that job. The default deliberately equals the dedup
+    guard's wedge threshold so both mechanisms agree on when a fire is
+    considered stuck.
+    """
+    per_job = job.get("timeout_seconds")
+    if per_job is not None:
+        try:
+            return float(per_job)
+        except (TypeError, ValueError):
+            pass
+    raw = os.getenv("HERMES_CRON_JOB_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+    try:
+        _cfg = load_config() or {}
+        val = (_cfg.get("cron", {}) if isinstance(_cfg, dict) else {}).get(
+            "job_timeout_seconds"
+        )
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return _DEFAULT_JOB_TIMEOUT_S
+
+
+def _run_callable_with_deadline(job, process_fn, abandon_on_timeout, ctx):
+    """Run one due job under a soft wall-clock deadline.
+
+    The job executes in a daemon worker thread (under ``ctx``, the
+    caller's copied contextvars). At the deadline:
+
+    - ``abandon_on_timeout=True`` (parallel-safe jobs): the run is marked
+      failed, a failure event is emitted, the in-flight slot is released
+      (start-time-checked) so the next scheduled fire is not blocked, and
+      the worker is abandoned. ``process_fn`` receives an ``_abandoned``
+      threading.Event and must suppress its late side effects once set.
+    - ``abandon_on_timeout=False`` (workdir/profile jobs): those mutate
+      process-global state (os.environ snapshot/restore, Hermes-home
+      override), so racing a successor against the runaway's eventual
+      restore could corrupt the successor's environment. The deadline
+      only ALERTS (failure-shaped event for operator visibility) and then
+      keeps waiting, preserving the sequential invariant.
+    """
+    timeout_s = _job_timeout_seconds(job)
+    if timeout_s <= 0:
+        return ctx.run(process_fn, job)
+
+    job_id = job["id"]
+    job_name = job.get("name", job_id)
+    abandoned = threading.Event()
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["result"] = ctx.run(process_fn, job, _abandoned=abandoned)
+        except Exception:
+            logger.exception("Deadline worker for cron job %s crashed", job_id)
+            box["result"] = False
+
+    t = threading.Thread(
+        target=_worker, daemon=True, name=f"cron-job-{str(job_id)[:12]}"
+    )
+    t.start()
+    t.join(timeout_s)
+    if not t.is_alive():
+        return bool(box.get("result", False))
+
+    deadline_now = time.monotonic()
+    msg = "soft deadline exceeded: still running after %ds%s" % (
+        int(timeout_s),
+        "; worker abandoned (daemon thread)" if abandon_on_timeout
+        else "; sequential job — tick keeps waiting",
+    )
+    logger.error("Cron job '%s' (%s): %s", job_name, job_id, msg)
+    emitter = _get_event_emitter()
+    if emitter:
+        try:
+            emitter.on_job_completed(
+                job_id=job_id,
+                job_name=job_name,
+                success=False,
+                duration=round(timeout_s, 1),
+                output_summary=None,
+                error=msg,
+                # The next real completion refreshes the true count.
+                consecutive_errors=0,
+            )
+        except Exception as ee:
+            logger.debug("Event emit failed for deadline timeout: %s", ee)
+
+    if not abandon_on_timeout:
+        t.join()
+        return bool(box.get("result", False))
+
+    abandoned.set()
+    try:
+        mark_job_run(job_id, False, msg)
+    except Exception:
+        logger.exception("Failed to mark timed-out cron job %s", job_id)
+    _release_in_flight_started_before(job_id, deadline_now)
+    return False
+
+
 def _summarize_for_event_bus(final_response: str) -> str:
     """Preserve normal cron reports while capping truly huge event payloads."""
     summary = final_response or ""
@@ -2650,8 +2788,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 _max_workers if _max_workers else "unbounded",
             )
 
-        def _process_job(job: dict) -> bool:
-            """Run one due job end-to-end: execute, save, deliver, mark."""
+        def _process_job(job: dict, _abandoned=None) -> bool:
+            """Run one due job end-to-end: execute, save, deliver, mark.
+
+            ``_abandoned`` is set by the soft-deadline wrapper when this
+            run was already declared failed at its deadline — late side
+            effects (delivery, marking, events, slot release) must then
+            be suppressed; only the output file is still written.
+            """
             _job_id = job["id"]
             _cron_job_name = job.get("name", _job_id)
             emitter = _get_event_emitter()
@@ -2784,6 +2928,27 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 success, output, final_response, error = run_job(job)
                 _job_duration = _time.monotonic() - _job_start
 
+                if _abandoned is not None and _abandoned.is_set():
+                    # The deadline handler already marked this run failed,
+                    # emitted its event, and released the in-flight slot.
+                    # Keep the output for forensics; suppress everything
+                    # user-visible or state-mutating.
+                    try:
+                        save_job_output(job["id"], output)
+                    except Exception:
+                        logger.debug("Late output save failed for %s", job["id"])
+                    logger.warning(
+                        "Job '%s': finished %.1fs after deadline abandon — "
+                        "late result suppressed (success=%s)",
+                        job["id"], _job_duration, success,
+                    )
+                    try:
+                        _cron_span.set_attribute("cron.deadline_abandoned", True)
+                        _cron_cm.__exit__(None, None, None)
+                    except Exception:
+                        pass
+                    return False
+
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
@@ -2895,7 +3060,11 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # Release the same-job concurrency slot regardless of how
                 # the run exited (success, agent failure, raised exception).
                 # See `_in_flight` registry block at module top — Guard #3.
-                _release_in_flight(_job_id)
+                # EXCEPT when the deadline handler abandoned this run: it
+                # already released the slot, and a successor fire may have
+                # registered a fresh record that must not be popped here.
+                if _abandoned is None or not _abandoned.is_set():
+                    _release_in_flight(_job_id)
 
         # Partition due jobs: jobs with a per-job workdir and/or profile touch
         # process-global runtime state inside run_job. Workdir jobs temporarily
@@ -2917,19 +3086,38 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         _results: list = []
 
-        # Sequential pass for env/context-mutating jobs.
+        # Sequential pass for env/context-mutating jobs. The soft deadline
+        # here is alert-only (abandon_on_timeout=False): abandoning a job
+        # that snapshots/restores os.environ would race its eventual
+        # restore against the next job's environment.
         for job in sequential_jobs:
-            _ctx = contextvars.copy_context()
-            _results.append(_ctx.run(_process_job, job))
+            _results.append(
+                _run_callable_with_deadline(
+                    job, _process_job, False, contextvars.copy_context()
+                )
+            )
 
-        # Parallel pass for the rest — same behaviour as before.
+        # Parallel pass for the rest — per-job soft deadline with abandon:
+        # a hung run is marked failed, surfaced, and its slot released so
+        # the next scheduled fire is not blocked.
         if parallel_jobs:
+            # Workers self-bound via the per-job deadline, so collection
+            # only needs a grace margin over the largest deadline (jobs
+            # with deadline disabled fall back to the legacy 600s).
+            _bounds = [_job_timeout_seconds(j) for j in parallel_jobs]
+            _collect_timeout = (
+                max(max(_bounds), 600.0) + 120.0 if all(b > 0 for b in _bounds) else None
+            )
             with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
                 _futures = []
                 for job in parallel_jobs:
-                    _ctx = contextvars.copy_context()
-                    _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
-                for f in concurrent.futures.as_completed(_futures, timeout=600):
+                    _futures.append(
+                        _tick_pool.submit(
+                            _run_callable_with_deadline,
+                            job, _process_job, True, contextvars.copy_context(),
+                        )
+                    )
+                for f in concurrent.futures.as_completed(_futures, timeout=_collect_timeout):
                     try:
                         _results.append(f.result())
                     except Exception as exc:
