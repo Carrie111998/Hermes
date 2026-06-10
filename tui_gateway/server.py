@@ -15690,3 +15690,32 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("wiki.list failed")
         return _err(rid, 5052, str(e))
+
+@method("feed.get")
+def _(rid, params: dict) -> dict:
+    """Return curated news feed from digest pipelines."""
+    try:
+        from tui_gateway.digest_store import get_feed as _feed_get
+        sources = params.get("sources")
+        if sources is not None and not isinstance(sources, list):
+            return _err(rid, 4001, "sources must be a list or null")
+        result = _feed_get(
+            sources=sources, since=params.get("since"),
+            limit=params.get("limit", 50), offset=params.get("offset", 0),
+        )
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("feed.get failed")
+        return _err(rid, 5200, str(e))
+
+
+@method("feed.sources")
+def _(rid, params: dict) -> dict:
+    """Return available feed sources and article counts."""
+    try:
+        from tui_gateway.digest_store import get_sources as _feed_sources
+        result = _feed_sources()
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("feed.sources failed")
+        return _err(rid, 5201, str(e))
