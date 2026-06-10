@@ -504,7 +504,17 @@ def _next_wa_job_no(conn: sqlite3.Connection, ts: int) -> str:
 
 
 class _ReplayOperatorBackend:
-    """Local operator API with the same route shape as the TGG portal."""
+    """Local operator API with the same route shape as the TGG portal.
+
+    DEPRECATED (2026-06-10, WB b7e19b21): this hand-written python stand-in drifted
+    from the deployed systems API (a '#' unit-normalization gap made Christopher
+    falsely mint duplicate cases in eval). The canonical replay backend is now the
+    isolated EVAL TENANT served by the real deployed systems app on tgg-prod-sg
+    (christopher-tgg-systems-eval.service) via --no-local-operator-backend +
+    --business-base-url through an ssh tunnel — see run_replay.sh in the
+    2026-06-09-christopher-wa-eval-disamb spec dir. Kept only as a fallback when
+    the VPS is unreachable; do not extend its query logic.
+    """
 
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -2230,6 +2240,15 @@ async def _run(args: argparse.Namespace) -> int:
         atexit.register(local_backend.stop)
         business_base_url = local_backend.base_url
         # Business writes are safe here: the bridge points at the copied local DB.
+        os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "0"
+    elif business_base_url:
+        # Eval-tenant backend (canonical since 2026-06-10, WB b7e19b21): the URL points
+        # at the isolated eval tenant served by the REAL deployed systems app on
+        # tgg-prod-sg (christopher-tgg-systems-eval.service, loopback :5192, separate
+        # PS_DATA_DIR seeded from the baseline DB), reached via an ssh -L tunnel.
+        # Real writes are enabled because _validate_replay_args refuses any
+        # non-localhost --business-base-url (LOCAL_BUSINESS_PREFIXES + allow_prod_url),
+        # so this can never target https://systems.papercut-labs.com directly.
         os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "0"
     _prepare_hermes_home(
         hermes_home,
