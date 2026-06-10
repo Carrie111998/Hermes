@@ -42,6 +42,7 @@ Do not treat yellow as production capability. It is a routing anchor for impleme
 - [Open-source architecture selection](../open-source-architecture/00-index.html)
 - [Open-source architecture plan](../hermes-open-source-architecture-plan.md)
 - [Ultra Studio product specs](../ultra-studio-product-specs/00-index.md)
+- [Final research analysis pack](../ultra-studio-research-analysis/00-index.md)
 - [Ultra Studio architecture diagram](../ultra-studio-agent-architecture.html)
 - [TokenRouter credential flow](../hermes-tokenrouter-credential-flow.md)
 - [CometAPI media gateway](../hermes-cometapi-media-gateway.md)
@@ -107,4 +108,3 @@ This design is complete enough to implement when:
 - Every red gap maps to a P0/P1 roadmap item with a validation check.
 - The web UI can stream real state from the Gateway instead of hardcoded demo state.
 - The agent cannot claim media completion unless a job, asset, or ledger record exists.
-

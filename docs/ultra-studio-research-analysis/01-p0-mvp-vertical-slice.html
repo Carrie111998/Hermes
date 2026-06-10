@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P0 MVP Vertical Slice</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>P0 MVP Vertical Slice</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="01-p0-mvp-vertical-slice.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>P0 MVP Vertical Slice</h1>
+<p>Status: final P0 build scope</p>
+<p>Date: 2026-06-11</p>
+<h2>Goal</h2>
+<p>Build one real creative loop before adding platform infrastructure:</p>
+<pre><code class="language-text">user prompt + optional upload
+  -&gt; real Hermes web session
+  -&gt; workflow-router classification
+  -&gt; Atlas image/video generation
+  -&gt; media_job record
+  -&gt; asset record
+  -&gt; streamed status
+  -&gt; rendered image/video in chat and inspector</code></pre>
+<p>This is the first slice. It should be boring, narrow, and testable.</p>
+<h2>P0 User Stories</h2>
+<table><thead><tr><th>Story</th><th>Required behavior</th></tr></thead><tbody>
+<tr><td>Ask a normal question</td><td>Reply normally. No media job is created.</td></tr>
+<tr><td>Generate an image</td><td>Route to Atlas image generation and render the image in the UI.</td></tr>
+<tr><td>Generate a video</td><td>Route to Atlas video generation and render the video in the UI, or return a typed blocker.</td></tr>
+<tr><td>Upload an image then ask for a video</td><td>Upload creates an asset; router uses that asset as image input if supported.</td></tr>
+<tr><td>Refresh during generation</td><td>Session resumes and current job/asset state remains visible.</td></tr>
+<tr><td>Provider failure</td><td>Show structured error; no fake asset or fake completion.</td></tr>
+</tbody></table>
+<h2>P0 Non-Goals</h2>
+<p>Do not build these in P0:</p>
+<ul>
+<li>Keycloak.</li>
+<li>Istio.</li>
+<li>Kueue.</li>
+<li>Temporal cluster.</li>
+<li>NATS JetStream.</li>
+<li>Kata microVM.</li>
+<li>Rook-Ceph.</li>
+<li>Argo CD.</li>
+<li>full OpenBao TokenRouter.</li>
+<li>full CometAPI.</li>
+<li>browser context fleet.</li>
+<li>marketplace publishing.</li>
+<li>smart groups.</li>
+<li>Character/Element lifecycle.</li>
+<li>full memory UI.</li>
+<li>autonomous posting or account actions.</li>
+</ul>
+<p>They are legitimate later architecture, but they block the first real loop if pulled into P0.</p>
+<h2>Existing Code To Use</h2>
+<table><thead><tr><th>Area</th><th>Path</th><th>Use in P0</th></tr></thead><tbody>
+<tr><td>Web chat</td><td><code>web/src/pages/ChatPage.tsx</code></td><td>Treat as P0 chat baseline.</td></tr>
+<tr><td>Gateway hook</td><td><code>web/src/hooks/useGatewayChat.ts</code></td><td>Use existing <code>session.create</code>, <code>session.resume</code>, <code>prompt.submit</code> flow.</td></tr>
+<tr><td>Web routes</td><td><code>hermes_cli/web_server.py</code></td><td>Reuse <code>/api/ws</code>, <code>/api/events</code>, upload route, plugin API route patterns.</td></tr>
+<tr><td>Uploads</td><td><code>hermes_cli/dashboard_uploads.py</code></td><td>Wrap uploads into typed assets.</td></tr>
+<tr><td>Atlas image</td><td><code>plugins/image_gen/atlas/</code></td><td>Use via existing <code>image_generate</code> tool path.</td></tr>
+<tr><td>Atlas video</td><td><code>plugins/video_gen/atlas/</code></td><td>Use via existing <code>video_generate</code> provider path.</td></tr>
+<tr><td>Router skill</td><td><code>skills/creative/workflow-router/SKILL.md</code></td><td>Use as routing policy until deterministic router tool exists.</td></tr>
+<tr><td>Skill allowlist helper</td><td><code>hermes_cli/ultra_studio_skills.py</code></td><td>Apply Ultra profile allowlist.</td></tr>
+</tbody></table>
+<h2>Required P0 Work</h2>
+<p>1. Choose React <code>/api/ws</code> chat as the baseline.</p>
+<p>2. Add <code>media_jobs</code> and <code>media_assets</code> persistence.</p>
+<p>3. Upgrade uploads to create <code>asset_id</code> while preserving existing <code>path</code>.</p>
+<p>4. Add <code>ultra_media_job_create</code>, <code>ultra_media_job_status</code>, and <code>ultra_asset_get</code>.</p>
+<p>5. Wrap existing Atlas image/video tools behind those job functions.</p>
+<p>6. Emit <code>media_job.created</code>, <code>media_job.updated</code>, and <code>asset.ready</code> events.</p>
+<p>7. Render media job cards and final assets in chat.</p>
+<p>8. Show selected job/asset details in inspector.</p>
+<p>9. Wire <code>workflow-router</code> to the job/asset contract.</p>
+<p>10. Add smoke tests for real Atlas success or typed missing-credential blockers.</p>
+<h2>P0 Acceptance</h2>
+<table><thead><tr><th>Scenario</th><th>Pass condition</th></tr></thead><tbody>
+<tr><td><code>你好</code></td><td>Text response only; no <code>media_job</code> row.</td></tr>
+<tr><td><code>帮我生成一个猫的图片</code></td><td><code>media_job</code> row, Atlas image call, <code>asset.ready</code>, image rendered.</td></tr>
+<tr><td><code>做一个猫的视频</code></td><td><code>media_job</code> row, Atlas video call or typed blocker, video rendered if complete.</td></tr>
+<tr><td>upload image + <code>把这张图做成视频</code></td><td>upload creates <code>asset_id</code>; job references that asset.</td></tr>
+<tr><td>refresh while job running</td><td>UI restores session and job status.</td></tr>
+<tr><td>missing <code>ATLAS_API_KEY</code></td><td>typed <code>missing_credential</code>; no FAL fallback; no fake result.</td></tr>
+<tr><td>provider returns no output</td><td>typed <code>empty_response</code>; no ready asset.</td></tr>
+</tbody></table>
+<h2>Build Order</h2>
+<p>1. Data model and API wrapper.</p>
+<p>2. Upload-to-asset.</p>
+<p>3. Media job wrapper around Atlas tools.</p>
+<p>4. Event emission.</p>
+<p>5. Chat/media card rendering.</p>
+<p>6. Inspector details.</p>
+<p>7. Router handoff.</p>
+<p>8. Smoke tests and fixtures.</p>
+</main></div>
+</body>
+</html>

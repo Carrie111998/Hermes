@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Later Cloud Infra Roadmap</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Later Cloud Infra Roadmap</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="04-later-cloud-infra-roadmap.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Later Cloud Infra Roadmap</h1>
+<p>Status: deferred architecture roadmap</p>
+<p>Date: 2026-06-11</p>
+<h2>Rule</h2>
+<p>Do not implement these before the P0 media loop is real. Keep the seams in P0, but defer the infrastructure.</p>
+<h2>P1: Hardening After P0 Works</h2>
+<table><thead><tr><th>Area</th><th>Trigger</th><th>Work</th></tr></thead><tbody>
+<tr><td>TokenRouter service</td><td>P0 server env credentials become risky or multi-user</td><td>Move Atlas credential access behind service boundary.</td></tr>
+<tr><td>Durable job worker</td><td>Video jobs need refresh-safe background progress</td><td>Move blocking provider polling out of chat tool loop.</td></tr>
+<tr><td>Event replay</td><td>Refresh/resume loses status</td><td>Add persistent event cursor or DB-backed event replay.</td></tr>
+<tr><td>Asset ACL</td><td>More than one project/user profile uses same server</td><td>Add project/user checks around asset APIs.</td></tr>
+<tr><td>Router enforcement</td><td>Prompt-only router still causes wrong tool calls</td><td>Add deterministic route tool and evals.</td></tr>
+<tr><td>Basic policy tests</td><td>More workflows or providers are added</td><td>Add allow/deny tests for providers, assets, and hidden skills.</td></tr>
+</tbody></table>
+<h2>P2: Cloud / Supercomputer Stage</h2>
+<table><thead><tr><th>Area</th><th>Keep from earlier infra docs</th><th>Why later</th></tr></thead><tbody>
+<tr><td>Keycloak</td><td>Identity and enterprise SSO</td><td>Not needed for local/single-user P0.</td></tr>
+<tr><td>OPA</td><td>Deterministic policy engine</td><td>Useful after multiple services and roles exist.</td></tr>
+<tr><td>OpenBao</td><td>Provider credential vault</td><td>P0 can use server env while preserving TokenRouter seam.</td></tr>
+<tr><td>Temporal</td><td>Durable long-running workflows</td><td>P0 can use DB job rows first.</td></tr>
+<tr><td>NATS JetStream</td><td>Realtime fanout and replay</td><td>Existing websocket/events can carry P0 events.</td></tr>
+<tr><td>Kata / E2B-style sandbox</td><td>Untrusted execution isolation</td><td>Atlas tool loop does not require arbitrary code execution first.</td></tr>
+<tr><td>Browserbase-style contexts</td><td>Persistent authenticated browser sessions</td><td>Not required for image/video generation.</td></tr>
+<tr><td>CometAPI</td><td>Large media preprocessing and multimodal packaging</td><td>Useful for long video analysis, not P0 generation.</td></tr>
+<tr><td>Kueue / GPU Operator</td><td>Multi-tenant GPU scheduling</td><td>Atlas external provider handles P0 compute.</td></tr>
+<tr><td>Rook-Ceph / MinIO object plane</td><td>Production object storage</td><td>Local files can prove P0 first.</td></tr>
+<tr><td>Argo CD / GitOps</td><td>Multi-service deployment</td><td>Adds operational load before product loop exists.</td></tr>
+</tbody></table>
+<h2>Reference Architecture Still Useful</h2>
+<p>The earlier infra documents are not wasted. They define where to go once P0 demonstrates demand:</p>
+<ul>
+<li><a href="../ultra-studio-infra-design/00-index.md">Ultra Studio infra design</a></li>
+<li><a href="../open-source-architecture/00-index.html">Open-source architecture selection</a></li>
+<li><a href="../hermes-tokenrouter-credential-flow.md">TokenRouter credential flow</a></li>
+<li><a href="../hermes-cometapi-media-gateway.md">CometAPI media gateway</a></li>
+</ul>
+<p>Their role is now clear: future platform reference, not P0 task list.</p>
+<h2>Promotion Criteria</h2>
+<p>Promote a later item into active implementation only when one of these happens:</p>
+<ul>
+<li>P0 cannot pass acceptance without it.</li>
+<li>A real security problem is observed, not imagined.</li>
+<li>A second user/project/tenant makes local assumptions unsafe.</li>
+<li>Media job volume makes blocking tool calls unacceptable.</li>
+<li>Assets need durable sharing across sessions or machines.</li>
+<li>Browser/account automation becomes a core workflow.</li>
+</ul>
+<h2>Do Not Promote Because</h2>
+<ul>
+<li>a reference product has it;</li>
+<li>the architecture looks more complete;</li>
+<li>the diagram feels more impressive;</li>
+<li>we can predict future scale;</li>
+<li>a provider has a more advanced API;</li>
+<li>the UI mockup has a button.</li>
+</ul>
+<p>Implementation should follow observed product pressure.</p>
+</main></div>
+</body>
+</html>

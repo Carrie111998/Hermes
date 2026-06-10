@@ -30,6 +30,7 @@ document without reading everything.
 Use these as the current source material:
 
 - [Ultra Studio architecture diagram](../ultra-studio-agent-architecture.html)
+- [Final research analysis pack](../ultra-studio-research-analysis/00-index.md)
 - [Infrastructure design research pack](../ultra-studio-infra-design/00-index.md)
 - [Full research appendix](../ultra-studio-agent-research-appendix.html)
 - [Manus gap research](../ultra-studio-agent-manus-gap-research.md)

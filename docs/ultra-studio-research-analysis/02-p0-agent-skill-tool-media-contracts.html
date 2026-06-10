@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P0 Agent, Skill, Tool, and Media Contracts</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>P0 Agent, Skill, Tool, and Media Contracts</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="02-p0-agent-skill-tool-media-contracts.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>P0 Agent, Skill, Tool, and Media Contracts</h1>
+<p>Status: canonical P0 runtime contract</p>
+<p>Date: 2026-06-11</p>
+<h2>Canonical Endpoint Namespace</h2>
+<p>Use <code>/api/...</code> for web-facing P0 routes.</p>
+<table><thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>POST /api/sessions</code></td><td>Create a session.</td></tr>
+<tr><td><code>POST /api/sessions/{session_id}/resume</code></td><td>Resume messages, active media jobs, and selected assets.</td></tr>
+<tr><td><code>POST /api/sessions/{session_id}/prompt</code></td><td>Submit text and attachment asset IDs.</td></tr>
+<tr><td><code>GET /api/sessions/{session_id}/events</code></td><td>SSE replay and live events.</td></tr>
+<tr><td><code>POST /api/chat/uploads</code></td><td>Upload media and create an asset.</td></tr>
+<tr><td><code>POST /api/media-jobs</code></td><td>Create image/video generation job.</td></tr>
+<tr><td><code>GET /api/media-jobs/{job_id}</code></td><td>Read job status.</td></tr>
+<tr><td><code>POST /api/media-jobs/{job_id}/cancel</code></td><td>Cancel if provider supports it.</td></tr>
+<tr><td><code>GET /api/assets/{asset_id}</code></td><td>Read asset metadata.</td></tr>
+<tr><td><code>GET /api/assets/{asset_id}/download</code></td><td>Get signed or local download URL.</td></tr>
+</tbody></table>
+<p>Existing <code>/api/ws</code> can remain the transport for session calls. The contract names above are canonical for implementation and tests.</p>
+<h2>Canonical Events</h2>
+<table><thead><tr><th>Event</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>message.delta</code></td><td>Streaming assistant text.</td></tr>
+<tr><td><code>message.complete</code></td><td>Assistant text finished.</td></tr>
+<tr><td><code>tool.start</code></td><td>Tool call started.</td></tr>
+<tr><td><code>tool.complete</code></td><td>Tool call finished.</td></tr>
+<tr><td><code>tool.error</code></td><td>Tool call failed.</td></tr>
+<tr><td><code>media_job.created</code></td><td>Durable media job created.</td></tr>
+<tr><td><code>media_job.updated</code></td><td>Job status/progress changed.</td></tr>
+<tr><td><code>asset.ready</code></td><td>Output asset is persisted and previewable.</td></tr>
+<tr><td><code>asset.failed</code></td><td>Asset publish failed.</td></tr>
+<tr><td><code>approval.requested</code></td><td>Human input is required.</td></tr>
+<tr><td><code>error</code></td><td>Structured user-visible error.</td></tr>
+</tbody></table>
+<p>Do not mix <code>job.created</code>, <code>asset.created</code>, and <code>job.succeeded</code> in P0 docs. Use the names above.</p>
+<h2>Media Job Schema</h2>
+<pre><code class="language-json">{
+  &quot;job_id&quot;: &quot;mj_...&quot;,
+  &quot;session_id&quot;: &quot;sess_...&quot;,
+  &quot;run_id&quot;: &quot;run_...&quot;,
+  &quot;tool_call_id&quot;: &quot;tool_...&quot;,
+  &quot;kind&quot;: &quot;image_generate&quot;,
+  &quot;provider&quot;: &quot;atlas&quot;,
+  &quot;model&quot;: &quot;nano-banana-2&quot;,
+  &quot;status&quot;: &quot;queued&quot;,
+  &quot;prompt&quot;: &quot;cat image&quot;,
+  &quot;input_asset_ids&quot;: [],
+  &quot;output_asset_ids&quot;: [],
+  &quot;progress&quot;: 0,
+  &quot;error_code&quot;: null,
+  &quot;error_message&quot;: null,
+  &quot;created_at&quot;: &quot;2026-06-11T00:00:00Z&quot;,
+  &quot;updated_at&quot;: &quot;2026-06-11T00:00:00Z&quot;
+}</code></pre>
+<p>Allowed statuses:</p>
+<pre><code class="language-text">queued
+running
+polling
+publishing
+complete
+failed
+cancelled
+blocked</code></pre>
+<h2>Asset Schema</h2>
+<pre><code class="language-json">{
+  &quot;asset_id&quot;: &quot;asset_...&quot;,
+  &quot;session_id&quot;: &quot;sess_...&quot;,
+  &quot;media_job_id&quot;: &quot;mj_...&quot;,
+  &quot;kind&quot;: &quot;image&quot;,
+  &quot;source&quot;: &quot;generated&quot;,
+  &quot;mime_type&quot;: &quot;image/png&quot;,
+  &quot;path&quot;: &quot;/local/path/or/object/key&quot;,
+  &quot;preview_url&quot;: &quot;/api/assets/asset_.../preview&quot;,
+  &quot;download_url&quot;: &quot;/api/assets/asset_.../download&quot;,
+  &quot;width&quot;: 1024,
+  &quot;height&quot;: 1024,
+  &quot;duration_sec&quot;: null,
+  &quot;provider&quot;: &quot;atlas&quot;,
+  &quot;model&quot;: &quot;nano-banana-2&quot;,
+  &quot;prompt_hash&quot;: &quot;sha256:...&quot;,
+  &quot;created_at&quot;: &quot;2026-06-11T00:00:00Z&quot;
+}</code></pre>
+<p>P0 may store local paths. The key point is that UI and router use <code>asset_id</code>, not raw paths as product identity.</p>
+<h2>Router Output</h2>
+<p>P0 router output must be persisted or attached to the run:</p>
+<pre><code class="language-yaml">intent: chat | image_generate | video_generate | video_from_image | qa | repair | planning
+execution_mode: answer_only | ask_once | generate_now | inspect_then_generate | repair_then_retry
+workflow_skill: null | infographic-md-flow | media-qa | prompt-repair
+primary_tool: null | image_generate | video_generate
+asset_roles:
+  foundation: []
+  image_reference: []
+  logo: []
+  style_reference: []
+  source_video: []
+  ignore: []
+missing: []
+handoff:
+  brief: &quot;&quot;
+  constraints: []
+  allowed_text: []</code></pre>
+<p>Rules:</p>
+<ul>
+<li>greeting or planning requests cannot create media jobs.</li>
+<li>router asks at most one blocking question.</li>
+<li>router never asks for provider API keys.</li>
+<li>router cannot hand off to <code>ultra_media_job_create</code> unless that tool exists.</li>
+<li>if no specialized skill exists, it can compile a direct Atlas prompt.</li>
+</ul>
+<h2>P0 Skill Allowlist</h2>
+<p>P0 visible skills:</p>
+<ul>
+<li><code>workflow-router</code></li>
+<li><code>infographic-md-flow</code></li>
+<li><code>media-qa</code></li>
+<li><code>prompt-repair</code></li>
+</ul>
+<p>Not P0:</p>
+<ul>
+<li><code>product-photoshoot</code></li>
+<li><code>product-md-flow</code></li>
+<li><code>ugc-flow</code></li>
+<li><code>amazon-product-listing</code></li>
+<li>unrelated legacy skills such as ASCII video, ComfyUI, Manim, music, YouTube, productivity, GitHub, and general devops.</li>
+</ul>
+<h2>Atlas Tool Contract</h2>
+<p>P0 wraps the existing tools:</p>
+<table><thead><tr><th>Tool</th><th>Provider path</th><th>P0 wrapper</th></tr></thead><tbody>
+<tr><td><code>image_generate</code></td><td><code>plugins/image_gen/atlas/</code></td><td><code>ultra_media_job_create(kind=image_generate)</code></td></tr>
+<tr><td><code>video_generate</code></td><td><code>plugins/video_gen/atlas/</code></td><td><code>ultra_media_job_create(kind=video_generate)</code></td></tr>
+</tbody></table>
+<p>Wrapper requirements:</p>
+<ul>
+<li>create <code>media_job</code> before provider call;</li>
+<li>emit <code>media_job.created</code>;</li>
+<li>update status while provider runs or polls;</li>
+<li>create <code>asset</code> only from real provider output;</li>
+<li>emit <code>asset.ready</code> after persistence;</li>
+<li>return typed errors instead of fake output.</li>
+</ul>
+<h2>Typed Errors</h2>
+<table><thead><tr><th>Code</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>missing_credential</code></td><td><code>ATLAS_API_KEY</code> or allowed server credential is unavailable.</td></tr>
+<tr><td><code>invalid_prompt</code></td><td>Prompt is blank or invalid.</td></tr>
+<tr><td><code>invalid_asset_ref</code></td><td>Asset ID is unknown or not usable for this request.</td></tr>
+<tr><td><code>unsupported_modality</code></td><td>Tool/model does not support requested input mode.</td></tr>
+<tr><td><code>provider_api_error</code></td><td>Provider returned HTTP/API error.</td></tr>
+<tr><td><code>provider_timeout</code></td><td>Provider did not finish within timeout.</td></tr>
+<tr><td><code>empty_response</code></td><td>Provider completed without usable output.</td></tr>
+<tr><td><code>asset_publish_failed</code></td><td>Output existed but could not be persisted.</td></tr>
+<tr><td><code>cancelled</code></td><td>User or system cancelled the job.</td></tr>
+</tbody></table>
+<h2>Verification</h2>
+<p>P0 contract tests should assert:</p>
+<ul>
+<li><code>你好</code> does not create <code>media_job</code>;</li>
+<li><code>image_generate</code> success creates one job and one asset;</li>
+<li>missing credential creates <code>missing_credential</code>;</li>
+<li>Atlas video prediction ID is recorded in job metadata;</li>
+<li>refresh/resume returns active jobs and assets;</li>
+<li>no FAL fallback is used when Atlas is missing.</li>
+</ul>
+</main></div>
+</body>
+</html>
