@@ -1088,8 +1088,43 @@ def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str
     return _handle_tgg_write("tgg_case_observation", payload)
 
 
+_JOB_NO_TOKEN_RE = re.compile(r"\b[A-Z]{2}/JOB/\d{4}/\d{1,4}\b")
+
+_CREATE_JOB_NO_ALIASES = ("reportedJobNo", "reported_job_no", "job_no", "jobno", "jobNumber")
+
+
 def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload = dict(args)
+
+    # Alias coercion: the model sometimes invents sibling names for the job
+    # number param (PG day-26 run passed reportedJobNo); the backend only
+    # honors jobNo and silently mints a WA/JOB placeholder otherwise.
+    if not str(payload.get("jobNo") or "").strip():
+        for alias in _CREATE_JOB_NO_ALIASES:
+            value = str(payload.get(alias) or "").strip()
+            if value and _JOB_NO_TOKEN_RE.search(value.upper()):
+                payload["jobNo"] = value.upper()
+                break
+    for alias in _CREATE_JOB_NO_ALIASES:
+        payload.pop(alias, None)
+
+    # Corrective gate: creating WITHOUT jobNo while the evidence text plainly
+    # carries one almost always means the param got lost — bounce with the
+    # found token(s) so the model self-corrects in-turn. confirmNoJobNo=true
+    # is the explicit escape hatch when the token references a DIFFERENT case.
+    if not str(payload.get("jobNo") or "").strip() and not payload.get("confirmNoJobNo"):
+        evidence_blob = json.dumps(payload.get("evidence") or {}, ensure_ascii=False)
+        found = sorted(set(_JOB_NO_TOKEN_RE.findall(evidence_blob.upper())))
+        if found:
+            return tool_error(
+                "JOB_NO_OMITTED: the evidence text contains job number(s) "
+                f"{', '.join(found)} but no jobNo was passed — the case would be "
+                "created under a synthetic WA/JOB placeholder. If the number "
+                "belongs to THIS case, re-call with jobNo set to it exactly. "
+                "If it only references a different/previous case, re-call with "
+                "confirmNoJobNo: true."
+            )
+    payload.pop("confirmNoJobNo", None)
     return _handle_tgg_write("tgg_case_create", payload)
 
 
@@ -1434,6 +1469,24 @@ TGG_CASE_CREATE_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "jobNo": {
+                "type": "string",
+                "description": (
+                    "The job number stated in the message (e.g. 'Job no: "
+                    "PG/JOB/2605/0973'). REQUIRED whenever the message states "
+                    "one — pass it EXACTLY as written; the case is created "
+                    "under this number. Omit ONLY when the message genuinely "
+                    "has no job number (a WA placeholder is then minted)."
+                ),
+            },
+            "confirmNoJobNo": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY to confirm a deliberate no-jobNo create when "
+                    "the message mentions job number(s) that belong to a "
+                    "DIFFERENT case (e.g. 'previous job ...')."
+                ),
+            },
             "zone": {"type": "string", "description": "TGG zone if known."},
             "serviceLine": {"type": "string", "description": "maintenance or sprucing."},
             "address": {"type": "string", "description": "Case address."},

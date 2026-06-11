@@ -1207,3 +1207,60 @@ def test_case_update_state_operation_in_production_config():
     op = bridge.operations["tgg_case_update_state"]
     assert op.method == "POST"
     assert op.url.endswith("/api/operator/cases/state")
+
+
+class TestCaseCreateJobNoContract:
+    """jobNo alias coercion + omission gate (PG day-26 WA-mint regression)."""
+
+    def _create(self, monkeypatch, args):
+        import tools.pa_business_tools as pbt
+        captured = {}
+
+        def fake_write(op, payload):
+            captured.update(payload)
+            return '{"ok": true}'
+
+        monkeypatch.setattr(pbt, "_handle_tgg_write", fake_write)
+        result = pbt._handle_tgg_case_create(args)
+        return result, captured
+
+    def test_reported_job_no_alias_coerced(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "reportedJobNo": "PG/JOB/2605/0973",
+        })
+        assert captured.get("jobNo") == "PG/JOB/2605/0973"
+        assert "reportedJobNo" not in captured
+
+    def test_omitted_job_no_with_evidence_token_bounces(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "evidence": {"messageText": "Job no: PG/JOB/2605/0980\nRemarks: y"},
+        })
+        assert "JOB_NO_OMITTED" in result
+        assert "PG/JOB/2605/0980" in result
+        assert not captured  # write never happened
+
+    def test_confirm_no_job_no_escape_hatch(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "confirmNoJobNo": True,
+            "evidence": {"messageText": "previous job SK/JOB/2603/1709 not attended"},
+        })
+        assert "JOB_NO_OMITTED" not in result
+        assert "confirmNoJobNo" not in captured
+
+    def test_clean_create_without_any_token_passes(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "evidence": {"messageText": "tenant reports leak, no job sheet"},
+        })
+        assert "JOB_NO_OMITTED" not in result
+        assert "jobNo" not in captured
+
+    def test_explicit_job_no_passes_through(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "jobNo": "SK/JOB/2605/2564",
+        })
+        assert captured.get("jobNo") == "SK/JOB/2605/2564"
