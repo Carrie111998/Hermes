@@ -83,6 +83,10 @@ class PaToolCall:
     # pointer, NOT the client entity itself.  None for tools that touch no
     # client entity.
     client_entity_pointer: Optional[str] = None
+    # Provider tool-call id (OpenAI-style ``tc.id``).  Lets the DB layer
+    # dedup per-session so a payload extracted from the full conversation
+    # history persists only the recording turn's delta.
+    call_id: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         return asdict(self)
@@ -286,6 +290,7 @@ def extract_tool_calls(messages: Optional[List[Dict[str, Any]]]) -> List[PaToolC
                     cost_usd=None,
                     duration_ms=None,
                     client_entity_pointer=None,
+                    call_id=str(tcid) if tcid is not None else None,
                 )
             )
     return calls

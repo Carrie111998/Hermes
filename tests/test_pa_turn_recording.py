@@ -187,6 +187,131 @@ def test_list_pa_turns_scopes_by_chat(tmp_path):
         db.close()
 
 
+# ── per-turn delta at source (session-scoped call_id dedup) ──────────────
+
+
+def _tc(call_id, name="pa_business_read"):
+    return {"tool_name": name, "input": {"i": call_id}, "call_id": call_id}
+
+
+def test_record_pa_turn_dedups_prior_turns_calls_by_call_id(tmp_path):
+    """Cumulative payloads (extracted from full session history) persist only
+    the recording turn's DELTA: call_ids already recorded for the session
+    under other turns are skipped."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_pa_turn(
+            turn_id="t1", agent_id="a", chat_id="c", session_id="s1",
+            tool_calls=[_tc("call_a"), _tc("call_b")],
+        )
+        # Turn 2 payload re-carries turn 1's calls (cumulative extraction)
+        # plus its own new call.
+        db.record_pa_turn(
+            turn_id="t2", agent_id="a", chat_id="c", session_id="s1",
+            tool_calls=[_tc("call_a"), _tc("call_b"), _tc("call_c")],
+        )
+        turns = {t["turn_id"]: t for t in db.list_pa_turns(agent_id="a")}
+        assert [tc["call_id"] for tc in turns["t1"]["tool_calls"]] == ["call_a", "call_b"]
+        assert [tc["call_id"] for tc in turns["t2"]["tool_calls"]] == ["call_c"]
+    finally:
+        db.close()
+
+
+def test_record_pa_turn_dedup_scoped_to_session(tmp_path):
+    """Dedup is per-session: the same call_id in a DIFFERENT session records."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_pa_turn(
+            turn_id="t1", agent_id="a", chat_id="c", session_id="s1",
+            tool_calls=[_tc("call_a")],
+        )
+        db.record_pa_turn(
+            turn_id="t2", agent_id="a", chat_id="c", session_id="s2",
+            tool_calls=[_tc("call_a")],
+        )
+        turns = {t["turn_id"]: t for t in db.list_pa_turns(agent_id="a")}
+        assert len(turns["t1"]["tool_calls"]) == 1
+        assert len(turns["t2"]["tool_calls"]) == 1
+    finally:
+        db.close()
+
+
+def test_record_pa_turn_rerecord_same_turn_keeps_own_calls(tmp_path):
+    """Idempotent re-record of the SAME turn_id keeps that turn's calls —
+    the session dedup only excludes calls recorded under OTHER turn_ids."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        for _ in range(2):
+            db.record_pa_turn(
+                turn_id="t1", agent_id="a", chat_id="c", session_id="s1",
+                tool_calls=[_tc("call_a"), _tc("call_b")],
+            )
+        turns = db.list_pa_turns(agent_id="a")
+        assert len(turns) == 1
+        assert [tc["call_id"] for tc in turns[0]["tool_calls"]] == ["call_a", "call_b"]
+    finally:
+        db.close()
+
+
+def test_record_pa_turn_calls_without_call_id_pass_through(tmp_path):
+    """Legacy payloads without call_id are not deduped (no high-water key)."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_pa_turn(
+            turn_id="t1", agent_id="a", chat_id="c", session_id="s1",
+            tool_calls=[{"tool_name": "x"}],
+        )
+        db.record_pa_turn(
+            turn_id="t2", agent_id="a", chat_id="c", session_id="s1",
+            tool_calls=[{"tool_name": "x"}],
+        )
+        turns = {t["turn_id"]: t for t in db.list_pa_turns(agent_id="a")}
+        assert len(turns["t1"]["tool_calls"]) == 1
+        assert len(turns["t2"]["tool_calls"]) == 1
+    finally:
+        db.close()
+
+
+def test_extract_tool_calls_carries_call_id():
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_42",
+                    "function": {"name": "f", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_42", "content": "ok"},
+    ]
+    calls = po.extract_tool_calls(messages)
+    assert len(calls) == 1
+    assert calls[0].call_id == "call_42"
+
+
+def test_failed_turn_calls_recorded_then_not_reattributed(tmp_path):
+    """A failed turn whose record carries its tool calls keeps attribution:
+    the NEXT turn's cumulative payload does not re-claim them."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_pa_turn(
+            turn_id="t_failed", agent_id="a", chat_id="c", session_id="s1",
+            turn_status="failed", error={"error": "stream cut"},
+            tool_calls=[_tc("call_a")],
+        )
+        db.record_pa_turn(
+            turn_id="t_next", agent_id="a", chat_id="c", session_id="s1",
+            turn_status="completed",
+            tool_calls=[_tc("call_a"), _tc("call_b")],
+        )
+        turns = {t["turn_id"]: t for t in db.list_pa_turns(agent_id="a")}
+        assert [tc["call_id"] for tc in turns["t_failed"]["tool_calls"]] == ["call_a"]
+        assert [tc["call_id"] for tc in turns["t_next"]["tool_calls"]] == ["call_b"]
+    finally:
+        db.close()
+
+
 # ── full build_turn_record + write integration (pure builder + DB) ───────
 
 
