@@ -284,7 +284,9 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
-    def test_close_stdin_pty_mode(self, registry):
+    def test_close_stdin_pty_mode_posix(self, registry, monkeypatch):
+        from tools import process_registry as pr
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
         pty = MagicMock()
         s = _make_session()
         s._pty = pty
@@ -295,6 +297,52 @@ class TestStdinHelpers:
         pty.sendeof.assert_called_once()
         assert result["status"] == "ok"
 
+    def test_close_stdin_pty_mode_windows(self, registry, monkeypatch):
+        """Windows console EOF is Ctrl-Z + Enter at line start; pywinpty's
+        sendeof() writes Ctrl-D, which a Windows console ignores."""
+        from tools import process_registry as pr
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        pty = MagicMock()
+        s = _make_session()
+        s._pty = pty
+        registry._running[s.id] = s
+
+        result = registry.close_stdin(s.id)
+
+        pty.write.assert_called_once_with("\x1a\r\n")
+        pty.sendeof.assert_not_called()
+        assert result["status"] == "ok"
+
+    def test_write_stdin_pty_mode_posix_passes_bytes(self, registry, monkeypatch):
+        """POSIX ptyprocess.PtyProcess.write expects bytes."""
+        from tools import process_registry as pr
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        pty = MagicMock()
+        s = _make_session()
+        s._pty = pty
+        registry._running[s.id] = s
+
+        result = registry.submit_stdin(s.id, "hello")
+
+        pty.write.assert_called_once_with(b"hello\n")
+        assert result["status"] == "ok"
+
+    def test_write_stdin_pty_mode_windows_str_and_crlf(self, registry, monkeypatch):
+        """pywinpty's write accepts only str (bytes raise TypeError), and a
+        ConPTY console submits a line on CR, not LF — write_stdin must
+        translate so submit_stdin's trailing \\n acts as Enter."""
+        from tools import process_registry as pr
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        pty = MagicMock()
+        s = _make_session()
+        s._pty = pty
+        registry._running[s.id] = s
+
+        result = registry.submit_stdin(s.id, "hello")
+
+        pty.write.assert_called_once_with("hello\r\n")
+        assert result["status"] == "ok"
+
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -302,15 +350,28 @@ class TestStdinHelpers:
         but PR #214b95392 detached non-PTY stdin to DEVNULL to fix keyboard
         lockout (#17959). For interactive stdin → PTY mode is now the only
         supported path.
+
+        The child prints READY before blocking on stdin, and the test waits
+        for it instead of sleeping a fixed interval: input written while the
+        shell is still initialising its console is discarded (observed on
+        Windows ConPTY, where ``bash -lic`` takes >1s to become input-ready
+        and earlier writes never reach the child).
         """
         session = registry.spawn_local(
-            'python3 -c "import sys; print(sys.stdin.read().strip())"',
+            "python3 -c \"import sys; print('READY', flush=True); "
+            'print(sys.stdin.read().strip())"',
             cwd=str(tmp_path),
             use_pty=True,
         )
 
         try:
-            time.sleep(0.5)
+            assert _wait_until(
+                lambda: "READY" in registry.poll(session.id)["output_preview"],
+                timeout=15.0,
+            ), (
+                "PTY child never printed READY — startup failed: "
+                f"{registry.poll(session.id)!r}"
+            )
             assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
             assert registry.close_stdin(session.id)["status"] == "ok"
 
@@ -642,6 +703,28 @@ class TestCheckpoint:
             assert len(data) == 1
             assert data[0]["session_id"] == s.id
 
+    def test_checkpoint_honors_hermes_home_at_call_time(self, registry):
+        """An unpatched checkpoint write must land in the per-test HERMES_HOME.
+
+        Regression (2026-06-11): CHECKPOINT_PATH was resolved at module import,
+        before the hermetic fixture redirected HERMES_HOME — so any test that
+        checkpointed without patching it overwrote the REAL
+        ~/.hermes/processes.json (gateway crash-recovery state).
+        """
+        from hermes_cli.config import get_hermes_home
+
+        s = _make_session()
+        registry._running[s.id] = s
+        registry._write_checkpoint()
+
+        written = get_hermes_home() / "processes.json"
+        assert written.exists(), (
+            "checkpoint path resolved at import time (real ~/.hermes), "
+            "not at call time (per-test HERMES_HOME)"
+        )
+        data = json.loads(written.read_text(encoding="utf-8"))
+        assert data[0]["session_id"] == s.id
+
     def test_recover_no_file(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "missing.json"):
             assert registry.recover_from_checkpoint() == 0
@@ -845,7 +928,7 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
-    def test_kill_detached_session_uses_host_pid(self, registry):
+    def test_kill_detached_session_uses_host_pid_posix(self, registry, monkeypatch):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
         s.detached = True
@@ -861,7 +944,10 @@ class TestKillProcess:
             def terminate(self):
                 terminate_calls.append(("terminate", self.pid))
 
+        from tools import process_registry as pr
         import psutil as _psutil
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
 
         try:
             # Post-#21561: liveness probe routes through
@@ -875,6 +961,42 @@ class TestKillProcess:
 
             assert result["status"] == "killed"
             assert ("terminate", 424242) in terminate_calls
+        finally:
+            registry._running.pop(s.id, None)
+
+    def test_kill_detached_session_uses_host_pid_windows(self, registry, monkeypatch):
+        """Windows kill path shells out to ``taskkill /PID <pid> /T /F``
+        (see ``_terminate_host_pid`` — psutil is intentionally not used on
+        Windows). Capture subprocess.run instead of letting a real taskkill
+        loose on an arbitrary, possibly recycled, live PID."""
+        s = _make_session(sid="proc_detached", command="sleep 999")
+        s.pid = 424242
+        s.detached = True
+        registry._running[s.id] = s
+
+        from tools import process_registry as pr
+
+        run_calls = []
+
+        def fake_run(args, **kwargs):
+            run_calls.append(args)
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+
+        try:
+            with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(pr.subprocess, "run", fake_run):
+                result = registry.kill_process(s.id)
+
+            assert result["status"] == "killed"
+            assert len(run_calls) == 1
+            args = run_calls[0]
+            assert args[0] == "taskkill"
+            assert "/PID" in args
+            assert "424242" in args
+            assert "/T" in args, "Tree flag required to reach descendants"
+            assert "/F" in args, "Force flag required for console-less children"
         finally:
             registry._running.pop(s.id, None)
 

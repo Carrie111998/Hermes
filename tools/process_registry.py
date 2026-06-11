@@ -44,6 +44,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
@@ -51,8 +52,19 @@ from hermes_cli.config import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
-# Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+# Checkpoint file for crash recovery (gateway only). None = resolve
+# get_hermes_home() at call time; an import-time snapshot bakes in the real
+# ~/.hermes before tests redirect HERMES_HOME, so registry tests would
+# clobber the gateway's live crash-recovery state. Tests may still patch
+# this attribute with a concrete Path to pin the location.
+CHECKPOINT_PATH: Optional[Path] = None
+
+
+def _checkpoint_path() -> Path:
+    """Resolve the checkpoint file at call time (see CHECKPOINT_PATH)."""
+    if CHECKPOINT_PATH is not None:
+        return CHECKPOINT_PATH
+    return get_hermes_home() / "processes.json"
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -1189,10 +1201,22 @@ class ProcessRegistry:
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
 
-        # PTY mode -- write through pty handle (expects bytes)
+        # PTY mode -- write through pty handle. POSIX ptyprocess expects bytes;
+        # pywinpty's native backend accepts only str (bytes raise TypeError).
         if hasattr(session, '_pty') and session._pty:
             try:
-                pty_data = data.encode("utf-8") if isinstance(data, str) else data
+                if _IS_WINDOWS:
+                    text = (
+                        data.decode("utf-8", errors="replace")
+                        if isinstance(data, (bytes, bytearray))
+                        else data
+                    )
+                    # A ConPTY console submits a line on CR, not LF. Translate
+                    # so "...\n" means "press Enter" exactly like it does
+                    # through the POSIX tty line discipline.
+                    pty_data = text.replace("\r\n", "\n").replace("\n", "\r\n")
+                else:
+                    pty_data = data.encode("utf-8") if isinstance(data, str) else data
                 session._pty.write(pty_data)
                 return {"status": "ok", "bytes_written": len(data)}
             except Exception as e:
@@ -1222,7 +1246,14 @@ class ProcessRegistry:
 
         if hasattr(session, '_pty') and session._pty:
             try:
-                session._pty.sendeof()
+                if _IS_WINDOWS:
+                    # pywinpty's sendeof() writes Ctrl-D (\x04), which a Windows
+                    # console treats as an ordinary character. Console EOF is
+                    # Ctrl-Z + Enter, and like POSIX VEOF it only signals EOF
+                    # when it lands at the start of a line.
+                    session._pty.write("\x1a\r\n")
+                else:
+                    session._pty.sendeof()
                 return {"status": "ok", "message": "EOF sent"}
             except Exception as e:
                 return {"status": "error", "error": str(e)}
@@ -1382,7 +1413,7 @@ class ProcessRegistry:
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            atomic_json_write(_checkpoint_path(), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -1392,11 +1423,12 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        checkpoint = _checkpoint_path()
+        if not checkpoint.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint.read_text(encoding="utf-8"))
         except Exception:
             return 0
 
