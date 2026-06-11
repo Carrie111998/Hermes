@@ -12159,6 +12159,49 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Public entry for a conversation turn — see _run_conversation_impl.
+
+        Thin wrapper that guarantees the TURN-SCOPED telemetry keys
+        (turn_input_tokens / turn_output_tokens / turn_context_window_peak)
+        are present on EVERY dict return path. The impl has ~20 early-return
+        sites (failure / interrupt / retry-exhaustion); before this wrapper
+        only the happy-path result dict carried the keys, so PA turn
+        recording (gateway/pa_observability.build_turn_record) saw NULL
+        context_window_peak on those turns. setdefault keeps the impl's own
+        values when present.
+        """
+        result = self._run_conversation_impl(
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            persist_user_message=persist_user_message,
+        )
+        if isinstance(result, dict):
+            result.setdefault(
+                "turn_input_tokens",
+                max(0, self.session_input_tokens - getattr(self, "_turn_input_tokens_baseline", 0)),
+            )
+            result.setdefault(
+                "turn_output_tokens",
+                max(0, self.session_output_tokens - getattr(self, "_turn_output_tokens_baseline", 0)),
+            )
+            result.setdefault(
+                "turn_context_window_peak",
+                int(getattr(self, "_turn_context_window_peak", 0) or 0),
+            )
+        return result
+
+    def _run_conversation_impl(
+        self,
+        user_message: str,
+        system_message: str = None,
+        conversation_history: List[Dict[str, Any]] = None,
+        task_id: str = None,
+        stream_callback: Optional[callable] = None,
+        persist_user_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
 
@@ -12197,6 +12240,12 @@ class AIAgent:
         # cost"; this answers "how full was the context window" — the signal
         # autocompact analysis needs.
         _turn_context_window_peak = 0
+        # Mirror the per-turn telemetry to self so the run_conversation
+        # wrapper can stamp the keys onto EARLY-RETURN result dicts (the ~20
+        # failure/interrupt sites that don't build the full result below).
+        self._turn_input_tokens_baseline = _turn_input_tokens_baseline
+        self._turn_output_tokens_baseline = _turn_output_tokens_baseline
+        self._turn_context_window_peak = 0
 
         self._ensure_db_session()
 
@@ -13636,6 +13685,7 @@ class AIAgent:
                         _turn_context_window_peak = max(
                             _turn_context_window_peak, canonical_usage.prompt_tokens
                         )
+                        self._turn_context_window_peak = _turn_context_window_peak
 
                         # Log API call details for debugging/observability
                         _cache_pct = ""

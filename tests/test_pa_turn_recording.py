@@ -769,3 +769,151 @@ def test_record_pa_turn_persists_context_window_peak(tmp_path):
             conn.close()
     finally:
         db.close()
+
+
+# ── v6.3 item 5a: turn telemetry survives the LIVE gateway path ──────────
+#
+# Subagent tests passed but ALL live rows recorded NULL context_window_peak:
+# gateway run_sync REBUILDS the agent_result dict with an explicit field
+# whitelist (two return sites) that dropped turn_input_tokens /
+# turn_output_tokens / turn_context_window_peak, and run_conversation's ~20
+# early-return sites never emitted them at all. The fixes are
+# gateway.run._turn_telemetry_fields (whitelist passthrough) and the
+# run_conversation wrapper (stamps the keys on every dict return path).
+
+
+def test_turn_telemetry_fields_passthrough():
+    from gateway.run import _turn_telemetry_fields
+
+    result = {
+        "final_response": "ok",
+        "turn_input_tokens": 1200,
+        "turn_output_tokens": 90,
+        "turn_context_window_peak": 98342,
+        "input_tokens": 999999,  # cumulative — must NOT be remapped
+    }
+    fields = _turn_telemetry_fields(result)
+    assert fields == {
+        "turn_input_tokens": 1200,
+        "turn_output_tokens": 90,
+        "turn_context_window_peak": 98342,
+    }
+
+
+def test_turn_telemetry_fields_absent_or_none_keys_omitted():
+    from gateway.run import _turn_telemetry_fields
+
+    assert _turn_telemetry_fields({"final_response": "x"}) == {}
+    assert _turn_telemetry_fields({"turn_context_window_peak": None}) == {}
+    assert _turn_telemetry_fields("not a dict") == {}
+    assert _turn_telemetry_fields(None) == {}
+
+
+def test_live_shaped_rebuilt_result_records_context_window_peak(tmp_path):
+    """LIVE-shaped flow: run_conversation result -> run_sync REBUILD (field
+    whitelist + telemetry passthrough) -> stashed agent_result ->
+    build_turn_record -> DB row. This is the path the 25 NULL day-30 rows
+    took; the rebuild previously dropped the telemetry keys."""
+    from gateway.run import _turn_telemetry_fields
+
+    run_conversation_result = {
+        "final_response": "recorded the observation",
+        "messages": [{"role": "assistant", "content": "recorded"}],
+        "api_calls": 3,
+        "completed": True,
+        "input_tokens": 2_280_000,  # session-cumulative (cached gateway agent)
+        "output_tokens": 64_000,
+        "turn_input_tokens": 141_000,
+        "turn_output_tokens": 1_800,
+        "turn_context_window_peak": 187_404,
+        "model": "gpt-5.4-mini",
+        "provider": "openai",
+        "estimated_cost_usd": 0.02,
+    }
+    # run_sync's success-path rebuild (gateway/run.py): explicit whitelist
+    # plus the telemetry passthrough under test.
+    stashed_agent_result = {
+        "final_response": run_conversation_result["final_response"],
+        "messages": run_conversation_result["messages"],
+        "api_calls": run_conversation_result["api_calls"],
+        "completed": run_conversation_result["completed"],
+        "input_tokens": run_conversation_result["input_tokens"],
+        "output_tokens": run_conversation_result["output_tokens"],
+        "model": run_conversation_result["model"],
+        "provider": run_conversation_result["provider"],
+        "estimated_cost_usd": run_conversation_result["estimated_cost_usd"],
+        **_turn_telemetry_fields(run_conversation_result),
+    }
+    record = po.build_turn_record(
+        agent_id="christopher",
+        chat_id="chat-amk",
+        session_id="sess-live",
+        agent_result=stashed_agent_result,
+        final_response=stashed_agent_result["final_response"],
+        started_at=10.0,
+        completed_at=11.0,
+    )
+    assert record.context_window_peak == 187_404
+    # Token columns take the TURN deltas, not the cumulative counters.
+    assert record.input_tokens == 141_000
+    assert record.output_tokens == 1_800
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        po.write_turn_record(db, record)
+        conn = sqlite3.connect(tmp_path / "state.db")
+        try:
+            row = conn.execute(
+                "SELECT input_tokens, output_tokens, context_window_peak FROM pa_turns"
+            ).fetchone()
+            assert row == (141_000, 1_800, 187_404)
+        finally:
+            conn.close()
+    finally:
+        db.close()
+
+
+def _bare_agent_with_turn_state():
+    from run_agent import AIAgent
+
+    agent = AIAgent.__new__(AIAgent)
+    agent.session_input_tokens = 5_000
+    agent.session_output_tokens = 700
+    agent._turn_input_tokens_baseline = 4_000
+    agent._turn_output_tokens_baseline = 600
+    agent._turn_context_window_peak = 98_342
+    return agent
+
+
+def test_run_conversation_wrapper_stamps_telemetry_on_early_returns():
+    """Early-return impl dicts (failure / interrupt sites) get the
+    turn-scoped keys stamped by the public wrapper."""
+    agent = _bare_agent_with_turn_state()
+    agent._run_conversation_impl = lambda *a, **kw: {
+        "final_response": None,
+        "messages": [],
+        "api_calls": 2,
+        "completed": False,
+        "failed": True,
+        "error": "Invalid API response after 3 retries",
+    }
+    result = agent.run_conversation("hello")
+    assert result["turn_input_tokens"] == 1_000
+    assert result["turn_output_tokens"] == 100
+    assert result["turn_context_window_peak"] == 98_342
+
+
+def test_run_conversation_wrapper_keeps_impl_values():
+    """The happy-path result computes its own turn fields — setdefault must
+    not override them."""
+    agent = _bare_agent_with_turn_state()
+    agent._run_conversation_impl = lambda *a, **kw: {
+        "final_response": "ok",
+        "turn_input_tokens": 123,
+        "turn_output_tokens": 45,
+        "turn_context_window_peak": 67_890,
+    }
+    result = agent.run_conversation("hello")
+    assert result["turn_input_tokens"] == 123
+    assert result["turn_output_tokens"] == 45
+    assert result["turn_context_window_peak"] == 67_890
