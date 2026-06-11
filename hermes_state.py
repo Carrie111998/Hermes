@@ -1069,8 +1069,10 @@ class SessionDB:
         ``tool_calls`` items: ``{tool_name, input, result, cost_usd,
         duration_ms, client_entity_pointer, call_id}`` (all optional except
         presence).  ``call_id`` is the provider tool-call id; when present it
-        drives per-session dedup so a payload extracted from the full session
-        history only persists THIS turn's delta (see ``_do`` below).
+        drives per-CHAT dedup (session-scope fallback when no chat_id) so a
+        payload extracted from the full session history only persists THIS
+        turn's delta, surviving compression session-rotation (see ``_do``
+        below).
         ``events`` items: ``{event_type, reason, evidence_message_refs,
         source, recorded_at}``.  All complex fields are JSON-encoded here so
         callers pass plain Python objects.
@@ -1167,21 +1169,37 @@ class SessionDB:
             conn.execute("DELETE FROM pa_events WHERE turn_id = ?", (turn_id,))
             # Per-turn delta at source: callers extract tool calls from the
             # FULL session message history, so each turn's payload re-carries
-            # every prior turn's calls.  The already-recorded call_ids for
-            # this session (under OTHER turn_ids — same-turn re-records stay
-            # idempotent) are the high-water mark; only genuinely-new calls
-            # are persisted.  Rows without a call_id (legacy callers) are
-            # passed through unchanged.
+            # every prior turn's calls.  The already-recorded call_ids under
+            # OTHER turn_ids (same-turn re-records stay idempotent) are the
+            # high-water mark; only genuinely-new calls are persisted.  Rows
+            # without a call_id (legacy callers) are passed through unchanged.
+            #
+            # Scope: CHAT, not session (v6.3 item 5b, WB f6845320).  Hermes
+            # compression rotates the session_id on every compaction
+            # (_compress_context ends the old session and mints a new id) and
+            # the carried transcript still contains the historical tool
+            # calls — a session-scoped high-water mark therefore reset on
+            # every compaction and re-recorded the whole history under the
+            # next turn (day-30 AMK: 132 calls attributed to one 40-second
+            # turn, including "[Result from earlier conversation]" stubs).
+            # The chat is the rotation-stable conversation key; fall back to
+            # session scope only when the caller has no chat_id.
             insert_rows = tool_call_rows
-            if tool_call_rows and session_id is not None:
+            if tool_call_rows and (chat_id is not None or session_id is not None):
+                if chat_id is not None:
+                    dedup_where = "t.chat_id = ?"
+                    dedup_param = chat_id
+                else:
+                    dedup_where = "t.session_id = ?"
+                    dedup_param = session_id
                 already_recorded = {
                     r[0]
                     for r in conn.execute(
-                        """SELECT tc.call_id FROM pa_tool_calls tc
+                        f"""SELECT tc.call_id FROM pa_tool_calls tc
                            JOIN pa_turns t ON t.turn_id = tc.turn_id
-                           WHERE t.session_id = ? AND tc.turn_id != ?
+                           WHERE {dedup_where} AND tc.turn_id != ?
                              AND tc.call_id IS NOT NULL""",
-                        (session_id, turn_id),
+                        (dedup_param, turn_id),
                     ).fetchall()
                 }
                 if already_recorded:

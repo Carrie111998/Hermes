@@ -217,21 +217,62 @@ def test_record_pa_turn_dedups_prior_turns_calls_by_call_id(tmp_path):
         db.close()
 
 
-def test_record_pa_turn_dedup_scoped_to_session(tmp_path):
-    """Dedup is per-session: the same call_id in a DIFFERENT session records."""
+def test_record_pa_turn_dedup_survives_session_rotation(tmp_path):
+    """v6.3 item 5b (WB f6845320): hermes compression rotates session_id on
+    every compaction while the carried transcript still contains the
+    historical tool calls. The dedup high-water mark is therefore scoped to
+    the CHAT, not the session — after rotation (same chat, new session id,
+    carried messages re-extracted) the second turn records ONLY its own
+    calls. Pre-fix this re-recorded the whole history under the new turn
+    (day-30 AMK: 132 calls attributed to one 40-second turn)."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        # Day's turns before the compaction, session s1.
+        db.record_pa_turn(
+            turn_id="t1", agent_id="a", chat_id="c", session_id="s1",
+            tool_calls=[_tc("call_a"), _tc("call_b")],
+        )
+        # Compaction rotates s1 -> s2. The next turn's payload (extracted
+        # from the carried/compressed transcript) re-carries the historical
+        # calls plus its own new one.
+        db.record_pa_turn(
+            turn_id="t2", agent_id="a", chat_id="c", session_id="s2",
+            tool_calls=[_tc("call_a"), _tc("call_b"), _tc("call_c")],
+        )
+        turns = {t["turn_id"]: t for t in db.list_pa_turns(agent_id="a")}
+        assert [tc["call_id"] for tc in turns["t1"]["tool_calls"]] == ["call_a", "call_b"]
+        assert [tc["call_id"] for tc in turns["t2"]["tool_calls"]] == ["call_c"]
+    finally:
+        db.close()
+
+
+def test_record_pa_turn_dedup_scoped_to_chat(tmp_path):
+    """The same call_id in a DIFFERENT chat still records (chat is the scope
+    boundary); without a chat_id the dedup falls back to session scope."""
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.record_pa_turn(
-            turn_id="t1", agent_id="a", chat_id="c", session_id="s1",
+            turn_id="t1", agent_id="a", chat_id="c1", session_id="s1",
             tool_calls=[_tc("call_a")],
         )
         db.record_pa_turn(
-            turn_id="t2", agent_id="a", chat_id="c", session_id="s2",
+            turn_id="t2", agent_id="a", chat_id="c2", session_id="s2",
             tool_calls=[_tc("call_a")],
+        )
+        # No chat_id: session-scope fallback — same session still dedups.
+        db.record_pa_turn(
+            turn_id="t3", agent_id="a", chat_id=None, session_id="s3",
+            tool_calls=[_tc("call_x")],
+        )
+        db.record_pa_turn(
+            turn_id="t4", agent_id="a", chat_id=None, session_id="s3",
+            tool_calls=[_tc("call_x"), _tc("call_y")],
         )
         turns = {t["turn_id"]: t for t in db.list_pa_turns(agent_id="a")}
         assert len(turns["t1"]["tool_calls"]) == 1
         assert len(turns["t2"]["tool_calls"]) == 1
+        assert [tc["call_id"] for tc in turns["t3"]["tool_calls"]] == ["call_x"]
+        assert [tc["call_id"] for tc in turns["t4"]["tool_calls"]] == ["call_y"]
     finally:
         db.close()
 
