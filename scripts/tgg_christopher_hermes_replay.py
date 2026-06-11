@@ -137,6 +137,77 @@ REPLAY_PROFILES: dict[str, ReplayProfile] = {
 }
 
 
+# ── Deployed-config-derived profiles (config-drift killer) ────────────────
+# Profiles named in DERIVED_PROFILE_DELTAS take their BASE from the DEPLOYED
+# christopher config (deploy/tgg/christopher/config.yaml) at resolution time
+# and apply only the NAMED deltas. Everything not named inherits the deployed
+# value, so deployed-config changes (vision fanout model, aux settings, new
+# business operations) flow into the eval automatically instead of drifting
+# against a hand-built parallel config. The static REPLAY_PROFILES above stay
+# as explicit legacy variants.
+DERIVED_PROFILE_DELTAS: dict[str, dict[str, Any]] = {
+    # Default eval profile: the model under evaluation -> gpt-5.4-mini via
+    # OpenAI direct. Vision KEEPS the deployed fanout (provider gemini, model
+    # gemini-3.1-flash-lite -- requires GEMINI_API_KEY_PCL_PA_SHARED from
+    # ~/.marshal/secrets.env). Business URL/token -> eval tenant, applied at
+    # the harness layer exactly as for the legacy profiles.
+    "tgg-eval-gpt54-mini": {
+        "main_provider": "openai-direct-primary",
+        "model": "gpt-5.4-mini",
+        "transport": "codex_responses",
+    },
+}
+
+
+def _deployed_profile_base() -> dict[str, Any]:
+    """Derive replay-profile base values from the DEPLOYED christopher config.
+
+    The deployed config is the single source of truth for what christopher
+    actually runs (main provider/model, vision fanout). A vision provider of
+    "main" in the deployed auxiliary section resolves to the deployed main
+    provider — that IS the deployed fanout shape.
+    """
+    config = _load_yaml(TGG_CONFIG)
+    model_cfg = config.get("model") or {}
+    aux = config.get("auxiliary") or {}
+    vision = aux.get("vision") if isinstance(aux, dict) else {}
+    vision = vision if isinstance(vision, dict) else {}
+
+    main_provider = str(model_cfg.get("provider") or "gemini")
+    main_model = str(model_cfg.get("default") or "gemini-3.1-flash-lite")
+    vision_provider = str(vision.get("provider") or "main")
+    if vision_provider == "main":
+        vision_provider = main_provider
+    vision_model = str(vision.get("model") or main_model)
+
+    return {
+        "main_provider": main_provider,
+        "model": main_model,
+        "transport": "chat_completions" if main_provider == "gemini" else "codex_responses",
+        "vision_enabled": True,
+        "vision_provider": vision_provider,
+        "vision_model": vision_model,
+        "vision_concurrency": 8,
+        # Harness-level (NOT deployed-config) settings — eval tenant backend,
+        # replay debounce shape. Same values the legacy profiles use.
+        "business_mode": "copied-db-local-operator",
+        "allow_prod_url": False,
+        "debounce_seconds": 300,
+        "direct_mention_immediate": True,
+    }
+
+
+def _build_derived_profile(name: str) -> ReplayProfile:
+    deltas = DERIVED_PROFILE_DELTAS[name]
+    base = _deployed_profile_base()
+    base.update(deltas)
+    return ReplayProfile(name=name, **base)
+
+
+def _replay_profile_names() -> list[str]:
+    return sorted({*REPLAY_PROFILES, *DERIVED_PROFILE_DELTAS})
+
+
 def _infer_vision_provider(vision_provider: str | None, vision_model: str | None) -> str | None:
     provider = (vision_provider or "").strip()
     if provider:
@@ -157,9 +228,13 @@ def _validate_provider_model_args(*, vision_provider: str | None, vision_model: 
 
 
 def _resolve_replay_profile(args: argparse.Namespace) -> ReplayProfile:
-    base = REPLAY_PROFILES.get(str(args.profile or ""))
+    profile_name = str(args.profile or "")
+    if profile_name in DERIVED_PROFILE_DELTAS:
+        base = _build_derived_profile(profile_name)
+    else:
+        base = REPLAY_PROFILES.get(profile_name)
     if base is None:
-        known = ", ".join(sorted(REPLAY_PROFILES))
+        known = ", ".join(_replay_profile_names())
         raise SystemExit(f"Unknown replay profile {args.profile!r}. Known profiles: {known}")
     vision_provider = args.vision_provider if args.vision_provider is not None else base.vision_provider
     vision_model = args.vision_model if args.vision_model is not None else base.vision_model
@@ -1039,6 +1114,25 @@ def _media_paths(refs: list[dict[str, Any]]) -> list[str]:
         if candidate:
             paths.append(_remap_media_path(str(candidate)))
     return paths
+
+
+_REACTION_TEXT_RE = re.compile(r"^\s*\[reaction:[^\]]*\]\s*$", re.IGNORECASE)
+
+
+def _is_bare_reaction_record(record: ReplayRecord) -> bool:
+    """True for bare reaction messages ('[reaction: X]' / message_kind
+    reaction with no other content).
+
+    Bare reactions must never trigger replay turns — live WhatsApp turn
+    formation does not fire on a thumbs-up, and a reaction-only turn gives
+    the model nothing actionable. They are skipped at the replay feed."""
+    if record.has_media:
+        return False
+    kind = (record.message_kind or "").strip().lower()
+    text = (record.text or "").strip()
+    if kind == "reaction":
+        return not text or bool(_REACTION_TEXT_RE.match(text))
+    return bool(_REACTION_TEXT_RE.match(text))
 
 
 def _record_to_bridge_message(record: ReplayRecord) -> dict[str, Any]:
@@ -2470,13 +2564,18 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
     adapter.handle_message = handle_turn  # type: ignore[method-assign]
-    messages = [_record_to_bridge_message(record) for record in records]
+    # Reaction skip: bare reaction messages never trigger replay turns.
+    feed_records = [record for record in records if not _is_bare_reaction_record(record)]
+    skipped_reactions = len(records) - len(feed_records)
+    if skipped_reactions:
+        print(f"skipped {skipped_reactions} bare reaction message(s) at the replay feed", file=sys.stderr)
+    messages = [_record_to_bridge_message(record) for record in feed_records]
     try:
         processed = await adapter.replay_bridge_messages(messages)
     finally:
         gateway_run._record_pa_agent_action = original_record_pa_agent_action
-    if processed != len(records):
-        print(f"processed {processed}/{len(records)} bridge rows", file=sys.stderr)
+    if processed != len(feed_records):
+        print(f"processed {processed}/{len(feed_records)} bridge rows", file=sys.stderr)
 
     session_ids = sorted({str(r.get("session_id") or "") for r in turn_results if r.get("session_id")})
     session_id = session_ids[-1] if session_ids else ""
@@ -2543,7 +2642,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", default="tgg-local-gpt54-mini-gemini-vision", choices=sorted(REPLAY_PROFILES))
+    parser.add_argument("--profile", default="tgg-eval-gpt54-mini", choices=_replay_profile_names())
     parser.add_argument("--db", default=str(DEFAULT_DB))
     parser.add_argument("--chat-id", default=DEFAULT_CHAT)
     parser.add_argument("--since-sgt", default=DEFAULT_SINCE)

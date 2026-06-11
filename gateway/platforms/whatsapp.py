@@ -747,8 +747,20 @@ class WhatsAppAdapter(BasePlatformAdapter):
             return
         tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, debounce_s))
 
+    # Replay-only hard cap on messages per simulated turn bundle. Without it,
+    # a busy chat whose consecutive messages each land inside the debounce
+    # window accumulates into one mega-bundle spanning hours of real time
+    # (observed: a 22-message bundle covering ~2h) — a shape no live turn
+    # would ever see. Spillover starts the NEXT turn.
+    REPLAY_BUNDLE_MESSAGE_CAP = 10
+
     async def _queue_or_handle_replay_event(self, event: MessageEvent) -> None:
-        """Apply WhatsApp turn policy using message timestamps, not wall-clock sleeps."""
+        """Apply WhatsApp turn policy using message timestamps, not wall-clock sleeps.
+
+        Turn bundles split on ORIGINAL message timestamp gaps (gap >=
+        debounce_seconds => new turn) and are hard-capped at
+        REPLAY_BUNDLE_MESSAGE_CAP messages (spillover => next turn).
+        """
         debounce_s = self._debounce_seconds_for_event(event)
         if debounce_s <= 0:
             await self.handle_message(event)
@@ -774,6 +786,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 current = []
 
         buffers.setdefault(chat_id, []).append(event)
+        if len(buffers.get(chat_id) or []) >= self.REPLAY_BUNDLE_MESSAGE_CAP:
+            await self._flush_turn(chat_id)
+            return
         if self._should_flush_turn_immediately(event):
             await self._flush_turn(chat_id)
 

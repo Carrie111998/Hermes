@@ -91,3 +91,56 @@ async def test_direct_trigger_closes_replay_turn_immediately():
     assert len(captured) == 2
     assert captured[0].raw_message["sourceMessageIds"] == ["m1", "m2"]
     assert captured[1].message_id == "m3"
+
+
+@pytest.mark.asyncio
+async def test_replay_bundle_hard_capped_at_ten_messages():
+    """A run of messages all inside the debounce window must not accumulate
+    into one mega-bundle: the replay cap flushes at 10, spillover starts the
+    next turn."""
+    adapter = _adapter({
+        "require_mention": True,
+        "ingest_chats": [CHAT],
+        "turn_policy": {
+            CHAT: {"debounce_seconds": 300, "direct_mention_immediate": False},
+        },
+    })
+
+    # 22 messages, each 100s apart (< debounce) — would previously bundle
+    # into a single 22-message turn spanning ~35 minutes.
+    captured = await _capture_replay(adapter, [
+        _message(f"m{i:02d}", 1000 + i * 100, f"update {i}") for i in range(22)
+    ])
+
+    assert len(captured) == 3
+    sizes = [
+        len(e.raw_message["sourceMessageIds"]) if e.raw_message.get("bundle") else 1
+        for e in captured
+    ]
+    assert sizes == [10, 10, 2]
+    assert captured[0].raw_message["sourceMessageIds"][0] == "m00"
+    assert captured[1].raw_message["sourceMessageIds"][0] == "m10"
+    assert captured[2].raw_message["sourceMessageIds"][0] == "m20"
+
+
+@pytest.mark.asyncio
+async def test_replay_bundle_still_splits_on_timestamp_gap():
+    """Original-timestamp gap > debounce starts a new turn even under the cap."""
+    adapter = _adapter({
+        "require_mention": True,
+        "ingest_chats": [CHAT],
+        "turn_policy": {
+            CHAT: {"debounce_seconds": 300, "direct_mention_immediate": False},
+        },
+    })
+
+    captured = await _capture_replay(adapter, [
+        _message("m1", 1000, "first"),
+        _message("m2", 1100, "second"),
+        _message("m3", 9000, "after a 2h-style gap"),
+        _message("m4", 9100, "fourth"),
+    ])
+
+    assert len(captured) == 2
+    assert captured[0].raw_message["sourceMessageIds"] == ["m1", "m2"]
+    assert captured[1].raw_message["sourceMessageIds"] == ["m3", "m4"]
