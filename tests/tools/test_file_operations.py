@@ -874,3 +874,197 @@ class TestLocalNativeReadFastPath:
         ops = ShellFileOperations(env)
         ops.read_file("/x/whatever.txt")
         assert env.execute.called
+
+
+class TestLocalNativeReadRawFastPath:
+    """read_file_raw on the local backend must not shell out for regular files.
+
+    Same rationale as TestLocalNativeReadFastPath: the raw-read shell
+    pipeline costs THREE bash round-trips (wc -c, head -c, cat) and the
+    local backend spawns a fresh Git Bash per round-trip — 0.3-1s each
+    on Windows, ~3s per call.  read_file_raw feeds the patch/verify
+    flows, so it is a hot path.
+
+    The expected values pin the shell pipeline's exact output, captured
+    empirically before the fast path existed: content is the byte-exact
+    file text decoded utf-8/errors=replace — trailing newlines survive
+    the pipe (the CWD-marker stripping removes only the wrapper's own
+    injected newline) — total_lines stays 0 and truncated False (raw
+    reads never count lines), the image short-circuit sets no hint and
+    no error (unlike read_file's), and the binary error is the em-dash
+    variant ("Binary file — cannot display as text.").
+    """
+
+    @pytest.fixture
+    def local_ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        class _NoSpawnLocal(LocalEnvironment):
+            """Real LocalEnvironment, minus the init-time bash snapshot."""
+
+            def init_session(self):
+                self._snapshot_ready = False
+
+        env = _NoSpawnLocal(cwd=str(tmp_path))
+        env.execute = _must_not_execute
+        return ShellFileOperations(env, cwd=str(tmp_path))
+
+    def test_raw_read_uses_no_shell_trailing_newline_preserved(self, local_ops, tmp_path):
+        f = tmp_path / "plain.txt"
+        f.write_bytes(b"a\nb\n")
+        r = local_ops.read_file_raw(str(f))
+        assert r.error is None
+        assert r.content == "a\nb\n"
+        assert r.file_size == 4
+        assert r.total_lines == 0
+        assert r.truncated is False
+        assert r.hint is None
+
+    def test_raw_read_no_trailing_newline(self, local_ops, tmp_path):
+        f = tmp_path / "nonl.txt"
+        f.write_bytes(b"a\nb")
+        r = local_ops.read_file_raw(str(f))
+        assert r.error is None
+        assert r.content == "a\nb"
+        assert r.file_size == 3
+
+    def test_raw_read_empty_file(self, local_ops, tmp_path):
+        f = tmp_path / "empty.txt"
+        f.write_bytes(b"")
+        r = local_ops.read_file_raw(str(f))
+        assert r.error is None
+        assert r.content == ""
+        assert r.file_size == 0
+
+    def test_raw_read_multiple_trailing_newlines(self, local_ops, tmp_path):
+        f = tmp_path / "multi.txt"
+        f.write_bytes(b"a\nb\n\n\n")
+        r = local_ops.read_file_raw(str(f))
+        assert r.content == "a\nb\n\n\n"
+        assert r.file_size == 6
+
+    def test_raw_read_crlf_preserved(self, local_ops, tmp_path):
+        f = tmp_path / "dos.txt"
+        f.write_bytes(b"a\r\nb\r\n")
+        r = local_ops.read_file_raw(str(f))
+        assert r.content == "a\r\nb\r\n"
+        assert r.file_size == 6
+
+    def test_raw_read_utf8_multibyte(self, local_ops, tmp_path):
+        f = tmp_path / "utf8.txt"
+        f.write_bytes("héllo wörld\n".encode("utf-8"))
+        r = local_ops.read_file_raw(str(f))
+        assert r.content == "héllo wörld\n"
+        assert r.file_size == 14
+
+    def test_raw_image_short_circuits_without_shell(self, local_ops, tmp_path):
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        r = local_ops.read_file_raw(str(f))
+        assert r.is_image is True
+        assert r.is_binary is True
+        assert r.file_size == 24
+        # Unlike read_file's image result, read_file_raw sets no hint.
+        assert r.hint is None
+        assert r.error is None
+        assert r.content == ""
+
+    def test_raw_binary_extension_short_circuits(self, local_ops, tmp_path):
+        f = tmp_path / "blob.exe"
+        f.write_bytes(b"\x00\x01\x02\x03" * 10)
+        r = local_ops.read_file_raw(str(f))
+        assert r.is_binary is True
+        assert r.error == "Binary file — cannot display as text."
+        assert r.file_size == 40
+        assert r.content == ""
+
+    def test_raw_binary_content_sniff(self, local_ops, tmp_path):
+        f = tmp_path / "nuls.txt"
+        f.write_bytes(b"\x00" * 600 + b"text tail\n")
+        r = local_ops.read_file_raw(str(f))
+        assert r.is_binary is True
+        assert r.error == "Binary file — cannot display as text."
+        assert r.file_size == 610
+
+    def test_raw_relative_path_resolves_against_env_cwd(self, local_ops, tmp_path):
+        (tmp_path / "rel.txt").write_bytes(b"REL_OK\n")
+        r = local_ops.read_file_raw("rel.txt")
+        assert r.error is None
+        assert r.content == "REL_OK\n"
+
+    def test_raw_missing_file_falls_back_to_shell(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        r = ops.read_file_raw(str(tmp_path / "ghost.txt"))
+        assert r.error is not None
+        assert r.error.startswith("File not found:")
+        assert calls, "missing file should defer to the shell pipeline"
+
+    def test_raw_size_cap_falls_back_to_shell(self, tmp_path, monkeypatch):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        monkeypatch.setattr("tools.file_operations._NATIVE_READ_MAX_BYTES", 4)
+        f = tmp_path / "big.txt"
+        f.write_bytes(b"12345\n")
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        ops.read_file_raw(str(f))
+        assert calls, "file past the size cap should defer to the shell pipeline"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_raw_msys_drive_path_reads_natively_on_windows(self, local_ops, tmp_path):
+        f = tmp_path / "msys.txt"
+        f.write_bytes(b"MSYS_OK\n")
+        drive = f.drive.rstrip(":").lower()
+        msys = "/" + drive + str(f)[len(f.drive):].replace("\\", "/")
+        r = local_ops.read_file_raw(msys)
+        assert r.error is None
+        assert r.content == "MSYS_OK\n"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_raw_posix_root_path_falls_back_on_windows(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        # /tmp/... resolves inside Git Bash's filesystem, not C:\tmp —
+        # native I/O must not guess, the shell pipeline owns this path.
+        ops.read_file_raw("/tmp/hermes-native-rawread-probe.txt")
+        assert calls, "POSIX-root path should defer to the shell pipeline"
+
+    def test_raw_non_local_env_keeps_shell_pipeline(self):
+        env = MagicMock()
+        env.cwd = "/x"
+        env.execute.return_value = {"output": "", "returncode": 1}
+        ops = ShellFileOperations(env)
+        ops.read_file_raw("/x/whatever.txt")
+        assert env.execute.called

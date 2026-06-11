@@ -1051,6 +1051,21 @@ class ShellFileOperations(FileOperations):
         Uses cat so the full file is returned regardless of size.
         """
         path = self._expand_path(path)
+
+        # Local backend: read regular files with direct Python I/O
+        # instead of shelling out.  The shell pipeline below costs THREE
+        # bash round-trips per call (wc -c, head -c, cat) and the local
+        # backend spawns a fresh bash per round-trip; on Windows each
+        # Git Bash spawn is 0.3-1s, i.e. ~3s for a single raw read —
+        # and raw reads feed the patch/verify flows, a real hot path.
+        # A None return means "not a plain readable local file" — fall
+        # through so the shell pipeline keeps its historical semantics
+        # for every edge case (missing file, directory, POSIX-root path).
+        if self._lsp_local_only():
+            native = self._read_file_raw_native(path)
+            if native is not None:
+                return native
+
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
         if stat_result.exit_code != 0:
@@ -1076,6 +1091,73 @@ class ShellFileOperations(FileOperations):
             content=_strip_terminal_fence_leaks(cat_result.stdout),
             file_size=file_size,
         )
+
+    def _read_file_raw_native(self, path: str) -> Optional[ReadResult]:
+        """Native (no-shell) raw read for regular files on the local backend.
+
+        Mirrors the shell pipeline's output exactly: content is the
+        byte-exact file text decoded utf-8/errors=replace (trailing
+        newlines survive the cat pipe — the CWD-marker stripping removes
+        only the wrapper's own injected newline), no pagination fields
+        are set, the image short-circuit carries no hint and no error
+        (unlike read_file's), and the binary error is the em-dash
+        variant.  The pinned contract lives in
+        TestLocalNativeReadRawFastPath.
+
+        Returns None for anything that is not a regular, natively
+        addressable file — missing paths, directories, FIFOs/devices,
+        POSIX-root paths on Windows (``/tmp/...`` only resolves inside
+        Git Bash), files past the size cap, or any unexpected I/O error.
+        The caller then falls through to the shell pipeline so those
+        keep behaving exactly as before.
+        """
+        try:
+            from tools.environments.local import _msys_to_windows_path
+
+            native_path = _msys_to_windows_path(path)
+            if os.name == "nt" and native_path.startswith("/"):
+                return None
+            if not os.path.isabs(native_path):
+                base = _msys_to_windows_path(
+                    getattr(self.env, "cwd", None) or self.cwd
+                )
+                if os.name == "nt" and base.startswith("/"):
+                    return None
+                native_path = os.path.join(base, native_path)
+            if not os.path.isfile(native_path):
+                return None
+
+            file_size = os.path.getsize(native_path)
+            if file_size > _NATIVE_READ_MAX_BYTES:
+                # The shell pipeline already pays the slurp cost in the
+                # output drain, but keep huge files on the historical
+                # path rather than widening the native one.
+                return None
+
+            if self._is_image(path):
+                return ReadResult(is_image=True, is_binary=True, file_size=file_size)
+
+            with open(native_path, "rb") as fh:
+                raw_bytes = fh.read()
+
+            # Same sample the shell path feeds _is_likely_binary
+            # (head -c 1000 decoded with errors="replace").
+            sample = raw_bytes[:1000].decode("utf-8", errors="replace")
+            if self._is_likely_binary(path, sample):
+                return ReadResult(
+                    is_binary=True, file_size=file_size,
+                    error="Binary file — cannot display as text."
+                )
+
+            return ReadResult(
+                content=raw_bytes.decode("utf-8", errors="replace"),
+                file_size=file_size,
+            )
+        except Exception:
+            # Any surprise (permission change, deletion race, exotic
+            # filesystem) falls back to the shell pipeline rather than
+            # failing the read outright.
+            return None
 
     def delete_file(self, path: str) -> WriteResult:
         """Delete a file via rm."""
