@@ -54,6 +54,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -523,6 +524,21 @@ def _dir_file_count(path: str) -> int:
     except (PermissionError, OSError):
         pass
     return count
+
+
+def _rmtree_git(path: Path) -> None:
+    """``shutil.rmtree`` that tolerates read-only entries.
+
+    Git marks object files (loose objects and packs) read-only, and on
+    Windows deleting a read-only file raises ``PermissionError`` — a plain
+    ``rmtree`` on any dir containing a git store always fails there.  Clear
+    the read-only bit and retry the failed operation.
+    """
+    def _onerror(func, p, _exc_info):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+
+    shutil.rmtree(path, onerror=_onerror)
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -1273,7 +1289,7 @@ def prune_checkpoints(
                 continue
             try:
                 size = _dir_size_bytes(child)
-                shutil.rmtree(child)
+                _rmtree_git(child)
                 result["bytes_freed"] += size
                 result["deleted_stale"] += 1
             except OSError as exc:
@@ -1312,7 +1328,7 @@ def prune_checkpoints(
             continue
         try:
             size = _dir_size_bytes(child)
-            shutil.rmtree(child)
+            _rmtree_git(child)
             result["bytes_freed"] += size
             if reason == "orphan":
                 result["deleted_orphan"] += 1
@@ -1597,7 +1613,7 @@ def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
         return out
     size = _dir_size_bytes(base)
     try:
-        shutil.rmtree(base)
+        _rmtree_git(base)
         out["bytes_freed"] = size
         out["deleted"] = True
     except OSError as exc:
@@ -1619,7 +1635,7 @@ def clear_legacy(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
             continue
         try:
             size = _dir_size_bytes(child)
-            shutil.rmtree(child)
+            _rmtree_git(child)
             out["bytes_freed"] += size
             out["deleted"] += 1
         except OSError as exc:

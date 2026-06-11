@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import stat
 import subprocess
 import time
 import pytest
@@ -503,8 +504,11 @@ class TestWorkingDirResolution:
         def _guarded_exists(self):
             s = str(self)
             stop = str(tmp_path)
+            # Match markers with the platform separator — with "/" the guard
+            # never fires on Windows and ancestor markers (e.g. a Makefile in
+            # the home dir) leak through, breaking the fallback assertion.
             if not s.startswith(stop) and any(
-                s.endswith("/" + m) or s == "/" + m
+                s.endswith(os.sep + m) or s == os.sep + m
                 for m in (".git", "pyproject.toml", "package.json",
                           "Cargo.toml", "go.mod", "Makefile", "pom.xml",
                           ".hg", "Gemfile")
@@ -552,11 +556,13 @@ class TestGitEnvIsolation:
         assert "GIT_INDEX_FILE" not in env
 
     def test_sets_index_file_when_provided(self, tmp_path):
+        index_file = tmp_path / "store" / "indexes" / "abc"
         env = _git_env(
             tmp_path / "store", str(tmp_path),
-            index_file=tmp_path / "store" / "indexes" / "abc",
+            index_file=index_file,
         )
-        assert env["GIT_INDEX_FILE"].endswith("indexes/abc")
+        # Compare as paths — the separator is platform-dependent.
+        assert Path(env["GIT_INDEX_FILE"]) == index_file
 
     def test_expands_tilde_in_work_tree(self, fake_home, tmp_path):
         work = fake_home / "work"
@@ -1100,6 +1106,11 @@ class TestClearFunctions:
         legacy = base / "legacy-20200101-000000"
         legacy.mkdir()
         (legacy / "junk").write_bytes(b"x" * 1000)
+        # Archived shadow repos contain read-only git object files; on
+        # Windows a plain rmtree dies on those — deletion must still work.
+        ro = legacy / "read-only-object"
+        ro.write_bytes(b"y" * 10)
+        os.chmod(ro, stat.S_IREAD)
 
         result = clear_legacy()
         assert result["deleted"] == 1
