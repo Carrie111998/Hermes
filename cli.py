@@ -11944,20 +11944,28 @@ class HermesCLI:
                         except Exception:
                             pass
                     try:
-                        set_sudo_password_callback(None)
-                        set_approval_callback(None)
-                        set_secret_capture_callback(None)
-                    except Exception:
-                        pass
-                    # Release the per-turn approval session key. ``_session_yolo``
-                    # state itself is preserved across turns (so /yolo persists
-                    # for the whole CLI run); we just unbind the contextvar so a
-                    # reused thread doesn't see stale identity on its next run.
-                    if _approval_session_token is not None and reset_current_session_key is not None:
+                        result = self.agent.run_conversation(
+                            user_message=agent_message,
+                            conversation_history=self.conversation_history,
+                            stream_callback=stream_callback,
+                        )
+                    finally:
                         try:
-                            reset_current_session_key(_approval_session_token)
+                            set_sudo_password_callback(None)
+                            set_approval_callback(None)
+                            set_secret_capture_callback(None)
                         except Exception:
                             pass
+                        # Release the per-turn approval session key.
+                        # ``_session_yolo`` state itself is preserved across turns
+                        # (so /yolo persists for the whole CLI run); we just
+                        # unbind the contextvar so a reused thread doesn't see
+                        # stale identity on its next run.
+                        if _approval_session_token is not None and reset_current_session_key is not None:
+                            try:
+                                reset_current_session_key(_approval_session_token)
+                            except Exception:
+                                pass
 
             # Start agent in background thread (daemon so it cannot keep the
             # process alive when the user closes the terminal tab — SIGHUP
