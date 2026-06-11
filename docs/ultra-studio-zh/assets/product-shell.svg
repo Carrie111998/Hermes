@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="480" viewBox="0 0 1120 480" role="img" aria-label="Ultra Studio三栏产品界面">
+<style>
+  .bg{fill:#fffdf8}.panel{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.future{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:16px;font-weight:700}.small{font-size:13px}.tiny{font-size:12px}.arrow{stroke:#7a746a;stroke-width:2.4;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1120" height="480" rx="20"/>
+<text class="text title" x="36" y="46">产品界面先看三栏</text>
+<text class="text small muted" x="36" y="72">左边找入口，中间创作，右边检查当前任务/资产。</text>
+<rect class="panel" x="36" y="104" width="236" height="316" rx="18"/>
+<text class="text label" x="62" y="142">Left Nav</text>
+<text class="text small muted" x="62" y="174">New task</text><text class="text small muted" x="62" y="200">Search</text><text class="text small muted" x="62" y="226">Marketplace</text><text class="text small muted" x="62" y="252">Files</text><text class="text small muted" x="62" y="278">Memory</text><text class="text small muted" x="62" y="304">Tasks</text>
+<rect class="p0" x="302" y="104" width="500" height="316" rx="18"/>
+<text class="text label" x="332" y="142">Creative Chat</text>
+<rect fill="#fff" stroke="#bdd7de" x="332" y="174" width="410" height="64" rx="12"/><text class="text small muted" x="352" y="212">用户：做一个猫的视频，上传参考图</text>
+<rect fill="#fff" stroke="#bdd7de" x="392" y="258" width="350" height="84" rx="12"/><text class="text small muted" x="412" y="292">助手：先确认画幅 / 风格</text><text class="text small muted" x="412" y="316">或开始真实媒体任务</text>
+<rect fill="#fff" stroke="#bdd7de" x="332" y="364" width="410" height="36" rx="10"/><text class="text small muted" x="352" y="388">输入框 + 上传 + 模型选择</text>
+<rect class="panel" x="832" y="104" width="252" height="316" rx="18"/>
+<text class="text label" x="858" y="142">Inspector</text>
+<text class="text small muted" x="858" y="174">当前 job</text><text class="text small muted" x="858" y="200">选中资产</text><text class="text small muted" x="858" y="226">QA / 失败原因</text><text class="text small muted" x="858" y="252">下载</text><text class="text small muted" x="858" y="278">转 Element</text><text class="text small muted" x="858" y="304">建 Character</text>
+</svg>

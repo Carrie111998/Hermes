@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="520" viewBox="0 0 1320 520" role="img" aria-label="长期成熟度路线">
+<style>
+.bg{fill:#fffdf8}.now{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.next{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.later{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.risk{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.external{fill:#edf5fb;stroke:#83b2d1;stroke-width:2}.box{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:15px;font-weight:750}.small{font-size:12px}.tiny{font-size:11px}.arrow{stroke:#7a746a;stroke-width:2.1;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1320" height="520" rx="20"/>
+<text class="text title" x="36" y="46">长期成熟度路线</text>
+<text class="text small muted" x="36" y="72">同一能力从 P0 到 P3 的演化，不是一次性重写。</text>
+<g transform="translate(54,118)">
+<rect class="now" x="0" y="0" width="280" height="260" rx="18"/><text class="text label" x="24" y="38">P0 本地真实闭环</text><text class="text small muted" x="24" y="76">真实 Web Chat</text><text class="text small muted" x="24" y="104">上传 / Atlas Job</text><text class="text small muted" x="24" y="132">Asset Card</text><text class="text small muted" x="24" y="160">Session History</text><text class="text small muted" x="24" y="188">Typed Errors</text><text class="text tiny muted" x="24" y="224">禁止：fake demo / 假状态</text>
+<path class="arrow" d="M292 130 H352"/>
+<rect class="next" x="364" y="0" width="280" height="260" rx="18"/><text class="text label" x="388" y="38">P1 产品化</text><text class="text small muted" x="388" y="76">Asset Service</text><text class="text small muted" x="388" y="104">Memory / Marketplace</text><text class="text small muted" x="388" y="132">Approval Gateway</text><text class="text small muted" x="388" y="160">Provenance Ledger</text><text class="text small muted" x="388" y="188">Smart Groups / Search</text><text class="text tiny muted" x="388" y="224">目标：可恢复、可复用、可检查</text>
+<path class="arrow" d="M656 130 H716"/>
+<rect class="later" x="728" y="0" width="280" height="260" rx="18"/><text class="text label" x="752" y="38">P2 云端基建</text><text class="text small muted" x="752" y="76">TokenRouter</text><text class="text small muted" x="752" y="104">Sandbox Lifecycle</text><text class="text small muted" x="752" y="132">Durable Orchestration</text><text class="text small muted" x="752" y="160">CometAPI</text><text class="text small muted" x="752" y="188">Multi-tenant Isolation</text><text class="text tiny muted" x="752" y="224">目标：安全、多租户、长任务</text>
+<path class="arrow" d="M1020 130 H1080"/>
+<rect class="risk" x="1092" y="0" width="170" height="260" rx="18"/><text class="text label" x="1116" y="38">P3 生态化</text><text class="text small muted" x="1116" y="76">Public Marketplace</text><text class="text small muted" x="1116" y="104">Collaboration</text><text class="text small muted" x="1116" y="132">Publishing</text><text class="text small muted" x="1116" y="160">Billing UX</text><text class="text small muted" x="1116" y="188">Enterprise Ops</text></g>
+</svg>

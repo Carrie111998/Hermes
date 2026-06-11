@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="360" viewBox="0 0 1120 360" role="img" aria-label="P0真实生成闭环">
+<style>
+  .bg{fill:#fffdf8}.panel{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.future{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:16px;font-weight:700}.small{font-size:13px}.tiny{font-size:12px}.arrow{stroke:#7a746a;stroke-width:2.4;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1120" height="360" rx="20"/>
+<text class="text title" x="36" y="46">P0 真实生成闭环</text>
+<text class="text small muted" x="36" y="72">先跑通这个，不先做 TokenRouter / CometAPI / 云编排。</text>
+<g transform="translate(36,112)">
+  <rect class="panel" x="0" y="0" width="145" height="120" rx="14"/><text class="text label" x="18" y="34">用户请求</text><text class="text small muted" x="18" y="62">文本 + 上传</text><text class="text small muted" x="18" y="84">图片 / 视频引用</text>
+  <path class="arrow" d="M154 60 H205"/>
+  <rect class="p0" x="214" y="0" width="145" height="120" rx="14"/><text class="text label" x="232" y="34">Web Chat</text><text class="text small muted" x="232" y="62">流式回复</text><text class="text small muted" x="232" y="84">结构化附件</text>
+  <path class="arrow" d="M368 60 H419"/>
+  <rect class="p0" x="428" y="0" width="145" height="120" rx="14"/><text class="text label" x="446" y="34">Router</text><text class="text small muted" x="446" y="62">判断 intent</text><text class="text small muted" x="446" y="84">缺字段才问</text>
+  <path class="arrow" d="M582 60 H633"/>
+  <rect class="p1" x="642" y="0" width="145" height="120" rx="14"/><text class="text label" x="660" y="34">Atlas Job</text><text class="text small muted" x="660" y="62">真实 submit</text><text class="text small muted" x="660" y="84">poll / status</text>
+  <path class="arrow" d="M796 60 H847"/>
+  <rect class="p1" x="856" y="0" width="145" height="120" rx="14"/><text class="text label" x="874" y="34">Asset</text><text class="text small muted" x="874" y="62">生成结果入库</text><text class="text small muted" x="874" y="84">卡片 / 下载</text>
+  <path class="arrow" d="M929 128 V168 H88 V132"/>
+  <text class="text small muted" x="278" y="176">历史恢复：session / job / asset / event 必须能串回去</text>
+</g>
+</svg>

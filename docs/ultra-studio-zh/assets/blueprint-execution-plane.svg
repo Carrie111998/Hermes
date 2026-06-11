@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" role="img" aria-label="执行面建设图">
+<style>
+.bg{fill:#fffdf8}.box{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.risk{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.external{fill:#edf5fb;stroke:#83b2d1;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:15px;font-weight:750}.small{font-size:12px}.tiny{font-size:11px}.arrow{stroke:#7a746a;stroke-width:2.2;fill:none;marker-end:url(#arrow)}.line{stroke:#d9cfbd;stroke-width:2;fill:none}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1280" height="520" rx="20"/><text class="text title" x="36" y="46">执行面：任务在哪里跑，怎么恢复</text><text class="text small muted" x="36" y="72">Sandbox 是任务计算机，不是一次性 shell。</text>
+<g transform="translate(54,118)">
+<rect class="p0" x="0" y="0" width="210" height="110" rx="14"/><text class="text label" x="20" y="36">Session Runtime</text><text class="text small muted" x="20" y="66">run_id / cursor</text><text class="text small muted" x="20" y="88">stream events</text>
+<path class="arrow" d="M220 55 H282"/>
+<rect class="p1" x="292" y="0" width="210" height="110" rx="14"/><text class="text label" x="312" y="36">Sandbox Manager</text><text class="text small muted" x="312" y="66">create / attach</text><text class="text small muted" x="312" y="88">sleep / wake</text>
+<path class="arrow" d="M512 55 H574"/>
+<rect class="p1" x="584" y="0" width="210" height="110" rx="14"/><text class="text label" x="604" y="36">Task Filesystem</text><text class="text small muted" x="604" y="66">uploads / outputs</text><text class="text small muted" x="604" y="88">artifact restore</text>
+<path class="arrow" d="M804 55 H866"/>
+<rect class="p2" x="876" y="0" width="240" height="110" rx="14"/><text class="text label" x="896" y="36">Browser Context</text><text class="text small muted" x="896" y="66">persistent session</text><text class="text small muted" x="896" y="88">approval gated</text>
+<rect class="p0" x="0" y="184" width="210" height="110" rx="14"/><text class="text label" x="20" y="220">Tool Runner</text><text class="text small muted" x="20" y="250">tools / shell</text><text class="text small muted" x="20" y="272">structured errors</text>
+<rect class="p1" x="292" y="184" width="210" height="110" rx="14"/><text class="text label" x="312" y="220">Media Workers</text><text class="text small muted" x="312" y="250">Atlas poll</text><text class="text small muted" x="312" y="272">finalize asset</text>
+<rect class="p2" x="584" y="184" width="210" height="110" rx="14"/><text class="text label" x="604" y="220">Durable Queue</text><text class="text small muted" x="604" y="250">retry / resume</text><text class="text small muted" x="604" y="272">worker crash safe</text>
+<rect class="p1" x="876" y="184" width="240" height="110" rx="14"/><text class="text label" x="896" y="220">Realtime Bus</text><text class="text small muted" x="896" y="250">job progress</text><text class="text small muted" x="896" y="272">tool deltas</text>
+<path class="arrow" d="M105 116 V176"/><path class="arrow" d="M397 116 V176"/><path class="arrow" d="M689 116 V176"/><path class="arrow" d="M996 116 V176"/>
+</g>
+</svg>

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="520" viewBox="0 0 1120 520" role="img" aria-label="系统分层">
+<style>
+  .bg{fill:#fffdf8}.panel{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.future{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:16px;font-weight:700}.small{font-size:13px}.tiny{font-size:12px}.arrow{stroke:#7a746a;stroke-width:2.4;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1120" height="520" rx="20"/>
+<text class="text title" x="36" y="46">系统分层：哪些现在做，哪些以后做</text>
+<text class="text small muted" x="36" y="72">绿色是 P0 真实闭环，黄色是下一层产品化，紫色是云端/多租户基建。</text>
+<g transform="translate(60,112)">
+ <rect class="p1" x="0" y="0" width="1000" height="70" rx="16"/><text class="text label" x="28" y="42">产品层</text><text class="text small muted" x="210" y="42">Left Nav / Creative Chat / Inspector / Tasks / Asset Library</text>
+ <rect class="p0" x="0" y="92" width="1000" height="70" rx="16"/><text class="text label" x="28" y="134">运行层</text><text class="text small muted" x="210" y="134">Gateway / Session / Event Stream / Workflow Router / Skill Registry / Prompt Compiler</text>
+ <rect class="p0" x="0" y="184" width="1000" height="70" rx="16"/><text class="text label" x="28" y="226">媒体层</text><text class="text small muted" x="210" y="226">Upload / Media Job / Atlas Provider / Asset Service / History Recovery</text>
+ <rect class="future" x="0" y="276" width="1000" height="70" rx="16"/><text class="text label" x="28" y="318">云端基建</text><text class="text small muted" x="210" y="318">Sandbox Lifecycle / TokenRouter / CometAPI / Ledger / OPA / Durable Workers</text>
+ <path class="arrow" d="M500 74 V88"/><path class="arrow" d="M500 166 V180"/><path class="arrow" d="M500 258 V272"/>
+</g>
+</svg>

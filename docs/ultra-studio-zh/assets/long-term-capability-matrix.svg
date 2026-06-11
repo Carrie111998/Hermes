@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="620" viewBox="0 0 1320 620" role="img" aria-label="长期能力矩阵">
+<style>
+.bg{fill:#fffdf8}.now{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.next{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.later{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.risk{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.external{fill:#edf5fb;stroke:#83b2d1;stroke-width:2}.box{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:15px;font-weight:750}.small{font-size:12px}.tiny{font-size:11px}.arrow{stroke:#7a746a;stroke-width:2.1;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1320" height="620" rx="20"/>
+<text class="text title" x="36" y="46">长期能力矩阵</text>
+<text class="text small muted" x="36" y="72">每个能力必须有 owner、状态来源和升级条件。</text>
+<g transform="translate(54,118)">
+<rect class="box" x="0" y="0" width="1170" height="52" rx="10"/><text class="text label" x="24" y="33">能力</text><text class="text label" x="260" y="33">Owner</text><text class="text label" x="520" y="33">P0</text><text class="text label" x="720" y="33">P1/P2</text><text class="text label" x="970" y="33">验证</text>
+<g class="text small">
+<text x="24" y="96">Web Chat / Session</text><text x="260" y="96">Gateway + Runtime</text><text x="520" y="96">真实流式事件</text><text x="720" y="96">断线恢复</text><text x="970" y="96">刷新不丢状态</text>
+<text x="24" y="146">Media Job</text><text x="260" y="146">Media Job Service</text><text x="520" y="146">Atlas submit/poll</text><text x="720" y="146">队列 / 重试 / 取消</text><text x="970" y="146">job_id 可追踪</text>
+<text x="24" y="196">Asset Service</text><text x="260" y="196">Data Plane</text><text x="520" y="196">结果卡片</text><text x="720" y="196">权限 / 来源链路 / search</text><text x="970" y="196">asset_id 可复用</text>
+<text x="24" y="246">TokenRouter</text><text x="260" y="246">Control Plane</text><text x="520" y="246">server-side key shim</text><text x="720" y="246">JWT / vault / quota</text><text x="970" y="246">sandbox 无 key</text>
+<text x="24" y="296">CometAPI</text><text x="260" y="296">Media Data Plane</text><text x="520" y="296">暂不做</text><text x="720" y="296">长视频/URL/抽帧</text><text x="970" y="296">bounded window</text>
+<text x="24" y="346">Sandbox</text><text x="260" y="346">Execution Plane</text><text x="520" y="346">本地工具执行</text><text x="720" y="346">sleep/wake/recycle</text><text x="970" y="346">产物恢复</text>
+<text x="24" y="396">Memory</text><text x="260" y="396">Memory Service</text><text x="520" y="396">可见入口</text><text x="720" y="396">治理/溯源/偏好</text><text x="970" y="396">用户可检查</text>
+<text x="24" y="446">Marketplace</text><text x="260" y="446">Catalog</text><text x="520" y="446">本地目录</text><text x="720" y="446">发布/安装/版本</text><text x="970" y="446">启用状态一致</text>
+<text x="24" y="496">Ledger</text><text x="260" y="496">操作记录层</text><text x="520" y="496">事件/错误</text><text x="720" y="496">provenance graph</text><text x="970" y="496">不能空口完成</text>
+</g>
+<path class="line" d="M0 70 H1170 M0 120 H1170 M0 170 H1170 M0 220 H1170 M0 270 H1170 M0 320 H1170 M0 370 H1170 M0 420 H1170 M0 470 H1170 M0 520 H1170"/>
+</g>
+</svg>

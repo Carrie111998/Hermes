@@ -1,0 +1,112 @@
+:root {
+  --vp-c-brand-1: #9dff2e;
+  --vp-c-brand-2: #7bdc1c;
+  --vp-c-brand-3: #5fad13;
+  --vp-c-brand-soft: rgba(157, 255, 46, 0.16);
+  --vp-font-family-base: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --vp-font-family-mono: "SFMono-Regular", "JetBrains Mono", Consolas, monospace;
+}
+
+.dark {
+  --vp-c-bg: #0c0f0f;
+  --vp-c-bg-alt: #121615;
+  --vp-c-bg-soft: #171d1b;
+  --vp-c-border: rgba(209, 255, 191, 0.16);
+  --vp-c-divider: rgba(209, 255, 191, 0.12);
+  --vp-c-text-1: #f4f5ee;
+  --vp-c-text-2: #c4c7bd;
+  --vp-c-text-3: #90958a;
+}
+
+.VPHomeHero .name {
+  letter-spacing: 0;
+}
+
+.VPHomeHero .text {
+  color: var(--vp-c-text-1);
+}
+
+.VPFeature {
+  border-radius: 8px;
+}
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3 {
+  letter-spacing: 0;
+}
+
+.vp-doc img {
+  display: block;
+  width: 100%;
+  max-height: 72vh;
+  object-fit: contain;
+  margin: 18px 0;
+  border: 1px solid var(--vp-c-border);
+  border-radius: 8px;
+  background: #0b0e0d;
+  cursor: zoom-in;
+}
+
+.vp-doc table {
+  display: table;
+  width: 100%;
+  font-size: 14px;
+}
+
+.vp-doc td,
+.vp-doc th {
+  vertical-align: top;
+}
+
+.vp-doc .custom-block {
+  border-radius: 8px;
+}
+
+.us-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  place-items: center;
+  padding: 28px;
+  background: rgba(0, 0, 0, 0.82);
+}
+
+.us-lightbox.is-open {
+  display: grid;
+}
+
+.us-lightbox-image {
+  max-width: min(1200px, 94vw);
+  max-height: 88vh;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: #0b0e0d;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+}
+
+.us-lightbox-close {
+  position: fixed;
+  top: 18px;
+  right: 20px;
+  width: 42px;
+  height: 42px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 50%;
+  color: #fff;
+  background: rgba(18, 22, 21, 0.86);
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+@media (max-width: 720px) {
+  .vp-doc table {
+    display: block;
+  }
+
+  .vp-doc img {
+    max-height: 56vh;
+  }
+}

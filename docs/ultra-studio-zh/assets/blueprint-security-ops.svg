@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="500" viewBox="0 0 1280 500" role="img" aria-label="安全运维建设图">
+<style>
+.bg{fill:#fffdf8}.box{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.risk{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.external{fill:#edf5fb;stroke:#83b2d1;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:15px;font-weight:750}.small{font-size:12px}.tiny{font-size:11px}.arrow{stroke:#7a746a;stroke-width:2.2;fill:none;marker-end:url(#arrow)}.line{stroke:#d9cfbd;stroke-width:2;fill:none}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1280" height="500" rx="20"/><text class="text title" x="36" y="46">安全与运维：防止假完成和越权</text><text class="text small muted" x="36" y="72">所有高风险动作必须留下证据链，不能靠模型文字自证完成。</text>
+<g transform="translate(58,120)">
+<rect class="risk" x="0" y="0" width="205" height="112" rx="14"/><text class="text label" x="20" y="36">Secrets</text><text class="text small muted" x="20" y="66">no provider key in browser</text><text class="text small muted" x="20" y="88">no key in sandbox</text>
+<rect class="risk" x="245" y="0" width="205" height="112" rx="14"/><text class="text label" x="265" y="36">Policy</text><text class="text small muted" x="265" y="66">default deny</text><text class="text small muted" x="265" y="88">typed reason</text>
+<rect class="risk" x="490" y="0" width="205" height="112" rx="14"/><text class="text label" x="510" y="36">Approval</text><text class="text small muted" x="510" y="66">budget / publish</text><text class="text small muted" x="510" y="88">delete / browser auth</text>
+<rect class="p1" x="735" y="0" width="205" height="112" rx="14"/><text class="text label" x="755" y="36">Observability</text><text class="text small muted" x="755" y="66">logs / traces</text><text class="text small muted" x="755" y="88">metrics / events</text>
+<rect class="p1" x="980" y="0" width="205" height="112" rx="14"/><text class="text label" x="1000" y="36">Runbooks</text><text class="text small muted" x="1000" y="66">failure injection</text><text class="text small muted" x="1000" y="88">release gates</text>
+<rect class="p0" x="245" y="198" width="205" height="112" rx="14"/><text class="text label" x="265" y="234">Evidence</text><text class="text small muted" x="265" y="264">job_id / asset_id</text><text class="text small muted" x="265" y="286">tool_call_id</text>
+<rect class="p1" x="490" y="198" width="205" height="112" rx="14"/><text class="text label" x="510" y="234">Provenance</text><text class="text small muted" x="510" y="264">来源链路 / QA</text><text class="text small muted" x="510" y="286">decision_id</text>
+<rect class="p2" x="735" y="198" width="205" height="112" rx="14"/><text class="text label" x="755" y="234">GitOps</text><text class="text small muted" x="755" y="264">config bundles</text><text class="text small muted" x="755" y="286">policy version</text>
+<path class="arrow" d="M103 116 C103 164 348 150 348 190"/><path class="arrow" d="M348 116 V190"/><path class="arrow" d="M592 116 V190"/><path class="arrow" d="M837 116 V190"/>
+</g>
+</svg>

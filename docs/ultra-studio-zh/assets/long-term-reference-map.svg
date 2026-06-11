@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="700" viewBox="0 0 1320 700" role="img" aria-label="长期参考全景图">
+<style>
+.bg{fill:#fffdf8}.now{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.next{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.later{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.risk{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.external{fill:#edf5fb;stroke:#83b2d1;stroke-width:2}.box{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:15px;font-weight:750}.small{font-size:12px}.tiny{font-size:11px}.arrow{stroke:#7a746a;stroke-width:2.1;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1320" height="700" rx="20"/>
+<text class="text title" x="36" y="46">长期参考全景图</text>
+<text class="text small muted" x="36" y="72">新增内容全部放进长期目标形态；P0 不一次性实现，但接口边界要保留。</text>
+<g transform="translate(48,116)">
+<rect class="now" x="0" y="0" width="220" height="112" rx="14"/><text class="text label" x="18" y="34">Product Workbench</text><text class="text small muted" x="18" y="62">Left Nav / Chat / Inspector</text><text class="text small muted" x="18" y="84">Tasks / Files / Memory</text>
+<rect class="now" x="260" y="0" width="220" height="112" rx="14"/><text class="text label" x="278" y="34">Agent Runtime</text><text class="text small muted" x="278" y="62">Session / Router / Skills</text><text class="text small muted" x="278" y="84">Prompt Compiler / Tools</text>
+<rect class="next" x="520" y="0" width="220" height="112" rx="14"/><text class="text label" x="538" y="34">Media System</text><text class="text small muted" x="538" y="62">MediaJob / Atlas</text><text class="text small muted" x="538" y="84">Asset finalize / QA</text>
+<rect class="next" x="780" y="0" width="220" height="112" rx="14"/><text class="text label" x="798" y="34">Asset Platform</text><text class="text small muted" x="798" y="62">Asset Service / Library</text><text class="text small muted" x="798" y="84">Element / Character / SoulID</text>
+<rect class="later" x="1040" y="0" width="220" height="112" rx="14"/><text class="text label" x="1058" y="34">Ecosystem</text><text class="text small muted" x="1058" y="62">Marketplace / Recipes</text><text class="text small muted" x="1058" y="84">Publishing / Collaboration</text>
+<rect class="risk" x="0" y="176" width="220" height="112" rx="14"/><text class="text label" x="18" y="210">Control Plane</text><text class="text small muted" x="18" y="238">Gateway / Identity / OPA</text><text class="text small muted" x="18" y="260">Approval / Quota</text>
+<rect class="risk" x="260" y="176" width="220" height="112" rx="14"/><text class="text label" x="278" y="210">TokenRouter</text><text class="text small muted" x="278" y="238">JWT / Vault Exchange</text><text class="text small muted" x="278" y="260">Usage / Billing Event</text>
+<rect class="later" x="520" y="176" width="220" height="112" rx="14"/><text class="text label" x="538" y="210">Execution Plane</text><text class="text small muted" x="538" y="238">Sandbox Lifecycle</text><text class="text small muted" x="538" y="260">Durable Queue / Workers</text>
+<rect class="later" x="780" y="176" width="220" height="112" rx="14"/><text class="text label" x="798" y="210">Browser Context</text><text class="text small muted" x="798" y="238">Cloud / Local Bridge</text><text class="text small muted" x="798" y="260">Approval-gated Auth</text>
+<rect class="external" x="1040" y="176" width="220" height="112" rx="14"/><text class="text label" x="1058" y="210">Provider Mesh</text><text class="text small muted" x="1058" y="238">Atlas / Future Providers</text><text class="text small muted" x="1058" y="260">Model Catalog</text>
+<rect class="later" x="0" y="352" width="220" height="112" rx="14"/><text class="text label" x="18" y="386">CometAPI</text><text class="text small muted" x="18" y="414">Long Media Resolve</text><text class="text small muted" x="18" y="436">Frames / Audio / Transcript</text>
+<rect class="next" x="260" y="352" width="220" height="112" rx="14"/><text class="text label" x="278" y="386">Memory Governance</text><text class="text small muted" x="278" y="414">Brand Facts / Preferences</text><text class="text small muted" x="278" y="436">User vs Inferred</text>
+<rect class="risk" x="520" y="352" width="220" height="112" rx="14"/><text class="text label" x="538" y="386">Provenance Ledger</text><text class="text small muted" x="538" y="414">Observation / QA</text><text class="text small muted" x="538" y="436">来源链路 / Evidence</text>
+<rect class="later" x="780" y="352" width="220" height="112" rx="14"/><text class="text label" x="798" y="386">Observability Ops</text><text class="text small muted" x="798" y="414">Logs / Traces / Metrics</text><text class="text small muted" x="798" y="436">Failure Injection</text>
+<rect class="later" x="1040" y="352" width="220" height="112" rx="14"/><text class="text label" x="1058" y="386">Cloud Tenant Layer</text><text class="text small muted" x="1058" y="414">Workspace Isolation</text><text class="text small muted" x="1058" y="436">RLS / mTLS / GitOps</text>
+<path class="arrow" d="M230 56 H250"/><path class="arrow" d="M490 56 H510"/><path class="arrow" d="M750 56 H770"/><path class="arrow" d="M1010 56 H1030"/>
+<path class="arrow" d="M370 116 V166"/><path class="arrow" d="M630 116 V166"/><path class="arrow" d="M890 116 V166"/><path class="arrow" d="M1150 116 V166"/>
+<path class="arrow" d="M370 292 V342"/><path class="arrow" d="M630 292 V342"/><path class="arrow" d="M890 292 V342"/>
+</g>
+</svg>

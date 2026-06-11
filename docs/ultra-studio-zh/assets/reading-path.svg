@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="420" viewBox="0 0 1120 420" role="img" aria-label="阅读路线">
+<style>
+  .bg{fill:#fffdf8}.panel{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.future{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:16px;font-weight:700}.small{font-size:13px}.tiny{font-size:12px}.arrow{stroke:#7a746a;stroke-width:2.4;fill:none;marker-end:url(#arrow)}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1120" height="420" rx="20"/>
+<text class="text title" x="36" y="46">别从 47 份文档开始读</text>
+<text class="text small muted" x="36" y="72">按目的选路线，只读需要的 4-6 页。</text>
+<g transform="translate(52,116)">
+ <rect class="p0" x="0" y="0" width="300" height="220" rx="18"/><text class="text label" x="24" y="38">我要开始写代码</text><text class="text small muted" x="24" y="72">1. P0 垂直切片</text><text class="text small muted" x="24" y="98">2. Agent Runtime</text><text class="text small muted" x="24" y="124">3. Workflow Router</text><text class="text small muted" x="24" y="150">4. Media Job</text><text class="text small muted" x="24" y="176">5. Model Catalog</text>
+ <rect class="p1" x="360" y="0" width="300" height="220" rx="18"/><text class="text label" x="384" y="38">我要理解产品</text><text class="text small muted" x="384" y="72">1. 产品界面</text><text class="text small muted" x="384" y="98">2. 三栏界面</text><text class="text small muted" x="384" y="124">3. Tasks</text><text class="text small muted" x="384" y="150">4. Asset Library</text><text class="text small muted" x="384" y="176">5. Memory / Marketplace</text>
+ <rect class="future" x="720" y="0" width="300" height="220" rx="18"/><text class="text label" x="744" y="38">我要看长期架构</text><text class="text small muted" x="744" y="72">1. 完整系统视角</text><text class="text small muted" x="744" y="98">2. 基建边界图</text><text class="text small muted" x="744" y="124">3. 控制面设计</text><text class="text small muted" x="744" y="150">4. 数据面设计</text><text class="text small muted" x="744" y="176">5. 安全与运维</text>
+</g>
+</svg>

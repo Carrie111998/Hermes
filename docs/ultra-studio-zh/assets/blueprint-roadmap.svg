@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-label="建设路线图">
+<style>
+.bg{fill:#fffdf8}.box{fill:#fff7e8;stroke:#d9cfbd;stroke-width:2}.p0{fill:#edf8fa;stroke:#80b9c4;stroke-width:2}.p1{fill:#f1fbf3;stroke:#8ebd98;stroke-width:2}.p2{fill:#f6f0ff;stroke:#bba4d9;stroke-width:2}.risk{fill:#fff0ee;stroke:#d99a94;stroke-width:2}.external{fill:#edf5fb;stroke:#83b2d1;stroke-width:2}.text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;fill:#1d1e1a}.muted{fill:#66635d}.title{font-size:24px;font-weight:750}.label{font-size:15px;font-weight:750}.small{font-size:12px}.tiny{font-size:11px}.arrow{stroke:#7a746a;stroke-width:2.2;fill:none;marker-end:url(#arrow)}.line{stroke:#d9cfbd;stroke-width:2;fill:none}
+</style>
+<defs><marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,6 L9,3 z" fill="#7a746a"/></marker></defs>
+<rect class="bg" width="1280" height="420" rx="20"/><text class="text title" x="36" y="46">建设路线：先闭环，再平台化</text><text class="text small muted" x="36" y="72">不要把长期架构一次性全塞进 P0。</text>
+<g transform="translate(64,118)">
+<rect class="p0" x="0" y="0" width="330" height="220" rx="18"/><text class="text label" x="28" y="40">P0：真实可用</text><text class="text small muted" x="28" y="76">Web chat + upload</text><text class="text small muted" x="28" y="104">workflow-router</text><text class="text small muted" x="28" y="132">Atlas media job</text><text class="text small muted" x="28" y="160">asset card / history</text><text class="text small muted" x="28" y="188">typed errors</text>
+<path class="arrow" d="M342 110 H406"/>
+<rect class="p1" x="418" y="0" width="330" height="220" rx="18"/><text class="text label" x="446" y="40">P1：产品化</text><text class="text small muted" x="446" y="76">Asset Service</text><text class="text small muted" x="446" y="104">Memory / Marketplace</text><text class="text small muted" x="446" y="132">Approval / Ledger</text><text class="text small muted" x="446" y="160">persistent jobs</text><text class="text small muted" x="446" y="188">search / smart groups</text>
+<path class="arrow" d="M760 110 H824"/>
+<rect class="p2" x="836" y="0" width="330" height="220" rx="18"/><text class="text label" x="864" y="40">P2：Supercomputer 级</text><text class="text small muted" x="864" y="76">TokenRouter</text><text class="text small muted" x="864" y="104">CometAPI</text><text class="text small muted" x="864" y="132">Sandbox lifecycle</text><text class="text small muted" x="864" y="160">durable orchestration</text><text class="text small muted" x="864" y="188">multi-tenant security</text>
+</g>
+</svg>
