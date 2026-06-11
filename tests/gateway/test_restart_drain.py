@@ -185,6 +185,9 @@ async def test_launch_detached_restart_command_uses_setsid(monkeypatch):
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["/usr/bin/hermes"])
     monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
     monkeypatch.setattr(shutil, "which", lambda cmd: "/usr/bin/setsid" if cmd == "setsid" else None)
+    # Force the POSIX branch — on Windows prod spawns a python watcher
+    # (no setsid/bash) and this test asserts the POSIX spawn shape.
+    monkeypatch.setattr("sys.platform", "linux")
 
     def fake_popen(cmd, **kwargs):
         popen_calls.append((cmd, kwargs))

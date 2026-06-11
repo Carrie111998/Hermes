@@ -152,7 +152,7 @@ async def test_connect_only_requests_members_intent_when_needed(monkeypatch, all
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setenv("DISCORD_ALLOWED_USERS", allowed_users)
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
@@ -192,7 +192,7 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
     """
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(
@@ -249,7 +249,7 @@ async def test_reconnect_closes_previous_client_to_prevent_zombie_websocket(monk
 async def test_connect_releases_token_lock_on_timeout(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     released = []
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: released.append((scope, identity)))
 
@@ -284,7 +284,7 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
 
     monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "bulk")
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)
@@ -320,7 +320,7 @@ async def test_connect_respects_slash_commands_opt_out(monkeypatch):
     )
 
     monkeypatch.setenv("DISCORD_COMMAND_SYNC_POLICY", "off")
-    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None: (True, None))
+    monkeypatch.setattr("gateway.status.acquire_scoped_lock", lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None))
     monkeypatch.setattr("gateway.status.release_scoped_lock", lambda scope, identity: None)
 
     intents = SimpleNamespace(message_content=False, dm_messages=False, guild_messages=False, members=False, voice_states=False)

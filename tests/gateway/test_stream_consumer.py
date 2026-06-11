@@ -521,6 +521,12 @@ class TestSegmentBreakOnToolBoundary:
 
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+        # Entering fallback mode requires _MAX_FLOOD_STRIKES consecutive edit
+        # failures. How many edit ticks fit between the deltas and finish()
+        # depends on event-loop timer granularity (~1 ms POSIX, ~15.6 ms
+        # Windows), so pre-load all-but-one strikes: the first flood failure
+        # then deterministically tips into fallback mode on any platform.
+        consumer._flood_strikes = consumer._MAX_FLOOD_STRIKES - 1
 
         consumer.on_delta("Hello")
         task = asyncio.create_task(consumer.run())

@@ -13,6 +13,7 @@ Covers:
 """
 
 import os
+import tempfile
 import unittest
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -60,8 +61,13 @@ class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {}, clear=True)
     def test_email_not_loaded_without_env(self):
         from gateway.config import GatewayConfig, Platform, _apply_env_overrides
-        config = GatewayConfig()
-        _apply_env_overrides(config)
+        # clear=True also wipes HERMES_HOME/USERPROFILE; on Windows the
+        # sessions_dir default factory's Path.home() fallback then raises,
+        # so pin config's home lookup to a tempdir.
+        with tempfile.TemporaryDirectory() as home, \
+             patch("gateway.config.get_hermes_home", return_value=Path(home)):
+            config = GatewayConfig()
+            _apply_env_overrides(config)
         self.assertNotIn(Platform.EMAIL, config.platforms)
 
 class TestCheckRequirements(unittest.TestCase):

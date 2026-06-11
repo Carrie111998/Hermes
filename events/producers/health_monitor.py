@@ -53,8 +53,11 @@ class GatewayHealthMonitor:
             port = 3000  # default
             if config_path.exists():
                 import yaml
-                with open(config_path, encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f) or {}
+                # Read via Path.read_text (io.open), not builtins.open: this
+                # runs on a background thread that can outlive a test patching
+                # builtins.open, and yaml on a mock file object never reaches
+                # EOF — the reader spins forever.
+                cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
                 port = cfg.get("whatsapp", {}).get("bridge_port", 3000)
 
             resp = requests.get(f"http://127.0.0.1:{port}/health", timeout=5)

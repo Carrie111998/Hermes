@@ -59,6 +59,15 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
     for k in ("PATH", "PYTHONPATH", "VIRTUAL_ENV", "HOME"):
         if k in os.environ and k not in env:
             env[k] = os.environ[k]
+    # Windows: the interpreter needs SYSTEMROOT, user-site package discovery
+    # runs through APPDATA/LOCALAPPDATA (where pip-installed deps like yaml
+    # live for Store Python), and USERPROFILE is Path.home(). Without these
+    # the subprocess dies with ModuleNotFoundError before the bridge runs.
+    if sys.platform == "win32":
+        for k in ("SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+                  "TEMP", "TMP", "PATHEXT", "COMSPEC"):
+            if k in os.environ and k not in env:
+                env[k] = os.environ[k]
 
     result = subprocess.run(
         [sys.executable, "-c", script],

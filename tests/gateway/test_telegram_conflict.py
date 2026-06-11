@@ -53,7 +53,7 @@ async def test_connect_rejects_same_host_token_lock(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (False, {"pid": 4242}),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (False, {"pid": 4242}),
     )
 
     ok = await adapter.connect()
@@ -73,7 +73,7 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",
@@ -137,7 +137,7 @@ async def test_polling_conflict_becomes_fatal_after_retries(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",
@@ -213,7 +213,7 @@ async def test_connect_marks_retryable_fatal_error_for_startup_network_failure(m
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",
@@ -248,7 +248,7 @@ async def test_connect_clears_webhook_before_polling(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",

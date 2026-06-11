@@ -22,6 +22,12 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
+    if "telegram" in sys.modules:
+        # conftest's comprehensive mock (or the real library) is already
+        # installed. Replacing it here would rebind gateway.platforms.telegram
+        # for every later-collected file (this file sorts before
+        # test_telegram_*) and break their ParseMode/error-class expectations.
+        return
     telegram_mod = MagicMock()
     telegram_mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
 

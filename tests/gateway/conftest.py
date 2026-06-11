@@ -59,6 +59,17 @@ def _ensure_telegram_mock() -> None:
     mod.constants.ChatType.GROUP = "group"
     mod.constants.ChatType.SUPERGROUP = "supergroup"
     mod.constants.ChatType.CHANNEL = "channel"
+    # ``from telegram.constants import ChatType`` resolves through
+    # sys.modules["telegram.constants"] — which is ``mod`` itself — so the
+    # members must ALSO live at ``mod.ChatType``. Without this, prod code
+    # using the from-import form compares chat types against auto-generated
+    # MagicMocks and misclassifies every group as a DM. (ParseMode is
+    # deliberately NOT mirrored: tests assert on the name-bearing repr of
+    # its auto-Mock members.)
+    mod.ChatType.PRIVATE = "private"
+    mod.ChatType.GROUP = "group"
+    mod.ChatType.SUPERGROUP = "supergroup"
+    mod.ChatType.CHANNEL = "channel"
 
     # Real exception classes so ``except (NetworkError, ...)`` clauses
     # in production code don't blow up with TypeError.
@@ -226,6 +237,27 @@ def _ensure_discord_mock() -> None:
 # Run at collection time — before any test file's module-level imports.
 _ensure_telegram_mock()
 _ensure_discord_mock()
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_leaked_event_subscribers():
+    """Stop the events.gateway_integration subscriber thread if a test
+    started it (via the gateway startup path) and leaked it.
+
+    A leaked "event-subscribers" daemon thread keeps polling for the rest
+    of the session. If one of its 60 s health-check ticks lands while a
+    later test has ``builtins.open`` patched with a Mock, yaml's stream
+    reader never reaches EOF and spins forever, accumulating mock call
+    history until the whole run starves — observed killing the
+    2026-06-10 Windows full run at 99% via pytest-timeout's thread method.
+    """
+    yield
+    gi = sys.modules.get("events.gateway_integration")
+    if gi is not None and getattr(gi, "_subscriber_thread", None) is not None:
+        try:
+            gi.shutdown()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,8 @@ Feishu adapter: credentials, connection mode, DM policy, and group policy.
 """
 
 import os
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -224,6 +226,21 @@ class TestSetupFeishuAdapterIntegration:
     This bridges the gap between 'setup wrote the right env vars' and
     'the adapter will actually initialize correctly from those vars'.
     """
+
+    def setup_method(self, method):
+        # The ``clear=True`` env patches below also wipe HERMES_HOME and
+        # USERPROFILE; on Windows Path.home() then raises RuntimeError (no
+        # pwd fallback), so pin the adapter's home lookup to a tempdir.
+        self._home_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self._home_patcher = patch(
+            "gateway.platforms.feishu.get_hermes_home",
+            return_value=Path(self._home_tmp.name),
+        )
+        self._home_patcher.start()
+
+    def teardown_method(self, method):
+        self._home_patcher.stop()
+        self._home_tmp.cleanup()
 
     def _make_env_from_setup(self, dm_idx=0, group_idx=0):
         """Run _setup_feishu via QR path and return the env vars it would write."""

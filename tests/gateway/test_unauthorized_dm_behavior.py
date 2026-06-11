@@ -37,6 +37,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "DINGTALK_ALLOW_ALL_USERS", "FEISHU_ALLOW_ALL_USERS", "WECOM_ALLOW_ALL_USERS",
         "QQ_ALLOW_ALL_USERS",
         "GATEWAY_ALLOW_ALL_USERS",
+        "HERMES_WHATSAPP_ALLOW_PAIRING",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -65,6 +66,7 @@ def _make_runner(platform: Platform, config: GatewayConfig):
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = False
     runner.pairing_store._is_rate_limited.return_value = False
+    runner.session_store = MagicMock()
     # Attributes required by _handle_message for the authorized-user path
     runner._running_agents = {}
     runner._running_agents_ts = {}
@@ -484,6 +486,9 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
 @pytest.mark.asyncio
 async def test_unauthorized_dm_pairs_by_default(monkeypatch):
     _clear_auth_env(monkeypatch)
+    # WhatsApp DMs are silent to strangers by default (2026-04-19 pairing-code
+    # leak fix); the pairing flow requires explicit opt-in.
+    monkeypatch.setenv("HERMES_WHATSAPP_ALLOW_PAIRING", "1")
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )
@@ -562,6 +567,7 @@ async def test_rejection_message_records_rate_limit(monkeypatch):
     """After sending a 'too many requests' rejection, rate limit is recorded
     so subsequent messages are silently ignored."""
     _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("HERMES_WHATSAPP_ALLOW_PAIRING", "1")
     config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
     )

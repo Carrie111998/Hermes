@@ -36,14 +36,18 @@ def test_model_short_drops_vendor_prefix(model, expected):
 
 def test_home_relative_cwd_collapses_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     sub = tmp_path / "projects" / "hermes"
     sub.mkdir(parents=True)
     result = _home_relative_cwd(str(sub))
-    assert result == "~/projects/hermes"
+    assert result == os.path.join("~", "projects", "hermes")
 
 
 def test_home_relative_cwd_leaves_abs_path_alone(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "other"))
+    # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "other"))
     result = _home_relative_cwd(str(tmp_path / "outside" / "dir"))
     assert result == str(tmp_path / "outside" / "dir")
 
@@ -58,6 +62,8 @@ def test_home_relative_cwd_empty_returns_empty():
 
 def test_format_footer_all_fields(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path / "projects" / "hermes"))
     (tmp_path / "projects" / "hermes").mkdir(parents=True)
     out = format_runtime_footer(
@@ -67,21 +73,25 @@ def test_format_footer_all_fields(monkeypatch, tmp_path):
         cwd=None,  # falls back to TERMINAL_CWD env var
         fields=("model", "context_pct", "cwd"),
     )
-    assert out == "gpt-5.4 · 68% · ~/projects/hermes"
+    assert out == "gpt-5.4 · 68% · " + os.path.join("~", "projects", "hermes")
 
 
-def test_format_footer_skips_missing_context_length():
+def test_format_footer_skips_missing_context_length(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
+    wd = tmp_path / "wd"
     out = format_runtime_footer(
         model="openai/gpt-5.4",
         context_tokens=500,
         context_length=None,
-        cwd="/tmp/wd",
+        cwd=str(wd),
         fields=("model", "context_pct", "cwd"),
     )
     # context_pct dropped silently; no "?%" artifact
     assert "%" not in out
     assert "gpt-5.4" in out
-    assert "/tmp/wd" in out
+    assert str(wd) in out
 
 
 def test_format_footer_context_pct_clamped_to_100():
@@ -219,6 +229,8 @@ def test_build_footer_empty_when_disabled():
 
 def test_build_footer_returns_rendered_when_enabled(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows expanduser() resolves USERPROFILE, not HOME (since 3.8).
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     out = build_footer_line(
         user_config={"display": {"runtime_footer": {"enabled": True}}},
         platform_key="telegram",

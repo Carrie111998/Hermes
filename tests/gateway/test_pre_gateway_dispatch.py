@@ -114,6 +114,8 @@ async def test_hook_allow_falls_through_to_auth(monkeypatch):
     _clear_auth_env(monkeypatch)
     # No allowed users set → auth fails → pairing flow triggers.
     monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
+    # WhatsApp DMs are silent to strangers unless pairing is opted in.
+    monkeypatch.setenv("HERMES_WHATSAPP_ALLOW_PAIRING", "1")
 
     def _fake_hook(name, **kwargs):
         if name == "pre_gateway_dispatch":

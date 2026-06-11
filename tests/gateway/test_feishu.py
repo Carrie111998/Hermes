@@ -32,6 +32,24 @@ def _mock_event_dispatcher_builder(mock_handler_class):
     return mock_builder
 
 
+def _pin_feishu_home(case: unittest.TestCase) -> None:
+    """Pin gateway.platforms.feishu.get_hermes_home to a per-test tempdir.
+
+    Tests in this file run under ``@patch.dict(os.environ, {...}, clear=True)``,
+    which also wipes HERMES_HOME/USERPROFILE. ``get_hermes_home()`` then falls
+    back to ``Path.home()`` — which raises RuntimeError on Windows (no pwd
+    fallback) and silently escapes into the real ``~/.hermes`` on POSIX.
+    """
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    patcher = patch(
+        "gateway.platforms.feishu.get_hermes_home",
+        return_value=Path(tmp.name),
+    )
+    patcher.start()
+    case.addCleanup(patcher.stop)
+    case.addCleanup(tmp.cleanup)
+
+
 class TestConfigEnvOverrides(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_xxx",
@@ -160,6 +178,9 @@ class TestFeishuMessageNormalization(unittest.TestCase):
 
 
 class TestFeishuAdapterMessaging(unittest.TestCase):
+    def setUp(self):
+        _pin_feishu_home(self)
+
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
         "FEISHU_APP_SECRET": "secret_app",
@@ -570,6 +591,9 @@ def _admits_group(adapter, message, sender_id, chat_id=""):
 
 
 class TestAdapterBehavior(unittest.TestCase):
+    def setUp(self):
+        _pin_feishu_home(self)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_build_event_handler_registers_reaction_and_card_processors(self):
         from gateway.config import PlatformConfig
@@ -3274,6 +3298,9 @@ class TestWebhookSecurity(unittest.TestCase):
 class TestDedupTTL(unittest.TestCase):
     """Tests for TTL-aware deduplication."""
 
+    def setUp(self):
+        _pin_feishu_home(self)
+
     @patch.dict(os.environ, {}, clear=True)
     def test_duplicate_within_ttl_is_rejected(self):
         from gateway.config import PlatformConfig
@@ -3362,6 +3389,9 @@ class TestDedupTTL(unittest.TestCase):
 
 class TestGroupMentionAtAll(unittest.TestCase):
     """Tests for @_all (Feishu @everyone) group mention routing."""
+
+    def setUp(self):
+        _pin_feishu_home(self)
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_at_all_in_content_accepts_without_explicit_bot_mention(self):
