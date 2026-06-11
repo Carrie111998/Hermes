@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Marketplace</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Marketplace</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="04-marketplace.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Marketplace</h1>
+<p>Status: spec-only as a product surface — no Marketplace page, route, or catalog</p>
+<p>API exists in code; adjacent machinery (skill install/enable, plugin manifests,</p>
+<p>skills hub) is implemented and is the natural substrate.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/01-product-surface.md</code></li>
+</ul>
+<p>(§Information Architecture, §Left Nav Shell),</p>
+<p><code>05-memory-marketplace-files.md</code> (§Marketplace, §Search, §Access Control,</p>
+<p>§Acceptance), <code>04-skill-tool-prompt-contract.md</code> (§Required Skill Runtime</p>
+<p>Objects, §Required Creative Skills), <code>06-delivery-plan.md</code> (P1 item 8,</p>
+<p>P3 item 2), <code>docs/ultra-studio-agent-skill-tool-prompt-design.md</code></p>
+<p>(§Skill Catalog Target, §Final Visible Catalog)</p>
+<ul>
+<li>Code (adjacent machinery, verified this session): <code>tools/skills_hub.py</code>,</li>
+</ul>
+<p><code>tools/skill_manager_tool.py</code>, <code>tools/skills_tool.py</code>, <code>tools/skills_sync.py</code>,</p>
+<p><code>tools/skills_guard.py</code>, <code>agent/skill_bundles.py</code>,</p>
+<p><code>web/src/pages/SkillsPage.tsx</code>, <code>web/src/pages/PluginsPage.tsx</code>,</p>
+<p><code>skills/</code> (category directories), <code>optional-skills/</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>Marketplace is the catalog surface for reusable creative capabilities:</p>
+<p>workflow skills, prompt recipes, storyboard templates, model recipes, reusable</p>
+<p>Elements, character packs, and project templates</p>
+<p>(<code>05-memory-marketplace-files.md</code> §Marketplace). It answers &quot;what can this</p>
+<p>product do for me&quot; without requiring the user to know skill names.</p>
+<p>Per the same spec, Marketplace &quot;is not a public app store in the first</p>
+<p>version. It can start as a local catalog backed by checked-in skill metadata</p>
+<p>and curated templates.&quot; Publishing flows are explicitly deferred to P3</p>
+<p>(<code>06-delivery-plan.md</code> P3 item 2).</p>
+<p>This spec covers the catalog model, item lifecycle, browse/install/enable</p>
+<p>behavior, and the boundary against the Skill Registry</p>
+<p>(<code>11-skill-registry.md</code>): the Skill Registry owns runtime discovery, loading,</p>
+<p>and allowlist enforcement; Marketplace owns the user-facing catalog,</p>
+<p>presentation, and acquisition flow.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented (adjacent)</td><td>Skill bundle scan/list/save/delete and slash-command resolution</td><td><code>agent/skill_bundles.py</code> (<code>scan_bundles</code>, <code>list_bundles</code>, <code>save_bundle</code>, <code>delete_bundle</code>, <code>resolve_bundle_command_key</code>)</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Skills hub metadata model and guarded remote fetch with locked install paths</td><td><code>tools/skills_hub.py</code> (<code>SkillMeta</code>, <code>SkillBundle</code>, <code>_normalize_lock_install_path</code>, <code>_guarded_http_get</code>)</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Skill install/management tool surface for the agent</td><td><code>tools/skill_manager_tool.py</code>, <code>tools/skills_tool.py</code>, <code>tools/skills_sync.py</code></td></tr>
+<tr><td>Implemented (adjacent)</td><td>Skill safety gates on acquisition</td><td><code>tools/skills_guard.py</code>, <code>tools/skills_ast_audit.py</code>, <code>tools/skill_provenance.py</code></td></tr>
+<tr><td>Implemented (adjacent)</td><td>Dashboard pages listing skills and plugins with enable/disable</td><td><code>web/src/pages/SkillsPage.tsx</code>, <code>web/src/pages/PluginsPage.tsx</code></td></tr>
+<tr><td>Implemented (adjacent)</td><td>Checked-in skill corpus organized by category</td><td><code>skills/</code> (e.g. <code>skills/creative/</code>), <code>optional-skills/</code></td></tr>
+<tr><td>Specified, not built</td><td>Marketplace nav entry and browsable catalog page</td><td><code>01-product-surface.md</code> §Left Nav Shell; zero <code>marketplace</code> hits in <code>web/src</code>, <code>agent/</code>, <code>plugins/</code>, <code>gateway/</code> (rg, this session)</td></tr>
+<tr><td>Specified, not built</td><td>Marketplace item envelope (<code>kind</code>, <code>inputs_schema</code>, <code>provider_constraints</code>, <code>status</code>)</td><td><code>05-memory-marketplace-files.md</code> §Marketplace</td></tr>
+<tr><td>Specified, not built</td><td>Non-skill item kinds: recipes, templates, element packs, character packs</td><td><code>05-memory-marketplace-files.md</code> §Marketplace</td></tr>
+<tr><td>Specified, not built</td><td>Marketplace search integration with typed result cards</td><td><code>05-memory-marketplace-files.md</code> §Search</td></tr>
+<tr><td>Specified, not built</td><td>Marketplace local catalog milestone</td><td><code>06-delivery-plan.md</code> P1 item 8</td></tr>
+<tr><td>Specified, not built</td><td>Publishing flow</td><td><code>06-delivery-plan.md</code> P3 item 2</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li><code>Marketplace</code> entry in the left nav (planned; see <code>01-left-nav-shell.md</code>).</li>
+<li>Cross-surface Search returning marketplace items as typed cards (planned,</li>
+</ul>
+<p><code>05-memory-marketplace-files.md</code> §Search).</p>
+<ul>
+<li>Router fallback: when <code>workflow-router</code> finds no matching workflow, it may</li>
+</ul>
+<p>point the user at the Marketplace entry for the closest available workflow</p>
+<p>(planned; router contract in <code>12-workflow-router.md</code>).</p>
+<ul>
+<li>Today&#x27;s closest entry points: the dashboard Skills page</li>
+</ul>
+<p>(<code>web/src/pages/SkillsPage.tsx</code>) and Plugins page</p>
+<p>(<code>web/src/pages/PluginsPage.tsx</code>), which list and toggle capabilities but</p>
+<p>are admin-oriented, not catalog-oriented.</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Browse catalog grouped by category and kind</td><td>Planned</td></tr>
+<tr><td>Item detail view: description, inputs schema, output type, required tools, provider constraints, version</td><td>Planned</td></tr>
+<tr><td>Install / enable / disable an item per workspace</td><td>Planned (skill-level enable/disable machinery exists: <code>tools/skill_manager_tool.py</code>, <code>web/src/pages/SkillsPage.tsx</code>)</td></tr>
+<tr><td>Show <code>installed / available / disabled / deprecated</code> status per item</td><td>Planned</td></tr>
+<tr><td>Local catalog backed by checked-in skill metadata</td><td>Planned (metadata source exists: <code>agent/skill_bundles.py</code>, <code>skills/</code>)</td></tr>
+<tr><td>Curated template entries (storyboard, project templates)</td><td>Planned; no template registry exists in code</td></tr>
+<tr><td>Element packs / character packs as catalog items</td><td>Planned; depends on Asset Service references (<code>09-asset-service.md</code>)</td></tr>
+<tr><td>Model recipes as catalog items</td><td>Planned; depends on Model Catalog (<code>19-model-catalog-provider-constraints.md</code>)</td></tr>
+<tr><td>Visible-without-enabled items</td><td>Planned (<code>05-memory-marketplace-files.md</code> §Access Control)</td></tr>
+<tr><td>Search marketplace entries with typed result cards</td><td>Planned</td></tr>
+<tr><td>Publishing user-authored items</td><td>Planned, P3 only</td></tr>
+<tr><td>Safety review on acquisition (provenance, AST audit)</td><td>Implemented for skills (<code>tools/skills_guard.py</code>, <code>tools/skills_ast_audit.py</code>); not wired to a Marketplace UI</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Item status, per <code>05-memory-marketplace-files.md</code> §Marketplace:</p>
+<pre><code class="language-text">available -&gt; installed -&gt; disabled -&gt; installed
+installed -&gt; deprecated (catalog owner action)
+available -&gt; deprecated</code></pre>
+<ul>
+<li><code>available</code>: visible in catalog, not active in any runtime profile.</li>
+<li><code>installed</code>: acquired into the workspace; the Skill Registry may still</li>
+</ul>
+<p>filter it out of the active profile (see <code>11-skill-registry.md</code>).</p>
+<ul>
+<li><code>disabled</code>: acquired but explicitly off; must stay visible</li>
+</ul>
+<p>(<code>05-memory-marketplace-files.md</code> §Access Control: &quot;Marketplace items can be</p>
+<p>visible without being enabled&quot;).</p>
+<ul>
+<li><code>deprecated</code>: remains inspectable for provenance; cannot be newly installed.</li>
+</ul>
+<p>Transitions are user actions except <code>deprecated</code>, which is a catalog-owner</p>
+<p>action. No automatic install is allowed; installing a skill item must not</p>
+<p>bypass the skills guard path (<code>tools/skills_guard.py</code>).</p>
+<h2>APIs &amp; Events</h2>
+<p>No marketplace API exists in code. Proposed contract (consistent with the</p>
+<p>asset/service envelope style of the pack):</p>
+<pre><code class="language-http">GET  /api/marketplace/items?kind=&amp;category=&amp;status=&amp;q=&amp;cursor=
+GET  /api/marketplace/items/{item_id}
+POST /api/marketplace/items/{item_id}/install
+POST /api/marketplace/items/{item_id}/disable
+POST /api/marketplace/items/{item_id}/enable</code></pre>
+<p>Item envelope (verbatim from <code>05-memory-marketplace-files.md</code>):</p>
+<pre><code class="language-yaml">id:
+kind: skill | recipe | template | element_pack | character_pack
+title:
+description:
+category:
+inputs_schema:
+output_type:
+required_tools:
+provider_constraints:
+version:
+status: installed | available | disabled | deprecated</code></pre>
+<p>Events (proposed, following the gateway event naming of</p>
+<p><code>02-agent-runtime-contract.md</code>):</p>
+<ul>
+<li><code>marketplace.item.installed</code></li>
+<li><code>marketplace.item.status_changed</code></li>
+</ul>
+<p>Existing adjacent surface: skill management runs through agent tools</p>
+<p>(<code>tools/skill_manager_tool.py</code>, <code>tools/skills_tool.py</code>) and the dashboard</p>
+<p>config API used by <code>web/src/pages/SkillsPage.tsx</code>; a Marketplace API should</p>
+<p>wrap these rather than duplicate them.</p>
+<h2>Data Model</h2>
+<p>Planned entities (no persistence exists today):</p>
+<pre><code class="language-text">marketplace_items
+- id
+- kind: skill | recipe | template | element_pack | character_pack
+- title, description, category
+- inputs_schema (JSON Schema)
+- output_type
+- required_tools (list)
+- provider_constraints (ref into model catalog constraints)
+- version
+- source: checked_in | curated | user_published (P3)
+
+marketplace_install_state
+- item_id
+- workspace_id
+- status: installed | available | disabled | deprecated
+- installed_by, installed_at</code></pre>
+<p>For <code>kind=skill</code>, the item must reference the existing skill metadata as the</p>
+<p>single source of truth (<code>agent/skill_bundles.py</code> bundle files, <code>skills/*/</code></p>
+<p>SKILL.md frontmatter) instead of copying it. For <code>kind=element_pack</code> /</p>
+<p><code>character_pack</code>, items reference <code>asset_references</code> owned by the Asset</p>
+<p>Service (<code>docs/hermes-asset-library-backend-design.md</code> §核心实体); the</p>
+<p>Marketplace must not own asset state.</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Catalog grid grouped by category; each card shows kind badge, title,</li>
+</ul>
+<p>one-line description, status chip, and version.</p>
+<ul>
+<li>Detail view shows the full item envelope, including <code>inputs_schema</code></li>
+</ul>
+<p>rendered as a field list, <code>required_tools</code>, and <code>provider_constraints</code>.</p>
+<ul>
+<li>Install/enable/disable actions are explicit buttons with confirmation; no</li>
+</ul>
+<p>hover-install or auto-enable.</p>
+<ul>
+<li>Disabled and deprecated items render with distinct visual state but remain</li>
+</ul>
+<p>clickable for inspection.</p>
+<ul>
+<li>A marketplace search result card must be visually typed so &quot;a model recipe</li>
+</ul>
+<p>does not look like a generated image&quot; (<code>05-memory-marketplace-files.md</code></p>
+<p>§Search).</p>
+<ul>
+<li>Non-goal: do not merge Marketplace into a generic &quot;Assets&quot; page</li>
+</ul>
+<p>(<code>01-product-surface.md</code> §Non-Goals).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Permissions (from <code>05-memory-marketplace-files.md</code> §Access Control):</p>
+<ul>
+<li><code>read</code>: any workspace member can browse the catalog, including disabled</li>
+</ul>
+<p>items.</p>
+<ul>
+<li><code>use</code>: requires <code>installed</code> status and registry-side profile inclusion.</li>
+<li><code>update</code> / <code>delete</code>: catalog curation rights; in the local-catalog phase</li>
+</ul>
+<p>this means repo maintainers, not end users.</p>
+<p>Error contract (typed, per <code>02-agent-runtime-contract.md</code> §Error Contract</p>
+<p>style):</p>
+<table><thead><tr><th>Error</th><th>Trigger</th></tr></thead><tbody>
+<tr><td><code>marketplace_item_not_found</code></td><td>Unknown or cross-workspace item id.</td></tr>
+<tr><td><code>marketplace_item_deprecated</code></td><td>Install attempt on deprecated item.</td></tr>
+<tr><td><code>skill_guard_rejected</code></td><td>Skill item failed the acquisition safety gate (<code>tools/skills_guard.py</code>); the rejection reason must be shown, not swallowed.</td></tr>
+<tr><td><code>required_tool_missing</code></td><td>Item declares <code>required_tools</code> that the current deployment does not provide.</td></tr>
+</tbody></table>
+<p>Failures must be explicit. An item that cannot run because a required tool or</p>
+<p>provider is missing renders as blocked-with-reason, never as silently hidden.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>Left nav exposes a Marketplace entry that opens a catalog page.</li>
+<li>The catalog lists checked-in workflow skills with correct</li>
+</ul>
+<p>installed/available/disabled status (P1 gate:</p>
+<p>&quot;Marketplace shows available workflows and status&quot;,</p>
+<p><code>06-delivery-plan.md</code>).</p>
+<ul>
+<li>Installing a skill item routes through the existing guard path and the</li>
+</ul>
+<p>result is visible in both Marketplace and the Skill Registry state.</p>
+<ul>
+<li>A disabled item remains visible and inspectable.</li>
+<li>Search returns marketplace entries as typed cards distinct from assets,</li>
+</ul>
+<p>files, and memory.</p>
+<ul>
+<li>No item kind other than <code>skill</code> is required for P1; recipes, templates, and</li>
+</ul>
+<p>packs may render as &quot;coming soon&quot; categories without fake entries.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Public app store, payments, or third-party publishing in P0-P2.</li>
+<li>Replacing the Skill Registry: Marketplace never loads skill content into</li>
+</ul>
+<p>the agent context; it only changes acquisition/enable state.</p>
+<ul>
+<li>Auto-installing skills based on router decisions.</li>
+<li>Owning Element/character pack asset state (Asset Service owns it).</li>
+<li>Marketplace-driven removal of upstream Hermes skills</li>
+</ul>
+<p>(<code>04-skill-tool-prompt-contract.md</code> §Non-Goals: disable/allowlist first).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Catalog source of truth for non-skill kinds: checked-in YAML next to</li>
+</ol>
+<p>skills, or a small DB table seeded at startup?</p>
+<ol>
+<li>Is install state per-workspace or per-user? <code>05-memory-marketplace-files.md</code></li>
+</ol>
+<p>scopes memory by user/workspace/project but is silent for marketplace</p>
+<p>install state.</p>
+<ol>
+<li>Version pinning: when a checked-in skill updates, do installed items</li>
+</ol>
+<p>auto-upgrade or hold the installed version? (<code>tools/skills_hub.py</code> lock</p>
+<p>install paths suggest pinning is intended for hub installs.)</p>
+<ol>
+<li>Does the Ultra allowlist profile (<code>04-skill-tool-prompt-contract.md</code>)</li>
+</ol>
+<p>filter the catalog view itself, or only runtime activation?</p>
+<ol>
+<li>How do Marketplace search results rank against assets/files/memory in the</li>
+</ol>
+<p>unified Search surface?</p>
+<ol>
+<li>Whether <code>PluginsPage</code>-style per-plugin visibility flags should be unified</li>
+</ol>
+<p>into marketplace install state or remain a separate admin concept.</p>
+</main></div>
+</body>
+</html>

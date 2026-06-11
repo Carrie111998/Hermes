@@ -1,0 +1,78 @@
+# 资产管理 Element Management
+
+Notion page id: 3720837e-a8a7-80e9-b333-f8c6d2e07ded
+Depth: 1
+Parent: 36e0837ea8a780eeb368e66611362836
+
+## Content
+
+这个模块负责语义化资产的持久化。它解决的是 AI 生成中最大的痛点：如何让同一个角色、同一件道具或同一个场景在不同任务中保持一致。
+
+### A. Soul ID (身份管理)
+
+通过 higgsfield_soul_id 工具实现，专门针对人脸生物特征。
+
+- 训练机制：通过 action='create' 提交 1-100 张图像。系统在后台启动 GPU 训练作业，提取面部高维特征并生成一个专有的身份权重。
+
+- 持久化标识：产出为一个 reference_id (UUID)。这个 ID 就像一个指纹，只要调用它，生成模型就会在潜空间中强制对齐面部特征。
+
+- 状态维护：支持 status 查询，训练通常耗时 30 分钟。
+
+### B. Element (元素管理)
+
+通过 higgsfield_element 工具实现，负责除单纯人脸外的对象化引用。
+
+- 分类体系 (category)：包含 character (全身角色)、environment (特定场景)、prop (特定道具)。
+
+- 注册逻辑：不同于 Soul ID 的重新训练，Element 更多是将已生成的优秀结果（Job ID）或上传的原始素材（Media ID）进行“标签化”包装。
+
+- 引用机制：创建后生成的 element_id 可以在后续的提示词中以 <element-tag value="element_id">element\_id</element-tag> 的形式注入。后端解析器会自动将占位符替换为对应的多模态特征向量。
+
+---
+
+### 2. Media Generation（媒体生成）
+
+这个模块是物理渲染层，负责执行具体的生成算法，将管理模块产出的“定义”转化为像素。
+
+### A. 核心生成工具
+
+主要通过 higgsfield_generate 接口运行。它不直接管理资产，而是消费资产。
+
+### B. 渲染模型矩阵
+
+系统根据任务需求路由到不同的底层模型：
+
+- 图像渲染：
+  - text2image_soul_v2：专门消费 soul_id 的渲染引擎。
+  - flux_2 / grok_image / imagegen_2_0：负责通用高质量图像渲染。
+  - cinematic_studio_2_5：侧重于电影感光影渲染。
+
+- 视频渲染：
+  - seedance_2_0：核心视频生成模型，支持 image 角色参考。
+  - veo-3-1-preview / kling3_0 / minimax-2.3：针对不同动态幅度和画质需求的视频渲染引擎。
+
+### C. 数据流向
+
+1. 参数注入：在 params 中接收来自管理模块的 ID。例如，在 text2image_soul_v2 中传入 soul_id。
+
+1. 多模态参考：通过 medias 或 images 数组接收参考帧。这些参考帧往往是管理模块中记录的 media_input 或 image_job。
+
+1. 并发控制：渲染层受 limits（如 text2image_concurrent_jobs）约束。
+
+---
+
+### 3. 两个模块的协作逻辑
+
+- 管理模块是“大脑”：它记住了“谁”是张三，“哪个”是特定的咖啡杯。
+
+- 生成模块是“画笔”：它根据大脑提供的 ID 和文字指令，在画布上画出像素。
+
+举例流程：
+
+1. 用户上传照片 -> 管理模块 (higgsfield_soul_id) 训练出 ID_A。
+
+1. 用户要求生成张三在公园 -> 生成模块 (higgsfield_generate) 调用 text2image_soul_v2，传入 ID_A 和 prompt "in the park"。
+
+1. 生成成功 -> 资产处理 (artifacts) 记录结果。
+
+这种架构分离确保了 Higgsfield 能够实现复杂的生产流水线（如电影感视频流），因为角色和环境的定义是独立于单次生成尝试而存在的。

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extension Seams and Migration Plan</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Extension Seams and Migration Plan</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="06-extension-seams-migration-plan.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Extension Seams and Migration Plan</h1>
+<p>Status: future-proofing design</p>
+<p>Date: 2026-06-11</p>
+<h2>Purpose</h2>
+<p>This document defines the seams that P0 must reserve so later infrastructure can</p>
+<p>be added without rewriting the product.</p>
+<h2>P0 Seams To Reserve Now</h2>
+<table><thead><tr><th>Seam</th><th>P0 implementation</th><th>Future replacement</th></tr></thead><tbody>
+<tr><td>Credential access</td><td>env-backed Atlas credential shim</td><td>TokenRouter + vault</td></tr>
+<tr><td>Job execution</td><td>synchronous wrapper with DB row</td><td>worker queue / Temporal workflow</td></tr>
+<tr><td>Realtime state</td><td>existing web gateway events</td><td>durable event stream / NATS replay</td></tr>
+<tr><td>Asset storage</td><td>local file path plus asset row</td><td>object storage plus signed URLs</td></tr>
+<tr><td>Router</td><td>prompt-level workflow-router</td><td>deterministic route tool / workflow runtime</td></tr>
+<tr><td>Provider adapter</td><td>Atlas image/video provider</td><td>provider registry with capability constraints</td></tr>
+<tr><td>Policy</td><td>simple server checks</td><td>OPA policy bundle</td></tr>
+<tr><td>Browser</td><td>unsupported or local manual browser</td><td>browser context service</td></tr>
+<tr><td>Sandbox</td><td>unsupported</td><td>E2B/Kata/Docker-backed execution service</td></tr>
+<tr><td>Media preprocessing</td><td>direct upload/image URL</td><td>CometAPI resolver/transcoder/packager</td></tr>
+</tbody></table>
+<h2>Anti-Rewrite Rules</h2>
+<p>P0 code should not:</p>
+<ul>
+<li>pass raw file paths as the only asset identity;</li>
+<li>return provider output directly to UI without an asset row;</li>
+<li>call Atlas directly from frontend;</li>
+<li>put provider keys into chat messages or tool outputs;</li>
+<li>hardcode <code>FAL</code> or other fallback providers;</li>
+<li>make router output transient only in model text;</li>
+<li>make UI depend on provider-specific response shape;</li>
+<li>make upload records separate from asset records forever.</li>
+</ul>
+<h2>Migration Steps</h2>
+<h3>Step 1: Local P0</h3>
+<pre><code class="language-text">SQLite media_jobs/media_assets
+local upload directory
+Atlas provider wrappers
+web gateway events
+React media cards</code></pre>
+<p>This proves the loop.</p>
+<h3>Step 2: Worker Split</h3>
+<p>Trigger: video polling blocks chat, refresh recovery is weak, or jobs run longer</p>
+<p>than a single request.</p>
+<p>Move provider calls to a worker while keeping:</p>
+<ul>
+<li>same <code>media_job</code> schema;</li>
+<li>same <code>media_job.*</code> events;</li>
+<li>same <code>asset.ready</code> event;</li>
+<li>same UI media card contract.</li>
+</ul>
+<h3>Step 3: TokenRouter</h3>
+<p>Trigger: multi-user use, quota, or credential safety pressure.</p>
+<p>Replace env credential shim with:</p>
+<pre><code class="language-text">media job wrapper
+  -&gt; TokenRouter request
+  -&gt; provider route</code></pre>
+<p>Do not change UI or router output.</p>
+<h3>Step 4: Object Storage</h3>
+<p>Trigger: assets need sharing, retention, or cross-machine access.</p>
+<p>Replace local <code>path</code> with object metadata:</p>
+<pre><code class="language-text">asset_id
+object_key
+preview_object_key
+signed_download_url
+checksum</code></pre>
+<p>Keep <code>asset_id</code> stable.</p>
+<h3>Step 5: CometAPI</h3>
+<p>Trigger: long video/audio analysis, external URL ingestion, repeated frame</p>
+<p>sampling, or native multimodal packaging.</p>
+<p>Insert CometAPI before provider/model calls:</p>
+<pre><code class="language-text">asset or URL
+  -&gt; CometAPI preprocess
+  -&gt; packaged media input
+  -&gt; provider route</code></pre>
+<p>Do not let CometAPI own credentials or policy.</p>
+<h3>Step 6: Browser And Sandbox</h3>
+<p>Trigger: user asks for authenticated web references, file transforms, custom</p>
+<p>render scripts, or account actions.</p>
+<p>Add separate resource types:</p>
+<pre><code class="language-text">browser_context_id
+sandbox_id
+workspace_mount_id</code></pre>
+<p>These are not chat messages. They are scoped resources with lifecycle, audit,</p>
+<p>and revoke/delete operations.</p>
+<h3>Step 7: Full Workflow Runtime</h3>
+<p>Trigger: workflows need resumable multi-stage execution, approvals, branching,</p>
+<p>or retries beyond a simple job row.</p>
+<p>Promote:</p>
+<ul>
+<li>router decision to workflow state;</li>
+<li>media job stages to workflow activities;</li>
+<li>approvals to interrupt/resume states;</li>
+<li>QA and repair to explicit stages.</li>
+</ul>
+<p>LangGraph or Temporal can fit here, but the product contract should already be stable.</p>
+<h2>Interface Stability Matrix</h2>
+<table><thead><tr><th>Interface</th><th>Must remain stable across migrations</th></tr></thead><tbody>
+<tr><td>UI media card</td><td>reads <code>media_job</code> and <code>asset</code>, not provider payload</td></tr>
+<tr><td>Router handoff</td><td>emits intent, tool, asset roles, missing fields</td></tr>
+<tr><td>Provider wrapper</td><td>returns typed success/error, not raw provider response</td></tr>
+<tr><td>Asset API</td><td>accepts <code>asset_id</code>; implementation can move from local path to object storage</td></tr>
+<tr><td>Events</td><td><code>media_job.created</code>, <code>media_job.updated</code>, <code>asset.ready</code>, <code>error</code></td></tr>
+<tr><td>Errors</td><td>typed codes remain stable even if backend changes</td></tr>
+</tbody></table>
+<h2>Future Feature Placement</h2>
+<table><thead><tr><th>Feature</th><th>Correct placement</th><th>Wrong placement</th></tr></thead><tbody>
+<tr><td>Character consistency</td><td>asset-derived Character service</td><td>prompt string only</td></tr>
+<tr><td>Element library</td><td>asset-derived Element service</td><td>tags in chat messages</td></tr>
+<tr><td>Smart Groups</td><td>saved asset query</td><td>manual collection mutation</td></tr>
+<tr><td>Marketplace skills</td><td>skill package registry</td><td>arbitrary hidden prompt text</td></tr>
+<tr><td>Brand memory</td><td>memory service with source links</td><td>global system prompt</td></tr>
+<tr><td>Browser automation</td><td>browser context service</td><td>direct UI hack in chat component</td></tr>
+<tr><td>Sandbox transforms</td><td>sandbox execution service</td><td>local shell from web request</td></tr>
+<tr><td>Billing</td><td>TokenRouter/usage ledger</td><td>provider response parsing in UI</td></tr>
+</tbody></table>
+<h2>Validation For Future Additions</h2>
+<p>Any new capability must answer:</p>
+<ol>
+<li>What state does it own?</li>
+<li>What IDs does it create?</li>
+<li>What events does it emit?</li>
+<li>What typed errors can it return?</li>
+<li>What assets does it read or write?</li>
+<li>Which skill routes to it?</li>
+<li>Which policy checks apply?</li>
+<li>How is it disabled without breaking P0?</li>
+</ol>
+<p>If it cannot answer these, it is not ready to enter the product architecture.</p>
+</main></div>
+</body>
+</html>

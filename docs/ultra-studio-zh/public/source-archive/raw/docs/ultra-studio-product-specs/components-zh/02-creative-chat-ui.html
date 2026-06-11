@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>02 创作聊天界面 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">02 / 19</span>
+      </nav>
+      <h1>02 创作聊天界面</h1>
+      <p class="lede">用户描述创作目标、上传素材、回答澄清问题、审批动作、查看生成进度的主工作区。打开页面不能自动开始生成。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Creative Chat UI</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 /chat 网页聊天、WebSocket JSON-RPC、session create/resume、文本流式输出。</li>
+          <li>已有上传附件、slash command、工具运行状态、clarify/approval/sudo/secret prompt cards。</li>
+          <li>代码证据：web/src/pages/ChatPage.tsx、web/src/hooks/useGatewayChat.ts、web/src/lib/chatUpload.ts、web/src/components/chat/*。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>媒体卡片、模型选择器、thinking/reasoning 展示、typed errors、可恢复 approval 都不完整。</li>
+          <li>media_job.created/updated、asset.ready 事件未接入。</li>
+          <li>上传附件仍偏文本化，未稳定变成 typed media_input ref。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>聊天只通过真实 Hermes session 运行，不 hardcode 用户请求或视频结果。</li>
+          <li>上传图片/视频后进入资产/输入引用，后续工具可读取。</li>
+          <li>生成中的文字和状态必须流式显示，不能长时间卡住。</li>
+          <li>生成完成后在 transcript 内显示真实图片/视频预览卡。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>媒体提及菜单、asset picker、角色/Element 选择器。</li>
+          <li>多模型切换、provider 约束提示、失败恢复卡。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>用户只说“你好”时不会自动做视频。</li>
+          <li>用户请求生成图片/视频时能看到状态变化和最终真实媒体。</li>
+          <li>刷新或 resume 后至少能恢复 transcript 和已完成结果。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/02-creative-chat-ui.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/02-creative-chat-ui.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/02-creative-chat-ui.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="01-left-nav-shell.html">上一页：01 左侧导航外壳</a>
+        <a class="chip" href="03-inspector-live-panel.html">下一页：03 右侧检查器 / 实时面板</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

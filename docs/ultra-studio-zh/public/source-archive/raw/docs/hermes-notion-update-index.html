@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Notion 更新索引</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink:#16202a;
+  --muted:#5b6673;
+  --line:#d8e0e8;
+  --panel:#f6f8fa;
+  --accent:#146b62;
+  --accent2:#7b4a18;
+  --bg:#ffffff;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  color:var(--ink);
+  background:var(--bg);
+  line-height:1.58;
+}
+header {
+  border-bottom:1px solid var(--line);
+  background:#f5f8f9;
+}
+.wrap { max-width:1120px; margin:0 auto; padding:28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+p { margin:8px 0; }
+a { color:#0b6070; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0d9; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.notice { border-left:5px solid var(--accent); background:#eff8f6; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:132px; }
+.card strong { display:block; margin-bottom:5px; }
+.small { color:var(--muted); font-size:13px; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f6; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { border-top:1px solid var(--line); margin-top:34px; color:var(--muted); font-size:13px; }
+@media (max-width:720px) { .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="kicker">Hermes Notion 更新</div>
+    <h1>Hermes Notion 更新索引</h1>
+    <p>Notion 的 Hermes 更新已保留为本地源快照，并按架构边界拆成多个实现文档。这个入口只负责导航，不把所有内容合并成一个长文档。</p>
+    <div class="meta">
+      <span class="pill">刷新：2026-06-02</span>
+      <span class="pill">源页面：8</span>
+      <span class="pill">派生文档：6</span>
+    </div>
+  </div>
+</header>
+<main class="wrap">
+  <section class="notice">
+    <strong>拆分原则</strong><br>
+    <code>references/</code> 是 Hermes 认知层；TokenRouter 是控制面；CometAPI 是媒体数据面；Soul ID/Element 是资产模型；工具 schema 是接口合约。它们互相关联，但不应该写成一个文档。
+  </section>
+
+  <section>
+    <h2>专题文档</h2>
+    <div class="grid">
+      <article class="card">
+        <strong><a href="hermes-references-knowledge-model.md">Hermes references 知识模型</a></strong>
+        <p class="small">Skill 内部 references、用户附件、生成资产引用三者拆分。</p>
+        <p>定义 System Prompt、SKILL.md、references/ 的热/温/冷知识层和导出保护。</p>
+      </article>
+      <article class="card">
+        <strong><a href="hermes-tokenrouter-credential-flow.md">TokenRouter 零信任凭证流</a></strong>
+        <p class="small">控制面、JWT、quota、vault key exchange。</p>
+        <p>定义 sandbox blind-state、四阶段凭证交换、策略输入和验收检查。</p>
+      </article>
+      <article class="card">
+        <strong><a href="hermes-cometapi-media-gateway.md">CometAPI 媒体数据面网关</a></strong>
+        <p class="small">媒体数据面，暂不作为 MVP 默认服务。</p>
+        <p>覆盖外部媒体解析、裁剪、抽帧、音频/字幕对齐和多模态 payload。</p>
+      </article>
+      <article class="card">
+        <strong><a href="hermes-soulid-element-asset-model.md">Soul ID 与 Element 资产模型</a></strong>
+        <p class="small">持久化语义资产模型。</p>
+        <p>定义 soul_id、element、media_input、image_job/video_job 和本地数据模型。</p>
+      </article>
+      <article class="card">
+        <strong><a href="hermes-soulid-reproduction-and-test-plan.md">Soul ID 复现与测试计划</a></strong>
+        <p class="small">实验计划，不是生产事实。</p>
+        <p>记录模型探测、开源复现路径和评估指标，避免把猜测写进生产架构。</p>
+      </article>
+      <article class="card">
+        <strong><a href="hermes-tool-contracts-from-notion.md">Notion 工具合约映射</a></strong>
+        <p class="small">default_api 工具清单和本地映射。</p>
+        <p>聚焦 ask_user_question、media_generate、identity_reference、asset_reference 等 MVP 工具。</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>Notion 源快照</h2>
+    <table>
+      <thead><tr><th>页面</th><th>本地源文件</th></tr></thead>
+      <tbody>
+        <tr><td>Hermes root</td><td><code>docs/notion-source/hermes/pages/00-hermes.md</code></td></tr>
+        <tr><td>soulID</td><td><code>docs/notion-source/hermes/pages/01-soulid.md</code></td></tr>
+        <tr><td>测试实际模型</td><td><code>docs/notion-source/hermes/pages/02-测试实际模型.md</code></td></tr>
+        <tr><td>复现方式</td><td><code>docs/notion-source/hermes/pages/03-复现方式.md</code></td></tr>
+        <tr><td>资产管理 Element Management</td><td><code>docs/notion-source/hermes/pages/04-资产管理-element-management.md</code></td></tr>
+        <tr><td>工具调用说明文档</td><td><code>docs/notion-source/hermes/pages/05-工具调用说明文档.md</code></td></tr>
+        <tr><td>tokenrouter</td><td><code>docs/notion-source/hermes/pages/06-tokenrouter.md</code></td></tr>
+        <tr><td>CometAPI</td><td><code>docs/notion-source/hermes/pages/07-cometapi.md</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+<footer>
+  <div class="wrap">另见 <code>hermes-notion-update-index.md</code>。</div>
+</footer>
+</body>
+</html>

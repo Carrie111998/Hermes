@@ -61,6 +61,17 @@ const standaloneItems = [
   { text: '技能 / 工具 / 提示词规格', link: '/standalone/ultra-studio-agent-skill-tool-prompt-design' }
 ]
 
+const sourceArchiveItems = [
+  { text: '归档总览', link: '/source-archive/README' },
+  { text: '完整源文档清单', link: '/source-archive/inventory' },
+  { text: 'Hermes 专题文档', link: '/source-archive/hermes-topic-docs' },
+  { text: 'Notion 源文档', link: '/source-archive/notion' },
+  { text: 'Lark 源文档', link: '/source-archive/lark' },
+  { text: '旧版 Ultra Studio 文档包', link: '/source-archive/legacy-ultra-studio' },
+  { text: '开源架构 HTML 包', link: '/source-archive/open-source-architecture' },
+  { text: '历史计划文档', link: '/source-archive/plans' }
+]
+
 export default defineConfig({
   lang: 'zh-CN',
   title: 'Ultra Studio',
@@ -71,7 +82,8 @@ export default defineConfig({
   ignoreDeadLinks: [
     (url) =>
       url.includes('../ultra-studio-docs-zh/') ||
-      url.includes('../ultra-studio-agent-architecture.html')
+      url.includes('../ultra-studio-agent-architecture.html') ||
+      url.includes('/source-archive/raw/')
   ],
   markdown: {
     lineNumbers: true,
@@ -88,6 +100,7 @@ export default defineConfig({
       { text: '产品', link: '/product-specs/00-index' },
       { text: '组件', link: '/product-specs/components/README' },
       { text: '基建', link: '/infra-design/00-index' },
+      { text: '源文档', link: '/source-archive/README' },
       { text: '长期参考', link: '/long-term-reference' },
       { text: '上线', link: '/preservation-and-deploy' }
     ],
@@ -109,7 +122,8 @@ export default defineConfig({
       { text: '组件规格', collapsed: true, items: componentItems },
       { text: '基建设计', collapsed: false, items: infraItems },
       { text: '调研分析', collapsed: true, items: researchItems },
-      { text: '独立专题', collapsed: true, items: standaloneItems }
+      { text: '独立专题', collapsed: true, items: standaloneItems },
+      { text: '源文档归档', collapsed: false, items: sourceArchiveItems }
     ],
     search: {
       provider: 'local'

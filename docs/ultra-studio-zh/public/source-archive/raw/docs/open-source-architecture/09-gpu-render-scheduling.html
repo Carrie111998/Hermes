@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GPU Render Scheduling / Supercomputer Fabric - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>GPU Render Scheduling / Supercomputer Fabric</h1>
+<p>Kueue 做批量 AI/ML/GPU job admission、quota、borrowing/preemption；GPU Operator 管理 NVIDIA driver、device plugin、runtime 和监控组件。</p>
+<div class="meta"><span class="pill">推荐：Kueue + NVIDIA GPU Operator</span><span class="pill">对应 spec：Sections 10, 17, 18, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="08-event-bus-realtime-fanout.html">上一项</a><a href="10-skill-workflow-runtime.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Kueue + NVIDIA GPU Operator 是该模块的主选型。Hermes 的 supercomputer 本质是多租户 GPU batch fabric：要按 plan/tenant 控制 queue、quota、priority、concurrency 和抢占。Kueue 是 Kubernetes-native 的 job queueing 方案，贴合这个模型。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 的 supercomputer 本质是多租户 GPU batch fabric：要按 plan/tenant 控制 queue、quota、priority、concurrency 和抢占。Kueue 是 Kubernetes-native 的 job queueing 方案，贴合这个模型。</li>
+<li>NVIDIA GPU Operator 把 driver、container toolkit、device plugin、DCGM exporter 等 GPU 节点基础设施自动化，减少手工节点漂移。</li>
+<li>相比 Slurm，Kueue 更适合和现有 K8s control plane、namespace、quota、GitOps、GPU worker deployment 整合。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Slurm</strong></td><td>HPC 调度成熟，GPU 集群经验丰富</td><td>和 K8s SaaS 控制面、per-tenant web workload、GitOps 的集成成本高</td></tr>
+<tr><td><strong>Volcano</strong></td><td>批调度能力强</td><td>生态和 SIG Scheduling/Kueue 的 K8s 原生 Job API 方向需要权衡</td></tr>
+<tr><td><strong>Ray/KubeRay</strong></td><td>分布式 Python/ML 任务强</td><td>更像计算框架；不应替代租户 quota/admission 的底层调度层</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>每个 plan 或 tenant tier 映射到 LocalQueue；ClusterQueue 定义 GPU/CPU/memory quota、cohort borrowing 和 preemption 策略。</li>
+<li>Job Manager 只创建受控 Job/Workload，不让 sandbox 直接提交 Kubernetes Job。</li>
+<li>GPU worker 启动后从 Job Manager 获取 lease 和 input manifest，只能写 assigned output_prefix。</li>
+<li>GPU Operator 管理节点 GPU 栈，DCGM metrics 进入 OpenTelemetry/Grafana。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：单 GPU node pool + Kueue LocalQueue + one model worker。</li>
+<li>第二阶段：按 model/profile 分队列，MIG/whole GPU 策略，spot/on-demand 分层。</li>
+<li>第三阶段：tenant fairness、preemption、multi-region queue admission。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>超过 tenant GPU quota 的 job 等待而不是直接创建 pod。</li>
+<li>Worker 无法写 assigned output_prefix 之外的对象。</li>
+<li>GPU node 驱动/device plugin 版本漂移能被 operator/observability 捕获。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://kueue.sigs.k8s.io/docs/overview/">Kueue overview</a></li>
+<li><a href="https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/">NVIDIA GPU Operator docs</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

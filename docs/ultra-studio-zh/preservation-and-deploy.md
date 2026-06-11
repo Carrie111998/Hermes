@@ -12,6 +12,9 @@
 | Markdown 主源 | `docs/ultra-studio-zh/**/*.md` | 是 | 文档网站的主要内容源。 |
 | 图谱资源 | `docs/ultra-studio-zh/assets/*.svg` | 是 | 架构图、路线图、阅读路径图。 |
 | VitePress 配置 | `docs/ultra-studio-zh/.vitepress/config.mts` | 是 | 导航、侧边栏、搜索、站点标题。 |
+| 源文档归档页 | `docs/ultra-studio-zh/source-archive/*.md` | 是 | 站点外历史文档、Notion/Lark 导出、旧 HTML 和专题文档清单。 |
+| 可读原文镜像 | `docs/ultra-studio-zh/public/source-archive/raw/**/*.md.txt`、`*.html`、`*.css` | 是 | 保留历史 Markdown/HTML/CSS 原文，供清单页直接打开核对。 |
+| raw API payload | `docs/notion-source/**/*.raw.json`、`docs/lark-source/**/*.raw.json` | 先不进站点 public | 只在清单登记；需要脱敏、拆分或确认后再公开镜像。 |
 | 构建生成的 HTML | `docs/ultra-studio-zh/.vitepress/dist/**/*.html` | 否 | 上线产物，可通过构建命令重新生成。 |
 | 依赖目录 | `docs/ultra-studio-zh/node_modules/` | 否 | 本地安装产物，不提交。 |
 | 构建输出 | `docs/ultra-studio-zh/.vitepress/dist/` | 否 | 可通过 `npm run docs:build` 重新生成。 |
@@ -24,6 +27,7 @@
 - “已实现 / 部分实现 / 已规定未构建”必须明确，不能把文档能力说成运行时能力。
 - 代码/API 名保留英文，读者解释用中文。
 - TokenRouter、CometAPI、Sandbox lifecycle、Asset Service、Memory、Marketplace、Ledger 等长期能力必须保留入口，即使 P0 不实现。
+- 站点外新增源文档必须进入 [源文档归档](source-archive/README)；可读 `md/html/css` 可以进 public 镜像，其中 Markdown 用 `.md.txt`，raw JSON 需要先做脱敏和行数检查。
 
 ## 本地预览
 
@@ -85,4 +89,5 @@ git diff --check -- docs/ultra-studio-zh
 - `node_modules/` 没有被加入 git。
 - `.vitepress/dist/` 没有被加入 git。
 - 新页面已加入侧边栏或文档地图。
+- 站点外新增原文已加入源文档归档。
 - 中文页面没有只剩英文标题和英文缩写。

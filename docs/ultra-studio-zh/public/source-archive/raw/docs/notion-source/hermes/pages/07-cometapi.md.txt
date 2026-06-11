@@ -1,0 +1,63 @@
+# CometAPI
+
+Notion page id: 3730837e-a8a7-80f2-90d3-e8e874edcf20
+Depth: 1
+Parent: 36e0837ea8a780eeb368e66611362836
+
+## Content
+
+### 一、 核心职责与设计初衷 (Core Responsibility) [LITERAL PROMPT]
+
+在多模态 Agent 工作流中，传统的 API 网关通常只处理结构化的 JSON 文本数据。当 Agent 需要分析用户提供的视频（如 TikTok 视频、YouTube 链接或本地 MP4）时，会面临两个核心瓶颈：
+
+1. Token 限制与计算开销：高清长视频直接输入多模态模型会导致 Token 消耗急剧膨胀，单次请求成本高昂且容易耗尽上下文窗口。
+
+1. 抓取与网络限制：社交媒体平台（如 Instagram/TikTok）具有严格的防爬虫机制，Agent 运行沙箱直接请求经常会被封禁或返回 403 错误。
+
+CometAPI 是专门为解决多媒体流式分析而设计的物理层网关，它与负责控制与计费的 TokenRouter 并行运作，专门处理图像、音频和视频的物理采样与预处理。
+
+---
+
+### 二、 四层物理架构与工作流 (Physical Architecture & Workflow) [INFERENCE]
+
+CometAPI 内部包含四个紧密耦合的核心逻辑模块，它们协同完成多媒体输入到模型可用 Token 的转换：
+
+### 1. 物理抓取与旁路解析层 (Bypass Scraper & Resolver)
+
+- 网络旁路 (Scraper Proxy)：当 Agent 发起 video_analyze 或 audio_analyze 任务并传入外部 URL（如 YouTube/TikTok）时，CometAPI 会拦截该请求，并利用其边缘部署的专用高匿代理集群进行抓取。
+
+- 原生解析器 (Native Resolvers)：
+  - YouTube 链路：直接走 Google 官方/流式数据通道获取视频片段与自动生成的 ASR 字幕，无需完整下载 [INFERENCE]。
+  - TikTok/Instagram 链路：通过内置的专有抓取服务（基于 yt-dlp 的二次定制开发）绕过验证码和滑动防御，将视频流式拉取到 CometAPI 沙箱的临时缓冲区中。
+
+### 2. 视频物理剪切与下采样层 (Physical Trimming & Downsampling)
+
+- 剪切窗口过滤 (Time-Window Filter)：网关接收 Agent 传入的 start_offset_sec（起始秒数）和 end_offset_sec（结束秒数）参数，物理裁剪视频，只保留需要分析的片段。
+
+- 下采样机制 (Downsampling Engine)：
+  - FPS（帧率）物理抽帧：根据传入的 fps 参数（标准模式下 fps=1，即每秒抽取 1 帧；高级模式下 fps=2），CometAPI 会直接解码视频流并执行物理抽帧，丢弃冗余帧。
+  - 分辨率重压缩 (Resolution Transcoding)：根据 Agent 请求的 media_resolution（如 LOW 或 MEDIUM），通过内置的轻量化物理转码引擎（基于 FFmpeg 硬件加速）将画幅物理压缩至指定的低分辨率（例如 480p 或 360p）以节省带宽和推理算力。
+
+### 3. 多模态 Token 物理重组层 (Token Packaging Layer)
+
+- 物理抽帧流化 (Frame Sequence Serialization)：将处理后的图像帧序列物理打包为内存中的 base64 数据流或写入临时对象存储（S3 Presigned URL）。
+
+- 多模态对齐 (Multimodal Alignment)：CometAPI 会将这组「低帧率、低分辨率」的物理帧序列，与抓取到的音频轨 (Audio Part) 及字幕轨 (ASR Transcript) 按时间戳进行时间轴上的物理对齐。
+
+### 4. 原生多模态注入 (Native injection)
+
+- 大模型直接通道：CometAPI 将重组对齐后的多模态 Frame 序列打包成模型（如 Gemini）原生支持的物理输入片段（例如 google.ai 规范中的图像序列部分），直接送入大模型，并将模型返回的文本分析结果（JSON 或 Markdown）以极低的文本延迟回传给 TokenRouter 和 Agent 沙箱。
+
+---
+
+### 三、 性能与稳定性保障设计 (Performance & Reliability) [INFERENCE]
+
+1. 零内存拷贝 (Zero-Copy Frame Processing)：CometAPI 在解码和抽帧时，采用内存映射文件与 GPU 硬件解码共享内存的技术，避免多媒体二进制数据在内存中的多次复制，极大降低了 CPU 负载与处理时延。
+
+1. 高速缓存复用 (Video-Chunk Cache)：对于相同的视频 URL，CometAPI 会在其物理边缘节点缓存已抽帧、已剪切的 Frame 序列。如果其他会话或 Agent 触发相同的视频分析，直接命中缓存返回，免去重复抓取和物理转码的过程。
+
+1. 熔断与降级机制 (Fallback Gates)：
+
+- 如果 CometAPI 的视频物理抓取彻底失败，它会触发降级策略，将错误返回给 Agent 并在前端暴露 [INFERENCE]。
+
+- 当多模态模型返回超时，CometAPI 会自动降级为「纯文本分析模式 (Text-Only Mode)」，仅通过提取到的视频元数据、标题、评论或 ASR 字幕轨让模型完成逻辑分析 [INFERENCE]。

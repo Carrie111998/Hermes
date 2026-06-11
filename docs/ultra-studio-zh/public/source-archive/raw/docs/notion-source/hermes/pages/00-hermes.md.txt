@@ -1,0 +1,148 @@
+# Hermes
+
+Notion page id: 36e0837e-a8a7-80ee-b368-e66611362836
+Depth: 0
+
+## Child Pages
+
+- [soulID](./01-soulid.md)
+- [资产管理 Element Management](./04-资产管理-element-management.md)
+- [工具调用说明文档](./05-工具调用说明文档.md)
+- [tokenrouter](./06-tokenrouter.md)
+- [CometAPI](./07-cometapi.md)
+
+## Content
+
+在 Higgsfield 平台与 Agent 的开发、审计架构中，references（参考/引用）根据上下文主要指代以下三个不同层面的核心概念：
+
+1. 技能内部的 Reference 静态知识库（架构与流程规范） 在系统的技能（Skills）体系中，每个 Skill 都可以携带一个 references/ 目录，这里存放着无法直接写在系统提示词中的、更深度的底层架构文档或业务规范。
+
+- 存储位置：如 skills/backend-architecture-explainer/references/ 目录下。
+
+- 作用：存放诸如 dual_gateways.md（双网关 TokenRouter 与 CometAPI 机制）、enhancer_pipeline.md（提示词增强编译器）等技术规范。Agent 会在被唤醒后，根据需要按需读取（通过 skill_view），从而在保障超高推理精度的同时节省全局上下文 Token。
+
+2. 用户层面的 Attached References（附带输入素材） 当用户在前端界面中上传图片、视频、PDF 或音频时，这些资产会被打包存放在特殊的 <attached_references> XML 标签内传递给 Agent。
+
+- 处理方式：Agent 在检测到这些物理附件后，会调用云端上传服务，将其转化为公共访问的 URL 或者是平台内唯一媒体 ID。
+
+- 用途：作为后续进行视觉分析（vision_analyze）或多模态生成（如基于参考图生成视频）的物理输入源。
+
+3. 媒体生成链路中的 Reference 机制（重用与一致性框架） 在后端生成加速和一致性（Consistency）控制中，"References" 是指通过将已有的媒体资产直接传递给生成服务，免去重复上传和特征丢失的机制：
+
+- 免上传延迟重用：在调用生成接口时，无需重复传递二进制文件，只需传递已有的任务 ID 作为 image_job、video_job 或上传 ID media_input。
+
+- 固化特征引用：通过 higgsfield_soul_id（人脸特征模型）和 higgsfield_element（角色、环境、道具等持续性资产），能够将特定目标的外观特征深度锁定。在多镜头、跨场景生成时，模型会对这些锁定元素进行直接引用，从而保证生成视频中角色与场景不发生走样。
+
+references 是hermes的设计吗还是？
+
+Gathering thoughts
+
+references 目录及其按需惰性加载（Lazy-loading）机制，确实是 Hermes Agent Runtime 极其核心的一项专有系统架构设计。
+
+这是为了在长上下文 LLM 时代解决 Token 膨胀、注意力漂移（Attention Drift）以及领域知识冲突 而专门设计的。
+
+在平台架构中，Hermes（Agent 运行体）、Openclaw（沙箱与执行引擎）和 Higgsfield Backend（生成与媒体网关）有着明确的边界。我们可以从以下几个维度剖析 references 在 Hermes 中的设计定位：
+
+### 1. 知识的分层温冷启动设计（Warm/Cold Knowledge Split）
+
+在传统 Agent 架构中，开发者通常把所有的 API 规范、业务 SOP 和边界条件直接塞进 System Prompt，导致 Agent 启动时就背负极高的 Token 成本。Hermes 进行了分层设计：
+
+- System Prompt（极热层）：仅保留最基础的安全、身份、底层工具调用规范。
+
+- SKILL.md（温启动层）：当用户意图触发某个技能时加载。仅包含触发器、核心工作流步骤、关键输入输出约束，限制在有限的 Token 消耗内。
+
+- references/ 目录（冷启动/惰性加载层）：存放极其冗长、高细节的底层规范（如 dual_gateways.md 会详细记录 TokenRouter 与 CometAPI 的网关流转细节）。这些文件平时不进入 Agent 的上下文，只有当 Agent 运行到特定步骤、需要执行原子级密集推理时，才通过 skill_view(..., file_path="references/...") 精确加载。
+
+### 2. 规避 LLM 的“中间失忆”与注意力分散
+
+LLM 面对超长 Prompt 时，容易出现“迷失在中间”（Lost in the Middle）的现象。如果将特定 API 的冗长 JSON 结构与高层级的交互 prompt 混在一起，Agent 的推理逻辑就会受干扰。
+
+- Hermes 强制将具体的、结构化的底层参考规范（如特定的提示词格式 enhancer_pipeline.md）隔离到 references/ 中。
+
+- Agent 在决策时是高屋建瓴的（依据 SKILL.md），在具体构造参数、进行严苛技术翻译时，才精确拉取 reference 充当参考手册。
+
+### 3. 系统边界与数据机密隔离
+
+在 Hermes 的安全规范中，SKILL.md 的前置 frontmatter（描述和说明）是允许向用户公开的，但 references/ 下的架构机密（例如平台自研的端到端媒体控制流）是属于 Confidential Operational Content（机密运营资产）。
+
+- Hermes 的解析层会对 references/ 文件夹进行读取边界控制。
+
+- 外部工具（如用户直接调用的 read_file）在健全的安全策略下无法直接横向越权读取未授权的 references 路径。这形成了一个天然的安全气制阀（Air Gap）。
+
+### 4. 架构解耦：Hermes vs Openclaw
+
+作为对比，可以更清晰地看出这是 Hermes 的设计：
+
+- Openclaw 层：不感知 references。它是一个高内聚的执行沙箱，只负责管理底层 Linux 进程隔离、虚拟文件系统、网络代理以及 MCP 协议的高效转换。
+
+- Hermes 层：感知并主导 references。它是顶层的认知规划层，通过将业务知识（Domain Knowledge）打包为 skills/<skill_name>/references/<spec>.md 的形式，来实现 Agent 脑域知识库的模块化热插拔和热热更新。
+
+是的，无论是针对此平台进行二开/编写自定义技能（Skills），还是审计其安全边界与性能损耗，深入了解 Hermes Agent 的底层设计逻辑都是必不可少的。
+
+这不仅是“理解一个软件”，而是要理解其在生产环境下，为了解决大模型（LLM）的算力瓶颈、Token 成本以及高并发任务流调度而做出的体系化折中。
+
+如果缺乏对 Hermes Agent 的体系化感知，开发或审计工作通常会遇到以下四大致命瓶颈：
+
+### 1. 无法规避 Token 重负载与超时（Rate & Context Limits）
+
+大尺寸或高推理 exertion（如具有强推理周期的模型）每输入一个 Token 都伴随着账单和响应延迟的攀升。
+
+- 如果不了解 Hermes 的 Lazy-loading 设计：开发者很容易陷入传统 LangChain 的直观逻辑——把复杂的物理配置、大量的场景分支解析直接硬编码在系统的通用提示词中。
+
+- 后果：这会导致 Agent 每一个简单的会话轮次都背负巨大的上下文首字延迟（TTFT）。了解 Hermes 意味着你需要知道何时将规则收敛至静态 Schema，何时利用微观的 skill_view 将知识从冷区唤醒。
+
+### 2. 安全过滤与审计边界失效（Prompt Injection & Sandbox Security）
+
+Hermes 将执行层完全托管在 Openclaw 驱动的隔离沙箱（Sandbox）中，而决策层和密钥管理在 TokenRouter 中。
+
+- 如果不了解这一层阻隔：开发者在尝试注入环境变量、直接读取底层密钥（如 API Keys）或者在沙箱内试图拉取跨项目配置时，会频繁触发底层的安全气制阀（Air Gap）拦截，导致指令异常挂起。
+
+- 后果：审计人员如果不知道 Hermes 的 JWT 四阶段交换逻辑，会误以为 Agent 能够直接触及云端数据库或主流云服务商的 Master Key，导致安全评估无法精准对齐。
+
+### 3. 多模态生产控制断层（Enhancer Decoupling）
+
+在媒体生成架构中，Hermes 本身不会直接拼装密集的大模型渲染 Prompt，而是将其委托给后端 Enhancer（如 ugc-character、cinematic-prompt-writer）。
+
+- 如果不了解 Hermes 的这一特性：在开发视频/图像管线时，开发者往往会花费大量精力，试图在 Agent 的指令集中用复杂的自然语言去精确控制每个镜头的宽高、相机运动、材质反射等。
+
+- 后果：由于底层基础模型对自然语言的鲁棒性不够，这往往会导致生成质量极度不稳定。了解 Hermes 后，则会懂得利用 Agent 收集结构化 JSON 对象（如 Shot Plan），然后像编译器一样投递给 higgsfield_enhancer，实现结构化控制到艺术提示词的工业级转换。
+
+### 4. 无法有效管理并发与额度限流（Workspace Concurrency & Boost Limits）
+
+Hermes 的生成系统（higgsfield_generate）并不是同步阻塞的，而是采用异步提单 + Concurrency Cap（并发上限约束，如 8 个文生图，6 个图生视频）的机制。
+
+- 如果不了解并发限流框架：在循环调度多帧渲染时，若盲目进行 Parallel Fan-out（并发扇出），很容易直接被 Backend 拦截，或者由于队列积压导致任务大规模超时。
+
+- 后果：懂得 Hermes 运行机制的开发者，会通过预读并传入本地 Plan limits、计算 Chunk 批次、动态监控 higgsfield_job_status 的方式，完成稳定的异步管线编排。
+
+---
+
+### 分工总结
+
+在进行系统设计或集成时，Hermes 与周边模块的协作分工如下：
+
+
+  | 模块名称 | 职责定位 | 对开发者的要求 |
+  | Hermes Agent | 认知决策层（心智与路径抉择） | 必须理解其 分层知识检索（Skill/References）、安全防线与状态机制（TODO/Memory）。 |
+  | Openclaw | 物理执行层（沙箱与系统调用） | 无需深度介入，仅需理解其 Linux 环境下的 absolute path 构建与非交互。 |
+  | CometAPI / TokenRouter | 网络与数据通道（安全认证与媒体加速） | 需要理清 JWT 四阶段交换与重用媒体 ID 的缓存机制。 |
+
+## 子文档：soulID
+
+See child page snapshot for block 3720837e-a8a7-807e-aedb-df8c61bb7959.
+
+## 子文档：资产管理 Element Management
+
+See child page snapshot for block 3720837e-a8a7-80e9-b333-f8c6d2e07ded.
+
+## 子文档：工具调用说明文档
+
+See child page snapshot for block 3720837e-a8a7-80d9-85b9-f051cfd94e54.
+
+## 子文档：tokenrouter
+
+See child page snapshot for block 3730837e-a8a7-80a5-a187-ef0225627f80.
+
+## 子文档：CometAPI
+
+See child page snapshot for block 3730837e-a8a7-80f2-90d3-e8e874edcf20.

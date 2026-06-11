@@ -1,0 +1,151 @@
+# tokenrouter
+
+Notion page id: 3730837e-a8a7-80a5-a187-ef0225627f80
+Depth: 1
+Parent: 36e0837ea8a780eeb368e66611362836
+
+## Content
+
+### 一、 核心定位与命名澄清
+
+在深入其架构前，必须进行命名上的去混淆：
+
+- 内部私有微服务：这里的 TokenRouter 是 Higgsfield 内部 proprietary 专有的微服务网关 [LITERAL PROMPT]。
+
+- 非公开产品：它与市面上公开的 SaaS 路由服务（如 tokenrouter.io）没有任何关系，两者仅存在命名空间上的冲突 [LITERAL PROMPT]。
+
+---
+
+### 二、 四阶段零信任鉴权流 (4-Stage Zero-Trust Auth Flow)
+
+在 Agent 运行的沙箱（Sandbox VM）中，为了保证密钥安全、多租户隔离以及精准计费，TokenRouter 充当了一个无状态的动态凭盘交换代理。其执行的 4 个阶段具体如下：
+
+
+```plain text
+[Agent 沙箱 VM]
+    │ (带 HF_JWT_TOKEN 发起 API 请求)
+    ▼
+[TokenRouter 边缘拦截] ────────► 验证签名、提取 Workspace ID/Chat ID
+    │
+    ▼
+[高速缓存 Redis] ─────────────► 进行 Quota/Boost 并发与余额校验
+    │
+    ▼
+[Vault 安全凭证库] ──────────► JWT 盲态兑换为 Upstream Provider API Keys
+    │
+    ▼
+[上游大模型/算力云]
+```
+
+
+### 1. 沙箱 JWT 注入 (Sandbox JWT Injection) [LITERAL PROMPT]
+
+- 机制：Agent 运行的 VM 容器中，绝不存储任何第三方 API 密钥（如 Google Vertex, Anthropic, OpenRouter, AWS 等的静态 API Key）。
+
+- 凭证形式：沙箱中仅注入一个短期有效、受限的 HF_JWT_TOKEN 环境变量。
+
+### 2. 边缘验证 (Edge Validation) [LITERAL PROMPT]
+
+- 动作：当 Agent 在代码中发起 API 请求或调用底层工具时，TokenRouter 处于反向代理的边缘位置，拦截所有的出站（Outbound）流量。
+
+- 解析：验证 HF_JWT_TOKEN 的签名合法性，解密并提取 Payload 中的核心声明（Claims），包括但不限于 workspace_id（工作空间 ID）、chat_id（会话 ID）和 user_id。
+
+### 3. 配额与限额校验 (Quota Check) [LITERAL PROMPT]
+
+- 状态存储：TokenRouter 挂载高性能的 Redis 集群作为高速 KV 缓存，用以记录各个工作空间的实时状态。
+
+- 校验逻辑：
+  - 读取该 Workspace 的可用账户余额（Credits）。
+  - 实时查询当前正在运行的并发任务数。例如，检测当前是否超出了 text2image_concurrent_jobs (最大 8) 或 image2video_concurrent_jobs (最大 6) 的并发上限。如果用户开启了 "Boost Speed"，则动态提升限制（如扩展至 24 并发）[LITERAL PROMPT]。
+
+### 4. 密钥交换 (Key Exchange) [LITERAL PROMPT]
+
+- 盲态代理：校验通过后，TokenRouter 访问内部的安全凭证库（Vault），将 HF_JWT_TOKEN 兑换成对应的真实上游供应商 API 密钥（如 Google Vertex Key 或 AWS 访问凭证）。
+
+- 转发：TokenRouter 在网关层修改 Request Header，注入真实的 API 密钥，并将请求转发给底层算力集群或模型 API。在此期间，Agent 沙箱对真实的静态密钥完全不可见（Blind State）。
+
+---
+
+### 三、 核心职责与功能边界
+
+除了上述鉴权流，TokenRouter 还在后端扮演了以下技术角色：
+
+1. 负载均衡与高可用调度 (Load Balancing) [LITERAL PROMPT]
+  - 将 Agent 的大模型推理请求、文本生成请求，根据上游通道的 Rate Limit（速率限制）和响应延迟，动态分发至不同的算力节点或备份模型通道，避免单点过载。
+
+1. 安全与内容过滤门禁 (Safety Gate) [LITERAL PROMPT]
+  - 拦截 Agent 的输入与输出文本，执行敏感词过滤、安全审查和输入合规性检测，防止恶意提示词注入以及违规内容的输出。
+
+1. 计量与账单统计 (Billing Metric Collection) [LITERAL PROMPT]
+  - 精确统计每一次 Token 消耗或工具调用的计费点数，并在任务结束后即时将扣费指令写入 Redis 及持久化账单数据库。
+
+---
+
+### 四、 与 CometAPI 的职责划分 [LITERAL PROMPT]
+
+在处理多模态工作流时，TokenRouter 绝不直接传输大型二进制媒体文件，而是与 CometAPI 协同工作：
+
+- TokenRouter (控制面 / 文本流)：仅处理控制信令、元数据 JSON 以及轻量级文本 Prompt。
+
+- CometAPI (数据面 / 媒体流)：负责处理视频/音频的拉取、抽帧、重采样（Downsampling）并将其转换为对齐的输入 Part 供给多模态大模型。TokenRouter 通过元数据地址指引，使控制流和媒体数据流在物理上完全解耦。
+
+## 五、TOKEN注入
+
+在大模型 Agent 运行的生命周期中，HF_JWT_TOKEN 的注入、生命周期以及其在安全调用链中的角色，是由 Higgsfield 后端的安全沙箱环境和双网关架构共同保障的。以下是具体的底层工作机制：
+
+### 1. 沙箱层面的 Token 注入 [INFERENCE]
+
+当你在 Web 客户端开启一个对话时，Higgsfield 的平台调度器会拉起一个隔离的容器沙箱（VM Sandbox）。在此初始化阶段，宿主机系统会向容器中注入两个关键的环境变量：
+
+- HF_JWT_TOKEN：由认证中心签发的一份包含特定声明的短期 JWT 凭证 [LITERAL PROMPT]。
+
+- CRON_BASE_URL：定时任务微服务的基准地址，与 JWT 配合使用。
+
+注：该 Token 是平台级自动管理的，Agent 沙箱内部不保存任何第三方的静态 API 密钥（如 OpenAI, Anthropic, Google Vertex 等密钥）[LITERAL PROMPT]。
+
+---
+
+### 2. 载荷声明 (JWT Claims) 与无降级校验 [LITERAL PROMPT]
+
+当 Agent 的后台服务（如定时器服务 higgsclaw-cron）拦截到携带此 Token 的请求时，它会严格校验 JWT 的合法性，并解析出包含租户隔离信息的 Claims [LITERAL PROMPT]：
+
+- sub：定位当前发起会话的 User ID [LITERAL PROMPT]。
+
+- chat_id：定位当前的 Chat 实例 ID [LITERAL PROMPT]。
+
+在系统的微服务设计中，没有本地开发降级方案 (No Dev Fallback) [LITERAL PROMPT]。如果 Agent 请求微服务时未携带此 Token，或者 Token 签名失效，微服务将直接拒绝访问。
+
+---
+
+### 3. TokenRouter 零信任凭证兑换流 (4-Stage Key Exchange) [LITERAL PROMPT]
+
+由于沙箱内部不持有静态密钥，Agent 在执行任何外部大模型请求（包括你正在交互的 Gemini 接口以及图像、视频生成）时，都必须经过私有的控制网关 TokenRouter。这一过程经历 4 个阶段：
+
+
+```plain text
+[ Agent 沙箱 ] (携带 HF_JWT_TOKEN 发起 API 调用)
+      │
+      ▼
+┌────────────────────────────────────────────────────────┐
+│              TokenRouter (控制网关)                    │
+│                                                        │
+│  1. 拦截请求，解析并校验边缘 HF_JWT_TOKEN                 │
+│  2. 提取 claims：workspace_id, chat_id                 │
+│  3. 访问 Redis (KV-store) 校验用户配额与 Boost 并发数    │
+│  4. 在 Vault (保密柜) 中用 JWT 兑换真实上游提供商 Key   │
+└────────────────────────────────────────────────────────┘
+      │
+      ▼ (使用真实 API 密钥代理调用)
+[ 算力后端 / 大模型提供商 API ]
+```
+
+
+1. 沙箱 JWT 注入：Agent 带着 HF_JWT_TOKEN 发起工具调用 [LITERAL PROMPT]。
+
+1. 边缘验证：TokenRouter 拦截出站请求，校验 JWT 签名并提取 workspace_id 与 chat_id 等声明 [LITERAL PROMPT]。
+
+1. 配额校验：在 Redis 高速 KV 缓存中核对当前工作区的并发额度限制（如基础限额 8 或 Boost 加速状态下并发数）[LITERAL PROMPT]。
+
+1. 密钥交换：TokenRouter 从 vaulted backend（后端安全密钥库）中，用经验证的 JWT 交换出真正的上游云服务商 API 密钥（例如 Google Vertex API 密钥），代理执行最终的算力请求并返回结果给 Agent [LITERAL PROMPT]。
+
+通过这种设计，Agent 对真实的第三方 API Key 保持完全的盲态 (Blind State) [LITERAL PROMPT]，防止由于 Agent 的代码执行能力或 prompt 注入攻击导致平台密钥泄露。

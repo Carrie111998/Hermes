@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>12 工作流路由器 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">12 / 19</span>
+      </nav>
+      <h1>12 工作流路由器</h1>
+      <p class="lede">在真正生成前判断 intent、asset roles、缺失字段、workflow_skill 和下一步。它要先问清楚，而不是一进来就开跑。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Workflow Router</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 workflow-router skill 包和 creative allowlist helper。</li>
+          <li>已有 clarify tool 可向用户提问。</li>
+          <li>代码证据：skills/creative/workflow-router、hermes_cli/ultra_studio_skills.py、tools/clarify_tool.py。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有 runtime 强制先路由，再调用生成工具。</li>
+          <li>没有 typed ultra_skill_route 输出 schema。</li>
+          <li>没有 asset role 分类：logo、foundation、reference、product、character。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>实现路由结果：intent、workflow_skill、missing_fields、asset_roles、allowed_tools、ask_user_question。</li>
+          <li>如果信息不足，只问一个最关键问题。</li>
+          <li>只有 route 决策允许 create_video/create_image 时才提交 Media Job。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>多轮 route memory、skill confidence、fallback route、eval dataset。</li>
+          <li>Higgsfield 风格的 workflow family 路由。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>“我要做一个视频”会问类型或素材，不会立即生成。</li>
+          <li>“帮我生成猫的图片”能路由到 image generation，而不是 FAL 默认。</li>
+          <li>上传多图时能区分 logo 和参考图。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/12-workflow-router.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/12-workflow-router.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/12-workflow-router.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="11-skill-registry.html">上一页：11 技能注册表</a>
+        <a class="chip" href="13-prompt-compiler.html">下一页：13 提示词编译器</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

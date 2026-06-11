@@ -3,3 +3,5 @@ node_modules/
 .vitepress/dist/
 *.html
 styles.css
+!public/source-archive/raw/**/*.html
+!public/source-archive/raw/**/*.css

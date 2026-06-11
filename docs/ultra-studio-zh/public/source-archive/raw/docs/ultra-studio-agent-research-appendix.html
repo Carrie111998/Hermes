@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultra Studio Agent Research Appendix</title>
+<style>
+:root{--bg:#f6f8f7;--panel:#fff;--ink:#182320;--muted:#60706d;--line:#d5dfdc;--ok:#1d7a53;--plan:#9a6a14;--miss:#9b3848;--blue:#22679a;--soft:#eef4f2;--yellow:#fff5dc;--red:#fff0f2;--green:#e9f6ef}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;line-height:1.58}
+.wrap{max-width:1240px;margin:0 auto;padding:28px}
+header{background:#fff;border-bottom:1px solid var(--line)}
+.kicker{color:var(--blue);font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+h1{margin:8px 0;font-size:34px;line-height:1.15}
+h2{margin:34px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line);font-size:23px}
+h3{margin:18px 0 8px;font-size:17px}
+p{margin:8px 0}
+a{color:#155c91;text-decoration:none}
+a:hover{text-decoration:underline}
+code{background:#eef3f2;border:1px solid #dbe5e2;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}
+pre{overflow:auto;background:#111b18;color:#e7f1ee;border-radius:10px;padding:14px;border:1px solid #29443c}
+.meta,.legend{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.pill,.tag{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:#fff;border-radius:999px;padding:7px 11px;font-size:13px;font-weight:700;color:#31403d}
+.dot{width:11px;height:11px;border-radius:50%;display:inline-block}
+.ok .dot{background:var(--ok)}.planned .dot{background:var(--plan)}.missing .dot{background:var(--miss)}.external .dot{background:var(--blue)}
+.note{border-left:5px solid var(--blue);background:#edf5fb;border-radius:8px;padding:14px 16px;margin:18px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;box-shadow:0 10px 30px rgba(30,45,41,.06)}
+.card h3{margin-top:0}
+.p0{background:var(--red);border-color:#d48a96}.p1{background:var(--yellow);border-color:#d1aa58}.done{background:var(--green);border-color:#78b692}
+table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}
+th,td{border:1px solid var(--line);padding:10px;text-align:left;vertical-align:top}
+th{background:var(--soft)}
+ul,ol{margin:8px 0;padding-left:22px}
+li{margin:5px 0}
+.compact li{margin:3px 0}
+footer{margin-top:34px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;padding-top:16px}
+@media(max-width:820px){
+  html,body{width:100vw;max-width:100vw;overflow-x:hidden}
+  .wrap{width:100%;max-width:100%;min-width:0;padding:20px 14px;overflow-x:hidden}
+  h1{font-size:24px;overflow-wrap:anywhere}
+  .grid{grid-template-columns:1fr}
+  .card{min-width:0}
+  table,thead,tbody,tr,th,td{display:block;width:100%}
+  thead{display:none}
+  tr{border:1px solid var(--line);margin-bottom:10px;background:#fff}
+  th,td{border:0;border-bottom:1px solid var(--line)}
+  th:last-child,td:last-child{border-bottom:0}
+  .note,.pill,.tag,p,li,a,code,th,td{overflow-wrap:anywhere;word-break:break-word}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="kicker">Full Research Appendix</div>
+    <h1>Ultra Studio Agent 完整调研附录</h1>
+    <p>这份附录把 Manus、E2B、Daytona、Browserbase、OpenAI Operator、Anthropic computer use、Temporal、Inngest、fal、Runway、Agent Skills 等调研结果完整展开。主架构图只保留导航和状态；这里保留细节、组件、P0/P1 和落地含义。</p>
+    <div class="meta">
+      <span class="pill">日期：2026-06-10</span>
+      <a class="pill" href="ultra-studio-agent-architecture.html">返回总体架构图</a>
+      <span class="pill">原则：不要只做媒体生成插件，要做创作任务电脑</span>
+    </div>
+    <div class="legend">
+      <span class="tag ok"><span class="dot"></span>已有基础</span>
+      <span class="tag planned"><span class="dot"></span>设计清楚待实现</span>
+      <span class="tag missing"><span class="dot"></span>P0/P1 缺口</span>
+      <span class="tag external"><span class="dot"></span>外部系统参考</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="note">
+    <strong>核心判断：</strong>Ultra Studio 不能只是 Atlas 媒体生成器 + 聊天 UI。要接近 Manus-style agent，需要补齐 task computer：sandbox、任务文件、浏览器上下文、审批、长任务恢复、skill registry、媒体 job envelope、observation/provenance ledger 和资产库。
+  </section>
+
+  <section>
+    <h2>1. 调研来源</h2>
+    <table>
+      <thead><tr><th>系统/文档</th><th>关注点</th><th>链接</th></tr></thead>
+      <tbody>
+        <tr><td>Manus Sandbox</td><td>任务沙箱生命周期、sleep/awake/recycle、artifact 可见性。</td><td><a href="https://manus.im/blog/manus-sandbox">manus.im/blog/manus-sandbox</a></td></tr>
+        <tr><td>Manus Cloud Browser</td><td>云浏览器、网页自动化、任务浏览器。</td><td><a href="https://manus.im/docs/features/cloud-browser">manus.im/docs/features/cloud-browser</a></td></tr>
+        <tr><td>Manus Desktop / My Computer</td><td>本地电脑/文件夹授权、本地 CLI、用户审批。</td><td><a href="https://manus.im/docs/features/desktop">manus.im/docs/features/desktop</a></td></tr>
+        <tr><td>Manus Skills</td><td>skill 包、渐进加载、触发描述。</td><td><a href="https://manus.im/docs/features/skills">manus.im/docs/features/skills</a></td></tr>
+        <tr><td>Manus Agent Skills Blog</td><td>skill 作为能力封装，不是长 prompt。</td><td><a href="https://manus.im/blog/manus-skills">manus.im/blog/manus-skills</a></td></tr>
+        <tr><td>OpenManus</td><td>开源 agent runtime 参考。</td><td><a href="https://github.com/FoundationAgents/OpenManus">github.com/FoundationAgents/OpenManus</a></td></tr>
+        <tr><td>E2B</td><td>按需安全 Linux VM sandbox。</td><td><a href="https://e2b.dev/docs">e2b.dev/docs</a></td></tr>
+        <tr><td>Daytona Sandboxes</td><td>可组合计算机：kernel、filesystem、network、vCPU、RAM、disk。</td><td><a href="https://www.daytona.io/docs/en/sandboxes/">daytona.io/docs/en/sandboxes</a></td></tr>
+        <tr><td>Browserbase Contexts</td><td>持久 cookie、localStorage、IndexedDB、auth context。</td><td><a href="https://docs.browserbase.com/platform/browser/core-features/contexts">docs.browserbase.com</a></td></tr>
+        <tr><td>Browserbase AI</td><td>AI browser sessions、agent identity、gateway、runtime primitives。</td><td><a href="https://www.browserbase.com/industry/ai">browserbase.com/industry/ai</a></td></tr>
+        <tr><td>OpenAI Operator</td><td>电脑使用类 agent 的用户接管/确认模式。</td><td><a href="https://openai.com/index/introducing-operator/">openai.com/index/introducing-operator</a></td></tr>
+        <tr><td>Anthropic computer use</td><td>VM/container、domain allowlist、sensitive-data 防护、human confirmation。</td><td><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool">platform.claude.com</a></td></tr>
+        <tr><td>LangChain HITL</td><td>approve/edit/reject/respond 类人工介入模式。</td><td><a href="https://docs.langchain.com/oss/python/langchain/human-in-the-loop">docs.langchain.com</a></td></tr>
+        <tr><td>Temporal Durable Execution</td><td>crash-proof long-running workflows。</td><td><a href="https://temporal.io/blog/what-is-durable-execution">temporal.io</a></td></tr>
+        <tr><td>Inngest AI</td><td>tool loop、sub-agent、HITL、reliable orchestration、observability。</td><td><a href="https://www.inngest.com/ai">inngest.com/ai</a></td></tr>
+        <tr><td>fal Queue API</td><td>queue submit/status/result/cancel/webhook。</td><td><a href="https://fal.ai/docs/documentation/model-apis/inference/queue">fal.ai/docs</a></td></tr>
+        <tr><td>Runway API</td><td>generation endpoint、task management、input assets、上传限制。</td><td><a href="https://docs.dev.runwayml.com/api/">docs.dev.runwayml.com/api</a></td></tr>
+        <tr><td>Codex Agent Skills</td><td>SKILL.md、scripts、references、assets、渐进披露。</td><td><a href="https://developers.openai.com/codex/skills">developers.openai.com/codex/skills</a></td></tr>
+        <tr><td>Microsoft Agent Skills</td><td>agent framework skills 标准。</td><td><a href="https://learn.microsoft.com/en-us/agent-framework/agents/skills">learn.microsoft.com</a></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>2. Manus 对照缺口</h2>
+    <div class="grid">
+      <article class="card p0">
+        <h3>Gap 1: Sandbox Lifecycle</h3>
+        <p>Manus 的 task sandbox 有 create、sleep、awake、recycle、restore files、artifact visibility。Ultra Studio 现在只画了 Sandbox VM 和 Hermes Cloud Attach，没有定义生命周期。</p>
+        <ul class="compact">
+          <li><code>sandbox.create</code></li>
+          <li><code>sandbox.attach</code></li>
+          <li><code>sandbox.sleep</code></li>
+          <li><code>sandbox.wake</code></li>
+          <li><code>sandbox.recycle</code></li>
+          <li><code>sandbox.restore_artifacts</code></li>
+          <li>restored vs non-restored manifest</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Gap 2: Artifact Browser / Task Files</h3>
+        <p>资产库不等于任务文件浏览器。任务里会产生 prompt JSON、storyboards、scripts、logs、intermediate renders、downloaded media。</p>
+        <ul class="compact">
+          <li><code>task_files</code> panel</li>
+          <li>session/job/sandbox file tree</li>
+          <li>artifact bundle export</li>
+          <li><code>task_file</code> / <code>asset</code> / <code>reference</code> / <code>protected_skill_reference</code></li>
+          <li>promote to asset library</li>
+        </ul>
+      </article>
+      <article class="card p1">
+        <h3>Gap 3: Cloud Browser / Local Browser Split</h3>
+        <p>创作 agent 需要竞品广告、产品页、社媒趋势、登录态资源和反爬敏感网站。一个 generic browser tool 不够。</p>
+        <ul class="compact">
+          <li><code>cloud_browser</code> for general web research</li>
+          <li><code>my_browser</code> / local bridge for logged-in sites</li>
+          <li>explicit takeover state</li>
+          <li>per-site session controls</li>
+          <li>browser artifacts captured into asset library</li>
+        </ul>
+      </article>
+      <article class="card p1">
+        <h3>Gap 4: Local Desktop Bridge</h3>
+        <p>创作用户有本地媒体文件、设计文件、剪辑素材、本地 CLI/GPU。需要文件夹级授权，不应默认全盘访问。</p>
+        <ul class="compact">
+          <li>folder-scoped connector</li>
+          <li>allow once / always / deny command approval</li>
+          <li>local file import into asset library</li>
+          <li>local render/export handoff</li>
+          <li>local GPU optional, never assumed</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Gap 5: Skill Progressive Disclosure</h3>
+        <p>启动时只加载 metadata，触发时加载 SKILL.md，scripts/references/assets 按需加载。否则主 prompt 会越来越重。</p>
+        <ul class="compact">
+          <li>production workflow has <code>SKILL.md</code></li>
+          <li><code>references/</code> for schema/compiler/rubric/examples</li>
+          <li><code>scripts/</code> for deterministic validators/compilers</li>
+          <li><code>assets/</code> for templates</li>
+          <li>trigger tests and eval fixtures</li>
+          <li>skill versioning and changelog</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Gap 6: Human Approval / Takeover</h3>
+        <p>电脑使用、浏览器和媒体花费不能只有普通 tool-call 权限。高成本、高隐私、高风险操作必须停下来问。</p>
+        <ul class="compact">
+          <li>spend credits / Boost concurrency</li>
+          <li>long GPU video job</li>
+          <li>paid external model</li>
+          <li>private media upload</li>
+          <li>logged-in browser context</li>
+          <li>local command</li>
+          <li>publish/share/export externally</li>
+        </ul>
+      </article>
+      <article class="card p1">
+        <h3>Gap 7: Sharing / Collaboration Privacy</h3>
+        <p>分享 conversation 不等于分享 sandbox。协作模式应默认禁用 connector/session credentials。</p>
+        <ul class="compact">
+          <li>share conversation</li>
+          <li>share selected artifacts only</li>
+          <li>never share sandbox filesystem by default</li>
+          <li>disable connectors in collaboration mode</li>
+          <li>asset ACL and redaction review</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Gap 8: Provenance / Anti-Fake</h3>
+        <p>每个媒体结果和研究结论都要有证据链，防止 agent 伪造“已完成”。</p>
+        <ul class="compact">
+          <li>job id, model, provider, prompt hash, inputs, status</li>
+          <li>research claim links to source or asset</li>
+          <li>no markdown-only generated URL as final proof</li>
+          <li>failed job trace: request -> TokenRouter -> worker log -> asset state</li>
+          <li>QA separates observed output from inference</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>3. 第二轮跨系统调研发现</h2>
+    <div class="grid">
+      <article class="card p0">
+        <h3>A. Sandbox 是产品原语</h3>
+        <p>E2B 把 sandbox 定义为按需创建的 secure Linux VM；Daytona 把 sandbox 定义为有 kernel、filesystem、network stack、vCPU、RAM、disk 的 composable computer。</p>
+        <p><strong>Ultra Studio 含义：</strong>用户应该看到 job 在哪个 task computer 里跑，文件、日志、代码、prompt JSON、输出都能从 session 检查。</p>
+        <p><strong>组件：</strong><code>Task Computer Service</code></p>
+      </article>
+      <article class="card p0">
+        <h3>B. Browser 需要持久 Context</h3>
+        <p>Browserbase Contexts 持久化 cookie、auth、localStorage、IndexedDB。创作场景需要登录态电商、社媒、广告库、灵感站点。</p>
+        <p><strong>组件：</strong><code>Browser Context Store</code>、<code>Browser Session Manager</code>、<code>Browser Artifact Capture</code>、<code>Agent Identity / Credential Boundary</code></p>
+      </article>
+      <article class="card p0">
+        <h3>C. Computer Use 需要强审批</h3>
+        <p>OpenAI Operator 和 Anthropic computer use 都强调用户接管/确认。Anthropic 还强调 VM/container、domain allowlists、避免敏感数据暴露。</p>
+        <p><strong>组件：</strong><code>Human Approval Gateway</code>，支持 approve、edit、reject、respond。</p>
+      </article>
+      <article class="card p0">
+        <h3>D. Durable Execution 是长媒体 job 的骨架</h3>
+        <p>Temporal 的 durable execution 解决 crash-proof workflow；Inngest 关注 tool loop、sub-agent、HITL、可靠 orchestration 和 observability。</p>
+        <p><strong>组件：</strong><code>Durable Workflow Engine</code>、<code>Media Job Event Log</code>、<code>Workflow Checkpoints</code>、<code>Approval Pause State</code></p>
+      </article>
+      <article class="card p0">
+        <h3>E. 媒体 API 都收敛到 Queue + Status + Webhook + Upload</h3>
+        <p>fal 有 queue submit/status/result/cancel/webhook；Runway 有 generation tasks、uploads、input constraints。Atlas 也不应该只作为裸 provider 调用暴露给 agent。</p>
+        <p><strong>组件：</strong><code>MediaJob</code> envelope、<code>Provider Constraint Registry</code>、<code>ultra_media_job_*</code> 工具组。</p>
+      </article>
+      <article class="card p0">
+        <h3>F. Skill 需要 Registry</h3>
+        <p>Codex、Microsoft Agent Skills、Manus 都收敛到 SKILL.md + scripts + references + assets + progressive disclosure。文件夹不等于可控 runtime。</p>
+        <p><strong>组件：</strong><code>Skill Registry</code>、<code>Skill Allowlist Profile</code>、<code>Skill Version Manifest</code>、<code>Skill Trigger Eval</code>、<code>Skill Output Contract Eval</code></p>
+      </article>
+      <article class="card p0">
+        <h3>G. Action 需要 Observation Loop</h3>
+        <p>电脑/浏览器 agent 不能只返回 success flag。每一步都要有 before/after observation、截图/DOM/stdout/file diff/media preview/job status。</p>
+        <p><strong>组件：</strong><code>Observation Ledger</code>。它和 <code>Provenance Ledger</code> 分工：observation 记录行动真相，provenance 记录资产血缘。</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>4. Approval Policy</h2>
+    <table>
+      <thead><tr><th>Action type</th><th>Default</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr><td>Read public page</td><td>allow</td><td>低风险公开读取。</td></tr>
+        <tr><td>Download public asset</td><td>allow with provenance</td><td>需要记录来源和时间。</td></tr>
+        <tr><td>Use logged-in browser context</td><td>ask</td><td>涉及账号、cookie、私密数据。</td></tr>
+        <tr><td>Upload private media</td><td>ask</td><td>涉及用户素材和版权/隐私。</td></tr>
+        <tr><td>Spend credits / Boost</td><td>ask</td><td>直接消耗额度和费用。</td></tr>
+        <tr><td>Start long GPU job</td><td>ask</td><td>长耗时、高成本、可能排队。</td></tr>
+        <tr><td>Run local command</td><td>ask</td><td>本地文件和系统风险。</td></tr>
+        <tr><td>Publish / post / email / checkout</td><td>require explicit approval</td><td>外部副作用不可自动发生。</td></tr>
+        <tr><td>Financial / legal / high-stakes decision</td><td>block or manual-only</td><td>高风险场景不交给自动 agent。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. MediaJob Envelope</h2>
+    <p>Provider 原始 API 不应该直接暴露给 agent。需要统一媒体 job envelope，把 Atlas、fal、Runway 类能力统一成 create/status/cancel/retry/finalize。</p>
+<pre><code>MediaJob:
+  job_id:
+  provider:
+  model:
+  media_type:
+  mode:
+  status:
+  inputs:
+  provider_constraints:
+  prompt:
+  negative_prompt:
+  seed:
+  created_by_session:
+  tokenrouter_decision_id:
+  output_assets:
+  error:</code></pre>
+    <table>
+      <thead><tr><th>Tool</th><th>职责</th></tr></thead>
+      <tbody>
+        <tr><td><code>ultra_media_job_create</code></td><td>创建 provider-neutral media job，挂上 session/run/tool/asset refs。</td></tr>
+        <tr><td><code>ultra_media_job_status</code></td><td>查询状态，支持 poll/webhook/streaming update。</td></tr>
+        <tr><td><code>ultra_media_job_cancel</code></td><td>取消排队或运行中的 job。</td></tr>
+        <tr><td><code>ultra_media_job_retry</code></td><td>根据失败原因、constraints、prompt-repair 生成重试。</td></tr>
+        <tr><td><code>ultra_media_job_finalize</code></td><td>注册 output asset、thumbnail、lineage、usage event。</td></tr>
+        <tr><td><code>ultra_media_constraints_get</code></td><td>给 prompt compiler 暴露模型输入限制、上传格式、参考图能力。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>6. Skill Registry 设计</h2>
+    <p>现有 `workflow-router` 有 SKILL.md 和 allowlist helper，但还缺 runtime 级 registry：过滤、路由、版本、eval、禁用、资源加载。</p>
+<pre><code>skills/creative/product-md-flow/
+  SKILL.md
+  references/
+    route.md
+    inputs.schema.json
+    prompt-compiler.md
+    qa-rubric.md
+    examples.md
+  scripts/
+    compile_prompt.py
+    validate_inputs.py
+  assets/
+    storyboard-template.json</code></pre>
+    <table>
+      <thead><tr><th>组件</th><th>作用</th></tr></thead>
+      <tbody>
+        <tr><td><code>Skill Registry</code></td><td>统一发现、启用、禁用、版本、平台过滤。</td></tr>
+        <tr><td><code>Skill Allowlist Profile</code></td><td>Ultra Studio 默认只暴露创作相关 skill。</td></tr>
+        <tr><td><code>Skill Version Manifest</code></td><td>记录每个 skill 的版本、变更和兼容性。</td></tr>
+        <tr><td><code>Skill Trigger Eval</code></td><td>验证用户请求是否路由到正确 skill。</td></tr>
+        <tr><td><code>Skill Output Contract Eval</code></td><td>验证输出是否满足 schema、asset roles、handoff。</td></tr>
+        <tr><td><code>Skill Resource Loader</code></td><td>按需加载 references/scripts/assets，避免上下文膨胀。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. Observation / Provenance Ledger</h2>
+    <div class="grid">
+      <article class="card p0">
+        <h3>Observation Ledger</h3>
+        <ul>
+          <li>action requested</li>
+          <li>action executed</li>
+          <li>observation before/after</li>
+          <li>result evidence</li>
+          <li>error evidence</li>
+          <li>retry decision</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Provenance Ledger</h3>
+        <ul>
+          <li>job id</li>
+          <li>model / provider</li>
+          <li>prompt hash</li>
+          <li>input asset refs</li>
+          <li>TokenRouter decision id</li>
+          <li>worker log</li>
+          <li>output assets and lineage</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>8. Revised Architecture Additions</h2>
+    <table>
+      <thead><tr><th>#</th><th>组件</th><th>优先级</th><th>落地含义</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Task Computer Service</td><td>P0</td><td>sandbox lifecycle、task filesystem、logs、artifact bundle。</td></tr>
+        <tr><td>2</td><td>Browser Context Store</td><td>P1</td><td>持久登录态、workspace scoped context、可撤销。</td></tr>
+        <tr><td>3</td><td>Browser Session Manager</td><td>P1</td><td>云浏览器、本地浏览器、artifact capture。</td></tr>
+        <tr><td>4</td><td>Human Approval Gateway</td><td>P0</td><td>成本、隐私、本地命令、发布动作审批。</td></tr>
+        <tr><td>5</td><td>Durable Workflow Engine</td><td>P0/P1</td><td>checkpoint、resume、retry、cancel、approval pause。</td></tr>
+        <tr><td>6</td><td>Media Job Event Log</td><td>P0</td><td>长媒体 job 的状态真相。</td></tr>
+        <tr><td>7</td><td>Provider Constraint Registry</td><td>P0</td><td>生成前知道模型输入限制。</td></tr>
+        <tr><td>8</td><td>Skill Registry</td><td>P0</td><td>allowlist、version、eval、resource loading。</td></tr>
+        <tr><td>9</td><td>Skill Eval Harness</td><td>P1</td><td>route correctness 和 output contract。</td></tr>
+        <tr><td>10</td><td>Observation Ledger</td><td>P0</td><td>action truth，防假完成。</td></tr>
+        <tr><td>11</td><td>Provenance Ledger</td><td>P0</td><td>asset lineage，防假结果。</td></tr>
+        <tr><td>12</td><td>Artifact Promotion Pipeline</td><td>P0</td><td>task files 转 asset library。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>9. Revised Build Order</h2>
+    <div class="grid">
+      <article class="card p0">
+        <h3>P0</h3>
+        <ol>
+          <li>Define <code>MediaJob</code> and provider constraint schema.</li>
+          <li>Add durable media job event log with create/status/cancel/retry/finalize.</li>
+          <li>Add human approval gateway for cost, private media, browser auth, local commands, publish actions.</li>
+          <li>Add task file browser and artifact promotion into Asset Library.</li>
+          <li>Add skill registry with allowlist, version manifest, and trigger evals.</li>
+          <li>Add observation/provenance ledger to prevent fake completion.</li>
+        </ol>
+      </article>
+      <article class="card p1">
+        <h3>P1</h3>
+        <ol>
+          <li>Browser Context Store and cloud browser session manager.</li>
+          <li>Durable workflow engine integration if event log is not enough.</li>
+          <li>Local desktop bridge with folder-scoped access and command approval.</li>
+          <li>Skill scripts for prompt compilation and input validation.</li>
+          <li>Collaboration privacy boundary and share artifact flow.</li>
+        </ol>
+      </article>
+      <article class="card">
+        <h3>P2</h3>
+        <ol>
+          <li>Full local GPU route.</li>
+          <li>Public project sharing.</li>
+          <li>Scheduled recurring creative tasks.</li>
+          <li>Automated skill packaging from successful sessions.</li>
+        </ol>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>10. 未压缩执行清单</h2>
+    <p>这部分直接按“要建什么”列，不再压成一句话。它可以变成 issue list、PRD checklist 或里程碑。</p>
+    <div class="grid">
+      <article class="card p0">
+        <h3>Sandbox Lifecycle</h3>
+        <ul>
+          <li><code>sandbox.create</code>：按 session/job 创建隔离任务电脑。</li>
+          <li><code>sandbox.attach</code>：把 Hermes runtime、workspace、volume、短期 token 挂上去。</li>
+          <li><code>sandbox.sleep</code>：长任务等待时释放重资源，但保留恢复点。</li>
+          <li><code>sandbox.wake</code>：从恢复点继续，不让用户重新描述任务。</li>
+          <li><code>sandbox.recycle</code>：异常或安全过期后重建环境。</li>
+          <li><code>sandbox.restore_artifacts</code>：只恢复 manifest 里声明要保留的文件。</li>
+          <li>记录 restored / disposable / promoted 三类文件状态。</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Task File Browser</h3>
+        <ul>
+          <li>按 session、run、job、sandbox 展示文件树。</li>
+          <li>支持 prompt JSON、storyboard、脚本、日志、中间帧、最终视频。</li>
+          <li>区分 <code>task_file</code>、<code>asset</code>、<code>reference</code>、<code>protected_skill_reference</code>。</li>
+          <li>支持下载 artifact bundle。</li>
+          <li>支持一键 promote 到 Asset Library。</li>
+          <li>promote 时生成 provenance record 和 asset id。</li>
+        </ul>
+      </article>
+      <article class="card p1">
+        <h3>Browser / Desktop</h3>
+        <ul>
+          <li><code>cloud_browser</code>：公开网页研究、素材抓取、灵感站点。</li>
+          <li><code>my_browser</code>：用户授权的登录态、本机浏览器或远端持久 context。</li>
+          <li>每个 browser context 必须 workspace scoped、可撤销、可过期。</li>
+          <li>browser artifact capture：截图、下载文件、HTML/markdown snapshot、source URL、timestamp。</li>
+          <li>local desktop bridge 只允许用户授权文件夹。</li>
+          <li>本地命令必须走 allow once / always / deny 审批。</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Approval Gateway</h3>
+        <ul>
+          <li>公开读取默认 allow，但要记录 provenance。</li>
+          <li>使用登录态浏览器、上传私有媒体、花费 credits、Boost 并发都默认 ask。</li>
+          <li>长 GPU 任务必须先显示预估成本、模型、输入资产、输出类型。</li>
+          <li>发布、发邮件、checkout、外部分享必须 explicit approval。</li>
+          <li>金融、法律、不可逆高风险动作默认 block 或 manual-only。</li>
+          <li>审批结果必须可恢复：approve、edit、reject、respond。</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Skill Runtime</h3>
+        <ul>
+          <li>启动只加载 skill metadata，不把所有 SKILL.md 塞进主 prompt。</li>
+          <li>触发后加载 <code>SKILL.md</code>，references/scripts/assets 按需加载。</li>
+          <li>每个创作 workflow 必须有 route、inputs schema、prompt compiler、QA rubric。</li>
+          <li>skill allowlist profile 决定当前 agent 能看到哪些技能。</li>
+          <li>trigger eval 测 route 是否误触发。</li>
+          <li>output contract eval 测 handoff、asset roles、missing fields 是否完整。</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Media Job Contract</h3>
+        <ul>
+          <li>所有 Atlas/fal/Runway 类调用统一进入 <code>MediaJob</code>。</li>
+          <li>agent 只调用 create/status/cancel/retry/finalize/constraints。</li>
+          <li>provider constraints 在 prompt 编译前可见，包括上传限制、URL 格式、尺寸、参考图数量。</li>
+          <li>job 必须绑定 session、run、tool_call、tokenrouter_decision、input assets。</li>
+          <li>finalize 负责注册 output assets、thumbnail、lineage 和 usage event。</li>
+          <li>失败不能降级成“生成好了”，必须暴露 provider error 和 worker log。</li>
+        </ul>
+      </article>
+      <article class="card p0">
+        <h3>Evidence Ledgers</h3>
+        <ul>
+          <li>Observation Ledger 记录 action requested、executed、before/after、stdout、screenshot、job status。</li>
+          <li>Provenance Ledger 记录 provider、model、prompt hash、seed、input refs、output refs、worker log。</li>
+          <li>研究 claim 必须链接 source 或本地 artifact。</li>
+          <li>媒体卡片必须展示 job id、model、status、inputs、prompt hash。</li>
+          <li>UI 不允许只显示 markdown URL 当作完成证明。</li>
+          <li>QA 报告必须区分 observed output 和 inferred quality。</li>
+        </ul>
+      </article>
+      <article class="card p1">
+        <h3>Sharing / Collaboration</h3>
+        <ul>
+          <li>conversation sharing 不等于 sandbox sharing。</li>
+          <li>默认只分享消息和用户选择的 artifacts。</li>
+          <li>connector/session credentials 在协作模式默认禁用。</li>
+          <li>分享前做 asset ACL、redaction review 和 license/source 检查。</li>
+          <li>团队模式再引入 role、workspace、project-level policy。</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section class="note">
+    <strong>最终原则：</strong>Ultra Studio = chat + sandbox/task filesystem + browser contexts + durable media jobs + human approvals + skill registry + provider constraints + artifact/provenance ledgers + asset library。Agent 不能在没有 artifact、observation 或 ledger record 的情况下声称完成。
+  </section>
+
+  <footer>
+    <p>本附录是完整调研展开页。主架构图保持短小、可编辑和状态化；详细依据和缺口都在这里。</p>
+  </footer>
+</main>
+</body>
+</html>

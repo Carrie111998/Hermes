@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>03 右侧检查器 / 实时面板 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">03 / 19</span>
+      </nav>
+      <h1>03 右侧检查器 / 实时面板</h1>
+      <p class="lede">右侧面板显示当前 job、选中资产、QA、下载、重试、转 Element、建角色。它不是第二个聊天窗口。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Inspector / Live Panel</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 session card、connection badge、model/session id、工具调用 feed、pending input prompts。</li>
+          <li>已有 image/video 同步工具和 Atlas provider 插件，但不是 durable job。</li>
+          <li>代码证据：web/src/components/chat/ChatInspector.tsx、ToolCall.tsx、PendingPromptPanel.tsx、useGatewayChat.ts。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有 selected job/asset/tool run 的选择模型。</li>
+          <li>没有资产预览、prompt/seed/dimension/duration/lineage、QA 面板、下载和导出。</li>
+          <li>移动端隐藏 inspector 时，pending prompt 的可达性需要重新设计。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>显示当前 media job 状态、provider/model、输入约束和错误。</li>
+          <li>选中生成资产后显示预览、下载链接、原 prompt、输入来源。</li>
+          <li>失败时给 retry/repair plan，而不是只显示通用错误字符串。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>Create Character、Convert to Element、QA score、provenance ledger drilldown。</li>
+          <li>移动端底部抽屉版 inspector。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>用户点击一张生成图，右侧出现该图的真实元数据。</li>
+          <li>下载按钮使用真实 asset URL 或本地文件路径。</li>
+          <li>失败 job 可以从 inspector 找到原因和下一步。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/03-inspector-live-panel.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/03-inspector-live-panel.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/03-inspector-live-panel.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="02-creative-chat-ui.html">上一页：02 创作聊天界面</a>
+        <a class="chip" href="04-marketplace.html">下一页：04 技能市场</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

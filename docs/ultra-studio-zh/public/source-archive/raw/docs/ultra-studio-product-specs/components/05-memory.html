@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Memory</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="05-memory.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Memory</h1>
+<p>Status: partial — agent-side memory storage, a provider plugin layer, and</p>
+<p>prompt injection are implemented; the Memory product surface (visible,</p>
+<p>editable, source-attributed entries in the UI) is spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/05-memory-marketplace-files.md</code></li>
+</ul>
+<p>(§Memory, §Search, §Access Control, §Acceptance),</p>
+<p><code>01-product-surface.md</code> (§Left Nav Shell), <code>02-agent-runtime-contract.md</code></p>
+<p>(§Session Lifecycle), <code>06-delivery-plan.md</code> (P1 item 9),</p>
+<p><code>docs/hermes-references-knowledge-model.md</code></p>
+<ul>
+<li>Code (verified this session): <code>tools/memory_tool.py</code> (<code>MemoryStore</code>,</li>
+</ul>
+<p><code>memory_tool</code>, <code>get_memory_dir</code>), <code>agent/memory_manager.py</code></p>
+<p>(<code>MemoryManager</code>, <code>build_memory_context_block</code>, <code>sanitize_context</code>,</p>
+<p><code>StreamingContextScrubber</code>), <code>agent/memory_provider.py</code> (<code>MemoryProvider</code></p>
+<p>ABC), <code>plugins/memory/</code> (<code>byterover</code>, <code>hindsight</code>, <code>holographic</code>, <code>honcho</code>,</p>
+<p><code>mem0</code>, <code>openviking</code>, <code>retaindb</code>, <code>supermemory</code>)</p>
+<h2>Purpose &amp; Scope</h2>
+<p>Memory stores durable facts that should influence future work: user</p>
+<p>preferences, brand rules, project facts, reusable prompt decisions, model</p>
+<p>preferences, rejected styles, and safety/policy notes</p>
+<p>(<code>05-memory-marketplace-files.md</code> §Memory). The governing rule is &quot;Memory</p>
+<p>must be visible and editable. Hidden memory creates trust problems.&quot;</p>
+<p>This spec covers the memory data layer, the provider plugin layer, prompt</p>
+<p>injection, and the planned Memory page. It does not cover session transcripts</p>
+<p>(owned by <code>07-tasks-session-history.md</code>) or RAM monitoring</p>
+<p>(<code>gateway/memory_monitor.py</code> is process RSS logging, unrelated to this</p>
+<p>component).</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>File-backed memory store with per-target files, char budgets (memory 2200 / user 1375 by default), file locking, and drift detection against external edits</td><td><code>tools/memory_tool.py</code> (<code>MemoryStore.__init__</code>, <code>_file_lock</code>, <code>_drift_error</code>, <code>load_from_disk</code>)</td></tr>
+<tr><td>Implemented</td><td>Agent-facing memory tool: add / replace / remove entries</td><td><code>tools/memory_tool.py</code> (<code>MemoryStore.add</code>, <code>.replace</code>, <code>.remove</code>, <code>memory_tool</code>)</td></tr>
+<tr><td>Implemented</td><td>Memory injection into the system prompt</td><td><code>tools/memory_tool.py</code> (<code>format_for_system_prompt</code>), <code>agent/memory_manager.py</code> (<code>build_memory_context_block</code>)</td></tr>
+<tr><td>Implemented</td><td>Context sanitization before injection (prompt-injection scrubbing)</td><td><code>agent/memory_manager.py</code> (<code>sanitize_context</code>, <code>StreamingContextScrubber</code>), <code>tools/memory_tool.py</code> (<code>_scan_memory_content</code>)</td></tr>
+<tr><td>Implemented</td><td>Pluggable external memory providers behind a <code>MemoryProvider</code> ABC</td><td><code>agent/memory_provider.py</code>; <code>plugins/memory/mem0/__init__.py</code> (Mem0 Platform API, circuit breaker), plus <code>byterover</code>, <code>hindsight</code>, <code>holographic</code>, <code>honcho</code>, <code>openviking</code>, <code>retaindb</code>, <code>supermemory</code></td></tr>
+<tr><td>Specified, not built</td><td>Memory nav entry and Memory page (list, inspect, delete/revoke)</td><td><code>01-product-surface.md</code> §Left Nav Shell; no memory page exists in <code>web/src/pages/</code> (listing verified this session)</td></tr>
+<tr><td>Specified, not built</td><td>Source attribution per entry (&quot;show source session or user action&quot;)</td><td><code>05-memory-marketplace-files.md</code> §Memory; <code>MemoryStore</code> entries are plain strings without provenance fields</td></tr>
+<tr><td>Specified, not built</td><td>User-authored vs inferred memory distinction</td><td><code>05-memory-marketplace-files.md</code> §Memory</td></tr>
+<tr><td>Specified, not built</td><td>Workspace/project scoping (&quot;Memory is scoped by user/workspace/project&quot;)</td><td><code>05-memory-marketplace-files.md</code> §Access Control; current store is per-Hermes-home, not per-project</td></tr>
+<tr><td>Specified, not built</td><td>Memory in unified Search with typed result cards</td><td><code>05-memory-marketplace-files.md</code> §Search</td></tr>
+<tr><td>Specified, not built</td><td>&quot;Memory can influence a follow-up request and can be inspected&quot; P1 gate</td><td><code>06-delivery-plan.md</code> P1</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li><code>Memory</code> entry in the left nav opening the Memory page (planned).</li>
+<li>Agent-initiated writes during conversation via the memory tool</li>
+</ul>
+<p>(implemented: <code>tools/memory_tool.py</code> <code>memory_tool</code>).</p>
+<ul>
+<li>Implicit read path: every agent turn can receive the memory block in its</li>
+</ul>
+<p>system prompt (implemented: <code>format_for_system_prompt</code>,</p>
+<p><code>build_memory_context_block</code>).</p>
+<ul>
+<li>Search results of type <code>memory</code> (planned).</li>
+<li>Task restore: reopening a task should bring &quot;relevant memory&quot; back into</li>
+</ul>
+<p>context (<code>05-memory-marketplace-files.md</code> §Tasks; planned).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Add / replace / remove memory entries from agent turns</td><td>Implemented (<code>MemoryStore.add/replace/remove</code>)</td></tr>
+<tr><td>Char-budgeted storage with explicit limits per target</td><td>Implemented (<code>MemoryStore._char_limit</code>)</td></tr>
+<tr><td>Concurrent-write safety and external-edit drift detection</td><td>Implemented (<code>_file_lock</code>, <code>_drift_error</code>)</td></tr>
+<tr><td>Injection scrubbing of memory content before prompt use</td><td>Implemented (<code>sanitize_context</code>, <code>_scan_memory_content</code>)</td></tr>
+<tr><td>External memory backends (Mem0, Supermemory, etc.) with failure circuit breakers</td><td>Implemented (<code>plugins/memory/*</code>; circuit breaker in <code>plugins/memory/mem0/__init__.py</code>)</td></tr>
+<tr><td>Memory page: list entries for current workspace/project</td><td>Planned</td></tr>
+<tr><td>Inspect entry: content, category, source session, created time</td><td>Planned</td></tr>
+<tr><td>Delete / revoke from UI</td><td>Planned (delete exists only as agent tool <code>remove</code>)</td></tr>
+<tr><td>User-authored vs inferred badge</td><td>Planned</td></tr>
+<tr><td>Category taxonomy (preferences, brand rules, project facts, …)</td><td>Planned; current store has targets, not categories</td></tr>
+<tr><td>Per user/workspace/project scoping</td><td>Planned</td></tr>
+<tr><td>Never store provider secrets</td><td>Planned as a validation rule; scrubbing exists but no secret-pattern rejection on write is specified</td></tr>
+<tr><td>Memory entries in unified Search</td><td>Planned</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Memory entries are not stateful objects today; a stored entry is either</p>
+<p>present or absent (<code>MemoryStore</code> keeps lists of strings per target). The</p>
+<p>planned product model adds a lifecycle:</p>
+<pre><code class="language-text">proposed (inferred by agent)
+  -&gt; active            (auto, or user confirms)
+active
+  -&gt; revoked           (user delete/revoke from Memory page)
+active
+  -&gt; superseded        (replace writes a new active entry)</code></pre>
+<ul>
+<li><code>proposed -&gt; active</code> policy is an open question (auto-apply vs confirm).</li>
+<li><code>revoked</code> entries must stop influencing prompts immediately and should</li>
+</ul>
+<p>remain auditable (who revoked, when).</p>
+<ul>
+<li><code>superseded</code> preserves history for &quot;why did the agent think this&quot; digs.</li>
+</ul>
+<p>Until that model exists, the implemented behavior is immediate-active on</p>
+<p><code>add</code> and hard-delete on <code>remove</code>.</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (agent tool surface, not HTTP):</p>
+<ul>
+<li><code>memory_tool(action=add|replace|remove, target, content, …)</code> —</li>
+</ul>
+<p><code>tools/memory_tool.py</code> (<code>memory_tool</code>, dispatching into <code>MemoryStore</code>).</p>
+<ul>
+<li><code>MemoryProvider</code> ABC for external backends — <code>agent/memory_provider.py</code>;</li>
+</ul>
+<p>providers configured via env/<code>$HERMES_HOME</code> config (e.g. <code>MEM0_API_KEY</code>,</p>
+<p>per <code>plugins/memory/mem0/__init__.py</code> docstring).</p>
+<p>Planned (HTTP, for the Memory page; no code exists):</p>
+<pre><code class="language-http">GET    /api/memory?scope=workspace|project|user&amp;category=&amp;q=&amp;cursor=
+GET    /api/memory/{entry_id}
+DELETE /api/memory/{entry_id}        # revoke</code></pre>
+<p>Planned events, following <code>02-agent-runtime-contract.md</code> naming:</p>
+<ul>
+<li><code>memory.entry.created</code> (with <code>source: user | inferred</code>, session id)</li>
+<li><code>memory.entry.revoked</code></li>
+</ul>
+<h2>Data Model</h2>
+<p>Implemented: plain-text entry lists per target file under the memory dir</p>
+<p>(<code>tools/memory_tool.py</code> <code>get_memory_dir</code>, <code>_path_for</code>), with char budgets and</p>
+<p>a rendered block format for prompts (<code>_render_block</code>).</p>
+<p>Planned entity for the product surface:</p>
+<pre><code class="language-text">memory_entries
+- id
+- scope: user | workspace | project
+- scope_id
+- category: preference | brand_rule | project_fact | prompt_decision
+            | model_preference | rejected_style | policy_note
+- content
+- source: user_authored | inferred
+- source_session_id
+- created_by, created_at
+- status: active | revoked | superseded</code></pre>
+<p>Migration note: existing file-store entries map to</p>
+<p><code>scope=user, source=inferred, category=null</code> and must not be silently</p>
+<p>dropped.</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Memory page lists entries grouped by category, scoped to the current</li>
+</ul>
+<p>workspace/project, with a scope switcher.</p>
+<ul>
+<li>Each row: content, category chip, source badge (user/inferred), source</li>
+</ul>
+<p>session link, created date, revoke button.</p>
+<ul>
+<li>Revoke asks for confirmation and takes effect on the next agent turn.</li>
+<li>Empty state is blank (&quot;no memory yet&quot;), never seeded with fake examples.</li>
+<li>A memory search result card must look like memory, not like a file</li>
+</ul>
+<p>(<code>05-memory-marketplace-files.md</code> §Search).</p>
+<ul>
+<li>The page never renders provider secrets; if scrubbing flags an entry, it</li>
+</ul>
+<p>renders with a warning state instead of raw content.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Permissions (<code>05-memory-marketplace-files.md</code> §Access Control): memory is</p>
+<p>scoped by user/workspace/project; minimum verbs are read, update, delete,</p>
+<p>revoke. Shared conversations must not leak another user&#x27;s memory scope.</p>
+<p>Error contract:</p>
+<table><thead><tr><th>Error</th><th>Trigger</th><th>Today</th></tr></thead><tbody>
+<tr><td><code>memory_drift_detected</code></td><td>Store file changed outside Hermes between load and write</td><td>Implemented as a structured error (<code>tools/memory_tool.py</code> <code>_drift_error</code>)</td></tr>
+<tr><td><code>memory_budget_exceeded</code></td><td>Add exceeds target char limit</td><td>Implemented (limits in <code>MemoryStore</code>; add returns failure response)</td></tr>
+<tr><td><code>memory_entry_not_found</code></td><td>Revoke/inspect of unknown id</td><td>Planned with the HTTP API</td></tr>
+<tr><td><code>memory_scope_denied</code></td><td>Cross-workspace read/revoke</td><td>Planned</td></tr>
+<tr><td>Provider outage</td><td>External provider (e.g. Mem0) unreachable</td><td>Implemented as circuit breaker pause (<code>plugins/memory/mem0/__init__.py</code>); UI surfacing planned</td></tr>
+</tbody></table>
+<p>Provider failures must degrade visibly (memory marked unavailable), not</p>
+<p>silently produce a turn that ignores known facts.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>The left nav exposes Memory; the page lists real entries from the store</li>
+</ul>
+<p>(blank when none — no sample data).</p>
+<ul>
+<li>A user can revoke an entry and a subsequent agent turn provably stops</li>
+</ul>
+<p>using it (verify via prompt block diff).</p>
+<ul>
+<li>New inferred entries appear with source session attribution.</li>
+<li>User-authored and inferred entries are visually distinct.</li>
+<li>A memory write containing a provider key pattern is rejected and surfaced</li>
+</ul>
+<p>as an error (never stored).</p>
+<ul>
+<li><code>06-delivery-plan.md</code> P1 gate holds: memory influences a follow-up request</li>
+</ul>
+<p>and can be inspected.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Embedding-based semantic memory retrieval as a P0/P1 requirement</li>
+</ul>
+<p>(external providers may offer it, but the product surface only requires</p>
+<p>list/inspect/revoke).</p>
+<ul>
+<li>Memory as a chat transcript archive (Tasks owns transcripts).</li>
+<li>Cross-tenant or cross-workspace memory sharing.</li>
+<li>Storing provider credentials or tokens of any kind.</li>
+<li>Automatic memory harvesting from every turn without an inferred-source</li>
+</ul>
+<p>trail.</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Do inferred entries auto-activate or require user confirmation</li>
+</ol>
+<p>(<code>proposed -&gt; active</code> policy)?</p>
+<ol>
+<li>Which store is authoritative when an external provider (Mem0 et al.) and</li>
+</ol>
+<p>the local file store disagree?</p>
+<ol>
+<li>Per-project scoping: keyed how — project id from session state</li>
+</ol>
+<p>(<code>02-agent-runtime-contract.md</code> §Session Lifecycle), or directory-based?</p>
+<ol>
+<li>Category taxonomy enforcement: free-form tags vs the fixed seven</li>
+</ol>
+<p>categories in <code>05-memory-marketplace-files.md</code>.</p>
+<ol>
+<li>Retention: do revoked/superseded entries expire, and is there an export?</li>
+<li>Does the Memory page edit content in place (<code>update</code> verb) or only</li>
+</ol>
+<p>revoke-and-recreate, given drift detection on the file store?</p>
+</main></div>
+</body>
+</html>

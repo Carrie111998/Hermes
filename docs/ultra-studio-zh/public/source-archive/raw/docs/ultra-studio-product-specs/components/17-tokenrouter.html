@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TokenRouter</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>TokenRouter</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="17-tokenrouter.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>TokenRouter</h1>
+<p>Status: spec-only — zero TokenRouter code exists (rg for</p>
+<p><code>tokenrouter|token_router</code> over source returns no hits, verified this</p>
+<p>session); the design is complete in the credential-flow doc. Today&#x27;s</p>
+<p>credential reality: provider keys are server-side static config (e.g.</p>
+<p><code>ATLAS_API_KEY</code> resolved in provider clients), with LLM-credential pooling</p>
+<p>machinery in <code>agent/</code>.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/hermes-tokenrouter-credential-flow.md</code> (entire doc; itself</li>
+</ul>
+<p>sourced from <code>docs/notion-source/hermes/pages/06-tokenrouter.md</code> — the</p>
+<p>Notion <code>[LITERAL PROMPT]</code> statements are treated as target-design</p>
+<p>evidence, not verified Higgsfield production fact),</p>
+<p><code>docs/ultra-studio-product-specs/02-agent-runtime-contract.md</code></p>
+<p>(§Sandbox Lifecycle, §Error Contract), <code>03-media-asset-contract.md</code></p>
+<p>(<code>tokenrouter_decision_id</code>), <code>docs/hermes-cometapi-media-gateway.md</code></p>
+<p>(§与 TokenRouter 的关系)</p>
+<ul>
+<li>Code (adjacent, verified this session): <code>plugins/video_gen/atlas/client.py</code></li>
+</ul>
+<p>(<code>resolve_credentials</code> — server-side static key resolution),</p>
+<p><code>agent/credential_pool.py</code>, <code>agent/credential_sources.py</code>,</p>
+<p><code>agent/credential_persistence.py</code> (LLM provider credential machinery,</p>
+<p>not a policy/exchange proxy), <code>agent/secret_sources/</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>TokenRouter is the control-plane boundary for model/provider calls: protect</p>
+<p>provider credentials, enforce tenant policy, meter usage, and route</p>
+<p>requests without exposing real upstream keys to the sandbox</p>
+<p>(<code>hermes-tokenrouter-credential-flow.md</code> §范围).</p>
+<p>Core contract (§核心合约):</p>
+<ul>
+<li>Sandboxes never receive real provider API keys.</li>
+<li>Sandboxes receive only short-lived Hermes tokens such as <code>HF_JWT_TOKEN</code>.</li>
+<li>TokenRouter verifies the token, extracts claims, checks</li>
+</ul>
+<p>quota/concurrency, exchanges through a vault-backed credential backend,</p>
+<p>then proxies the upstream request.</p>
+<ul>
+<li>Missing/expired/invalid/under-scoped tokens fail closed; no local-dev</li>
+</ul>
+<p>credential fallback in cloud mode.</p>
+<p>Scope: token verification, policy evaluation, credential exchange,</p>
+<p>proxying, usage metering, and decision logging. Media preprocessing is</p>
+<p>CometAPI (<code>18-cometapi-media-gateway.md</code>); asset ACL data is owned by the</p>
+<p>Asset Service and consumed here as policy input.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Specified, not built</td><td>Four-phase flow: edge validation -&gt; quota/policy -&gt; vault key exchange -&gt; provider</td><td><code>hermes-tokenrouter-credential-flow.md</code> §四阶段流程</td></tr>
+<tr><td>Specified, not built</td><td>Claim set: <code>sub</code>, <code>tenant_id</code>, <code>workspace_id</code>, <code>project_id</code>, <code>chat_id/session_id</code>, <code>tool_scopes</code>, <code>budget</code>, <code>exp/nbf</code></td><td>§必需 claims</td></tr>
+<tr><td>Specified, not built</td><td>Policy inputs: membership, plan/credits, model allowlist, tool family, asset ACL, concurrency caps, request size, redaction/audit requirements</td><td>§策略输入</td></tr>
+<tr><td>Specified, not built</td><td>Storage/integration picks: vault backend (OpenBao-class), Redis-class quota KV, PostgreSQL + append-only audit, OPA policy, mTLS service identity</td><td>§存储与集成 (recommendations, not decisions)</td></tr>
+<tr><td>Specified, not built</td><td>Fail-closed behaviors incl. audit-write fail-closed for high-risk calls</td><td>§失败行为</td></tr>
+<tr><td>Specified, not built</td><td>Per-request decision logging with ids and policy reason</td><td>§可观测性</td></tr>
+<tr><td>Specified, not built</td><td><code>tokenrouter_decision_id</code> on MediaJob envelopes</td><td><code>03-media-asset-contract.md</code> §Media Job Envelope</td></tr>
+<tr><td>Implemented (adjacent, different concern)</td><td>Server-side static provider key resolution for media calls</td><td><code>plugins/video_gen/atlas/client.py</code> (<code>resolve_credentials</code>) — keys never reach the browser, but they are static and process-wide, not scoped tokens</td></tr>
+<tr><td>Implemented (adjacent, different concern)</td><td>LLM credential pooling/persistence for agent model calls</td><td><code>agent/credential_pool.py</code>, <code>credential_sources.py</code>, <code>credential_persistence.py</code>, <code>agent/secret_sources/</code></td></tr>
+<tr><td>Gap</td><td>No tenancy model exists in the deployment today (single-operator self-host); tenant/workspace claims have no enforcement substrate yet</td><td>—</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<p>None — TokenRouter is invisible infrastructure. Its effects surface as:</p>
+<ul>
+<li>Typed errors in chat/tools: <code>missing_credential</code>, <code>quota_exceeded</code>,</li>
+</ul>
+<p>model-denied messages (<code>02-agent-runtime-contract.md</code> §Error Contract).</p>
+<ul>
+<li>Budget/quota state in account surfaces (future pricing/account nav,</li>
+</ul>
+<p><code>01-product-surface.md</code> IA).</p>
+<ul>
+<li>Decision ids on job records for failure tracing</li>
+</ul>
+<p>(&quot;A failed media job can be traced from <code>job_id</code> to TokenRouter decision</p>
+<p>and worker log&quot;, §MVP 验收检查).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>JWT verification (signature, lifetime, scope claims) at the edge</td><td>Planned</td></tr>
+<tr><td>Tenant/workspace/project isolation enforcement</td><td>Planned</td></tr>
+<tr><td>Plan/credit/quota checks with realtime concurrency caps (e.g. t2i, i2v limits)</td><td>Planned</td></tr>
+<tr><td>Model/provider allowlist enforcement</td><td>Planned (catalog declares, TokenRouter decides — <code>19-model-catalog-provider-constraints.md</code>)</td></tr>
+<tr><td>Asset ACL checks for <code>image_job</code>/<code>video_job</code>/<code>media_input</code>/<code>soul_id</code>/<code>element_id</code> refs</td><td>Planned (data from Asset Service)</td></tr>
+<tr><td>Vault-backed key exchange; upstream keys never serialized to sandbox</td><td>Planned</td></tr>
+<tr><td>Request proxying with sanitized upstream errors</td><td>Planned</td></tr>
+<tr><td>Usage events with quota deltas</td><td>Planned</td></tr>
+<tr><td>Decision logging (<code>request_id</code>, <code>run_id</code>, <code>tool_call_id</code>, tenant ids, policy reason, route, latency — no secret material)</td><td>Planned</td></tr>
+<tr><td>Budget claims per run/session</td><td>Planned</td></tr>
+<tr><td>Break-glass path for audit-store outage</td><td>Planned (explicit approval required, §失败行为)</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Per-request decision pipeline (stateless per request; quota state is</p>
+<p>external):</p>
+<pre><code class="language-text">received
+  -&gt; token_verified        | -&gt; rejected(401/403)  invalid/expired/under-scoped
+  -&gt; policy_evaluated      | -&gt; denied(policy_reason)
+  -&gt; key_exchanged         | -&gt; failed(provider_unavailable)  vault outage; no fallback
+  -&gt; proxied -&gt; upstream_ok | upstream_error(sanitized)
+  -&gt; usage_recorded        | audit-write failure -&gt; fail closed for high-risk calls</code></pre>
+<p>Token lifecycle (issued elsewhere, validated here):</p>
+<pre><code class="language-text">issued (short-lived, scoped) -&gt; active -&gt; expired
+                                      -&gt; revoked</code></pre>
+<p>Rules: every terminal state produces a decision record with a reason; no</p>
+<p>path skips logging except total ledger outage, which itself fails closed</p>
+<p>for paid/generation calls.</p>
+<h2>APIs &amp; Events</h2>
+<p>Planned surface (shape per §四阶段流程 and §与 TokenRouter 的关系):</p>
+<ul>
+<li>Proxy endpoint(s) that accept provider-neutral requests with</li>
+</ul>
+<p><code>Authorization: Bearer &lt;HF_JWT_TOKEN&gt;</code>; internal routes per tool family.</p>
+<ul>
+<li>Delegation: CometAPI receives verified scoped requests or validates a</li>
+</ul>
+<p>delegated token; emits usage signals back.</p>
+<ul>
+<li>Decision/usage records exposed to the ledger by id join</li>
+</ul>
+<p>(<code>16-observation-provenance-ledger.md</code>), not by API in MVP.</p>
+<p>Required claims (verbatim table, §必需 claims): <code>sub</code>, <code>tenant_id</code>,</p>
+<p><code>workspace_id</code>, <code>project_id</code>, <code>chat_id</code>/<code>session_id</code>, <code>tool_scopes</code>,</p>
+<p><code>budget</code>, <code>exp</code>/<code>nbf</code>.</p>
+<p>No gateway events; failures map to the typed error contract</p>
+<p>(<code>missing_credential</code>, <code>quota_exceeded</code>, provider errors sanitized).</p>
+<h2>Data Model</h2>
+<p>Planned (storage recommendations from §存储与集成):</p>
+<pre><code class="language-text">tokenrouter_decisions (append-only)
+- decision_id (= tokenrouter_decision_id on MediaJob)
+- request_id, run_id, tool_call_id
+- tenant_id, workspace_id, project_id, sub
+- decision: allow | deny | fail_closed
+- policy_reason
+- provider/model route        (no secret material)
+- quota_delta, usage_event_id
+- upstream_status (sanitized), latency_ms
+- created_at
+
+quota_state (KV, realtime)
+- scope keys (tenant/workspace/user) -&gt; credits, concurrency counters
+
+vault: upstream credentials       (never in app DB)
+policy: OPA bundles or equivalent (versioned)</code></pre>
+<h2>UI Behavior</h2>
+<p>None owned. Obligations to other surfaces:</p>
+<ul>
+<li>Denials must reach the user as actionable typed errors (&quot;model not in</li>
+</ul>
+<p>your workspace allowlist&quot;, &quot;quota exceeded — resets …&quot;), not vague</p>
+<p>apologies (<code>02-agent-runtime-contract.md</code> §Error Contract).</p>
+<ul>
+<li>The inspector shows the decision id on failed jobs for support/debug.</li>
+<li>No UI ever displays exchanged upstream credentials or vault paths.</li>
+</ul>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Failure behavior is the heart of the component (verbatim, §失败行为):</p>
+<ul>
+<li>Invalid token: 401/403, provider never called.</li>
+<li>Missing quota state: fail closed for paid/generation calls.</li>
+<li>Vault access failure: sanitized provider-unavailable error; never fall</li>
+</ul>
+<p>back to sandbox keys.</p>
+<ul>
+<li>Provider failure: preserve provider error class internally, return</li>
+</ul>
+<p>sanitized user-facing error.</p>
+<ul>
+<li>Audit write failure: fail closed for high-risk calls unless an explicit</li>
+</ul>
+<p>break-glass path is approved.</p>
+<p>Logging redaction: decisions log routes and reasons, never secret material</p>
+<p>(§可观测性).</p>
+<h2>Acceptance Criteria</h2>
+<p>Verbatim MVP checks (<code>hermes-tokenrouter-credential-flow.md</code></p>
+<p>§MVP 验收检查):</p>
+<ul>
+<li>Sandbox environment and mounted files contain no real provider key.</li>
+<li>Expired <code>HF_JWT_TOKEN</code> is rejected before provider routing.</li>
+<li>Tenant A token cannot access Tenant B assets or sessions.</li>
+<li>A model outside the workspace allowlist is denied.</li>
+<li>A failed media job can be traced from <code>job_id</code> to TokenRouter decision</li>
+</ul>
+<p>and worker log.</p>
+<p>Plus integration checks: <code>tokenrouter_decision_id</code> is present on MediaJob</p>
+<p>records once both exist; CometAPI usage is traceable into usage/billing</p>
+<p>records (<code>hermes-cometapi-media-gateway.md</code> §验收检查).</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Media data-plane work (fetch/transcode/packaging — CometAPI).</li>
+<li>Being the asset ACL source of truth (Asset Service owns ACL data;</li>
+</ul>
+<p>TokenRouter evaluates it).</p>
+<ul>
+<li>Replacing the existing LLM credential pool for agent chat models in MVP</li>
+</ul>
+<p>(<code>agent/credential_pool.py</code> machinery is a separate concern until cloud</p>
+<p>multi-tenancy requires unification).</p>
+<ul>
+<li>Billing UI/pricing pages (out of pack scope per <code>00-index.md</code>).</li>
+<li>Local self-host hard requirement: the fail-closed cloud rules apply to</li>
+</ul>
+<p>cloud mode; the single-operator local deployment keeps server-side static</p>
+<p>keys until TokenRouter ships.</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Token issuer: which component mints <code>HF_JWT_TOKEN</code> (gateway at</li>
+</ol>
+<p>session/sandbox create?), and what is the rotation/lifetime policy per</p>
+<p>claim scope?</p>
+<ol>
+<li>MVP cut: full vault + OPA + Redis stack vs a minimal in-process policy</li>
+</ol>
+<p>checker with the same contract — what is the smallest honest version</p>
+<p>that keeps fail-closed semantics?</p>
+<ol>
+<li>Tenancy substrate: tenant/workspace ids exist in specs but not in the</li>
+</ol>
+<p>current deployment model — what creates them, and how do self-host</p>
+<p>single-tenant installs degrade?</p>
+<ol>
+<li>Concurrency cap taxonomy (t2i, i2v, …) — where are the cap values</li>
+</ol>
+<p>declared (plan config?) and how do they interact with provider-side</p>
+<p>limits?</p>
+<ol>
+<li>Budget claim semantics: per-run hard stop vs soft warning; who decides</li>
+</ol>
+<p>the budget at <code>prompt.submit</code> time?</p>
+<ol>
+<li>Migration: when TokenRouter ships, do the static <code>ATLAS_API_KEY</code> paths</li>
+</ol>
+<p>in provider clients get replaced outright (repo no-backward-compat rule)</p>
+<p>or gated by deployment mode?</p>
+</main></div>
+</body>
+</html>

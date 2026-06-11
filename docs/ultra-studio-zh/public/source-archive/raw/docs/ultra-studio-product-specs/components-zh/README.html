@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="../../ultra-studio-docs-zh/README.html">中文文档总站</a>
+        <a href="../00-index.md">Spec Pack</a>
+        <a href="../components/README.html">英文组件审计版</a>
+        <span class="chip">中文阅读版</span>
+      </nav>
+      <h1>Ultra Studio 中文组件规格</h1>
+      <p class="lede">这套页面把 19 份英文组件审计文档压成中文实施视角：先看状态，再看已有代码、缺口、P0、验收点。适合排期、开 issue 和核对“现在到底有什么”。</p>
+      <div class="meta">
+        <span class="badge partial">19 个组件</span>
+        <span class="badge info">阅读版 HTML</span>
+        <span class="chip">不覆盖英文原文</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <h2>颜色和状态</h2>
+      <div class="status-strip">
+        <div><span class="badge implemented">绿色：已实现</span><p>代码中已有可用能力，仍要看是否完整接入 Ultra Studio。</p></div>
+        <div><span class="badge partial">黄色：部分实现</span><p>有真实底座或原型，但产品合同、事件、持久化或 UI 还缺。</p></div>
+        <div><span class="badge spec-only">红色：仅设计</span><p>文档已定义，代码里没有可用实现。不能当作已落地。</p></div>
+      </div>
+
+      <h2>当前总览</h2>
+      <div class="grid">
+        <article class="card"><h3>已实现</h3><p><strong>0</strong> 个组件目前没有单独归为 fully implemented。原因是 Ultra Studio 仍是组合产品，不是单点功能。</p></article>
+        <article class="card"><h3>部分实现</h3><p><strong>12</strong> 个组件已有 Hermes 底座或 Atlas 插件，但需要接入 Ultra 的产品合同。</p></article>
+        <article class="card"><h3>仅设计</h3><p><strong>7</strong> 个组件只有文档或原型，不能在 UI 里假装可用。</p></article>
+      </div>
+
+      <h2>建议阅读顺序</h2>
+      <ul>
+        <li><strong>先跑通 P0 生成闭环：</strong>01 左侧导航、02 创作聊天、12 路由器、10 媒体任务、19 模型约束、03 右侧检查器。</li>
+<li><strong>资产体系：</strong>09 资产服务、08 资产库界面、06 文件浏览、03 检查器。</li>
+<li><strong>运行时与安全：</strong>14 沙箱、15 审批、11 技能注册、13 提示词编译、16 溯源账本。</li>
+<li><strong>云模式预研：</strong>17 TokenRouter、18 CometAPI、14 沙箱。</li>
+      </ul>
+
+      <h2>组件地图</h2>
+      <table class="table">
+        <thead><tr><th>组件</th><th>状态</th><th>一句话</th><th>英文审计版</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><a href="01-left-nav-shell.html">01 左侧导航外壳</a><br><span class="muted">Left Nav Shell</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>Ultra Studio 的固定左侧入口，承载 New task、Search、My office、Marketplace、Files、Memory、Tasks。它不是装饰栏，而是工作状态的主导航。</td>
+            <td><a href="../components/01-left-nav-shell.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="02-creative-chat-ui.html">02 创作聊天界面</a><br><span class="muted">Creative Chat UI</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>用户描述创作目标、上传素材、回答澄清问题、审批动作、查看生成进度的主工作区。打开页面不能自动开始生成。</td>
+            <td><a href="../components/02-creative-chat-ui.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="03-inspector-live-panel.html">03 右侧检查器 / 实时面板</a><br><span class="muted">Inspector / Live Panel</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>右侧面板显示当前 job、选中资产、QA、下载、重试、转 Element、建角色。它不是第二个聊天窗口。</td>
+            <td><a href="../components/03-inspector-live-panel.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="04-marketplace.html">04 技能市场</a><br><span class="muted">Marketplace</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>面向 Ultra Studio 的技能、模板、工作流和连接器目录。第一版可以是空态，但不能伪造市场数据。</td>
+            <td><a href="../components/04-marketplace.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="05-memory.html">05 记忆系统</a><br><span class="muted">Memory</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>保存项目偏好、品牌设定、角色设定、用户选择和长期上下文。它要能被 agent 使用，也要能被用户审计。</td>
+            <td><a href="../components/05-memory.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="06-files-task-file-browser.html">06 文件 / 任务文件浏览器</a><br><span class="muted">Files / Task File Browser</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>展示上传文件、任务工作目录、生成中间产物和可复用素材。它连接 chat upload、sandbox 文件和 asset library。</td>
+            <td><a href="../components/06-files-task-file-browser.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="07-tasks-session-history.html">07 任务 / 会话历史</a><br><span class="muted">Tasks / Session History</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>左侧任务列表和历史恢复能力，用户可以回到某次创作，看到 transcript、工具、文件、资产和结果。</td>
+            <td><a href="../components/07-tasks-session-history.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="08-asset-library-ui.html">08 资产库界面</a><br><span class="muted">Asset Library UI</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>统一浏览生成资产、上传素材、角色、合集、智能分组和散装资产。它是创作复用的核心页面，不只是图库。</td>
+            <td><a href="../components/08-asset-library-ui.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="09-asset-service.html">09 资产服务</a><br><span class="muted">Asset Service</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>资产库的后端实体和 API，负责 media_assets、lineage、下载、索引、collections、characters。</td>
+            <td><a href="../components/09-asset-service.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="10-media-job-service.html">10 媒体任务服务</a><br><span class="muted">Media Job Service</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>把图片/视频生成从同步工具升级为可追踪 job：submit、poll、状态事件、产物入库、失败恢复。</td>
+            <td><a href="../components/10-media-job-service.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="11-skill-registry.html">11 技能注册表</a><br><span class="muted">Skill Registry</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>管理 agent 可见技能、渐进加载、安装守卫、Ultra allowlist、评估和版本。它决定“做视频”时 agent 应该看到哪些技能。</td>
+            <td><a href="../components/11-skill-registry.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="12-workflow-router.html">12 工作流路由器</a><br><span class="muted">Workflow Router</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>在真正生成前判断 intent、asset roles、缺失字段、workflow_skill 和下一步。它要先问清楚，而不是一进来就开跑。</td>
+            <td><a href="../components/12-workflow-router.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="13-prompt-compiler.html">13 提示词编译器</a><br><span class="muted">Prompt Compiler</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>把用户自然语言、技能规则、模型约束、资产引用和安全边界编译成 provider payload。不是简单润色 prompt。</td>
+            <td><a href="../components/13-prompt-compiler.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="14-sandbox-lifecycle.html">14 沙箱生命周期</a><br><span class="muted">Sandbox Lifecycle</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>管理每个任务的执行环境：创建、挂载文件、运行工具、暂停、唤醒、销毁。Atlas-only P0 可以先弱化，但不能把它当已经完整。</td>
+            <td><a href="../components/14-sandbox-lifecycle.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="15-human-approval-gateway.html">15 人工审批网关</a><br><span class="muted">Human Approval Gateway</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>对高风险动作、付费调用、删除、外发、重试消耗等操作做明确审批。要可恢复、可审计。</td>
+            <td><a href="../components/15-human-approval-gateway.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="16-observation-provenance-ledger.html">16 观察与溯源账本</a><br><span class="muted">Observation / Provenance Ledger</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>记录每次生成、工具调用、观察结果、资产来源、QA 证据和决策链。它用来防止 agent 空口声称完成。</td>
+            <td><a href="../components/16-observation-provenance-ledger.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="17-tokenrouter.html">17 TokenRouter 凭证与额度路由</a><br><span class="muted">TokenRouter</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>控制 provider 凭证、租户策略、额度、并发和计费。沙箱或浏览器不拿真实上游 key，只拿短期 Hermes token。</td>
+            <td><a href="../components/17-tokenrouter.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="18-cometapi-media-gateway.html">18 CometAPI 媒体网关</a><br><span class="muted">CometAPI Media Gateway</span></td>
+            <td><span class="badge spec-only">仅设计</span></td>
+            <td>处理长视频、外部社媒 URL、抽帧、转码、音频/字幕提取、多模态打包。它是媒体数据面，不是 TokenRouter。</td>
+            <td><a href="../components/18-cometapi-media-gateway.md">英文原文</a></td>
+          </tr>
+          <tr>
+            <td><a href="19-model-catalog-provider-constraints.html">19 模型目录与供应商约束</a><br><span class="muted">Model Catalog / Provider Constraints</span></td>
+            <td><span class="badge partial">部分实现</span></td>
+            <td>记录 Atlas 图片/视频模型、输入能力、画幅、时长、参考图、价格/限制，供 router、compiler、UI 使用。</td>
+            <td><a href="../components/19-model-catalog-provider-constraints.md">英文原文</a></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>怎么使用这套中文页</h2>
+      <ul>
+        <li>做实现时，看每页的 <strong>P0 要做</strong> 和 <strong>验收点</strong>。</li>
+        <li>做审计时，点每页底部英文 Markdown，那里保留完整证据和 open questions。</li>
+        <li>做排期时，优先处理黄色组件里的 P0 缺口，再处理红色组件里的最小后端合同。</li>
+      </ul>
+
+      <p class="footer">中文页是阅读版，英文 Markdown 是详细审计版。两者不互相覆盖。</p>
+    </section>
+  </main>
+</body>
+</html>

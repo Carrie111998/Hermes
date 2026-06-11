@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Policy Engine / Authorization - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Policy Engine / Authorization</h1>
+<p>作为统一 PDP，给 Edge、TokenRouter、Volume Mounter、egress proxy、K8s admission 和 Skill exfil filter 返回默认拒绝的策略判断。</p>
+<div class="meta"><span class="pill">推荐：Open Policy Agent (OPA)</span><span class="pill">对应 spec：Sections 4, 6, 8, 9, 12, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="02-identity-tenant-access.html">上一项</a><a href="04-sandbox-runtime-isolation.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Open Policy Agent (OPA) 是该模块的主选型。Hermes 的安全边界很多，不能把权限判断散落在每个服务里。OPA 可以用同一种 policy bundle 驱动 Envoy ext_authz、Kubernetes admission 和业务服务 sidecar/SDK。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 的安全边界很多，不能把权限判断散落在每个服务里。OPA 可以用同一种 policy bundle 驱动 Envoy ext_authz、Kubernetes admission 和业务服务 sidecar/SDK。</li>
+<li>OPA 的 Rego 适合表达 asset ACL、tool scope、mount policy、tenant plan、egress allowlist 这类结构化策略。</li>
+<li>相比只在应用里写 if/else，OPA policy 可以版本化、审计、回放测试，并在 CI 中做策略单元测试。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Cedar</strong></td><td>权限语言清晰，适合应用授权</td><td>Envoy/K8s/sidecar 生态没有 OPA 广；需要更多自研集成</td></tr>
+<tr><td><strong>Casbin</strong></td><td>轻量，嵌入应用简单</td><td>跨网关、K8s admission、bundle 分发和决策审计不如 OPA</td></tr>
+<tr><td><strong>OpenFGA</strong></td><td>关系授权强</td><td>适合 Zanzibar 风格关系图，不适合作为所有 tool/egress/mount 的通用 PDP</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>建立 `policy-bundles/hermes` 仓库，按 `edge.rego`、`tokenrouter.rego`、`mount.rego`、`egress.rego`、`skill_exfil.rego` 拆分。</li>
+<li>所有策略输入必须包含 identity tuple：tenant_id、workspace_id、project_id、session_id、user_id、run_id、tool_call_id。</li>
+<li>OPA 返回 `{allow, reason, redactions, limits}`，业务服务只能执行明确 allow；缺字段、未知工具、未知模型全部默认 deny。</li>
+<li>策略发布走 GitOps，生产 OPA 只拉签名 bundle，不从运行时写入策略。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>先做 TokenRouter 和 Volume Mounter 的库内 OPA evaluate。</li>
+<li>再接 Edge ext_authz，把会话订阅、API route 和 plan 限流的决策统一。</li>
+<li>最后加 Kubernetes admission，阻止未声明 RuntimeClass、hostPath、privileged、metadata egress 的 sandbox pod。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>策略 bundle 缺失时所有敏感操作默认拒绝。</li>
+<li>每个 deny 都有短 reason，但不暴露内部规则细节。</li>
+<li>OPA 单测覆盖所有 acceptance criteria 的 allow/deny 路径。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://www.openpolicyagent.org/docs/envoy">OPA Envoy plugin</a></li>
+<li><a href="https://www.openpolicyagent.org/docs/deploy/k8s">OPA on Kubernetes</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

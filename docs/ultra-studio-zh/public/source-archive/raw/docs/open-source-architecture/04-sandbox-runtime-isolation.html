@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox Runtime / Isolation - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Sandbox Runtime / Isolation</h1>
+<p>为不可信 terminal/tool execution 提供 microVM 级隔离，同时保留 Kubernetes 调度、镜像和 RuntimeClass 生态。</p>
+<div class="meta"><span class="pill">推荐：Kata Containers with Cloud Hypervisor profile</span><span class="pill">对应 spec：Sections 7, 17, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="03-policy-engine-authorization.html">上一项</a><a href="05-workspace-volume-mounter.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Kata Containers with Cloud Hypervisor profile 是该模块的主选型。Hermes sandbox 会执行用户文件、shell、第三方内容派生工具，普通容器边界不足以承担主隔离职责。Kata 用轻量 VM 包住容器 workload，更符合“默认假设 sandbox 可被攻破”的模型。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes sandbox 会执行用户文件、shell、第三方内容派生工具，普通容器边界不足以承担主隔离职责。Kata 用轻量 VM 包住容器 workload，更符合“默认假设 sandbox 可被攻破”的模型。</li>
+<li>直接用 Firecracker 需要自研 fleet manager、镜像构建、网络、存储和调度；Kata 先借用 Kubernetes/containerd/CRI，落地风险更低。</li>
+<li>Cloud Hypervisor profile 对通用云环境更容易调试；Firecracker profile 可作为高密度、成熟后的优化路径。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Firecracker direct</strong></td><td>隔离强、启动快、AWS Lambda 证明过高密度模型</td><td>需要自建 microVM 调度、网络、镜像和卷挂载控制面</td></tr>
+<tr><td><strong>gVisor</strong></td><td>更轻，K8s 集成好</td><td>不是完整 VM 边界；对任意 shell/code 的隔离信心低于 Kata/Firecracker</td></tr>
+<tr><td><strong>plain Docker/containerd runc</strong></td><td>成本低、性能好</td><td>不能作为多租户任意代码执行的主安全边界</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>创建 tainted `sandbox-host` node pool，只允许运行 RuntimeClass=`kata-hermes` 的 sandbox pods。</li>
+<li>每个 active session 默认一个 sandbox pod/microVM；reuse key 必须包含 tenant_id、workspace_id、project_id、profile、base_image_digest。</li>
+<li>禁用 privileged、hostPath、hostNetwork、hostPID、hostIPC；seccomp/AppArmor 仍保留作为 VM 内第二层防线。</li>
+<li>Sandbox 网络默认只允许 TokenRouter、egress proxy、event sidecar、volume broker；metadata IP 和私网默认拒绝。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：Kata RuntimeClass + 固定 sandbox image + session 级冷启动。</li>
+<li>性能阶段：warm pool 只预热未绑定 VM；绑定 tenant 后不能跨 tenant 复用。</li>
+<li>硬化阶段：sandbox escape test、metadata egress test、hostPath admission test、kernel capability audit。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>Sandbox 内无法访问 cloud metadata service。</li>
+<li>Sandbox pod spec 出现 hostPath/privileged 会被 admission 拒绝。</li>
+<li>Tenant A sandbox 销毁后，其 writable overlay 不能被任何后续 tenant 读到。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://katacontainers.io/">Kata Containers</a></li>
+<li><a href="https://kubernetes.io/docs/concepts/containers/runtime-class">Kubernetes RuntimeClass</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

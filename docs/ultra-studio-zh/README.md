@@ -13,6 +13,7 @@
 - [文档网站地图](site-map)：说明每个分区解决什么问题，以及推荐阅读顺序。
 - [完整建设图谱](architecture-blueprint)：完整系统总图、控制面、执行面、数据面、安全运维和路线图。
 - [完整长期参考](long-term-reference)：把 TokenRouter、CometAPI、Sandbox lifecycle、Asset Service、Memory、Marketplace、Ledger 和 Cloud tenant layer 放到同一张长期地图里。
+- [源文档归档](source-archive/README)：列出站点外所有历史文档、Notion/Lark 导出、旧版 HTML 和专题 PRD，并保留可读原文镜像。
 - [信息保留与上线说明](preservation-and-deploy)：说明 Markdown 主源、图谱资源、构建输出和部署方式。
 - 产品规格：定义 Ultra Studio 要做成什么。
 - 组件规格：定义每个 UI/服务/基建组件的功能、状态、API、数据和验收。
@@ -23,6 +24,8 @@
 ## 站点入口
 
 - [文档网站地图](site-map)
+- [源文档归档总览](source-archive/README)
+- [完整源文档清单](source-archive/inventory)
 - [信息保留与上线说明](preservation-and-deploy)
 
 ## 产品规格

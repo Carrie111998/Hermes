@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skill Workflow Runtime / Registry - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Skill Workflow Runtime / Registry</h1>
+<p>把 Skill 建模为路由、输入门、状态图、阶段执行、QA gate、失败恢复和可保护的内部资产，而不是 prompt 文本。</p>
+<div class="meta"><span class="pill">推荐：LangGraph OSS library + custom Skill Registry</span><span class="pill">对应 spec：Sections 1, 11, 12, 18</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="09-gpu-render-scheduling.html">上一项</a><a href="11-guardrails-exfiltration-defense.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>LangGraph OSS library + custom Skill Registry 是该模块的主选型。Lark 源文档强调 Skill 是 workflow，不是 prompt。LangGraph 的状态图、checkpoint、subgraph 和持久化机制适合表达这类有阶段、有条件、有 QA 的 agent workflow。</section>
+<section><h2>为什么选它</h2><ul><li>Lark 源文档强调 Skill 是 workflow，不是 prompt。LangGraph 的状态图、checkpoint、subgraph 和持久化机制适合表达这类有阶段、有条件、有 QA 的 agent workflow。</li>
+<li>Skill Registry 必须自研，因为它要控制 metadata 可见性、protected internals、versioning、routing priority、tenant allowlist 和 exfil 防御。</li>
+<li>外层长任务仍交给 Temporal；LangGraph 只负责单个 skill 内部的有状态执行图，避免把平台级 job durability 和 skill logic 混在一起。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>LangChain agents only</strong></td><td>工具生态广，上手快</td><td>开放式 agent loop 不够确定，难以表达严格路由和 QA gate</td></tr>
+<tr><td><strong>CrewAI/AutoGen</strong></td><td>多 agent 协作表达方便</td><td>更偏对话式协作，不适合作为受保护 skill internals 的平台边界</td></tr>
+<tr><td><strong>Temporal-only workflows</strong></td><td>durability 强</td><td>对 LLM state、tool graph、conversation memory 的开发体验不如 LangGraph</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>Skill Registry 表：skill_id、version、category、public_metadata、input_gate_schema、routing_rules、protected_bundle_ref、owner、status。</li>
+<li>公开 UI 只展示 metadata、用途、输入输出、示例资产；`SKILL.md`、`references/*`、内部 prompt、tool chain 永不直接给用户。</li>
+<li>Skill runtime 编译 LangGraph state machine；节点调用工具必须经过 TokenRouter/OPA。</li>
+<li>每个 skill execution 输出 routing trace、QA score、intermediate artifact manifest，但不暴露 protected instructions。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：把 17 个 workflow-generation routing priority 编成 deterministic router。</li>
+<li>第二阶段：为 infographicMD-flow 建立完整 LangGraph 示例和 QA gate。</li>
+<li>第三阶段：skill package signing、version promotion、tenant allowlist、red-team exfil tests。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>用户请求导出 `SKILL.md` 或 references 被拒绝。</li>
+<li>同一输入多次 routing 到同一 skill，除非 routing rules 版本变化。</li>
+<li>Skill failure 有可恢复状态，不会无限重试。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://reference.langchain.com/python/langgraph/overview">LangGraph package reference</a></li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/persistence">LangGraph persistence docs</a></li>
+<li><a href="https://github.com/langchain-ai/langgraph/blob/main/LICENSE">LangGraph MIT license</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

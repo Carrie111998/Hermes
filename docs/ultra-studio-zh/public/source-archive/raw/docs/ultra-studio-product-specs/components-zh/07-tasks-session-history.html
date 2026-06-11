@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>07 任务 / 会话历史 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">07 / 19</span>
+      </nav>
+      <h1>07 任务 / 会话历史</h1>
+      <p class="lede">左侧任务列表和历史恢复能力，用户可以回到某次创作，看到 transcript、工具、文件、资产和结果。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Tasks / Session History</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 SessionStore、FTS5 search、Sessions 页面和 resume in chat。</li>
+          <li>已有会话标题、消息数、平台来源等基础信息。</li>
+          <li>代码证据：hermes_state.py、web/src/pages/SessionsPage.tsx、web/src/lib/api.ts。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>Tasks row 还不是创作任务模型，只是 session history。</li>
+          <li>没有 job/output count、active media job、任务文件、skill profile 的恢复。</li>
+          <li>没有 task lifecycle：running、waiting、failed、complete。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>保留 session list 和 resume chat。</li>
+          <li>新增任务行时只显示真实 session/job 数据。</li>
+          <li>生成完成的图片/视频能从历史会话重新打开。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>任务状态、运行中任务恢复、跨任务搜索、收藏和归档。</li>
+          <li>按项目/客户/品牌组织任务。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>刷新浏览器后历史列表还在。</li>
+          <li>点历史任务能恢复对话内容。</li>
+          <li>生成结果不会只存在于当前 React 内存。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/07-tasks-session-history.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/07-tasks-session-history.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/07-tasks-session-history.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="06-files-task-file-browser.html">上一页：06 文件 / 任务文件浏览器</a>
+        <a class="chip" href="08-asset-library-ui.html">下一页：08 资产库界面</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

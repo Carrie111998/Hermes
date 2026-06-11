@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>扩展接口与迁移计划 | Ultra Studio 中文文档站</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文文档站</a>
+        <a class="chip" href="research-05-complete-system-perspective.html">上一页</a>
+        <a class="chip" href="research-90-open-questions.html">下一页</a>
+      </nav>
+      <h1>扩展接口与迁移计划</h1>
+      <p class="lede">规定 P0 必须保留哪些 seam，未来如何从本地 P0 迁移到 worker、TokenRouter、object storage、CometAPI。</p>
+      <div class="meta">
+        <span class="badge research">调研</span>
+        <a class="chip" href="../ultra-studio-zh/research-analysis/06-extension-seams-migration-plan.html">打开中文详细版</a>
+        <a class="chip" href="../ultra-studio-research-analysis/06-extension-seams-migration-plan.md">打开原文</a>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="panel">
+      <div class="grid">
+        <article class="card">
+          <h2>这份文档解决什么</h2>
+          <p>这是防重写文档。P0 可以简化实现，但不能把未来关键边界写死。</p>
+        </article>
+        <article class="card">
+          <h2>P0 相关结论</h2>
+          <ul>
+          <li>不要直接从前端调用 Atlas。</li>
+          <li>不要只用原始文件路径当 asset identity。</li>
+          <li>不要把 router 输出只保存在模型文本里。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>阅读位置</h2>
+          <p>这是中文阅读层，原文仍然保留为审计来源。需要写代码或开 issue 时，先读本页，再回到原文看细节。</p>
+        </article>
+      </div>
+      <h2>相邻阅读</h2>
+      <nav class="crumbs">
+        <a class="chip" href="README.html">返回总入口</a>
+        <a class="chip" href="research-05-complete-system-perspective.html">上一页</a>
+        <a class="chip" href="research-90-open-questions.html">下一页</a>
+      </nav>
+      <p class="footer">中文页用于串联和快速理解，不替代英文原文的完整细节。</p>
+    </section>
+  </main>
+</body>
+</html>

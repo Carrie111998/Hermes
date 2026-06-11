@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultra Studio Research Analysis Index</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Ultra Studio Research Analysis Index</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="00-index.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Ultra Studio Research Analysis Index</h1>
+<p>Status: final research synthesis</p>
+<p>Date: 2026-06-11</p>
+<p>Method: Codex threads, local repo inspection, and current official-source check.</p>
+<h2>Verdict</h2>
+<p>Ultra Studio should not start as a cloud supercomputer platform. The P0 should</p>
+<p>be a real creative skill-runner:</p>
+<pre><code class="language-text">web chat
+  -&gt; upload or text request
+  -&gt; workflow-router
+  -&gt; Atlas image/video tool
+  -&gt; durable media_job
+  -&gt; typed asset
+  -&gt; streamed UI status
+  -&gt; rendered image/video card</code></pre>
+<p>Everything else is reference or later work until this loop is real.</p>
+<h2>Result Documents</h2>
+<p>Each result has both Markdown and HTML.</p>
+<table><thead><tr><th>Result</th><th>Markdown</th><th>HTML</th><th>Purpose</th></tr></thead><tbody>
+<tr><td>Architecture and decision index</td><td><a href="00-index.md">00-index.md</a></td><td><a href="00-index.html">00-index.html</a></td><td>Canonical verdict, source map, and status truth.</td></tr>
+<tr><td>P0 MVP vertical slice</td><td><a href="01-p0-mvp-vertical-slice.md">01-p0-mvp-vertical-slice.md</a></td><td><a href="01-p0-mvp-vertical-slice.html">01-p0-mvp-vertical-slice.html</a></td><td>What to build first and what not to build.</td></tr>
+<tr><td>P0 agent, skill, tool, media contracts</td><td><a href="02-p0-agent-skill-tool-media-contracts.md">02-p0-agent-skill-tool-media-contracts.md</a></td><td><a href="02-p0-agent-skill-tool-media-contracts.html">02-p0-agent-skill-tool-media-contracts.html</a></td><td>Canonical endpoints, events, state enums, typed errors, and Atlas tool contract.</td></tr>
+<tr><td>P0 security and credential boundaries</td><td><a href="03-p0-security-credential-boundaries.md">03-p0-security-credential-boundaries.md</a></td><td><a href="03-p0-security-credential-boundaries.html">03-p0-security-credential-boundaries.html</a></td><td>Minimal security needed for P0 without overbuilding cloud infra.</td></tr>
+<tr><td>Later cloud infra roadmap</td><td><a href="04-later-cloud-infra-roadmap.md">04-later-cloud-infra-roadmap.md</a></td><td><a href="04-later-cloud-infra-roadmap.html">04-later-cloud-infra-roadmap.html</a></td><td>What moves to P1/P2 and why it is not P0.</td></tr>
+<tr><td>Complete system perspective</td><td><a href="05-complete-system-perspective.md">05-complete-system-perspective.md</a></td><td><a href="05-complete-system-perspective.html">05-complete-system-perspective.html</a></td><td>Full product/system map so future features have a stable slot.</td></tr>
+<tr><td>Extension seams and migration plan</td><td><a href="06-extension-seams-migration-plan.md">06-extension-seams-migration-plan.md</a></td><td><a href="06-extension-seams-migration-plan.html">06-extension-seams-migration-plan.html</a></td><td>Interfaces P0 must reserve so later infra can be added without rewrites.</td></tr>
+<tr><td>Research appendix and open questions</td><td><a href="90-research-appendix-open-questions.md">90-research-appendix-open-questions.md</a></td><td><a href="90-research-appendix-open-questions.html">90-research-appendix-open-questions.html</a></td><td>Threads findings, external references, drift list, and open decisions.</td></tr>
+</tbody></table>
+<h2>Authoritative Sources</h2>
+<p>For implementation, read in this order:</p>
+<p>1. <a href="01-p0-mvp-vertical-slice.md">01-p0-mvp-vertical-slice.md</a></p>
+<p>2. <a href="02-p0-agent-skill-tool-media-contracts.md">02-p0-agent-skill-tool-media-contracts.md</a></p>
+<p>3. <a href="03-p0-security-credential-boundaries.md">03-p0-security-credential-boundaries.md</a></p>
+<p>4. <a href="04-later-cloud-infra-roadmap.md">04-later-cloud-infra-roadmap.md</a></p>
+<p>5. <a href="05-complete-system-perspective.md">05-complete-system-perspective.md</a></p>
+<p>6. <a href="06-extension-seams-migration-plan.md">06-extension-seams-migration-plan.md</a></p>
+<p>The earlier documents remain source material, not final P0 authority:</p>
+<ul>
+<li><a href="../ultra-studio-product-specs/00-index.md">Ultra Studio product specs</a></li>
+<li><a href="../ultra-studio-infra-design/00-index.md">Ultra Studio infra design</a></li>
+<li><a href="../ultra-studio-agent-architecture.html">Ultra Studio architecture diagram</a></li>
+<li><a href="../open-source-architecture/00-index.html">Open-source architecture selection</a></li>
+</ul>
+<h2>Thread Results Incorporated</h2>
+<table><thead><tr><th>Lane</th><th>Finding</th></tr></thead><tbody>
+<tr><td>docs-audit</td><td>Docs are broad and honest, but P0/P1/P2 are mixed; endpoint/event names drift.</td></tr>
+<tr><td>code-reality</td><td>Web chat, uploads, streaming, Atlas image/video providers exist; typed media jobs/assets do not.</td></tr>
+<tr><td>reference-research</td><td>Borrow skill progressive disclosure and async media jobs; defer full sandbox/browser/cloud orchestration.</td></tr>
+<tr><td>synthesis</td><td>Final pack should be small, paired md/html, and split P0 from cloud references.</td></tr>
+</tbody></table>
+<h2>Current Truth</h2>
+<table><thead><tr><th>Capability</th><th>Status</th><th>Current evidence</th></tr></thead><tbody>
+<tr><td>React web chat over <code>/api/ws</code></td><td>Green / Yellow</td><td><code>web/src/pages/ChatPage.tsx</code>, <code>web/src/hooks/useGatewayChat.ts</code>, <code>hermes_cli/web_server.py</code></td></tr>
+<tr><td>PTY endpoint</td><td>Green</td><td><code>/api/pty</code> exists, but current <code>/chat</code> is not PTY/xterm-based.</td></tr>
+<tr><td>Upload route</td><td>Yellow</td><td><code>hermes_cli/dashboard_uploads.py</code> stores files, but does not create typed <code>asset_id</code>.</td></tr>
+<tr><td>Chat/tool streaming</td><td>Yellow</td><td>Generic <code>message.delta</code>, <code>message.complete</code>, <code>tool.start</code>, <code>tool.complete</code> exist.</td></tr>
+<tr><td>Media-specific events</td><td>Red</td><td><code>media_job.created</code>, <code>media_job.updated</code>, <code>asset.ready</code> are not implemented.</td></tr>
+<tr><td>Atlas image provider</td><td>Green</td><td><code>plugins/image_gen/atlas/</code> and <code>tools/image_generation_tool.py</code> dispatch.</td></tr>
+<tr><td>Atlas video provider</td><td>Green</td><td><code>plugins/video_gen/atlas/</code> submits and polls Atlas prediction IDs.</td></tr>
+<tr><td>Workflow router</td><td>Yellow</td><td><code>skills/creative/workflow-router/SKILL.md</code> exists as prompt-level routing.</td></tr>
+<tr><td>Durable media jobs/assets</td><td>Red</td><td>No <code>media_jobs</code> or <code>media_assets</code> store in <code>hermes_state.py</code>.</td></tr>
+</tbody></table>
+<h2>Decision Log</h2>
+<table><thead><tr><th>Decision</th><th>Result</th></tr></thead><tbody>
+<tr><td>P0 chat baseline</td><td>Use the existing React <code>/api/ws</code> web chat. Do not pivot back to PTY as P0.</td></tr>
+<tr><td>Endpoint namespace</td><td>Use <code>/api/...</code> consistently for web-facing P0 endpoints.</td></tr>
+<tr><td>Event vocabulary</td><td>Use <code>media_job.*</code> and <code>asset.ready</code> as the canonical media event names.</td></tr>
+<tr><td>P0 skills</td><td><code>workflow-router</code>, <code>infographic-md-flow</code>, <code>media-qa</code>, <code>prompt-repair</code>. Product/photo/UGC flows are P1 unless implemented.</td></tr>
+<tr><td>Element/Character</td><td>Not P0. They can appear as disabled or planned actions, not acceptance blockers.</td></tr>
+<tr><td>Cloud infra</td><td>TokenRouter/Temporal/NATS/Kata/Kueue/etc. are later/reference until P0 media loop is stable.</td></tr>
+</tbody></table>
+<h2>Completion Standard</h2>
+<p>Documentation is complete enough when:</p>
+<ul>
+<li>every final result has both <code>.md</code> and <code>.html</code>;</li>
+<li>P0 scope and P0 non-goals are explicit;</li>
+<li>endpoint names and event names are canonical;</li>
+<li>media job and asset schemas are concrete;</li>
+<li>security boundaries are enough to prevent fake outputs and provider-key leakage;</li>
+<li>P1/P2 infrastructure is clearly separated from P0;</li>
+<li>future features have a named owner, state boundary, event path, and migration seam;</li>
+<li>each acceptance case can become a test or smoke command.</li>
+</ul>
+</main></div>
+</body>
+</html>

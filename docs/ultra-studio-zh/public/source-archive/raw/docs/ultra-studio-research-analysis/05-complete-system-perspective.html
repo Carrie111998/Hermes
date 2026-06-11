@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Complete System Perspective</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Complete System Perspective</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="05-complete-system-perspective.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Complete System Perspective</h1>
+<p>Status: complete-view design, not P0 implementation scope</p>
+<p>Date: 2026-06-11</p>
+<h2>Purpose</h2>
+<p>P0 must stay thin, but the system model must be complete. This document defines</p>
+<p>the whole target shape so later additions do not become accidental patches.</p>
+<p>The rule is:</p>
+<pre><code class="language-text">build the P0 vertical slice now
+reserve the ownership seams for the full product now
+defer heavy infrastructure until a trigger makes it necessary</code></pre>
+<h2>Complete Product Surface</h2>
+<table><thead><tr><th>Surface</th><th>P0</th><th>Later</th></tr></thead><tbody>
+<tr><td>Chat</td><td>real Hermes web chat, upload, streaming, media cards</td><td>multi-run workspace, advanced approvals, collaborative sessions</td></tr>
+<tr><td>Inspector</td><td>selected job/asset details, error, download</td><td>QA scores, repair plans, create Element, create Character</td></tr>
+<tr><td>Assets</td><td>upload asset, generated image/video asset</td><td>smart groups, semantic search, collections, lineage graph</td></tr>
+<tr><td>Skills</td><td>workflow-router, infographic, media QA, prompt repair</td><td>product shoots, UGC, listing, campaigns, marketplace skills</td></tr>
+<tr><td>Browser</td><td>not required for generation</td><td>persistent contexts, take-over, authenticated reference gathering</td></tr>
+<tr><td>Sandbox</td><td>not required for Atlas-only generation</td><td>isolated tools, file transforms, render pipelines, code execution</td></tr>
+<tr><td>Memory</td><td>not P0 unless already available</td><td>project memory, brand memory, preference memory, source-backed recall</td></tr>
+<tr><td>Marketplace</td><td>not P0</td><td>skill/template/asset packages with permissions and provenance</td></tr>
+</tbody></table>
+<h2>Target Architecture</h2>
+<pre><code class="language-text">Experience Layer
+  chat, uploads, inspector, assets, files, marketplace
+
+Agent Runtime Layer
+  session, run, workflow-router, skill runtime, prompt compiler
+
+Media Execution Layer
+  media_job, Atlas provider adapters, polling, publish, retry
+
+Asset Data Layer
+  asset, object/file, lineage, collection, smart_group, character, element
+
+Control Boundary Layer
+  credential shim -&gt; TokenRouter, policy shim -&gt; OPA, audit, quota
+
+Expansion Layer
+  browser contexts, sandbox runtime, CometAPI, durable workflows, GPU fabric</code></pre>
+<p>P0 implements the first three layers minimally and creates the first asset data</p>
+<p>layer. It should not implement the full expansion layer, but it must not block it.</p>
+<h2>State Ownership</h2>
+<table><thead><tr><th>State</th><th>Owner</th><th>P0 representation</th><th>Later upgrade</th></tr></thead><tbody>
+<tr><td>Session</td><td>Hermes session store</td><td>existing session/message store</td><td>multi-user workspace session store</td></tr>
+<tr><td>Run</td><td>Agent runtime</td><td>run_id attached to prompt/tool/job</td><td>durable run event log</td></tr>
+<tr><td>Router decision</td><td>Agent runtime</td><td>stored route JSON</td><td>deterministic router service/tool</td></tr>
+<tr><td>Tool call</td><td>Agent runtime</td><td>existing tool event + tool_call_id</td><td>complete tool ledger</td></tr>
+<tr><td>Media job</td><td>Media execution</td><td>new <code>media_jobs</code> table</td><td>worker queue / Temporal workflow</td></tr>
+<tr><td>Asset</td><td>Asset data layer</td><td>new <code>media_assets</code> table</td><td>object store, lineage graph, search index</td></tr>
+<tr><td>Provider credential</td><td>Credential boundary</td><td>server env credential shim</td><td>TokenRouter + vault</td></tr>
+<tr><td>Browser context</td><td>Browser service</td><td>none</td><td>scoped context store</td></tr>
+<tr><td>Sandbox workspace</td><td>Sandbox service</td><td>none</td><td>workspace volume and sandbox lifecycle</td></tr>
+<tr><td>Usage/billing</td><td>Control boundary</td><td>optional usage row</td><td>quota, credits, audit, billing ledger</td></tr>
+</tbody></table>
+<h2>Complete Capability Map</h2>
+<table><thead><tr><th>Capability</th><th>First usable version</th><th>Final owner</th></tr></thead><tbody>
+<tr><td>text-to-image</td><td>P0 Atlas wrapper</td><td>Media execution</td></tr>
+<tr><td>text-to-video</td><td>P0 Atlas wrapper</td><td>Media execution</td></tr>
+<tr><td>image-to-video</td><td>P0 if current Atlas model supports it</td><td>Media execution</td></tr>
+<tr><td>video analysis</td><td>later simple worker, then CometAPI</td><td>CometAPI / media data plane</td></tr>
+<tr><td>asset reuse</td><td>P0 by <code>asset_id</code></td><td>Asset data layer</td></tr>
+<tr><td>character consistency</td><td>later</td><td>Character service over asset data</td></tr>
+<tr><td>element reuse</td><td>later</td><td>Element service over asset data</td></tr>
+<tr><td>skill routing</td><td>P0 prompt-level router</td><td>Skill runtime</td></tr>
+<tr><td>skill marketplace</td><td>later</td><td>Marketplace service</td></tr>
+<tr><td>browser reference gathering</td><td>later</td><td>Browser context service</td></tr>
+<tr><td>sandbox file transforms</td><td>later</td><td>Sandbox runtime</td></tr>
+<tr><td>provider quota</td><td>P0 shim</td><td>TokenRouter</td></tr>
+<tr><td>multi-tenant policy</td><td>later</td><td>OPA / auth boundary</td></tr>
+</tbody></table>
+<h2>Design Invariants</h2>
+<p>These must hold from P0 onward:</p>
+<ul>
+<li>UI references media by <code>asset_id</code>, not raw file path.</li>
+<li>Any generated media must pass through <code>media_job</code>.</li>
+<li>A final response cannot claim an artifact unless <code>asset.ready</code> was emitted.</li>
+<li>Router decides before generation.</li>
+<li>Missing credential is a typed blocker, not a provider fallback.</li>
+<li>Skills are progressively disclosed.</li>
+<li>Provider details are behind a media/provider adapter.</li>
+<li>Later browser/sandbox work cannot bypass job, asset, audit, or policy seams.</li>
+</ul>
+<h2>Full Research Implications</h2>
+<p>The official references point to the same architecture direction:</p>
+<ul>
+<li>Manus Skills emphasizes file-based, reusable, composable skills and progressive disclosure.</li>
+<li>Manus Cloud Browser shows authenticated browser action needs isolated sessions, take-over, and user-controlled account access.</li>
+<li>E2B shows sandbox lifecycle should be explicit when code/file execution becomes necessary.</li>
+<li>Browserbase contexts show browser session state is its own managed object.</li>
+<li>OpenAI/Anthropic computer-use patterns show GUI control should be tool-like, observable, and constrained.</li>
+<li>LangGraph and Temporal both justify durable state for long-running workflows, but only after P0 proves the loop needs more than DB-backed jobs.</li>
+</ul>
+<h2>Complete View Acceptance</h2>
+<p>The design is complete enough when future features have a named slot:</p>
+<table><thead><tr><th>Future feature</th><th>Slot already reserved</th></tr></thead><tbody>
+<tr><td>TokenRouter</td><td>provider credential seam behind media job wrapper</td></tr>
+<tr><td>CometAPI</td><td>media data-plane seam before provider call</td></tr>
+<tr><td>browser contexts</td><td>browser service seam, not chat UI state</td></tr>
+<tr><td>sandbox</td><td>execution service seam, not direct local shell</td></tr>
+<tr><td>smart groups</td><td>asset query layer, not collection mutation</td></tr>
+<tr><td>characters/elements</td><td>first-class asset-derived entities</td></tr>
+<tr><td>marketplace</td><td>skill/template package layer with permissions</td></tr>
+<tr><td>Temporal/NATS</td><td>job/event implementation upgrade, not contract rewrite</td></tr>
+</tbody></table>
+</main></div>
+</body>
+</html>

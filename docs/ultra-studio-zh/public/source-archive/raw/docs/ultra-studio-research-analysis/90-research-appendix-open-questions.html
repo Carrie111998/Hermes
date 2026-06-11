@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Appendix and Open Questions</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1040px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Research Appendix and Open Questions</h1><div class="meta"><span class="pill">Ultra Studio Research Analysis</span><span class="pill">2026-06-11</span><a class="pill" href="00-index.html">Index</a><a class="pill" href="90-research-appendix-open-questions.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Research Appendix and Open Questions</h1>
+<p>Status: evidence appendix</p>
+<p>Date: 2026-06-11</p>
+<h2>Threads Summary</h2>
+<p>Four read-only Codex threads were used.</p>
+<table><thead><tr><th>Thread</th><th>Output used</th></tr></thead><tbody>
+<tr><td>docs-audit</td><td>Current docs are broad, but not a clean P0 pack. Found endpoint/event drift and P0/P1 conflicts.</td></tr>
+<tr><td>code-reality</td><td>Web chat/upload/Atlas providers exist; media job and asset persistence do not.</td></tr>
+<tr><td>reference-research</td><td>Borrow skills, async job contracts, narrow browser/sandbox ideas; defer cloud infra.</td></tr>
+<tr><td>synthesis</td><td>Recommended six paired md/html docs with P0 separated from cloud references.</td></tr>
+</tbody></table>
+<h2>External Research</h2>
+<table><thead><tr><th>Source</th><th>Finding for Ultra Studio</th></tr></thead><tbody>
+<tr><td>Manus Agent Skills</td><td>Skills are workflow packages with progressive disclosure and execution, not just prompts.</td></tr>
+<tr><td>Manus Cloud Browser</td><td>Browser automation can use logged-in sessions and human take-over; this is later for Ultra P0.</td></tr>
+<tr><td>E2B Sandbox</td><td>Sandbox lifecycle, filesystem, commands, volumes, and metrics are useful references, not mandatory P0.</td></tr>
+<tr><td>Browserbase Contexts</td><td>Persisted browser contexts are useful when authenticated browser automation becomes real.</td></tr>
+<tr><td>OpenAI Computer-Using Agent</td><td>GUI agents need confirmation for sensitive actions and are not a substitute for APIs.</td></tr>
+<tr><td>Anthropic computer use</td><td>Computer-use is a tool surface with screenshots/actions; fallibility must be explicit.</td></tr>
+<tr><td>Temporal</td><td>Durable execution is valuable for crash/retry/resume, but a DB-backed job table is enough for P0.</td></tr>
+<tr><td>LangGraph</td><td>Good reference for stateful agent workflows and human-in-loop; not required for first media loop.</td></tr>
+<tr><td>async media APIs</td><td>Runway/Replicate/fal patterns support a durable <code>job -&gt; status -&gt; output asset</code> contract.</td></tr>
+</tbody></table>
+<p>Source links:</p>
+<ul>
+<li>Manus Agent Skills: https://manus.im/features/agent-skills</li>
+<li>Manus Cloud Browser: https://manus.im/docs/features/cloud-browser</li>
+<li>E2B docs: https://e2b.dev/docs</li>
+<li>Browserbase Contexts: https://docs.browserbase.com/platform/browser/core-features/contexts</li>
+<li>OpenAI Computer-Using Agent: https://openai.com/index/computer-using-agent/</li>
+<li>Anthropic computer use: https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool</li>
+<li>Temporal docs: https://docs.temporal.io/</li>
+<li>LangGraph overview: https://docs.langchain.com/oss/python/langgraph/overview</li>
+<li>fal Queue API: https://fal.ai/docs/documentation/model-apis/inference/queue</li>
+</ul>
+<h2>Local Evidence</h2>
+<table><thead><tr><th>Evidence</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>web/src/pages/ChatPage.tsx</code></td><td>Current web chat exists.</td></tr>
+<tr><td><code>web/src/hooks/useGatewayChat.ts</code></td><td>Uses session and prompt submit gateway flow.</td></tr>
+<tr><td><code>hermes_cli/web_server.py</code></td><td>Has <code>/api/pty</code>, <code>/api/ws</code>, <code>/api/pub</code>, <code>/api/events</code>, plugin routes.</td></tr>
+<tr><td><code>hermes_cli/dashboard_uploads.py</code></td><td>Uploads are real but return file metadata, not typed assets.</td></tr>
+<tr><td><code>plugins/image_gen/atlas/</code></td><td>Atlas image provider exists.</td></tr>
+<tr><td><code>plugins/video_gen/atlas/</code></td><td>Atlas video provider exists and polls prediction status.</td></tr>
+<tr><td><code>tools/image_generation_tool.py</code></td><td>Image tool dispatch path exists.</td></tr>
+<tr><td><code>tools/video_generation_tool.py</code></td><td>Video tool dispatch path exists.</td></tr>
+<tr><td><code>skills/creative/workflow-router/SKILL.md</code></td><td>Router exists as skill prompt.</td></tr>
+<tr><td><code>hermes_cli/ultra_studio_skills.py</code></td><td>Ultra allowlist helper exists but needs startup wiring.</td></tr>
+<tr><td><code>hermes_state.py</code></td><td>Sessions/messages exist; media job/asset tables are missing.</td></tr>
+</tbody></table>
+<h2>Drift Found</h2>
+<table><thead><tr><th>Drift</th><th>Resolution</th></tr></thead><tbody>
+<tr><td><code>/api/sessions</code> vs <code>/sessions</code></td><td>Use <code>/api/...</code> in final P0 docs.</td></tr>
+<tr><td><code>media_job.*</code> vs <code>job.*</code></td><td>Use <code>media_job.created</code>, <code>media_job.updated</code>, <code>asset.ready</code>.</td></tr>
+<tr><td>Product/photo/UGC as P0 vs P1</td><td>P0 skill list is only router, infographic, media QA, prompt repair.</td></tr>
+<tr><td>Element/Character listed in top-level acceptance</td><td>Move to P1; P0 may show disabled/planned actions only.</td></tr>
+<tr><td>Approval protocol variants</td><td>P0 only needs confirm for delete/retry/spend; full approval lifecycle later.</td></tr>
+<tr><td>PTY vs React chat baseline</td><td>P0 uses existing React <code>/api/ws</code> chat. PTY remains available but not baseline.</td></tr>
+</tbody></table>
+<h2>Open Questions</h2>
+<p>These block implementation choices, not architecture:</p>
+<p>1. Which exact Atlas video family should be the P0 default?</p>
+<p>2. Should P0 store <code>media_jobs</code> and <code>media_assets</code> in existing SQLite <code>SessionDB</code>, or a separate local DB module?</p>
+<p>3. Should uploads immediately become assets, or only after the user attaches them to a prompt?</p>
+<p>4. Should <code>video_generate</code> stay blocking while polling for P0, or move directly to a background worker?</p>
+<p>5. Which UI route is canonical for Ultra Studio: existing <code>/chat</code>, a new <code>/studio</code>, or dashboard plugin route?</p>
+<p>6. Should HTML docs be generated from Markdown in CI, or checked in as static rendered files?</p>
+<h2>Recommended Next Implementation Slice</h2>
+<p>1. Add tables and data access methods for <code>media_jobs</code> and <code>media_assets</code>.</p>
+<p>2. Upgrade upload response to include <code>asset_id</code>.</p>
+<p>3. Add job wrapper tools around existing Atlas providers.</p>
+<p>4. Emit media events through existing gateway.</p>
+<p>5. Render media cards in chat.</p>
+<p>6. Add inspector detail view.</p>
+<p>7. Add router handoff tests.</p>
+<p>8. Add smoke test: real Atlas success or typed missing credential.</p>
+</main></div>
+</body>
+</html>

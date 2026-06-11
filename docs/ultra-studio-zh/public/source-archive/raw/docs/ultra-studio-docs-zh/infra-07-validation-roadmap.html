@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>基础设施验证路线 | Ultra Studio 中文文档站</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文文档站</a>
+        <a class="chip" href="infra-06-security-ops-design.html">上一页</a>
+        <a class="chip" href="standalone-skill-tool-prompt.html">下一页</a>
+      </nav>
+      <h1>基础设施验证路线</h1>
+      <p class="lede">定义 P0/P1/P2 基建验证、失败测试和 launch gates。</p>
+      <div class="meta">
+        <span class="badge infra">基建</span>
+        <a class="chip" href="../ultra-studio-zh/infra-design/07-validation-roadmap.html">打开中文详细版</a>
+        <a class="chip" href="../ultra-studio-infra-design/07-validation-roadmap.md">打开原文</a>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="panel">
+      <div class="grid">
+        <article class="card">
+          <h2>这份文档解决什么</h2>
+          <p>基建不是画图结束，要能用失败场景验证。比如 provider 失败、刷新恢复、权限拒绝、secret 泄漏检测。</p>
+        </article>
+        <article class="card">
+          <h2>P0 相关结论</h2>
+          <ul>
+          <li>P0 launch gate：真实 media job、真实 asset、真实错误、刷新恢复、下载可用。</li>
+          <li>P1/P2 再加多用户、sandbox、TokenRouter、CometAPI。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>阅读位置</h2>
+          <p>这是中文阅读层，原文仍然保留为审计来源。需要写代码或开 issue 时，先读本页，再回到原文看细节。</p>
+        </article>
+      </div>
+      <h2>相邻阅读</h2>
+      <nav class="crumbs">
+        <a class="chip" href="README.html">返回总入口</a>
+        <a class="chip" href="infra-06-security-ops-design.html">上一页</a>
+        <a class="chip" href="standalone-skill-tool-prompt.html">下一页</a>
+      </nav>
+      <p class="footer">中文页用于串联和快速理解，不替代英文原文的完整细节。</p>
+    </section>
+  </main>
+</body>
+</html>

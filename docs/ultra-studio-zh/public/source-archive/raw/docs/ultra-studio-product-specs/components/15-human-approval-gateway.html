@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Human Approval Gateway</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Human Approval Gateway</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="15-human-approval-gateway.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Human Approval Gateway</h1>
+<p>Status: partial — in-process approval machinery exists (command approval</p>
+<p>with hardline blocking, a clarify gateway with timeouts and notification</p>
+<p>callbacks, slash confirmation); the durable approval contract (typed</p>
+<p>decisions, page-refresh survival, <code>approval.*</code> events) is spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/02-agent-runtime-contract.md</code></li>
+</ul>
+<p>(§Human Approval Gateway, §Event Stream, §Error Contract),</p>
+<p><code>01-product-surface.md</code> (§Required States: &quot;Waiting for user&quot;),</p>
+<p><code>06-delivery-plan.md</code> (P2 item 7, P2 gate &quot;Cost/private/publish actions</p>
+<p>require approval&quot;), <code>00-index.md</code> (§Top-Level Acceptance)</p>
+<ul>
+<li>Code (verified this session): <code>tools/approval.py</code></li>
+</ul>
+<p>(<code>_fire_approval_hook</code>, <code>set_current_session_key</code>,</p>
+<p><code>_is_gateway_approval_context</code>, <code>detect_hardline_command</code>,</p>
+<p><code>_check_sudo_stdin_guard</code>, approval key aliasing),</p>
+<p><code>tools/clarify_gateway.py</code> (<code>register</code>, <code>wait_for_response</code>,</p>
+<p><code>resolve_gateway_clarify</code>, <code>get_pending_for_session</code>,</p>
+<p><code>mark_awaiting_text</code>, <code>get_clarify_timeout</code>, <code>register_notify</code>),</p>
+<p><code>tools/slash_confirm.py</code>, <code>gateway/run.py</code>, <code>gateway/pairing.py</code></p>
+<p>(approval-related handling), <code>agent/tool_guardrails.py</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>Approval is required for actions that spend money, expose private media,</p>
+<p>touch logged-in accounts, run local commands, or publish externally</p>
+<p>(<code>02-agent-runtime-contract.md</code> §Human Approval Gateway). The agent must</p>
+<p>pause and resume from durable state; a page refresh must not lose the</p>
+<p>approval request.</p>
+<p>Decision types: <code>approve</code>, <code>edit</code>, <code>reject</code>, <code>respond</code>.</p>
+<p>Scope: approval triggers, the pause/resume contract, decision handling,</p>
+<p>durability, events, and the relationship to clarification (ask-user</p>
+<p>questions). Clarification and approval share plumbing (the clarify gateway)</p>
+<p>but differ in intent: clarification fills missing fields</p>
+<p>(<code>12-workflow-router.md</code> ask-once rules); approval authorizes consequences.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Command approval flow with per-session context keys and platform awareness</td><td><code>tools/approval.py</code> (<code>set_current_session_key</code>, <code>_get_session_platform</code>, <code>_is_gateway_approval_context</code>)</td></tr>
+<tr><td>Implemented</td><td>Hardline command detection (always-block class) and sudo-stdin guard</td><td><code>tools/approval.py</code> (<code>detect_hardline_command</code>, <code>_hardline_block_result</code>, <code>_check_sudo_stdin_guard</code>)</td></tr>
+<tr><td>Implemented</td><td>Approval pattern keys with aliasing (remember prior decisions per pattern)</td><td><code>tools/approval.py</code> (<code>_legacy_pattern_key</code>, <code>_approval_key_aliases</code>, <code>_normalize_command_for_detection</code>)</td></tr>
+<tr><td>Implemented</td><td>Approval lifecycle hooks for observers</td><td><code>tools/approval.py</code> (<code>_fire_approval_hook</code>)</td></tr>
+<tr><td>Implemented</td><td>Ask-user gateway: register a pending question, block with timeout, resolve from another channel, notify callbacks, per-session pending state</td><td><code>tools/clarify_gateway.py</code> (<code>register</code>, <code>wait_for_response</code>, <code>resolve_gateway_clarify</code>, <code>register_notify</code>, <code>get_clarify_timeout</code>)</td></tr>
+<tr><td>Implemented</td><td>Slash-command confirmation path</td><td><code>tools/slash_confirm.py</code></td></tr>
+<tr><td>Implemented</td><td>Tool-level guardrails preceding approval</td><td><code>agent/tool_guardrails.py</code></td></tr>
+<tr><td>Specified, not built</td><td>Typed decisions <code>approve / edit / reject / respond</code> as a uniform contract (today: approve/deny + free-text response paths)</td><td><code>02-agent-runtime-contract.md</code> §Human Approval Gateway</td></tr>
+<tr><td>Specified, not built</td><td>Durable approval requests (survive page refresh / gateway restart) — the clarify gateway state is in-process (module-level registry with timeouts)</td><td>same; <code>tools/clarify_gateway.py</code> structure</td></tr>
+<tr><td>Specified, not built</td><td><code>approval.requested</code> / <code>approval.resolved</code> gateway events to the web UI</td><td><code>02-agent-runtime-contract.md</code> §Event Stream</td></tr>
+<tr><td>Specified, not built</td><td>Trigger taxonomy beyond commands: spend-money, private-media, logged-in-account, publish-external</td><td>§Human Approval Gateway; today&#x27;s machinery is command/tool-centric</td></tr>
+<tr><td>Specified, not built</td><td><code>approval_required</code> typed error</td><td>§Error Contract</td></tr>
+<tr><td>Specified, not built</td><td>Web approval card UI (&quot;Waiting for user&quot; state)</td><td><code>01-product-surface.md</code> §Required States; web chat renders ask-user cards (see <code>02-creative-chat-ui.md</code>), approval-specific cards planned</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li>Approval card in chat when the agent requests authorization (planned</li>
+</ul>
+<p>rendering; plumbing exists for messaging platforms via the gateway).</p>
+<ul>
+<li>Inline command-approval prompts in TUI/CLI sessions (implemented path</li>
+</ul>
+<p>through <code>tools/approval.py</code>).</p>
+<ul>
+<li>Pending-approval indicator on task rows (&quot;Waiting&quot; status,</li>
+</ul>
+<p><code>07-tasks-session-history.md</code> State Machine).</p>
+<ul>
+<li>Approval resolution from a different surface than the request (the</li>
+</ul>
+<p>clarify gateway supports cross-channel resolve:</p>
+<p><code>resolve_gateway_clarify</code>).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Pause agent execution pending a human decision</td><td>Implemented (blocking <code>wait_for_response</code> with timeout)</td></tr>
+<tr><td>Hardline blocks that approval cannot override</td><td>Implemented (<code>detect_hardline_command</code>)</td></tr>
+<tr><td>Remembered approvals per command pattern</td><td>Implemented (pattern keys + aliases)</td></tr>
+<tr><td>Session-scoped pending question state</td><td>Implemented (<code>get_pending_for_session</code>, <code>clear_session</code>)</td></tr>
+<tr><td>Notification callbacks on pending approvals</td><td>Implemented (<code>register_notify</code>)</td></tr>
+<tr><td>Typed decision set incl. <code>edit</code> (modify-then-approve)</td><td>Planned</td></tr>
+<tr><td>Durable approval records surviving restarts</td><td>Planned</td></tr>
+<tr><td><code>approval.requested/resolved</code> events to web UI</td><td>Planned</td></tr>
+<tr><td>Trigger taxonomy: money / private media / accounts / local exec / publish</td><td>Planned (local exec exists; the rest need integration points in media job, publish, and browser flows)</td></tr>
+<tr><td>Approval audit trail (who, when, what changed)</td><td>Planned (pairs with <code>16-observation-provenance-ledger.md</code>)</td></tr>
+<tr><td>Timeout policy with safe default deny</td><td>Implemented mechanically (<code>get_clarify_timeout</code>); product policy per trigger class planned</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Approval request lifecycle (target contract):</p>
+<pre><code class="language-text">created -&gt; pending -&gt; resolved(approve)
+                   -&gt; resolved(edit)      (payload modified, then proceeds)
+                   -&gt; resolved(reject)
+                   -&gt; resolved(respond)   (free-text answer back to agent)
+pending -&gt; expired   (timeout policy; default deny for consequential actions)</code></pre>
+<p>Agent-side:</p>
+<pre><code class="language-text">running -&gt; paused(awaiting_approval) -&gt; resumed (with decision attached)
+                                      -&gt; aborted (reject/expired)</code></pre>
+<p>Rules:</p>
+<ul>
+<li><code>pending</code> must be durable: re-rendered after refresh, re-deliverable</li>
+</ul>
+<p>after gateway restart (planned; today restart drops in-process state).</p>
+<ul>
+<li><code>edit</code> returns the modified payload to the exact decision point — the</li>
+</ul>
+<p>agent must use the edited version, not re-derive its own.</p>
+<ul>
+<li>Hardline-blocked actions never enter <code>pending</code>; they are refused outright</li>
+</ul>
+<p>(<code>_hardline_block_result</code> behavior).</p>
+<ul>
+<li>Expiry of a money/publish approval is a deny, never an implicit approve.</li>
+</ul>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (in-process):</p>
+<ul>
+<li><code>register(...) -&gt; clarify_id</code>, <code>wait_for_response(clarify_id, timeout)</code>,</li>
+</ul>
+<p><code>resolve_gateway_clarify(clarify_id, response)</code>,</p>
+<p><code>get_pending_for_session(session_key)</code>, <code>mark_awaiting_text</code>,</p>
+<p><code>register_notify/unregister_notify</code> — <code>tools/clarify_gateway.py</code>.</p>
+<ul>
+<li>Approval hook firing for lifecycle observers</li>
+</ul>
+<p>(<code>_fire_approval_hook(hook_name, **kwargs)</code>).</p>
+<p>Planned (gateway contract):</p>
+<ul>
+<li>Events <code>approval.requested</code> (typed payload: trigger class, summary of the</li>
+</ul>
+<p>action, editable fields, expiry) and <code>approval.resolved</code> (decision,</p>
+<p>decider, edited payload hash) — <code>02-agent-runtime-contract.md</code></p>
+<p>§Event Stream.</p>
+<ul>
+<li>Typed error <code>approval_required</code> returned by tools that hit an approval</li>
+</ul>
+<p>gate in a non-interactive context (cron/scheduled runs).</p>
+<pre><code class="language-http">POST /api/approvals/{approval_id}/resolve   # {decision, edited_payload?}
+GET  /api/approvals?session_id=&amp;status=pending</code></pre>
+<h2>Data Model</h2>
+<p>Implemented: in-memory <code>_ClarifyEntry</code> registry keyed by clarify id with</p>
+<p>session key, timestamps, awaiting-text flag (<code>tools/clarify_gateway.py</code>);</p>
+<p>approval pattern decisions persisted per session/config in the approval</p>
+<p>layer.</p>
+<p>Planned durable entity:</p>
+<pre><code class="language-text">approval_requests
+- approval_id
+- session_id, run_id, tool_call_id
+- trigger_class: spend_money | private_media | account_access
+                | local_exec | publish_external
+- action_summary          (human-readable, no secrets)
+- payload_ref             (what will execute if approved)
+- editable_fields[]
+- status: pending | approved | edited | rejected | responded | expired
+- decision_by, decided_at, expiry_at
+- edited_payload_hash     (when decision = edited)</code></pre>
+<h2>UI Behavior</h2>
+<ul>
+<li>An approval card renders in the transcript at the decision point: action</li>
+</ul>
+<p>summary, trigger class badge, cost estimate where applicable, and the</p>
+<p>four decision buttons; <code>edit</code> opens the editable fields inline.</p>
+<ul>
+<li>The card persists across refresh (durable <code>pending</code>), shows expiry</li>
+</ul>
+<p>countdown, and collapses into a resolved record (decision + who + when)</p>
+<p>after resolution.</p>
+<ul>
+<li>The inspector mirrors the pending approval&#x27;s context (missing field /</li>
+</ul>
+<p>consequence details), per <code>01-product-surface.md</code> §Required States</p>
+<p>(&quot;Waiting for user&quot;: center renders structured question; inspector shows</p>
+<p>missing field context).</p>
+<ul>
+<li>Approvals never render raw secrets or full credentials in the summary.</li>
+<li>Non-interactive surfaces (cron) surface <code>approval_required</code> as a task</li>
+</ul>
+<p>state, not a silent skip.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>Only the session owner (or explicitly authorized workspace roles) can</li>
+</ul>
+<p>resolve an approval; resolutions record the decider.</p>
+<ul>
+<li>Remembered approvals apply per pattern and per session scope; a</li>
+</ul>
+<p>remembered command approval never generalizes to money/publish triggers.</p>
+<ul>
+<li>Typed errors: <code>approval_required</code> (gate hit, no interactive channel),</li>
+</ul>
+<p><code>approval_expired</code>, <code>approval_not_found</code> (stale resolve).</p>
+<ul>
+<li>Failure of the approval store must fail closed for consequential actions</li>
+</ul>
+<p>— execution does not proceed on a lost request (aligned with the</p>
+<p>TokenRouter fail-closed posture, <code>hermes-tokenrouter-credential-flow.md</code></p>
+<p>§失败行为).</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>A media job that would spend money pauses with an approval card; refresh</li>
+</ul>
+<p>re-renders the same card; approving resumes from durable state</p>
+<p>(<code>02-agent-runtime-contract.md</code>: &quot;A page refresh must not lose the</p>
+<p>approval request&quot;).</p>
+<ul>
+<li><code>edit</code> decisions provably alter the executed payload (diff visible in</li>
+</ul>
+<p>inspector / ledger).</p>
+<ul>
+<li>Reject and expiry both abort the action with a typed, visible outcome.</li>
+<li>Hardline commands are blocked even if the user clicks approve (no</li>
+</ul>
+<p>override path).</p>
+<ul>
+<li>A scheduled (non-interactive) run hitting a gate ends in</li>
+</ul>
+<p><code>approval_required</code> task state, not execution and not silence.</p>
+<ul>
+<li>P2 gate holds: &quot;Cost/private/publish actions require approval&quot;</li>
+</ul>
+<p>(<code>06-delivery-plan.md</code>).</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Multi-step approval chains / multi-party sign-off (single decider in</li>
+</ul>
+<p>scope).</p>
+<ul>
+<li>Replacing tool guardrails: guardrails decide what is forbidden;</li>
+</ul>
+<p>approvals decide what is permitted-with-consent. Hardline blocks stay</p>
+<p>non-overridable.</p>
+<ul>
+<li>Approval for routine read-only tool calls (would create approval</li>
+</ul>
+<p>fatigue; trigger taxonomy is consequence-based).</p>
+<ul>
+<li>Clarification UX redesign (ask-user questions are routed by the router&#x27;s</li>
+</ul>
+<p>ask-once rules; this component only shares transport).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Durability backend: where do <code>approval_requests</code> live (gateway DB?), and</li>
+</ol>
+<p>how do messaging-platform sessions (Telegram/WhatsApp via gateway</p>
+<p>platforms) get the same durable card semantics?</p>
+<ol>
+<li>Default timeout per trigger class — command approvals today use the</li>
+</ol>
+<p>clarify timeout (<code>get_clarify_timeout</code>); money/publish likely need</p>
+<p>longer expiry plus deny-on-expire. Values unspecified.</p>
+<ol>
+<li><code>respond</code> vs clarification: is <code>respond</code> just a clarify answer attached</li>
+</ol>
+<p>to an approval, or a distinct decision with different resume semantics?</p>
+<ol>
+<li>Cost estimation source for spend-money cards before TokenRouter usage</li>
+</ol>
+<p>metering exists.</p>
+<ol>
+<li>Who can resolve in shared/multi-user gateway sessions</li>
+</ol>
+<p>(<code>gateway/session.py</code> <code>is_shared_multi_user_session</code>) — requester-only,</p>
+<p>or any participant?</p>
+<ol>
+<li>Does an <code>edit</code> decision require recompile (<code>13-prompt-compiler.md</code>) when</li>
+</ol>
+<p>the edited fields affect the payload, and who re-validates constraints?</p>
+</main></div>
+</body>
+</html>

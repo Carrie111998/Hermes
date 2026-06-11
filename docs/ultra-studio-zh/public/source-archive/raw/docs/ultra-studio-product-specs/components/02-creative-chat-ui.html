@@ -1,0 +1,543 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Creative Chat UI</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Creative Chat UI</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="02-creative-chat-ui.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Creative Chat UI</h1>
+<p>Status: partial — a real Hermes gateway chat client ships today at <code>/chat</code>; all creative-specific layers (media cards, model picker, thinking stream, media job events, typed errors, durable approvals, entity pickers, creative inspector) are spec-only.</p>
+<p>Date: 2026-06-10</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/00-index.md</code>, <code>01-product-surface.md</code>,</li>
+</ul>
+<p><code>02-agent-runtime-contract.md</code>, <code>03-media-asset-contract.md</code>,</p>
+<p><code>04-skill-tool-prompt-contract.md</code>, <code>06-delivery-plan.md</code>,</p>
+<p><code>docs/hermes-real-chat-agent-ui.md</code></p>
+<ul>
+<li>Code: <code>web/src/pages/ChatPage.tsx</code>, <code>web/src/hooks/useGatewayChat.ts</code>,</li>
+</ul>
+<p><code>web/src/lib/gatewayClient.ts</code>, <code>web/src/lib/slashExec.ts</code>,</p>
+<p><code>web/src/lib/chatUpload.ts</code>, <code>web/src/components/chat/*</code>,</p>
+<p><code>web/src/components/ToolCall.tsx</code>, <code>web/src/components/ChatSidebar.tsx</code>,</p>
+<p><code>tui_gateway/server.py</code>, <code>hermes_cli/dashboard_uploads.py</code>,</p>
+<p><code>hermes_cli/ultra_studio_skills.py</code>, <code>tools/clarify_tool.py</code>,</p>
+<p><code>skills/creative/*</code>, <code>plugins/image_gen/atlas/</code>, <code>plugins/video_gen/atlas/</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Creative Chat UI is the &quot;Center: Creative Session&quot; surface of Ultra Studio.</p>
+<p>It is the conversation column where the user states intent, uploads media,</p>
+<p>answers agent questions, approves actions, and watches generation progress.</p>
+<p>It pairs with the right-hand inspector (live panel) and must never auto-start</p>
+<p>generation on open.</p>
+<p>In scope:</p>
+<ul>
+<li>Chat transcript: streamed assistant text, user input, slash commands.</li>
+<li>Media upload and attachment flow into the agent session.</li>
+<li>Tool status, clarify/approval/sudo/secret prompt cards, interrupt.</li>
+<li>The inspector panel as it relates to the chat session (session info, tools,</li>
+</ul>
+<p>pending prompts today; job/asset/QA/lineage details per spec).</p>
+<ul>
+<li>Session create/resume lifecycle from the dashboard.</li>
+</ul>
+<p>Out of scope (covered by sibling specs): the media/asset contract itself (03),</p>
+<p>the agent runtime event contract (02), skill/tool/prompt contracts (04), and</p>
+<p>the surrounding product shell/left nav (01).</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Layer</th><th>State</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Gateway chat client (WS JSON-RPC, session create/resume, streamed text)</td><td>Implemented</td><td><code>web/src/pages/ChatPage.tsx</code>, <code>web/src/hooks/useGatewayChat.ts</code>, <code>web/src/lib/gatewayClient.ts</code></td></tr>
+<tr><td>Media upload + attachment chips + attach-by-path</td><td>Implemented</td><td><code>web/src/lib/chatUpload.ts</code>, <code>web/src/components/chat/ChatComposer.tsx</code>, <code>hermes_cli/dashboard_uploads.py</code></td></tr>
+<tr><td>Slash commands with directive fallback</td><td>Implemented</td><td><code>web/src/lib/slashExec.ts</code></td></tr>
+<tr><td>Tool-call status feed (running/done/error, inline diff, live preview)</td><td>Implemented</td><td><code>web/src/components/ToolCall.tsx</code>, <code>web/src/components/chat/ChatInspector.tsx</code></td></tr>
+<tr><td>Clarify / approval / sudo / secret prompt cards</td><td>Implemented</td><td><code>web/src/components/chat/PendingPromptPanel.tsx</code>, <code>tools/clarify_tool.py</code></td></tr>
+<tr><td>Interrupt, reconnect, connection badge</td><td>Implemented</td><td><code>web/src/pages/ChatPage.tsx</code>, <code>web/src/hooks/useGatewayChat.ts</code></td></tr>
+<tr><td>Ultra Studio skill allowlist + 4 creative SKILL.md files</td><td>Implemented</td><td><code>hermes_cli/ultra_studio_skills.py</code>, <code>skills/creative/{workflow-router,infographic-md-flow,media-qa,prompt-repair}/</code></td></tr>
+<tr><td>Atlas image/video provider plugins</td><td>Implemented</td><td><code>plugins/image_gen/atlas/</code>, <code>plugins/video_gen/atlas/</code></td></tr>
+<tr><td>Media cards in transcript (preview, status, actions)</td><td>Specified, not built</td><td><code>01-product-surface.md</code> §Center, <code>03-media-asset-contract.md</code> §Asset Card UI; zero media rendering in <code>ChatMessageList.tsx</code></td></tr>
+<tr><td>Model picker in the creative session</td><td>Specified, not built</td><td><code>01-product-surface.md</code> §Center; new ChatPage has none (only legacy <code>ChatSidebar.tsx</code> has <code>ModelPickerDialog</code>)</td></tr>
+<tr><td>Thinking/reasoning phase display</td><td>Specified, not built</td><td><code>01-product-surface.md</code> §Required States; gateway declares <code>thinking.delta</code>/<code>reasoning.delta</code> but <code>useGatewayChat.ts</code> ignores them</td></tr>
+<tr><td><code>media_job.created/updated</code>, <code>asset.ready</code> events</td><td>Specified, not built</td><td><code>02-agent-runtime-contract.md</code> §Event Stream; absent from <code>tui_gateway/</code> and <code>gateway/</code> (rg verified)</td></tr>
+<tr><td><code>ultra_media_job_*</code> / <code>ultra_media_constraints_get</code> tools</td><td>Specified, not built</td><td><code>03-media-asset-contract.md</code> §Required Job Tools; not present in <code>tools/</code></td></tr>
+<tr><td>Typed error contract + recovery cards</td><td>Specified, not built</td><td><code>02-agent-runtime-contract.md</code> §Error Contract; UI shows generic string errors only</td></tr>
+<tr><td>Inspector job/asset/QA/lineage/download/convert features</td><td>Specified, not built</td><td><code>01-product-surface.md</code> §Inspector; <code>ChatInspector.tsx</code> shows session + tools only</td></tr>
+<tr><td>Entity pickers (soul_id/element/voice/language)</td><td>Specified, not built</td><td><code>docs/hermes-real-chat-agent-ui.md</code> §References And Asset UI</td></tr>
+<tr><td>Attachments as typed <code>media_input</code> refs</td><td>Specified, not built</td><td><code>03-media-asset-contract.md</code> §Goal; today attachments flatten to text markers</td></tr>
+<tr><td>Durable approvals + active jobs on resume</td><td>Specified, not built</td><td><code>02-agent-runtime-contract.md</code> §Human Approval Gateway, §Acceptance; pending prompt is in-memory only</td></tr>
+<tr><td>Approval decision-set mismatch (spec <code>approve/edit/reject/respond</code> vs code <code>once/session/deny</code>)</td><td>Open gap</td><td><code>02-agent-runtime-contract.md</code> vs <code>PendingPromptPanel.tsx</code></td></tr>
+<tr><td>Event-name mismatch (<code>approval.requested</code> vs <code>approval.request</code>; <code>tool.error</code> vs <code>tool.complete</code> with error)</td><td>Open gap</td><td><code>02-agent-runtime-contract.md</code> vs <code>tui_gateway/server.py</code></td></tr>
+<tr><td>Markdown rendering, SlashPopover wiring, message <code>error</code> status, tool feed 24-cap, hardcoded greeting</td><td>Open gap</td><td><code>web/src/components/chat/ChatMessageList.tsx</code>, <code>web/src/components/SlashPopover.tsx</code>, <code>web/src/components/chat/contracts.ts</code>, <code>useGatewayChat.ts</code></td></tr>
+</tbody></table>
+<p>Never read the &quot;Specified, not built&quot; rows as shipped behavior.</p>
+<h2>User Entry Points</h2>
+<table><thead><tr><th>Entry</th><th>State</th><th>Detail</th></tr></thead><tbody>
+<tr><td>Dashboard route <code>/chat</code></td><td>Implemented</td><td>Persistent host in <code>web/src/App.tsx</code> (<code>ChatRouteSink</code> claims <code>/chat</code>); rendered only when the server injects <code>window.__HERMES_DASHBOARD_EMBEDDED_CHAT__=true</code> via <code>hermes dashboard --tui</code> or <code>HERMES_DASHBOARD_TUI=1</code> (<code>web/src/lib/dashboard-flags.ts</code>)</td></tr>
+<tr><td>Sessions page &quot;resume in chat&quot;</td><td>Implemented</td><td>Navigates to <code>/chat?resume=&lt;session_id&gt;</code> (<code>web/src/pages/SessionsPage.tsx</code>)</td></tr>
+<tr><td>Plugin extension points</td><td>Implemented</td><td><code>chat:top</code> / <code>chat:bottom</code> PluginSlots (<code>web/src/pages/ChatPage.tsx</code>); plugins may replace the page via <code>tab.override:/chat</code> (<code>web/src/App.tsx</code>)</td></tr>
+<tr><td>Left-nav &quot;New task&quot; entry</td><td>Planned</td><td><code>01-product-surface.md</code> §Left Nav Shell; no such nav exists in <code>web/src/App.tsx</code></td></tr>
+<tr><td>Tasks page &quot;Continue work&quot; reopening creative work with artifacts</td><td>Planned</td><td><code>01-product-surface.md</code> §Main Jobs</td></tr>
+</tbody></table>
+<h2>Feature List</h2>
+<table><thead><tr><th>#</th><th>Feature</th><th>Tag</th><th>Source</th></tr></thead><tbody>
+<tr><td>1</td><td>WebSocket gateway chat client with <code>session.create</code> / <code>session.resume</code></td><td>Implemented</td><td><code>web/src/hooks/useGatewayChat.ts</code>, <code>web/src/lib/gatewayClient.ts</code></td></tr>
+<tr><td>2</td><td>Streaming assistant text via <code>message.start/delta/complete</code></td><td>Implemented</td><td><code>web/src/hooks/useGatewayChat.ts</code></td></tr>
+<tr><td>3</td><td>User text input: Enter sends, Shift+Enter newline, disabled while running/disconnected</td><td>Implemented</td><td><code>web/src/components/chat/ChatComposer.tsx</code></td></tr>
+<tr><td>4</td><td>Slash commands via <code>slash.exec</code> with <code>command.dispatch</code> fallback (exec/plugin/alias/skill/send)</td><td>Implemented</td><td><code>web/src/lib/slashExec.ts</code></td></tr>
+<tr><td>5</td><td>Media file upload (paperclip) → <code>POST /api/chat/uploads</code> → <code>input.detect_drop</code> / <code>image.attach</code></td><td>Implemented</td><td><code>web/src/lib/chatUpload.ts</code>, <code>hermes_cli/dashboard_uploads.py</code></td></tr>
+<tr><td>6</td><td>Attach by local filesystem path</td><td>Implemented</td><td><code>web/src/components/chat/ChatComposer.tsx</code></td></tr>
+<tr><td>7</td><td>Attachment chips with name/meta (dimensions, token estimate) and remove</td><td>Implemented</td><td><code>ChatComposer.tsx</code>, <code>ChatMessageList.tsx</code></td></tr>
+<tr><td>8</td><td>Tool-call status feed: running/done/error with context, preview, summary, inline_diff, auto-expanded errors</td><td>Implemented</td><td><code>ChatInspector.tsx</code>, <code>ToolCall.tsx</code></td></tr>
+<tr><td>9</td><td>Clarify question card: choice buttons + free-text → <code>clarify.respond</code></td><td>Implemented</td><td><code>PendingPromptPanel.tsx</code>, <code>tools/clarify_tool.py</code></td></tr>
+<tr><td>10</td><td>Approval card: approve once / approve session / deny → <code>approval.respond</code></td><td>Implemented</td><td><code>PendingPromptPanel.tsx</code></td></tr>
+<tr><td>11</td><td>Sudo password and secret value prompts → <code>sudo.respond</code> / <code>secret.respond</code></td><td>Implemented</td><td><code>PendingPromptPanel.tsx</code></td></tr>
+<tr><td>12</td><td>Interrupt running turn via <code>session.interrupt</code></td><td>Implemented</td><td><code>ChatPage.tsx</code>, <code>useGatewayChat.ts</code></td></tr>
+<tr><td>13</td><td>Reconnect button (rebuilds GatewayClient, clears tools/pending state)</td><td>Implemented</td><td><code>useGatewayChat.ts</code></td></tr>
+<tr><td>14</td><td>Connection state badge: idle/connecting/live/closed/error</td><td>Implemented</td><td><code>ChatInspector.tsx</code></td></tr>
+<tr><td>15</td><td>Resume session from Sessions page via <code>/chat?resume=&lt;id&gt;</code></td><td>Implemented</td><td><code>web/src/pages/SessionsPage.tsx</code></td></tr>
+<tr><td>16</td><td>Embedded-chat gating via <code>__HERMES_DASHBOARD_EMBEDDED_CHAT__</code></td><td>Implemented</td><td><code>web/src/lib/dashboard-flags.ts</code>, <code>docs/hermes-real-chat-agent-ui.md</code></td></tr>
+<tr><td>17</td><td>Persistent ChatPage host across route changes; plugin <code>tab.override</code> for <code>/chat</code></td><td>Implemented</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td>18</td><td>Plugin slots <code>chat:top</code> / <code>chat:bottom</code></td><td>Implemented</td><td><code>web/src/pages/ChatPage.tsx</code></td></tr>
+<tr><td>19</td><td>Empty-state greeting screen (hardcoded text)</td><td>Implemented</td><td><code>ChatMessageList.tsx</code></td></tr>
+<tr><td>20</td><td>No auto-generation on open — <code>session.create</code> only, user intent drives execution</td><td>Implemented</td><td><code>useGatewayChat.ts</code>; matches <code>01-product-surface.md</code></td></tr>
+<tr><td>21</td><td>Ultra Studio skill allowlist helper + 4 creative SKILL.md files</td><td>Implemented</td><td><code>hermes_cli/ultra_studio_skills.py</code>, <code>skills/creative/*</code></td></tr>
+<tr><td>22</td><td>Atlas image/video provider plugins</td><td>Implemented</td><td><code>plugins/image_gen/atlas/</code>, <code>plugins/video_gen/atlas/</code></td></tr>
+<tr><td>23</td><td>Media cards in transcript: preview/status/download/inspect/reuse/convert-to-element/create-character</td><td>Planned</td><td><code>01</code> §Center, <code>03</code> §Asset Card UI</td></tr>
+<tr><td>24</td><td>Model picker inside the creative session</td><td>Planned</td><td><code>01</code> §Center</td></tr>
+<tr><td>25</td><td>Thinking/reasoning phase display</td><td>Planned</td><td><code>01</code> §Required States &quot;Thinking&quot;</td></tr>
+<tr><td>26</td><td>Durable media job events <code>media_job.created/updated</code>, <code>asset.ready</code></td><td>Planned</td><td><code>02</code> §Event Stream</td></tr>
+<tr><td>27</td><td><code>ultra_media_job_create/status/cancel/retry/finalize</code> + <code>ultra_media_constraints_get</code> tools</td><td>Planned</td><td><code>03</code> §Required Job Tools, <code>04</code></td></tr>
+<tr><td>28</td><td>Typed error contract with actionable recovery cards</td><td>Planned</td><td><code>02</code> §Error Contract</td></tr>
+<tr><td>29</td><td>Inspector job/asset details: prompt, seed, dimensions, lineage, QA evidence, download, retry/repair plan</td><td>Planned</td><td><code>01</code> §Inspector</td></tr>
+<tr><td>30</td><td>Entity picker UI for soul_id / element / voice / language in ask-user-question</td><td>Planned</td><td><code>hermes-real-chat-agent-ui.md</code> §References And Asset UI</td></tr>
+<tr><td>31</td><td>Attachments as typed <code>media_input</code> asset refs instead of text-prefix markers</td><td>Planned</td><td><code>03</code> §Goal, <code>00</code> §Acceptance</td></tr>
+<tr><td>32</td><td>Session state restoring active jobs, selected assets, task files on resume</td><td>Planned</td><td><code>02</code> §Session Lifecycle</td></tr>
+<tr><td>33</td><td>Approval persistence across page refresh from durable state</td><td>Planned</td><td><code>02</code> §Human Approval Gateway</td></tr>
+<tr><td>34</td><td>workflow-router runtime connection / one-useful-question routing</td><td>Planned</td><td><code>04</code> §Clarification Rules, <code>06</code> P0 item 4; SKILL.md exists, runtime wiring unverified</td></tr>
+<tr><td>35</td><td>Approval decision-type mismatch: spec <code>approve/edit/reject/respond</code> vs implemented <code>once/session/deny</code>; &quot;edit&quot; and &quot;respond&quot; have no UI or RPC</td><td>Gap</td><td><code>02</code> vs <code>PendingPromptPanel.tsx</code></td></tr>
+<tr><td>36</td><td>Event-name mismatch: spec <code>approval.requested/resolved</code> vs code <code>approval.request/respond</code>; spec <code>tool.error</code> vs code <code>tool.complete</code>-with-error</td><td>Gap</td><td><code>02</code> vs <code>tui_gateway/server.py</code></td></tr>
+<tr><td>37</td><td>Message error status: <code>WebChatStatus</code> declares <code>&#x27;error&#x27;</code> but no code path sets it</td><td>Gap</td><td><code>contracts.ts</code> vs <code>useGatewayChat.ts</code></td></tr>
+<tr><td>38</td><td>Markdown rendering: <code>Markdown.tsx</code> exists but <code>ChatMessageList</code> renders raw text</td><td>Gap</td><td><code>ChatMessageList.tsx</code></td></tr>
+<tr><td>39</td><td>SlashPopover autocomplete exists but is not wired into the ChatPage composer</td><td>Gap</td><td><code>web/src/components/SlashPopover.tsx</code> (imported by no other file)</td></tr>
+<tr><td>40</td><td>Hardcoded personalized greeting &quot;lif, what are we creating today?&quot; — no user-name source or i18n</td><td>Gap</td><td><code>ChatMessageList.tsx</code></td></tr>
+<tr><td>41</td><td><code>tool.generating</code> and <code>background.complete</code> events declared but unhandled in web chat</td><td>Gap</td><td><code>gatewayClient.ts</code> vs <code>useGatewayChat.ts</code></td></tr>
+<tr><td>42</td><td>Tool feed silently truncates at 24 entries with no indicator (<code>TOOL_LIMIT</code>)</td><td>Gap</td><td><code>useGatewayChat.ts</code></td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<h3>Connection state (implemented — <code>web/src/lib/gatewayClient.ts</code>)</h3>
+<pre><code class="language-text">idle -&gt; connecting -&gt; open -&gt; closed | error</code></pre>
+<ul>
+<li><code>connecting</code>: triggered by mount or by the user pressing reconnect.</li>
+<li><code>open</code>: WS handshake (plus ticket auth when gated) succeeds.</li>
+<li><code>closed</code> / <code>error</code>: socket close or failure. Reconnect rebuilds the client</li>
+</ul>
+<p>and clears tool entries and pending prompts.</p>
+<h3>Message status (implemented — <code>web/src/components/chat/contracts.ts</code>)</h3>
+<pre><code class="language-text">streaming -&gt; complete</code></pre>
+<p><code>&#x27;error&#x27;</code> is declared in the type but never set by any code path (gap, item 37).</p>
+<p>Transitions are driven by gateway <code>message.start/delta/complete</code> events.</p>
+<h3>Tool entry status (implemented — <code>web/src/components/ToolCall.tsx</code>)</h3>
+<pre><code class="language-text">running -&gt; done | error</code></pre>
+<p>Driven by <code>tool.start</code> → <code>tool.progress</code> → <code>tool.complete</code>; the error state</p>
+<p>comes from a <code>tool.complete</code> payload with an <code>error</code> field, not a separate</p>
+<p><code>tool.error</code> event (gap, item 36).</p>
+<h3>Pending prompt (implemented — <code>contracts.ts</code>, <code>useGatewayChat.ts</code>)</h3>
+<pre><code class="language-text">none -&gt; clarify | approval | sudo | secret -&gt; resolved</code></pre>
+<ul>
+<li>Entered by gateway <code>clarify.request</code> / <code>approval.request</code> / <code>sudo.request</code> /</li>
+</ul>
+<p><code>secret.request</code>.</p>
+<ul>
+<li>Resolved by the user via the matching <code>*.respond</code> RPC, or cleared by</li>
+</ul>
+<p>interrupt/reconnect.</p>
+<ul>
+<li>Not durable: a page refresh or reconnect loses the pending prompt (gap vs</li>
+</ul>
+<p><code>02</code> §Human Approval Gateway).</p>
+<h3>Creative session states (spec-only — <code>01-product-surface.md</code> §Required States)</h3>
+<pre><code class="language-text">Empty -&gt; Thinking -&gt; Waiting for user -&gt; Creating -&gt; Complete | Failed</code></pre>
+<p>Each state pairs center-column behavior with inspector behavior. Triggers:</p>
+<p>user submits a prompt (Empty→Thinking), agent asks a question or requests</p>
+<p>approval (→Waiting for user), media job starts (→Creating), job/asset</p>
+<p>completes (→Complete), typed error (→Failed). None of this state labeling</p>
+<p>exists in code today.</p>
+<h3>Asset lifecycle and media-job chain (spec-only — <code>03-media-asset-contract.md</code>)</h3>
+<pre><code class="language-text">uploading -&gt; processing -&gt; ready -&gt; archived        (failure: failed | revoked | deleted)
+job.created -&gt; job.running -&gt; job.succeeded -&gt; asset.processing -&gt; asset.ready</code></pre>
+<p>Triggered by the planned <code>ultra_media_job_*</code> tool layer and gateway</p>
+<p><code>media_job.*</code> / <code>asset.ready</code> events; none exist in code.</p>
+<h2>APIs &amp; Events</h2>
+<h3>Transport (exists)</h3>
+<table><thead><tr><th>Surface</th><th>Detail</th></tr></thead><tbody>
+<tr><td><code>WS /api/ws</code></td><td>JSON-RPC gateway, newline-delimited dialect shared with the Ink TUI; default request timeout 120s (<code>web/src/lib/gatewayClient.ts</code>)</td></tr>
+<tr><td><code>GET /api/auth/ws-ticket</code></td><td>Single-use ticket auth when <code>window.__HERMES_AUTH_REQUIRED__</code>; gated mode rejects legacy <code>?token=</code></td></tr>
+<tr><td><code>POST /api/chat/uploads</code></td><td>Raw body + <code>X-Hermes-Filename</code> header; returns <code>{path, name, mime_type, size}</code>; 415 for non-media; 200MB cap (<code>hermes_cli/dashboard_uploads.py</code>)</td></tr>
+<tr><td><code>GET /api/events?channel=&lt;id&gt;</code></td><td>Legacy passive fanout used only by the PTY-pane <code>ChatSidebar.tsx</code></td></tr>
+</tbody></table>
+<h3>RPC methods (exist — verified in <code>tui_gateway/server.py</code>)</h3>
+<p><code>session.create</code>, <code>session.resume</code>, <code>session.list</code>, <code>session.history</code>,</p>
+<p><code>session.interrupt</code>, <code>session.steer</code>, <code>session.branch</code>, <code>session.compress</code>,</p>
+<p><code>session.undo</code>, <code>session.delete</code>, <code>session.title</code>, <code>session.usage</code>,</p>
+<p><code>session.status</code>, <code>session.save</code>, <code>session.close</code>, <code>session.activate</code>,</p>
+<p><code>session.active_list</code>, <code>session.most_recent</code>, <code>prompt.submit</code>,</p>
+<p><code>prompt.background</code>, <code>input.detect_drop</code>, <code>input.request</code>, <code>image.attach</code>,</p>
+<p><code>slash.exec</code>, <code>command.dispatch</code>, <code>command.resolve</code>, <code>clarify.respond</code>,</p>
+<p><code>approval.respond</code>, <code>sudo.respond</code>, <code>secret.respond</code>.</p>
+<h3>Events (exist — emitted/declared in <code>tui_gateway/*.py</code> and <code>gatewayClient.ts</code>)</h3>
+<table><thead><tr><th>Event</th><th>Handled by chat UI?</th></tr></thead><tbody>
+<tr><td><code>gateway.ready</code>, <code>session.info</code></td><td>Yes</td></tr>
+<tr><td><code>message.start</code>, <code>message.delta</code>, <code>message.complete</code></td><td>Yes</td></tr>
+<tr><td><code>status.update</code></td><td>Yes</td></tr>
+<tr><td><code>tool.start</code>, <code>tool.progress</code>, <code>tool.complete</code></td><td>Yes (also <code>tool.started</code> declared)</td></tr>
+<tr><td><code>clarify.request</code>, <code>approval.request</code>, <code>sudo.request</code>, <code>secret.request</code></td><td>Yes</td></tr>
+<tr><td><code>error</code></td><td>Yes (generic banner + system message)</td></tr>
+<tr><td><code>thinking.delta</code>, <code>reasoning.delta</code>, <code>reasoning.available</code></td><td>No — declared in <code>gatewayClient.ts</code>, ignored by <code>useGatewayChat.ts</code></td></tr>
+<tr><td><code>tool.generating</code>, <code>background.complete</code>, <code>skin.changed</code></td><td>No — declared, unhandled</td></tr>
+</tbody></table>
+<h3>Proposed (spec-only — do not assume these exist)</h3>
+<table><thead><tr><th>Contract</th><th>Source</th><th>Status</th></tr></thead><tbody>
+<tr><td>Events <code>media_job.created</code>, <code>media_job.updated</code>, <code>asset.ready</code>, <code>approval.requested</code>, <code>approval.resolved</code>, <code>tool.error</code></td><td><code>02-agent-runtime-contract.md</code> §Event Stream</td><td>None exist in <code>tui_gateway/</code> or <code>gateway/</code> (rg verified zero matches)</td></tr>
+<tr><td>Tools <code>ultra_media_job_create/status/cancel/retry/finalize</code>, <code>ultra_media_constraints_get</code></td><td><code>03-media-asset-contract.md</code> §Required Job Tools</td><td>Not present in <code>tools/</code></td></tr>
+<tr><td>Tools <code>ultra_asset_upload/list/inspect/download/promote</code>, <code>ultra_model_catalog</code>, <code>ultra_prompt_compile/enhance</code></td><td><code>03</code>/<code>04</code> spec pack</td><td>Not present in <code>tools/</code></td></tr>
+</tbody></table>
+<p>A canonical event vocabulary table reconciling spec names with gateway names</p>
+<p>is required before frontend media work starts (see Open Questions).</p>
+<h2>Data Model</h2>
+<h3>Implemented (frontend, in-memory React state — <code>web/src/components/chat/contracts.ts</code> unless noted)</h3>
+<table><thead><tr><th>Entity</th><th>Fields</th><th>Persistence</th></tr></thead><tbody>
+<tr><td><code>WebChatMessage</code></td><td><code>id: string</code>, `role: &#x27;user&#x27;\</td><td>&#x27;assistant&#x27;\</td><td>&#x27;system&#x27;\</td><td>&#x27;tool&#x27;<code>, </code>text: string<code>, </code>status?: &#x27;streaming&#x27;\</td><td>&#x27;complete&#x27;\</td><td>&#x27;error&#x27;<code>, </code>attachments?: WebChatAttachment[]`</td><td>React state only; history rehydrated lossily via <code>session.resume</code></td></tr>
+<tr><td><code>WebChatAttachment</code></td><td><code>id</code>, `kind: &#x27;image&#x27;\</td><td>&#x27;file&#x27;<code>, </code>name<code>, </code>path<code>, </code>text<code> (the prompt marker string), </code>meta?`</td><td>React state only</td></tr>
+<tr><td><code>WebChatSessionInfo</code></td><td><code>cwd?</code>, <code>model?</code>, <code>provider?</code>, <code>profile_name?</code>, <code>credential_warning?</code></td><td>From <code>session.info</code> event</td></tr>
+<tr><td><code>WebChatPendingPrompt</code></td><td>union: clarify <code>{requestId, question, choices?}</code> \</td><td>approval <code>{command, description}</code> \</td><td>sudo <code>{requestId, password}</code> \</td><td>secret <code>{requestId, envVar, prompt, value}</code></td><td>React state only; lost on refresh/reconnect</td></tr>
+<tr><td><code>ToolEntry</code> (<code>web/src/components/ToolCall.tsx</code>)</td><td><code>kind:&#x27;tool&#x27;</code>, <code>id</code>, <code>tool_id</code>, <code>name</code>, <code>context?</code>, <code>preview?</code>, <code>summary?</code>, <code>error?</code>, <code>inline_diff?</code>, `status:&#x27;running&#x27;\</td><td>&#x27;done&#x27;\</td><td>&#x27;error&#x27;<code>, </code>startedAt<code>, </code>completedAt?`</td><td>React state; capped at 24 entries</td></tr>
+<tr><td><code>ChatUploadResponse</code> (<code>web/src/lib/chatUpload.ts</code>)</td><td><code>path</code>, <code>name</code>, <code>mime_type</code>, <code>size</code></td><td>File stored under <code>HERMES_HOME/dashboard-uploads/&lt;YYYYMMDD&gt;/</code> with timestamp+token-prefixed safe filename</td></tr>
+<tr><td><code>WebChatImageAttachResult</code> / <code>WebChatDetectDropResult</code></td><td><code>attached?</code>, <code>path?</code>, <code>name?</code>, <code>text?</code>, <code>count?</code>, <code>width?</code>, <code>height?</code>, <code>token_estimate?</code>, <code>message?</code>; detect-drop adds <code>matched?</code>, <code>is_image?</code></td><td>Transient RPC results</td></tr>
+<tr><td>Resume message shape (<code>WebChatSessionResumeResult</code>)</td><td><code>{role?, text?, name?, context?}[]</code></td><td>Server-side session history; restores text only — tools, attachments, jobs, pending prompts are not restored</td></tr>
+</tbody></table>
+<h3>Specified, not built</h3>
+<table><thead><tr><th>Entity</th><th>Fields</th><th>Source</th></tr></thead><tbody>
+<tr><td><code>MediaJob</code> envelope</td><td><code>job_id</code>, <code>session_id</code>, <code>run_id</code>, <code>tool_call_id</code>, <code>provider</code>, <code>model</code>, <code>media_type</code>, <code>mode</code>, <code>status</code>, <code>input_assets</code>, <code>prompt</code>, <code>negative_prompt</code>, <code>provider_constraints</code>, <code>seed</code>, <code>tokenrouter_decision_id</code>, <code>output_assets</code>, <code>error</code></td><td><code>03-media-asset-contract.md</code> §Media Job Envelope</td></tr>
+<tr><td>Asset types</td><td><code>media_input</code>, <code>image_job</code>, <code>video_job</code>, <code>audio_job</code>, <code>element</code>, <code>character</code>, <code>soul_id</code>, <code>task_file</code></td><td><code>03</code> §Asset Types</td></tr>
+<tr><td>Router output</td><td><code>{intent, execution_mode, workflow_skill, primary_tool, asset_roles, missing, handoff}</code></td><td><code>04-skill-tool-prompt-contract.md</code></td></tr>
+<tr><td>Session state on resume</td><td>user/workspace/project ids, model selection, active skill profile, sandbox id, task files root, active media jobs, selected assets</td><td><code>02</code> §Session Lifecycle</td></tr>
+</tbody></table>
+<h2>UI Behavior</h2>
+<h3>Layout (implemented)</h3>
+<ul>
+<li>Dark themed full-height panel. Center column: header / error banner /</li>
+</ul>
+<p>message list / composer. Fixed 320px (<code>w-80</code>) right inspector, hidden below</p>
+<p>the <code>lg</code> breakpoint (<code>ChatPage.tsx</code>, <code>ChatInspector.tsx</code>).</p>
+<ul>
+<li>Header: bot icon, &quot;Hermes Agent&quot; title, provider·model subtitle (model</li>
+</ul>
+<p>basename via <code>displayModel</code>), connection badge, stop button only while</p>
+<p>running, reconnect icon button.</p>
+<h3>Transcript (implemented)</h3>
+<ul>
+<li>User messages right-aligned teal-tinted bubbles; assistant left dark</li>
+</ul>
+<p>bubbles; system amber bubbles; role icons; streaming spinner inside the</p>
+<p>active assistant bubble.</p>
+<ul>
+<li>Text renders as plain <code>whitespace-pre-wrap</code> only: no Markdown, no</li>
+</ul>
+<p>image/video previews, no media cards, no inline ask-user-question cards</p>
+<p>(prompt cards live in the inspector).</p>
+<ul>
+<li>Empty state: large bot icon + hardcoded headline</li>
+</ul>
+<p>&quot;lif, what are we creating today?&quot; (gap: no user-name source, no suggested</p>
+<p>tasks despite <code>01</code> §Required States &quot;Prompt input and suggested tasks&quot;).</p>
+<ul>
+<li>Auto-scrolls to bottom (smooth) on every messages change; no scroll-lock</li>
+</ul>
+<p>when the user scrolls up. No virtualization or pagination.</p>
+<h3>Composer (implemented)</h3>
+<ul>
+<li>Textarea: Enter sends, Shift+Enter newline. Send disabled unless connection</li>
+</ul>
+<p>open + session exists + not running + non-empty input.</p>
+<ul>
+<li>Paperclip upload: single file per pick, <code>accept=image/*,video/*,audio/*</code>.</li>
+<li>Folder icon toggles an attach-by-local-path row (<code>sm</code>+ screens only).</li>
+<li>Attachment chip row above the input with remove buttons and meta</li>
+</ul>
+<p>(dimensions/token estimate); <code>attachError</code> text renders under the composer.</p>
+<ul>
+<li>Attachment submission: <code>attachPath()</code> calls <code>input.detect_drop</code> first,</li>
+</ul>
+<p>falls back to <code>image.attach</code>; the resulting text marker (e.g.</p>
+<p><code>[User attached image: name]</code>) is joined as a plain-text prefix to the</p>
+<p>outbound <code>prompt.submit</code> text. Attachments are not typed asset refs.</p>
+<h3>Slash input (implemented)</h3>
+<ul>
+<li>Any input starting with <code>/</code> goes through <code>executeSlash</code>; outputs render as</li>
+</ul>
+<p>system messages; skill directives show a &quot;⚡ loading skill: &lt;name&gt;&quot; system</p>
+<p>line. The <code>SlashPopover</code> autocomplete component exists but is not wired in.</p>
+<h3>Inspector (implemented subset)</h3>
+<ul>
+<li>Session card: model, session id, status line preferring</li>
+</ul>
+<p><code>error ?? credential_warning ?? currentStatus</code>.</p>
+<ul>
+<li>&quot;Input needed&quot; <code>PendingPromptPanel</code> when a prompt is pending: clarify</li>
+</ul>
+<p>(choice buttons + free text), approval (approve once / approve session /</p>
+<p>deny), sudo password, secret value.</p>
+<ul>
+<li>Scrollable Tools card with per-tool collapsible detail; &quot;no tool calls yet&quot;</li>
+</ul>
+<p>empty text. Error rows auto-expand.</p>
+<ul>
+<li>Contains none of the spec inspector features: job status/progress, asset</li>
+</ul>
+<p>preview, prompt/seed/dimensions/duration/lineage, QA result + observed</p>
+<p>evidence, download/export, Convert to Element, Create Character,</p>
+<p>retry/repair plan (<code>01</code> §Inspector).</p>
+<h3>Status transitions (implemented)</h3>
+<ul>
+<li>Pending prompts set <code>running=true</code>; deny → status &quot;denied&quot;; interrupt →</li>
+</ul>
+<p>&quot;interrupted&quot;; a clarify answer echoes back as a user message.</p>
+<h3>Resume (implemented, lossy)</h3>
+<ul>
+<li>History renders as completed messages only; tools, attachments, active</li>
+</ul>
+<p>jobs, selected assets, and pending prompts are not restored.</p>
+<h3>Planned UI behavior (spec-only)</h3>
+<ul>
+<li>Media cards inline in the transcript with preview, status, type,</li>
+</ul>
+<p>provider/model, dimensions/duration, prompt hash, input refs, job id,</p>
+<p>download, inspect, reuse, convert-to-element, create-character; cards must</p>
+<p>not expose internal filesystem paths by default (<code>03</code> §Asset Card UI).</p>
+<ul>
+<li>Ask-user-question cards inline in the transcript with entity pickers for</li>
+</ul>
+<p><code>soul_id</code> / element / voice / language.</p>
+<ul>
+<li>Error cards with per-code recovery actions.</li>
+<li>Thinking-phase display driven by <code>thinking.delta</code>.</li>
+<li>Model picker in the session header.</li>
+<li>Suggested tasks on the empty state.</li>
+<li>Six required states (Empty/Thinking/Waiting for user/Creating/Complete/</li>
+</ul>
+<p>Failed) each with paired center + inspector behavior (<code>01</code> §Required</p>
+<p>States).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<h3>Implemented</h3>
+<table><thead><tr><th>Control</th><th>Behavior</th></tr></thead><tbody>
+<tr><td>Chat surface gating</td><td>Embedded chat renders only when the server injects <code>__HERMES_DASHBOARD_EMBEDDED_CHAT__</code> (<code>hermes dashboard --tui</code>); otherwise <code>/chat</code> is absent</td></tr>
+<tr><td>WS auth</td><td>Gated mode rejects legacy <code>?token=</code>; SPA must fetch a single-use ticket from <code>/api/auth/ws-ticket</code></td></tr>
+<tr><td>Upload validation</td><td>Media-only (MIME prefix or suffix allowlist) else HTTP 415; 200MB limit; filename sanitized (path traversal/NUL stripped, 140-char cap); stored under <code>HERMES_HOME/dashboard-uploads/&lt;date&gt;/</code> with random token prefix; tests at <code>tests/hermes_cli/test_dashboard_chat_uploads.py</code></td></tr>
+<tr><td>Approval gateway (subset)</td><td>Command approval via <code>approval.request</code> → once/session/deny; sudo password and secret env-var values collected in UI and sent via <code>sudo.respond</code>/<code>secret.respond</code> — values held in plain React state until submit</td></tr>
+<tr><td>Error display</td><td>Gateway <code>error</code> events and request failures render as a generic red banner + system message; attach errors render under the composer; tool failures render as error-status tool rows with auto-expanded detail</td></tr>
+</tbody></table>
+<h3>Specified, not built</h3>
+<ul>
+<li>Typed error contract with nine codes — <code>missing_credential</code>,</li>
+</ul>
+<p><code>unsupported_model_capability</code>, <code>invalid_asset_ref</code>,</p>
+<p><code>provider_rejected_input</code>, <code>quota_exceeded</code>, <code>job_timeout</code>,</p>
+<p><code>asset_upload_failed</code>, <code>sandbox_unavailable</code>, <code>approval_required</code> — each</p>
+<p>rendered as an error card with an actionable recovery path; &quot;do not convert</p>
+<p>these into vague apologies&quot; (<code>02</code> §Error Contract). No typed errors reach</p>
+<p>the UI today. The per-code recovery-action mapping is itself unspecified</p>
+<p>(see Open Questions).</p>
+<ul>
+<li>Approval required for spend / private-media / logged-in-account /</li>
+</ul>
+<p>local-command / publish actions, with durable pause/resume across refresh</p>
+<p>(<code>02</code> §Human Approval Gateway).</p>
+<h3>Known holes</h3>
+<ul>
+<li>Mobile users cannot answer approvals or clarifications: the inspector is</li>
+</ul>
+<p>the only host of <code>PendingPromptPanel</code> and is hidden below the <code>lg</code></p>
+<p>breakpoint.</p>
+<ul>
+<li>Skill-internal <code>references/</code> protection</li>
+</ul>
+<p>(<code>docs/hermes-real-chat-agent-ui.md</code>) has no visible enforcement in the</p>
+<p>chat upload/attachment path.</p>
+<ul>
+<li>Per-user upload quota, auth requirements on <code>/api/chat/uploads</code> beyond the</li>
+</ul>
+<p>dashboard session, and which sessions a user may resume are unspecified.</p>
+<h2>Acceptance Criteria</h2>
+<p>Verifiable today (regression bar for the implemented surface):</p>
+<ol>
+<li>With <code>hermes dashboard --tui</code>, <code>/chat</code> renders; without the injected flag,</li>
+</ol>
+<p><code>/chat</code> is absent.</p>
+<ol>
+<li>Opening <code>/chat</code> creates a session via <code>session.create</code> and triggers no</li>
+</ol>
+<p>media generation.</p>
+<ol>
+<li>Submitting text streams assistant output token-by-token</li>
+</ol>
+<p>(<code>message.start/delta/complete</code>), with a stop button that issues</p>
+<p><code>session.interrupt</code>.</p>
+<ol>
+<li>Uploading an image via the paperclip returns 200 from</li>
+</ol>
+<p><code>POST /api/chat/uploads</code>, produces an attachment chip, and the next</p>
+<p><code>prompt.submit</code> carries the real attachment marker. A non-media file</p>
+<p>returns 415. A &gt;200MB body is rejected.</p>
+<ol>
+<li>A clarify request renders choice buttons plus free text and resolves via</li>
+</ol>
+<p><code>clarify.respond</code>; an approval renders once/session/deny and resolves via</p>
+<p><code>approval.respond</code>.</p>
+<ol>
+<li><code>/chat?resume=&lt;id&gt;</code> restores the message history text of that session.</li>
+<li>A failing tool call renders an auto-expanded error row in the Tools list.</li>
+</ol>
+<p>Required for the creative layer (from the spec pack — not yet satisfiable):</p>
+<ol>
+<li>Browser refresh during a media job must not lose the job; the resumed</li>
+</ol>
+<p>session shows active jobs (<code>02</code> §Acceptance).</p>
+<ol>
+<li>A page refresh re-presents an outstanding approval request from durable</li>
+</ol>
+<p>state (<code>02</code> §Human Approval Gateway).</p>
+<ol>
+<li>A failed provider request shows a typed error with a visible retry path;</li>
+</ol>
+<p>failed jobs remain inspectable (<code>02</code> §Acceptance, <code>06</code> §Launch Gates).</p>
+<ol>
+<li>Uploaded media becomes a typed <code>media_input</code> asset, not plain prompt text</li>
+</ol>
+<p>(<code>00</code> §Top-Level Acceptance).</p>
+<ol>
+<li>The UI streams thinking/status/tool/media events instead of freezing</li>
+</ol>
+<p>during long jobs (<code>00</code> §Top-Level Acceptance).</p>
+<ol>
+<li>Generated media renders as an asset card in the transcript; the inspector</li>
+</ol>
+<p>can open the card and show model/job/prompt/input details (<code>03</code></p>
+<p>§Acceptance).</p>
+<ol>
+<li>The agent cannot claim completion without an event/artifact/ledger record</li>
+</ol>
+<p>(<code>02</code> §Acceptance).</p>
+<ol>
+<li>No fake media URLs, no hardcoded job results, no accidental FAL/Comfy</li>
+</ol>
+<p>fallback when Atlas is selected (<code>06</code> §Launch Gates).</p>
+<ol>
+<li>A vague &quot;make a video&quot; routes to the <code>video_generate</code> intent and asks at</li>
+</ol>
+<p>most one useful question (<code>04</code> §Clarification Rules).</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>No auto-start generation on open; user intent drives execution</li>
+</ul>
+<p>(<code>docs/hermes-real-chat-agent-ui.md</code> §Non-Goals).</p>
+<ul>
+<li>No raw provider dashboards inside the chat surface (<code>01</code> §Non-Goals).</li>
+<li>No internal prompt templates exposed by default (<code>01</code> §Non-Goals).</li>
+<li>No fake run/status panel disconnected from real Hermes events (<code>01</code></li>
+</ul>
+<p>§Non-Goals).</p>
+<ul>
+<li>No merged generic Assets page as part of this component (<code>01</code> §Non-Goals).</li>
+<li>No hardcoded prompts/jobs, no dashboard-plugin job endpoints, no fake Atlas</li>
+</ul>
+<p>responses (<code>hermes-real-chat-agent-ui.md</code> §Non-Goals).</p>
+<ul>
+<li>The inspector is not a second chat (<code>01</code> §Inspector).</li>
+<li>The legacy PTY <code>ChatSidebar.tsx</code> surface and the <code>standalone-chat-panel/</code></li>
+</ul>
+<p>package are not specified here; whether they are replaced or kept in</p>
+<p>parallel is an open question, not a commitment of this spec.</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Media event source: should media cards render from a new</li>
+</ol>
+<p><code>asset.ready</code>/<code>media_job.*</code> event family (gateway work, spec <code>02</code></p>
+<p>mandates it) or from enriched <code>tool.complete</code> payloads (faster, less</p>
+<p>durable)? Nothing exists yet.</p>
+<ol>
+<li>Selection model: how is the &quot;currently selected job/asset&quot; chosen and</li>
+</ol>
+<p>stored for the inspector — click target, URL state, or session state —</p>
+<p>and does it survive resume?</p>
+<ol>
+<li>Approval decision sets: keep implemented <code>once/session/deny</code>, adopt spec</li>
+</ol>
+<p><code>approve/edit/reject/respond</code>, or merge? &quot;edit&quot; (modify command/payload</p>
+<p>before approving) needs full UX design.</p>
+<ol>
+<li>Does the new ChatPage replace the legacy PTY <code>ChatSidebar</code> surface, or do</li>
+</ol>
+<p>both ship?</p>
+<ol>
+<li>Model picker source: Hermes profiles, the Atlas catalog</li>
+</ol>
+<p>(<code>plugins/*/atlas/catalog.py</code>), or the spec-only <code>ultra_model_catalog</code>?</p>
+<p>Is mid-session switching allowed, and how does it interact with</p>
+<p>workflow-router model selection?</p>
+<ol>
+<li>Should <code>prompt.submit</code> gain a structured attachments field (typed</li>
+</ol>
+<p><code>media_input</code> refs), and what is the migration path from text markers?</p>
+<ol>
+<li>How should <code>thinking.delta</code>/<code>reasoning.delta</code> render in a consumer</li>
+</ol>
+<p>creative product, given the <code>01</code> non-goal of not showing internal prompt</p>
+<p>templates — phase label only, collapsible reasoning, or hidden?</p>
+<ol>
+<li>What is the durable store for pending approvals/clarifications so a</li>
+</ol>
+<p>refresh re-presents them, and which RPC returns them on resume?</p>
+<ol>
+<li>Is the hardcoded greeting (&quot;lif, ...&quot;) meant to become a</li>
+</ol>
+<p>user-profile-driven personalized greeting, and what is the name source?</p>
+<ol>
+<li>Whose responsibility is one-question clarification (<code>04</code> rules) — the</li>
+</ol>
+<p>workflow-router skill prompt, or enforced UI/gateway-side — and how is</p>
+<p>&quot;only one question&quot; verified?</p>
+<ol>
+<li>Typed-error-to-recovery-action mapping: which concrete UI action pairs</li>
+</ol>
+<p>with each of the nine error codes (e.g. <code>missing_credential</code> →</p>
+<p>credentials deep link, <code>quota_exceeded</code> → upgrade link)?</p>
+<ol>
+<li>Event vocabulary reconciliation: which side renames —</li>
+</ol>
+<p><code>approval.requested/resolved</code> vs <code>approval.request/respond</code>, <code>tool.error</code></p>
+<p>vs <code>tool.complete</code>-with-error — and where does the canonical table live?</p>
+<ol>
+<li>Multi-file upload, drag-and-drop, and paste-image flows: in or out of</li>
+</ol>
+<p>the first creative release?</p>
+<ol>
+<li>Transcript scalability: virtualization, scroll-lock, history pagination,</li>
+</ol>
+<p>and the 24-entry tool feed cap for long creative sessions.</p>
+<ol>
+<li>Session naming: <code>session.title</code> RPC exists but nothing in the chat UI</li>
+</ol>
+<p>uses it — does the creative session expose rename/auto-title?</p>
+<ol>
+<li>Mobile surface for pending approvals/clarifications, since the inspector</li>
+</ol>
+<p>is hidden below <code>lg</code>.</p>
+</main></div>
+</body>
+</html>

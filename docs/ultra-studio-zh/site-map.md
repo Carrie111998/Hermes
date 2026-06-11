@@ -18,6 +18,7 @@
 | 5 | [基础设施设计总览](infra-design/00-index) | 看 Gateway、Sandbox、TokenRouter、CometAPI、数据面和安全边界。 |
 | 6 | [调研分析总览](research-analysis/00-index) | 理解为什么 P0 要薄做，哪些能力必须后置。 |
 | 7 | [长期参考](long-term-reference) | 保留未来云化、多租户、市场、CometAPI 和安全运营目标。 |
+| 8 | [源文档归档](source-archive/README) | 查所有旧文档、Notion/Lark 导出和可读原文镜像。 |
 
 ## 主要分区
 
@@ -29,6 +30,7 @@
 | 调研分析 | P0 垂直切片、安全凭证、云能力后置、迁移接口 | 判断优先级和取舍 |
 | 独立专题 | 真实聊天 UI、Manus 差距、Skill/Tool/Prompt 规格 | 回答专项问题 |
 | 图谱 | SVG 总图和长期路线图 | 给产品、设计、工程同步全局视角 |
+| 源文档归档 | 站点外 217 个历史文件清单，可读原文镜像，raw JSON/PDF 登记 | 核对旧资料、迁移遗漏、追溯 Notion/Lark 来源 |
 
 ## 状态词
 
@@ -57,5 +59,6 @@
 1. [中文总入口](README)
 2. 本页文档地图
 3. VitePress 侧边栏配置：`.vitepress/config.mts`
+4. 如果新增的是站点外源文件，同步更新 [源文档归档](source-archive/README)
 
 如果新增的是架构图或视觉说明，还要更新 [可视化导读](visual-guide) 或 [完整建设图谱](architecture-blueprint)。

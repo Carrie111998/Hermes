@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Catalog / Provider Constraints</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Model Catalog / Provider Constraints</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="19-model-catalog-provider-constraints.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Model Catalog / Provider Constraints</h1>
+<p>Status: partial — Atlas media-model catalogs with per-family constraints</p>
+<p>exist as code constants and feed dynamic tool schemas; LLM model metadata</p>
+<p>and a Models admin page exist; the queryable <code>ultra_model_catalog</code> /</p>
+<p><code>ultra_media_constraints_get</code> tools and a unified constraints registry are</p>
+<p>spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/04-skill-tool-prompt-contract.md</code></li>
+</ul>
+<p>(§Model / Prompt Tools, §Prompt Compiler Boundary),</p>
+<p><code>03-media-asset-contract.md</code> (<code>provider_constraints</code> envelope field,</p>
+<p><code>ultra_media_constraints_get</code>), <code>01-product-surface.md</code> (model picker),</p>
+<p><code>06-delivery-plan.md</code> (P1 item 4: &quot;Prompt compiler and provider</p>
+<p>constraints registry&quot;, P3 item 3),</p>
+<p><code>docs/higgsfield-supercomputer-dialogue-architecture-research.md</code>,</p>
+<p><code>docs/ultra-studio-agent-manus-gap-research.md</code></p>
+<ul>
+<li>Code (verified this session): <code>plugins/video_gen/atlas/catalog.py</code></li>
+</ul>
+<p>(<code>ATLAS_FAMILIES</code>, <code>DEFAULT_MODEL</code>, <code>VALID_ASPECT_RATIOS</code>),</p>
+<p><code>plugins/image_gen/atlas/catalog.py</code>, <code>tools/video_generation_tool.py</code></p>
+<p>(<code>_build_dynamic_video_schema</code>, <code>_format_model_caveats</code>,</p>
+<p><code>check_video_generation_requirements</code>), <code>agent/model_metadata.py</code></p>
+<p>(provider/base-url detection, capability probing),</p>
+<p><code>agent/models_dev.py</code>, <code>web/src/pages/ModelsPage.tsx</code>,</p>
+<p><code>cli-config.yaml.example</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>This component answers two questions for every other component, before</p>
+<p>money is spent: &quot;which models exist for this media type&quot; and &quot;what will this</p>
+<p>model accept&quot; (durations, resolutions, aspect ratios, audio support, input</p>
+<p>counts, reference roles). The prompt compiler consumes constraints before</p>
+<p>payload construction (<code>04-skill-tool-prompt-contract.md</code> §Prompt Compiler</p>
+<p>Boundary); the router uses capability facts for clarification decisions</p>
+<p>(&quot;model capability&quot; is a legitimate ask trigger, §Clarification Rules).</p>
+<p>Two catalogs exist conceptually and must not be conflated:</p>
+<ol>
+<li>LLM/chat model catalog — which model runs the agent</li>
+</ol>
+<p>(implemented: <code>agent/model_metadata.py</code>, <code>agent/models_dev.py</code>,</p>
+<p><code>web/src/pages/ModelsPage.tsx</code>).</p>
+<ol>
+<li>Media model catalog — which models generate media and under what</li>
+</ol>
+<p>constraints (implemented as code constants per provider plugin;</p>
+<p>spec target is a queryable registry).</p>
+<p>This spec covers the media catalog and constraints registry, plus the</p>
+<p>boundary to the LLM catalog. Job execution is <code>10-media-job-service.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Atlas video family catalog: display name, speed/price hints, strengths, text/image route ids, allowed durations, resolutions, audio flag</td><td><code>plugins/video_gen/atlas/catalog.py</code> (<code>ATLAS_FAMILIES</code>; e.g. <code>wan-2.6-flash</code> -&gt; durations (5,10,15), 720P, no audio)</td></tr>
+<tr><td>Implemented</td><td>Atlas image catalog and routing helpers</td><td><code>plugins/image_gen/atlas/catalog.py</code></td></tr>
+<tr><td>Implemented</td><td>Defaults and validation constants (default model, valid aspect ratios)</td><td><code>plugins/video_gen/atlas/catalog.py</code> (<code>DEFAULT_MODEL</code>, <code>VALID_ASPECT_RATIOS</code>)</td></tr>
+<tr><td>Implemented</td><td>Constraints injected into the agent-visible tool schema per active model</td><td><code>tools/video_generation_tool.py</code> (<code>_build_dynamic_video_schema</code>)</td></tr>
+<tr><td>Implemented</td><td>Human-readable caveats returned to the agent (duration/resolution/audio limits)</td><td><code>tools/video_generation_tool.py</code> (<code>_format_model_caveats</code>)</td></tr>
+<tr><td>Implemented</td><td>Provider availability checks before offering capability</td><td><code>tools/video_generation_tool.py</code> (<code>check_video_generation_requirements</code>), config via <code>cli-config.yaml.example</code></td></tr>
+<tr><td>Implemented</td><td>LLM model metadata: provider inference from base URLs, local endpoint detection, capability flags</td><td><code>agent/model_metadata.py</code> (<code>_infer_provider_from_url</code>, <code>is_local_endpoint</code>, <code>detect_local_server_type</code>), <code>agent/models_dev.py</code></td></tr>
+<tr><td>Implemented</td><td>Models admin UI for LLM endpoints</td><td><code>web/src/pages/ModelsPage.tsx</code></td></tr>
+<tr><td>Specified, not built</td><td><code>ultra_model_catalog</code> tool (queryable catalog for the agent)</td><td><code>04-skill-tool-prompt-contract.md</code> §Model / Prompt Tools</td></tr>
+<tr><td>Specified, not built</td><td><code>ultra_media_constraints_get</code> tool (limits before prompt compile)</td><td><code>03-media-asset-contract.md</code> §Required Job Tools</td></tr>
+<tr><td>Specified, not built</td><td>Provider constraints registry as a service/data layer (vs per-plugin constants)</td><td><code>06-delivery-plan.md</code> P1 item 4</td></tr>
+<tr><td>Specified, not built</td><td>Model recipes as marketplace items; model benchmarking reports</td><td><code>05-memory-marketplace-files.md</code> §Marketplace; <code>06-delivery-plan.md</code> P3 item 3</td></tr>
+<tr><td>Gap</td><td>Per-model input-asset constraints (max reference images, mask support, role types) are not modeled in <code>ATLAS_FAMILIES</code></td><td>—</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li>Model picker in the chat composer (<code>01-product-surface.md</code> §Center) —</li>
+</ul>
+<p>user-facing selection among allowed media models (planned for media; the</p>
+<p>LLM picker exists via <code>ModelInfoCard</code>/<code>ModelPickerDialog</code> components in</p>
+<p><code>web/src/components/</code>).</p>
+<ul>
+<li>Agent-side: router/compiler queries (<code>ultra_model_catalog</code>,</li>
+</ul>
+<p><code>ultra_media_constraints_get</code>; planned).</p>
+<ul>
+<li>Inspector: shows provider/model and input constraints for the selected job</li>
+</ul>
+<p>(<code>01-product-surface.md</code> §Right).</p>
+<ul>
+<li>Admin: Models page for LLM endpoints (implemented); media model</li>
+</ul>
+<p>enablement via config (<code>cli-config.yaml.example</code>).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Enumerate available media models per media type with availability checks</td><td>Implemented in-plugin; not yet exposed as a tool</td></tr>
+<tr><td>Per-family constraints: durations, resolutions, audio</td><td>Implemented (<code>ATLAS_FAMILIES</code>)</td></tr>
+<tr><td>Aspect ratio validation</td><td>Implemented (<code>VALID_ASPECT_RATIOS</code>)</td></tr>
+<tr><td>Dynamic tool schema reflecting active model constraints</td><td>Implemented (<code>_build_dynamic_video_schema</code>)</td></tr>
+<tr><td>Capability caveats messaged to the agent</td><td>Implemented (<code>_format_model_caveats</code>)</td></tr>
+<tr><td>Queryable catalog tool for router/compiler (<code>ultra_model_catalog</code>)</td><td>Planned</td></tr>
+<tr><td>Pre-compile constraints fetch (<code>ultra_media_constraints_get</code>)</td><td>Planned</td></tr>
+<tr><td>Input-asset constraints (reference count, roles, mask/edit support)</td><td>Planned</td></tr>
+<tr><td>Workspace model allowlists (policy input to TokenRouter)</td><td>Planned (<code>17-tokenrouter.md</code> §策略输入: model allowlist)</td></tr>
+<tr><td>Cost/price metadata beyond the informal <code>price</code> string</td><td>Planned</td></tr>
+<tr><td>Model recipes (curated parameter presets)</td><td>Planned (Marketplace item kind)</td></tr>
+<tr><td>Benchmark/quality reports per model</td><td>Planned (P3)</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Catalog entries are configuration, not stateful objects. Effective</p>
+<p>availability of a model is derived:</p>
+<pre><code class="language-text">declared (in catalog constants)
+  -&gt; configured (provider + credentials present; check_*_requirements passes)
+  -&gt; allowed    (workspace allowlist / TokenRouter policy permits)
+  -&gt; selectable (UI/agent may choose it)
+declared but unconfigured -&gt; hidden or blocked-with-reason (never silently substituted)
+deprecated route -&gt; blocked-with-reason, existing lineage still resolvable</code></pre>
+<p>Rule: a model that fails the configured check must produce a typed</p>
+<p><code>missing_credential</code> / provider-missing error, not a fallback to another</p>
+<p>provider (launch gate: &quot;No accidental FAL/Comfy fallback&quot;,</p>
+<p><code>06-delivery-plan.md</code>).</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (in-process): catalog lookups inside provider plugins</p>
+<p>(<code>plugins/video_gen/atlas/catalog.py</code> helpers), schema/caveat injection at</p>
+<p>tool-definition time (<code>model_tools.py</code> <code>get_tool_definitions</code> path), LLM</p>
+<p>metadata fetch (<code>agent/models_dev.py</code>).</p>
+<p>Planned tools (spec contracts):</p>
+<pre><code class="language-text">ultra_model_catalog(media_type?, provider?) -&gt;
+  [{ model_id, display, media_type, provider, route_ids,
+     constraints_ref, price_hint, status }]
+
+ultra_media_constraints_get(model_id) -&gt;
+  { durations, resolutions, aspect_ratios, audio,
+    max_reference_images, input_roles, prompt_limits,
+    negative_prompt_support, seed_support }</code></pre>
+<p>No gateway events; catalog changes are deploy/config-time. The model picker</p>
+<p>reads the same catalog through a dashboard API (shape TBD).</p>
+<h2>Data Model</h2>
+<p>Implemented: typed dicts in code —</p>
+<pre><code class="language-text">ATLAS_FAMILIES[model_key] = {
+  display, speed, price, strengths,
+  text_model,  # Atlas route for text-to-video
+  image_model, # Atlas route for image-to-video
+  durations: tuple, resolutions: tuple, audio: bool
+}</code></pre>
+<p>Planned registry entity (the P1 &quot;provider constraints registry&quot;):</p>
+<pre><code class="language-text">model_catalog_entries
+- model_id, provider, media_type
+- display, description
+- route_ids { text:, image:, edit:, … }
+- constraints_json   (durations, resolutions, aspect_ratios, audio,
+                      max_reference_images, input_roles, prompt_limits)
+- price_meta
+- status: active | deprecated
+- version, updated_at</code></pre>
+<p>Migration rule: plugin constants remain the bootstrap source; the registry</p>
+<p>must be seeded from them rather than hand-duplicated, so a single source of</p>
+<p>truth survives (repo anti-duplication rule).</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>The model picker shows display name, speed/price hint, and strengths —</li>
+</ul>
+<p>the same fields <code>ATLAS_FAMILIES</code> already carries — and only lists</p>
+<p><code>selectable</code> models.</p>
+<ul>
+<li>Choosing a model updates composer affordances (e.g. duration choices,</li>
+</ul>
+<p>audio toggle) from constraints, mirroring how</p>
+<p><code>_build_dynamic_video_schema</code> already constrains the agent.</p>
+<ul>
+<li>The inspector shows the selected job&#x27;s model, route id, and the</li>
+</ul>
+<p>constraints that applied at submission time (frozen copy, since the</p>
+<p>catalog may change later).</p>
+<ul>
+<li>Unconfigured providers render as visible-but-blocked with the reason</li>
+</ul>
+<p>(missing credential/config), never hidden silently and never auto-swapped.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>Workspace model allowlists are policy inputs evaluated by TokenRouter</li>
+</ul>
+<p>(<code>17-tokenrouter.md</code>); the catalog only declares, policy decides. Until</p>
+<p>TokenRouter exists, config-level enablement is the gate.</p>
+<ul>
+<li>Typed errors: <code>unsupported_model_capability</code> (request violates</li>
+</ul>
+<p>constraints — e.g. 1080p on a 720P-only family), <code>missing_credential</code></p>
+<p>(configured check fails), denial from policy</p>
+<p>(&quot;A model outside the workspace allowlist is denied&quot;,</p>
+<p><code>hermes-tokenrouter-credential-flow.md</code> §MVP 验收检查).</p>
+<ul>
+<li>Constraint violations must be caught pre-submission by the compiler using</li>
+</ul>
+<p>registry data; provider-side rejections (<code>provider_rejected_input</code>) are</p>
+<p>the backstop, not the primary validation.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>The agent can enumerate available video models and their</li>
+</ul>
+<p>duration/resolution/audio limits without calling a provider (today via</p>
+<p>schema/caveats; post-P1 via <code>ultra_model_catalog</code>).</p>
+<ul>
+<li>A request exceeding a family constraint fails pre-flight with</li>
+</ul>
+<p><code>unsupported_model_capability</code> and a corrected-options message.</p>
+<ul>
+<li>Disabling a provider in config removes its models from selectable state</li>
+</ul>
+<p>with a visible reason; no silent fallback occurs.</p>
+<ul>
+<li>The inspector shows the constraints snapshot for any past job.</li>
+<li>Catalog/registry and plugin constants cannot disagree (registry seeded</li>
+</ul>
+<p>from constants; CI check or single import path).</p>
+<ul>
+<li>Model picker price/speed hints match catalog metadata exactly.</li>
+</ul>
+<h2>Non-Goals</h2>
+<ul>
+<li>LLM/chat model endpoint management redesign (exists:</li>
+</ul>
+<p><code>web/src/pages/ModelsPage.tsx</code>; out of scope here beyond the boundary</p>
+<p>note).</p>
+<ul>
+<li>Automatic model selection optimization / bandit routing (P3 benchmarking</li>
+</ul>
+<p>may inform it later).</p>
+<ul>
+<li>Pricing display as billing truth — <code>price</code> hints are informational until</li>
+</ul>
+<p>TokenRouter usage metering exists.</p>
+<ul>
+<li>Editing provider routes from the UI in P0/P1 (config/deploy-time only).</li>
+</ul>
+<h2>Open Questions</h2>
+<ol>
+<li>Registry runtime shape: in-process module reading checked-in data vs a</li>
+</ol>
+<p>service endpoint — does anything need cross-process freshness before</p>
+<p>TokenRouter?</p>
+<ol>
+<li>Who owns the constraints snapshot stored on a job: Media Job Service</li>
+</ol>
+<p>envelope (<code>provider_constraints</code> field) freezing registry output at</p>
+<p>submit time?</p>
+<ol>
+<li>Input-asset constraint vocabulary: roles (<code>style_reference</code>,</li>
+</ol>
+<p><code>character</code>, <code>first_frame</code>…) need a closed enum shared with the Asset</p>
+<p>Service ref roles.</p>
+<ol>
+<li>How do image-edit capabilities (mask, inpaint) get modeled — per-route</li>
+</ol>
+<p>flags or a separate capability matrix?</p>
+<ol>
+<li>Atlas catalog drift: what process keeps <code>ATLAS_FAMILIES</code> in sync with</li>
+</ol>
+<p>upstream Atlas route changes (manual today)?</p>
+<ol>
+<li>Should the LLM catalog and media catalog share the picker UI pattern but</li>
+</ol>
+<p>stay separate data sources, or unify behind one catalog API with a</p>
+<p><code>kind</code> discriminator?</p>
+</main></div>
+</body>
+</html>

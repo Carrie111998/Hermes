@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>15 人工审批网关 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">15 / 19</span>
+      </nav>
+      <h1>15 人工审批网关</h1>
+      <p class="lede">对高风险动作、付费调用、删除、外发、重试消耗等操作做明确审批。要可恢复、可审计。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Human Approval Gateway</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 approval 和 clarify 机制，chat UI 有 pending prompt cards。</li>
+          <li>已有 sudo/secret prompt 相关 UI。</li>
+          <li>代码证据：tools/clarify_tool.py、PendingPromptPanel.tsx、tui_gateway/server.py。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>当前审批偏内存态，刷新后不稳定。</li>
+          <li>spec 的 approve/edit/reject/respond 与代码的 once/session/deny 不一致。</li>
+          <li>没有 durable decision record 和审批作用域。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>生成前如有高成本或破坏性动作，显示明确审批卡。</li>
+          <li>审批决定写入 session/job record。</li>
+          <li>刷新后 pending approval 可恢复或明确过期。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>团队审批、预算审批、policy-based auto approve、审计导出。</li>
+          <li>编辑参数后再批准。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>未经批准不会删除资产或消耗高成本任务。</li>
+          <li>审批失败/过期有明确提示。</li>
+          <li>每个 approval 能追踪到触发工具和用户选择。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/15-human-approval-gateway.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/15-human-approval-gateway.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/15-human-approval-gateway.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="14-sandbox-lifecycle.html">上一页：14 沙箱生命周期</a>
+        <a class="chip" href="16-observation-provenance-ledger.html">下一页：16 观察与溯源账本</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

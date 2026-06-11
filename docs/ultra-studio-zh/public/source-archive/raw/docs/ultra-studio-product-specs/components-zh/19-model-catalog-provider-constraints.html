@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>19 模型目录与供应商约束 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">19 / 19</span>
+      </nav>
+      <h1>19 模型目录与供应商约束</h1>
+      <p class="lede">记录 Atlas 图片/视频模型、输入能力、画幅、时长、参考图、价格/限制，供 router、compiler、UI 使用。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Model Catalog / Provider Constraints</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 Atlas image/video catalog。图片默认 nano-banana-2，视频默认 wan-2.6-flash 等。</li>
+          <li>工具 schema 已能读取部分 provider constraints。</li>
+          <li>代码证据：plugins/image_gen/atlas/catalog.py、plugins/video_gen/atlas/catalog.py、provider schema。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有统一 queryable registry API。</li>
+          <li>模型选择器、router、prompt compiler 没有全部从 catalog 取约束。</li>
+          <li>价格、区域、失败率、冷启动等运行时信号未纳入。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>把 Atlas catalog 暴露给前端 model picker 和 workflow router。</li>
+          <li>生成前校验 aspect_ratio、duration、reference image、mode 是否被模型支持。</li>
+          <li>缺 key、模型不可用、参数不支持时返回 typed error。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>多 provider catalog、实时健康、价格展示、自动降级、eval score。</li>
+          <li>按工作流推荐模型。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>UI 不允许选择当前模型不支持的参数组合。</li>
+          <li>猫图请求走 Atlas 图片模型，不回落到 FAL。</li>
+          <li>视频请求使用 Atlas 视频模型，且能说明为什么选它。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/19-model-catalog-provider-constraints.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/19-model-catalog-provider-constraints.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/19-model-catalog-provider-constraints.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="18-cometapi-media-gateway.html">上一页：18 CometAPI 媒体网关</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

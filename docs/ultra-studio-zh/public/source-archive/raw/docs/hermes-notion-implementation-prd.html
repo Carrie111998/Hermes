@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Notion Implementation PRD</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink: #17202a;
+  --muted: #5a6675;
+  --line: #d9e2ea;
+  --panel: #f6f8fa;
+  --soft: #eef7f4;
+  --accent: #147064;
+  --accent2: #7a5b18;
+  --danger: #8d2f2f;
+  --bg: #ffffff;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  line-height: 1.58;
+}
+header {
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #f5faf8 0%, #ffffff 100%);
+}
+.wrap { max-width: 1160px; margin: 0 auto; padding: 28px; }
+.kicker { color: var(--accent); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+h1 { margin: 8px 0 10px; font-size: 34px; line-height: 1.15; letter-spacing: 0; }
+h2 { margin: 34px 0 12px; font-size: 22px; border-bottom: 1px solid var(--line); padding-bottom: 8px; }
+h3 { margin: 22px 0 8px; font-size: 17px; }
+p { margin: 8px 0; }
+ul, ol { padding-left: 22px; }
+li { margin: 6px 0; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.pill { border: 1px solid #bfd0d9; background: #fff; border-radius: 999px; padding: 5px 10px; color: #314153; font-size: 13px; }
+.notice { border-left: 5px solid var(--accent); background: var(--soft); padding: 14px 16px; border-radius: 6px; margin: 18px 0; }
+.warning { border-left: 5px solid var(--danger); background: #fff4f4; padding: 14px 16px; border-radius: 6px; margin: 18px 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 14px; background: #fff; min-height: 112px; }
+.card strong { display: block; margin-bottom: 5px; }
+table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 14px; }
+th, td { border: 1px solid var(--line); padding: 10px 11px; vertical-align: top; text-align: left; }
+th { background: #eef4f6; }
+code { background: #eef3f6; padding: 2px 4px; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre { background: #101820; color: #edf7f5; border-radius: 8px; padding: 14px; overflow-x: auto; font-size: 13px; }
+.small { color: var(--muted); font-size: 13px; }
+.section-label { color: var(--accent2); font-weight: 700; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; }
+footer { border-top: 1px solid var(--line); margin-top: 34px; color: var(--muted); font-size: 13px; }
+@media (max-width: 720px) {
+  .wrap { padding: 22px 16px; }
+  h1 { font-size: 28px; }
+  table { font-size: 13px; }
+  th, td { padding: 8px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="kicker">Hermes Notion Implementation PRD</div>
+    <h1>把 Notion Hermes 设计落成 Ultra Studio Agent 的产品需求文档</h1>
+    <p>这份 PRD 把 Notion 页面中的 Hermes、Skill、Prompt、Prompt enhance、Sandbox、TokenRouter、CometAPI、Soul ID、Element 和工具合约拆成可实现的产品模块。目标是指导当前 Hermes fork 做成 Atlas-first 创作型 Agent，而不是复刻外部系统的隐藏内部实现。</p>
+    <div class="meta">
+      <span class="pill">日期：2026-06-10</span>
+      <span class="pill">输入源：Notion Hermes 页面 + 本地同步文档</span>
+      <span class="pill">输出：HTML PRD</span>
+      <span class="pill">产品方向：Ultra Studio Agent</span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="notice">
+    <strong>一页结论</strong><br>
+    要实现 Notion 里的 Hermes 设计，不能只做一个媒体生成插件。需要做一个分层产品：真实聊天 Agent、窄 Skill catalog、受保护 Skill references、结构化 Prompt 编译、Atlas 媒体工具、异步 job、项目资产库、TokenRouter 凭证边界、Sandbox 执行边界、审计与可观测性。
+  </section>
+
+  <section>
+    <h2>1. 背景与问题</h2>
+    <p>当前 Hermes fork 已经具备 Atlas 图片/视频 provider、真实聊天面板雏形、基础 Skill 机制和 Ultra Studio 方向文档。但 Notion 中的目标系统不是“用户一句话 -> 直接调用模型”的简单链路，而是围绕 Skill、Reference、Prompt compiler、资产复用和安全边界构建的生产型 Agent。</p>
+    <div class="grid">
+      <article class="card">
+        <strong>用户侧问题</strong>
+        <p>用户想在网页聊天里上传素材、让 Agent 判断该用哪个视频流程、生成真实图片/视频，并在后续任务里复用角色、产品、场景和历史结果。</p>
+      </article>
+      <article class="card">
+        <strong>Agent 侧问题</strong>
+        <p>Agent 不能看到 87 个无关 Skill，也不能在没理解任务时直接生成。它需要 router、workflow Skill、QA 和 repair 机制。</p>
+      </article>
+      <article class="card">
+        <strong>平台侧问题</strong>
+        <p>API key、资产权限、模型限额、生成 job、上传文件和内部 references 必须隔离，否则会出现串租户、泄露或假成功。</p>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 目标与非目标</h2>
+    <table>
+      <thead><tr><th>类别</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>产品目标</td>
+          <td>把 Hermes fork 魔改成一个 Atlas-first 创作型 Agent：网页聊天、上传素材、路由 Skill、真实生成、保存资产、复用 reference、展示 job 状态和媒体结果。</td>
+        </tr>
+        <tr>
+          <td>工程目标</td>
+          <td>建立清晰边界：Skill 是工作流层，工具是执行接口，Atlas provider 是模型适配层，资产服务是复用层，TokenRouter 是凭证/策略层。</td>
+        </tr>
+        <tr>
+          <td>安全目标</td>
+          <td>Skill 内部 references、用户上传 references、媒体生成 references 三者分离；普通用户无法导出内部 references；provider key 不进入沙箱或前端。</td>
+        </tr>
+        <tr>
+          <td>非目标</td>
+          <td>不照搬 Higgsfield 内部命名作为公开 API；不承诺复现外部系统隐藏模型效果；不做 fake demo；不把 CometAPI 长视频数据面放进第一阶段必做。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>3. 证据来源与设计边界</h2>
+    <table>
+      <thead><tr><th>来源</th><th>可用结论</th><th>实现处理</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Notion 根页面 Hermes</td>
+          <td>References 至少有三类含义；Hermes、Sandbox、TokenRouter、媒体后端边界不同。</td>
+          <td>进入架构边界和权限设计，不把所有 reference 混成一个字段。</td>
+        </tr>
+        <tr>
+          <td>Notion Skill / skill_view</td>
+          <td>Skill 是路由、输入门槛、阶段编排和冷层资料加载，不是简单 prompt。</td>
+          <td>保留 `SKILL.md` + `references/` progressive disclosure；新增视频相关 skill。</td>
+        </tr>
+        <tr>
+          <td>Notion Prompt / Communication / Security</td>
+          <td>输出需要简洁、隐藏内部 ID/路径；长任务要有阶段状态；失败要明确环节。</td>
+          <td>前端和 Agent 回复都要显示人可读状态，隐藏 raw job_id/provider path。</td>
+        </tr>
+        <tr>
+          <td>Notion Prompt enhance</td>
+          <td>Enhancer 是 prompt compiler 边界，根据 flow、inputs、image_refs 生成模型 prompt。</td>
+          <td>本地设计 `ultra_prompt_compile`，把 workflow plan 编译成 Atlas payload。</td>
+        </tr>
+        <tr>
+          <td>Notion Soul ID / Element</td>
+          <td>身份、角色、道具、场景应是持久化语义资产。</td>
+          <td>本地实现为 project asset references；底层训练可先 pending/unavailable，不假装支持。</td>
+        </tr>
+        <tr>
+          <td>Notion TokenRouter / CometAPI</td>
+          <td>控制面和媒体数据面要分离。</td>
+          <td>第一阶段做 TokenRouter-style policy/credential boundary；CometAPI 作为后续长视频/多模态预处理网关。</td>
+        </tr>
+      </tbody>
+    </table>
+    <p class="small">Notion API 于 2026-06-10 可访问根页面，页面当前包含 `Skill`、`Prompt`、`Sandbox`、`Prompt enhance`、`名次定义` 等新增子页。本 PRD 将这些作为设计线索，不把其中对外部平台内部实现的推断当成已验证事实。</p>
+  </section>
+
+  <section>
+    <h2>4. 用户画像与核心场景</h2>
+    <table>
+      <thead><tr><th>用户</th><th>目标</th><th>关键场景</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>创作者 / 运营</td>
+          <td>快速生成图片、短视频、广告素材和 motion design。</td>
+          <td>上传产品图或参考图，通过聊天生成视频，结果可预览、下载、复用。</td>
+        </tr>
+        <tr>
+          <td>品牌 / 内容团队</td>
+          <td>保持角色、产品、风格、Logo 和场景一致。</td>
+          <td>把生成结果保存为 Element 或参考资产，在下一条视频中复用。</td>
+        </tr>
+        <tr>
+          <td>Agent power user</td>
+          <td>使用真实 Hermes runtime，而不是静态 demo。</td>
+          <td>可以看到流式聊天、工具状态、Skill 路由、错误、历史会话和资产库。</td>
+        </tr>
+        <tr>
+          <td>平台 operator</td>
+          <td>验证生成链路可审计、可计费、可隔离。</td>
+          <td>从一次生成追踪到 session、run、tool call、TokenRouter decision、worker log、usage event。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>5. 端到端用户流程</h2>
+    <pre>用户进入网页
+  -> 新建或恢复 Creative Session
+  -> 输入需求 / 上传图片视频
+  -> workflow-router 判断 intent、asset roles、workflow_skill、missing fields
+  -> 必要时只问一个关键问题
+  -> 加载对应 Skill: infographic-md-flow / product / UGC / cinematic / repair / QA
+  -> 结构化 plan + prompt compile
+  -> 创建 Atlas media job
+  -> UI 流式显示 thinking / routing / uploading / queued / rendering / finalizing
+  -> 展示图片或视频结果
+  -> 用户保存为 Element / 下载 / 继续迭代 / 复用为 reference</pre>
+  </section>
+
+  <section>
+    <h2>6. 功能需求</h2>
+
+    <h3>6.1 Web Chat 与 Live Panel</h3>
+    <table>
+      <thead><tr><th>需求</th><th>说明</th><th>验收</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>真实聊天接入</td>
+          <td>网页不是 hardcoded demo；输入必须进入真实 Hermes Agent/gateway 会话。</td>
+          <td>问“你是什么模型”不会触发生成；普通聊天正常回复；生成请求才调用工具。</td>
+        </tr>
+        <tr>
+          <td>流式状态</td>
+          <td>至少支持 thinking、routing、uploading、planning、queued、creating、rendering、finalizing、complete、failed。</td>
+          <td>长任务期间页面不卡死；状态不只显示 working。</td>
+        </tr>
+        <tr>
+          <td>媒体展示</td>
+          <td>Assistant 返回 markdown 图片/视频链接时，前端要渲染成真实媒体卡片。</td>
+          <td>生成猫图能在前端显示图片；生成视频能播放或下载。</td>
+        </tr>
+        <tr>
+          <td>历史记录</td>
+          <td>左侧保留会话列表、标题、最近消息、状态、入口来源。</td>
+          <td>刷新页面后历史不丢；可点击恢复。</td>
+        </tr>
+        <tr>
+          <td>模型切换</td>
+          <td>输入区提供模型选择，但不占据过宽空间，不显示无意义 transport/session debug 卡。</td>
+          <td>用户可选可用模型；不可用模型给明确错误。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.2 Upload / Attached References</h3>
+    <table>
+      <thead><tr><th>需求</th><th>说明</th><th>验收</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>上传入口</td>
+          <td>Composer 左侧上传按钮支持 image/video/audio/PDF；上传后出现缩略卡。</td>
+          <td>用户能上传图片并在同一条 prompt 中引用它。</td>
+        </tr>
+        <tr>
+          <td>资产角色识别</td>
+          <td>上传素材被 router 分类为 foundation、logo、style_reference、source_video、ignore。</td>
+          <td>多图上传时，Agent 不会把 Logo 当作产品图或把 style ref 当 source。</td>
+        </tr>
+        <tr>
+          <td>安全引用</td>
+          <td>Agent 只看到受控 media id/URL，不暴露本地路径或对象存储内部 key。</td>
+          <td>回复中不出现本地绝对路径或内部 bucket key。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.3 Skill Catalog 与 Workflow Routing</h3>
+    <table>
+      <thead><tr><th>需求</th><th>说明</th><th>验收</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>窄目录</td>
+          <td>默认可见 Skill 只保留 Ultra Studio 相关：workflow-router、infographic-md-flow、media-qa、prompt-repair，后续再加 product/UGC/cinematic。</td>
+          <td>用户说“我要做视频”不会加载 ascii-video、comfyui、manim-video、youtube-content 等无关 skill。</td>
+        </tr>
+        <tr>
+          <td>Router 先行</td>
+          <td>所有媒体请求先经过 router，输出 intent、workflow_skill、missing、asset_roles、handoff。</td>
+          <td>没有明确需求时只问关键问题，不自动开始生成。</td>
+        </tr>
+        <tr>
+          <td>Skill 分层</td>
+          <td>SKILL.md 保存触发、流程、约束；复杂 schema、prompt compiler 输入、QA rubric 放 references。</td>
+          <td>主 prompt 不膨胀；深层资料只在需要步骤加载。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.4 Prompt Compile / Enhance</h3>
+    <table>
+      <thead><tr><th>需求</th><th>说明</th><th>验收</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>结构化输入</td>
+          <td>Agent 先生成 plan/shot/storyboard/asset roles，再交给 compiler 生成 Atlas prompt。</td>
+          <td>prompt compile 输入可审计，不是纯自然语言堆砌。</td>
+        </tr>
+        <tr>
+          <td>Flow 枚举</td>
+          <td>本地先支持 image-direct、video-direct、image-to-video、infographic-board、infographic-clip、repair。</td>
+          <td>未知 flow 返回 schema error，不静默 fallback。</td>
+        </tr>
+        <tr>
+          <td>Provider-aware</td>
+          <td>Atlas 当前 video 不承诺多 reference conditioning；compiler 必须根据 model_catalog 限制裁剪输入。</td>
+          <td>多参考图时，系统会要求选择主 source 或说明只使用一个 image_url。</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <h3>6.5 Media Job 与 Atlas Tool Layer</h3>
+    <table>
+      <thead><tr><th>工具</th><th>职责</th><th>MVP 验收</th></tr></thead>
+      <tbody>
+        <tr><td><code>ultra_asset_upload</code></td><td>注册上传文件并返回 typed asset ref。</td><td>上传图片后可作为 image-to-video source。</td></tr>
+        <tr><td><code>ultra_asset_list</code></td><td>列出当前 project/session 可复用素材。</td><td>只能看到有权限资产。</td></tr>
+        <tr><td><code>ultra_model_catalog</code></td><td>返回 Atlas image/video 模型、输入限制、支持能力。</td><td>前端模型选择和 router 使用同一目录。</td></tr>
+        <tr><td><code>ultra_prompt_compile</code></td><td>把 workflow plan 编译成 provider payload。</td><td>输出 schema 可测试。</td></tr>
+        <tr><td><code>ultra_media_job_create</code></td><td>创建异步生成 job，内部调用 image/video provider。</td><td>返回真实 job 状态，不 fake URL。</td></tr>
+        <tr><td><code>ultra_media_job_status</code></td><td>轮询或订阅 job 状态。</td><td>UI 能显示 queued/running/failed/completed。</td></tr>
+        <tr><td><code>ultra_media_asset_download</code></td><td>把远端结果落到 project storage。</td><td>生成结果可下载和复用。</td></tr>
+      </tbody>
+    </table>
+
+    <h3>6.6 Asset References: Soul ID / Element / Media</h3>
+    <table>
+      <thead><tr><th>资产类型</th><th>产品含义</th><th>MVP 做法</th></tr></thead>
+      <tbody>
+        <tr><td><code>media_input</code></td><td>用户上传素材。</td><td>完整支持上传、预览、引用、删除。</td></tr>
+        <tr><td><code>image_job</code> / <code>video_job</code></td><td>生成结果引用。</td><td>完整支持列表、预览、下载、reuse as reference。</td></tr>
+        <tr><td><code>element</code></td><td>角色、道具、环境、产品等可复用语义资产。</td><td>支持从上传或生成结果保存，状态 completed。</td></tr>
+        <tr><td><code>soul_id</code></td><td>身份一致性资产。</td><td>首版支持 create/status/list 的状态模型；无真实训练 provider 时返回 unavailable，不假装训练完成。</td></tr>
+      </tbody>
+    </table>
+
+    <h3>6.7 Security / TokenRouter / Sandbox</h3>
+    <table>
+      <thead><tr><th>边界</th><th>需求</th><th>验收</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Provider key</td>
+          <td>API key 只在服务端或 vault；前端、sandbox、Agent prompt 都不能拿到。</td>
+          <td>日志、环境变量、上传文件中搜不到 provider key。</td>
+        </tr>
+        <tr>
+          <td>Asset ACL</td>
+          <td>任何 asset id 使用前都查 tenant/workspace/project/permission/status。</td>
+          <td>Tenant A 不能通过 prompt 注入 Tenant B 的 asset id。</td>
+        </tr>
+        <tr>
+          <td>Skill confidentiality</td>
+          <td>用户可见 metadata；内部 references 不可 bulk export。</td>
+          <td>通过 chat/file/terminal/export 索要 references 会被拒绝。</td>
+        </tr>
+        <tr>
+          <td>Sandbox egress</td>
+          <td>执行环境不能直接访问任意外网或 provider；需要受控 upload/tool channel。</td>
+          <td>沙箱内无真实外部 key；外传文件必须通过 artifact/upload gate。</td>
+        </tr>
+        <tr>
+          <td>Audit</td>
+          <td>所有生成、资产读取、reference 读取、TokenRouter decision 需要追踪。</td>
+          <td>失败 job 可回溯到 run、tool call、policy reason、worker log。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>7. 信息架构与 UI 设计</h2>
+    <table>
+      <thead><tr><th>区域</th><th>设计要求</th><th>不合理设计要避免</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>左侧导航</td>
+          <td>品牌区、New Session、历史记录、资产库入口、设置入口。品牌文案不溢出。</td>
+          <td>不要显示 transport/model/session debug 卡；不要让标题挤到主区域。</td>
+        </tr>
+        <tr>
+          <td>主聊天区</td>
+          <td>真实 message stream、媒体卡片、状态阶段、错误卡、question prompt。</td>
+          <td>不要未输入就自动生成；不要把工具 trace 当 assistant 正文。</td>
+        </tr>
+        <tr>
+          <td>Composer</td>
+          <td>上传按钮、文本输入、发送、紧凑模型选择；输入不卡顿。</td>
+          <td>不要让模型选择框横跨整个宽度；不要输入一长串时 re-render 全页面。</td>
+        </tr>
+        <tr>
+          <td>右侧 Inspector</td>
+          <td>当前 job、选中资产、生成参数、QA 分数、下载/复用动作。</td>
+          <td>不要显示空 Run 面板；空状态应收起或显示有用 CTA。</td>
+        </tr>
+        <tr>
+          <td>Asset Picker</td>
+          <td>按 upload、image、video、element、soul_id 分类；支持选择 source/logo/style ref。</td>
+          <td>不要让用户复制粘贴 asset id。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>8. 数据模型</h2>
+    <table>
+      <thead><tr><th>表 / 对象</th><th>关键字段</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><code>sessions</code></td><td>id, tenant_id, workspace_id, project_id, title, status, created_by</td><td>聊天会话。</td></tr>
+        <tr><td><code>runs</code></td><td>id, session_id, status, model, started_at, completed_at</td><td>一次用户输入触发的 Agent run。</td></tr>
+        <tr><td><code>messages</code></td><td>id, session_id, run_id, role, content, rendered_assets</td><td>聊天消息。</td></tr>
+        <tr><td><code>tool_calls</code></td><td>id, run_id, tool_name, args_redacted, status, error_code</td><td>工具调用审计。</td></tr>
+        <tr><td><code>media_assets</code></td><td>id, type, mime, width, height, duration, storage_key, preview_url</td><td>上传和生成的物理媒体。</td></tr>
+        <tr><td><code>asset_references</code></td><td>id, type, name, status, source_asset_id, metadata</td><td>Element、Soul ID、media_input、job reference。</td></tr>
+        <tr><td><code>generation_jobs</code></td><td>id, run_id, provider, model, media_type, status, input_manifest, output_asset_id</td><td>异步生成 job。</td></tr>
+        <tr><td><code>asset_acl</code></td><td>asset_id, subject_type, subject_id, permission</td><td>资产权限。</td></tr>
+        <tr><td><code>skill_reference_access_logs</code></td><td>run_id, skill_name, reference_path, decision, reason</td><td>冷层 reference 访问审计。</td></tr>
+        <tr><td><code>usage_events</code></td><td>run_id, job_id, provider, model, cost_units, status</td><td>计费和额度追踪。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>9. API / Tool Contract</h2>
+    <h3>9.1 本地公开接口命名</h3>
+    <table>
+      <thead><tr><th>Notion 线索</th><th>本地接口</th><th>原因</th></tr></thead>
+      <tbody>
+        <tr><td><code>higgsfield_generate</code></td><td><code>ultra_media_job_create</code></td><td>避免公开 API 绑定外部 provider 名称。</td></tr>
+        <tr><td><code>higgsfield_job_status</code></td><td><code>ultra_media_job_status</code></td><td>统一图片/视频 job 状态。</td></tr>
+        <tr><td><code>higgsfield_upload</code></td><td><code>ultra_asset_upload</code></td><td>统一上传素材入口。</td></tr>
+        <tr><td><code>higgsfield_soul_id</code></td><td><code>identity_reference_train/status/list</code></td><td>表达产品职责，不泄漏 provider。</td></tr>
+        <tr><td><code>higgsfield_element</code></td><td><code>asset_reference_create/list/get</code></td><td>适用于多 provider。</td></tr>
+        <tr><td><code>higgsfield_enhancer</code></td><td><code>ultra_prompt_compile</code></td><td>Prompt compiler 边界。</td></tr>
+        <tr><td><code>skill_view</code></td><td><code>skill_view</code></td><td>Hermes 核心概念保留。</td></tr>
+      </tbody>
+    </table>
+
+    <h3>9.2 Job 状态枚举</h3>
+    <pre>created
+queued
+uploading
+planning
+compiling
+running
+rendering
+finalizing
+completed
+failed
+cancelled</pre>
+
+    <h3>9.3 错误枚举</h3>
+    <table>
+      <thead><tr><th>错误</th><th>用户可见说明</th><th>系统行为</th></tr></thead>
+      <tbody>
+        <tr><td><code>provider_not_configured</code></td><td>当前媒体 provider 未配置。</td><td>停止，不重试，不切到 FAL 或 fake provider。</td></tr>
+        <tr><td><code>unsupported_capability</code></td><td>当前模型不支持该输入模式。</td><td>返回可选替代路径。</td></tr>
+        <tr><td><code>asset_not_authorized</code></td><td>你无权使用该资产。</td><td>拒绝生成并记录审计。</td></tr>
+        <tr><td><code>asset_not_ready</code></td><td>该资产还在处理或训练中。</td><td>展示状态，不生成。</td></tr>
+        <tr><td><code>quota_exceeded</code></td><td>当前额度不足或并发已满。</td><td>不调用 provider。</td></tr>
+        <tr><td><code>provider_failed</code></td><td>生成服务返回错误。</td><td>保留内部错误分类，用户看到脱敏说明。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>10. Skill 与 Prompt 设计</h2>
+    <table>
+      <thead><tr><th>层</th><th>内容</th><th>当前状态</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Router Skill</td>
+          <td><code>workflow-router</code> 负责 intent、workflow_skill、missing、asset_roles，不直接生成。</td>
+          <td>已建立初版。</td>
+        </tr>
+        <tr>
+          <td>Workflow Skill</td>
+          <td><code>infographic-md-flow</code> 等每个 Skill 定义触发、输入门槛、阶段、QA、失败恢复。</td>
+          <td>已建立 infographic 初版；product/UGC/cinematic 待补。</td>
+        </tr>
+        <tr>
+          <td>QA Skill</td>
+          <td><code>media-qa</code> 评估生成结果，不捏造视觉观察。</td>
+          <td>已建立初版。</td>
+        </tr>
+        <tr>
+          <td>Repair Skill</td>
+          <td><code>prompt-repair</code> 根据失败证据和 provider 限制生成重试方案。</td>
+          <td>已建立初版。</td>
+        </tr>
+        <tr>
+          <td>Cold References</td>
+          <td>每个复杂 workflow 的 prompt compiler schema、shot templates、QA rubric 进入 <code>references/</code>。</td>
+          <td>待补。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>11. 里程碑</h2>
+    <table>
+      <thead><tr><th>阶段</th><th>目标</th><th>完成标准</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>M0: PRD 与边界冻结</td>
+          <td>完成本文档、确认 Notion 概念映射、本地命名、MVP 非目标。</td>
+          <td>团队确认不做 fake demo、不直接暴露外部 provider 命名、不把 CometAPI 放进首版必做。</td>
+        </tr>
+        <tr>
+          <td>M1: 窄 Skill Catalog</td>
+          <td>默认隐藏无关 Skill，保留 Ultra Studio catalog。</td>
+          <td>`skills_list` 只展示视频相关 Skill；“我要做视频”不会加载无关技能。</td>
+        </tr>
+        <tr>
+          <td>M2: 真实网页聊天 + 上传</td>
+          <td>聊天接入真实 Hermes，会话历史可恢复，支持上传和媒体渲染。</td>
+          <td>生成猫图能真实显示；上传图可作为 image-to-video source。</td>
+        </tr>
+        <tr>
+          <td>M3: Media Job Layer</td>
+          <td>新增 ultra media tools，封装 Atlas job、状态和资产落库。</td>
+          <td>job 状态流可见，失败有 typed error，结果可下载复用。</td>
+        </tr>
+        <tr>
+          <td>M4: Asset References</td>
+          <td>Element/media_input/image_job/video_job 可创建、列表、复用；Soul ID 状态模型接入。</td>
+          <td>资产 picker 可选，权限和 not-ready 错误可见。</td>
+        </tr>
+        <tr>
+          <td>M5: Prompt Compile</td>
+          <td>把 workflow plan 编译成 provider-aware prompt payload。</td>
+          <td>infographic / direct video / repair 至少三条 flow 可测试。</td>
+        </tr>
+        <tr>
+          <td>M6: TokenRouter-style Boundary</td>
+          <td>provider key 隔离、quota、asset ACL、audit。</td>
+          <td>沙箱无 key；跨租户 asset id 被拒绝；失败可追踪。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>12. 验收清单</h2>
+    <div class="grid">
+      <article class="card">
+        <strong>聊天行为</strong>
+        <ul>
+          <li>普通问答不会触发生成。</li>
+          <li>媒体请求先 route，再生成或澄清。</li>
+          <li>流式状态不阻塞输入。</li>
+        </ul>
+      </article>
+      <article class="card">
+        <strong>媒体结果</strong>
+        <ul>
+          <li>图片在前端直接显示。</li>
+          <li>视频可播放、下载、保存为资产。</li>
+          <li>provider 未配置时有 typed error。</li>
+        </ul>
+      </article>
+      <article class="card">
+        <strong>Skill</strong>
+        <ul>
+          <li>无关 Skill 默认隐藏。</li>
+          <li>Skill references 不能被批量导出。</li>
+          <li>router 输出可测试。</li>
+        </ul>
+      </article>
+      <article class="card">
+        <strong>资产</strong>
+        <ul>
+          <li>上传、生成结果、Element、Soul ID 类型分明。</li>
+          <li>ACL、status、lineage 生效。</li>
+          <li>未授权 id 不能通过 prompt 使用。</li>
+        </ul>
+      </article>
+      <article class="card">
+        <strong>安全</strong>
+        <ul>
+          <li>provider key 不进前端和沙箱。</li>
+          <li>工具错误不被吞掉。</li>
+          <li>所有高风险操作有审计记录。</li>
+        </ul>
+      </article>
+      <article class="card">
+        <strong>UI</strong>
+        <ul>
+          <li>品牌区不溢出。</li>
+          <li>模型选择紧凑可用。</li>
+          <li>空面板不显示无意义 debug。</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+
+  <section>
+    <h2>13. 风险与开放问题</h2>
+    <table>
+      <thead><tr><th>风险</th><th>影响</th><th>处理</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Notion 中部分内容是推断或外部系统描述</td>
+          <td>误当生产事实会导致错误架构。</td>
+          <td>全部映射为本地目标设计，保留 evidence policy。</td>
+        </tr>
+        <tr>
+          <td>Atlas 当前模型能力限制</td>
+          <td>多参考图、Soul ID 训练、长视频分析可能无法真实支持。</td>
+          <td>通过 model_catalog 暴露能力，unsupported 明确失败。</td>
+        </tr>
+        <tr>
+          <td>旧 Skill 物理删除过早</td>
+          <td>破坏测试、文档或用户已有习惯。</td>
+          <td>先 disabled allowlist，再分批 archive/delete。</td>
+        </tr>
+        <tr>
+          <td>前端变成第二套假 chat</td>
+          <td>和 Hermes runtime 脱节。</td>
+          <td>必须接真实 gateway/agent；React 只做支持面板和媒体展示。</td>
+        </tr>
+        <tr>
+          <td>Prompt compile 质量不足</td>
+          <td>生成质量不稳定。</td>
+          <td>先实现可观测 schema 和 repair loop，再逐步优化 prompt 模板。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>14. 第一批工程任务</h2>
+    <ol>
+      <li>把 `hermes_cli/ultra_studio_skills.py` 接入 profile/bootstrap 命令，让 Ultra Studio profile 自动禁用无关 Skill。</li>
+      <li>新增 `ultra_asset_upload/list/inspect` 工具和最小项目资产表。</li>
+      <li>新增 `ultra_media_job_create/status/download`，包装现有 Atlas image/video provider。</li>
+      <li>前端 composer 接真实上传，assistant message renderer 支持 image/video URL 卡片。</li>
+      <li>新增 `ultra_model_catalog`，前端模型选择、router 和 prompt repair 共用。</li>
+      <li>为 `infographic-md-flow` 增加 `references/`：input schema、storyboard schema、QA rubric、prompt compiler contract。</li>
+      <li>补 `product-photoshoot`、`productMD-flow`、`ugc-flow`、`cinematic-flow` 的 clean-room Skill。</li>
+      <li>增加端到端测试：普通聊天不生成、图片生成显示、上传图生成视频、无 provider typed error、无关 Skill 不展示。</li>
+    </ol>
+  </section>
+
+  <footer>
+    <p>本 HTML 是 Notion Hermes 实现 PRD，不包含 API key、Notion token 或任何 provider secret。它引用本地文档作为设计依据：`docs/hermes-notion-update-index.md`、`docs/hermes-references-knowledge-model.md`、`docs/hermes-tool-contracts-from-notion.md`、`docs/hermes-tokenrouter-credential-flow.md`、`docs/hermes-cometapi-media-gateway.md`、`docs/hermes-soulid-element-asset-model.md`、`docs/ultra-studio-agent-skill-tool-prompt-design.md`。</p>
+  </footer>
+</main>
+</body>
+</html>

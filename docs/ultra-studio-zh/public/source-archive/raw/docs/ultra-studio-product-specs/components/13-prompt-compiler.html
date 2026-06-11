@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt Compiler</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Prompt Compiler</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="13-prompt-compiler.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Prompt Compiler</h1>
+<p>Status: spec-only — <code>ultra_prompt_compile</code> / <code>ultra_prompt_enhance</code> and a</p>
+<p>provider-aware media prompt compiler do not exist; adjacent machinery exists</p>
+<p>at both ends (agent system-prompt assembly, and per-provider payload</p>
+<p>builders inside media plugins).</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/04-skill-tool-prompt-contract.md</code></li>
+</ul>
+<p>(§Prompt Compiler Boundary, §Model / Prompt Tools, §Clarification Rules),</p>
+<p><code>docs/ultra-studio-agent-skill-tool-prompt-design.md</code> (§Prompt Design:</p>
+<p>Global Agent Prompt Addendum, Router Prompt, Workflow Skill Prompt</p>
+<p>Pattern, No-Fake Prompt Clause), <code>03-media-asset-contract.md</code></p>
+<p>(§Media Job Envelope: <code>prompt</code>, <code>negative_prompt</code>,</p>
+<p><code>provider_constraints</code>), <code>06-delivery-plan.md</code> (P1 item 4)</p>
+<ul>
+<li>Code (adjacent, verified this session): <code>agent/prompt_builder.py</code></li>
+</ul>
+<p>(agent/system prompt assembly — skills manifest, environment hints,</p>
+<p>HERMES.md context scanning; not a media compiler),</p>
+<p><code>agent/system_prompt.py</code>, <code>plugins/video_gen/atlas/client.py</code></p>
+<p>(<code>build_payload</code> — provider payload construction from already-resolved</p>
+<p>args), <code>tools/video_generation_tool.py</code> (<code>_build_dynamic_video_schema</code>,</p>
+<p><code>_format_model_caveats</code> — constraint surfacing),</p>
+<p><code>trajectory_compressor.py</code> (unrelated to media prompts; listed to</p>
+<p>disambiguate)</p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Prompt Compiler turns structured intent into provider-specific payloads:</p>
+<p>&quot;The agent should collect structured intent and asset roles. A prompt</p>
+<p>compiler turns that into provider-specific payloads&quot;</p>
+<p>(<code>04-skill-tool-prompt-contract.md</code> §Prompt Compiler Boundary).</p>
+<p>Pipeline position:</p>
+<pre><code class="language-text">user request -&gt; route -&gt; workflow plan -&gt; asset role manifest
+  -&gt; provider constraints -&gt; prompt compile -&gt; job create</code></pre>
+<p>The compiler must know: target media type, model family, aspect ratio,</p>
+<p>duration, reference assets, negative constraints, workflow skill, and</p>
+<p>provider input limits (§Prompt Compiler Boundary).</p>
+<p>Scope: the compile/enhance tool contracts, inputs/outputs, constraint</p>
+<p>enforcement, repair-plan compilation for retries, and the boundary against</p>
+<p>(a) the LLM system prompt builder (<code>agent/prompt_builder.py</code>, a different</p>
+<p>component despite the name) and (b) provider clients, which receive compiled</p>
+<p>payloads and only do transport-level normalization.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented (adjacent)</td><td>Agent/system prompt assembly: skills manifest, environment hints, context file scanning</td><td><code>agent/prompt_builder.py</code>, <code>agent/system_prompt.py</code> — LLM-side, not media payloads</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Provider payload construction from resolved args (model route, image input normalization)</td><td><code>plugins/video_gen/atlas/client.py</code> (<code>build_payload</code>, <code>normalize_image_input</code>)</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Constraint surfacing to the agent before submission (dynamic schema + caveats)</td><td><code>tools/video_generation_tool.py</code> (<code>_build_dynamic_video_schema</code>, <code>_format_model_caveats</code>)</td></tr>
+<tr><td>Specified, not built</td><td><code>ultra_prompt_compile</code> tool</td><td><code>04-skill-tool-prompt-contract.md</code> §Model / Prompt Tools; zero hits in code (rg, this session)</td></tr>
+<tr><td>Specified, not built</td><td><code>ultra_prompt_enhance</code> tool</td><td>same</td></tr>
+<tr><td>Specified, not built</td><td>Asset role manifest as compiler input (typed refs with roles)</td><td>§Prompt Compiler Boundary; <code>hermes-asset-library-backend-design.md</code> §生成链路</td></tr>
+<tr><td>Specified, not built</td><td>Negative-constraint handling per model family</td><td>§Prompt Compiler Boundary</td></tr>
+<tr><td>Specified, not built</td><td>Compiled repair plan for <code>ultra_media_job_retry</code></td><td><code>03-media-asset-contract.md</code> §Required Job Tools</td></tr>
+<tr><td>Specified, not built</td><td>Workflow-skill prompt patterns feeding the compiler (per-skill compile recipes in <code>references/</code>)</td><td><code>ultra-studio-agent-skill-tool-prompt-design.md</code> §Workflow Skill Prompt Pattern, §Skill Package Structure</td></tr>
+<tr><td>Gap</td><td>Where prompt-injection scrubbing applies to user-supplied creative prompts before provider submission</td><td>not specified anywhere in the pack</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<p>None directly — the compiler is agent infrastructure:</p>
+<ul>
+<li>Workflow skills call compile after collecting structured fields</li>
+</ul>
+<p>(<code>12-workflow-router.md</code> hands off <code>handoff{}</code> -&gt; workflow -&gt; compile).</p>
+<ul>
+<li><code>prompt-repair</code> skill (P0 skill set) compiles repair plans from failed-job</li>
+</ul>
+<p>evidence.</p>
+<ul>
+<li>The inspector&#x27;s &quot;retry/repair plan&quot; action triggers a recompile (planned,</li>
+</ul>
+<p><code>03-inspector-live-panel.md</code>).</p>
+<ul>
+<li>Users see compiler effects only as job parameters on the asset/job card —</li>
+</ul>
+<p>internal prompt templates are not shown by default</p>
+<p>(<code>01-product-surface.md</code> §Non-Goals).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Compile structured intent + asset roles -&gt; provider payload</td><td>Planned (core contract)</td></tr>
+<tr><td>Pre-flight constraint validation against the model family</td><td>Planned (registry from <code>19-model-catalog-provider-constraints.md</code>; today partially enforced by dynamic tool schema)</td></tr>
+<tr><td>Aspect ratio / duration / resolution normalization to nearest allowed value with explicit notice</td><td>Planned</td></tr>
+<tr><td>Reference-asset role mapping into provider fields (style ref, first frame, character)</td><td>Planned</td></tr>
+<tr><td>Negative prompt construction where supported</td><td>Planned</td></tr>
+<tr><td>Prompt enhancement (<code>ultra_prompt_enhance</code>) as an explicit, separate step</td><td>Planned</td></tr>
+<tr><td>Repair-plan compilation from typed provider errors</td><td>Planned</td></tr>
+<tr><td>Per-skill compile recipes loaded from skill <code>references/</code></td><td>Planned</td></tr>
+<tr><td>Provider transport normalization (data URIs, route ids)</td><td>Implemented in clients (<code>build_payload</code>) — stays below the compiler</td></tr>
+<tr><td>Prompt hash emission for lineage</td><td>Planned (<code>03-media-asset-contract.md</code> §Lineage requires prompt hash)</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Compilation is a pure function, not a stateful object. The contract is a</p>
+<p>two-phase flow with explicit failure outcomes:</p>
+<pre><code class="language-text">collect (router/skill fills intent + asset role manifest)
+  -&gt; validate (constraints from catalog; asset refs already ACL-checked)
+       -&gt; compiled (payload + prompt_hash + constraints snapshot)
+       -&gt; rejected (typed: unsupported_model_capability | missing_field
+                    | invalid_asset_ref)
+compiled -&gt; submitted (job create consumes payload verbatim)
+failed job -&gt; repair_compile (error class + evidence -&gt; adjusted payload)</code></pre>
+<p>Rules:</p>
+<ul>
+<li><code>rejected</code> must name the exact field and allowed values; the router&#x27;s</li>
+</ul>
+<p>clarification rules decide whether to ask the user</p>
+<p>(<code>04-skill-tool-prompt-contract.md</code> §Clarification Rules).</p>
+<ul>
+<li>The job service consumes compiled payloads without re-writing prompts; any</li>
+</ul>
+<p>post-compile mutation is a contract violation.</p>
+<ul>
+<li>Repair compilation never silently changes the model family; switching</li>
+</ul>
+<p>models is a user/router decision.</p>
+<h2>APIs &amp; Events</h2>
+<p>Planned tool contracts (names from <code>04-skill-tool-prompt-contract.md</code>):</p>
+<pre><code class="language-text">ultra_prompt_compile(
+  intent, workflow_skill, model_id,
+  asset_roles: [{ref, role}],
+  fields: {aspect_ratio?, duration?, resolution?, audio?, …},
+  negative_constraints?
+) -&gt; {
+  payload,                 # provider-ready
+  prompt_hash,
+  constraints_snapshot,    # frozen catalog constraints used
+  notices[]                # normalizations applied
+}
+
+ultra_prompt_enhance(prompt, model_id, style_context?) -&gt;
+  { enhanced_prompt, rationale }</code></pre>
+<p><code>ultra_prompt_compile</code> reads constraints via <code>ultra_media_constraints_get</code></p>
+<p>(<code>19-model-catalog-provider-constraints.md</code>) — it does not embed its own</p>
+<p>copy of model limits. No gateway events; compile failures surface on the</p>
+<p>tool channel as typed errors.</p>
+<h2>Data Model</h2>
+<p>The compiler persists nothing. Its outputs land in:</p>
+<ul>
+<li>The MediaJob envelope: <code>prompt</code>, <code>negative_prompt</code>,</li>
+</ul>
+<p><code>provider_constraints</code> (snapshot), <code>seed</code> passthrough</p>
+<p>(<code>03-media-asset-contract.md</code> §Media Job Envelope).</p>
+<ul>
+<li>Lineage: <code>prompt hash</code>, <code>seed/params</code></li>
+</ul>
+<p>(<code>03-media-asset-contract.md</code> §Lineage).</p>
+<p>Compile recipes (planned) live inside skill packages under <code>references/</code></p>
+<p>(per-model prompt patterns, rubric constraints), loaded on demand by the</p>
+<p>skill resource loading path — not in a central template DB</p>
+<p>(<code>ultra-studio-agent-skill-tool-prompt-design.md</code> §Skill Package Structure).</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Internal prompt templates are not exposed by default</li>
+</ul>
+<p>(<code>01-product-surface.md</code> §Non-Goals); the inspector shows the final</p>
+<p>compiled prompt, params, and constraint snapshot for a job — facts, not</p>
+<p>templates.</p>
+<ul>
+<li>Normalization notices (&quot;duration adjusted 12s -&gt; 10s for wan-2.6&quot;) must</li>
+</ul>
+<p>surface in the job card/tool progress so users understand divergence from</p>
+<p>their request.</p>
+<ul>
+<li>Enhancement is opt-in and visible: an enhanced prompt is shown as such,</li>
+</ul>
+<p>never silently substituted (consistent with the No-Fake Prompt Clause,</p>
+<p><code>ultra-studio-agent-skill-tool-prompt-design.md</code> §Prompt Design).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>The compiler trusts only structured asset refs that already passed Asset</li>
+</ul>
+<p>Service validation; it never resolves plain-text mentions</p>
+<p>(<code>hermes-asset-library-backend-design.md</code> §前端交互契约).</p>
+<ul>
+<li>Typed rejections: <code>unsupported_model_capability</code> (field outside</li>
+</ul>
+<p>constraints), <code>missing_field</code> (blocking field for this workflow —</p>
+<p>feeds ask-one-question routing), <code>invalid_asset_ref</code> (ref/role mismatch,</p>
+<p>e.g. video asset in an image-only role).</p>
+<ul>
+<li>No silent clamping: every normalization emits a notice; out-of-range</li>
+</ul>
+<p>values that cannot be normalized reject.</p>
+<ul>
+<li>The compiler must not embed credentials or internal endpoints in</li>
+</ul>
+<p>payloads; provider routing/credentials are attached downstream</p>
+<p>(TokenRouter / provider clients).</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>For a fixed structured intent, compile output is deterministic (same</li>
+</ul>
+<p>payload + prompt_hash), enabling lineage dedup and retry comparison.</p>
+<ul>
+<li>A request violating a family constraint is rejected pre-submission with</li>
+</ul>
+<p>the exact field and allowed values (no provider round-trip).</p>
+<ul>
+<li>Compiled payloads for Atlas routes pass <code>build_payload</code> without</li>
+</ul>
+<p>modification beyond transport normalization.</p>
+<ul>
+<li>A failed job retried via repair plan produces a visibly different,</li>
+</ul>
+<p>explained payload (diffable in the inspector).</p>
+<ul>
+<li>Prompt hash recorded on every job matches a recompute from stored intent.</li>
+<li>No code path lets raw user text bypass compile for a workflow-routed</li>
+</ul>
+<p>media job (&quot;Do not bypass Atlas constraints in prompts&quot;,</p>
+<p><code>04-skill-tool-prompt-contract.md</code> §Non-Goals).</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Being the LLM system prompt builder (<code>agent/prompt_builder.py</code> is a</li>
+</ul>
+<p>separate, existing component; the name collision is historical).</p>
+<ul>
+<li>Creative ideation/brainstorming — enhancement refines a provided prompt;</li>
+</ul>
+<p>content invention belongs to workflow skills.</p>
+<ul>
+<li>Model selection (router/catalog decide; the compiler receives</li>
+</ul>
+<p><code>model_id</code>).</p>
+<ul>
+<li>Provider transport details (data URI encoding, HTTP shapes — provider</li>
+</ul>
+<p>clients own these).</p>
+<ul>
+<li>A user-facing template editor.</li>
+</ul>
+<h2>Open Questions</h2>
+<ol>
+<li>Runtime shape: a real tool the LLM calls, or a deterministic library</li>
+</ol>
+<p>invoked inside workflow skills&#x27; scripts? (The contract names tools; the</p>
+<p>skill design doc implies skill-local recipes.)</p>
+<ol>
+<li>The existing <code>image_edit</code> intent path (&quot;use the image tool only if the</li>
+</ol>
+<p>active tool supports editing&quot;, flagged in <code>12-workflow-router.md</code> Open</p>
+<p>Question 8) — does edit-capability checking live in compile or routing?</p>
+<ol>
+<li><code>ultra_prompt_enhance</code> model: enhanced by the agent LLM itself or a</li>
+</ol>
+<p>dedicated cheaper model? Cost accounting for enhancement calls?</p>
+<ol>
+<li>Prompt-injection scrubbing for user creative prompts: required before</li>
+</ol>
+<p>provider submission, or is provider-side safety sufficient?</p>
+<ol>
+<li>Localization: prompts arrive in Chinese/English mixed (real usage);</li>
+</ol>
+<p>do compile recipes translate, and is that visible?</p>
+<ol>
+<li>Where does the deterministic compile function run when workflows execute</li>
+</ol>
+<p>inside a sandbox (<code>14-sandbox-lifecycle.md</code>) — host-side tool or</p>
+<p>sandbox-side library?</p>
+</main></div>
+</body>
+</html>

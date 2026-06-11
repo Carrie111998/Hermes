@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>09 资产服务 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">09 / 19</span>
+      </nav>
+      <h1>09 资产服务</h1>
+      <p class="lede">资产库的后端实体和 API，负责 media_assets、lineage、下载、索引、collections、characters。</p>
+      <div class="meta">
+        <span class="badge spec-only">仅设计</span>
+        <span class="badge info">Asset Service</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>仅设计：文档已定义，代码里还没有可用实现。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>设计文档定义了资产、上下文、关系元数据和阶段路线。</li>
+          <li>目前没有独立 asset service、entities、API 或索引实现。</li>
+          <li>现有生成工具只返回 URL/文本，不能替代资产服务。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有 media_assets 表或等价持久模型。</li>
+          <li>没有 asset_id、source_job_id、input_refs、lineage、ACL、download API。</li>
+          <li>没有 collections/smart_groups/characters 的真实存储。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>建最小 media_assets 持久模型：id、type、url/path、provider、model、prompt、created_at、source_job_id。</li>
+          <li>提供 list/detail/download 三个 API。</li>
+          <li>Media Job 成功后必须写 asset.ready。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>语义索引、相似搜索、collections、smart_groups、characters、元素库。</li>
+          <li>权限、审计、清理、外部对象存储生命周期。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>生成成功但 asset 写入失败时不能说任务完成。</li>
+          <li>asset_id 可以反查 job、prompt、输入素材。</li>
+          <li>删除或权限不足返回 typed error。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../../ultra-studio-zh/product-specs/components/09-asset-service.html">中文详细版</a></td><td>完整中文实施版，包含状态机、API、数据模型、权限错误和验收要求。</td></tr>
+          <tr><td><a href="../components/09-asset-service.md">英文 Markdown 原文</a></td><td>审计来源，用于和中文详细版对照。</td></tr>
+          <tr><td><a href="../components/09-asset-service.html">英文 HTML 原文</a></td><td>英文网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="08-asset-library-ui.html">上一页：08 资产库界面</a>
+        <a class="chip" href="10-media-job-service.html">下一页：10 媒体任务服务</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

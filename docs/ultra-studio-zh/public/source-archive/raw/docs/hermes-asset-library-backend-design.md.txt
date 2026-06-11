@@ -1,0 +1,489 @@
+# Hermes Asset Library Backend Design
+
+状态：设计草案  
+范围：资产库后端、前端交互契约、`@` mention / picker、上传、生成入库、Collection、Smart Group、Character。
+
+## 目标
+
+把资产库做成 AI 生成工作流的项目级资产服务，而不是普通图库。
+
+P0 后端必须支持：
+
+- 上传素材入库为 `media_input`。
+- 生成输出入库为 `image_job` / `video_job`。
+- 从上传或生成结果创建 `element` / `character` / `soul_id`。
+- 手动 Collection 和动态 Smart Group 分开建模。
+- 搜索、筛选、mention、picker 全部经过权限和状态检查。
+- 生成调用只消费结构化 asset refs，不能靠 prompt 里裸写 asset id。
+
+## 架构形状
+
+采用 `Asset Service + Indexer + Media Job + TokenRouter` 的事件驱动服务边界。
+
+```text
+Dashboard / Chat UI
+  -> API Gateway
+  -> Asset Service
+  -> Object Storage
+  -> Search Indexer
+  -> Media Job Service
+  -> TokenRouter / ACL / Audit
+```
+
+状态所有权：
+
+- `Asset Service` 拥有资产、合集、智能分组、角色引用、ACL、lineage 的强一致状态。
+- `Object Storage` 只保存二进制对象、缩略图、manifest，不拥有产品语义。
+- `Search Indexer` 拥有可重建的搜索投影：关键词、embedding、聚类、缩略图索引。
+- `Media Job Service` 创建和运行生成任务，但生成完成后必须回写 Asset Service 注册 output asset。
+- `TokenRouter` 在生成前做 `asset_ref` 权限、状态、quota、model allowlist 检查。
+
+## 核心实体
+
+```text
+assets
+- id
+- tenant_id
+- workspace_id
+- project_id
+- type: media_input | image_job | video_job | audio_job | mesh_job | element | character | soul_id
+- media_type: image | video | audio | mesh | reference
+- status: uploading | processing | ready | failed | archived | revoked
+- title
+- prompt
+- negative_prompt
+- endpoint
+- api_version
+- model_route
+- provider
+- params_json
+- seed
+- source: upload | generation | import | connector
+- object_key
+- thumbnail_key
+- owner_user_id
+- created_at
+- updated_at
+
+asset_lineage
+- id
+- asset_id
+- parent_asset_id
+- parent_kind: upload | image_job | video_job | character | element | prompt | provider_job
+- relation: input | output | derived_from | saved_as | character_source
+- order_index
+
+generation_jobs
+- id
+- run_id
+- session_id
+- provider_job_id
+- endpoint
+- model_route
+- status
+- request_json
+- output_asset_id
+- usage_event_id
+- error_code
+- created_at
+
+collections
+- id
+- project_id
+- name
+- created_by
+- created_at
+
+collection_members
+- collection_id
+- asset_id
+- added_by
+- added_at
+
+smart_groups
+- id
+- project_id
+- name
+- query_json
+- similarity_threshold
+- created_by
+- created_at
+
+asset_references
+- id
+- project_id
+- type: element | character | soul_id
+- source_asset_id
+- status: queued | training | ready | failed | revoked
+- provider_reference_id
+- metadata_json
+- created_by
+
+asset_acl
+- asset_id
+- subject_type: user | project | workspace | service_account
+- subject_id
+- permission: read | use | update | delete | revoke
+
+asset_audit_events
+- id
+- asset_id
+- actor_user_id
+- action: create | view | use | update | delete | revoke | mention_resolve
+- run_id
+- request_id
+- metadata_json
+- created_at
+```
+
+## API 面
+
+### 上传入库
+
+```http
+POST /api/assets/uploads/init
+{
+  "project_id": "proj_1",
+  "filename": "ref.png",
+  "mime": "image/png",
+  "size": 4200000,
+  "intent": "media_input | character_source | product_ref"
+}
+```
+
+返回：
+
+```json
+{
+  "upload_id": "upl_123",
+  "asset_id": "media_input_123",
+  "put_url": "signed-url",
+  "headers": {},
+  "max_size": 52428800
+}
+```
+
+```http
+POST /api/assets/uploads/complete
+{
+  "upload_id": "upl_123",
+  "asset_id": "media_input_123"
+}
+```
+
+完成后：
+
+- 后端校验 object 存在、mime、size。
+- 写 `assets.status=processing`。
+- 异步生成 thumbnail、metadata、embedding。
+- 完成后发 `asset.created` / `asset.ready` 事件。
+
+### 资产列表和详情
+
+```http
+GET /api/assets?project_id=&media_type=&type=&status=&endpoint=&source=&collection_id=&q=&cursor=
+GET /api/assets/{asset_id}
+GET /api/assets/{asset_id}/lineage
+GET /api/assets/{asset_id}/audit
+```
+
+列表查询只返回当前用户有 `read` 权限的资产。
+
+详情页需要返回：
+
+```json
+{
+  "asset": {},
+  "context": {
+    "api_version": "v1",
+    "endpoint": "atlas/flux-pro",
+    "model_route": "atlascloud/...",
+    "prompt": "...",
+    "negative_prompt": "...",
+    "params": {},
+    "seed": 18472,
+    "request_id": "req_...",
+    "run_id": "run_...",
+    "session_id": "sess_..."
+  },
+  "lineage": [],
+  "acl": {},
+  "audit": []
+}
+```
+
+### Collection
+
+```http
+POST /api/assets/collections
+PATCH /api/assets/collections/{collection_id}
+DELETE /api/assets/collections/{collection_id}
+POST /api/assets/collections/{collection_id}/members
+DELETE /api/assets/collections/{collection_id}/members/{asset_id}
+```
+
+Collection 是静态成员表。新资产不会自动进入。
+
+### Smart Group
+
+```http
+POST /api/assets/smart-groups/preview
+POST /api/assets/smart-groups
+PATCH /api/assets/smart-groups/{group_id}
+DELETE /api/assets/smart-groups/{group_id}
+GET /api/assets/smart-groups/{group_id}/assets
+```
+
+`query_json` 示例：
+
+```json
+{
+  "prompt": {"contains": "cyberpunk"},
+  "endpoint": ["atlas/kling-video"],
+  "source": ["generation"],
+  "created_at": {"from": "2026-06-01", "to": "2026-06-10"},
+  "media_type": ["video"],
+  "status": ["ready"],
+  "collection_id": "col_campaign_a",
+  "similarity_threshold": 0.78
+}
+```
+
+Smart Group 是动态查询。打开时实时查，不保存资产 ID 列表。
+
+### Character / Element / Soul ID
+
+```http
+POST /api/assets/references
+{
+  "source_asset_id": "media_input_123",
+  "type": "character | element | soul_id",
+  "kind": "ordinary_character | face_identity | product_mascot",
+  "name": "Luna",
+  "metadata": {}
+}
+```
+
+状态流：
+
+```text
+queued -> training -> ready
+queued -> failed
+ready -> revoked
+```
+
+生成调用必须引用 `reference_id`，不是把名字塞进 prompt。
+
+## 搜索和索引
+
+P0 搜索分两层：
+
+1. 硬过滤：`project_id`、ACL、type、media_type、endpoint、source、status、time、collection。
+2. 软召回：prompt FTS、tag/keyword extraction、prompt embedding、视觉 embedding。
+
+搜索索引表：
+
+```text
+asset_search_index
+- asset_id
+- prompt_text
+- extracted_keywords
+- endpoint_family
+- media_type
+- embedding_vector
+- visual_embedding_vector
+- indexed_at
+```
+
+索引由事件驱动：
+
+```text
+asset.created -> extract metadata -> generate thumbnail -> extract keywords -> embedding -> asset.indexed
+asset.updated -> reindex
+asset.revoked -> remove from mention/search usable set
+```
+
+无索引不应该让资产消失。降级策略是：硬过滤 + FTS 可用，语义召回显示为 pending。
+
+## 前端交互契约
+
+前端不应该只提交纯文本 prompt。Chat composer 应提交结构化消息：
+
+```json
+{
+  "text": "用 @Luna 生成一个天台夜景视频",
+  "mentions": [
+    {
+      "span": [2, 7],
+      "display": "@Luna",
+      "entity_type": "character",
+      "entity_id": "char_luna",
+      "asset_ref_type": "soul_id",
+      "operation": "use"
+    }
+  ],
+  "attachments": [
+    {"asset_id": "media_input_123", "role": "image_reference"}
+  ]
+}
+```
+
+后端处理：
+
+1. 解析 mention payload，不信任纯文本里的 `@Luna`。
+2. 对每个 `entity_id` 查 ACL、status、revocation。
+3. 把 mention 编译成 tool/generation 的结构化参数。
+4. prompt text 只保留给模型理解，不作为权限凭证。
+
+### `@` mention 查询
+
+```http
+GET /api/assets/mentions?q=lun&project_id=&types=asset,character,element,collection,smart_group&context=chat_prompt
+```
+
+返回：
+
+```json
+{
+  "items": [
+    {
+      "id": "char_luna",
+      "type": "character",
+      "label": "Luna",
+      "subtitle": "face identity · ready · 4 source images",
+      "thumbnail_url": "...",
+      "status": "ready",
+      "allowed_operations": ["read", "use"],
+      "insert_token": "@Luna",
+      "structured_ref": {
+        "asset_ref_type": "soul_id",
+        "reference_id": "char_luna"
+      }
+    }
+  ]
+}
+```
+
+Mention 类型建议：
+
+| Prefix | 类型 | 行为 |
+|---|---|---|
+| `@asset` | 单个资产 | 作为 `media_input` / `image_job` / `video_job` 引用 |
+| `@character` | 角色 | 作为 `character_id` / `soul_id` 传入 |
+| `@element` | 元素 | 作为 `element_id` 传入 |
+| `@collection` | 手动合集 | 打开 picker，让用户选择具体成员或显式展开 |
+| `@group` | Smart Group | 不默认展开，先 preview 命中数量，再让用户选择 |
+
+重要规则：
+
+- `@collection` 和 `@group` 不能无提示展开成大量资产，必须经过确认或 picker。
+- `@revoked_asset` 不出现在 mention 结果里。
+- `not_ready` 可以显示，但不可 `use`，提交时返回 `asset_not_ready`。
+- 同名实体必须前端 disambiguation，后端也要拒绝 ambiguous plain-text resolve。
+
+### Picker 与 ask_user_question 复用
+
+`ask_user_question(entity)` 和 chat `@` mention 应共用同一个后端搜索端点，区别只在 `context`。
+
+```text
+context=chat_prompt
+context=asset_picker
+context=character_picker
+context=smart_group_builder
+context=collection_member_add
+```
+
+这样前端交互一致，后端权限也只有一套。
+
+## 生成链路
+
+```text
+User message with mentions
+  -> Gateway parses structured mentions
+  -> Asset Service validates refs
+  -> TokenRouter checks ACL/quota/model allowlist
+  -> Media Job creates provider request
+  -> Provider returns job id
+  -> Worker polls
+  -> Output registered as image_job/video_job asset
+  -> Search indexer indexes output
+  -> UI receives job.status + asset.created events
+```
+
+生成请求内部结构：
+
+```json
+{
+  "prompt": "生成一个天台夜景视频",
+  "asset_refs": [
+    {"type": "soul_id", "reference_id": "char_luna", "role": "character"},
+    {"type": "image_job", "asset_id": "asset_img_6508", "role": "style_reference"}
+  ],
+  "endpoint": "atlas/kling-video",
+  "params": {}
+}
+```
+
+## 实时事件
+
+前端需要订阅项目或 session 事件：
+
+```text
+asset.upload.started
+asset.processing
+asset.ready
+asset.failed
+asset.revoked
+asset.indexed
+collection.updated
+smart_group.updated
+reference.status
+job.status
+```
+
+事件示例：
+
+```json
+{
+  "type": "asset.ready",
+  "asset_id": "media_input_123",
+  "project_id": "proj_1",
+  "thumbnail_url": "...",
+  "status": "ready"
+}
+```
+
+## 错误策略
+
+用户可见错误：
+
+| code | 场景 |
+|---|---|
+| `asset_access_denied` | 无 read/use 权限 |
+| `asset_not_ready` | 资产或角色未 ready |
+| `asset_revoked` | 已撤销资产被引用 |
+| `asset_not_found` | ID 不存在或跨项目 |
+| `upload_mime_not_allowed` | 上传类型不允许 |
+| `smart_group_query_invalid` | 规则不合法 |
+| `collection_expand_requires_confirmation` | 合集/智能分组需要用户确认展开 |
+
+不允许 warning + fallback 造成静默错误。生成链路遇到资产错误必须 fail closed。
+
+## P0 切片
+
+1. `assets` + `uploads/init/complete` + thumbnail placeholder。
+2. `collections` + `collection_members` CRUD。
+3. `smart_groups` preview/save/query。
+4. `references` create/status/list，先 mock provider，但不能伪造 ready，必须显式 queued/training/ready 状态。
+5. `mentions` search endpoint，接 chat composer 和 picker。
+6. `media_generate` 在提交前调用 Asset Service validate refs。
+7. `asset.created/job.status` 事件推到前端。
+
+## 前端必须配合的点
+
+- Composer 内部维护 mention token，不只存文本。
+- `@` 菜单结果按类型分组：Assets、Characters、Elements、Collections、Smart Groups。
+- 选择 `@collection` / `@group` 时先打开 preview，而不是直接插入所有资产。
+- 资产详情页的复用按钮调用同一套 structured refs。
+- 上传成功后 asset 同时出现在资产库和 chat side panel。
+- 生成结果卡的 “reuse / save as Element / build Character” 走 Asset Service，不走前端本地状态。

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Open Source Architecture Selection</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer</div>
+<h1>开源架构选型总览</h1>
+<p>这套文档把现有多租户隔离 spec 拆成 16 个可落地架构模块。每个模块都有主选开源方案、候选对比、为什么是它、落地设计、实施规划和验收标准。</p>
+<div class="meta"><span class="pill">模块数：16</span><span class="pill">资料核对：2026-05-29</span><span class="pill">范围：云端多租户 supercomputer</span></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>总原则</strong><br>优先选择能形成明确隔离边界、可被审计、能和 Kubernetes/TokenRouter/OPA/Temporal 串起来的开源组件。Agent sandbox、provider key、tenant data、GPU worker 和 protected skill internals 必须各有独立边界。</section>
+<section><h2>模块入口</h2><div class="grid"><article class="card"><strong><a href="01-edge-gateway-realtime-ingress.html">Edge Gateway / Realtime Ingress</a></strong><p class="small">推荐：Envoy Gateway + Envoy Proxy</p><p>统一承接浏览器 SSE/WebSocket/HTTP 请求，完成 TLS、JWT 校验、限流、外部授权、带宽限制、路由和会话流转发。</p></article>
+<article class="card"><strong><a href="02-identity-tenant-access.html">Identity / Tenant Access</a></strong><p class="small">推荐：Keycloak</p><p>负责 OIDC/OAuth2 登录、企业 IdP federation、客户端注册、用户身份令牌和可审计的身份生命周期。</p></article>
+<article class="card"><strong><a href="03-policy-engine-authorization.html">Policy Engine / Authorization</a></strong><p class="small">推荐：Open Policy Agent (OPA)</p><p>作为统一 PDP，给 Edge、TokenRouter、Volume Mounter、egress proxy、K8s admission 和 Skill exfil filter 返回默认拒绝的策略判断。</p></article>
+<article class="card"><strong><a href="04-sandbox-runtime-isolation.html">Sandbox Runtime / Isolation</a></strong><p class="small">推荐：Kata Containers with Cloud Hypervisor profile</p><p>为不可信 terminal/tool execution 提供 microVM 级隔离，同时保留 Kubernetes 调度、镜像和 RuntimeClass 生态。</p></article>
+<article class="card"><strong><a href="05-workspace-volume-mounter.html">Workspace Volume Mounter / POSIX Data Isolation</a></strong><p class="small">推荐：JuiceFS CSI backed by object storage</p><p>把 tenant/workspace/project/session 的文件、memory、outputs 以 POSIX 文件系统形式挂进 sandbox，同时让底层容量和生命周期走对象存储。</p></article>
+<article class="card"><strong><a href="06-tokenrouter-secrets-boundary.html">TokenRouter / Secrets Boundary</a></strong><p class="small">推荐：Custom TokenRouter backed by OpenBao</p><p>TokenRouter 是业务边界；OpenBao 是密钥、动态凭证、transit crypto 和审计后端。Sandbox 永远拿不到真实 provider key。</p></article>
+<article class="card"><strong><a href="07-durable-session-job-orchestration.html">Session / Job Orchestration</a></strong><p class="small">推荐：Temporal</p><p>承接 session lifecycle、sandbox attach、media job group、retry、timeout、compensation、human approval 和长任务状态恢复。</p></article>
+<article class="card"><strong><a href="08-event-bus-realtime-fanout.html">Event Bus / Realtime Fanout</a></strong><p class="small">推荐：NATS JetStream</p><p>处理 session 事件、tool progress、job status、worker heartbeat、轻量控制消息和可回放的事件流。</p></article>
+<article class="card"><strong><a href="09-gpu-render-scheduling.html">GPU Render Scheduling / Supercomputer Fabric</a></strong><p class="small">推荐：Kueue + NVIDIA GPU Operator</p><p>Kueue 做批量 AI/ML/GPU job admission、quota、borrowing/preemption；GPU Operator 管理 NVIDIA driver、device plugin、runtime 和监控组件。</p></article>
+<article class="card"><strong><a href="10-skill-workflow-runtime.html">Skill Workflow Runtime / Registry</a></strong><p class="small">推荐：LangGraph OSS library + custom Skill Registry</p><p>把 Skill 建模为路由、输入门、状态图、阶段执行、QA gate、失败恢复和可保护的内部资产，而不是 prompt 文本。</p></article>
+<article class="card"><strong><a href="11-guardrails-exfiltration-defense.html">Guardrails / Exfiltration Defense</a></strong><p class="small">推荐：NVIDIA NeMo Guardrails + OPA + custom egress filters</p><p>对输入、输出、工具调用和外发通道做可编程 guardrails；OPA 做确定性 allow/deny；自研 egress filter 覆盖 chat/write_file/upload/terminal/archive。</p></article>
+<article class="card"><strong><a href="12-relational-data-tenant-rls.html">Relational Data / Tenant Row Isolation</a></strong><p class="small">推荐：PostgreSQL with Row Level Security</p><p>保存 tenants、workspaces、projects、sessions、runs、tool_calls、jobs、assets、usage_events、audit_events 等强一致业务数据。</p></article>
+<article class="card"><strong><a href="13-object-media-storage.html">Object / Media Storage</a></strong><p class="small">推荐：Rook-Ceph RGW for production; MinIO only for dev/small private deployments</p><p>保存 uploads、generated media、job outputs、thumbnails、manifests、asset lineage 和长期归档。</p></article>
+<article class="card"><strong><a href="14-observability-audit.html">Observability / Audit</a></strong><p class="small">推荐：OpenTelemetry + Grafana LGTM stack</p><p>统一采集 traces、metrics、logs、events，把 run_id/tool_call_id/job_id/tenant_id 串起来；审计日志另做 append-only 存储。</p></article>
+<article class="card"><strong><a href="15-service-mesh-egress.html">Service Mesh / Internal mTLS / Egress</a></strong><p class="small">推荐：Istio</p><p>在内部服务之间提供 mTLS、服务身份、授权策略和受控 egress gateway，支撑 TokenRouter/Job Manager/worker 的零信任通信。</p></article>
+<article class="card"><strong><a href="16-gitops-secrets-delivery.html">Cloud Deployment / GitOps / Secrets Delivery</a></strong><p class="small">推荐：Argo CD + External Secrets Operator</p><p>把 Kubernetes desired state、策略 bundle、服务发布和 OpenBao/外部 secrets 到 K8s 的投递纳入可审计 GitOps 流程。</p></article></div></section>
+<section><h2>推荐组合</h2><table><thead><tr><th>架构模块</th><th>主选方案</th><th>对应 spec</th></tr></thead><tbody><tr><td>Edge Gateway / Realtime Ingress</td><td>Envoy Gateway + Envoy Proxy</td><td>Sections 4, 5, 13, 17</td></tr>
+<tr><td>Identity / Tenant Access</td><td>Keycloak</td><td>Sections 4, 6, 13, 14</td></tr>
+<tr><td>Policy Engine / Authorization</td><td>Open Policy Agent (OPA)</td><td>Sections 4, 6, 8, 9, 12, 19</td></tr>
+<tr><td>Sandbox Runtime / Isolation</td><td>Kata Containers with Cloud Hypervisor profile</td><td>Sections 7, 17, 19</td></tr>
+<tr><td>Workspace Volume Mounter / POSIX Data Isolation</td><td>JuiceFS CSI backed by object storage</td><td>Sections 8, 15, 19</td></tr>
+<tr><td>TokenRouter / Secrets Boundary</td><td>Custom TokenRouter backed by OpenBao</td><td>Sections 6, 9, 16, 19</td></tr>
+<tr><td>Session / Job Orchestration</td><td>Temporal</td><td>Sections 5, 10, 18, 19</td></tr>
+<tr><td>Event Bus / Realtime Fanout</td><td>NATS JetStream</td><td>Sections 5, 10, 13, 16</td></tr>
+<tr><td>GPU Render Scheduling / Supercomputer Fabric</td><td>Kueue + NVIDIA GPU Operator</td><td>Sections 10, 17, 18, 19</td></tr>
+<tr><td>Skill Workflow Runtime / Registry</td><td>LangGraph OSS library + custom Skill Registry</td><td>Sections 1, 11, 12, 18</td></tr>
+<tr><td>Guardrails / Exfiltration Defense</td><td>NVIDIA NeMo Guardrails + OPA + custom egress filters</td><td>Sections 11, 12, 19</td></tr>
+<tr><td>Relational Data / Tenant Row Isolation</td><td>PostgreSQL with Row Level Security</td><td>Sections 6, 14, 16, 19</td></tr>
+<tr><td>Object / Media Storage</td><td>Rook-Ceph RGW for production; MinIO only for dev/small private deployments</td><td>Sections 8, 10, 15, 16, 19</td></tr>
+<tr><td>Observability / Audit</td><td>OpenTelemetry + Grafana LGTM stack</td><td>Sections 16, 18, 19</td></tr>
+<tr><td>Service Mesh / Internal mTLS / Egress</td><td>Istio</td><td>Sections 7, 12, 17, 19</td></tr>
+<tr><td>Cloud Deployment / GitOps / Secrets Delivery</td><td>Argo CD + External Secrets Operator</td><td>Sections 17, 18, 19</td></tr></tbody></table></section>
+<section><h2>关键取舍</h2><ul>
+<li>Sandbox 隔离选择 microVM 路线，普通 Docker 只可用于低风险内部服务，不能承载任意租户代码。</li>
+<li>TokenRouter 必须自研，因为它是业务策略和 provider key 边界；OpenBao 只作为 secrets/crypto/audit 基座。</li>
+<li>Temporal 和 NATS 分工：Temporal 负责真实长任务状态，NATS 负责实时事件和短期回放。</li>
+<li>OPA 是统一策略决策点，NeMo Guardrails 只负责 LLM 应用层 rails，不能替代确定性的工具/egress 策略。</li>
+<li>Rook-Ceph 是生产自托管存储主选；MinIO 保留为开发和小规模部署选项。</li>
+</ul></section>
+</main>
+<footer><div class="wrap">See also <code>../hermes-open-source-architecture-plan.md</code>.</div></footer>
+</body>
+</html>

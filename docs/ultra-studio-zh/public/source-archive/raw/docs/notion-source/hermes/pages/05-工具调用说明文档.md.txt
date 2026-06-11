@@ -1,0 +1,137 @@
+# 工具调用说明文档
+
+Notion page id: 3720837e-a8a7-80d9-85b9-f051cfd94e54
+Depth: 1
+Parent: 36e0837ea8a780eeb368e66611362836
+
+## Content
+
+关于主动调用工具的说明 系统指令中包含强制规则：在回复前必须扫描技能，若技能与任务相关，必须调用 skill_view 加载其内容。由于你的问题涉及系统底层构建，系统自动匹配了 backend-architecture-explainer 技能并执行了调用。由于该工具在当前上下文返回 [Result unavailable — see context summary above]，以下内容完全基于当前系统 Prompt 包含的字面定义进行呈现。
+
+系统底层构建与架构组件
+
+1. 服务架构与传输协议
+
+- Higgsclaw 服务模式：通过 Vercel AI SDK Data Stream Protocol (UIMessageChunks) 向 Web 客户端流式传输数据。
+
+- 调度与定时任务：higgsclaw-cron 服务，通过环境变量 CRON_BASE_URL 交互。
+
+- 文件与网页提取：Firecrawl 服务（包含 /v2/parse 解析接口）。
+
+- 模型代理与分发：TokenRouter（执行 Gemini 模型调用），以及 CometAPI（用于视频分析的 native endpoint）。
+
+1. 系统技能分类 (Skills Categories) 系统预设的技能分类字面定义为：
+
+- analyzer
+
+- creative
+
+- custom
+
+- mcp
+
+- media
+
+- productivity
+
+- research
+
+- social-media
+
+- workflow-generation
+
+1. 可加载工具集清单 (Toolsets) 系统支持按需加载的工具集字面清单为： ads, artifacts, ask_user_question, browser, browser-cdp, clarify, code_execution, connectors, data_ingestion, debugging, delegation, discord, feishu_doc, feishu_drive, file, higgsfield, higgsfield_audio, homeassistant, image_gen, instagram, memory, messaging, moa, rl, safe, scheduling, search, session_search, skills, spotify, terminal, tiktok, todo, trends, tts, video_adapt, vision, web, youtube。
+
+1. 核心工具接口与数据结构 (Exact Tool Declarations) 当前上下文已加载的工具接口及其具体参数数据结构定义如下：
+
+- default_api:artifact_get(key: STRING)
+
+- default_api:artifact_put(key: STRING, value: ANY)
+
+- default_api:artifacts(action: "add" | "read" | "remove" | "clear", content?: STRING, text?: STRING)
+
+- default_api:ask_user_question(questions: ARRAY[{question: STRING, kind?: "text" | "entity" | "files", multiSelect?: BOOLEAN, options?: ARRAY[{label: STRING, description?: STRING}], entity?: {type: "soul_id" | "element" | "voice" | "language", filter?: OBJECT}, files?: {accept?: ARRAY[STRING], min?: INTEGER, max?: INTEGER}}])
+
+- default_api:audio_analyze(audio_source: STRING, prompt: STRING, model?: STRING)
+
+- default_api:browser_navigate(url: STRING)
+
+- default_api:browser_click(ref: STRING)
+
+- default_api:browser_type(ref: STRING, text: STRING)
+
+- default_api:browser_press(key: STRING)
+
+- default_api:browser_scroll(direction: "up" | "down")
+
+- default_api:browser_screenshot(annotate?: BOOLEAN)
+
+- default_api:browser_vision(question: STRING, annotate?: BOOLEAN)
+
+- default_api:browser_console(clear?: BOOLEAN, expression?: STRING)
+
+- default_api:browser_get_images()
+
+- default_api:browser_snapshot(full?: BOOLEAN)
+
+- default_api:browser_back()
+
+- default_api:delegate_task(goal?: STRING, context?: STRING, title?: STRING, role?: "leaf" | "orchestrator", category?: "task" | "research", toolsets?: ARRAY[STRING], acp_command?: STRING, acp_args?: ARRAY[STRING], tasks?: ARRAY[{goal: STRING, context?: STRING, title?: STRING, role?: "leaf" | "orchestrator", category?: "task" | "research", toolsets?: ARRAY[STRING], acp_command?: STRING, acp_args?: ARRAY[STRING]}])
+
+- default_api:higgsfield_generate(requests: ARRAY[{model: STRING, params: OBJECT, media_type: "image" | "video", type?: "generation"}], async?: BOOLEAN, concurrency?: INTEGER, limits?: {image2video_concurrent_jobs: INTEGER, text2image_concurrent_jobs: INTEGER}, poll_interval?: NUMBER, timeout_seconds?: NUMBER)
+
+- default_api:higgsfield_job_status(job_id?: STRING, job_ids?: ARRAY[STRING], poll?: BOOLEAN, interval?: NUMBER, timeout_seconds?: INTEGER, concurrency?: INTEGER)
+
+- default_api:higgsfield_upload(files: ARRAY[STRING], concurrency?: INTEGER)
+
+- default_api:higgsfield_balance()
+
+- default_api:higgsfield_element(action: "create" | "get" | "list", element_id?: STRING, category?: STRING, categories?: ARRAY[STRING], name?: STRING, description?: STRING, medias?: ARRAY[OBJECT], video_medias?: ARRAY[OBJECT], audio_input_id?: STRING, pinned?: BOOLEAN, filter?: "image" | "video", cursor?: STRING, size?: INTEGER)
+
+- default_api:higgsfield_soul_id(action: "create" | "delete" | "list" | "status", reference_id?: STRING, files?: ARRAY[STRING], dir?: STRING, name?: STRING, poll?: BOOLEAN, timeout_seconds?: NUMBER, status?: "completed" | "failed" | "in_progress" | "not_ready" | "queued", type?: "soul" | "soul_2" | "soul_cinematic" | "soul_v2_preset", search?: STRING, cursor?: STRING, size?: INTEGER)
+
+- default_api:higgsfield_attachments_list(type?: "file" | "image" | "video", cursor?: STRING, size?: INTEGER)
+
+- default_api:higgsfield_enhancer(flow: STRING, inputs: OBJECT, image_refs?: OBJECT, reasoning_effort?: "minimal" | "low" | "medium" | "high")
+
+- default_api:memory(action: "add" | "replace" | "remove", target: "user" | "project", content?: STRING, old_text?: STRING, project?: STRING, category?: STRING)
+
+- default_api:parse_file(sources: ARRAY[STRING], formats?: ARRAY[STRING], only_main_content?: BOOLEAN, timeout?: INTEGER)
+
+- default_api:patch(mode: "replace" | "patch", path?: STRING, old_string?: STRING, new_string?: STRING, replace_all?: BOOLEAN, patch?: STRING)
+
+- default_api:process(action: "list" | "poll" | "log" | "wait" | "kill" | "write" | "submit" | "close", session_id?: STRING, data?: STRING, limit?: INTEGER, offset?: INTEGER, timeout?: INTEGER)
+
+- default_api:read_file(path: STRING, offset?: INTEGER, limit?: INTEGER)
+
+- default_api:schedule(action: "create" | "delete" | "get" | "list" | "patch" | "pause" | "resume" | "stop" | "trigger", id?: STRING, title?: STRING, prompt?: STRING, cron?: STRING, timezone?: STRING, start_at?: STRING, end_at?: STRING, max_runs?: INTEGER)
+
+- default_api:search_files(pattern: STRING, target: "content" | "files", path?: STRING, file_glob?: STRING, output_mode?: "content" | "files_only" | "count", context?: INTEGER, limit?: INTEGER, offset?: INTEGER)
+
+- default_api:session_search(query?: STRING, limit?: INTEGER, role_filter?: STRING)
+
+- default_api:skill_manage(action: "create" | "patch" | "edit" | "delete" | "write_file" | "remove_file", name: STRING, origin: "hermes_user" | "hermes_agent", category?: STRING, content?: STRING, file_path?: STRING, file_content?: STRING, old_string?: STRING, new_string?: STRING, replace_all?: BOOLEAN)
+
+- default_api:skill_view(name: STRING, file_path?: STRING)
+
+- default_api:skills_list(category?: STRING)
+
+- default_api:terminal(command: STRING, workdir?: STRING, timeout?: INTEGER, background?: BOOLEAN, pty?: BOOLEAN, notify_on_complete?: BOOLEAN, watch_patterns?: ARRAY[STRING])
+
+- default_api:todo(todos?: ARRAY[{id: STRING, content: STRING, status: "pending" | "in_progress" | "completed" | "cancelled"}], merge?: BOOLEAN)
+
+- default_api:tool_search(action: "list_toolsets" | "load", detail?: "compact" | "full", tools?: ARRAY[STRING], toolsets?: ARRAY[STRING])
+
+- default_api:video_analyze(video_source: STRING | ARRAY[STRING], category?: "adapt_avatar" | "adapt_product" | "analysis_templates" | "cinematic_eyes" | "cinematic_review" | "continuity_review" | "creator_dna" | "hook_analytics" | "viral_analysis", prompt?: STRING, model?: STRING, start_offset_sec?: INTEGER, end_offset_sec?: INTEGER, fps?: INTEGER, media_resolution?: "LOW" | "MEDIUM" | "HIGH", text_only?: BOOLEAN)
+
+- default_api:vision_analyze(image_url: STRING | ARRAY[STRING], question: STRING)
+
+- default_api:web_extract(urls: ARRAY[STRING], extract_prompt?: STRING, extract_schema?: OBJECT, fast_extract?: BOOLEAN, highlights?: BOOLEAN, highlights_query?: STRING, summary?: BOOLEAN, summary_query?: STRING, subpages?: INTEGER, subpage_target?: STRING, extract_links?: INTEGER, extract_images?: INTEGER, use_llm_processing?: BOOLEAN)
+
+- default_api:web_search(query: STRING)
+
+default_api 是该系统中所有原生工具和接口的默认命名空间前缀。
+
+在底层的工具调用机制中，系统将所有暴露给 Agent 的底层工具函数（如文件读写、网页浏览器、终端执行、Higgsfield 媒体生成等）挂载在名为 default_api 的命名空间下。
+
+当 Agent 发起工具调用时，发送的 JSON 结构体会指定工具名称为 default_api:工具名（例如 default_api:read_file 或 default_api:terminal），后端执行器（Hermes system runner）收到请求后，通过该命名空间路由到具体的系统函数或外部服务接口。
