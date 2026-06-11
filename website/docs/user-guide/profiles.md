@@ -24,6 +24,10 @@ That's it. `coder` is now its own Hermes profile with its own config, memory, an
 
 ## Creating a profile
 
+:::tip
+Quickest setup: run `hermes setup --portal` inside the new profile to wire up models + tools at once. See [Nous Portal](/integrations/nous-portal).
+:::
+
 ### Blank profile
 
 ```bash
@@ -194,6 +198,20 @@ If you want this profile to work in a specific project by default, also set its 
 ```bash
 coder config set terminal.cwd /absolute/path/to/project
 ```
+
+### From the dashboard
+
+The [web dashboard](features/web-dashboard.md#managing-multiple-profiles)
+is a machine-level surface that can manage **any** profile's config, API
+keys, skills, MCPs, and model via the profile switcher in its sidebar — no
+per-profile dashboard needed. `coder dashboard` routes to the machine
+dashboard with the `coder` profile preselected. The dashboard's Chat tab
+also follows the switcher, spawning a conversation under the selected
+profile's home.
+
+Note: "Set as active" on the dashboard's Profiles page is the sticky
+default for **future CLI/gateway runs** (same as `hermes profile use`) —
+to edit a profile from the dashboard, use the switcher instead.
 
 ## Updating
 
