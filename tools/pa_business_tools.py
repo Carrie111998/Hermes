@@ -354,6 +354,16 @@ def _case_search_work_text(payload: Mapping[str, Any]) -> str:
 
 
 def _normalize_case_search_payload(clean: dict[str, Any]) -> dict[str, Any]:
+    """Shape a case-search payload for the operator candidate-search API.
+
+    Structured anchors (block / unit / job number) are PRESERVED as payload
+    keys — the API runs a tiered candidate search on them (unit_exact >
+    job_no > block_street_fuzzy > text_like) and each returned row carries a
+    match_basis naming why it surfaced. The free `search` text is still
+    composed from address/street parts and feeds the text + street-fuzzy
+    tiers. (The old behavior squashed everything into one whole-string LIKE,
+    which made "Rivervale Cres" vs "Rivervale Crescent" return zero results.)
+    """
     if "search" not in clean and clean.get("query") is not None:
         clean["search"] = clean["query"]
     address_text = _case_search_address_text(clean)
@@ -364,10 +374,23 @@ def _normalize_case_search_payload(clean: dict[str, Any]) -> dict[str, Any]:
         clean["search"] = address_text
     elif work_text and (has_work_terms or not str(clean.get("search") or "").strip()):
         clean["search"] = work_text
+    # Partial/typo'd job fragments are allowed on the candidate search — use
+    # the non-path 'job_no' key (contains-match), never strict-validated jobNo.
+    job_no = str(clean.get("job_no") or clean.get("jobNo") or "").strip()
+    clean.pop("jobNo", None)
+    clean.pop("job_no", None)
+    block = str(clean.get("block") or "").strip()
+    unit = str(clean.get("unit") or "").strip()
     clean.pop("query", None)
     clean.pop("zone", None)
     for key in CASE_SEARCH_TEXT_KEYS:
         clean.pop(key, None)
+    if job_no:
+        clean["job_no"] = job_no
+    if block:
+        clean["block"] = block
+    if unit:
+        clean["unit"] = unit
     return clean
 
 
@@ -893,6 +916,29 @@ def _handle_tgg_message_history_search(args: Mapping[str, Any], **_kwargs: Any) 
     return _handle_tgg_read("tgg_message_history_search", payload)
 
 
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _handle_tgg_clarification_request(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return tool_error("clarification_request requires a non-empty question")
+    payload: dict[str, Any] = {"question": question}
+    candidates = _string_list(args.get("candidate_job_nos") or args.get("candidateJobNos"))
+    if candidates:
+        payload["candidate_job_nos"] = candidates
+    evidence = _string_list(args.get("evidence_message_refs") or args.get("evidenceMessageRefs"))
+    if evidence:
+        payload["evidence_message_refs"] = evidence
+    context = str(args.get("context") or "").strip()
+    if context:
+        payload["context"] = context
+    return _handle_tgg_write("tgg_clarification_request", payload)
+
+
 def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str:
     raw = dict(args)
     fields = raw.get("fields") if isinstance(raw.get("fields"), Mapping) else {}
@@ -1017,7 +1063,16 @@ TGG_CASE_LOOKUP_SCHEMA = {
 
 TGG_CASE_SEARCH_SCHEMA = {
     "name": "tgg_case_search",
-    "description": "Search TGG operator cases. Prefer address fields first; workType/problem are reasoning hints and are only used as the search text when no address or job number is available.",
+    "description": (
+        "Search TGG operator cases. With structured block/unit/jobNo anchors this "
+        "returns CANDIDATES, each with a match_basis naming why it surfaced "
+        "(unit_exact, unit_exact_block_mismatch, job_no, block_street_fuzzy, "
+        "text_like). The search is deliberately generous (recall) — YOU judge "
+        "which candidate (if any) is the same job. Multiple plausible candidates "
+        "or conflicting evidence → use tgg_clarification_request instead of "
+        "guessing. Prefer structured anchors; workType/problem are reasoning "
+        "hints, only used as search text when no address or job number exists."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -1028,7 +1083,8 @@ TGG_CASE_SEARCH_SCHEMA = {
             "address": {"type": "string", "description": "Structured address if known, e.g. 'Blk 350 Anchorvale Rd #11-109'."},
             "block": {"type": "string", "description": "Structured block number if known, e.g. '350'."},
             "street": {"type": "string", "description": "Structured street/name if known, e.g. 'Anchorvale Rd'."},
-            "unit": {"type": "string", "description": "Structured unit if known, e.g. '#11-109'."},
+            "unit": {"type": "string", "description": "Structured unit if known, e.g. '#11-109'. Matches stored units with or without '#'."},
+            "jobNo": {"type": "string", "description": "Full or partial job number, e.g. 'SK/JOB/2605/2480' or '2605/2480'. Contains-match; typo'd fragments are fine here."},
             "workType": {"type": "string", "description": "Structured work type/problem if known. Used for reasoning after address candidates return, not mixed into address search."},
             "problem": {"type": "string", "description": "Structured problem/work description if known. Used for reasoning after address candidates return, not mixed into address search."},
             "limit": {"type": "integer", "description": "Maximum candidates to return.", "default": 12},
@@ -1074,6 +1130,53 @@ TGG_MESSAGE_HISTORY_SEARCH_SCHEMA = {
 MESSAGE_HISTORY_SEARCH_SCHEMA = {
     **TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
     "name": "message_history_search",
+}
+
+
+TGG_CLARIFICATION_REQUEST_SCHEMA = {
+    "name": "tgg_clarification_request",
+    "description": (
+        "Record a clarification question for the OPERATOR when case-matching "
+        "evidence is ambiguous: multiple plausible candidate cases, a completed "
+        "case matching new same-shape work, or a report whose unit/job cannot be "
+        "resolved. The question is recorded for the operator to review later; it "
+        "is NEVER sent to any WhatsApp chat and no answer will arrive this turn. "
+        "After calling: proceed without assuming the answer, and do NOT create a "
+        "placeholder case for the work you just asked about — the clarification "
+        "IS the record. Do not use this when evidence is clear (over-asking is "
+        "noise). Max one clarification per case decision."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The concrete question the operator should answer, naming the unit/address and candidate job(s) involved.",
+            },
+            "candidate_job_nos": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Job numbers of the candidate cases under consideration.",
+            },
+            "evidence_message_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "WhatsApp message refs/ids that triggered the question.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Short factual context: what was reported, what the candidates show, what is missing.",
+            },
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+}
+
+
+CLARIFICATION_REQUEST_SCHEMA = {
+    **TGG_CLARIFICATION_REQUEST_SCHEMA,
+    "name": "clarification_request",
 }
 
 
@@ -1167,6 +1270,22 @@ registry.register(
     toolset="pa-business",
     schema=MESSAGE_HISTORY_SEARCH_SCHEMA,
     handler=_handle_tgg_message_history_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_clarification_request",
+    toolset="pa-business",
+    schema=TGG_CLARIFICATION_REQUEST_SCHEMA,
+    handler=_handle_tgg_clarification_request,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="clarification_request",
+    toolset="pa-business",
+    schema=CLARIFICATION_REQUEST_SCHEMA,
+    handler=_handle_tgg_clarification_request,
     check_fn=_bridge_available,
 )
 

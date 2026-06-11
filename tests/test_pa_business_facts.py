@@ -557,6 +557,10 @@ def test_pa_business_toolset_is_registered_without_all_tools():
         "pa_business_write",
         "tgg_case_lookup",
         "tgg_case_search",
+        "tgg_message_history_search",
+        "message_history_search",
+        "tgg_clarification_request",
+        "clarification_request",
         "tgg_case_observation",
         "tgg_case_create",
     }
@@ -749,9 +753,12 @@ def test_case_search_accepts_structured_fields_as_single_query(path_param_endpoi
     assert last["method"] == "GET"
     assert "search=Blk+350+Anchorvale+Rd+%2311-109" in last["path"]
     assert "window+grille+install" not in last["path"]
-    assert "block=" not in last["path"]
+    # Structured anchors are PRESERVED — the API runs the tiered candidate
+    # search on them (unit_exact > job_no > block_street_fuzzy > text_like).
+    assert "block=350" in last["path"]
+    assert "unit=11-109" in last["path"]
+    # Street feeds the composed search text only; work/zone never pass through.
     assert "street=" not in last["path"]
-    assert "unit=" not in last["path"]
     assert "workType=" not in last["path"]
     assert "zone=SK" not in last["path"]
     assert "limit=10" in last["path"]
@@ -867,6 +874,39 @@ def test_path_param_missing_from_payload_fails_loudly(path_param_endpoint):
         execute_business_operation(config, "case_lookup", {})
 
 
+def test_clarification_request_posts_to_clarifications_endpoint(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_clarification_request": {
+                    "type": "http",
+                    "method": "POST",
+                    "url": f"{path_param_endpoint}/api/operator/clarifications",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "tgg_clarification_request",
+        {
+            "question": "Is the 182 Rivervale grille report the same job as SK/JOB/2603/1728?",
+            "candidate_job_nos": ["SK/JOB/2603/1728"],
+            "evidence_message_refs": ["wa:12345"],
+            "context": "Completed case matches new same-shape work.",
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "POST"
+    assert last["path"].startswith("/api/operator/clarifications")
+    assert last["payload"]["question"].startswith("Is the 182 Rivervale")
+    assert last["payload"]["candidate_job_nos"] == ["SK/JOB/2603/1728"]
+    assert last["payload"]["evidence_message_refs"] == ["wa:12345"]
+
+
 def test_case_lookup_rejects_unit_as_job_number(path_param_endpoint):
     config = {
         "pa_business": {
@@ -898,7 +938,7 @@ def test_path_param_without_placeholder_fails_loudly(path_param_endpoint):
         }
     }
     with pytest.raises(ValueError, match="URL has no \\{jobNo\\} placeholder"):
-        execute_business_operation(config, "broken", {"jobNo": "X"})
+        execute_business_operation(config, "broken", {"jobNo": "SK/JOB/2604/2376"})
 
 
 def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):

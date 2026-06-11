@@ -42,8 +42,8 @@ job_briefs:
       number returns no match in the operator DB, do NOT attach the message to
       any other existing case that merely shares the address, block, or unit.
       Preserve the explicit job identity: record it as a WhatsApp-only case
-      (provenance WA-only) OR flag needs_clarification, and list any
-      same-address cases only as review context -- never resolve to them. Same
+      (provenance WA-only) OR ask via tgg_clarification_request, listing any
+      same-address cases as candidates only -- never resolve to them. Same
       address + different job number = a different case.
     - >-
       Before any case lookup or create, extract structured anchors from the
@@ -52,18 +52,34 @@ job_briefs:
       (exact match). Use block + unit + street as strong identity. Treat
       zone-text as a soft hint only (per the zone rule). If only block + unit
       are present and they match multiple streets, towns, or zones, treat it
-      as ambiguous and clarify (record candidates) rather than create.
+      as ambiguous and ask via tgg_clarification_request (naming the
+      candidates) rather than create.
     - If address, unit, block/street, or work-type text is present without a
       real job number, use tgg_case_search before deciding whether an existing
       case matches.
     - >-
+      tgg_case_search returns CANDIDATES, each with a match_basis naming why it
+      surfaced (unit_exact, unit_exact_block_mismatch, job_no,
+      block_street_fuzzy, text_like). The search is deliberately generous --
+      YOU judge which candidate (if any) is the same job, weighing unit/block
+      identity, street, work shape, and case state. A unit_exact candidate on
+      the same block is strong identity even when the street wording differs
+      (Cres vs Crescent, typo'd street). Candidates are evidence to judge, not
+      answers to accept.
+    - >-
       Search once per distinct address first. If block/street/unit or address is
-      present, use those address fields as the search and keep workType/problem
-      as your reasoning hint after candidates return; do not mix work words such
-      as "toilet door" or "main gate" into the address search. Use workType/problem
-      as fallback search text only when no usable address or job number exists.
-      Only run a second search for the same cluster if the first result is empty,
-      ambiguous, or contradicts the message evidence.
+      present, pass them as structured block/unit fields (plus address text as
+      the search) and keep workType/problem as your reasoning hint after
+      candidates return; do not mix work words such as "toilet door" or "main
+      gate" into the address search. Use workType/problem as fallback search
+      text only when no usable address or job number exists. Only run a second
+      search for the same cluster if the first result is empty, ambiguous, or
+      contradicts the message evidence.
+    - >-
+      Search economy: one search per case decision, then REUSE that result.
+      Never repeat an identical search (same tool, same block/unit/terms) you
+      already ran this turn -- the archive and the case DB do not change
+      between identical calls.
     - >-
       When searching for an existing case to match an inbound report, search by
       job number, block, unit, and street/address text. Do NOT pass zone as a
@@ -85,10 +101,21 @@ job_briefs:
       block + unit + street together with a clear problem and WhatsApp source.
       When identity is ambiguous -- block + unit match more than one
       street/town/zone, only partial anchors are present, or confidence is low
-      -- do NOT create a case and do NOT silently drop the message. Record it
-      as a case_observation flagged `needs_clarification`, listing the candidate
-      matches you found and what is missing, so the operator can resolve it.
-      Clarify; do not guess, and do not force a create-or-drop decision.
+      -- do NOT create a case and do NOT silently drop the message. Ask via
+      tgg_clarification_request, naming the candidate job numbers you found and
+      what is missing, so the operator can resolve it. Clarify; do not guess,
+      and do not force a create-or-drop decision.
+    - >-
+      When to clarify vs decide: if the candidate evidence is ambiguous --
+      multiple plausible candidate cases, a COMPLETED case matching new
+      same-shape work at the same unit (is this a recurrence/follow-up or the
+      old job?), or a report whose unit/job cannot be resolved -- ask via
+      tgg_clarification_request instead of guessing or minting a new case. The
+      clarification is recorded for the operator; no answer arrives this turn,
+      so proceed without assuming the answer and do NOT also create a
+      placeholder case for the same work (the clarification IS the record).
+      When the evidence is clear, do NOT clarify -- over-asking is noise. At
+      most one clarification per case decision.
     - >-
       If an inbound WhatsApp operations message contains photos, worker updates,
       or case evidence and a safe case match exists, call tgg_case_observation.
@@ -101,10 +128,11 @@ job_briefs:
     - >-
       For TGG case work in this ingest job, use only tgg_case_lookup,
       tgg_case_search, message_history_search (tgg_message_history_search),
-      tgg_case_create, and tgg_case_observation. Do not call
-      generic pa_business_read, pa_business_write, or agent config operations as
-      a workaround when a lookup/search is unclear. Ask for clarification or
-      create a WhatsApp-only case only when the tgg_case_* result supports it.
+      tgg_clarification_request (clarification_request), tgg_case_create, and
+      tgg_case_observation. Do not call generic pa_business_read,
+      pa_business_write, or agent config operations as a workaround when a
+      lookup/search is unclear. Ask for clarification or create a WhatsApp-only
+      case only when the tgg_case_* result supports it.
     - Route management questions out of ops ingest instead of answering them inline.
     - >
       Recording what happened (observability): at the end of each turn, use the
