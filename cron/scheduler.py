@@ -41,7 +41,7 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import resolve_windows_git_bash, windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_time import now as _hermes_now
 
@@ -1647,30 +1647,17 @@ def _resolve_bash() -> str | None:
     (System32\\bash.exe) or its WindowsApps stub ahead of Git Bash.
     WSL bash runs the script inside the Linux VM, where a ``C:\\...``
     script path does not resolve — bash exits 127 with a mangled-path
-    "No such file or directory". Prefer Git Bash explicitly; refuse the
-    WSL launcher rather than hand it a path it cannot open.
+    "No such file or directory".  Delegates to the shared
+    ``resolve_windows_git_bash`` helper, which prefers Git Bash
+    explicitly and refuses the WSL launcher — the same resolution the
+    terminal tool uses, including the HERMES_GIT_BASH_PATH override and
+    Hermes' portable Git install.
     """
     if sys.platform != "win32":
         return shutil.which("bash") or (
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
-    for base_var, rel in (
-        ("ProgramFiles", r"Git\bin\bash.exe"),
-        ("ProgramFiles", r"Git\usr\bin\bash.exe"),
-        ("ProgramFiles(x86)", r"Git\bin\bash.exe"),
-        ("LOCALAPPDATA", r"Programs\Git\bin\bash.exe"),
-    ):
-        base = os.environ.get(base_var)
-        if base:
-            cand = os.path.join(base, rel)
-            if os.path.isfile(cand):
-                return cand
-    found = shutil.which("bash")
-    if found and (
-        "\\system32\\" in found.lower() or "\\windowsapps\\" in found.lower()
-    ):
-        return None  # WSL launcher / Store stub — not usable for C:\ scripts
-    return found
+    return resolve_windows_git_bash()
 
 
 def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:

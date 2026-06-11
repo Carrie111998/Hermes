@@ -36,6 +36,7 @@ from typing import Optional, Sequence
 __all__ = [
     "IS_WINDOWS",
     "resolve_node_command",
+    "resolve_windows_git_bash",
     "windows_detach_flags",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
@@ -86,6 +87,75 @@ def resolve_node_command(name: str, argv: Sequence[str]) -> list[str]:
     if resolved:
         return [resolved, *argv]
     return [name, *argv]
+
+
+# -----------------------------------------------------------------------------
+# Git Bash resolution (Windows)
+# -----------------------------------------------------------------------------
+
+
+def resolve_windows_git_bash() -> Optional[str]:
+    """Locate a bash.exe on Windows that can execute ``C:\\`` paths.
+
+    On a box with WSL installed, PATH order usually puts the WSL launcher
+    (``System32\\bash.exe``) or its Microsoft Store stub
+    (``WindowsApps\\bash.exe``) ahead of Git Bash — when Git Bash is on
+    PATH at all (a default Git for Windows install only adds ``Git\\cmd``,
+    which ships no bash).  WSL bash runs commands inside the Linux VM,
+    where ``C:\\...``-style paths do not resolve: scripts and snapshot
+    files "vanish" and bash exits 126/127 with a mangled-path "No such
+    file or directory".
+
+    Preference order:
+
+    1. ``HERMES_GIT_BASH_PATH`` — explicit user override.
+    2. Hermes' own portable Git (``%LOCALAPPDATA%\\hermes\\git``) —
+       dropped by install.ps1 when the user had no working system Git;
+       checked before system installs so a broken or partially
+       uninstalled system Git can't hijack the lookup.  Both PortableGit
+       (``bin\\bash.exe``) and MinGit (``usr\\bin\\bash.exe``) layouts
+       are probed.
+    3. Known Git for Windows install locations (machine-wide and
+       per-user).
+    4. ``shutil.which("bash")`` — last resort, REFUSING System32 /
+       WindowsApps results (the WSL launcher and its Store stub).
+
+    Returns ``None`` when nothing usable exists.  Windows-only by
+    intent: callers branch on platform before calling (the POSIX answer
+    is just ``shutil.which("bash")``).
+    """
+    custom = os.environ.get("HERMES_GIT_BASH_PATH")
+    if custom and os.path.isfile(custom):
+        return custom
+
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if local_appdata:
+        hermes_git = os.path.join(local_appdata, "hermes", "git")
+        for candidate in (
+            os.path.join(hermes_git, "bin", "bash.exe"),         # PortableGit
+            os.path.join(hermes_git, "usr", "bin", "bash.exe"),  # MinGit
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+
+    for base_var, rel in (
+        ("ProgramFiles", os.path.join("Git", "bin", "bash.exe")),
+        ("ProgramFiles", os.path.join("Git", "usr", "bin", "bash.exe")),
+        ("ProgramFiles(x86)", os.path.join("Git", "bin", "bash.exe")),
+        ("LOCALAPPDATA", os.path.join("Programs", "Git", "bin", "bash.exe")),
+    ):
+        base = os.environ.get(base_var)
+        if base:
+            candidate = os.path.join(base, rel)
+            if os.path.isfile(candidate):
+                return candidate
+
+    found = shutil.which("bash")
+    if found and (
+        "\\system32\\" in found.lower() or "\\windowsapps\\" in found.lower()
+    ):
+        return None  # WSL launcher / Store stub — cannot see C:\ paths
+    return found
 
 
 # -----------------------------------------------------------------------------

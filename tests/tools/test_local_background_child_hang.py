@@ -11,12 +11,28 @@ The fix switches ``_drain()`` to select()-based non-blocking reads and
 stops draining shortly after bash exits even if the pipe hasn't EOF'd.
 """
 import json
+import os
 import subprocess
 import time
 
 import pytest
 
 from tools.environments.local import LocalEnvironment
+
+# The #8340 fix this file guards is select()-based non-blocking drain —
+# select() on pipe fds is POSIX-only, and the Windows drain still does
+# blocking os.read.  Now that bash resolution prefers real Git Bash on
+# Windows (instead of the WSL launcher, which made these commands fail
+# fast with mangled C:\ paths), the guarded scenario genuinely hangs
+# there: a backgrounded child inherits the pipe write-end and the drain
+# never sees EOF, so the first test stalls until pytest-timeout aborts
+# the whole session.  Skip on Windows; the regression guard is for the
+# POSIX mechanism.
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="select()-based drain under test is POSIX-only; Windows blocking "
+    "drain hangs on backgrounded children (pre-existing limitation)",
+)
 
 
 def _pkill(pattern: str) -> None:

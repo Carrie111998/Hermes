@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import resolve_windows_git_bash, windows_hide_flags
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -223,40 +223,15 @@ def _find_bash() -> str:
             or "/bin/sh"
         )
 
-    custom = os.environ.get("HERMES_GIT_BASH_PATH")
-    if custom and os.path.isfile(custom):
-        return custom
-
-    # Prefer our own portable Git install first — this way a broken or
-    # partially-uninstalled system Git can't hijack the bash lookup.  The
-    # install.ps1 installer always drops portable Git here when the user
-    # didn't already have a working system Git.
-    #
-    # Layouts (both checked so upgrades between MinGit and PortableGit
-    # installs work transparently):
-    #   PortableGit: %LOCALAPPDATA%\hermes\git\bin\bash.exe   (primary)
-    #   MinGit:      %LOCALAPPDATA%\hermes\git\usr\bin\bash.exe (legacy/32-bit fallback)
-    _local_appdata = os.environ.get("LOCALAPPDATA", "")
-    _hermes_portable_git = os.path.join(_local_appdata, "hermes", "git") if _local_appdata else ""
-    if _hermes_portable_git:
-        for candidate in (
-            os.path.join(_hermes_portable_git, "bin", "bash.exe"),        # PortableGit (primary)
-            os.path.join(_hermes_portable_git, "usr", "bin", "bash.exe"), # MinGit fallback
-        ):
-            if os.path.isfile(candidate):
-                return candidate
-
-    found = shutil.which("bash")
+    # Shared Windows discovery (hermes_cli._subprocess_compat): the
+    # HERMES_GIT_BASH_PATH override, then Hermes' portable Git, then known
+    # Git for Windows installs, and only then PATH — refusing the WSL
+    # launcher (System32/WindowsApps bash runs inside the Linux VM, where
+    # the C:\...-style snapshot/cwd/temp paths this environment builds do
+    # not resolve; every command would exit 126/127).
+    found = resolve_windows_git_bash()
     if found:
         return found
-
-    for candidate in (
-        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
-        os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
-        os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
-    ):
-        if candidate and os.path.isfile(candidate):
-            return candidate
 
     raise RuntimeError(
         "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
