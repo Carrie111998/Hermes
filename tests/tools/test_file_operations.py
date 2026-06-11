@@ -501,6 +501,12 @@ class TestSearchPathValidation:
         assert "search failed" in result.error.lower() or "Search error" in result.error
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="GNU find fallback under test through a shell=True fake env; on "
+    "Windows that resolves cmd.exe + System32 find.exe (a different tool), "
+    "same gating as TestFindExcludesHiddenDirs in test_search_hidden_dirs.py",
+)
 class TestSearchFilesFallbackHiddenPaths:
     def _make_env(self):
         env = MagicMock()

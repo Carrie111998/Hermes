@@ -25,6 +25,21 @@ import pytest
 from tools.file_operations import ShellFileOperations
 
 
+def _bash_argv(command: str) -> list:
+    """argv for running *command* through bash, matching production resolution.
+
+    On Windows, bare ``bash`` resolves through PATH to the System32 WSL
+    launcher, which runs the command inside the WSL VM — absolute
+    ``C:\\...`` paths do not exist there, so any test using one fails.
+    Use the same Git Bash discovery the real backends use.
+    """
+    if os.name == "nt":
+        from hermes_cli._subprocess_compat import resolve_windows_git_bash
+
+        return [resolve_windows_git_bash() or "bash", "-c", command]
+    return ["bash", "-c", command]
+
+
 class _FakeEnv:
     """Minimal terminal env that tracks cwd across execute() calls.
 
@@ -47,17 +62,19 @@ class _FakeEnv:
             new = command.strip()[3:].strip()
             self.cwd = new
             return {"output": "", "returncode": 0}
-        # Actually run the command — handle stdin via subprocess
+        # Actually run the command — handle stdin via subprocess.
+        # stdin goes through as raw bytes, mirroring the real backends'
+        # _pipe_stdin: text=True would translate \n -> \r\n on Windows and
+        # corrupt every write_file/patch payload (tools/environments/base.py).
         stdin_data = kwargs.get("stdin_data")
         proc = subprocess.run(
-            ["bash", "-c", command],
+            _bash_argv(command),
             cwd=cwd or self.cwd,
-            input=stdin_data,
+            input=stdin_data.encode("utf-8") if stdin_data is not None else None,
             capture_output=True,
-            text=True,
         )
         return {
-            "output": proc.stdout + proc.stderr,
+            "output": (proc.stdout + proc.stderr).decode("utf-8", errors="replace"),
             "returncode": proc.returncode,
         }
 
@@ -145,7 +162,7 @@ class TestShellFileOpsCwdTracking:
         class _NoCwdEnv:
             def execute(self, command, cwd=None, **kwargs):
                 import subprocess
-                proc = subprocess.run(["bash", "-c", command], cwd=cwd,
+                proc = subprocess.run(_bash_argv(command), cwd=cwd,
                                       capture_output=True, text=True)
                 return {"output": proc.stdout, "returncode": proc.returncode}
 

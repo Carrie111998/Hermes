@@ -110,6 +110,11 @@ class TestLocalEnvironmentExecute:
         assert "STDERR_TEST" in result["output"]
         _assert_clean(result["output"])
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="Git Bash pwd reports MSYS mount forms (/c/Users/..., or /tmp "
+        "for %TEMP% via the usertemp fstab mount), never the native C:\\ form",
+    )
     def test_cwd_respected(self, env, tmp_path):
         subdir = tmp_path / "subdir_test"
         subdir.mkdir()
@@ -124,6 +129,11 @@ class TestLocalEnvironmentExecute:
         assert lines == ["AAA", "BBB", "CCC"]
         _assert_clean(result["output"])
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="$HOME inside Git Bash is the MSYS form /c/Users/<user>; it "
+        "can never equal Path.home()'s native C:\\ form",
+    )
     def test_env_var_home(self, env):
         result = env.execute("echo $HOME")
         assert result["returncode"] == 0
@@ -139,8 +149,12 @@ class TestLocalEnvironmentExecute:
 
     def test_cat_deterministic_content(self, env, tmp_path):
         f = tmp_path / "det.txt"
-        f.write_text(SIMPLE_CONTENT)
-        result = env.execute(f"cat {f}")
+        # newline="" keeps the bytes LF-exact on Windows (default write_text
+        # maps \n -> os.linesep); as_posix() because bash strips backslashes
+        # from unquoted words, mangling C:\-style paths.  Both are byte-level
+        # no-ops on POSIX.
+        f.write_text(SIMPLE_CONTENT, newline="")
+        result = env.execute(f"cat {f.as_posix()}")
         assert result["returncode"] == 0
         assert result["output"] == SIMPLE_CONTENT
         _assert_clean(result["output"])
@@ -363,6 +377,12 @@ class TestSearch:
 # ── _expand_path ─────────────────────────────────────────────────────────
 
 class TestExpandPath:
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="_expand_path resolves ~ by asking the shell for $HOME; Git "
+        "Bash answers in MSYS form (/c/Users/<user>), not Path.home()'s "
+        "native form",
+    )
     def test_tilde_exact(self, ops):
         result = ops._expand_path("~/test.txt")
         expected = f"{Path.home()}/test.txt"
@@ -375,6 +395,12 @@ class TestExpandPath:
     def test_relative_unchanged(self, ops):
         assert ops._expand_path("relative/path.txt") == "relative/path.txt"
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="_expand_path resolves ~ by asking the shell for $HOME; Git "
+        "Bash answers in MSYS form (/c/Users/<user>), not Path.home()'s "
+        "native form",
+    )
     def test_bare_tilde(self, ops):
         result = ops._expand_path("~")
         assert result == str(Path.home())
@@ -412,15 +438,18 @@ class TestTerminalOutputCleanliness:
 
     def test_cat(self, env, tmp_path):
         f = tmp_path / "cat_test.txt"
-        f.write_text("CAT_CONTENT_EXACT\n")
-        result = env.execute(f"cat {f}")
+        # newline="" + as_posix(): LF-exact bytes and a backslash-free path
+        # so the assertion holds under Git Bash on Windows too (no-ops on
+        # POSIX) — see test_cat_deterministic_content.
+        f.write_text("CAT_CONTENT_EXACT\n", newline="")
+        result = env.execute(f"cat {f.as_posix()}")
         assert result["output"] == "CAT_CONTENT_EXACT\n"
         _assert_clean(result["output"])
 
     def test_ls(self, env, tmp_path):
         (tmp_path / "file_a.txt").write_text("")
         (tmp_path / "file_b.txt").write_text("")
-        result = env.execute(f"ls {tmp_path}")
+        result = env.execute(f"ls {tmp_path.as_posix()}")
         _assert_clean(result["output"])
         assert "file_a.txt" in result["output"]
         assert "file_b.txt" in result["output"]
@@ -428,18 +457,23 @@ class TestTerminalOutputCleanliness:
     def test_wc(self, env, tmp_path):
         f = tmp_path / "wc_test.txt"
         f.write_text("one\ntwo\nthree\n")
-        result = env.execute(f"wc -l < {f}")
+        result = env.execute(f"wc -l < {f.as_posix()}")
         assert result["output"].strip() == "3"
         _assert_clean(result["output"])
 
     def test_head(self, env, tmp_path):
         f = tmp_path / "head_test.txt"
-        f.write_text(NUMBERED_CONTENT)
-        result = env.execute(f"head -n 3 {f}")
+        f.write_text(NUMBERED_CONTENT, newline="")
+        result = env.execute(f"head -n 3 {f.as_posix()}")
         expected = "LINE_0001\nLINE_0002\nLINE_0003\n"
         assert result["output"] == expected
         _assert_clean(result["output"])
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="$HOME inside Git Bash is the MSYS form /c/Users/<user>; it "
+        "can never equal Path.home()'s native C:\\ form",
+    )
     def test_env_var_expansion(self, env):
         result = env.execute("echo $HOME")
         assert result["output"].strip() == str(Path.home())
