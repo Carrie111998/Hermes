@@ -1082,6 +1082,33 @@ def _record_to_bridge_message(record: ReplayRecord) -> dict[str, Any]:
     return bridge
 
 
+def _event_max_epoch_seconds(event: Any) -> int | None:
+    """Latest message timestamp (epoch seconds) carried by a turn event.
+
+    Handles both single-message events and debounce bundles
+    ({"bundle": True, "messages": [...]}). bridge_message_log.ts is epoch
+    seconds, and _record_to_bridge_message copies it into raw "timestamp".
+    """
+    raw = event.raw_message if isinstance(getattr(event, "raw_message", None), dict) else {}
+    candidates = raw.get("messages") if raw.get("bundle") else [raw]
+    if not isinstance(candidates, list):
+        candidates = [raw]
+    best: int | None = None
+    for message in candidates:
+        if not isinstance(message, dict):
+            continue
+        ts = message.get("timestamp")
+        if isinstance(ts, dict):
+            ts = ts.get("low") or ts.get("value")
+        try:
+            ts_num = int(float(ts))
+        except (TypeError, ValueError):
+            continue
+        if ts_num > 0:
+            best = ts_num if best is None else max(best, ts_num)
+    return best
+
+
 def _extract_latest_assistant(messages: list[dict[str, Any]], start: int = 0) -> str:
     for msg in reversed(messages[start:]):
         if msg.get("role") == "assistant" and msg.get("content"):
@@ -2336,6 +2363,14 @@ async def _run(args: argparse.Namespace) -> int:
             before = runner.session_store.load_transcript(session_id)
         action_start = len(captured_agent_actions)
         os.environ["HERMES_LLM_TURN_ID"] = turn_env_value
+        # Per-turn future cap: message_history_search must never see archive
+        # rows from after the replayed moment. Cap = latest turn-message ts + 1
+        # (exclusive `ts < cap` on the endpoint ⇒ everything up to and including
+        # "now", nothing after). Live runtime never sets this env var.
+        previous_before_env = os.environ.get("HERMES_PA_HISTORY_BEFORE_TS")
+        turn_max_ts = _event_max_epoch_seconds(event)
+        if turn_max_ts is not None:
+            os.environ["HERMES_PA_HISTORY_BEFORE_TS"] = str(turn_max_ts + 1)
         try:
             returned = await runner._handle_message(event)
         finally:
@@ -2343,6 +2378,10 @@ async def _run(args: argparse.Namespace) -> int:
                 os.environ.pop("HERMES_LLM_TURN_ID", None)
             else:
                 os.environ["HERMES_LLM_TURN_ID"] = previous_turn_env
+            if previous_before_env is None:
+                os.environ.pop("HERMES_PA_HISTORY_BEFORE_TS", None)
+            else:
+                os.environ["HERMES_PA_HISTORY_BEFORE_TS"] = previous_before_env
         after = runner.session_store.load_transcript(session_id) if session_id else []
         segment = after[len(before):]
         assistant = _extract_latest_assistant(after, start=len(before))

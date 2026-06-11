@@ -175,6 +175,7 @@ TOOLSETS = {
         "tools": [
             "pa_business_read", "pa_business_write",
             "tgg_case_lookup", "tgg_case_search",
+            "tgg_message_history_search", "message_history_search",
             "tgg_case_observation", "tgg_case_create",
         ],
         "includes": [],
@@ -185,6 +186,7 @@ TOOLSETS = {
         "tools": [
             "pa_business_read", "pa_business_write",
             "tgg_case_lookup", "tgg_case_search",
+            "tgg_message_history_search", "message_history_search",
             "tgg_case_observation", "tgg_case_create",
         ],
         "includes": [],

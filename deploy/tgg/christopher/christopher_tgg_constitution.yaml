@@ -72,6 +72,15 @@ job_briefs:
       sourced from the operator DB or iLinked. A "Zone: X" line in a chat must
       never exclude an exact block/unit match that lives in a different zone.
     - >-
+      Before creating any case that would mint a placeholder WA/JOB number,
+      run message_history_search by block + unit first (and by job number if
+      one is visible in the message). The real job number is often announced
+      earlier in a DIFFERENT chat, and street names in chat are sometimes
+      typo'd (for example "Jalan Kati" vs "Jalan Kayu"), so block + unit
+      matching beats street strings. If a prior announcement carries a real
+      job number, use that number -- look it up / search cases for it and
+      attach the report there -- instead of minting a new WA/JOB case.
+    - >-
       Only create a new case when identity is strong: an explicit job number, OR
       block + unit + street together with a clear problem and WhatsApp source.
       When identity is ambiguous -- block + unit match more than one
@@ -91,7 +100,8 @@ job_briefs:
       -- never pick a single match silently when others are plausible.
     - >-
       For TGG case work in this ingest job, use only tgg_case_lookup,
-      tgg_case_search, tgg_case_create, and tgg_case_observation. Do not call
+      tgg_case_search, message_history_search (tgg_message_history_search),
+      tgg_case_create, and tgg_case_observation. Do not call
       generic pa_business_read, pa_business_write, or agent config operations as
       a workaround when a lookup/search is unclear. Ask for clarification or
       create a WhatsApp-only case only when the tgg_case_* result supports it.

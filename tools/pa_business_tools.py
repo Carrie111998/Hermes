@@ -852,6 +852,47 @@ def _handle_tgg_case_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
     return _handle_tgg_read("tgg_case_search", payload)
 
 
+def _history_before_ts_cap() -> int | None:
+    """Replay-only future cap for message-history search.
+
+    The replay harness sets HERMES_PA_HISTORY_BEFORE_TS per turn (epoch seconds
+    of the turn's latest message + 1) so a replayed agent can never see archive
+    messages from after the moment being replayed. Live runtime never sets the
+    variable, so live searches are uncapped.
+    """
+    raw = os.getenv("HERMES_PA_HISTORY_BEFORE_TS")
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
+def _handle_tgg_message_history_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    payload: dict[str, Any] = {}
+    for key in ("q", "block", "unit"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            payload[key] = value
+    job_no = str(args.get("jobNo") or args.get("job_no") or "").strip()
+    if job_no:
+        # Deliberately the non-path 'job_no' key: partial/typo'd fragments are
+        # allowed here (contains-match), unlike the strict jobNo validation on
+        # lookup/observation operations.
+        payload["job_no"] = job_no
+    chat_jid = str(args.get("chat_jid") or args.get("chatJid") or "").strip()
+    if chat_jid:
+        payload["chat_jid"] = chat_jid
+    limit = args.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        payload["limit"] = min(limit, 50)
+    cap = _history_before_ts_cap()
+    if cap is not None:
+        payload["before_ts"] = cap
+    return _handle_tgg_read("tgg_message_history_search", payload)
+
+
 def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str:
     raw = dict(args)
     fields = raw.get("fields") if isinstance(raw.get("fields"), Mapping) else {}
@@ -1002,6 +1043,40 @@ TGG_CASE_SEARCH_SCHEMA = {
 }
 
 
+TGG_MESSAGE_HISTORY_SEARCH_SCHEMA = {
+    "name": "tgg_message_history_search",
+    "description": (
+        "Search the WhatsApp message archive (all group chats, full history) "
+        "for prior announcements/reports about a unit, job number, or topic. "
+        "Use BEFORE creating any case with a WA/JOB placeholder number — the "
+        "real job number is often in an earlier announcement (possibly in a "
+        "different chat or with a typo'd street name; prefer block+unit search)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "q": {
+                "type": "string",
+                "description": "Free text search over message text. Multiple words are ANDed; keep it to 1-3 distinctive words.",
+            },
+            "block": {"type": "string", "description": "Block number to match in message text, e.g. '446A'."},
+            "unit": {"type": "string", "description": "Unit to match in message text, e.g. '#03-326' (matches with or without '#'/spaces)."},
+            "jobNo": {"type": "string", "description": "Full or partial job number to match, e.g. 'SK/JOB/2605/2480' or '2605/2480'."},
+            "chat_jid": {"type": "string", "description": "Optional: restrict to one chat jid. Usually omit — announcements often live in a different chat."},
+            "limit": {"type": "integer", "description": "Maximum messages to return (default 20, max 50)."},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+
+MESSAGE_HISTORY_SEARCH_SCHEMA = {
+    **TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
+    "name": "message_history_search",
+}
+
+
 TGG_CASE_OBSERVATION_SCHEMA = {
     "name": "tgg_case_observation",
     "description": "Record WhatsApp evidence or worker updates against an existing TGG case. Requires a real job number; dry-run mode validates without writing.",
@@ -1076,6 +1151,22 @@ registry.register(
     toolset="pa-business",
     schema=TGG_CASE_SEARCH_SCHEMA,
     handler=_handle_tgg_case_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_message_history_search",
+    toolset="pa-business",
+    schema=TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
+    handler=_handle_tgg_message_history_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="message_history_search",
+    toolset="pa-business",
+    schema=MESSAGE_HISTORY_SEARCH_SCHEMA,
+    handler=_handle_tgg_message_history_search,
     check_fn=_bridge_available,
 )
 
