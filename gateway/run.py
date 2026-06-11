@@ -1159,19 +1159,41 @@ def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
 
 
 def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
-    """Attach job-brief compression policy to an agent compressor when supported."""
+    """Attach job-brief compression behavior to an agent compressor when supported.
+
+    Two distinct knobs live under ``response_policy.compression``:
+
+    * ``strategy`` (+ window/fields) — the legacy PA compression POLICY. It
+      REPLACES the native pipeline with a deterministic keep/drop filter
+      (``_compress_with_pa_policy`` short-circuits ``compress()``). Only set
+      when a strategy is actually declared.
+    * ``compaction_guidance`` — standing guidance string threaded into the
+      NATIVE summarizer prompt (auto-trigger compactions; composes with any
+      per-call /compress focus). Keeps the native pipeline running.
+    """
     compressor = getattr(agent, "context_compressor", None)
     setter = getattr(compressor, "set_pa_compression_policy", None)
     if not callable(setter):
         return
     policy = None
+    guidance = None
     job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
     response_policy = getattr(job_brief, "response_policy", None) if job_brief is not None else None
     if isinstance(response_policy, Mapping):
         raw_policy = response_policy.get("compression")
         if isinstance(raw_policy, Mapping):
-            policy = raw_policy
+            # Guidance-only mappings (no strategy) must NOT register as a
+            # policy: a policy short-circuits the native pipeline at the top
+            # of compress(), which is exactly what guidance-mode avoids.
+            if str(raw_policy.get("strategy") or "").strip():
+                policy = raw_policy
+            raw_guidance = raw_policy.get("compaction_guidance")
+            if isinstance(raw_guidance, str) and raw_guidance.strip():
+                guidance = raw_guidance
     setter(policy)
+    guidance_setter = getattr(compressor, "set_pa_compaction_guidance", None)
+    if callable(guidance_setter):
+        guidance_setter(guidance)
 
 
 def _pa_response_policy(pa_context: Any) -> Mapping[str, Any]:

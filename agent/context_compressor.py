@@ -506,6 +506,11 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_error: Optional[str] = None
         self._last_aux_model_failure_model: Optional[str] = None
         self.pa_compression_policy: Optional[Mapping[str, Any]] = None
+        # Standing PA compaction guidance (constitution-authored). Unlike the
+        # policy above (which REPLACES the native pipeline with a keep/drop
+        # filter), the guidance keeps the native pipeline and threads a
+        # retention brief into the summarizer prompt on every compaction.
+        self.pa_compaction_guidance: Optional[str] = None
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
@@ -515,6 +520,21 @@ class ContextCompressor(ContextEngine):
     def set_pa_compression_policy(self, policy: Mapping[str, Any] | None) -> None:
         """Attach an optional PA job-brief compression policy."""
         self.pa_compression_policy = dict(policy) if isinstance(policy, Mapping) else None
+
+    def set_pa_compaction_guidance(self, guidance: str | None) -> None:
+        """Attach standing PA compaction guidance for the native summarizer.
+
+        Sibling setter to ``set_pa_compression_policy`` with the opposite
+        philosophy: the policy SHORT-CIRCUITS the native pipeline with a
+        deterministic keep/drop filter, while the guidance keeps the native
+        pipeline (tool-result pruning → boundary calc → aux-model rolling
+        summary) and steers WHAT the summarizer preserves. Threaded into the
+        summarizer prompt on every compaction — auto-triggered compactions
+        are the main consumer. Composes with (never replaces) a per-call
+        ``focus_topic``.
+        """
+        text = str(guidance).strip() if isinstance(guidance, str) else ""
+        self.pa_compaction_guidance = text or None
 
     def _pa_compression_window(self, policy: Mapping[str, Any], default: int) -> int:
         raw = policy.get("window_size", default)
@@ -545,7 +565,9 @@ class ContextCompressor(ContextEngine):
         return any(marker in text for marker in _PA_CASE_STATE_MARKERS)
 
     def _compress_with_pa_policy(self, messages: List[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
-        policy = self.pa_compression_policy
+        # getattr: instances built without __init__ (tests, plugin engines)
+        # may not carry the attribute -- treat that as "no policy".
+        policy = getattr(self, "pa_compression_policy", None)
         if not isinstance(policy, Mapping):
             return None
         strategy = str(policy.get("strategy") or "").strip().lower()
@@ -1033,6 +1055,18 @@ TURNS TO SUMMARIZE:
 Use this exact structure:
 
 {_template_sections}"""
+
+        # Standing PA compaction guidance (constitution-authored, set via
+        # set_pa_compaction_guidance). Injected on every summary generation
+        # for agents that declare it — AUTO-triggered compactions are the
+        # main path. Composes with the per-call focus topic below; the focus
+        # stays last so it takes precedence when both are present.
+        _standing_guidance = getattr(self, "pa_compaction_guidance", None)
+        if _standing_guidance:
+            prompt += f"""
+
+STANDING COMPACTION GUIDANCE (from the agent's constitution — apply on every compaction):
+{_standing_guidance}"""
 
         # Inject focus topic guidance when the user provides one via /compress <focus>.
         # This goes at the end of the prompt so it takes precedence.

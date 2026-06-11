@@ -202,15 +202,33 @@ job_briefs:
       include_next_actions: true
       slash_commands: []
       max_output_tokens: 2048
+      # compaction_guidance (v6.3, WB f6845320): standing retention brief
+      # threaded into the NATIVE context-compressor summarizer prompt on
+      # auto-triggered compactions (composes with any per-call /compress
+      # focus). This REPLACES the former pa_compression_policy block
+      # (strategy: preserve-case-state, added 2f6e2f847) — that keyword
+      # keep/drop filter short-circuited the native pipeline entirely and on
+      # 100%-case-traffic zone chats kept ~98% of messages per pass, so
+      # context only grew (8 compactions in 13 turns, ctx 143k→201k, AMK
+      # day-30 receipt). The case ledger is the durable state store;
+      # conversation history only needs working state, so the native
+      # rolling-summary pipeline + this guidance now governs compaction.
+      # Wiring: gateway _apply_pa_compression_policy →
+      # ContextCompressor.set_pa_compaction_guidance.
       compression:
-        strategy: preserve-case-state
-        window_size: 24
-        preserve_fields:
-        - block
-        - unit
-        - worker
-        - photo
-        - status
+        compaction_guidance: >-
+          Case-state retention rules for this summary. OPEN cases: keep
+          working state for each — jobNo, current state, the last action
+          taken, and anything pending or promised (follow-ups, awaited
+          confirmations, outstanding clarifications). CLOSED/completed
+          cases: collapse each to ONE line (jobNo + closed date); keep only
+          the most recent ~50 closed-case one-liners and drop older
+          closed-case lines entirely on subsequent compactions. Compress
+          evidence detail (photo descriptions, quoted worker messages,
+          observation bodies) aggressively — every observation is already
+          recorded in the case ledger and retrievable via
+          tgg_message_history_search and tgg_case_lookup, so the summary
+          only needs the fact that evidence was recorded, not its content.
   tgg_management:
     title: TGG Management Brief
     purpose: Prepare decision-oriented management summaries from known facts.
