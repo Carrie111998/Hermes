@@ -1074,3 +1074,275 @@ class TestLocalNativeReadRawFastPath:
         ops = ShellFileOperations(env)
         ops.read_file_raw("/x/whatever.txt")
         assert env.execute.called
+
+
+# =========================================================================
+# Local-backend native WRITE / PATCH fast path
+# =========================================================================
+
+
+class TestLocalNativeWriteFastPath:
+    """write_file on the local backend must not shell out for regular files.
+
+    The shell write pipeline costs 3-5 bash round-trips per call (a
+    pre-read ``cat`` for lint/LSP extensions, ``head -c 4096`` for
+    line-ending detection, ``mkdir -p``, the ``cat >`` write, ``wc -c``)
+    and the local backend spawns a fresh Git Bash per round-trip — 0.3-1s
+    each on Windows.  write_file is the agent's hottest edit-loop path.
+    Regular local files are written with native Python I/O instead;
+    anything else falls back to the shell pipeline unchanged.
+
+    The pinned expectations are the shell pipeline's exact, empirically
+    captured behavior: content lands as ``content.encode("utf-8")`` byte
+    for byte (the stdin pipe writes through ``proc.stdin.buffer`` so bare
+    LFs are NOT CRLF-injected on Windows); a pre-existing CRLF file forces
+    the write to CRLF via line-ending detection; ``bytes_written`` is the
+    on-disk byte count; and ``dirs_created`` is True whenever the path has
+    a non-empty dirname (even when the directory already existed), False
+    only for a bare relative filename.
+    """
+
+    @pytest.fixture
+    def local_ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        class _NoSpawnLocal(LocalEnvironment):
+            """Real LocalEnvironment, minus the init-time bash snapshot."""
+
+            def init_session(self):
+                self._snapshot_ready = False
+
+        env = _NoSpawnLocal(cwd=str(tmp_path))
+        env.execute = _must_not_execute
+        return ShellFileOperations(env, cwd=str(tmp_path))
+
+    def test_write_new_file_uses_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "one.txt"
+        r = local_ops.write_file(str(f), "a\nb\n")
+        assert r.error is None
+        assert r.bytes_written == 4
+        # Absolute path -> non-empty dirname -> dirs_created True even
+        # though tmp_path already exists (shell `mkdir -p` quirk).
+        assert r.dirs_created is True
+        assert r.lint == {"status": "skipped", "message": "No linter for .txt files"}
+        # Bare LF must NOT be CRLF-injected (stdin .buffer write contract).
+        assert f.read_bytes() == b"a\nb\n"
+
+    def test_write_no_trailing_newline(self, local_ops, tmp_path):
+        f = tmp_path / "nonl.txt"
+        r = local_ops.write_file(str(f), "abc")
+        assert r.error is None
+        assert r.bytes_written == 3
+        assert f.read_bytes() == b"abc"
+
+    def test_write_utf8_multibyte_byte_count(self, local_ops, tmp_path):
+        f = tmp_path / "utf8.txt"
+        r = local_ops.write_file(str(f), "héllo\n")
+        assert r.error is None
+        assert r.bytes_written == 7  # wc -c counts bytes, not chars
+        assert f.read_bytes() == "héllo\n".encode("utf-8")
+
+    def test_write_crlf_txt_normalizes_via_head_sample(self, local_ops, tmp_path):
+        # .txt is not a lint/LSP extension -> no pre_content -> the shell
+        # path detects the ending with `head -c 4096`; the native path
+        # must detect it from a native head read instead.  Bare-LF content
+        # must land as CRLF to match the existing file.
+        f = tmp_path / "dos.txt"
+        f.write_bytes(b"old\r\nline\r\n")
+        r = local_ops.write_file(str(f), "new\nstuff\n")
+        assert r.error is None
+        assert f.read_bytes() == b"new\r\nstuff\r\n"
+        assert r.bytes_written == 12
+
+    def test_write_lf_txt_stays_lf(self, local_ops, tmp_path):
+        f = tmp_path / "unix.txt"
+        f.write_bytes(b"old\nline\n")
+        r = local_ops.write_file(str(f), "new\nstuff\n")
+        assert r.error is None
+        assert f.read_bytes() == b"new\nstuff\n"
+        assert r.bytes_written == 10
+
+    def test_write_crlf_py_normalizes_via_precontent(self, local_ops, tmp_path):
+        # .py IS a lint/LSP extension -> pre_content is captured -> the
+        # ending is detected from it (no head sample) and the write is
+        # CRLF-normalized.  In-process py lint must still run (no shell).
+        f = tmp_path / "dos.py"
+        f.write_bytes(b"a = 1\r\n")
+        r = local_ops.write_file(str(f), "b = 2\n")
+        assert r.error is None
+        assert f.read_bytes() == b"b = 2\r\n"
+        assert r.lint == {"status": "ok", "output": ""}
+
+    def test_write_creates_nested_dirs(self, local_ops, tmp_path):
+        r = local_ops.write_file("deep/nest/two.txt", "x\n")
+        assert r.error is None
+        assert r.dirs_created is True
+        assert (tmp_path / "deep" / "nest" / "two.txt").read_bytes() == b"x\n"
+
+    def test_write_bare_relative_name_dirs_created_false(self, local_ops, tmp_path):
+        # dirname("bare.txt") == "" -> the shell path skips mkdir and
+        # reports dirs_created False; the native path must match.
+        r = local_ops.write_file("bare.txt", "hi\n")
+        assert r.error is None
+        assert r.dirs_created is False
+        assert (tmp_path / "bare.txt").read_bytes() == b"hi\n"
+
+    def test_write_overwrite_truncates(self, local_ops, tmp_path):
+        f = tmp_path / "ow.txt"
+        f.write_bytes(b"aaaaaaaaaa\n")
+        r = local_ops.write_file(str(f), "z\n")
+        assert r.error is None
+        assert r.bytes_written == 2
+        assert f.read_bytes() == b"z\n"
+
+    def test_write_clean_py_lints_ok_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "clean.py"
+        r = local_ops.write_file(str(f), "x = 1\n")
+        assert r.error is None
+        assert r.lint == {"status": "ok", "output": ""}
+        assert f.read_bytes() == b"x = 1\n"
+
+    def test_write_broken_py_lint_reported_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "broken.py"
+        r = local_ops.write_file(str(f), "def (:\n")
+        assert r.error is None
+        assert r.lint["status"] == "error"
+        assert "SyntaxError" in r.lint["output"]
+        assert f.read_bytes() == b"def (:\n"
+
+    def test_write_deny_listed_path_blocked(self, local_ops):
+        # Deny check precedes the native gate; must still block with no
+        # write and no shell spawn.
+        denied = os.path.join(str(Path.home()), ".ssh", "id_rsa")
+        r = local_ops.write_file(denied, "SHOULD NOT WRITE")
+        assert r.error is not None
+        assert "Write denied" in r.error
+        assert r.bytes_written == 0
+
+    def test_write_non_local_env_keeps_shell_pipeline(self):
+        env = MagicMock()
+        env.cwd = "/x"
+        env.execute.return_value = {"output": "", "returncode": 0}
+        ops = ShellFileOperations(env)
+        ops.write_file("/x/whatever.txt", "data\n")
+        assert env.execute.called
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_write_msys_drive_path_writes_natively_on_windows(self, local_ops, tmp_path):
+        f = tmp_path / "msys.txt"
+        drive = f.drive.rstrip(":").lower()
+        msys = "/" + drive + str(f)[len(f.drive):].replace("\\", "/")
+        r = local_ops.write_file(msys, "MSYS_OK\n")
+        assert r.error is None
+        assert f.read_bytes() == b"MSYS_OK\n"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_write_posix_root_path_falls_back_on_windows(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        # /tmp/... resolves inside Git Bash's filesystem, not C:\tmp — the
+        # native path must not guess; the shell pipeline owns this write.
+        ops.write_file("/tmp/hermes-native-writepath-probe.txt", "x\n")
+        assert calls, "POSIX-root path should defer to the shell pipeline"
+
+
+class TestLocalNativePatchReplaceFastPath:
+    """patch_replace on the local backend must not shell out for regular files.
+
+    patch_replace reads its initial content and re-reads for post-write
+    verification through a direct ``cat`` _exec — two bash spawns per call
+    that the read-fast-path commit did NOT cover (it uses ``cat``, not
+    read_file_raw).  Its internal write goes through write_file (now native
+    too).  For a regular local file the whole patch_replace round-trip is
+    native; anything non-trivial (missing file, POSIX-root path, non-local
+    backend) falls back to the shell ``cat`` so the historical error and
+    verify semantics are preserved untouched.
+    """
+
+    @pytest.fixture
+    def local_ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        class _NoSpawnLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+        env = _NoSpawnLocal(cwd=str(tmp_path))
+        env.execute = _must_not_execute
+        return ShellFileOperations(env, cwd=str(tmp_path))
+
+    def test_patch_replace_uses_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "pr.txt"
+        f.write_bytes(b"alpha\nbeta\ngamma\n")
+        r = local_ops.patch_replace(str(f), "beta", "BETA")
+        assert r.success is True
+        assert r.error is None
+        assert f.read_bytes() == b"alpha\nBETA\ngamma\n"
+        assert "-beta" in r.diff and "+BETA" in r.diff
+
+    def test_patch_replace_crlf_preserved_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "pr_crlf.txt"
+        f.write_bytes(b"a\r\nb\r\nc\r\n")
+        r = local_ops.patch_replace(str(f), "b", "BB")
+        assert r.success is True
+        assert f.read_bytes() == b"a\r\nBB\r\nc\r\n"
+
+    def test_patch_replace_py_lints_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "pr.py"
+        f.write_bytes(b"x = 1\ny = 2\n")
+        r = local_ops.patch_replace(str(f), "y = 2", "y = 3")
+        assert r.success is True
+        assert f.read_bytes() == b"x = 1\ny = 3\n"
+        assert r.lint == {"status": "ok", "output": ""}
+
+    def test_patch_replace_no_match_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "pr.txt"
+        f.write_bytes(b"alpha\nbeta\ngamma\n")
+        r = local_ops.patch_replace(str(f), "NOPE-not-present", "X")
+        assert r.success is False
+        assert r.error is not None
+        assert f.read_bytes() == b"alpha\nbeta\ngamma\n"  # unchanged
+
+    def test_patch_replace_deny_listed_blocked(self, local_ops):
+        denied = os.path.join(str(Path.home()), ".ssh", "id_rsa")
+        r = local_ops.patch_replace(denied, "a", "b")
+        assert r.success is False
+        assert "Write denied" in r.error
+
+    def test_patch_replace_missing_file_falls_back(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        r = ops.patch_replace(str(tmp_path / "ghost.txt"), "a", "b")
+        assert r.success is False
+        assert "Failed to read file" in r.error
+        assert calls, "missing file should defer to the shell cat"
+
+    def test_patch_replace_non_local_env_keeps_shell(self):
+        env = MagicMock()
+        env.cwd = "/x"
+        env.execute.return_value = {"output": "", "returncode": 1}
+        ops = ShellFileOperations(env)
+        ops.patch_replace("/x/whatever.txt", "a", "b")
+        assert env.execute.called

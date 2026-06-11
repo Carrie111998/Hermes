@@ -1216,6 +1216,21 @@ class ShellFileOperations(FileOperations):
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
+        # Local backend: write regular files with direct Python I/O instead
+        # of shelling out.  The shell pipeline below costs 3-5 bash
+        # round-trips per call (pre-read cat, head -c 4096 for line-ending
+        # detection, mkdir -p, the cat > write, wc -c) and the local
+        # backend spawns a fresh bash per round-trip; on Windows each Git
+        # Bash spawn is 0.3-1s.  write_file is the agent's hottest
+        # edit-loop path.  A None return means "not a plain writable local
+        # file" — fall through so the shell pipeline keeps its historical
+        # semantics for every edge case (POSIX-root path on Windows,
+        # exotic FS, genuine I/O error).
+        if self._lsp_local_only():
+            native = self._write_file_native(path, content)
+            if native is not None:
+                return native
+
         # Capture pre-write content.  Two consumers want it:
         #
         #   1. The lint-delta layer (for in-process linters like ast.parse
@@ -1312,6 +1327,189 @@ class ShellFileOperations(FileOperations):
             lint=lint_result.to_dict() if lint_result else None,
             lsp_diagnostics=lsp_diagnostics,
         )
+
+    def _resolve_native_path(self, path: str) -> Optional[str]:
+        """Resolve a tool path to a native absolute filesystem path for
+        local-backend direct I/O, or None when the shell pipeline must own
+        it.
+
+        Returns None for a POSIX-root path on Windows (``/tmp/...`` only
+        resolves inside Git Bash, not as ``C:\\tmp``) and for a relative
+        path resolved against a POSIX-root cwd — the same guards the
+        native read fast path uses.  Callers add their own existence /
+        regular-file checks; this only does path translation.
+        """
+        from tools.environments.local import _msys_to_windows_path
+
+        native_path = _msys_to_windows_path(path)
+        if os.name == "nt" and native_path.startswith("/"):
+            return None
+        if not os.path.isabs(native_path):
+            base = _msys_to_windows_path(
+                getattr(self.env, "cwd", None) or self.cwd
+            )
+            if os.name == "nt" and base.startswith("/"):
+                return None
+            native_path = os.path.join(base, native_path)
+        return native_path
+
+    def _write_file_native(self, path: str, content: str) -> Optional[WriteResult]:
+        """Native (no-shell) write for regular files on the local backend.
+
+        Replaces the shell write pipeline's per-call bash spawns (pre-read
+        cat, ``head -c 4096`` for line-ending detection, ``mkdir -p``, the
+        ``cat >`` write, ``wc -c``) with direct Python I/O, reproducing
+        that pipeline's exact observable behavior — captured empirically
+        before implementation:
+
+          * content lands as ``content.encode("utf-8")`` byte for byte;
+            the shell path pipes through ``proc.stdin.buffer`` (see
+            :func:`tools.environments.base._pipe_stdin`) so bare LFs are
+            NOT CRLF-translated on Windows;
+          * a pre-existing CRLF file forces the new content to CRLF first,
+            exactly like :meth:`_detect_file_line_ending` + the shell
+            write — detected from captured pre_content when the extension
+            is lint/LSP-handled, otherwise from a native 4 KiB head sample
+            (the ``head -c 4096`` the shell path would run);
+          * ``bytes_written`` is the on-disk byte count (``wc -c``);
+          * ``dirs_created`` is True whenever the *expanded* path has a
+            non-empty dirname — even if the directory already existed —
+            and False for a bare relative filename;
+          * the same pre-write content capture, LSP baseline snapshot, and
+            lint-delta / LSP-diagnostics layers run, unchanged.
+
+        Returns None for anything not natively addressable (POSIX-root
+        path on Windows, exotic resolution / I/O failure) so the caller
+        falls through to the shell pipeline.  Deny-list checks and
+        ``~`` expansion are handled by the caller before this runs.
+        """
+        try:
+            native_path = self._resolve_native_path(path)
+            if native_path is None:
+                return None
+
+            # ── pre-write content capture (lint-delta + LSP line-shift) ──
+            # Use the exact gate the shell path uses; capturing pre_content
+            # for extensions outside both linter sets would change the
+            # lint-delta result, so preserve it precisely.  Mirror the
+            # shell quirk that an empty existing file leaves pre_content
+            # None (``cat ... && read_result.stdout`` treats empty as
+            # falsy).  A read error degrades silently, exactly like
+            # ``cat ... 2>/dev/null`` / ``head -c 4096 ... 2>/dev/null``.
+            ext = os.path.splitext(path)[1].lower()
+            pre_content: Optional[str] = None
+            existing_head: Optional[bytes] = None
+            want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+            if os.path.isfile(native_path):
+                try:
+                    if want_pre:
+                        with open(native_path, "rb") as fh:
+                            existing = fh.read()
+                        decoded = existing.decode("utf-8", errors="replace")
+                        if decoded:
+                            pre_content = decoded
+                        existing_head = existing[:4096]
+                    else:
+                        with open(native_path, "rb") as fh:
+                            existing_head = fh.read(4096)
+                except OSError:
+                    pre_content = None
+                    existing_head = None
+
+            # ── line-ending preservation ──
+            if pre_content:
+                original_ending = _detect_line_ending(pre_content)
+            elif existing_head:
+                original_ending = _detect_line_ending(
+                    existing_head.decode("utf-8", errors="replace")
+                )
+            else:
+                original_ending = None
+            if original_ending == "\r\n":
+                content = _normalize_line_endings(content, "\r\n")
+
+            # LSP baseline (best-effort, before the write — mirrors shell).
+            self._snapshot_lsp_baseline(path)
+
+            # ── parent directories ──
+            # dirs_created tracks the shell path's decision basis: the
+            # dirname of the EXPANDED (pre-resolution) path.  A bare
+            # relative filename has an empty dirname -> no mkdir,
+            # dirs_created False; anything else -> mkdir -p (idempotent)
+            # and dirs_created True.
+            dirs_created = False
+            if os.path.dirname(path):
+                try:
+                    os.makedirs(os.path.dirname(native_path), exist_ok=True)
+                    dirs_created = True
+                except OSError:
+                    # Shell `mkdir -p` failure leaves dirs_created False
+                    # and still attempts the write (which then errors).
+                    dirs_created = False
+
+            # ── the write ──
+            # Truncate + write the exact utf-8 bytes, matching ``cat >
+            # file`` fed by _pipe_stdin's ``.buffer.write(content.encode(
+            # "utf-8"))``.  A genuine write failure falls back to the
+            # shell pipeline so its exact error text is preserved.
+            try:
+                with open(native_path, "wb") as fh:
+                    fh.write(content.encode("utf-8"))
+            except OSError:
+                return None
+
+            bytes_written = os.path.getsize(native_path)
+
+            # Post-write lint with delta refinement — same call the shell
+            # path makes; in-process for .py/.json/.yaml/.toml (no spawn),
+            # shell-based for compiled languages (spawns, as before).
+            lint_result = self._check_lint_delta(
+                path, pre_content=pre_content, post_content=content
+            )
+
+            lsp_diagnostics: Optional[str] = None
+            if lint_result.success or lint_result.skipped:
+                block = self._maybe_lsp_diagnostics(
+                    path, pre_content=pre_content, post_content=content
+                )
+                if block:
+                    lsp_diagnostics = block
+
+            return WriteResult(
+                bytes_written=bytes_written,
+                dirs_created=dirs_created,
+                lint=lint_result.to_dict() if lint_result else None,
+                lsp_diagnostics=lsp_diagnostics,
+            )
+        except Exception:
+            # Any surprise (encoding error, exotic filesystem, race) falls
+            # back to the shell pipeline rather than failing the write.
+            return None
+
+    def _read_native_text(self, path: str) -> Optional[str]:
+        """Full file content as a decoded string for the local backend, or
+        None to fall back to the shell ``cat``.
+
+        Mirrors ``cat <path> 2>/dev/null``'s stdout exactly (verified
+        empirically: byte-faithful, trailing newlines and CRLFs preserved,
+        no binary/image short-circuit — patch_replace fuzzy-matches the
+        raw content).  None means a non-local backend, a POSIX-root path
+        on Windows, a missing / non-regular / unreadable file, or a file
+        past the native size cap — all of which the shell pipeline owns so
+        the historical error and verify semantics are preserved untouched.
+        """
+        if not self._lsp_local_only():
+            return None
+        try:
+            native_path = self._resolve_native_path(path)
+            if native_path is None or not os.path.isfile(native_path):
+                return None
+            if os.path.getsize(native_path) > _NATIVE_READ_MAX_BYTES:
+                return None
+            with open(native_path, "rb") as fh:
+                return fh.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
     
     # =========================================================================
     # PATCH Implementation (Replace Mode)
@@ -1338,14 +1536,20 @@ class ShellFileOperations(FileOperations):
         if _is_write_denied(path):
             return PatchResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
-        # Read current content
-        read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        read_result = self._exec(read_cmd)
-        
-        if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
-        
-        content = read_result.stdout
+        # Read current content.  Prefer a native read on the local
+        # backend: patch_replace reads with a direct `cat` (two bash
+        # spawns per call, counting the post-write verify below) that the
+        # read-fast-path commit did not cover, since it bypasses
+        # read_file_raw.  A None return means "the shell owns this" — fall
+        # back so missing-file / permission / POSIX-root semantics stay
+        # byte-identical.
+        content = self._read_native_text(path)
+        if content is None:
+            read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+            read_result = self._exec(read_cmd)
+            if read_result.exit_code != 0:
+                return PatchResult(error=f"Failed to read file: {path}")
+            content = read_result.stdout
         
         # Import and use fuzzy matching
         from tools.fuzzy_match import fuzzy_find_and_replace
@@ -1385,10 +1589,16 @@ class ShellFileOperations(FileOperations):
         # failures (backend FS oddities, race with another task, truncated
         # pipe, etc.) that would otherwise return success-with-diff while the
         # file is unchanged on disk.
-        verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
-        verify_result = self._exec(verify_cmd)
-        if verify_result.exit_code != 0:
-            return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
+        # Re-read for verification, native-first (same rationale as the
+        # initial read above); fall back to the shell ``cat`` so the
+        # "could not re-read" error path stays byte-for-byte identical.
+        verify_stdout = self._read_native_text(path)
+        if verify_stdout is None:
+            verify_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
+            verify_result = self._exec(verify_cmd)
+            if verify_result.exit_code != 0:
+                return PatchResult(error=f"Post-write verification failed: could not re-read {path}")
+            verify_stdout = verify_result.stdout
         # Normalize line endings before comparing.  On Windows, Python's
         # default text-mode ``open()`` translates ``\n`` → ``\r\n`` on
         # write, so the file on disk legitimately holds CRLFs while our
@@ -1396,7 +1606,7 @@ class ShellFileOperations(FileOperations):
         # every patch on Windows returns a bogus "wrote 39, read 42"
         # false-negative even though the edit landed correctly.  POSIX
         # backends don't translate, so this is a no-op there.
-        _verify_stdout_normalized = verify_result.stdout.replace("\r\n", "\n").replace("\r", "\n")
+        _verify_stdout_normalized = verify_stdout.replace("\r\n", "\n").replace("\r", "\n")
         _new_content_normalized = new_content.replace("\r\n", "\n").replace("\r", "\n")
         if _verify_stdout_normalized != _new_content_normalized:
             return PatchResult(error=(
