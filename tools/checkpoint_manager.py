@@ -857,17 +857,25 @@ class CheckpointManager:
         index_file = _index_path(store, dir_hash)
         ref = _ref_name(dir_hash)
 
+        # Resolve the current ref tip ONCE — reused for index seeding, the
+        # change check, the commit parent, and the CAS ref update.  A process
+        # spawn costs 0.2-0.4s on Windows; don't re-ask git for the same
+        # answer.  The final ``update-ref`` still compare-and-swaps against
+        # this value, so a concurrent move of the ref fails the snapshot
+        # instead of clobbering it.
+        ok_ref, ref_commit, _ = _run_git(
+            ["rev-parse", "--verify", ref + "^{commit}"],
+            store, working_dir,
+            allowed_returncodes={128},
+        )
+        has_ref = ok_ref and bool(ref_commit)
+
         # Seed the per-project index from the last checkpoint, if any, so the
         # diff/commit machinery sees only changes since then.  On first call,
         # clear the index so ``git add -A`` produces a clean tree.
         if index_file.exists():
-            # Reset index to current ref tip to avoid accumulating stale paths.
-            ok_ref, ref_commit, _ = _run_git(
-                ["rev-parse", "--verify", ref + "^{commit}"],
-                store, working_dir,
-                allowed_returncodes={128},
-            )
-            if ok_ref and ref_commit:
+            if has_ref:
+                # Reset index to current ref tip to avoid accumulating stale paths.
                 _run_git(
                     ["read-tree", ref_commit],
                     store, working_dir,
@@ -901,13 +909,6 @@ class CheckpointManager:
         # Compare against the current ref tip (not HEAD — HEAD points to a
         # branch that doesn't exist on a bare store, so ``diff --cached``
         # against HEAD would always show "new file" for every staged path).
-        ok_ref, ref_commit, _ = _run_git(
-            ["rev-parse", "--verify", ref + "^{commit}"],
-            store, working_dir,
-            allowed_returncodes={128},
-        )
-        has_ref = ok_ref and bool(ref_commit)
-
         if has_ref:
             ok_diff, _, _ = _run_git(
                 ["diff-index", "--cached", "--quiet", ref_commit],
@@ -1023,43 +1024,41 @@ class CheckpointManager:
         v1's ``_prune`` was documented as a no-op (``git``'s pack mechanism
         was supposed to handle it, but only the log view was limited — loose
         objects accumulated forever).  v2 actually rewrites the ref to drop
-        commits older than ``max_snapshots`` and then runs ``git gc`` on the
-        store so unreachable objects are reclaimed.
+        commits older than ``max_snapshots``.
+
+        This runs after EVERY snapshot once the ref is at capacity, and a
+        process spawn costs 0.2-0.4s on Windows, so the git traffic is
+        batched: one ``git log`` supplies hash+tree+subject for the whole
+        chain (was 2 spawns + 3 more per kept commit).  Unreachable objects
+        are NOT gc'd here — a per-snapshot ``git gc --prune=now`` cost
+        1.5-2.2s and pushed snapshot turns over pytest/agent timeouts.
+        Reclamation still happens in ``prune_checkpoints`` (daily
+        auto-maintenance sweep) and ``_enforce_size_cap`` (whenever the
+        store exceeds its size cap — dangling objects count toward the
+        measured size, so growth self-corrects), both of which run
+        ``reflog expire`` + ``gc --prune=now``.
         """
         ok, stdout, _ = _run_git(
-            ["rev-list", "--count", ref], store, working_dir,
+            ["log", "--reverse", "--format=%H%x1f%T%x1f%s", ref],
+            store, working_dir,
             allowed_returncodes={128},
         )
-        if not ok:
+        if not ok or not stdout:
             return
-        try:
-            count = int(stdout)
-        except ValueError:
-            return
-        if count <= self.max_snapshots:
+        entries: List[Tuple[str, str, str]] = []
+        for line in stdout.splitlines():
+            parts = line.split("\x1f", 2)
+            if len(parts) != 3:
+                return  # unexpected format — leave the ref alone
+            entries.append((parts[0], parts[1], parts[2]))
+        if len(entries) <= self.max_snapshots:
             return
 
-        # Collect commits oldest → newest, take last N.
-        ok_list, list_out, _ = _run_git(
-            ["rev-list", "--reverse", ref], store, working_dir,
-        )
-        if not ok_list or not list_out:
-            return
-        commits = list_out.splitlines()
-        keep = commits[-self.max_snapshots:]
-
-        # Rebuild a linear chain off keep[0]'s tree.
+        # Rebuild a linear chain from the newest ``max_snapshots`` trees.
+        keep = entries[-self.max_snapshots:]
         new_parent: Optional[str] = None
-        for sha in keep:
-            ok_tree, tree_sha, _ = _run_git(
-                ["rev-parse", f"{sha}^{{tree}}"], store, working_dir,
-            )
-            if not ok_tree or not tree_sha:
-                return
-            ok_msg, msg, _ = _run_git(
-                ["log", "--format=%s", "-1", sha], store, working_dir,
-            )
-            commit_msg = msg if ok_msg and msg else "checkpoint"
+        for _sha, tree_sha, subject in keep:
+            commit_msg = subject or "checkpoint"
             args = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
             if new_parent is not None:
                 args = ["commit-tree", tree_sha, "-p", new_parent,
@@ -1072,16 +1071,6 @@ class CheckpointManager:
         if new_parent is None:
             return
         _run_git(["update-ref", ref, new_parent], store, working_dir)
-
-        # Reclaim objects from the dropped commits.
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, working_dir,
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, working_dir, timeout=_GIT_TIMEOUT * 3,
-        )
 
     def _enforce_size_cap(self, store: Path) -> None:
         """If total store size exceeds ``max_total_size_mb``, drop oldest

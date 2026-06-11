@@ -294,7 +294,18 @@ class TestListCheckpoints:
 # Pruning: max_snapshots actually enforced (v2 fix)
 # =========================================================================
 
+@pytest.mark.timeout(120)
 class TestRealPruning:
+    """Real snapshot+prune cycles — dozens of git spawns per test.
+
+    Windows 2026-06-11: a git spawn costs 0.2-0.4s under redirected stdio,
+    so these tests are spawn-bound (test_max_snapshots_trims_history ran
+    ~30s pre-fix and straddled the suite-wide --timeout=30, whose thread
+    method kills the whole session).  The class-level timeout(120) keeps a
+    documented margin; the spawn-budget test below pins the fix so the
+    budget can't silently regress.
+    """
+
     def test_max_snapshots_trims_history(self, work_dir, checkpoint_base, monkeypatch):
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
         # Tiny cap to test enforcement.
@@ -334,6 +345,58 @@ class TestRealPruning:
         names = set(files.splitlines())
         assert "small.py" in names
         assert "weights.bin" not in names  # filtered by size cap
+
+    def test_steady_state_prune_snapshot_spawn_budget(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """A snapshot that triggers pruning must stay within a fixed git
+        spawn budget, with no per-snapshot gc.
+
+        Each spawn costs 0.2-0.4s on Windows under redirected stdio.  The
+        pre-fix steady-state snapshot spawned ~20 git processes — 3 per
+        kept commit to rebuild the chain, plus ``reflog expire`` and a full
+        ``git gc --prune=now`` (1.5-2.2s alone) after EVERY at-capacity
+        snapshot.  Object reclamation belongs to the maintenance paths
+        (``prune_checkpoints`` daily sweep, ``_enforce_size_cap``), not the
+        snapshot hot path.
+        """
+        import tools.checkpoint_manager as cm
+
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        m = CheckpointManager(enabled=True, max_snapshots=2)
+
+        # Seed to capacity (no prune yet: count == max_snapshots).
+        for i in range(2):
+            (work_dir / "main.py").write_text(f"v{i}\n")
+            m.new_turn()
+            assert m.ensure_checkpoint(str(work_dir), f"seed-{i}") is True
+
+        spawned = []
+        real_run = cm.subprocess.run
+
+        def counting_run(cmd, *args, **kwargs):
+            if isinstance(cmd, (list, tuple)) and cmd and "git" in str(cmd[0]):
+                spawned.append(cmd[1] if len(cmd) > 1 else "?")
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", counting_run)
+
+        # This snapshot exceeds the cap and prunes seed-0.
+        (work_dir / "main.py").write_text("v-final\n")
+        m.new_turn()
+        assert m.ensure_checkpoint(str(work_dir), "final") is True
+
+        # Snapshot + prune budget: 8 for the snapshot (rev-parse, read-tree,
+        # add, ls-files, diff-index, write-tree, commit-tree, update-ref)
+        # + 4 for the prune (log, commit-tree x2, update-ref), +1 slack.
+        assert len(spawned) <= 13, spawned
+        assert "gc" not in spawned, spawned
+        assert "reflog" not in spawned, spawned
+
+        # The trim itself still happened, newest-first.
+        monkeypatch.setattr("tools.checkpoint_manager.subprocess.run", real_run)
+        cps = m.list_checkpoints(str(work_dir))
+        assert [c["reason"] for c in cps] == ["final", "seed-1"]
 
 
 # =========================================================================
