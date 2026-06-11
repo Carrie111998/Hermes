@@ -1112,8 +1112,76 @@ def test_case_update_state_maps_contract_payload(captured_writes):
         "jobNo": "SK/JOB/2604/2376",
         "state": "completed",
         "evidenceMessageRefs": ["wa:9", "wa:10"],
-        "observedAt": "2026-06-10T14:00:00+08:00",
+        # ISO-8601 input is coerced to epoch seconds at the tool boundary
+        # (the backend expects epoch; see the observed_at coercion tests).
+        "observedAt": 1781071200,
     }
+
+
+def test_case_update_state_coerces_iso_observed_at_to_epoch(captured_writes):
+    """REPRO of the sk-day26-v6 wasted retry: christopher sent observed_at as
+    ISO-8601 ('2026-05-26T11:02:58+08:00'), the backend rejected it, and the
+    agent burned a second call resending epoch. The tool must coerce ISO to
+    epoch seconds BEFORE posting. FAILS on pre-fix code (ISO string passed
+    through verbatim)."""
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_tgg_case_update_state(
+        {
+            "job_no": "SK/JOB/2601/2304",
+            "state": "completed",
+            "observed_at": "2026-05-26T11:02:58+08:00",
+        }
+    )
+    _, payload = captured_writes[0]
+    assert payload["observedAt"] == 1779764578
+    assert isinstance(payload["observedAt"], int)
+
+
+def test_case_update_state_naive_iso_observed_at_assumed_sgt(captured_writes):
+    """Naive ISO timestamps are treated as SGT (TGG operates Asia/Singapore)."""
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_tgg_case_update_state(
+        {
+            "job_no": "SK/JOB/2601/2304",
+            "state": "completed",
+            "observed_at": "2026-05-26T11:02:58",
+        }
+    )
+    _, payload = captured_writes[0]
+    assert payload["observedAt"] == 1779764578
+
+
+def test_case_update_state_epoch_observed_at_passthrough(captured_writes):
+    """Epoch input (int or numeric string) lands as an int; unparseable text
+    passes through unchanged so the backend stays the rejection authority."""
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2601/2304", "state": "completed", "observed_at": 1779764578}
+    )
+    pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2601/2304", "state": "completed", "observed_at": "1779764578"}
+    )
+    pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2601/2304", "state": "completed", "observed_at": "around noon"}
+    )
+    assert captured_writes[0][1]["observedAt"] == 1779764578
+    assert captured_writes[1][1]["observedAt"] == 1779764578
+    assert captured_writes[2][1]["observedAt"] == "around noon"
+
+
+def test_case_update_state_schema_says_epoch_seconds():
+    """The schema description must steer the model to epoch seconds (the
+    'SGT or ISO format' description caused the ISO-first attempt)."""
+    from tools.pa_business_tools import TGG_CASE_UPDATE_STATE_SCHEMA
+
+    desc = TGG_CASE_UPDATE_STATE_SCHEMA["parameters"]["properties"]["observed_at"][
+        "description"
+    ]
+    assert "epoch" in desc.lower()
+    assert "seconds" in desc.lower()
 
 
 def test_case_update_state_rejects_non_completed(captured_writes):

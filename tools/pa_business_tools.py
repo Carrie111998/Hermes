@@ -1000,6 +1000,44 @@ def _handle_generic_clarification_request(args: Mapping[str, Any], **_kwargs: An
     return _handle_tgg_write("tgg_clarification_request", payload)
 
 
+def _coerce_observed_at_epoch(value: Any) -> Any:
+    """Coerce an observed_at value to epoch SECONDS (int) when possible.
+
+    The tgg_case_update_state backend expects epoch seconds; agents naturally
+    produce ISO-8601 strings (sk-day26-v6: christopher sent
+    '2026-05-26T11:02:58+08:00', got rejected, and burned a retry call with
+    epoch). Accept both shapes at the tool boundary:
+
+      * int/float (or numeric string)  -> int(value)
+      * ISO-8601 string                -> int(datetime.timestamp());
+        naive timestamps are treated as SGT (UTC+8) — TGG operates in
+        Asia/Singapore and all message timestamps in scope are SGT.
+
+    Anything unparseable is returned UNCHANGED so the backend stays the
+    authority on rejection (no new tool-side validation surface).
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return text
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+    return int(parsed.timestamp())
+
+
 def _handle_tgg_case_update_state(args: Mapping[str, Any], **_kwargs: Any) -> str:
     job_no = str(args.get("job_no") or args.get("jobNo") or "").strip()
     if not job_no:
@@ -1016,8 +1054,11 @@ def _handle_tgg_case_update_state(args: Mapping[str, Any], **_kwargs: Any) -> st
     )
     if evidence:
         payload["evidenceMessageRefs"] = evidence
-    observed_at = str(args.get("observed_at") or args.get("observedAt") or "").strip()
-    if observed_at:
+    observed_at_raw = args.get("observed_at")
+    if observed_at_raw is None:
+        observed_at_raw = args.get("observedAt")
+    observed_at = _coerce_observed_at_epoch(observed_at_raw)
+    if observed_at is not None and observed_at != "":
         payload["observedAt"] = observed_at
     return _handle_tgg_write("tgg_case_update_state", payload)
 
@@ -1346,7 +1387,14 @@ TGG_CASE_UPDATE_STATE_SCHEMA = {
             },
             "observed_at": {
                 "type": "string",
-                "description": "When the completion was observed (SGT or ISO format).",
+                "description": (
+                    "When the completion was observed, as epoch SECONDS "
+                    "(integer), e.g. 1779700000 — this is what the backend "
+                    "expects. ISO-8601 strings (e.g. "
+                    "'2026-05-26T11:02:58+08:00') are also accepted and "
+                    "coerced to epoch seconds; naive timestamps are treated "
+                    "as SGT."
+                ),
             },
         },
         "required": ["job_no", "state"],
