@@ -41,10 +41,11 @@ job_briefs:
       an explicit job number (HDB or iLinked) and the exact lookup for THAT job
       number returns no match in the operator DB, do NOT attach the message to
       any other existing case that merely shares the address, block, or unit.
-      Preserve the explicit job identity: record it as a WhatsApp-only case
-      (provenance WA-only) OR ask via tgg_clarification_request, listing any
-      same-address cases as candidates only -- never resolve to them. Same
-      address + different job number = a different case.
+      Preserve the explicit job identity: create the case under THAT job
+      number (tgg_case_create with jobNo set exactly as written) OR ask via
+      tgg_clarification_request, listing any same-address cases as candidates
+      only -- never resolve to them. Same address + different job number = a
+      different case.
     - >-
       Before any case lookup or create, extract structured anchors from the
       message: job number, block, street, unit, zone-text, sender, and
@@ -88,23 +89,28 @@ job_briefs:
       sourced from the operator DB or iLinked. A "Zone: X" line in a chat must
       never exclude an exact block/unit match that lives in a different zone.
     - >-
-      Before creating any case that would mint a placeholder WA/JOB number,
-      run message_history_search by block + unit first (and by job number if
-      one is visible in the message). The real job number is often announced
-      earlier in a DIFFERENT chat, and street names in chat are sometimes
-      typo'd (for example "Jalan Kati" vs "Jalan Kayu"), so block + unit
-      matching beats street strings. If a prior announcement carries a real
-      job number, use that number -- look it up / search cases for it and
-      attach the report there -- instead of minting a new WA/JOB case.
+      When a worker report carries no job number, run message_history_search
+      by block + unit first (and by job number if one is visible in the
+      message). The real job number is often announced earlier in a DIFFERENT
+      chat, and street names in chat are sometimes typo'd (for example "Jalan
+      Kati" vs "Jalan Kayu"), so block + unit matching beats street strings.
+      If a prior announcement carries a real job number, use that number --
+      look it up / search cases for it and attach the report there.
     - >-
-      Only create a new case when identity is strong: an explicit job number, OR
-      block + unit + street together with a clear problem and WhatsApp source.
-      When identity is ambiguous -- block + unit match more than one
-      street/town/zone, only partial anchors are present, or confidence is low
-      -- do NOT create a case and do NOT silently drop the message. Ask via
-      tgg_clarification_request, naming the candidate job numbers you found and
-      what is missing, so the operator can resolve it. Clarify; do not guess,
-      and do not force a create-or-drop decision.
+      We do not open new cases -- that is for HDB. Cases enter the ledger
+      ONLY from HDB job sheets (messages carrying an explicit job number).
+      Call tgg_case_create only when an explicit HDB job number is in the
+      evidence, passing it as jobNo exactly as written. A worker-reported
+      issue with no job sheet is NEVER a new case: when an existing case
+      matches, record it with tgg_case_observation against that case; when no
+      case matches, record it via tgg_clarification_request in the
+      propose-and-confirm shape ("no HDB job sheet found for this report --
+      holding it as pending; send the job number when issued"). Do not mint
+      placeholder WA/JOB numbers. When identity is ambiguous -- block + unit
+      match more than one street/town/zone, only partial anchors are present,
+      or confidence is low -- do NOT create a case and do NOT silently drop
+      the message: ask via tgg_clarification_request, naming the candidate
+      job numbers you found and what is missing. Clarify; do not guess.
     - >-
       When to clarify vs decide: if the candidate evidence is ambiguous --
       multiple plausible candidate cases, a COMPLETED case matching new
@@ -158,8 +164,9 @@ job_briefs:
       tgg_clarification_request (clarification_request), tgg_case_create,
       tgg_case_observation, and tgg_case_update_state. Do not call generic
       pa_business_read, pa_business_write, or agent config operations as a
-      workaround when a lookup/search is unclear. Ask for clarification or
-      create a WhatsApp-only case only when the tgg_case_* result supports it.
+      workaround when a lookup/search is unclear. Ask for clarification when
+      the tgg_case_* result leaves the decision ambiguous; never create a
+      WhatsApp-only case.
     - Route management questions out of ops ingest instead of answering them inline.
     - >
       Recording what happened (observability): at the end of each turn, use the

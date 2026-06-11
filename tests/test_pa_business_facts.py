@@ -1250,13 +1250,39 @@ class TestCaseCreateJobNoContract:
         assert "JOB_NO_OMITTED" not in result
         assert "confirmNoJobNo" not in captured
 
-    def test_clean_create_without_any_token_passes(self, monkeypatch):
+    def test_create_without_job_no_bounces(self, monkeypatch):
+        """No jobNo + no confirmNoJobNo = corrective error: cases enter the
+        ledger only from HDB job sheets (no WA placeholder minting)."""
         result, captured = self._create(monkeypatch, {
             "address": "Blk 1 Test St #01-01", "problem": "x",
             "evidence": {"messageText": "tenant reports leak, no job sheet"},
         })
+        assert "JOB_NO_REQUIRED" in result
+        assert "tgg_case_observation" in result
+        assert "tgg_clarification_request" in result
+        assert not captured  # write never happened
+
+    def test_operator_instructed_no_job_no_create_passes(self, monkeypatch):
+        """confirmNoJobNo is the explicit-operator-instruction escape hatch."""
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "confirmNoJobNo": True,
+            "evidence": {"messageText": "tenant reports leak, no job sheet"},
+        })
+        assert "JOB_NO_REQUIRED" not in result
         assert "JOB_NO_OMITTED" not in result
-        assert "jobNo" not in captured
+        assert "confirmNoJobNo" not in captured
+
+    def test_create_schema_requires_hdb_job_no(self):
+        from tools.pa_business_tools import TGG_CASE_CREATE_SCHEMA
+
+        desc = TGG_CASE_CREATE_SCHEMA["description"]
+        assert "HDB job number" in desc
+        assert "not allowed" in desc
+        job_no_desc = TGG_CASE_CREATE_SCHEMA["parameters"]["properties"]["jobNo"]["description"]
+        assert "minted" not in job_no_desc
+        confirm_desc = TGG_CASE_CREATE_SCHEMA["parameters"]["properties"]["confirmNoJobNo"]["description"]
+        assert "operator" in confirm_desc.lower()
 
     def test_explicit_job_no_passes_through(self, monkeypatch):
         result, captured = self._create(monkeypatch, {

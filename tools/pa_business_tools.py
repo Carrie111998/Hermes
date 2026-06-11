@@ -1108,22 +1108,34 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
     for alias in _CREATE_JOB_NO_ALIASES:
         payload.pop(alias, None)
 
-    # Corrective gate: creating WITHOUT jobNo while the evidence text plainly
-    # carries one almost always means the param got lost — bounce with the
-    # found token(s) so the model self-corrects in-turn. confirmNoJobNo=true
-    # is the explicit escape hatch when the token references a DIFFERENT case.
+    # Corrective gate: cases enter the ledger only from HDB job sheets, so a
+    # create without jobNo is bounced. When the evidence text plainly carries
+    # a job number the param almost always got lost — bounce with the found
+    # token(s) so the model self-corrects in-turn. confirmNoJobNo=true is the
+    # explicit-operator-instruction escape hatch.
     if not str(payload.get("jobNo") or "").strip() and not payload.get("confirmNoJobNo"):
         evidence_blob = json.dumps(payload.get("evidence") or {}, ensure_ascii=False)
         found = sorted(set(_JOB_NO_TOKEN_RE.findall(evidence_blob.upper())))
         if found:
             return tool_error(
                 "JOB_NO_OMITTED: the evidence text contains job number(s) "
-                f"{', '.join(found)} but no jobNo was passed — the case would be "
-                "created under a synthetic WA/JOB placeholder. If the number "
-                "belongs to THIS case, re-call with jobNo set to it exactly. "
-                "If it only references a different/previous case, re-call with "
-                "confirmNoJobNo: true."
+                f"{', '.join(found)} but no jobNo was passed — cases are "
+                "created only under an HDB job number. If the number belongs "
+                "to THIS case, re-call with jobNo set to it exactly. If it "
+                "only references a different/previous case, this report is "
+                "not a new case: record a tgg_case_observation against the "
+                "matched case or hold it via tgg_clarification_request."
             )
+        return tool_error(
+            "JOB_NO_REQUIRED: cases enter the ledger only from HDB job "
+            "sheets — tgg_case_create requires an explicit HDB jobNo. A "
+            "worker report with no job sheet is not a new case: record it "
+            "with tgg_case_observation against a matched case, or hold it "
+            "via tgg_clarification_request (\"no HDB job sheet found for "
+            "this report — holding it as pending; send the job number when "
+            "issued\"). confirmNoJobNo: true is allowed only on explicit "
+            "operator instruction."
+        )
     payload.pop("confirmNoJobNo", None)
     return _handle_tgg_write("tgg_case_create", payload)
 
@@ -1480,26 +1492,35 @@ TGG_CASE_OBSERVATION_SCHEMA = {
 
 TGG_CASE_CREATE_SCHEMA = {
     "name": "tgg_case_create",
-    "description": "Create a genuinely new TGG case after search finds no matching existing case. Dry-run mode validates without writing.",
+    "description": (
+        "Create a new TGG case from an HDB job sheet after search finds no "
+        "matching existing case. Creation requires an HDB job number — "
+        "creates without jobNo are not allowed. A worker report with no job "
+        "sheet is never a new case: record it with tgg_case_observation "
+        "against a matched case, or hold it via tgg_clarification_request. "
+        "Dry-run mode validates without writing."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "jobNo": {
                 "type": "string",
                 "description": (
-                    "The job number stated in the message (e.g. 'Job no: "
-                    "PG/JOB/2605/0973'). REQUIRED whenever the message states "
-                    "one — pass it EXACTLY as written; the case is created "
-                    "under this number. Omit ONLY when the message genuinely "
-                    "has no job number (a WA placeholder is then minted)."
+                    "The HDB job number stated in the message (e.g. 'Job no: "
+                    "PG/JOB/2605/0973'). REQUIRED — pass it EXACTLY as "
+                    "written; the case is created under this number. Cases "
+                    "enter the ledger only from HDB job sheets; there is no "
+                    "placeholder path for creates without a job number."
                 ),
             },
             "confirmNoJobNo": {
                 "type": "boolean",
                 "description": (
-                    "Set true ONLY to confirm a deliberate no-jobNo create when "
-                    "the message mentions job number(s) that belong to a "
-                    "DIFFERENT case (e.g. 'previous job ...')."
+                    "Set true ONLY when the OPERATOR has explicitly "
+                    "instructed you to record this as a case despite no HDB "
+                    "job number. Never set it on your own judgment — a "
+                    "worker report without a job sheet is an observation or "
+                    "a clarification, not a case."
                 ),
             },
             "zone": {"type": "string", "description": "TGG zone if known."},
