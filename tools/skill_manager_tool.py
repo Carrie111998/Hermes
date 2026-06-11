@@ -649,16 +649,25 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     Searches the local skills dir (~/.hermes/skills/) first, then any
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
+
+    Uses os.walk with followlinks=True instead of Path.rglob so that
+    symlinked skill directories (e.g. shared skills under ~/.agents/skills/)
+    are visible — Python 3.11's rglob does not follow directory symlinks
+    (the follow_symlinks parameter was added in 3.12).
     """
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+    import os
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
-        for skill_md in skills_dir.rglob("SKILL.md"):
-            if is_excluded_skill_path(skill_md):
+        for root, _dirs, files in os.walk(skills_dir, followlinks=True):
+            if "SKILL.md" not in files:
                 continue
-            if skill_md.parent.name == name:
-                return {"path": skill_md.parent}
+            if os.path.basename(root) == name:
+                skill_md_path = Path(root) / "SKILL.md"
+                if is_excluded_skill_path(skill_md_path):
+                    continue
+                return {"path": Path(root)}
     return None
 
 
