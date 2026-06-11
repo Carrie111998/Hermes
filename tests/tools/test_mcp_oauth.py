@@ -232,17 +232,28 @@ class TestUtilities:
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        # Mock os.name and uname for non-macOS, non-Windows
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
-        assert _can_open_browser() is False
+        # Simulate a headless Linux host. Patch os.name/os.uname *inside* a
+        # context so they are restored before the assert runs. If anything
+        # raises while os.name != the host value, pytest's failure formatter
+        # (_repr_failure_py -> Path(os.getcwd())) crashes with "cannot
+        # instantiate 'PosixPath'" on a Windows host — an INTERNALERROR that
+        # aborts the whole session. raising=False: os.uname is absent on Windows.
+        with monkeypatch.context() as m:
+            m.setattr(os, "name", "posix")
+            m.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})(), raising=False)
+            result = _can_open_browser()
+        assert result is False
 
     def test_can_open_browser_true_with_display(self, monkeypatch):
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.setenv("DISPLAY", ":0")
-        monkeypatch.setattr(os, "name", "posix")
-        assert _can_open_browser() is True
+        # Patch os.name only while calling the function (see sibling test) so a
+        # failed assert can't crash pytest's repr with a leaked posix os.name.
+        with monkeypatch.context() as m:
+            m.setattr(os, "name", "posix")
+            result = _can_open_browser()
+        assert result is True
 
 
 class TestRedirectHandlerSshHint:
