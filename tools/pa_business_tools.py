@@ -1320,22 +1320,32 @@ MESSAGE_HISTORY_SEARCH_SCHEMA = {
 TGG_CLARIFICATION_REQUEST_SCHEMA = {
     "name": "tgg_clarification_request",
     "description": (
-        "Record a clarification question for the OPERATOR when case-matching "
-        "evidence is ambiguous: multiple plausible candidate cases, a completed "
-        "case matching new same-shape work, or a report whose unit/job cannot be "
-        "resolved. The question is recorded for the operator to review later; it "
-        "is NEVER sent to any WhatsApp chat and no answer will arrive this turn. "
-        "After calling: proceed without assuming the answer, and do NOT create a "
-        "placeholder case for the work you just asked about — the clarification "
-        "IS the record. Do not use this when evidence is clear (over-asking is "
-        "noise). Max one clarification per case decision."
+        "Record a clarification for the OPERATOR when case-matching evidence "
+        "is ambiguous: multiple plausible candidate cases, a completed case "
+        "matching new same-shape work, or a report whose unit/job cannot be "
+        "resolved. Shape: propose and confirm, not an open question — state "
+        "your read, the action you will take by default, and invite "
+        "correction (e.g. \"we'll add it to the existing case, let me know if "
+        "you want me to record otherwise\"). The proposed default must never "
+        "be opening a new case. The clarification is recorded for the "
+        "operator to review later; it is NEVER sent to any WhatsApp chat and "
+        "no answer will arrive this turn. After calling: proceed on your "
+        "stated default without assuming a different answer, and do NOT "
+        "create a placeholder case for the work you just asked about — the "
+        "clarification IS the record. Do not use this when evidence is clear "
+        "(over-asking is noise). Max one clarification per case decision."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "question": {
                 "type": "string",
-                "description": "The concrete question the operator should answer, naming the unit/address and candidate job(s) involved.",
+                "description": (
+                    "Propose-and-confirm text naming the unit/address and "
+                    "candidate job(s): your one-line read, the default action "
+                    "you will take, and an invite to correct — not an "
+                    "open-ended question."
+                ),
             },
             "candidate_job_nos": {
                 "type": "array",
@@ -1368,7 +1378,12 @@ CLARIFICATION_REQUEST_SCHEMA = {
         "properties": {
             "question": {
                 "type": "string",
-                "description": "The concrete question the operator should answer, naming the entity/candidates involved.",
+                "description": (
+                    "Propose-and-confirm text naming the entity/candidates "
+                    "involved: your one-line read, the default action you "
+                    "will take, and an invite to correct — not an open-ended "
+                    "question."
+                ),
             },
             "candidate_refs": {
                 "type": "array",

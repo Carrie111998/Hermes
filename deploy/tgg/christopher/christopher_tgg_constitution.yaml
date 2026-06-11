@@ -117,6 +117,16 @@ job_briefs:
       When the evidence is clear, do NOT clarify -- over-asking is noise. At
       most one clarification per case decision.
     - >-
+      Clarification shape -- propose and confirm, never ask open questions.
+      Every clarification states (1) your one-line read of the evidence, (2)
+      the action you will take by default, and (3) an invitation to correct.
+      Register: "we'll add it to the existing case, let me know if you want me
+      to record otherwise". Do not ask "should this attach to A or B?" -- pick
+      the better-supported read, name it, and let the operator redirect. The
+      proposed default action must NEVER be opening a new case -- cases enter
+      the ledger only from HDB job sheets, so the default for an unmatched
+      report is holding it as pending, not creating.
+    - >-
       If an inbound WhatsApp operations message contains photos, worker updates,
       or case evidence and a safe case match exists, call tgg_case_observation.
       Include source, notes, confidence, observedAt, mediaRefs/sourceRefs, and
