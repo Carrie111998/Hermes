@@ -64,8 +64,12 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
     # live for Store Python), and USERPROFILE is Path.home(). Without these
     # the subprocess dies with ModuleNotFoundError before the bridge runs.
     if sys.platform == "win32":
-        for k in ("SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
-                  "TEMP", "TMP", "PATHEXT", "COMSPEC"):
+        # SYSTEMDRIVE/PROGRAMDATA included: without them, Windows shell
+        # components in the child literally create a "%SystemDrive%/" cache
+        # directory tree relative to the CWD (observed in this repo).
+        for k in ("SYSTEMROOT", "SYSTEMDRIVE", "APPDATA", "LOCALAPPDATA",
+                  "USERPROFILE", "PROGRAMDATA", "TEMP", "TMP", "PATHEXT",
+                  "COMSPEC"):
             if k in os.environ and k not in env:
                 env[k] = os.environ[k]
 
