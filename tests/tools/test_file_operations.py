@@ -1,6 +1,8 @@
 """Tests for tools/file_operations.py — deny list, result dataclasses, helpers."""
 
 import os
+import sys
+
 import pytest
 import subprocess
 from pathlib import Path
@@ -704,3 +706,171 @@ class _DeletedTestGitBaselineCheck:
     helper is restored or replaced.
     """
     pass
+
+
+# =========================================================================
+# Local-backend native read fast path
+# =========================================================================
+
+def _must_not_execute(*args, **kwargs):
+    raise AssertionError("native fast path must not call env.execute()")
+
+
+class TestLocalNativeReadFastPath:
+    """read_file on the local backend must not shell out for regular files.
+
+    Every ShellFileOperations._exec spawns a fresh bash on the local
+    backend (spawn-per-call design), and the shell read pipeline makes
+    FOUR round-trips per read (wc -c, head -c, sed, wc -l).  On Windows
+    a Git Bash spawn costs 0.3-1s, so one read_file was 3-4s and any
+    test doing a handful of reads blew the suite-wide 30s pytest-timeout
+    (test_accretion_caps killed the whole session under redirected
+    stdio).  Regular local files are read with native Python I/O
+    instead; anything else falls back to the shell pipeline unchanged.
+
+    The expected values pin the shell pipeline's exact historical
+    output, quirks included: total_lines is the newline count (wc -l),
+    and a window whose last printed line ends with a newline gains a
+    trailing empty numbered line (sed's final \\n split by
+    _add_line_numbers).
+    """
+
+    @pytest.fixture
+    def local_ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        class _NoSpawnLocal(LocalEnvironment):
+            """Real LocalEnvironment, minus the init-time bash snapshot."""
+
+            def init_session(self):
+                self._snapshot_ready = False
+
+        env = _NoSpawnLocal(cwd=str(tmp_path))
+        env.execute = _must_not_execute
+        return ShellFileOperations(env, cwd=str(tmp_path))
+
+    def test_read_regular_file_uses_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "plain.txt"
+        f.write_bytes(b"a\nb\n")
+        r = local_ops.read_file(str(f))
+        assert r.error is None
+        assert r.content == "     1|a\n     2|b\n     3|"
+        assert r.total_lines == 2
+        assert r.file_size == 4
+        assert r.truncated is False
+
+    def test_read_slice_matches_shell_contract(self, local_ops, tmp_path):
+        f = tmp_path / "slice.txt"
+        f.write_bytes(b"l1\nl2\nl3\nl4\n")
+        r = local_ops.read_file(str(f), offset=2, limit=2)
+        assert r.content == "     2|l2\n     3|l3\n     4|"
+        assert r.total_lines == 4
+        assert r.truncated is True
+        assert r.hint == "Use offset=4 to continue reading (showing 2-3 of 4 lines)"
+
+    def test_read_no_trailing_newline(self, local_ops, tmp_path):
+        f = tmp_path / "nonl.txt"
+        f.write_bytes(b"a\nb")
+        r = local_ops.read_file(str(f))
+        assert r.content == "     1|a\n     2|b"
+        assert r.total_lines == 1  # wc -l counts newlines — historical contract
+
+    def test_read_empty_file(self, local_ops, tmp_path):
+        f = tmp_path / "empty.txt"
+        f.write_bytes(b"")
+        r = local_ops.read_file(str(f))
+        assert r.error is None
+        assert r.content == "     1|"
+        assert r.total_lines == 0
+
+    def test_read_offset_past_eof(self, local_ops, tmp_path):
+        f = tmp_path / "short.txt"
+        f.write_bytes(b"x\n")
+        r = local_ops.read_file(str(f), offset=5, limit=10)
+        assert r.content == "     5|"
+        assert r.total_lines == 1
+        assert r.truncated is False
+
+    def test_read_crlf_keeps_carriage_returns(self, local_ops, tmp_path):
+        f = tmp_path / "dos.txt"
+        f.write_bytes(b"a\r\nb\r\n")
+        r = local_ops.read_file(str(f))
+        assert r.content == "     1|a\r\n     2|b\r\n     3|"
+        assert r.total_lines == 2
+
+    def test_relative_path_resolves_against_env_cwd(self, local_ops, tmp_path):
+        (tmp_path / "rel.txt").write_bytes(b"REL_OK\n")
+        r = local_ops.read_file("rel.txt")
+        assert r.error is None
+        assert "REL_OK" in r.content
+
+    def test_image_short_circuits_without_shell(self, local_ops, tmp_path):
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+        r = local_ops.read_file(str(f))
+        assert r.is_image is True
+        assert r.is_binary is True
+
+    def test_binary_extension_short_circuits(self, local_ops, tmp_path):
+        f = tmp_path / "blob.exe"
+        f.write_bytes(b"\x00\x01\x02\x03" * 10)
+        r = local_ops.read_file(str(f))
+        assert r.is_binary is True
+        assert r.error is not None
+
+    def test_missing_file_falls_back_to_shell(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        r = ops.read_file(str(tmp_path / "ghost.txt"))
+        assert r.error is not None
+        assert r.error.startswith("File not found:")
+        assert calls, "missing file should defer to the shell pipeline"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_msys_drive_path_reads_natively_on_windows(self, local_ops, tmp_path):
+        f = tmp_path / "msys.txt"
+        f.write_bytes(b"MSYS_OK\n")
+        drive = f.drive.rstrip(":").lower()
+        msys = "/" + drive + str(f)[len(f.drive):].replace("\\", "/")
+        r = local_ops.read_file(msys)
+        assert r.error is None
+        assert "MSYS_OK" in r.content
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_posix_root_path_falls_back_on_windows(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        # /tmp/... resolves inside Git Bash's filesystem, not C:\tmp —
+        # native I/O must not guess, the shell pipeline owns this path.
+        ops.read_file("/tmp/hermes-native-readpath-probe.txt")
+        assert calls, "POSIX-root path should defer to the shell pipeline"
+
+    def test_non_local_env_keeps_shell_pipeline(self):
+        env = MagicMock()
+        env.cwd = "/x"
+        env.execute.return_value = {"output": "", "returncode": 1}
+        ops = ShellFileOperations(env)
+        ops.read_file("/x/whatever.txt")
+        assert env.execute.called

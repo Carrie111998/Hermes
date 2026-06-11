@@ -537,6 +537,11 @@ LINTERS_INPROC = {
 MAX_LINES = 2000
 MAX_LINE_LENGTH = 2000
 MAX_FILE_SIZE = 50 * 1024  # 50KB
+
+# Files above this size are excluded from the local-backend native read
+# fast path (which slurps the whole file) and stay on the streaming
+# sed-based shell pipeline.
+_NATIVE_READ_MAX_BYTES = 50 * 1024 * 1024  # 50MB
 DEFAULT_READ_OFFSET = 1
 DEFAULT_READ_LIMIT = 500
 DEFAULT_SEARCH_OFFSET = 0
@@ -789,13 +794,26 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
-        
+
         offset, limit = normalize_read_pagination(offset, limit)
-        
+
+        # Local backend: read regular files with direct Python I/O instead
+        # of shelling out.  The shell pipeline below costs FOUR bash
+        # round-trips per read (wc -c, head -c, sed, wc -l) and the local
+        # backend spawns a fresh bash per round-trip; on Windows each Git
+        # Bash spawn is 0.3-1s, i.e. 3-4s for a single read_file call.  A
+        # None return means "not a plain readable local file" — fall
+        # through so the shell pipeline keeps its historical semantics
+        # for every edge case (missing file, directory, POSIX-root path).
+        if self._lsp_local_only():
+            native = self._read_file_native(path, offset, limit)
+            if native is not None:
+                return native
+
         # Check if file exists and get size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
-        
+
         if stat_result.exit_code != 0:
             # File not found - try to suggest similar files
             return self._suggest_similar_files(path)
@@ -866,7 +884,114 @@ class ShellFileOperations(FileOperations):
             truncated=truncated,
             hint=hint
         )
-    
+
+    def _read_file_native(self, path: str, offset: int, limit: int) -> Optional[ReadResult]:
+        """Native (no-shell) read for regular files on the local backend.
+
+        Mirrors the shell pipeline's output exactly, quirks included:
+        ``total_lines`` is the file's newline count (``wc -l``), and a
+        window whose last printed line ends with a newline gains a
+        trailing empty numbered line (sed emits the final ``\\n``, which
+        ``_add_line_numbers`` then splits).  The pinned contract lives in
+        TestLocalNativeReadFastPath.
+
+        Returns None for anything that is not a regular, natively
+        addressable file — missing paths, directories, FIFOs/devices,
+        POSIX-root paths on Windows (``/tmp/...`` only resolves inside
+        Git Bash), files past the size cap, or any unexpected I/O error.
+        The caller then falls through to the shell pipeline so those
+        keep behaving exactly as before.
+        """
+        try:
+            from tools.environments.local import _msys_to_windows_path
+
+            native_path = _msys_to_windows_path(path)
+            if os.name == "nt" and native_path.startswith("/"):
+                return None
+            if not os.path.isabs(native_path):
+                base = _msys_to_windows_path(
+                    getattr(self.env, "cwd", None) or self.cwd
+                )
+                if os.name == "nt" and base.startswith("/"):
+                    return None
+                native_path = os.path.join(base, native_path)
+            if not os.path.isfile(native_path):
+                return None
+
+            file_size = os.path.getsize(native_path)
+            if file_size > _NATIVE_READ_MAX_BYTES:
+                # The shell pipeline streams via sed; reading this
+                # natively would hold the whole file in memory.
+                return None
+
+            if self._is_image(path):
+                return ReadResult(
+                    is_image=True,
+                    is_binary=True,
+                    file_size=file_size,
+                    hint=(
+                        "Image file detected. Automatically redirected to vision_analyze tool. "
+                        "Use vision_analyze with this file path to inspect the image contents."
+                    ),
+                )
+
+            with open(native_path, "rb") as fh:
+                raw_bytes = fh.read()
+
+            # Same sample the shell path feeds _is_likely_binary
+            # (head -c 1000 decoded with errors="replace").
+            sample = raw_bytes[:1000].decode("utf-8", errors="replace")
+            if self._is_likely_binary(path, sample):
+                return ReadResult(
+                    is_binary=True,
+                    file_size=file_size,
+                    error=(
+                        "Binary file - cannot display as text. "
+                        "Use appropriate tools to handle this file type."
+                    ),
+                )
+
+            text = raw_bytes.decode("utf-8", errors="replace")
+
+            # Reproduce sed's line model: lines split on \n only (never
+            # \r), with the trailing newline producing no extra line.
+            end_line = offset + limit - 1
+            parts = text.split("\n")
+            trailing_nl = text.endswith("\n")
+            sed_lines = 0 if not text else (len(parts) - 1 if trailing_nl else len(parts))
+            if offset > sed_lines:
+                window = ""
+            else:
+                last = min(end_line, sed_lines)
+                window = "\n".join(parts[offset - 1:last])
+                # sed prints each selected line WITH its newline; the last
+                # one only lacks it when it is the file's final line and
+                # the file has no trailing newline.
+                if last < sed_lines or trailing_nl:
+                    window += "\n"
+
+            total_lines = text.count("\n")  # == wc -l
+            truncated = total_lines > end_line
+            hint = None
+            if truncated:
+                hint = (
+                    f"Use offset={end_line + 1} to continue reading "
+                    f"(showing {offset}-{end_line} of {total_lines} lines)"
+                )
+
+            return ReadResult(
+                content=self._add_line_numbers(window, offset),
+                total_lines=total_lines,
+                file_size=file_size,
+                truncated=truncated,
+                hint=hint,
+            )
+        except Exception:
+            # Any surprise (permission change, deletion race, exotic
+            # filesystem) falls back to the shell pipeline rather than
+            # failing the read outright.
+            return None
+
     def _suggest_similar_files(self, path: str) -> ReadResult:
         """Suggest similar files when the requested file is not found."""
         dir_path = os.path.dirname(path) or "."
@@ -1433,6 +1558,10 @@ class ShellFileOperations(FileOperations):
         Modal, SSH, Daytona) keep files inside the sandbox where the
         host-side LSP server can't reach them, so we skip the LSP
         path for those entirely.
+
+        Also gates the native read fast path (:meth:`_read_file_native`)
+        — same question: "do this process and the backend share a
+        filesystem?".
         """
         env = getattr(self, "env", None)
         if env is None:
