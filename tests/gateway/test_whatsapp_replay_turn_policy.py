@@ -144,3 +144,75 @@ async def test_replay_bundle_still_splits_on_timestamp_gap():
     assert len(captured) == 2
     assert captured[0].raw_message["sourceMessageIds"] == ["m1", "m2"]
     assert captured[1].raw_message["sourceMessageIds"] == ["m3", "m4"]
+
+
+def _album_photo(message_id: str, ts: int, quoted_text: str, quoted_id: str) -> dict:
+    """Album-shaped photo message: no body, quote carries the job-sheet context."""
+    return {
+        "messageId": message_id,
+        "chatId": CHAT,
+        "chatName": "MM2 Maintenance (SK)",
+        "senderId": "251547711758376@lid",
+        "senderName": "251547711758376",
+        "isGroup": True,
+        "timestamp": ts,
+        "body": "",
+        "hasMedia": True,
+        "mediaType": "image",
+        "mediaUrls": [f"/tmp/tgg-eval-synthetic-{message_id}.jpg"],
+        "quotedText": quoted_text,
+        "quotedMessageId": quoted_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_album_bundle_renders_shared_quote_once_with_case_refs():
+    """Album messages with no body but with quotedText must carry the quote
+    (incl. extracted case refs) into the bundle text — and a quote shared by
+    several images in one album renders once, not once per image."""
+    adapter = _adapter({
+        "require_mention": True,
+        "ingest_chats": [CHAT],
+        "turn_policy": {
+            CHAT: {"debounce_seconds": 300, "direct_mention_immediate": False},
+        },
+    })
+
+    quote = "Job sheet SK/JOB/2605/1954\nBlk 123 #04-567 toilet door install"
+    captured = await _capture_replay(adapter, [
+        _album_photo("a1", 1000, quote, "q-jobsheet-1"),
+        _album_photo("a2", 1005, quote, "q-jobsheet-1"),
+    ])
+
+    assert len(captured) == 1
+    bundle = captured[0]
+    assert bundle.raw_message.get("bundle") is True
+    text = bundle.text
+    assert "Quoted WhatsApp message case refs: SK/JOB/2605/1954" in text
+    assert "toilet door install" in text
+    # Shared quote renders once per album, not per image.
+    assert text.count("Quoted WhatsApp message case refs") == 1
+    assert text.count("[Replying to:") == 1
+
+
+@pytest.mark.asyncio
+async def test_album_bundle_renders_distinct_quotes_separately():
+    """Two messages quoting different prior messages keep both quotes."""
+    adapter = _adapter({
+        "require_mention": True,
+        "ingest_chats": [CHAT],
+        "turn_policy": {
+            CHAT: {"debounce_seconds": 300, "direct_mention_immediate": False},
+        },
+    })
+
+    captured = await _capture_replay(adapter, [
+        _album_photo("b1", 1000, "Job sheet SK/JOB/2605/1954", "q-1"),
+        _album_photo("b2", 1005, "Job sheet SK/WC/2605/2001", "q-2"),
+    ])
+
+    assert len(captured) == 1
+    text = captured[0].text
+    assert "SK/JOB/2605/1954" in text
+    assert "SK/WC/2605/2001" in text
+    assert text.count("[Replying to:") == 2

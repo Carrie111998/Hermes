@@ -827,6 +827,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         media_types: List[str] = []
         raw_messages: List[Any] = []
         ids: List[str] = []
+        seen_quote_keys: set[str] = set()
         for index, event in enumerate(events, start=1):
             raw = event.raw_message or {}
             raw_messages.append(raw)
@@ -846,6 +847,22 @@ class WhatsAppAdapter(BasePlatformAdapter):
             if event.media_urls and not text:
                 text = "[media received]"
             lines.append(f"{prefix}{text}".rstrip())
+            # Media/album messages frequently carry the load-bearing context in
+            # their quote (e.g. a photo album replying to an HDB job sheet).
+            # The single-message path injects this via reply_to_text in the
+            # gateway; the bundle path must render it here or the quote never
+            # reaches the model. A quote shared by several messages in one
+            # album is rendered once per bundle, not once per image.
+            quoted_context = (
+                self._reply_context_text(raw) if isinstance(raw, dict) else None
+            )
+            if quoted_context:
+                quote_key = str(
+                    raw.get("quotedMessageId") or quoted_context.strip()
+                )
+                if quote_key not in seen_quote_keys:
+                    seen_quote_keys.add(quote_key)
+                    lines.append(f'   [Replying to: "{quoted_context[:500]}"]')
             if event.media_urls:
                 lines.append(f"   attachments: {', '.join(event.media_urls)}")
             lines.append(f"   source_message_id: {message_id}")
