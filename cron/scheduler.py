@@ -1640,6 +1640,39 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _resolve_bash() -> str | None:
+    """Locate a bash capable of running HERMES_HOME/scripts/*.sh.
+
+    On Windows, PATH order often puts the WSL launcher
+    (System32\\bash.exe) or its WindowsApps stub ahead of Git Bash.
+    WSL bash runs the script inside the Linux VM, where a ``C:\\...``
+    script path does not resolve — bash exits 127 with a mangled-path
+    "No such file or directory". Prefer Git Bash explicitly; refuse the
+    WSL launcher rather than hand it a path it cannot open.
+    """
+    if sys.platform != "win32":
+        return shutil.which("bash") or (
+            "/bin/bash" if os.path.isfile("/bin/bash") else None
+        )
+    for base_var, rel in (
+        ("ProgramFiles", r"Git\bin\bash.exe"),
+        ("ProgramFiles", r"Git\usr\bin\bash.exe"),
+        ("ProgramFiles(x86)", r"Git\bin\bash.exe"),
+        ("LOCALAPPDATA", r"Programs\Git\bin\bash.exe"),
+    ):
+        base = os.environ.get(base_var)
+        if base:
+            cand = os.path.join(base, rel)
+            if os.path.isfile(cand):
+                return cand
+    found = shutil.which("bash")
+    if found and (
+        "\\system32\\" in found.lower() or "\\windowsapps\\" in found.lower()
+    ):
+        return None  # WSL launcher / Store stub — not usable for C:\ scripts
+    return found
+
+
 def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -1716,12 +1749,10 @@ def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:
     if suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
-        # shutil.which returns None — fall back to a clear error rather
+        # _resolve_bash returns None — fall back to a clear error rather
         # than a FileNotFoundError with a confusing "[WinError 2]"
         # traceback.
-        _bash = shutil.which("bash") or (
-            "/bin/bash" if os.path.isfile("/bin/bash") else None
-        )
+        _bash = _resolve_bash()
         if _bash is None:
             return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "

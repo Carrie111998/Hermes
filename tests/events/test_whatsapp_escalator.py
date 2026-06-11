@@ -598,7 +598,7 @@ class TestNotificationDeliveredReverseSignal:
         assert bus.query(event_type=EventType.NOTIFICATION_FAILED) == []
 
     def test_throttled_delivery_does_not_emit_per_event(
-        self, bus, quiet_config, queue_path,
+        self, bus, tmp_path, queue_path,
     ):
         """IMPORTANT (URGENT/IMPORTANT tier) events that aren't IMMEDIATE
         breakthrough hit the 15-min throttle buffer rather than _deliver()
@@ -606,8 +606,15 @@ class TestNotificationDeliveredReverseSignal:
         per-event reverse signals (mirrors Telegram's batched scoping).
         Failures still emit when the eventual flush attempts a send.
         """
+        # Quiet hours OFF: this test exercises only the throttle tier.
+        # With the shared 23:00-07:00 fixture and the real wall clock, any
+        # run inside the window (e.g. the 02:30 nightly gate) would route
+        # the event to the quiet queue and never reach the throttle buffer.
+        quiet_off = tmp_path / "notifications" / "quiet_hours_off.json"
+        quiet_off.parent.mkdir(parents=True, exist_ok=True)
+        quiet_off.write_text(json.dumps({"enabled": False}))
         escalator = WhatsAppEscalator(
-            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            bus, quiet_config_path=quiet_off, queue_path=queue_path,
             send_fn=lambda msg: None,
         )
         # application_ready is IMPORTANT tier (throttled, not immediate)
