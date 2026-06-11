@@ -4399,6 +4399,17 @@ class AIAgent:
                     # if a future code path bypasses the cache.
                     review_agent.session_start = self.session_start
                     review_agent.session_id = self.session_id
+                    # AIAgent.__init__ above generated a throwaway session_id
+                    # and wrote it to the PROCESS-GLOBAL HERMES_SESSION_ID
+                    # env var. Restore the parent's id so ambient session-id
+                    # resolution (e.g. PA record_event staging fallback)
+                    # keeps pointing at the live session instead of the
+                    # review fork's. Without this, every later env-resolved
+                    # session id in the process was wrong (sk-day26-v6:
+                    # record_event stagings for turns 11-14 landed under the
+                    # fork's id and were never drained into pa_events).
+                    if self.session_id:
+                        os.environ["HERMES_SESSION_ID"] = self.session_id
 
                     from model_tools import get_tool_definitions
                     from hermes_cli.plugins import (

@@ -523,3 +523,92 @@ def test_safe_record_turn_swallows_write_exception(tmp_path):
     except RuntimeError:
         raised = True
     assert raised is True
+
+
+# ── (e) staging key must match the drain key (sk-day26-v6 drain miss) ────
+
+
+def test_record_event_stages_under_explicit_session_id_despite_env_clobber(monkeypatch):
+    """REPRO of the sk-day26-v6 pa_events drain miss (turns 11-14 lost).
+
+    Mid-run, a background AIAgent fork (bg-review) overwrote the
+    process-global HERMES_SESSION_ID env var with its own fresh session id.
+    record_event then staged under the fork's id while the turn-boundary
+    drained the live gateway session id — the events were stranded forever.
+
+    The fix: the agent loop threads its authoritative session_id through
+    tool dispatch, and record_event MUST key staging on that explicit id,
+    not the clobberable env var.  This test FAILS on pre-fix code (the
+    event lands under the clobbered env key).
+    """
+    import tools.pa_record_event as pre
+    from gateway import pa_observability as po
+
+    # Hygiene: empty both keys in the process-global buffer.
+    po.drain_agent_events("live-session")
+    po.drain_agent_events("fork-session-clobber")
+
+    # Simulate the clobber: another AIAgent.__init__ re-pointed the env var.
+    monkeypatch.setenv("HERMES_SESSION_ID", "fork-session-clobber")
+
+    out = pre._handle_record_event(
+        {"event_type": "case_observation", "reason": "tap leak fixed"},
+        task_id="t1",
+        user_task=None,
+        session_id="live-session",  # explicit id from the agent-loop dispatch
+    )
+    assert '"recorded": true' in out
+
+    # Drain side keys on the LIVE session id — the event must be there...
+    drained = po.drain_agent_events("live-session")
+    assert [e.event_type for e in drained] == ["case_observation"]
+    # ...and nothing may be stranded under the clobbered env key.
+    assert po.drain_agent_events("fork-session-clobber") == []
+
+
+def test_handle_function_call_threads_session_id_to_record_event(monkeypatch):
+    """End-to-end through the real dispatch path: run_agent passes
+    session_id into handle_function_call; the registry must deliver it to
+    the handler so staging keys on it (not on the env var)."""
+    from model_tools import handle_function_call
+    from gateway import pa_observability as po
+
+    po.drain_agent_events("live-dispatch-session")
+    po.drain_agent_events("env-other-session")
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-other-session")
+
+    result = handle_function_call(
+        "record_event",
+        {"event_type": "case_update_confirmed", "reason": "done"},
+        "task-1",
+        session_id="live-dispatch-session",
+        skip_pre_tool_call_hook=True,
+    )
+    assert '"recorded": true' in result
+
+    drained = po.drain_agent_events("live-dispatch-session")
+    assert [e.event_type for e in drained] == ["case_update_confirmed"]
+    assert po.drain_agent_events("env-other-session") == []
+
+
+def test_record_event_fallback_prefers_contextvar_over_env(monkeypatch):
+    """Without an explicit session_id kwarg, resolution must prefer the
+    task-local ContextVar (gateway.session_context._SESSION_ID) over the
+    process-global env var.  Pre-fix code imported the ContextVar from the
+    wrong module (run_agent — always ImportError) so this also FAILS on
+    pre-fix code."""
+    import tools.pa_record_event as pre
+    from gateway import pa_observability as po
+    from gateway.session_context import _SESSION_ID
+
+    po.drain_agent_events("ctx-sess")
+    po.drain_agent_events("env-sess")
+    monkeypatch.setenv("HERMES_SESSION_ID", "env-sess")
+    token = _SESSION_ID.set("ctx-sess")
+    try:
+        out = pre._handle_record_event({"event_type": "escalated"})
+        assert '"recorded": true' in out
+        assert [e.event_type for e in po.drain_agent_events("ctx-sess")] == ["escalated"]
+        assert po.drain_agent_events("env-sess") == []
+    finally:
+        _SESSION_ID.reset(token)
