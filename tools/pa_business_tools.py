@@ -835,6 +835,83 @@ def _dry_run_business_result(operation: str, payload: Mapping[str, Any]) -> str 
     })
 
 
+# ── last-seen case state (v6.3 item 4b, WB f6845320 — 1018/1092 receipt) ──
+#
+# The tgg_case_observation backend response carries only {observationId}; the
+# agent attaching evidence therefore never sees the case's CURRENT state in
+# the tool result, and a stale "completed" carried in conversation memory can
+# survive right past a same-turn lookup that said "open". A fresh fetch per
+# observation is not worth an extra round-trip, so instead we remember the
+# most recent backend-returned state per jobNo from lookup/search/write
+# results and echo it prominently into the observation success result.
+# Deterministic, code-layer surface (match-the-layer); the constitution
+# carries the judgment-side rule ("this-turn tool result wins").
+
+_LAST_SEEN_CASE_STATE: dict[str, str] = {}
+_LAST_SEEN_CASE_STATE_MAX = 512
+
+
+def _case_state_key(job_no: Any) -> str | None:
+    text = " ".join(str(job_no or "").split()).upper()
+    return text or None
+
+
+def _remember_case_state(job_no: Any, state: Any) -> None:
+    key = _case_state_key(job_no)
+    state_text = str(state or "").strip()
+    if not key or not state_text:
+        return
+    # Bounded cache: drop the oldest entry past the cap (long-lived gateway).
+    if key not in _LAST_SEEN_CASE_STATE and len(_LAST_SEEN_CASE_STATE) >= _LAST_SEEN_CASE_STATE_MAX:
+        _LAST_SEEN_CASE_STATE.pop(next(iter(_LAST_SEEN_CASE_STATE)), None)
+    _LAST_SEEN_CASE_STATE[key] = state_text
+
+
+def _harvest_case_states(result: Any, _depth: int = 0) -> None:
+    """Record state for every case-shaped dict (jobNo/job_no + state) in a
+    backend result — covers lookup ({data: {case: ...}}), search candidates,
+    and any write response that echoes the case."""
+    if _depth > 6:
+        return
+    try:
+        if isinstance(result, Mapping):
+            job_no = result.get("jobNo") or result.get("job_no")
+            if job_no is not None and "state" in result:
+                _remember_case_state(job_no, result.get("state"))
+            for value in result.values():
+                if isinstance(value, (Mapping, list, tuple)):
+                    _harvest_case_states(value, _depth + 1)
+        elif isinstance(result, (list, tuple)):
+            for item in result:
+                _harvest_case_states(item, _depth + 1)
+    except Exception:
+        pass
+
+
+def _annotate_observation_result(raw: str, job_no: Any) -> str:
+    """Echo the last-known backend state for the observed case into the
+    observation tool result so fresh state is in-face at attach time."""
+    key = _case_state_key(job_no)
+    state = _LAST_SEEN_CASE_STATE.get(key) if key else None
+    if not state:
+        return raw
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+    if not isinstance(data, dict) or data.get("error") or "caseState" in data:
+        return raw
+    if data.get("ok") is False:
+        return raw
+    data["caseState"] = state
+    data["caseStateNote"] = (
+        "current backend state for this case (from the most recent "
+        "lookup/search result) — any state claim must restate THIS value, "
+        "not conversation memory"
+    )
+    return json.dumps(data, ensure_ascii=False)
+
+
 def _handle_tgg_read(operation: str, payload: Mapping[str, Any]) -> str:
     try:
         result = execute_business_operation(
@@ -844,6 +921,7 @@ def _handle_tgg_read(operation: str, payload: Mapping[str, Any]) -> str:
         )
     except Exception as exc:
         return tool_error(exc)
+    _harvest_case_states(result)
     return tool_result(result)
 
 
@@ -859,6 +937,7 @@ def _handle_tgg_write(operation: str, payload: Mapping[str, Any]) -> str:
         )
     except Exception as exc:
         return tool_error(exc)
+    _harvest_case_states(result)
     return tool_result(result)
 
 
@@ -1085,7 +1164,13 @@ def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str
         "notes": raw.get("notes"),
         "confidence": raw.get("confidence"),
     }
-    return _handle_tgg_write("tgg_case_observation", payload)
+    # v6.3 item 4b: the backend observation response carries only
+    # {observationId} — echo the case's last-known backend state into the
+    # success result so fresh state is in-face at evidence-attach time.
+    return _annotate_observation_result(
+        _handle_tgg_write("tgg_case_observation", payload),
+        payload.get("jobNo"),
+    )
 
 
 _JOB_NO_TOKEN_RE = re.compile(r"\b[A-Z]{2}/JOB/\d{4}/\d{1,4}\b")

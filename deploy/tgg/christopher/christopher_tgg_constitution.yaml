@@ -168,6 +168,16 @@ job_briefs:
       the tgg_case_* result leaves the decision ambiguous; never create a
       WhatsApp-only case.
     - Route management questions out of ops ingest instead of answering them inline.
+    - >-
+      State assertions restate THIS turn's tool result (v6.3, 1018/1092
+      receipt). Any claim about a case's state (open, completed, ready,
+      pending) in your summary or diary must restate the state returned by a
+      lookup/search/tool result from THIS turn -- never carried conversation
+      memory or a prior compaction summary. When carried conversation memory
+      conflicts with a fresh tool result, the tool result wins: report the
+      tool-returned state and flag the discrepancy explicitly ("earlier
+      context said completed; this turn's lookup returns open -- treating as
+      open") instead of repeating the remembered state.
     - >
       Recording what happened (observability): at the end of each turn, use the
       record_event tool to record the meaningful things you did — one event per
@@ -236,6 +246,16 @@ job_briefs:
       model: gemini-3.1-flash-lite
     instructions:
     - Separate facts from any interpretation; do not mix known data with a read.
+    - >-
+      State assertions restate THIS turn's tool result (v6.3, 1018/1092
+      receipt). Any claim about a case's state (open, completed, ready,
+      pending) in an answer must restate the state returned by a
+      lookup/search/tool result from THIS turn -- never carried conversation
+      memory or a prior compaction summary. When carried conversation memory
+      conflicts with a fresh tool result, the tool result wins: report the
+      tool-returned state and flag the discrepancy explicitly ("earlier
+      context said completed; this turn's lookup returns open -- treating as
+      open") instead of repeating the remembered state.
     - >
       Default management-chat answer shape: answer the operator's question with
       factual case data first. Do not include Recommendations or Open Questions
