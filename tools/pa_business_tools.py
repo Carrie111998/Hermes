@@ -1243,15 +1243,18 @@ TGG_CASE_SEARCH_SCHEMA = {
         "(recall) — it returns CANDIDATES with matchBasis; YOU judge which "
         "(if any) is the same job. Multiple plausible candidates or "
         "conflicting evidence → use tgg_clarification_request instead of "
-        "guessing. Prefer structured anchors; workType/problem are reasoning "
-        "hints, only used as search text when no address or job number exists."
+        "guessing. Identity params (jobNo, block, unit — taken from the "
+        "message AND its quoted context) are the primary search keys; "
+        "free-text search is a last resort when none of them exist. "
+        "workType/problem are reasoning hints, only used as search text when "
+        "no address or job number exists."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "search": {
                 "type": "string",
-                "description": "Free text fallback. If block/street/unit or address is known, keep this to address text only.",
+                "description": "Free text LAST-RESORT fallback — never put work-description prose here when a jobNo, block, or unit is available in the message or its quoted context. If block/street/unit or address is known, keep this to address text only.",
             },
             "address": {"type": "string", "description": "Structured address if known, e.g. 'Blk 350 Anchorvale Rd #11-109'."},
             "block": {"type": "string", "description": "Structured block number if known, e.g. '350'."},
