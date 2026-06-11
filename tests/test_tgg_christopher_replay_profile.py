@@ -137,3 +137,88 @@ def test_bare_reaction_records_are_skipped_at_feed():
     # Real content never skipped
     assert _is_bare_reaction_record(_rec("epoxy applied, done")) is False
     assert _is_bare_reaction_record(_rec("", kind="image", has_media=True)) is False
+
+
+# ── continue-session mode: session-reuse decision logic (pure part) ──────
+
+
+class TestContinueSessionPlan:
+    def _seed_prior_store(self, hermes_home: Path) -> None:
+        (hermes_home / "sessions").mkdir(parents=True)
+        (hermes_home / "sessions" / "sessions.json").write_text("{}", encoding="utf-8")
+        (hermes_home / "state.db").write_bytes(b"")
+
+    def test_fresh_run_without_flag_changes_nothing(self, tmp_path):
+        from scripts.tgg_christopher_hermes_replay import _continue_session_plan
+
+        plan = _continue_session_plan(tmp_path, continue_session=False)
+        assert plan["resume"] is False
+        assert plan["session_reset_mode"] is None
+
+    def test_continue_with_prior_store_resumes(self, tmp_path):
+        from scripts.tgg_christopher_hermes_replay import _continue_session_plan
+
+        self._seed_prior_store(tmp_path)
+        plan = _continue_session_plan(tmp_path, continue_session=True)
+        assert plan["resume"] is True
+        # Reset policy must be disabled so a wall-clock daily/idle boundary
+        # between replay runs can't rotate the resumed session.
+        assert plan["session_reset_mode"] == "none"
+
+    def test_continue_without_prior_store_starts_fresh_but_protects_session(self, tmp_path):
+        from scripts.tgg_christopher_hermes_replay import _continue_session_plan
+
+        plan = _continue_session_plan(tmp_path, continue_session=True)
+        assert plan["resume"] is False
+        # Day-1-with-flag: still disable resets so THIS session survives to
+        # the next continued run.
+        assert plan["session_reset_mode"] == "none"
+        assert "no prior session store" in plan["reason"]
+
+    def test_continue_requires_both_store_files(self, tmp_path):
+        from scripts.tgg_christopher_hermes_replay import _continue_session_plan
+
+        (tmp_path / "sessions").mkdir(parents=True)
+        (tmp_path / "sessions" / "sessions.json").write_text("{}", encoding="utf-8")
+        # state.db missing — bridge rows / transcripts live there; without it
+        # the "prior session" is not actually resumable.
+        plan = _continue_session_plan(tmp_path, continue_session=True)
+        assert plan["resume"] is False
+        assert "state.db" in plan["reason"]
+
+
+def test_prepare_hermes_home_writes_session_reset_none_in_continue_mode(tmp_path, monkeypatch):
+    """Continue mode must land session_reset mode "none" in the prepared
+    config (config.yaml session_reset maps to default_reset_policy); fresh
+    mode must leave the key absent (live-default policy)."""
+    import yaml
+
+    from scripts.tgg_christopher_hermes_replay import (
+        _prepare_hermes_home,
+        _resolve_replay_profile,
+    )
+
+    profile = _resolve_replay_profile(_args(_sqlite_db(tmp_path / "tgg.db")))
+
+    fresh_home = tmp_path / "fresh-home"
+    fresh_home.mkdir()
+    _prepare_hermes_home(
+        fresh_home,
+        chat_id="120363403845802098@g.us",
+        profile=profile,
+        business_base_url=None,
+    )
+    fresh_config = yaml.safe_load((fresh_home / "config.yaml").read_text(encoding="utf-8"))
+    assert "session_reset" not in fresh_config
+
+    cont_home = tmp_path / "cont-home"
+    cont_home.mkdir()
+    _prepare_hermes_home(
+        cont_home,
+        chat_id="120363403845802098@g.us",
+        profile=profile,
+        business_base_url=None,
+        session_reset_mode="none",
+    )
+    cont_config = yaml.safe_load((cont_home / "config.yaml").read_text(encoding="utf-8"))
+    assert cont_config["session_reset"]["mode"] == "none"

@@ -885,12 +885,60 @@ def _set_nested(mapping: dict[str, Any], keys: list[str], value: Any) -> None:
     current[keys[-1]] = value
 
 
+def _continue_session_plan(hermes_home: Path, *, continue_session: bool) -> dict[str, Any]:
+    """Session-reuse decision for a replay run (pure — trivially testable).
+
+    Continue mode resumes the sandbox's existing hermes session the same way
+    live hermes keeps one long-running session per chat: SessionStore keys
+    sessions on the chat (group_sessions_per_user=False in the prepared
+    config), so as long as the prior session store survives
+    (sessions/sessions.json + state.db in hermes-home) AND no reset policy
+    fires, get_or_create_session returns the prior entry — same session_id,
+    full message history intact — and the existing ContextCompressor
+    auto-compaction (threshold 0.50, aux summarize, protect-tail) fires
+    naturally as multi-day history accumulates. The harness therefore only
+    has to (a) NOT re-create/rotate anything, and (b) disable the wall-clock
+    session reset policy (mode "none") so a daily-4am/idle-24h boundary
+    crossed between replay runs cannot rotate the session.
+
+    Returns {"resume": bool, "session_reset_mode": Optional[str], "reason": str}.
+    """
+    if not continue_session:
+        return {
+            "resume": False,
+            "session_reset_mode": None,
+            "reason": "fresh run (--continue-session not set)",
+        }
+    sessions_file = hermes_home / "sessions" / "sessions.json"
+    state_db = hermes_home / "state.db"
+    missing = [str(path) for path in (sessions_file, state_db) if not path.exists()]
+    if missing:
+        # Day-1-with-flag shape: nothing to resume yet — start fresh, but
+        # still disable the reset policy so THIS session survives to the
+        # next continued run.
+        return {
+            "resume": False,
+            "session_reset_mode": "none",
+            "reason": (
+                "--continue-session set but no prior session store "
+                f"({', '.join(missing)} missing); starting a fresh session "
+                "that later --continue-session runs will resume"
+            ),
+        }
+    return {
+        "resume": True,
+        "session_reset_mode": "none",
+        "reason": "prior session store present; resuming the chat's most recent session",
+    }
+
+
 def _prepare_hermes_home(
     hermes_home: Path,
     *,
     chat_id: str,
     profile: ReplayProfile,
     business_base_url: str | None,
+    session_reset_mode: str | None = None,
 ) -> None:
     config = _load_yaml(TGG_CONFIG)
     constitution = _load_yaml(TGG_CONSTITUTION)
@@ -934,6 +982,11 @@ def _prepare_hermes_home(
     # many assistants but wrong for replay/live ledger perception here.
     config["group_sessions_per_user"] = False
     config["thread_sessions_per_user"] = False
+    if session_reset_mode:
+        # Continue-session runs: a wall-clock daily/idle reset boundary
+        # crossed between replay invocations must not rotate the resumed
+        # session — multi-day history accumulation is the point.
+        config["session_reset"] = {"mode": session_reset_mode, "notify": False}
 
     local_constitution = hermes_home / "christopher_tgg_constitution.yaml"
     _set_nested(config, ["pa", "constitution_path"], str(local_constitution))
@@ -2349,7 +2402,28 @@ async def _run(args: argparse.Namespace) -> int:
     )
     run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_label = args.run_label or f"tgg-hermes-replay-{args.chat_id.split('@', 1)[0]}-{run_stamp}"
+    if args.continue_session:
+        if not args.hermes_home:
+            raise SystemExit(
+                "--continue-session requires --hermes-home pointing at the prior "
+                "run's hermes-home (a fresh tempdir has no session to resume)"
+            )
+        if args.cleanup_hermes_home:
+            raise SystemExit(
+                "--continue-session is incompatible with --cleanup-hermes-home "
+                "(cleanup would delete the session store the next run resumes)"
+            )
+        if profile.rotate_session_every_turns:
+            raise SystemExit(
+                "--continue-session is incompatible with rotate_session_every_turns "
+                "(rotation resets the session this mode exists to preserve)"
+            )
     hermes_home = Path(args.hermes_home) if args.hermes_home else Path(tempfile.mkdtemp(prefix="tgg-hermes-replay-"))
+    continue_plan = _continue_session_plan(
+        hermes_home, continue_session=bool(args.continue_session)
+    )
+    if args.continue_session:
+        print(f"[continue-session] {continue_plan['reason']}", file=sys.stderr)
     output_path = Path(args.output) if args.output else DOCS_DIR / f"{run_label}.html"
 
     _prepare_env(hermes_home, secrets=Path(args.secrets))
@@ -2376,6 +2450,7 @@ async def _run(args: argparse.Namespace) -> int:
         chat_id=args.chat_id,
         profile=profile,
         business_base_url=business_base_url,
+        session_reset_mode=continue_plan["session_reset_mode"],
     )
 
     if profile.main_provider == "gemini":
@@ -2664,6 +2739,17 @@ def main() -> int:
     parser.add_argument("--publish-review-db")
     parser.add_argument("--render-review-run", help="Render a previously published tgg_christopher_* run without replaying")
     parser.add_argument("--rotate-session-every-turns", type=int)
+    parser.add_argument(
+        "--continue-session",
+        action="store_true",
+        help=(
+            "Resume the chat's most recent hermes session from a prior run's "
+            "hermes-home (same session_id, full history — lets ContextCompressor "
+            "auto-compaction fire naturally across multi-day replays). Requires "
+            "--hermes-home pointing at the prior run's hermes-home; disables the "
+            "wall-clock session reset policy for the run."
+        ),
+    )
     parser.add_argument("--secrets", default=str(DEFAULT_SECRETS))
     parser.add_argument("--cleanup-hermes-home", action="store_true")
     parser.add_argument(
