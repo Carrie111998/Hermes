@@ -404,10 +404,12 @@ class SessionManager:
         Returns ``None`` if the DB is unavailable (e.g. import error in a
         minimal test environment).
 
-        Note: we resolve ``HERMES_HOME`` dynamically rather than relying on
-        the module-level ``DEFAULT_DB_PATH`` constant, because that constant
-        is evaluated at import time and won't reflect env-var changes made
-        later (e.g. by the test fixture ``_isolate_hermes_home``).
+        Note: we resolve ``HERMES_HOME`` dynamically (at call time) so the DB
+        path reflects env-var changes made after import — e.g. the redirect
+        applied by the test fixture ``_isolate_hermes_home``.  ``hermes_state``
+        now defers the same resolution via the ``DEFAULT_DB_PATH`` None-sentinel
+        + ``_default_db_path()`` seam, so a bare ``SessionDB()`` would resolve
+        identically; this explicit form is kept as-is.
         """
         if self._db_instance is not None:
             return self._db_instance
