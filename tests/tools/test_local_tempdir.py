@@ -1,6 +1,19 @@
+import os
 from unittest.mock import patch
 
+import pytest
+
 from tools.environments.local import LocalEnvironment
+
+# These tests pin the POSIX/Termux TMPDIR resolution chain.  On Windows
+# get_temp_dir() ignores TMPDIR by design and returns a forward-slash path
+# under HERMES_HOME/cache/terminal (see the _IS_WINDOWS branch in
+# tools/environments/local.py get_temp_dir).
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX/Termux TMPDIR resolution under test; Windows "
+    "get_temp_dir() intentionally returns HERMES_HOME/cache/terminal",
+)
 
 
 class TestLocalTempDir:

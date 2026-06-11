@@ -14,6 +14,8 @@ import tempfile
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.environments.local import (
     LocalEnvironment,
     _resolve_safe_cwd,
@@ -43,6 +45,11 @@ class TestResolveSafeCwd:
         monkeypatch.setattr(os.path, "isdir", lambda p: False)
         assert _resolve_safe_cwd("/no/such/dir") == tempfile.gettempdir()
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX root-walk semantics: on ntpath the dirname walk of a "
+        "'/'-rooted path never reaches os.path.sep",
+    )
     def test_returns_root_when_only_root_exists(self, monkeypatch):
         """If every ancestor except the filesystem root is gone, the root
         itself is still a valid recovery target — don't skip it just because

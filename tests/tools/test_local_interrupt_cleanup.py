@@ -22,6 +22,15 @@ import pytest
 
 from tools.environments.local import LocalEnvironment
 
+# Both tests drive POSIX process-group APIs (os.getpgid / os.killpg) in the
+# test body, and the guarded scenario — os.setsid leaving a PPID=1 orphan
+# past SIGTERM — does not exist on Windows.
+pytestmark = pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX process-group semantics under test; os.getpgid/os.killpg "
+    "do not exist on Windows",
+)
+
 
 @pytest.fixture(autouse=True)
 def _isolate_hermes_home(tmp_path, monkeypatch):

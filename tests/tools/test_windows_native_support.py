@@ -51,6 +51,10 @@ class TestConfigureWindowsStdio:
         yield
         sys.modules.pop("hermes_cli.stdio", None)
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="POSIX-only by construction: asserts is_windows() is False",
+    )
     def test_no_op_on_posix(self):
         from hermes_cli import stdio
 
@@ -286,6 +290,11 @@ class TestSigkillFallback:
         result = getattr(fake_signal, "SIGKILL", fake_signal.SIGTERM)
         assert result == 15
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="signal.SIGKILL does not exist on Windows; the absent-SIGKILL "
+        "branch is covered by test_getattr_fallback_works_when_sigkill_missing",
+    )
     def test_getattr_fallback_prefers_sigkill_when_present(self):
         """On POSIX the fallback is a no-op: real SIGKILL wins."""
         result = getattr(signal, "SIGKILL", signal.SIGTERM)

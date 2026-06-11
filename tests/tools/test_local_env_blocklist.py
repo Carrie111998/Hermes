@@ -12,6 +12,8 @@ import os
 import threading
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.environments.local import (
     LocalEnvironment,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
@@ -302,6 +304,11 @@ class TestSanePathIncludesHomebrew:
         from tools.environments.local import _SANE_PATH
         assert "/opt/homebrew/sbin" in _SANE_PATH
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="_make_run_env's _SANE_PATH injection is POSIX-only "
+        "(gated `not _IS_WINDOWS` in tools/environments/local.py)",
+    )
     def test_make_run_env_appends_homebrew_on_minimal_path(self):
         """When PATH is minimal (no /usr/bin), _make_run_env should append
         _SANE_PATH which now includes Homebrew dirs."""
