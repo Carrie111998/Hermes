@@ -3332,6 +3332,11 @@ class TestRunConversation:
         assert result["completed"] is False
 
     def test_length_with_tool_calls_returns_partial_without_executing_tools(self, agent):
+        """A persistently stream-cut tool call (unparseable args) exhausts the
+        3 retries, gets ONE in-turn continuation, and — when the continuation
+        also dies — fails the turn with the stream-cut label (NOT the generic
+        output-length-limit label, which is reserved for genuine provider
+        length stops with intact args)."""
         self._setup_agent(agent)
         bad_tc = _mock_tool_call(
             name="write_file",
@@ -3343,6 +3348,7 @@ class TestRunConversation:
 
         with (
             patch("run_agent.handle_function_call") as mock_handle_function_call,
+            patch("run_agent.time.sleep", return_value=None),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -3351,12 +3357,17 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert result["error"] == "Stream interrupted mid-tool-call"
         mock_handle_function_call.assert_not_called()
+        # Two outer iterations: (initial + 3 in-loop retries), then the
+        # continuation restart which also dies after (initial + 3 retries).
+        # 8 raw API requests total.
+        assert result["api_calls"] == 2
+        assert agent.client.chat.completions.create.call_count == 8
 
-    def test_truncated_tool_call_retries_once_before_refusing(self, agent):
+    def test_truncated_tool_call_retries_with_backoff_before_refusing(self, agent):
         """When tool call args are truncated, the agent retries the API call
-        once. If the retry succeeds (valid JSON args), tool execution proceeds."""
+        with backoff. If a retry succeeds (valid JSON args), tools execute."""
         self._setup_agent(agent)
         agent.valid_tool_names.add("write_file")
         bad_tc = _mock_tool_call(
@@ -3377,6 +3388,7 @@ class TestRunConversation:
         )
         with (
             patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch("run_agent.time.sleep", return_value=None) as mock_sleep,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -3392,6 +3404,103 @@ class TestRunConversation:
         # Tool was executed on the retry (good_resp)
         mock_hfc.assert_called_once()
         assert result["final_response"] == "Done!"
+        # First retry backs off 1s
+        assert 1 in [c.args[0] for c in mock_sleep.call_args_list]
+
+    def test_truncated_tool_call_allows_three_retries_with_backoff(self, agent):
+        """The truncated-tool-call path retries up to 3 times (1s/3s/8s
+        backoff) before falling back to the in-turn continuation."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated_resp = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc],
+        )
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="stop", tool_calls=[good_tc],
+        )
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch("run_agent.time.sleep", return_value=None) as mock_sleep,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            # Three truncated responses → consumed by the 3 retries; the
+            # third retry returns valid args and tools execute.
+            agent.client.chat.completions.create.side_effect = [
+                truncated_resp, truncated_resp, truncated_resp,
+                good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+        # 5 raw API requests: initial + 3 retries within one outer iteration,
+        # then the final-response iteration.
+        assert agent.client.chat.completions.create.call_count == 5
+        sleep_args = [c.args[0] for c in mock_sleep.call_args_list]
+        assert sleep_args[:3] == [1, 3, 8]
+
+    def test_truncated_tool_call_continuation_after_retry_exhaustion(self, agent):
+        """After the 3 retries exhaust, the agent injects ONE in-turn
+        continuation nudge and keeps the turn alive instead of failing."""
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("write_file")
+        bad_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"partial',
+            call_id="c1",
+        )
+        truncated_resp = _mock_response(
+            content="", finish_reason="length", tool_calls=[bad_tc],
+        )
+        good_tc = _mock_tool_call(
+            name="write_file",
+            arguments='{"path":"report.md","content":"full content"}',
+            call_id="c2",
+        )
+        good_resp = _mock_response(
+            content="", finish_reason="stop", tool_calls=[good_tc],
+        )
+        final_resp = _mock_response(content="Done!", finish_reason="stop")
+        with (
+            patch("run_agent.handle_function_call", return_value='{"success":true}') as mock_hfc,
+            patch("run_agent.time.sleep", return_value=None),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            # Initial + 3 retries all truncated → continuation injected →
+            # next call succeeds and the turn completes.
+            agent.client.chat.completions.create.side_effect = [
+                truncated_resp, truncated_resp, truncated_resp, truncated_resp,
+                good_resp, final_resp,
+            ]
+            result = agent.run_conversation("write the report")
+
+        mock_hfc.assert_called_once()
+        assert result["final_response"] == "Done!"
+        # 6 raw API requests: (initial + 3 retries) → continuation restart →
+        # good tool round → final response.
+        assert agent.client.chat.completions.create.call_count == 6
+        continuation_msgs = [
+            m for m in result["messages"]
+            if isinstance(m, dict)
+            and m.get("role") == "user"
+            and "interrupted mid-tool-call" in str(m.get("content", ""))
+        ]
+        assert len(continuation_msgs) == 1
 
     def test_truncated_tool_args_detected_when_finish_reason_not_length(self, agent):
         """When a router rewrites finish_reason from 'length' to 'tool_calls',
@@ -3419,7 +3528,7 @@ class TestRunConversation:
 
         assert result["completed"] is False
         assert result["partial"] is True
-        assert "truncated due to output length limit" in result["error"]
+        assert result["error"] == "Stream interrupted mid-tool-call"
         mock_handle_function_call.assert_not_called()
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):

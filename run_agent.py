@@ -3833,6 +3833,28 @@ class AIAgent:
 
         return not self._has_natural_response_ending(visible_text)
 
+    @staticmethod
+    def _has_unparseable_tool_args(assistant_message) -> bool:
+        """True when any tool call carries non-empty arguments that fail to
+        parse as JSON — the signature of a response cut off mid-tool-call.
+
+        Used by the truncated-tool-call handler to distinguish a stream that
+        died while emitting tool-call arguments ("Stream interrupted
+        mid-tool-call") from a genuine provider length stop whose tool calls
+        arrived intact.
+        """
+        for tc in (getattr(assistant_message, "tool_calls", None) or []):
+            args = getattr(getattr(tc, "function", None), "arguments", None)
+            if isinstance(args, (dict, list)):
+                continue
+            if args is None or not str(args).strip():
+                continue
+            try:
+                json.loads(args)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return True
+        return False
+
     def _looks_like_codex_intermediate_ack(
         self,
         user_message: str,
@@ -8483,6 +8505,12 @@ class AIAgent:
                 model=model_name,
                 choices=[mock_choice],
                 usage=usage_obj,
+                # True when finish_reason="length" was FORCED above because the
+                # stream died mid-tool-call (unrepairable JSON args), as opposed
+                # to the provider genuinely reporting a length stop.  The retry
+                # handler uses this to label the failure correctly
+                # ("Stream interrupted mid-tool-call" vs output length limit).
+                truncated_tool_args=has_truncated_tool_args,
             )
 
         def _call_anthropic():
@@ -12494,6 +12522,10 @@ class AIAgent:
         codex_ack_continuations = 0
         length_continue_retries = 0
         truncated_tool_call_retries = 0
+        # One-shot guard for the truncated-tool-call continuation path: after
+        # retries exhaust we inject an in-turn continuation nudge at most ONCE
+        # per turn so a persistently-broken stream cannot loop forever.
+        stream_cut_continuation_used = False
         truncated_response_parts: List[str] = []
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
@@ -12892,6 +12924,7 @@ class AIAgent:
             has_retried_429 = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
+            restart_with_stream_cut_continuation = False
 
             finish_reason = "stop"
             response = None  # Guard against UnboundLocalError if all retries fail
@@ -13437,16 +13470,61 @@ class AIAgent:
                         if self.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                             assistant_message = _trunc_msg
                             if assistant_message is not None and _trunc_has_tool_calls:
-                                if truncated_tool_call_retries < 1:
+                                # Distinguish a stream that died mid-tool-call
+                                # (unparseable args; finish_reason="length" was
+                                # forced by the streaming accumulator) from a
+                                # genuine provider length stop.  Streaming path
+                                # carries an explicit flag; non-streaming falls
+                                # back to a JSON-parse check of the args.
+                                _stream_cut = bool(
+                                    getattr(response, "truncated_tool_args", False)
+                                ) or self._has_unparseable_tool_args(assistant_message)
+                                _trunc_error_label = (
+                                    "Stream interrupted mid-tool-call"
+                                    if _stream_cut
+                                    else "Response truncated due to output length limit"
+                                )
+                                if truncated_tool_call_retries < 3:
                                     truncated_tool_call_retries += 1
+                                    _backoff_s = (1, 3, 8)[truncated_tool_call_retries - 1]
                                     self._vprint(
-                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
+                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call "
+                                        f"({truncated_tool_call_retries}/3) in {_backoff_s}s...",
                                         force=True,
                                     )
                                     # Don't append the broken response to messages;
                                     # just re-run the same API call from the current
                                     # message state, giving the model another chance.
+                                    time.sleep(_backoff_s)
                                     continue
+                                if not stream_cut_continuation_used:
+                                    # Retries exhausted — instead of failing the
+                                    # turn, roll back to the last complete state
+                                    # (the broken responses were never appended,
+                                    # so `messages` already IS that state),
+                                    # nudge the model to continue, and restart
+                                    # the OUTER loop so the rebuilt API payload
+                                    # includes the nudge.  Bounded to once per
+                                    # turn to avoid loops.
+                                    stream_cut_continuation_used = True
+                                    truncated_tool_call_retries = 0
+                                    self._vprint(
+                                        f"{self.log_prefix}⏪ Truncated tool-call retries exhausted — "
+                                        f"injecting in-turn continuation and resuming.",
+                                        force=True,
+                                    )
+                                    messages.append({
+                                        "role": "user",
+                                        "content": (
+                                            "[System: Your previous response was interrupted "
+                                            "mid-tool-call. Continue processing the remaining "
+                                            "messages from where you left off.]"
+                                        ),
+                                    })
+                                    self._session_messages = messages
+                                    self._save_session_log(messages)
+                                    restart_with_stream_cut_continuation = True
+                                    break
                                 self._vprint(
                                     f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
@@ -13459,7 +13537,7 @@ class AIAgent:
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "partial": True,
-                                    "error": "Response truncated due to output length limit",
+                                    "error": _trunc_error_label,
                                 }
 
                         # If we have prior messages, roll back to last complete state
@@ -14846,6 +14924,12 @@ class AIAgent:
                 self._ephemeral_max_output_tokens = min(_boost, 32768)
                 continue
 
+            if restart_with_stream_cut_continuation:
+                # Truncated-tool-call retries exhausted; an in-turn
+                # continuation nudge was appended to `messages`.  Restart the
+                # outer loop so the rebuilt API payload includes it.
+                continue
+
             # Guard: if all retries exhausted without a successful response
             # (e.g. repeated context-length errors that exhausted retry_count),
             # the `response` variable is still None. Break out cleanly.
@@ -15141,7 +15225,7 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response truncated due to output length limit",
+                                "error": "Stream interrupted mid-tool-call",
                             }
 
                         # Track retries for invalid JSON arguments
