@@ -1125,3 +1125,46 @@ class TestClearFunctions:
         result = clear_all()
         assert result["deleted"] is False
         assert result["bytes_freed"] == 0
+
+
+# =========================================================================
+# CHECKPOINT_BASE resolved at call time (hermetic-test poisoning guard)
+# =========================================================================
+
+@pytest.mark.timeout(60)
+class TestCheckpointBaseHermeticResolution:
+    """CHECKPOINT_BASE must resolve get_hermes_home() at CALL time, not import.
+
+    Regression (2026-06-11): CHECKPOINT_BASE was a module-level constant
+    evaluated at import (collection) time, which baked in the REAL ~/.hermes
+    *before* the hermetic ``_hermetic_environment`` fixture redirects
+    HERMES_HOME to a per-test tempdir.  Any test that reaches a checkpoint
+    write path WITHOUT patching CHECKPOINT_BASE — e.g. via the agent
+    tool-executor hot path (``ensure_checkpoint``) or the ``hermes
+    checkpoints`` CLI, both of which use the module default — created (and
+    pruned/cleared) the user's live ~/.hermes/checkpoints store.
+
+    Mirrors the tools/process_registry CHECKPOINT_PATH -> _checkpoint_path()
+    None-sentinel seam fix.  These tests DELIBERATELY do not patch
+    CHECKPOINT_BASE, so they exercise the production default-resolution path.
+    """
+
+    def test_ensure_checkpoint_writes_under_per_test_hermes_home(self, work_dir):
+        from hermes_constants import get_hermes_home
+
+        # No monkeypatch of CHECKPOINT_BASE — same code path production hits.
+        m = CheckpointManager(enabled=True, max_snapshots=5)
+        assert m.ensure_checkpoint(str(work_dir), "hermetic-check") is True
+
+        store_head = get_hermes_home() / "checkpoints" / "store" / "HEAD"
+        assert store_head.exists(), (
+            "checkpoint store resolved at import time (real ~/.hermes), not "
+            "at call time (per-test HERMES_HOME) — CHECKPOINT_BASE must defer "
+            "get_hermes_home() to call time"
+        )
+
+    def test_store_path_default_resolves_to_per_test_hermes_home(self):
+        """Pure path resolution (no disk I/O) — the seam in isolation."""
+        from hermes_constants import get_hermes_home
+
+        assert _store_path().parent == get_hermes_home() / "checkpoints"

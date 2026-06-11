@@ -3241,3 +3241,61 @@ class TestApplyWalProbe:
         assert any("journal_mode=WAL" in sql for sql in conn.executed), (
             "set-pragma must fire when probe returns 'delete'"
         )
+
+
+# =========================================================================
+# DEFAULT_DB_PATH resolved at call time (hermetic-test poisoning guard)
+# =========================================================================
+
+class TestDefaultDbPathHermeticResolution:
+    """DEFAULT_DB_PATH must resolve get_hermes_home() at CALL time, not import.
+
+    Regression (2026-06-11): DEFAULT_DB_PATH was a module-level constant
+    evaluated at import (collection) time, which baked in the REAL ~/.hermes
+    *before* the hermetic ``_hermetic_environment`` fixture redirects
+    HERMES_HOME to a per-test tempdir.  Every production ``SessionDB()`` call
+    with no ``db_path`` (gateway, web_server, cli, cron, run_agent, mcp_serve,
+    ...) used that frozen path, so any test reaching one of those code paths
+    without pinning DEFAULT_DB_PATH opened — and ran schema migrations on —
+    the user's live ~/.hermes/state.db.  The suite accumulated several
+    defensive ``monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH",
+    tmp_path / "state.db")`` fixtures to work around it; this seam removes the
+    need (acp_adapter.session._get_db already hand-rolled the same workaround).
+
+    Mirrors the tools/process_registry CHECKPOINT_PATH -> _checkpoint_path()
+    None-sentinel seam fix.
+    """
+
+    def test_default_sessiondb_path_resolves_to_per_test_hermes_home(
+        self, monkeypatch, tmp_path,
+    ):
+        import sqlite3
+        import hermes_state
+        from hermes_constants import get_hermes_home
+
+        # Spy on sqlite3.connect so we observe the path SessionDB *requests*
+        # WITHOUT opening (and migrating!) the real ~/.hermes/state.db, which
+        # is a live database.  Every open is redirected to a throwaway file
+        # under tmp_path, so __init__ (WAL setup + _init_schema, including any
+        # internal reconnect) runs normally against a scratch DB.
+        requested = []
+        real_connect = sqlite3.connect
+        redirect = tmp_path / "spy_redirect.db"
+
+        def _spy_connect(target, *args, **kwargs):
+            requested.append(str(target))
+            return real_connect(str(redirect), *args, **kwargs)
+
+        monkeypatch.setattr(hermes_state.sqlite3, "connect", _spy_connect)
+
+        # No db_path arg and no DEFAULT_DB_PATH patch — exactly the production
+        # default-resolution path that bare SessionDB() callers use.
+        hermes_state.SessionDB()
+
+        assert requested, "SessionDB never reached sqlite3.connect"
+        # requested[0] is the main connection target = the resolved default.
+        assert Path(requested[0]).parent == get_hermes_home(), (
+            "SessionDB default db_path resolved at import time (real "
+            "~/.hermes), not at call time (per-test HERMES_HOME) — "
+            "DEFAULT_DB_PATH must defer get_hermes_home() to call time"
+        )

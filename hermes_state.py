@@ -31,7 +31,23 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-DEFAULT_DB_PATH = get_hermes_home() / "state.db"
+# Session DB path.  None = resolve get_hermes_home() at call time (see
+# _default_db_path()).  An import-time snapshot bakes in the real ~/.hermes
+# before the hermetic test fixture redirects HERMES_HOME, so any bare
+# ``SessionDB()`` reached without pinning this attribute would open — and run
+# schema migrations on — the user's live ~/.hermes/state.db.  Tests may still
+# patch this attribute with a concrete Path to pin the location (non-None
+# override wins).  Mirrors tools/process_registry.CHECKPOINT_PATH;
+# acp_adapter.session._get_db already hand-rolled the call-time workaround.
+DEFAULT_DB_PATH: Optional[Path] = None
+
+
+def _default_db_path() -> Path:
+    """Resolve the default session DB path at call time (see DEFAULT_DB_PATH)."""
+    if DEFAULT_DB_PATH is not None:
+        return DEFAULT_DB_PATH
+    return get_hermes_home() / "state.db"
+
 
 SCHEMA_VERSION = 13
 
@@ -367,7 +383,7 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        self.db_path = db_path or _default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.Lock()
