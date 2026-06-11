@@ -366,11 +366,22 @@ def build_turn_record(
         message_refs=message_refs,
         model=agent_result.get("model"),
         provider=agent_result.get("provider"),
+        # Token counts: PER-TURN deltas. run_agent's "input_tokens"/
+        # "output_tokens" are SESSION-CUMULATIVE counters (cached gateway
+        # agents span many turns — recording them made pa_turns token columns
+        # grow monotonically, e.g. sk-day26-v6 input 80k -> 2.28M over 14
+        # turns). Prefer the turn-scoped fields run_conversation now emits;
+        # fall back to the legacy fields for callers that don't provide them
+        # (string-only paths, replay backfill).
         input_tokens=_as_int(
-            agent_result.get("input_tokens") or agent_result.get("prompt_tokens")
+            agent_result.get("turn_input_tokens")
+            if agent_result.get("turn_input_tokens") is not None
+            else (agent_result.get("input_tokens") or agent_result.get("prompt_tokens"))
         ),
         output_tokens=_as_int(
-            agent_result.get("output_tokens") or agent_result.get("completion_tokens")
+            agent_result.get("turn_output_tokens")
+            if agent_result.get("turn_output_tokens") is not None
+            else (agent_result.get("output_tokens") or agent_result.get("completion_tokens"))
         ),
         cost_usd=_as_float(
             agent_result.get("estimated_cost_usd") or agent_result.get("cost_usd")

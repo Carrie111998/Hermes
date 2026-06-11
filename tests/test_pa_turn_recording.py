@@ -612,3 +612,80 @@ def test_record_event_fallback_prefers_contextvar_over_env(monkeypatch):
         assert po.drain_agent_events("env-sess") == []
     finally:
         _SESSION_ID.reset(token)
+
+
+# ── (f) per-turn token counts (cumulative-counter regression) ────────────
+
+
+def test_build_turn_record_prefers_turn_scoped_token_fields():
+    """pa_turns token columns must be PER-TURN. run_agent's legacy
+    "input_tokens"/"output_tokens" result fields are session-cumulative
+    (sk-day26-v6: 80k -> 2.28M monotonic across 14 turns); the extraction
+    must prefer the turn-scoped fields when present. FAILS on pre-fix code
+    (extraction reads only the cumulative fields)."""
+    record = po.build_turn_record(
+        session_id="s",
+        agent_id="christopher",
+        chat_id="c",
+        agent_result={
+            "final_response": "ok",
+            "completed": True,
+            "messages": [],
+            # cumulative (turn 3 of a cached agent)
+            "input_tokens": 188854,
+            "output_tokens": 2526,
+            # this turn's delta
+            "turn_input_tokens": 111899,
+            "turn_output_tokens": 894,
+        },
+        final_response="ok",
+        started_at=1.0,
+        completed_at=1.1,
+    )
+    assert record.input_tokens == 111899
+    assert record.output_tokens == 894
+
+
+def test_build_turn_record_turn_zero_tokens_do_not_fall_back():
+    """A genuine zero turn-delta must record 0, not the cumulative value."""
+    record = po.build_turn_record(
+        session_id="s",
+        agent_id="a",
+        chat_id="c",
+        agent_result={
+            "final_response": "",
+            "completed": True,
+            "messages": [],
+            "input_tokens": 500,
+            "output_tokens": 50,
+            "turn_input_tokens": 0,
+            "turn_output_tokens": 0,
+        },
+        final_response="",
+        started_at=1.0,
+        completed_at=1.1,
+    )
+    assert record.input_tokens == 0
+    assert record.output_tokens == 0
+
+
+def test_build_turn_record_falls_back_to_legacy_token_fields():
+    """Callers that don't emit turn-scoped fields (string-only paths, replay
+    backfill) keep the legacy extraction."""
+    record = po.build_turn_record(
+        session_id="s",
+        agent_id="a",
+        chat_id="c",
+        agent_result={
+            "final_response": "ok",
+            "completed": True,
+            "messages": [],
+            "input_tokens": 1234,
+            "output_tokens": 56,
+        },
+        final_response="ok",
+        started_at=1.0,
+        completed_at=1.1,
+    )
+    assert record.input_tokens == 1234
+    assert record.output_tokens == 56

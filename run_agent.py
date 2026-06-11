@@ -12182,6 +12182,16 @@ class AIAgent:
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
 
+        # Per-turn usage baseline. The session_* counters are CUMULATIVE for
+        # the agent's lifetime, and gateway agents are cached across turns —
+        # so result["input_tokens"] grows monotonically per turn. Snapshot
+        # the counters here so the result can also expose this call's
+        # turn-scoped deltas (turn_input_tokens / turn_output_tokens), which
+        # per-turn consumers (PA turn-recording) prefer over the cumulative
+        # fields.
+        _turn_input_tokens_baseline = self.session_input_tokens
+        _turn_output_tokens_baseline = self.session_output_tokens
+
         self._ensure_db_session()
 
         # Tell auxiliary_client what the live main provider/model are for
@@ -16037,6 +16047,16 @@ class AIAgent:
             "base_url": self.base_url,
             "input_tokens": self.session_input_tokens,
             "output_tokens": self.session_output_tokens,
+            # Turn-scoped deltas (THIS call's API usage only). The session_*
+            # fields above are cumulative across the agent's lifetime; cached
+            # gateway agents span many turns, so per-turn consumers (PA
+            # turn-recording) must use these instead.
+            "turn_input_tokens": max(
+                0, self.session_input_tokens - _turn_input_tokens_baseline
+            ),
+            "turn_output_tokens": max(
+                0, self.session_output_tokens - _turn_output_tokens_baseline
+            ),
             "cache_read_tokens": self.session_cache_read_tokens,
             "cache_write_tokens": self.session_cache_write_tokens,
             "reasoning_tokens": self.session_reasoning_tokens,
