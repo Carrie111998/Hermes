@@ -563,6 +563,7 @@ def test_pa_business_toolset_is_registered_without_all_tools():
         "clarification_request",
         "tgg_case_observation",
         "tgg_case_create",
+        "tgg_case_update_state",
     }
     toolset = get_toolset("pa-business")
     assert toolset is not None
@@ -979,3 +980,162 @@ def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):
             {"case_id": "M-1"},
             pa_context=pa_context,
         )
+
+
+# ── generic-vs-tgg tool param hygiene + completion verb (v6) ──────────────
+
+
+@pytest.fixture
+def captured_reads(monkeypatch):
+    """Capture (operation, payload) from the read handlers without HTTP."""
+    import tools.pa_business_tools as pbt
+
+    captured = []
+
+    def _fake_read(operation, payload):
+        captured.append((operation, dict(payload)))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(pbt, "_handle_tgg_read", _fake_read)
+    return captured
+
+
+@pytest.fixture
+def captured_writes(monkeypatch):
+    """Capture (operation, payload) from the write handlers without HTTP."""
+    import tools.pa_business_tools as pbt
+
+    captured = []
+
+    def _fake_write(operation, payload):
+        captured.append((operation, dict(payload)))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(pbt, "_handle_tgg_write", _fake_write)
+    return captured
+
+
+def test_generic_message_history_search_carries_agnostic_params_only(
+    captured_reads, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+
+    monkeypatch.delenv("HERMES_PA_HISTORY_BEFORE_TS", raising=False)
+    pbt._handle_generic_message_history_search(
+        {
+            "q": "epoxy leak",
+            "chat_jid": "123@g.us",
+            "before_ts": 1760000000,
+            "limit": 10,
+            # Client-shaped params a model might pass anyway — must be DROPPED
+            "block": "350",
+            "unit": "#11-109",
+            "jobNo": "SK/JOB/2604/2376",
+        }
+    )
+    op, payload = captured_reads[0]
+    assert op == "tgg_message_history_search"
+    assert payload == {
+        "q": "epoxy leak",
+        "chat_jid": "123@g.us",
+        "before_ts": 1760000000,
+        "limit": 10,
+    }
+
+
+def test_generic_message_history_search_schema_is_agnostic():
+    from tools.pa_business_tools import (
+        MESSAGE_HISTORY_SEARCH_SCHEMA,
+        TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
+    )
+
+    generic = set(MESSAGE_HISTORY_SEARCH_SCHEMA["parameters"]["properties"])
+    assert generic == {"q", "chat_jid", "before_ts", "limit"}
+    tgg = set(TGG_MESSAGE_HISTORY_SEARCH_SCHEMA["parameters"]["properties"])
+    assert {"block", "unit", "jobNo"} <= tgg
+
+
+def test_before_ts_clamped_by_replay_future_cap(captured_reads, monkeypatch):
+    import tools.pa_business_tools as pbt
+
+    monkeypatch.setenv("HERMES_PA_HISTORY_BEFORE_TS", "1700000000")
+    pbt._handle_generic_message_history_search(
+        {"q": "leak", "before_ts": 1760000000}
+    )
+    _, payload = captured_reads[0]
+    assert payload["before_ts"] == 1700000000  # cap wins over later agent value
+
+    pbt._handle_tgg_message_history_search({"q": "leak", "before_ts": 1600000000})
+    _, payload2 = captured_reads[1]
+    assert payload2["before_ts"] == 1600000000  # earlier agent value kept
+
+
+def test_generic_clarification_request_maps_candidate_refs(captured_writes):
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_generic_clarification_request(
+        {
+            "question": "Same job?",
+            "candidate_refs": ["SK/JOB/2603/1728"],
+            "evidence_message_refs": ["wa:1"],
+            "context": "ambiguous",
+        }
+    )
+    op, payload = captured_writes[0]
+    assert op == "tgg_clarification_request"
+    assert payload["candidate_job_nos"] == ["SK/JOB/2603/1728"]
+    assert payload["question"] == "Same job?"
+
+
+def test_generic_clarification_request_schema_is_agnostic():
+    from tools.pa_business_tools import CLARIFICATION_REQUEST_SCHEMA
+
+    props = set(CLARIFICATION_REQUEST_SCHEMA["parameters"]["properties"])
+    assert props == {"question", "candidate_refs", "evidence_message_refs", "context"}
+
+
+def test_case_update_state_maps_contract_payload(captured_writes):
+    import tools.pa_business_tools as pbt
+
+    out = pbt._handle_tgg_case_update_state(
+        {
+            "job_no": "SK/JOB/2604/2376",
+            "state": "completed",
+            "evidence_message_refs": ["wa:9", "wa:10"],
+            "observed_at": "2026-06-10T14:00:00+08:00",
+        }
+    )
+    assert json.loads(out)["ok"] is True
+    op, payload = captured_writes[0]
+    assert op == "tgg_case_update_state"
+    assert payload == {
+        "jobNo": "SK/JOB/2604/2376",
+        "state": "completed",
+        "evidenceMessageRefs": ["wa:9", "wa:10"],
+        "observedAt": "2026-06-10T14:00:00+08:00",
+    }
+
+
+def test_case_update_state_rejects_non_completed(captured_writes):
+    import tools.pa_business_tools as pbt
+
+    out = pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2604/2376", "state": "cancelled"}
+    )
+    assert "only accepts state='completed'" in out
+    assert captured_writes == []
+
+    out2 = pbt._handle_tgg_case_update_state({"state": "completed"})
+    assert "requires job_no" in out2
+    assert captured_writes == []
+
+
+def test_case_update_state_operation_in_production_config():
+    raw = yaml.safe_load(TGG_PRODUCTION_CONFIG.read_text(encoding="utf-8"))
+    pa_context = SimpleNamespace(
+        constitution=SimpleNamespace(client=raw["pa"]["overlay"]["client"])
+    )
+    bridge = load_business_bridge_config(raw, pa_context=pa_context)
+    op = bridge.operations["tgg_case_update_state"]
+    assert op.method == "POST"
+    assert op.url.endswith("/api/operator/cases/state")

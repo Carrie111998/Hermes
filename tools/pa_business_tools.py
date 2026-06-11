@@ -868,7 +868,7 @@ def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
 
 def _handle_tgg_case_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload = _normalize_case_search_payload(dict(args))
-    payload["limit"] = payload.get("limit", 12)
+    payload["limit"] = payload.get("limit", 10)
     for key in ("serviceLine", "sourceStatus", "progressStatus", "state"):
         if args.get(key) is not None:
             payload[key] = args.get(key)
@@ -892,6 +892,27 @@ def _history_before_ts_cap() -> int | None:
         return None
 
 
+def _apply_before_ts(payload: dict[str, Any], args: Mapping[str, Any]) -> None:
+    """Apply caller-supplied before_ts, clamped by the replay future-cap.
+
+    The replay cap always wins when present (a replayed agent must never see
+    archive messages from after the moment being replayed)."""
+    before_ts: int | None = None
+    raw = args.get("before_ts")
+    if raw is not None:
+        try:
+            before_ts = int(float(raw))
+        except (TypeError, ValueError):
+            before_ts = None
+    cap = _history_before_ts_cap()
+    if before_ts is not None and cap is not None:
+        payload["before_ts"] = min(before_ts, cap)
+    elif before_ts is not None:
+        payload["before_ts"] = before_ts
+    elif cap is not None:
+        payload["before_ts"] = cap
+
+
 def _handle_tgg_message_history_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
     payload: dict[str, Any] = {}
     for key in ("q", "block", "unit"):
@@ -910,9 +931,27 @@ def _handle_tgg_message_history_search(args: Mapping[str, Any], **_kwargs: Any) 
     limit = args.get("limit")
     if isinstance(limit, int) and limit > 0:
         payload["limit"] = min(limit, 50)
-    cap = _history_before_ts_cap()
-    if cap is not None:
-        payload["before_ts"] = cap
+    _apply_before_ts(payload, args)
+    return _handle_tgg_read("tgg_message_history_search", payload)
+
+
+def _handle_generic_message_history_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    """Client-agnostic message-history search: q/chat_jid/before_ts/limit ONLY.
+
+    The generic alias deliberately carries no client-shaped params (no
+    block/unit/job_no) — those live on the tgg_-prefixed variant.  Any extra
+    keys a model passes are ignored rather than forwarded."""
+    payload: dict[str, Any] = {}
+    q = str(args.get("q") or "").strip()
+    if q:
+        payload["q"] = q
+    chat_jid = str(args.get("chat_jid") or args.get("chatJid") or "").strip()
+    if chat_jid:
+        payload["chat_jid"] = chat_jid
+    limit = args.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        payload["limit"] = min(limit, 50)
+    _apply_before_ts(payload, args)
     return _handle_tgg_read("tgg_message_history_search", payload)
 
 
@@ -937,6 +976,50 @@ def _handle_tgg_clarification_request(args: Mapping[str, Any], **_kwargs: Any) -
     if context:
         payload["context"] = context
     return _handle_tgg_write("tgg_clarification_request", payload)
+
+
+def _handle_generic_clarification_request(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    """Client-agnostic clarification: question/candidate_refs/evidence/context.
+
+    ``candidate_refs`` is the agnostic name for candidate entity identifiers
+    (the tgg_ variant uses candidate_job_nos); the wire payload keeps the
+    backend's key so the endpoint is unchanged."""
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return tool_error("clarification_request requires a non-empty question")
+    payload: dict[str, Any] = {"question": question}
+    candidates = _string_list(args.get("candidate_refs") or args.get("candidateRefs"))
+    if candidates:
+        payload["candidate_job_nos"] = candidates
+    evidence = _string_list(args.get("evidence_message_refs") or args.get("evidenceMessageRefs"))
+    if evidence:
+        payload["evidence_message_refs"] = evidence
+    context = str(args.get("context") or "").strip()
+    if context:
+        payload["context"] = context
+    return _handle_tgg_write("tgg_clarification_request", payload)
+
+
+def _handle_tgg_case_update_state(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    job_no = str(args.get("job_no") or args.get("jobNo") or "").strip()
+    if not job_no:
+        return tool_error("tgg_case_update_state requires job_no")
+    state = str(args.get("state") or "").strip().lower()
+    if state != "completed":
+        return tool_error(
+            "tgg_case_update_state only accepts state='completed' (v1); "
+            f"got {state!r}"
+        )
+    payload: dict[str, Any] = {"jobNo": job_no, "state": "completed"}
+    evidence = _string_list(
+        args.get("evidence_message_refs") or args.get("evidenceMessageRefs")
+    )
+    if evidence:
+        payload["evidenceMessageRefs"] = evidence
+    observed_at = str(args.get("observed_at") or args.get("observedAt") or "").strip()
+    if observed_at:
+        payload["observedAt"] = observed_at
+    return _handle_tgg_write("tgg_case_update_state", payload)
 
 
 def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str:
@@ -1064,12 +1147,14 @@ TGG_CASE_LOOKUP_SCHEMA = {
 TGG_CASE_SEARCH_SCHEMA = {
     "name": "tgg_case_search",
     "description": (
-        "Search TGG operator cases. With structured block/unit/jobNo anchors this "
-        "returns CANDIDATES, each with a match_basis naming why it surfaced "
-        "(unit_exact, unit_exact_block_mismatch, job_no, block_street_fuzzy, "
-        "text_like). The search is deliberately generous (recall) — YOU judge "
-        "which candidate (if any) is the same job. Multiple plausible candidates "
-        "or conflicting evidence → use tgg_clarification_request instead of "
+        "Search TGG operator cases. Returns a compact candidate list "
+        "{candidates: [{jobNo, address, block, unit, state, problem, "
+        "matchBasis}], count} (limit 10). matchBasis names why each candidate "
+        "surfaced (unit_exact, unit_exact_block_mismatch, job_no, "
+        "block_street_fuzzy, text_like). The search is deliberately generous "
+        "(recall) — it returns CANDIDATES with matchBasis; YOU judge which "
+        "(if any) is the same job. Multiple plausible candidates or "
+        "conflicting evidence → use tgg_clarification_request instead of "
         "guessing. Prefer structured anchors; workType/problem are reasoning "
         "hints, only used as search text when no address or job number exists."
     ),
@@ -1087,7 +1172,7 @@ TGG_CASE_SEARCH_SCHEMA = {
             "jobNo": {"type": "string", "description": "Full or partial job number, e.g. 'SK/JOB/2605/2480' or '2605/2480'. Contains-match; typo'd fragments are fine here."},
             "workType": {"type": "string", "description": "Structured work type/problem if known. Used for reasoning after address candidates return, not mixed into address search."},
             "problem": {"type": "string", "description": "Structured problem/work description if known. Used for reasoning after address candidates return, not mixed into address search."},
-            "limit": {"type": "integer", "description": "Maximum candidates to return.", "default": 12},
+            "limit": {"type": "integer", "description": "Maximum candidates to return.", "default": 10},
             "serviceLine": {"type": "string", "description": "Optional service line, usually maintenance or sprucing."},
             "sourceStatus": {"type": "string", "description": "Optional source status filter."},
             "progressStatus": {"type": "string", "description": "Optional progress status filter."},
@@ -1119,6 +1204,7 @@ TGG_MESSAGE_HISTORY_SEARCH_SCHEMA = {
             "unit": {"type": "string", "description": "Unit to match in message text, e.g. '#03-326' (matches with or without '#'/spaces)."},
             "jobNo": {"type": "string", "description": "Full or partial job number to match, e.g. 'SK/JOB/2605/2480' or '2605/2480'."},
             "chat_jid": {"type": "string", "description": "Optional: restrict to one chat jid. Usually omit — announcements often live in a different chat."},
+            "before_ts": {"type": "integer", "description": "Optional: only return messages sent before this epoch-seconds timestamp."},
             "limit": {"type": "integer", "description": "Maximum messages to return (default 20, max 50)."},
         },
         "required": [],
@@ -1127,9 +1213,31 @@ TGG_MESSAGE_HISTORY_SEARCH_SCHEMA = {
 }
 
 
+# Client-agnostic alias: deliberately NOT a spread of the tgg_ schema — the
+# generic surface carries ONLY client-agnostic params (q, chat_jid, before_ts,
+# limit).  Structured client anchors (block/unit/job_no) belong to the
+# tgg_-prefixed variant.
 MESSAGE_HISTORY_SEARCH_SCHEMA = {
-    **TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
     "name": "message_history_search",
+    "description": (
+        "Search the message archive (all chats, full history) for prior "
+        "messages about a topic. Free-text search; restrict to one chat or a "
+        "time window when needed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "q": {
+                "type": "string",
+                "description": "Free text search over message text. Multiple words are ANDed; keep it to 1-3 distinctive words.",
+            },
+            "chat_jid": {"type": "string", "description": "Optional: restrict to one chat jid. Usually omit."},
+            "before_ts": {"type": "integer", "description": "Optional: only return messages sent before this epoch-seconds timestamp."},
+            "limit": {"type": "integer", "description": "Maximum messages to return (default 20, max 50)."},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
 }
 
 
@@ -1174,9 +1282,76 @@ TGG_CLARIFICATION_REQUEST_SCHEMA = {
 }
 
 
+# Client-agnostic alias: same recording semantics, but the candidate list is
+# the agnostic ``candidate_refs`` (no client-shaped candidate_job_nos param).
 CLARIFICATION_REQUEST_SCHEMA = {
-    **TGG_CLARIFICATION_REQUEST_SCHEMA,
     "name": "clarification_request",
+    "description": TGG_CLARIFICATION_REQUEST_SCHEMA["description"],
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "The concrete question the operator should answer, naming the entity/candidates involved.",
+            },
+            "candidate_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Identifiers of the candidate records under consideration.",
+            },
+            "evidence_message_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Message refs/ids that triggered the question.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Short factual context: what was reported, what the candidates show, what is missing.",
+            },
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CASE_UPDATE_STATE_SCHEMA = {
+    "name": "tgg_case_update_state",
+    "description": (
+        "Mark a TGG case COMPLETED from worker-report evidence. Use ONLY when "
+        "the case's scope is clearly what the report says is done (e.g. case "
+        "says pipe leak, report says 'epoxy applied, done') — cite the report "
+        "messages as evidence_message_refs. If the report covers only part of "
+        "the scope, or the scope is unclear, do NOT complete: record a "
+        "tgg_case_observation and ask via tgg_clarification_request ('is this "
+        "completed?') instead. Never complete on ambiguity. Only "
+        "state='completed' is accepted in v1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "job_no": {
+                "type": "string",
+                "description": "Exact job number of the case to mark completed, e.g. SK/JOB/2604/2376.",
+            },
+            "state": {
+                "type": "string",
+                "enum": ["completed"],
+                "description": "Target state. Only 'completed' is accepted (v1).",
+            },
+            "evidence_message_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "WhatsApp message refs/ids evidencing the completion (the worker report).",
+            },
+            "observed_at": {
+                "type": "string",
+                "description": "When the completion was observed (SGT or ISO format).",
+            },
+        },
+        "required": ["job_no", "state"],
+        "additionalProperties": False,
+    },
 }
 
 
@@ -1269,7 +1444,7 @@ registry.register(
     name="message_history_search",
     toolset="pa-business",
     schema=MESSAGE_HISTORY_SEARCH_SCHEMA,
-    handler=_handle_tgg_message_history_search,
+    handler=_handle_generic_message_history_search,
     check_fn=_bridge_available,
 )
 
@@ -1285,7 +1460,15 @@ registry.register(
     name="clarification_request",
     toolset="pa-business",
     schema=CLARIFICATION_REQUEST_SCHEMA,
-    handler=_handle_tgg_clarification_request,
+    handler=_handle_generic_clarification_request,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_update_state",
+    toolset="pa-business",
+    schema=TGG_CASE_UPDATE_STATE_SCHEMA,
+    handler=_handle_tgg_case_update_state,
     check_fn=_bridge_available,
 )
 

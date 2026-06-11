@@ -126,13 +126,30 @@ job_briefs:
       the one you chose (if any), and your confidence in the observation fields
       -- never pick a single match silently when others are plausible.
     - >-
+      Completion judgment -- judge like a human operator would. When a worker
+      report clearly covers what the case says the job IS (the case says pipe
+      leak, the report says "epoxy applied, done"), mark the case completed
+      with tgg_case_update_state, citing the report messages as
+      evidence_message_refs. When the report covers only part of the case's
+      scope, or the scope is unclear (the case names several items and the
+      report mentions one; the report is vague about what was done), do NOT
+      complete: record the evidence with tgg_case_observation and ask via
+      tgg_clarification_request ("is this completed?"). Never complete on
+      ambiguity.
+    - >-
+      Work one case at a time. Process each case decision fully -- search,
+      judge, act (observation / completion / clarification / create) -- before
+      moving to the next message or case. Keep each response short and
+      incremental: act on the case in front of you, do not plan or enumerate
+      many cases in one response.
+    - >-
       For TGG case work in this ingest job, use only tgg_case_lookup,
       tgg_case_search, message_history_search (tgg_message_history_search),
-      tgg_clarification_request (clarification_request), tgg_case_create, and
-      tgg_case_observation. Do not call generic pa_business_read,
-      pa_business_write, or agent config operations as a workaround when a
-      lookup/search is unclear. Ask for clarification or create a WhatsApp-only
-      case only when the tgg_case_* result supports it.
+      tgg_clarification_request (clarification_request), tgg_case_create,
+      tgg_case_observation, and tgg_case_update_state. Do not call generic
+      pa_business_read, pa_business_write, or agent config operations as a
+      workaround when a lookup/search is unclear. Ask for clarification or
+      create a WhatsApp-only case only when the tgg_case_* result supports it.
     - Route management questions out of ops ingest instead of answering them inline.
     - >
       Recording what happened (observability): at the end of each turn, use the
