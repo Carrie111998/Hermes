@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ultra Studio Component Specs</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Ultra Studio Component Specs</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="README.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Ultra Studio Component Specs</h1>
+<p>Status: per-component functional specifications</p>
+<p>Date: 2026-06-11</p>
+<p>This directory holds the complete per-component functional specs that</p>
+<p>complement the contract-level pack in the parent directory. Each doc follows</p>
+<p>the same 12 sections: Purpose &amp; Scope, Implementation Status, User Entry</p>
+<p>Points, Feature List, State Machine, APIs &amp; Events, Data Model, UI Behavior,</p>
+<p>Permissions &amp; Error Handling, Acceptance Criteria, Non-Goals, Open Questions.</p>
+<p>Status values: <code>implemented</code> (works today, code-cited), <code>partial</code> (real</p>
+<p>machinery exists, product contract incomplete), <code>spec-only</code> (design exists,</p>
+<p>no code). Every &quot;implemented&quot; claim in these docs cites a verified file</p>
+<p>path; planned behavior is never presented as shipped.</p>
+<h2>Component Map</h2>
+<table><thead><tr><th>Doc</th><th>Component</th><th>Status</th><th>Summary</th></tr></thead><tbody>
+<tr><td><a href="01-left-nav-shell.md">01-left-nav-shell.md</a></td><td>Left Nav Shell</td><td>partial</td><td>Generic dashboard sidebar shipped; all seven Ultra nav entries spec-only.</td></tr>
+<tr><td><a href="02-creative-chat-ui.md">02-creative-chat-ui.md</a></td><td>Creative Chat UI</td><td>partial</td><td>Real gateway chat at <code>/chat</code>; media cards, picker, typed errors spec-only.</td></tr>
+<tr><td><a href="03-inspector-live-panel.md">03-inspector-live-panel.md</a></td><td>Inspector / Live Panel</td><td>partial</td><td>Generic chat inspector exists; creative-asset inspector spec-only.</td></tr>
+<tr><td><a href="04-marketplace.md">04-marketplace.md</a></td><td>Marketplace</td><td>spec-only</td><td>No catalog surface; skill install/enable machinery is the substrate.</td></tr>
+<tr><td><a href="05-memory.md">05-memory.md</a></td><td>Memory</td><td>partial</td><td>Memory store, tool, providers, prompt injection shipped; Memory page spec-only.</td></tr>
+<tr><td><a href="06-files-task-file-browser.md">06-files-task-file-browser.md</a></td><td>Files / Task File Browser</td><td>partial</td><td>File tools, upload, sync shipped; Files surface and promotion spec-only.</td></tr>
+<tr><td><a href="07-tasks-session-history.md">07-tasks-session-history.md</a></td><td>Tasks / Session History</td><td>partial</td><td>Session store + sessions browser shipped; task rows and full restore spec-only.</td></tr>
+<tr><td><a href="08-asset-library-ui.md">08-asset-library-ui.md</a></td><td>Asset Library UI</td><td>spec-only</td><td>Gallery, mention menu, picker fully designed; no code.</td></tr>
+<tr><td><a href="09-asset-service.md">09-asset-service.md</a></td><td>Asset Service</td><td>spec-only</td><td>Entities/APIs/indexing fully designed; no service code.</td></tr>
+<tr><td><a href="10-media-job-service.md">10-media-job-service.md</a></td><td>Media Job Service</td><td>partial</td><td>Sync generation tools + Atlas submit/poll shipped; durable jobs spec-only.</td></tr>
+<tr><td><a href="11-skill-registry.md">11-skill-registry.md</a></td><td>Skill Registry</td><td>partial</td><td>Discovery, progressive loading, install/guard shipped; Ultra profile + evals spec-only.</td></tr>
+<tr><td><a href="12-workflow-router.md">12-workflow-router.md</a></td><td>Workflow Router</td><td>partial</td><td>Skill package + allowlist helpers exist; runtime wiring spec-only.</td></tr>
+<tr><td><a href="13-prompt-compiler.md">13-prompt-compiler.md</a></td><td>Prompt Compiler</td><td>spec-only</td><td>Compile/enhance tools undefined in code; payload builders exist below.</td></tr>
+<tr><td><a href="14-sandbox-lifecycle.md">14-sandbox-lifecycle.md</a></td><td>Sandbox Lifecycle</td><td>partial</td><td>Multi-backend environments shipped; product lifecycle verbs spec-only.</td></tr>
+<tr><td><a href="15-human-approval-gateway.md">15-human-approval-gateway.md</a></td><td>Human Approval Gateway</td><td>partial</td><td>Approval + clarify machinery shipped; durable typed decisions spec-only.</td></tr>
+<tr><td><a href="16-observation-provenance-ledger.md">16-observation-provenance-ledger.md</a></td><td>Observation / Provenance Ledger</td><td>spec-only</td><td>Insights/provenance fragments exist; unified ledger spec-only.</td></tr>
+<tr><td><a href="17-tokenrouter.md">17-tokenrouter.md</a></td><td>TokenRouter</td><td>spec-only</td><td>Zero-trust credential flow fully designed; no code, keys are static server-side.</td></tr>
+<tr><td><a href="18-cometapi-media-gateway.md">18-cometapi-media-gateway.md</a></td><td>CometAPI Media Gateway</td><td>spec-only</td><td>Future media data plane; explicitly not an MVP capability.</td></tr>
+<tr><td><a href="19-model-catalog-provider-constraints.md">19-model-catalog-provider-constraints.md</a></td><td>Model Catalog / Provider Constraints</td><td>partial</td><td>Atlas catalogs + constraint schemas shipped in plugins; queryable registry spec-only.</td></tr>
+</tbody></table>
+<h2>Reading Order</h2>
+<ul>
+<li>Building the P0 loop: 01, 02, 12, 10, 19, 03.</li>
+<li>Asset workstream: 09, 08, 06, 03.</li>
+<li>Platform/runtime workstream: 14, 15, 11, 13, 16.</li>
+<li>Cloud-mode security: 17, 18, 14.</li>
+</ul>
+<p>Cross-component contracts (events, errors, session state) remain owned by</p>
+<p>the parent pack (<code>../02-agent-runtime-contract.md</code> and siblings); component</p>
+<p>docs cite them rather than redefining them.</p>
+</main></div>
+</body>
+</html>

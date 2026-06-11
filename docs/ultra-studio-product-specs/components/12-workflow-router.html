@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workflow Router</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Workflow Router</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="12-workflow-router.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Workflow Router</h1>
+<p>Status: partial — prompt-level skill package and allowlist helpers exist; all</p>
+<p>runtime wiring (typed route tool, router-first enforcement, events, evals) is</p>
+<p>spec-only.</p>
+<p>Sources:</p>
+<ul>
+<li>Code: <code>skills/creative/workflow-router/SKILL.md</code> (v1.0.0, 172 lines),</li>
+</ul>
+<p><code>hermes_cli/ultra_studio_skills.py</code>,</p>
+<p><code>tests/hermes_cli/test_ultra_studio_skills.py</code>, <code>tools/skills_tool.py</code>,</p>
+<p><code>agent/skill_utils.py</code>, <code>agent/prompt_builder.py</code>, <code>toolsets.py</code>,</p>
+<p><code>plugins/image_gen/atlas/</code>, <code>plugins/video_gen/atlas/</code>,</p>
+<p><code>skills/creative/media-qa/SKILL.md</code>, <code>skills/creative/prompt-repair/SKILL.md</code>,</p>
+<p><code>skills/creative/infographic-md-flow/SKILL.md</code></p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/00-index.md</code>, <code>01-product-surface.md</code>,</li>
+</ul>
+<p><code>02-agent-runtime-contract.md</code>, <code>03-media-asset-contract.md</code>,</p>
+<p><code>04-skill-tool-prompt-contract.md</code>, <code>06-delivery-plan.md</code>,</p>
+<p><code>docs/ultra-studio-agent-skill-tool-prompt-design.md</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Workflow Router is the intent-classification front door for Ultra Studio</p>
+<p>creative sessions. Every creative request must pass through it before any media</p>
+<p>generation. The router classifies the user request and uploaded assets, selects</p>
+<p>exactly one workflow skill (or none), detects missing blocking fields, and</p>
+<p>either answers, asks one clarifying question, or hands off to a workflow skill</p>
+<p>or generation tool.</p>
+<p>Core rule (SKILL.md): route before generating. The router never generates media</p>
+<p>itself.</p>
+<p>In scope:</p>
+<ul>
+<li>Intent classification and execution-mode selection.</li>
+<li>Asset role classification for uploads attached to a request.</li>
+<li>Workflow skill selection within the Ultra Studio catalog.</li>
+<li>Ask-once clarification policy.</li>
+<li>Structured handoff to workflow skills and generation tools.</li>
+<li>The Ultra Studio skill allowlist that keeps the router&#x27;s catalog focused.</li>
+</ul>
+<p>Out of scope:</p>
+<ul>
+<li>Media generation, prompt compilation, and provider/model selection</li>
+</ul>
+<p>(workflow skills and <code>ultra_*</code> tools own these).</p>
+<ul>
+<li>TokenRouter credential/model routing. TokenRouter is a separate spec-only</li>
+</ul>
+<p>backend component (02 §Sandbox Lifecycle; 03 <code>tokenrouter_decision_id</code>).</p>
+<p>This document does not specify it.</p>
+<ul>
+<li>Model-specific prompt lore. Design doc: router owns classification; workflow</li>
+</ul>
+<p>skills own execution.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Layer</th><th>Status</th><th>Evidence</th></tr></thead><tbody>
+<tr><td>Router skill package (routing rules, output YAML, ask-once policy, asset classification, Atlas tool discipline, handoff format, failure guards)</td><td>Implemented (prompt-level only)</td><td><code>skills/creative/workflow-router/SKILL.md</code> v1.0.0</td></tr>
+<tr><td>8 intent classes: chat, image_generate, image_edit, video_generate, video_from_image, qa, repair, planning</td><td>Implemented (prompt contract)</td><td>SKILL.md</td></tr>
+<tr><td>Allowlist computation helpers + default 4-skill catalog (workflow-router, infographic-md-flow, media-qa, prompt-repair)</td><td>Implemented but unwired — no production caller</td><td><code>hermes_cli/ultra_studio_skills.py</code>; rg shows callers only in tests and research docs</td></tr>
+<tr><td>Allowlist unit/integration tests (9 tests, incl. discovery filtering)</td><td>Implemented</td><td><code>tests/hermes_cli/test_ultra_studio_skills.py</code></td></tr>
+<tr><td>Skill discovery runtime the router rides on (<code>skills_list</code>/<code>skill_view</code>, disabled filtering, skills index in system prompt)</td><td>Implemented (generic, not router-specific)</td><td><code>tools/skills_tool.py</code>, <code>agent/skill_utils.py</code>, <code>agent/prompt_builder.py</code>, <code>toolsets.py</code></td></tr>
+<tr><td>Low-level generation tools the router selects between (<code>image_generate</code>, <code>video_generate</code>)</td><td>Implemented</td><td><code>toolsets.py</code>; <code>plugins/image_gen/atlas/</code>, <code>plugins/video_gen/atlas/</code></td></tr>
+<tr><td>Handoff-target skill packages (media-qa, prompt-repair, infographic-md-flow)</td><td>Implemented (prompt packages)</td><td><code>skills/creative/*/SKILL.md</code></td></tr>
+<tr><td>Allowlist bootstrap at startup/CLI</td><td>Specified, not built</td><td>06-delivery-plan P0 item 1</td></tr>
+<tr><td>Router-first runtime connection (guaranteed load for creative sessions)</td><td>Specified, not built</td><td>06-delivery-plan P0 item 4</td></tr>
+<tr><td><code>ultra_skill_route</code> typed tool emitting machine-readable route JSON</td><td>Specified, not built</td><td>design doc §Layer 2; 04 §Acceptance</td></tr>
+<tr><td>Downstream <code>ultra_media_job_*</code> / <code>ultra_asset_*</code> / catalog / constraints / prompt tools</td><td>Specified, not built</td><td>04 §Tool Groups; 03 §Required Job Tools; rg confirms no code</td></tr>
+<tr><td>Routing-phase UI (Thinking state, question cards, <code>routing</code> status label)</td><td>Specified, not built</td><td>01 §Required States; 02 §Event Stream; web/src has zero references</td></tr>
+<tr><td>Skill Trigger Eval / Skill Output Contract Eval; named router tests</td><td>Specified, not built</td><td>04 §Required Skill Runtime Objects; design doc §Validation Matrix; tests absent</td></tr>
+<tr><td><code>references/router-schema.md</code> cold-layer schema file</td><td>Specified, not built</td><td>design doc §Skill Package Structure; skill dir contains only SKILL.md</td></tr>
+<tr><td>Single canonical router output schema</td><td>Open gap — resolved by this spec (see Data Model)</td><td>Three divergent schemas: SKILL.md vs 04 vs design doc</td></tr>
+<tr><td>Router output persistence/observability</td><td>Open gap</td><td>No spec or code answers where the route object lands</td></tr>
+<tr><td>Router error/fallback semantics (ambiguous intent, disabled workflow)</td><td>Open gap</td><td>No typed routing errors anywhere</td></tr>
+<tr><td>Re-routing policy mid-session</td><td>Open gap</td><td>Undefined</td></tr>
+<tr><td>Bypass prevention (agent calling generation tools without routing)</td><td>Open gap</td><td>&quot;Route before generating&quot; is prompt-level only</td></tr>
+</tbody></table>
+<p>Nothing in the planned or gap rows is shipped. Today the router works only as a</p>
+<p>prompt package discovered through generic Hermes skill discovery.</p>
+<h2>User Entry Points</h2>
+<table><thead><tr><th>Entry</th><th>Behavior</th><th>Status</th></tr></thead><tbody>
+<tr><td>Chat message in an Ultra Studio creative session (web UI per 01) — any media request (&quot;make a cat video&quot;, &quot;generate a product photo&quot;)</td><td>Hits the router before any generation</td><td>Planned wiring; today only generic Hermes chat exists</td></tr>
+<tr><td>Vague creative request (&quot;我要做一个视频&quot;)</td><td>Router classifies, then asks exactly one blocking question via an ask-user-question card</td><td>SKILL.md policy implemented as prompt text; UI card planned</td></tr>
+<tr><td>File upload alongside a prompt</td><td>Router classifies the asset role (foundation / logo / style_reference / source_video / ignore) before tool use</td><td>SKILL.md prompt rules implemented; typed <code>media_input</code> upload planned (06 P0 item 3)</td></tr>
+<tr><td>Follow-up on an existing output (&quot;why did this fail?&quot;, &quot;fix it&quot;)</td><td>Router hands off to media-qa / prompt-repair intents</td><td>Skill packages implemented; runtime handoff unenforced</td></tr>
+<tr><td>Indirect entry via Hermes skill discovery: agent sees workflow-router in the system-prompt skills index and loads it with <code>skill_view</code></td><td>Only activation path that exists today</td><td>Implemented (generic mechanism)</td></tr>
+</tbody></table>
+<h2>Feature List</h2>
+<table><thead><tr><th>#</th><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>1</td><td>workflow-router SKILL.md prompt package: classification rules, routing output YAML template, ask-once policy, asset role classification, Atlas tool discipline, handoff format, failure guards</td><td>Implemented</td></tr>
+<tr><td>2</td><td>8 intent classes: chat, image_generate, image_edit, video_generate, video_from_image, qa, repair, planning</td><td>Implemented</td></tr>
+<tr><td>3</td><td>Ultra Studio allowlist helpers + default 4-skill allowlist with tests (<code>hermes_cli/ultra_studio_skills.py</code>)</td><td>Implemented (unwired)</td></tr>
+<tr><td>4</td><td>Generic skill discovery runtime: <code>skills_list</code>/<code>skill_view</code> progressive disclosure, <code>skills.disabled</code> / <code>skills.platform_disabled</code> filtering, external skill dirs, skills index in system prompt</td><td>Implemented</td></tr>
+<tr><td>5</td><td>Downstream handoff-target skill packages: media-qa, prompt-repair, infographic-md-flow with <code>related_skills</code> cross-links</td><td>Implemented</td></tr>
+<tr><td>6</td><td>Low-level generation tools the router selects between: <code>image_generate</code>, <code>video_generate</code> (Atlas plugins)</td><td>Implemented</td></tr>
+<tr><td>7</td><td>Allowlist bootstrap wired into startup/CLI so the Ultra profile hides the ~80 unrelated skills</td><td>Planned (06 P0 item 1)</td></tr>
+<tr><td>8</td><td>Router-first runtime connection — guaranteed router load for creative sessions instead of best-effort metadata matching</td><td>Planned (06 P0 item 4)</td></tr>
+<tr><td>9</td><td><code>ultra_skill_route</code> typed tool emitting machine-readable route JSON consumable by tools and UI</td><td>Planned (design doc §Layer 2)</td></tr>
+<tr><td>10</td><td>Downstream tool surface the router hands off to: <code>ultra_media_job_create/status/cancel/retry/finalize</code>, <code>ultra_asset_upload/list/inspect/download/promote</code>, <code>ultra_model_catalog</code>, <code>ultra_media_constraints_get</code>, <code>ultra_prompt_compile</code>, <code>ultra_prompt_enhance</code></td><td>Planned (04 §Tool Groups; 03)</td></tr>
+<tr><td>11</td><td>Router confidence score + reason + recommended_tools fields</td><td>Planned (design doc schema only)</td></tr>
+<tr><td>12</td><td>Routing targets product-photoshoot, product-md-flow, ugc-flow, app-sizzle, cinematic-trailer/cinematic-flow, typography-md-flow, amazon-product-listing, character-consistency</td><td>Planned (04 P0/P1; skills verified absent)</td></tr>
+<tr><td>13</td><td>Skill Trigger Eval + Skill Output Contract Eval harness for routing accuracy</td><td>Planned (04 §Required Skill Runtime Objects)</td></tr>
+<tr><td>14</td><td>Routing-phase UI: Thinking state streaming route/plan text, structured question cards, <code>routing</code> status label</td><td>Planned (01; 02; design doc)</td></tr>
+<tr><td>15</td><td><code>references/router-schema.md</code> cold-layer schema file inside the skill package</td><td>Planned (design doc §Skill Package Structure)</td></tr>
+<tr><td>16</td><td>Single canonical router output schema across SKILL.md / 04 / design doc</td><td>Gap — resolved by Data Model below; sources must be updated to match</td></tr>
+<tr><td>17</td><td>Router output persistence/observability (log, session attachment, gateway event)</td><td>Gap</td></tr>
+<tr><td>18</td><td>Router error/fallback semantics (ambiguous classification, unknown intent, disabled/missing workflow skill)</td><td>Gap</td></tr>
+<tr><td>19</td><td>Re-routing policy mid-session (user pivot, post-repair retry exhaustion)</td><td>Gap</td></tr>
+<tr><td>20</td><td>Enforcement that the router cannot be bypassed (nothing prevents direct <code>image_generate</code>/<code>video_generate</code> calls)</td><td>Gap</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>No formal router state machine exists in code or in any upstream spec; the</p>
+<p>router today is stateless prompt text. This section defines the normative</p>
+<p>lifecycle this component must follow once the runtime connection (06 P0 item 4)</p>
+<p>ships. The phase names below are proposed by this spec; only the conceptual</p>
+<p>flow is sourced (SKILL.md + design doc).</p>
+<p>States:</p>
+<table><thead><tr><th>State</th><th>Meaning</th><th>Triggered by</th></tr></thead><tbody>
+<tr><td><code>received</code></td><td>Creative request (and any uploads) entered the session</td><td>User <code>prompt.submit</code></td></tr>
+<tr><td><code>classifying</code></td><td>Router classifies intent and asset roles</td><td>Agent (router-first load)</td></tr>
+<tr><td><code>asked</code></td><td>Exactly one blocking question rendered to the user</td><td>Router, when a blocking field is missing (<code>execution_mode: ask_once</code>)</td></tr>
+<tr><td><code>answered</code></td><td>User replied to the question</td><td>User</td></tr>
+<tr><td><code>routed</code></td><td>Route object finalized: intent, execution mode, workflow skill or none</td><td>Router</td></tr>
+<tr><td><code>handed_off</code></td><td>Workflow skill or generation tool received the handoff brief</td><td>Agent, per route object</td></tr>
+<tr><td><code>answer_only</code> (terminal)</td><td>Chat/planning intents answered with no media work</td><td>Router</td></tr>
+</tbody></table>
+<p>Transitions:</p>
+<pre><code class="language-text">received -&gt; classifying            (agent loads router first)
+classifying -&gt; routed              (no blocking field missing)
+classifying -&gt; asked               (one blocking field missing; ask_once)
+asked -&gt; answered -&gt; classifying   (re-classify with the answer)
+routed -&gt; handed_off               (generate_now / inspect_then_generate /
+                                    repair_then_retry)
+routed -&gt; answer_only              (chat / planning intents)</code></pre>
+<p>Execution modes act as router terminal outcomes (SKILL.md, implemented as</p>
+<p>prompt contract): <code>answer_only</code>, <code>ask_once</code>, <code>generate_now</code>,</p>
+<p><code>inspect_then_generate</code>, <code>repair_then_retry</code>.</p>
+<p>Unspecified transitions (open gaps, see Open Questions):</p>
+<ul>
+<li>Timeout or user ignoring the question in <code>asked</code>.</li>
+<li>User&#x27;s answer to the one question is itself ambiguous (ask-once allows no</li>
+</ul>
+<p>second question).</p>
+<ul>
+<li>Two fields blocking at once.</li>
+<li>Re-entry after a mid-session pivot or after N failed prompt-repair retries.</li>
+</ul>
+<p>Downstream machines the router feeds, for orientation only (both planned, not</p>
+<p>owned by the router):</p>
+<ul>
+<li>Media job: `queued -&gt; preparing -&gt; submitting -&gt; generating -&gt; polling -&gt;</li>
+</ul>
+<p>downloading -&gt; completed<code>, with </code>failed<code> / </code>cancelled<code> / </code>timeout` branches</p>
+<p>(design doc §Tool Contract Details).</p>
+<ul>
+<li>Session surface: `Empty -&gt; Thinking -&gt; Waiting for user -&gt; Creating -&gt;</li>
+</ul>
+<p>Complete | Failed` (01 §Required States).</p>
+<h2>APIs &amp; Events</h2>
+<h3>Tools</h3>
+<table><thead><tr><th>Tool</th><th>Role for the router</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>skills_list</code> / <code>skill_view</code> / <code>skill_manage</code></td><td>Current router load mechanism via progressive disclosure</td><td>Implemented (<code>tools/skills_tool.py</code>; registered in <code>toolsets.py</code>)</td></tr>
+<tr><td><code>image_generate</code> / <code>video_generate</code></td><td>The router&#x27;s <code>primary_tool</code> targets today</td><td>Implemented (<code>toolsets.py</code>; Atlas plugins)</td></tr>
+<tr><td><code>ultra_skill_route</code></td><td>Typed tool that returns the structured route object</td><td>Proposed (design doc §Layer 2); no implementation</td></tr>
+<tr><td><code>ultra_media_job_create/status/cancel/retry/finalize</code></td><td>Handoff target for generation routes per 04</td><td>Proposed; no implementation</td></tr>
+<tr><td><code>ultra_asset_upload/list/inspect/download/promote</code></td><td>Asset surface behind asset role classification</td><td>Proposed; no implementation</td></tr>
+<tr><td><code>ultra_model_catalog</code>, <code>ultra_media_constraints_get</code></td><td>Capability queries (e.g. image-edit support) the router needs</td><td>Proposed; no implementation</td></tr>
+<tr><td><code>ultra_prompt_compile</code>, <code>ultra_prompt_enhance</code></td><td>Post-route pipeline stages</td><td>Proposed; no implementation</td></tr>
+</tbody></table>
+<p>Pipeline position (04 §Prompt Compiler Boundary): user request -&gt; <strong>route</strong> -&gt;</p>
+<p>workflow plan -&gt; asset role manifest -&gt; provider constraints -&gt; prompt compile</p>
+<p>-&gt; job create.</p>
+<h3>Events</h3>
+<p>All routing-phase events are proposed; none exist in code.</p>
+<table><thead><tr><th>Event</th><th>Carries</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>status.update</code> with <code>routing</code> / <code>planning</code> labels</td><td>Phase signal for the inspector</td><td>Proposed (02 §Event Stream; design doc UI labels)</td></tr>
+<tr><td><code>thinking.delta</code></td><td>Streamed route/plan text in the Thinking state</td><td>Proposed (02)</td></tr>
+<tr><td><code>tool.start/progress/complete/error</code></td><td>Tool-call telemetry around handoff</td><td>Proposed (02)</td></tr>
+<tr><td><code>approval.requested/resolved</code></td><td>Cost-gated route confirmation</td><td>Proposed (02 §Human Approval Gateway); owner undefined (gap)</td></tr>
+<tr><td><code>media_job.created/updated</code>, <code>asset.ready</code></td><td>Downstream of handoff</td><td>Proposed (02)</td></tr>
+<tr><td>Route-specific event (e.g. <code>route.complete</code>)</td><td>Machine-readable route decision for the UI</td><td>Gap — not defined in 02&#x27;s event list; required to satisfy 04&#x27;s &quot;machine-readable for tools and UI&quot; acceptance</td></tr>
+</tbody></table>
+<h3>Session methods</h3>
+<p><code>session.create</code>, <code>session.resume</code> (restores active skill profile),</p>
+<p><code>prompt.submit</code>, <code>slash.exec</code> (02 §Session Lifecycle) — all proposed. Whether</p>
+<p><code>session.resume</code> restores the last route decision is undefined (gap).</p>
+<h2>Data Model</h2>
+<h3>Canonical route object (normative decision of this spec)</h3>
+<p>Three divergent schemas exist. This spec declares the canonical schema:</p>
+<p><strong>SKILL.md v1.0.0 as the base</strong>, extended with two additive fields from the</p>
+<p>design doc (<code>confidence</code>, <code>reason</code>). Rationale: SKILL.md is the only shipped</p>
+<p>surface, and its enums match the tools that actually exist; the design doc&#x27;s</p>
+<p><code>asset_roles</code> array shape requires <code>asset_id</code> values that cannot exist before</p>
+<p><code>ultra_asset_*</code> ships.</p>
+<pre><code class="language-yaml">RouteObject:
+  intent: chat | image_generate | image_edit | video_generate |
+          video_from_image | qa | repair | planning
+  execution_mode: answer_only | ask_once | generate_now |
+                  inspect_then_generate | repair_then_retry
+  workflow_skill: null | infographic-md-flow | media-qa | prompt-repair
+  primary_tool: null | image_generate | video_generate
+  aspect_ratio: null | 16:9 | 9:16 | 1:1 | 4:3 | 3:4
+  asset_roles:            # role-keyed map of asset references
+    foundation: []
+    image_reference: []
+    logo: []
+    style_reference: []
+    source_video: []
+    ignore: []
+  missing: []             # string[], blocking fields only
+  confidence: 0.0         # float, additive (design doc); semantics: see gap
+  reason: &quot;&quot;              # string, additive (design doc)
+  handoff:
+    brief: &quot;&quot;
+    constraints: []
+    allowed_text: []</code></pre>
+<p>Superseded variants (must be reconciled to the canonical schema above):</p>
+<table><thead><tr><th>Source</th><th>Divergence</th><th>Disposition</th></tr></thead><tbody>
+<tr><td>04 §Router Output</td><td><code>intent</code> adds <code>edit/asset_search/unknown</code>, drops edit/from-image split; `execution_mode: answer\</td><td>ask\</td><td>tool\</td><td>workflow<code>; </code>primary_tool: ultra_media_job_create`</td><td>Superseded; <code>primary_tool</code> migrates to <code>ultra_media_job_create</code> only when that tool ships</td></tr>
+<tr><td>Design doc §Progressive Disclosure</td><td>`intent: chat\</td><td>image\</td><td>video\</td><td>edit\</td><td>analysis\</td><td>unsupported<code>; </code>workflow<code> enum incl. product-photoshoot/ugc-flow/app-sizzle/cinematic-trailer; </code>execution_mode: answer\</td><td>ask\</td><td>generate_image\</td><td>generate_video\</td><td>multi_stage<code>; </code>asset_roles<code> as </code>[{asset_id, role}]<code>; adds </code>recommended_tools`</td><td>Superseded except <code>confidence</code>/<code>reason</code> (adopted). <code>workflow_skill</code> enum expands only when target skills ship and enter the allowlist. <code>asset_roles</code> migrates to the asset-id array form when <code>ultra_asset_*</code> ships. <code>multi_stage</code> remains an open question</td></tr>
+</tbody></table>
+<p>Open schema items: <code>confidence</code> threshold semantics (what flips</p>
+<p><code>generate_now</code> to <code>ask_once</code>) and multi-stage representation are undefined —</p>
+<p>see Open Questions.</p>
+<h3>Other entities</h3>
+<table><thead><tr><th>Entity</th><th>Fields</th><th>Persistence</th><th>Status</th></tr></thead><tbody>
+<tr><td>Skill frontmatter</td><td><code>name</code>, <code>description</code>, <code>version</code>, <code>author</code>, <code>license</code>, <code>platforms[]</code>, <code>metadata.hermes.tags[]</code>, <code>metadata.hermes.related_skills[]</code></td><td>SKILL.md files; parsed by <code>tools/skills_tool.py</code> <code>_parse_frontmatter</code></td><td>Implemented</td></tr>
+<tr><td>Allowlist config fragment</td><td><code>{skills: {disabled: string[]}}</code> or <code>{skills: {platform_disabled: {&lt;platform&gt;: string[]}}}</code></td><td>Config consumed by <code>_is_skill_disabled</code>; producer helpers are side-effect free, no persistence path defined</td><td>Implemented helpers, unwired (gap: which file, when, per-platform vs global)</td></tr>
+<tr><td>Media job record the route feeds</td><td><code>job_id</code>, <code>session_id</code>, <code>tool_call_id</code>, <code>provider</code>, <code>model</code>, <code>media_type</code>, <code>mode</code>, <code>status</code>, <code>input_assets</code>, <code>prompt</code>, <code>negative_prompt</code>, <code>provider_constraints</code>, <code>seed</code>, <code>tokenrouter_decision_id</code>, <code>output_assets</code>, <code>error</code></td><td>Planned (03)</td><td>Planned</td></tr>
+<tr><td>High-level tool result envelope</td><td>success form <code>{success, job_id, state, provider, model, modality, artifacts[], workflow: {skill, stage}}</code>; error form <code>{success: false, error_type, message, recoverable, next_action}</code></td><td>Planned (design doc)</td><td>Planned</td></tr>
+<tr><td>Route object persistence</td><td>Undefined — logged? attached to session? emitted as event?</td><td>None</td><td>Gap</td></tr>
+</tbody></table>
+<h2>UI Behavior</h2>
+<p>All router-related UI is planned. <code>web/src</code> contains zero Ultra Studio /</p>
+<p>workflow-router / routing references (verified by rg).</p>
+<ul>
+<li>Thinking state: center streams route/plan text; inspector shows the current</li>
+</ul>
+<p>reasoning phase (01 §Required States).</p>
+<ul>
+<li>Waiting-for-user state: center renders a structured ask-user-question card —</li>
+</ul>
+<p>at most one blocking question per the ask-once policy; inspector shows</p>
+<p>missing-field context (01).</p>
+<ul>
+<li>The router must not dump its internal YAML routing object to the user unless</li>
+</ul>
+<p>the user asks for the routing trace (SKILL.md §Routing Output).</p>
+<ul>
+<li>Final answers must not expose raw job IDs, internal paths, or template</li>
+</ul>
+<p>markers (design doc §Notion Alignment).</p>
+<ul>
+<li>The session must not auto-generate media on open; user intent drives</li>
+</ul>
+<p>execution (01 §Center) — mirrors the SKILL.md core rule.</p>
+<ul>
+<li>Failed routing/generation surfaces as typed error cards with actionable</li>
+</ul>
+<p>recovery, not generic apologies (01 Failed state; 02 §Error Contract).</p>
+<ul>
+<li>Phase labels spanning routing + generation (design doc): thinking, routing,</li>
+</ul>
+<p>planning, preparing_assets, creating_image, storyboarding, creating_video,</p>
+<p>polling, reviewing, complete, failed.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Implemented as prompt rules (SKILL.md):</p>
+<ul>
+<li>Atlas tool discipline: credentials and provider settings are server-side.</li>
+</ul>
+<p>The router never asks the user to paste provider keys, and never asks which</p>
+<p>low-level provider/model to use.</p>
+<ul>
+<li>Failure guards: no hardcoded demo responses; no fake job IDs, asset URLs, or</li>
+</ul>
+<p>completion states; no hidden provider-workflow switches; no invented</p>
+<p>metrics, brands, logos, or capabilities; no media generation for greetings,</p>
+<p>questions, or planning requests.</p>
+<ul>
+<li>When generation fails due to missing config or backend capability, report</li>
+</ul>
+<p>the real missing capability. Route to prompt-repair only if a retry can</p>
+<p>change the outcome (prompt-repair SKILL.md repeats: do not rewrite prompts</p>
+<p>for credential blockers).</p>
+<p>Planned:</p>
+<ul>
+<li>Approval gateway (02 §Human Approval Gateway): money-spending,</li>
+</ul>
+<p>private-media, logged-in-account, local-command, and publish actions require</p>
+<p>approve/edit/reject/respond decisions that survive refresh. Whether the</p>
+<p>router or the workflow skill raises <code>approval.requested</code> for cost-gated</p>
+<p>routes is undefined (gap).</p>
+<ul>
+<li>Typed error vocabulary around handoffs (02 §Error Contract):</li>
+</ul>
+<p><code>missing_credential</code>, <code>unsupported_model_capability</code>, <code>invalid_asset_ref</code>,</p>
+<p><code>provider_rejected_input</code>, <code>quota_exceeded</code>, <code>job_timeout</code>,</p>
+<p><code>asset_upload_failed</code>, <code>sandbox_unavailable</code>, <code>approval_required</code>. Plus</p>
+<p>tool-level <code>error_type</code> enum</p>
+<p><code>auth_required|unsupported_parameter|provider_error|timeout|empty_response|invalid_asset</code></p>
+<p>with <code>next_action</code></p>
+<p><code>configure_atlas|remove_reference_images|retry_status|ask_user</code> (design doc).</p>
+<p>Gap: no routing-specific error types exist anywhere. Candidate types named in</p>
+<p>the gap analysis — <code>ambiguous_intent</code>, <code>workflow_unavailable</code>,</p>
+<p><code>asset_role_conflict</code> — must be defined before the runtime connection ships.</p>
+<h2>Acceptance Criteria</h2>
+<p>P0 (from 04 §Acceptance and 06-delivery-plan):</p>
+<ol>
+<li>With the Ultra profile active, <code>skills_list</code> returns an Ultra-focused</li>
+</ol>
+<p>catalog; the ~80 unrelated skills are hidden (allowlist bootstrap wired,</p>
+<p>verifiable via the existing <code>test_ultra_allowlist_hides_unrelated_skills_from_discovery</code></p>
+<p>pattern against real startup, not a monkeypatch).</p>
+<ol>
+<li>A generic video request does not trigger ASCII/Comfy/Manim or any</li>
+</ol>
+<p>non-catalog skill.</p>
+<ol>
+<li>A clear image request calls the image path without irrelevant questions.</li>
+<li>A clear video request creates a real media job or returns a typed blocker</li>
+</ol>
+<p>(06 P0: &quot;a real job or a typed blocker&quot;).</p>
+<ol>
+<li>Router output is machine-readable for tools and UI — a structured route</li>
+</ol>
+<p>object exists outside prose (via <code>ultra_skill_route</code> or an equivalent</p>
+<p>event), matching the canonical schema in this spec.</p>
+<ol>
+<li>The router never generates media itself; the route step emits no</li>
+</ol>
+<p><code>image_generate</code>/<code>video_generate</code> call.</p>
+<p>P1:</p>
+<ol>
+<li>Vague requests ask exactly one useful question (06 P1; 00-index line 64:</li>
+</ol>
+<p>&quot;route the request to the right skill or ask one useful missing field&quot;).</p>
+<p>&quot;make a video&quot; / &quot;我要做一个视频&quot; routes to a video intent and asks one</p>
+<p>question that changes output type, aspect ratio, asset role, workflow,</p>
+<p>cost/concurrency, or model capability — never a generic question before</p>
+<p>routing (04 §Clarification Rules).</p>
+<p>Test gates (design doc §Validation Matrix — currently unwritten):</p>
+<ol>
+<li><code>test_workflow_router_routes_image_request_without_video_skill</code> passes.</li>
+<li><code>test_workflow_router_asks_for_vague_video_request</code> passes.</li>
+<li>Skill Trigger Eval and Skill Output Contract Eval exist and run as router</li>
+</ol>
+<p>quality gates (04 §Required Skill Runtime Objects); dataset and pass bar</p>
+<p>are an open question.</p>
+<p>Manual acceptance scenarios 1-5 (design doc): cat image, vague video,</p>
+<p>image-to-5s-video, KPI video, focused skill list.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>The router does not generate media (04 §Router Output; SKILL.md core rule).</li>
+<li>The router does not contain model-specific prompt lore — it owns</li>
+</ul>
+<p>classification; workflow skills own execution (design doc §Main Risks).</p>
+<ul>
+<li>The router does not select low-level providers/models or handle credentials;</li>
+</ul>
+<p>TokenRouter/CometAPI credential routing stays in the provider/backend layer</p>
+<p>(design doc §Notion Alignment).</p>
+<ul>
+<li>Do not expose unrelated general-purpose skills by default (04 §Non-Goals).</li>
+<li>Do not delete upstream skills before disable/allowlist verification (04).</li>
+<li>Do not let plugins replace workflow skills (04).</li>
+<li>Do not bypass Atlas constraints in prompts (04).</li>
+<li>Clarification does not happen before route/skill selection — ask after</li>
+</ul>
+<p>routing, never as a generic pre-routing question (design doc §Notion</p>
+<p>Alignment; 04 §Clarification Rules).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Transport: is the route object emitted as a tool result</li>
+</ol>
+<p>(<code>ultra_skill_route</code>), a gateway event, or kept as in-context working notes</p>
+<p>only? (This spec fixes the schema; transport remains open.)</p>
+<ol>
+<li>Enforcement: how is router-first execution guaranteed for creative</li>
+</ol>
+<p>sessions — system-prompt mandate, forced pre-turn skill load, or a typed</p>
+<p>routing tool the model must call before <code>image_generate</code>/<code>video_generate</code>?</p>
+<ol>
+<li>Allowlist bootstrap: CLI command vs startup hook vs config file; Ultra</li>
+</ol>
+<p>profile per-platform (<code>skills.platform_disabled</code>) or global</p>
+<p>(<code>skills.disabled</code>)?</p>
+<ol>
+<li>Should <code>workflow_skill</code> stay limited to the 4 shipped skills, or be specced</li>
+</ol>
+<p>now for product-photoshoot/ugc-flow/app-sizzle/cinematic-trailer ahead of</p>
+<p>their delivery (06 P1)?</p>
+<ol>
+<li>Is confidence scoring required, and what threshold flips execution mode</li>
+</ol>
+<p>from generate to ask?</p>
+<ol>
+<li>Does the router re-run on mid-session pivots and after N failed</li>
+</ol>
+<p>prompt-repair retries, or does the workflow skill own all post-handoff</p>
+<p>decisions?</p>
+<ol>
+<li>Which intents are cost-gated behind <code>approval.requested</code>, and does the</li>
+</ol>
+<p>router or the workflow skill raise the approval?</p>
+<ol>
+<li>How does the router query backend capability (image-edit support,</li>
+</ol>
+<p>image-to-video support, max_reference_images) before</p>
+<p><code>ultra_model_catalog</code> / <code>ultra_media_constraints_get</code> exist? SKILL.md&#x27;s</p>
+<p>image_edit intent says &quot;use the image tool only if the active tool supports</p>
+<p>editing&quot; with no defined query path.</p>
+<ol>
+<li>What is the eval dataset and pass bar for the Skill Trigger Eval and Skill</li>
+</ol>
+<p>Output Contract Eval, and do the two named router tests block CI?</p>
+<ol>
+<li>Is the routing decision persisted to the session (02 includes &quot;active</li>
+</ol>
+<p>skill profile&quot; in session state but not &quot;last route&quot;), and does</p>
+<p><code>session.resume</code> restore it?</p>
+<ol>
+<li>Ask-once edge cases: behavior when the user&#x27;s answer is itself ambiguous,</li>
+</ol>
+<p>or when two fields are blocking at once.</p>
+<ol>
+<li>Multi-intent/batch requests (&quot;make a product photo and then a UGC ad from</li>
+</ol>
+<p>it&quot;): the design doc&#x27;s <code>multi_stage</code> execution mode is the only hint; no</p>
+<p>representation is defined.</p>
+<ol>
+<li>Catalog cross-link hygiene: infographic-md-flow&#x27;s <code>related_skills</code> still</li>
+</ol>
+<p>references legacy skills (baoyu-infographic, manim-video, comfyui) that</p>
+<p>the Ultra profile disables; no rule governs catalog cross-links.</p>
+</main></div>
+</body>
+</html>

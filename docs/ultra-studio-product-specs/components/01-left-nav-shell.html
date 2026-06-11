@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Left Nav Shell</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Left Nav Shell</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="01-left-nav-shell.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Left Nav Shell</h1>
+<p>Status: partial — the generic Hermes dashboard sidebar is implemented; all seven</p>
+<p>Ultra Studio nav entries are spec-only.</p>
+<p>Date: 2026-06-10</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/00-index.md</code>,</li>
+</ul>
+<p><code>01-product-surface.md</code> (§Left Nav Shell, §Information Architecture, §Non-Goals),</p>
+<p><code>02-agent-runtime-contract.md</code> (§Session Lifecycle),</p>
+<p><code>05-memory-marketplace-files.md</code>, <code>06-delivery-plan.md</code> (P0 item 2),</p>
+<p><code>docs/hermes-real-chat-agent-ui.md</code></p>
+<ul>
+<li>Code: <code>web/src/App.tsx</code>, <code>web/src/plugins/</code> (<code>types.ts</code>, <code>usePlugins.ts</code>,</li>
+</ul>
+<p><code>slots.ts</code>), <code>web/src/components/SidebarStatusStrip.tsx</code>,</p>
+<p><code>web/src/components/AuthWidget.tsx</code>, <code>web/src/components/SidebarFooter.tsx</code>,</p>
+<p><code>web/src/hooks/useSidebarStatus.ts</code>, <code>web/src/lib/api.ts</code>,</p>
+<p><code>web/src/lib/dashboard-flags.ts</code>, <code>hermes_cli/web_server.py</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Left Nav Shell is the persistent left rail of Ultra Studio. Per</p>
+<p><code>01-product-surface.md</code>, it is &quot;not a decorative sidebar&quot;; it is how users reach</p>
+<p>product state that does not fit inside a single chat transcript. The required</p>
+<p>Ultra Studio entries are: New task, Search, My office, Marketplace, Files,</p>
+<p>Memory, Tasks. <code>00-index.md</code> lists the left nav shell as the first element of</p>
+<p>the product shape stack, and its top-level acceptance requires Memory,</p>
+<p>Marketplace, Files, and Tasks to exist as first-class navigation surfaces.</p>
+<p>This spec covers the shell itself: the rail, its nav entries, routing, the</p>
+<p>System block, auth widget, footer, mobile behavior, plugin extensibility, and</p>
+<p>the contracts each nav entry depends on. It does not specify the full internals</p>
+<p>of the destination pages (Marketplace, Files, Memory, Tasks are owned by</p>
+<p><code>05-memory-marketplace-files.md</code>; chat/runtime behavior by</p>
+<p><code>02-agent-runtime-contract.md</code>).</p>
+<p>What exists today is the generic Hermes dashboard sidebar in <code>web/src/App.tsx</code>:</p>
+<p>a fixed 264px (<code>w-64</code>) rail with admin nav, a manifest-driven plugin tab system,</p>
+<p>a System block, AuthWidget, theme/language switchers, and a version footer.</p>
+<p>None of the seven Ultra Studio entries exist in code (`rg -il</p>
+<p>&#x27;marketplace|my office&#x27;<code> over </code>web/src<code>, </code>gateway/<code>, </code>plugins/` returns zero</p>
+<p>hits). The delivery plan path (<code>06-delivery-plan.md</code> P0 item 2) is: &quot;Left nav</p>
+<p>shell with Tasks, Files, Memory, Marketplace placeholders.&quot;</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Fixed left sidebar shell: sticky <code>w-64</code> desktop column, off-canvas mobile drawer, brand header, scrollable nav, System block, theme/language row, AuthWidget, footer</td><td><code>web/src/App.tsx</code> (<code>&lt;aside id=&quot;app-sidebar&quot;&gt;</code>)</td></tr>
+<tr><td>Implemented</td><td>Built-in admin nav: Sessions, Analytics (config-gated), Models, Logs, Cron, Skills, Plugins, Profiles, Config, Keys (<code>/env</code>), Docs; Chat prepended only when embedded chat is enabled</td><td><code>web/src/App.tsx</code> (<code>BUILTIN_NAV_REST</code>, <code>CHAT_NAV_ITEM</code>), <code>web/src/lib/dashboard-flags.ts</code></td></tr>
+<tr><td>Implemented</td><td>Plugin-extensible nav tabs from manifests: position hints, route override, hidden tabs, per-plugin visibility persisted to <code>config.yaml</code></td><td><code>web/src/plugins/types.ts</code>, <code>web/src/App.tsx</code> (<code>buildNavItems</code>/<code>partitionSidebarNav</code>), <code>hermes_cli/web_server.py</code></td></tr>
+<tr><td>Implemented</td><td>Plugin bundle loading with optional SRI integrity and load-error states</td><td><code>web/src/plugins/usePlugins.ts</code></td></tr>
+<tr><td>Implemented</td><td>System block: gateway status strip + Restart Gateway / Update Hermes actions</td><td><code>web/src/components/SidebarStatusStrip.tsx</code>, <code>web/src/App.tsx</code> (<code>SidebarSystemActions</code>), <code>web/src/contexts/SystemActions.tsx</code></td></tr>
+<tr><td>Implemented</td><td>AuthWidget, theme/language switchers, version footer</td><td><code>web/src/components/AuthWidget.tsx</code>, <code>web/src/components/SidebarFooter.tsx</code></td></tr>
+<tr><td>Implemented</td><td>Sessions page as partial Tasks analog with FTS5 message search</td><td><code>web/src/pages/SessionsPage.tsx</code>, <code>web/src/lib/api.ts</code></td></tr>
+<tr><td>Specified, not built</td><td>Nav entries: New task, Search, My office, Marketplace, Files, Memory, Tasks</td><td><code>01-product-surface.md</code> §Left Nav Shell</td></tr>
+<tr><td>Specified, not built</td><td>Pricing/account nav entry in the IA tree</td><td><code>01-product-surface.md</code> §Information Architecture; pricing copy is out of pack scope per <code>00-index.md</code></td></tr>
+<tr><td>Specified, not built</td><td>Marketplace, Files, Memory, Tasks as browsable surfaces with placeholders at P0</td><td><code>05-memory-marketplace-files.md</code>, <code>06-delivery-plan.md</code> P0 item 2</td></tr>
+<tr><td>Specified, not built</td><td>Cross-surface Search with typed result cards</td><td><code>05-memory-marketplace-files.md</code> §Search</td></tr>
+<tr><td>Specified, not built</td><td>Task row click restores transcript, jobs, task files, model, skill profile, memory</td><td><code>05-memory-marketplace-files.md</code> §Tasks, <code>02-agent-runtime-contract.md</code> §Session Lifecycle</td></tr>
+<tr><td>Open gap</td><td>Build mechanism: built-in routes vs plugin manifests vs separate Ultra shell</td><td>no spec chooses; see Open Questions</td></tr>
+<tr><td>Open gap</td><td>Fate of the 12 existing Hermes admin entries in the Ultra Studio shell</td><td>specs never mention them</td></tr>
+<tr><td>Open gap</td><td>What a P0 &quot;placeholder&quot; renders</td><td><code>06-delivery-plan.md</code> says &quot;placeholders&quot; without a mechanism</td></tr>
+<tr><td>Open gap</td><td>Nav badges / live counts on entries (e.g. running jobs on Tasks)</td><td>neither spec nor code defines them</td></tr>
+<tr><td>Open gap</td><td>Ultra Studio branding of the shell</td><td>brand is hardcoded &quot;Hermes Agent&quot; in <code>App.tsx</code> and i18n <code>t.app.brand</code></td></tr>
+</tbody></table>
+<p>Nothing in the &quot;Specified, not built&quot; rows is shipped. There are no</p>
+<p>Tasks/Files/Memory/Marketplace/Search/Office pages in <code>web/src/pages</code> today.</p>
+<h2>User Entry Points</h2>
+<p>Implemented today:</p>
+<table><thead><tr><th>Entry</th><th>Behavior</th><th>Source</th></tr></thead><tbody>
+<tr><td>Browser → dashboard web UI</td><td><code>/</code> redirects to <code>/sessions</code> (<code>RootRedirect</code>); unknown routes also fall back to <code>/sessions</code> after plugins finish loading</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td>Desktop (≥1024px)</td><td>Persistent left sidebar</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td>Mobile (&lt;1024px)</td><td>Hamburger in a fixed top header opens an off-canvas drawer</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td><code>/chat</code> nav entry</td><td>Appears only when the server injects <code>window.__HERMES_DASHBOARD_EMBEDDED_CHAT__=true</code> (<code>hermes dashboard --tui</code>)</td><td><code>web/src/lib/dashboard-flags.ts</code></td></tr>
+<tr><td>Plugin tabs</td><td>Appear automatically when a plugin ships <code>dashboard/manifest.json</code> (e.g. <code>plugins/kanban</code>)</td><td><code>web/src/plugins/usePlugins.ts</code></td></tr>
+<tr><td>Deep links</td><td>Every nav path is a route</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td>Status strip / system actions</td><td>Click navigates to <code>/sessions</code></td><td><code>web/src/App.tsx</code></td></tr>
+</tbody></table>
+<p>Specified, not built (all planned, <code>01-product-surface.md</code>):</p>
+<table><thead><tr><th>Entry</th><th>Intent</th></tr></thead><tbody>
+<tr><td>New task</td><td>Start a new creative session</td></tr>
+<tr><td>Search</td><td>Cross-surface search over messages, tasks, files, assets, memory, marketplace entries</td></tr>
+<tr><td>My office</td><td>Workspace home: recent work, shared projects</td></tr>
+<tr><td>Marketplace</td><td>Browse skill/recipe/template/element-pack/character-pack catalog</td></tr>
+<tr><td>Files</td><td>Browse uploaded originals, task files, generated artifacts</td></tr>
+<tr><td>Memory</td><td>Inspect, edit, revoke memory entries</td></tr>
+<tr><td>Tasks</td><td>Recent sessions/projects/jobs; the &quot;Continue work&quot; job (&quot;Open the previous cat task&quot;)</td></tr>
+<tr><td>Pricing/account</td><td>In the IA tree; copy out of pack scope</td></tr>
+</tbody></table>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th><th>Source</th></tr></thead><tbody>
+<tr><td>Fixed left sidebar shell (desktop sticky, mobile off-canvas drawer, Escape close, scroll lock, backdrop)</td><td>Implemented</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td>Built-in nav: Chat (gated), Sessions, Analytics (config-gated), Models, Logs, Cron, Skills, Plugins, Profiles, Config, Keys, Documentation</td><td>Implemented</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td>Active-route highlight + i18n nav labels (17 locales)</td><td>Implemented</td><td><code>web/src/App.tsx</code>, <code>web/src/i18n/</code></td></tr>
+<tr><td>Plugin nav tabs with position hints (<code>end</code>/<code>after:</code>/<code>before:</code>), route override, hidden tabs, per-plugin visibility toggle persisted to <code>config.yaml</code></td><td>Implemented</td><td><code>web/src/plugins/*</code>, <code>hermes_cli/web_server.py</code></td></tr>
+<tr><td>Plugin bundle loading with optional SRI integrity and load-error states</td><td>Implemented</td><td><code>web/src/plugins/usePlugins.ts</code></td></tr>
+<tr><td>System block: gateway status strip (4 states + tone) and active-session count, 10s <code>/api/status</code> poll</td><td>Implemented</td><td><code>web/src/components/SidebarStatusStrip.tsx</code>, <code>web/src/hooks/useSidebarStatus.ts</code></td></tr>
+<tr><td>System actions: Restart Gateway, Update Hermes with pending/running/disabled states</td><td>Implemented</td><td><code>web/src/App.tsx</code>, <code>web/src/contexts/SystemActions.tsx</code></td></tr>
+<tr><td>AuthWidget (gated mode &quot;logged in as&quot; + logout; hidden in loopback)</td><td>Implemented</td><td><code>web/src/components/AuthWidget.tsx</code></td></tr>
+<tr><td>Theme + language switchers and version/org footer</td><td>Implemented</td><td><code>web/src/App.tsx</code>, <code>web/src/components/SidebarFooter.tsx</code></td></tr>
+<tr><td>Shell plugin slots near nav: <code>header-left</code>, <code>header-right</code>, <code>header-banner</code>, <code>backdrop</code>, <code>overlay</code>, cockpit <code>sidebar</code> rail</td><td>Implemented</td><td><code>web/src/plugins/slots.ts</code></td></tr>
+<tr><td>Sessions page as partial Tasks analog: list, active badge, msg/tool counts, FTS5 message search, resume-in-chat, delete</td><td>Implemented</td><td><code>web/src/pages/SessionsPage.tsx</code></td></tr>
+<tr><td>&quot;New task&quot; nav entry starting a new creative session</td><td>Planned</td><td><code>01-product-surface.md</code> §Left Nav Shell; no code</td></tr>
+<tr><td>Global &quot;Search&quot; entry across sessions/files/assets/memory/marketplace with typed result cards</td><td>Planned</td><td><code>01-product-surface.md</code>, <code>05-memory-marketplace-files.md</code> §Search; only session-scoped FTS5 exists</td></tr>
+<tr><td>&quot;My office&quot; workspace home (recent work, shared projects)</td><td>Planned</td><td><code>01-product-surface.md</code>; no code, no backing API</td></tr>
+<tr><td>&quot;Marketplace&quot; surface with installed/available/disabled/deprecated status</td><td>Planned</td><td><code>05-memory-marketplace-files.md</code> §Marketplace; nearest machinery is <code>/plugins</code> + <code>/api/dashboard/plugins/hub</code> and Skills page</td></tr>
+<tr><td>&quot;Files&quot; surface (uploaded originals, task files, generated artifacts; promote-to-asset)</td><td>Planned</td><td><code>05-memory-marketplace-files.md</code> §Files; only <code>POST /api/chat/uploads</code> exists</td></tr>
+<tr><td>&quot;Memory&quot; surface (visible/editable/revocable entries, user vs inferred provenance)</td><td>Planned</td><td><code>05-memory-marketplace-files.md</code> §Memory; <code>plugins/memory</code> agent plugin has no dashboard manifest</td></tr>
+<tr><td>&quot;Tasks&quot; surface with job-aware rows (status, active jobs, output count, source) and full restore</td><td>Planned</td><td><code>05-memory-marketplace-files.md</code> §Tasks, <code>02-agent-runtime-contract.md</code>; <code>SessionInfo</code> lacks the fields</td></tr>
+<tr><td>&quot;Pricing / account&quot; nav entry</td><td>Planned</td><td><code>01-product-surface.md</code> §Information Architecture; copy out of pack scope per <code>00-index.md</code></td></tr>
+<tr><td>Ultra Studio branding of the shell</td><td>Planned</td><td>current brand hardcoded &quot;Hermes Agent&quot; in <code>App.tsx</code> and i18n</td></tr>
+<tr><td>Decision: built-in routes vs dashboard plugins vs separate shell for the seven entries</td><td>Gap</td><td>specs are silent; P0 says &quot;placeholders&quot; without a mechanism</td></tr>
+<tr><td>Placeholder/empty-state definition for Tasks/Files/Memory/Marketplace at P0</td><td>Gap</td><td><code>06-delivery-plan.md</code> P0 item 2</td></tr>
+<tr><td>Whether admin entries (Logs, Cron, Config, Keys, Profiles…) stay visible to Ultra Studio end users</td><td>Gap</td><td>specs never mention them</td></tr>
+<tr><td>Badge/notification affordances on nav entries</td><td>Gap</td><td>neither spec nor code</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>The shell itself holds little state; its state machines are the small loops</p>
+<p>below. All &quot;Implemented&quot; machines are in code today.</p>
+<h3>Gateway state (Implemented)</h3>
+<p>Rendered by <code>SidebarStatusStrip</code> from <code>StatusResponse.gateway_state</code>:</p>
+<pre><code class="language-text">running | starting | startup_failed | stopped</code></pre>
+<p>Fallback when <code>gateway_state</code> is null: <code>gateway_running</code> boolean → running/off.</p>
+<p>Transitions are driven by the backend; the shell only displays them.</p>
+<h3>Sidebar status fetch (Implemented)</h3>
+<pre><code class="language-text">null (skeleton) -&gt; StatusResponse</code></pre>
+<p><code>useSidebarStatus.ts</code> polls <code>GET /api/status</code> every 10s. Errors keep the last</p>
+<p>value silently — the strip goes stale with no UI signal. Trigger: timer.</p>
+<h3>System action lifecycle (Implemented)</h3>
+<p>Per action (<code>restart</code> | <code>update</code>), in <code>SidebarSystemActions</code> +</p>
+<p><code>contexts/SystemActions.tsx</code>:</p>
+<pre><code class="language-text">idle -&gt; pending (user click, spinner)
+     -&gt; running (activeAction + isRunning, runningLabel)
+     -&gt; finished | failed</code></pre>
+<p>The sibling action is disabled while one is busy. Trigger: user click; progress</p>
+<p>polled via <code>GET /api/actions/{name}/status</code>.</p>
+<h3>Plugin load, per manifest (Implemented)</h3>
+<pre><code class="language-text">manifest fetched -&gt; script injected -&gt; registered
+                                    | LOAD_FAILED
+                                    | NO_REGISTER</code></pre>
+<p>Global loading flag clears on all-registered or a 2s timeout</p>
+<p>(<code>web/src/plugins/usePlugins.ts</code>, <code>registry.ts</code>). Trigger: shell mount.</p>
+<h3>Mobile drawer (Implemented)</h3>
+<pre><code class="language-text">closed &lt;-&gt; open</code></pre>
+<p>Open: hamburger click. Close: backdrop click, Escape, nav-link click, or</p>
+<p>viewport resize to ≥1024px. Trigger: user input / matchMedia listener.</p>
+<h3>Task/session lifecycle relevant to the Tasks entry</h3>
+<p>Implemented today: only <code>is_active</code> true/false on <code>SessionInfo</code>. The spec task</p>
+<p>states — a <code>status</code> field, active jobs, running/completed creative jobs — are</p>
+<p>Planned (<code>05-memory-marketplace-files.md</code> §Tasks; job states live in</p>
+<p><code>03-media-asset-contract.md</code>).</p>
+<h3>Marketplace item status (Planned)</h3>
+<pre><code class="language-text">installed | available | disabled | deprecated</code></pre>
+<p>From the <code>05-memory-marketplace-files.md</code> §Marketplace item yaml. Transitions</p>
+<p>(install, enable, disable, deprecate) and their triggers are not yet specified;</p>
+<p>mapping onto the existing plugin enable/disable endpoints is an open question.</p>
+<h2>APIs &amp; Events</h2>
+<h3>Implemented (in code today)</h3>
+<table><thead><tr><th>API</th><th>Use by the shell</th><th>Source</th></tr></thead><tbody>
+<tr><td><code>GET /api/status</code> → <code>StatusResponse</code></td><td>Status strip + footer version; 10s poll</td><td><code>web/src/lib/api.ts:155</code>, <code>hermes_cli/web_server.py:569</code></td></tr>
+<tr><td><code>GET /api/config</code></td><td>Reads <code>dashboard.show_token_analytics</code> to gate the Analytics nav entry</td><td><code>web/src/App.tsx</code></td></tr>
+<tr><td><code>GET /api/dashboard/plugins</code> → <code>PluginManifest[]</code></td><td>Plugin nav tabs; filters <code>dashboard.hidden_plugins</code></td><td><code>hermes_cli/web_server.py:4388</code></td></tr>
+<tr><td><code>GET /api/dashboard/plugins/rescan</code>, <code>GET /api/dashboard/plugins/hub</code>, <code>POST /api/dashboard/plugins/{name}/visibility</code>, plugin install/enable/disable/update/delete</td><td>Plugin management feeding nav visibility</td><td><code>hermes_cli/web_server.py:4403-4673</code></td></tr>
+<tr><td><code>GET /dashboard-plugins/{plugin}/{file}</code></td><td>Plugin JS/CSS asset serving</td><td><code>hermes_cli/web_server.py:4673</code></td></tr>
+<tr><td><code>POST /api/actions/...</code>, <code>GET /api/actions/{name}/status?lines=</code></td><td>Restart/update progress</td><td><code>web/src/lib/api.ts:~387</code></td></tr>
+<tr><td><code>GET /api/auth/me</code>, <code>GET /api/auth/providers</code>, <code>POST /auth/logout</code></td><td>AuthWidget</td><td><code>web/src/components/AuthWidget.tsx</code></td></tr>
+<tr><td><code>GET /api/sessions?limit&amp;offset</code>, <code>GET /api/sessions/{id}/messages</code>, <code>DELETE /api/sessions/{id}</code>, FTS5 <code>searchSessions</code></td><td>Sessions page; feeds the future Tasks surface</td><td><code>web/src/lib/api.ts:177-321</code></td></tr>
+<tr><td>Gateway WS <code>/api/ws</code> (<code>session.create</code>/<code>session.resume</code>, <code>prompt.submit</code>, <code>slash.exec</code>) + <code>/api/events?channel=</code> fanout</td><td>Used by chat, not by the nav shell itself</td><td><code>web/src/components/ChatSidebar.tsx</code>, <code>docs/hermes-real-chat-agent-ui.md</code></td></tr>
+</tbody></table>
+<h3>Proposed (no code; required by the planned entries)</h3>
+<p>None of these endpoints exist. Shapes are unspecified unless noted.</p>
+<table><thead><tr><th>Surface</th><th>Needed contract</th><th>Spec source</th></tr></thead><tbody>
+<tr><td>Search</td><td>Cross-surface search API over messages, tasks, files, assets, memory, marketplace entries; per-type result card schema; ranking</td><td><code>05-memory-marketplace-files.md</code> §Search</td></tr>
+<tr><td>Tasks</td><td>Task listing with status, active jobs, output count, last user request, source — via <code>SessionInfo</code> extension or a new tasks API joined with media jobs</td><td><code>05-memory-marketplace-files.md</code> §Tasks</td></tr>
+<tr><td>Tasks restore</td><td><code>session.resume</code> restoring messages, active jobs, selected assets, task files (gateway contract exists on paper; web client does not implement job/asset restoration)</td><td><code>02-agent-runtime-contract.md</code> §Session Lifecycle</td></tr>
+<tr><td>Files</td><td>Listing, preview, promote-to-asset API; must never list skill-internal <code>references/</code></td><td><code>05-memory-marketplace-files.md</code> §Files, <code>docs/hermes-real-chat-agent-ui.md</code> §References</td></tr>
+<tr><td>Memory</td><td>List/edit/revoke API with provenance (source session, user vs inferred)</td><td><code>05-memory-marketplace-files.md</code> §Memory</td></tr>
+<tr><td>Marketplace</td><td>Catalog API (local checked-in catalog vs server catalog is an explicit open question)</td><td><code>05-memory-marketplace-files.md</code> §Marketplace, <code>06-delivery-plan.md</code> §Open Questions</td></tr>
+<tr><td>My office</td><td>Workspace/project entities and APIs; nothing exists in any layer</td><td><code>01-product-surface.md</code></td></tr>
+</tbody></table>
+<h2>Data Model</h2>
+<h3>Implemented entities</h3>
+<table><thead><tr><th>Entity</th><th>Fields</th><th>Persisted where</th></tr></thead><tbody>
+<tr><td><code>NavItem</code> (<code>web/src/App.tsx</code>)</td><td><code>path: string</code>, <code>label: string</code>, <code>labelKey?: string</code>, <code>icon: ComponentType</code></td><td>In-memory only (built per render)</td></tr>
+<tr><td><code>PluginManifest</code> (<code>web/src/plugins/types.ts</code>)</td><td><code>name</code>, <code>label</code>, <code>description</code>, <code>icon</code> (resolved via <code>ICON_MAP</code>, fallback Puzzle), <code>version</code>, `tab { path, position?: &#x27;end&#x27; \</td><td>&#x27;after:&lt;seg&gt;&#x27; \</td><td>&#x27;before:&lt;seg&gt;&#x27;, override?, hidden? }<code>, </code>slots?<code>, </code>entry<code>, </code>css?<code>, </code>has_api<code>, </code>integrity?<code>, </code>source`</td><td><code>plugins/&lt;name&gt;/dashboard/manifest.json</code> on disk; served by the backend</td></tr>
+<tr><td><code>StatusResponse</code> (<code>web/src/lib/api.ts</code>)</td><td><code>active_sessions: number</code>, <code>auth_required?</code>, <code>auth_providers?: string[]</code>, `gateway_state: string \</td><td>null<code>, </code>gateway_running: boolean<code>, </code>gateway_pid<code>, </code>gateway_exit_reason<code>, </code>gateway_health_url<code>, </code>gateway_platforms: Record&lt;string, PlatformStatus&gt;<code>, </code>gateway_updated_at<code>, </code>version<code>, </code>release_date<code>, </code>hermes_home<code>, </code>config_path<code>, </code>config_version<code>, </code>latest_config_version`</td><td>Computed by the backend per request</td></tr>
+<tr><td><code>SessionInfo</code> (<code>web/src/lib/api.ts</code>)</td><td><code>id</code>, `source: string \</td><td>null<code>, </code>model<code>, </code>title<code>, </code>started_at<code>, </code>ended_at<code>, </code>last_active<code>, </code>is_active<code>, </code>message_count<code>, </code>tool_call_count<code>, </code>input_tokens<code>, </code>output_tokens<code>, </code>preview<code>, </code>parent_session_id?`</td><td>Backend session store (FTS5-indexed messages)</td></tr>
+<tr><td><code>SystemAction</code> (<code>web/src/contexts/system-actions-context.ts</code>)</td><td>`&#x27;restart&#x27; \</td><td>&#x27;update&#x27;`</td><td>In-memory</td></tr>
+<tr><td>Plugin visibility</td><td><code>dashboard.hidden_plugins</code> list</td><td><code>config.yaml</code></td></tr>
+</tbody></table>
+<p><code>SessionInfo</code> is missing the spec task-row fields: status, active jobs, output</p>
+<p>count, last user request.</p>
+<h3>Planned entities (no code; fields from <code>05-memory-marketplace-files.md</code>)</h3>
+<table><thead><tr><th>Entity</th><th>Fields</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Marketplace item</td><td><code>id</code>, `kind (skill \</td><td>recipe \</td><td>template \</td><td>element_pack \</td><td>character_pack)<code>, </code>title<code>, </code>description<code>, </code>category<code>, </code>inputs_schema<code>, </code>output_type<code>, </code>required_tools<code>, </code>provider_constraints<code>, </code>version<code>, </code>status (installed \</td><td>available \</td><td>disabled \</td><td>deprecated)`</td><td>v1 may be a local catalog of checked-in skill metadata</td></tr>
+<tr><td>Memory entry</td><td>Implied, not formalized: category (user preferences, brand rules, project facts, prompt decisions, model preferences, rejected styles, safety notes), scope (user/workspace/project), source session, user-authored vs inferred flag</td><td>Must never store provider secrets; schema must be defined</td></tr>
+<tr><td>Task row</td><td><code>title</code>, session id, last user request, <code>status</code>, active jobs, output count, date, `source (web \</td><td>tui \</td><td>cli \</td><td>panel)`</td><td>Storage decision pending (extend <code>SessionInfo</code> vs new aggregate)</td></tr>
+<tr><td>File entry</td><td>category (uploaded original, downloaded web artifact, generated task file, log, prompt plan, storyboard sheet, rendered output), promotable-to-asset flag</td><td>Field types undefined; promotion is explicit, never automatic</td></tr>
+</tbody></table>
+<h2>UI Behavior</h2>
+<p>Implemented (all in <code>web/src/App.tsx</code> unless noted):</p>
+<ul>
+<li>Sidebar is <code>w-64</code>, full-height flex column: brand header (<code>h-14</code>) →</li>
+</ul>
+<p>scrollable nav (core items, then a &quot;Plugins&quot; group with heading) → &quot;System&quot;</p>
+<p>group (status strip + restart/update) → theme/language row → AuthWidget →</p>
+<p>footer.</p>
+<ul>
+<li><code>SidebarNavLink</code> is a react-router <code>NavLink</code>. Active state: midground text +</li>
+</ul>
+<p>1px left active bar (mix-blend plus-lighter). Hover overlay at 5% opacity,</p>
+<p>focus-visible ring, uppercase mondwest display font, truncated labels. Labels</p>
+<p>resolve via i18n <code>t.app.nav</code> (17 locale files).</p>
+<ul>
+<li>Plugin tabs honor <code>after:</code>/<code>before:</code>/<code>end</code> position hints and may override</li>
+</ul>
+<p>built-in routes. Overriding <code>/chat</code> suppresses the persistent embedded chat</p>
+<p>host; a <code>pluginsLoading</code> gate avoids killing the PTY mid-paint.</p>
+<ul>
+<li>Status strip: skeleton pulse while status is null; gateway label color-coded</li>
+</ul>
+<p>(success/warning/destructive/muted); the whole strip is a Link to <code>/sessions</code></p>
+<p>with a title tooltip (<code>SidebarStatusStrip.tsx</code>).</p>
+<ul>
+<li>System actions: spinner while pending/running, label swap (e.g. &quot;Restarting</li>
+</ul>
+<p>gateway…&quot;), sibling action disabled while one is busy; click navigates to</p>
+<p><code>/sessions</code> and closes the mobile drawer.</p>
+<ul>
+<li>Mobile: fixed top header with hamburger (<code>aria-expanded</code>, `aria-controls</li>
+</ul>
+<p>app-sidebar`); 200ms translate drawer animation; backdrop blur button; Escape</p>
+<p>close; body overflow lock; auto-close at ≥1024px.</p>
+<ul>
+<li>Accessibility present: <code>aria-label</code> on nav/aside, <code>aria-busy</code> on actions,</li>
+</ul>
+<p><code>role=group</code> + <code>aria-labelledby</code> on the plugin section.</p>
+<ul>
+<li>Analytics is hidden from nav when the config flag is off but stays</li>
+</ul>
+<p>URL-reachable with an explanation page (<code>pages/AnalyticsPage.tsx</code>).</p>
+<p>Planned (spec requirements on the future shell):</p>
+<ul>
+<li>The nav is the primary access path to durable workspace state, not a</li>
+</ul>
+<p>decorative sidebar (<code>01-product-surface.md</code>).</p>
+<ul>
+<li>Search results are typed by surface: &quot;a memory should not look like a file&quot;</li>
+</ul>
+<p>(<code>05-memory-marketplace-files.md</code> §Search).</p>
+<ul>
+<li>Clicking a Task row restores the full working context: transcript,</li>
+</ul>
+<p>active/complete jobs, task files, selected model, active skill profile,</p>
+<p>relevant memory (<code>05-memory-marketplace-files.md</code> §Tasks).</p>
+<ul>
+<li>Nothing renders from fake data; placeholder surfaces must not fake run/status</li>
+</ul>
+<p>panels (<code>06-delivery-plan.md</code> launch gates, <code>01-product-surface.md</code></p>
+<p>§Non-Goals).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Implemented:</p>
+<ul>
+<li>Auth is binary today: OAuth gate (<code>auth_required</code>) vs loopback/<code>--insecure</code>.</li>
+</ul>
+<p>AuthWidget shows the user id (truncated to 14 chars) + logout in gated mode</p>
+<p>and renders nothing in loopback. A 401 on <code>/api/auth/me</code> hides the widget; a</p>
+<p>network error shows &quot;auth status unavailable&quot; (<code>AuthWidget.tsx</code>).</p>
+<ul>
+<li>No per-nav-entry permissions exist. Plugin visibility is user config</li>
+</ul>
+<p>(<code>dashboard.hidden_plugins</code> in <code>config.yaml</code>), not permission-based.</p>
+<ul>
+<li>Plugin load failure: per-plugin <code>LOAD_FAILED</code> / <code>NO_REGISTER</code> states with</li>
+</ul>
+<p>i18n messages shown on the plugin page; network failures <code>console.warn</code>.</p>
+<ul>
+<li>SRI integrity is optional on plugin bundles; without it, tampered delivery</li>
+</ul>
+<p>executes silently (documented trade-off in <code>usePlugins.ts</code>).</p>
+<ul>
+<li>Known silent-degradation spots, candidate violations of the &quot;real blockers</li>
+</ul>
+<p>visible&quot; launch gate: <code>useSidebarStatus</code> catches fetch errors with no UI</p>
+<p>signal (the strip goes stale), and <code>getConfig</code> failure silently defaults</p>
+<p>Analytics off (<code>web/src/hooks/useSidebarStatus.ts</code>, <code>web/src/App.tsx</code>).</p>
+<p>Planned constraints:</p>
+<ul>
+<li><code>05-memory-marketplace-files.md</code> §Access Control requires permissions</li>
+</ul>
+<p>read/use/update/delete/revoke/share per surface; Marketplace items visible</p>
+<p>without being enabled; Memory scoped user/workspace/project; Files scoped</p>
+<p>session/project; shared conversations must not imply shared sandbox or</p>
+<p>credentials. No such model exists in code.</p>
+<ul>
+<li>Skill-internal <code>references/</code> must never appear in any file browser or export</li>
+</ul>
+<p>UI (<code>docs/hermes-real-chat-agent-ui.md</code> §References). This is a hard</p>
+<p>constraint on the future Files surface.</p>
+<ul>
+<li>Per-surface error contracts are required: stale or unavailable backing data</li>
+</ul>
+<p>must be visible in the shell, not silently swallowed.</p>
+<h2>Acceptance Criteria</h2>
+<p>Implemented behavior (verifiable today):</p>
+<ol>
+<li>Loading <code>/</code> in the dashboard redirects to <code>/sessions</code>; an unknown URL</li>
+</ol>
+<p>redirects to <code>/sessions</code> after plugins finish loading.</p>
+<ol>
+<li>At &lt;1024px the sidebar renders as a drawer: hamburger opens it, Escape and</li>
+</ol>
+<p>backdrop close it, body scroll is locked while open, and resizing to</p>
+<p>≥1024px auto-closes it.</p>
+<ol>
+<li>A plugin shipping <code>dashboard/manifest.json</code> with <code>tab.path</code> appears in the</li>
+</ol>
+<p>nav under the &quot;Plugins&quot; group at the position its hint requests (verify</p>
+<p>with <code>plugins/kanban</code>: <code>/kanban</code>, <code>after:skills</code>).</p>
+<ol>
+<li>With <code>dashboard.show_token_analytics</code> false (default), Analytics is absent</li>
+</ol>
+<p>from the nav but <code>/analytics</code> is still URL-reachable.</p>
+<ol>
+<li><code>/chat</code> appears in the nav only when launched as <code>hermes dashboard --tui</code>.</li>
+<li>The status strip reflects <code>gateway_state</code> from <code>GET /api/status</code> within one</li>
+</ol>
+<p>10s poll cycle, and shows a skeleton before the first response.</p>
+<p>Target behavior for the Ultra Studio shell (testable once built; currently all</p>
+<p>fail):</p>
+<ol>
+<li>The nav exposes New task, Search, My office, Marketplace, Files, Memory,</li>
+</ol>
+<p>and Tasks as entries; Marketplace, Files, Memory, and Tasks route to real</p>
+<p>surfaces (placeholders acceptable at P0, per <code>06-delivery-plan.md</code>).</p>
+<ol>
+<li>No placeholder surface renders fake data: a P0 placeholder shows an</li>
+</ol>
+<p>explicit empty/coming-soon state, never invented rows, counts, or statuses.</p>
+<ol>
+<li>A Tasks row shows title, status, active jobs, output count, date, and</li>
+</ol>
+<p>source; clicking it restores transcript, jobs, task files, model, and skill</p>
+<p>profile per <code>02-agent-runtime-contract.md</code>.</p>
+<ol>
+<li>Search returns typed result cards; a memory result is visually and</li>
+</ol>
+<p>structurally distinct from a file result.</p>
+<ol>
+<li>Marketplace lists installed and disabled items, not only available ones.</li>
+<li>Memory entries are inspectable and revocable from the Memory surface, and</li>
+</ol>
+<p>each shows its source session and user-authored vs inferred provenance.</p>
+<ol>
+<li>The Files surface never lists skill-internal <code>references/</code> paths.</li>
+<li>A failure to load the data behind any nav surface produces a visible error</li>
+</ol>
+<p>state in that surface, not a stale or silently empty view.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Do not merge Marketplace, Memory, and Files into one generic &quot;Assets&quot; page</li>
+</ul>
+<p>(<code>01-product-surface.md</code> §Non-Goals).</p>
+<ul>
+<li>No raw provider dashboards inside the shell (<code>01-product-surface.md</code></li>
+</ul>
+<p>§Non-Goals).</p>
+<ul>
+<li>No fake run/status panel disconnected from Hermes events</li>
+</ul>
+<p>(<code>01-product-surface.md</code> §Non-Goals).</p>
+<ul>
+<li>This spec does not define pricing/account page content; pricing copy is out</li>
+</ul>
+<p>of pack scope (<code>00-index.md</code>). Only the nav entry&#x27;s existence is in</p>
+<p>question (see Open Questions).</p>
+<ul>
+<li>This spec does not define the internal page contracts of Marketplace, Files,</li>
+</ul>
+<p>Memory, Tasks (owned by <code>05-memory-marketplace-files.md</code>) or media job</p>
+<p>states (owned by <code>03-media-asset-contract.md</code>).</p>
+<ul>
+<li>No public app store at v1: Marketplace may start as a local catalog of</li>
+</ul>
+<p>checked-in skill metadata (<code>05-memory-marketplace-files.md</code> §Marketplace).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Build mechanism: extend <code>BUILTIN_ROUTES_CORE</code>/<code>BUILTIN_NAV_REST</code> in</li>
+</ol>
+<p><code>App.tsx</code>, ship the seven entries as dashboard plugins (the manifest system</p>
+<p>already supports position/override/hidden), or fork a separate Ultra shell?</p>
+<p>The specs do not choose.</p>
+<ol>
+<li>Do the 12 existing Hermes admin nav entries stay, get grouped under an</li>
+</ol>
+<p>admin section, or get hidden for Ultra Studio users — and by what gate</p>
+<p>(config flag like <code>show_token_analytics</code>, profile, or auth role)?</p>
+<ol>
+<li>What exactly is a P0 &quot;placeholder&quot; for Tasks/Files/Memory/Marketplace —</li>
+</ol>
+<p>empty routed page, disabled nav item, or coming-soon card? Launch gates</p>
+<p>forbid fake data, so placeholder content rules matter.</p>
+<ol>
+<li>&quot;New task&quot;: create a session immediately via gateway <code>session.create</code>, or</li>
+</ol>
+<p>navigate to an empty composer? How does it interact with the embedded-chat</p>
+<p>flag, which today requires <code>hermes dashboard --tui</code>? Ultra Studio</p>
+<p>presumably needs the chat surface without the TUI flag.</p>
+<ol>
+<li>Search form factor (command palette vs page) and API: extend FTS5 session</li>
+</ol>
+<p>search or build a new typed cross-surface index? What are the result-card</p>
+<p>schemas per type?</p>
+<ol>
+<li>&quot;My office&quot;: what entities back &quot;workspace / shared projects&quot;? No workspace</li>
+</ol>
+<p>or project model exists anywhere in the codebase.</p>
+<ol>
+<li>Tasks: extend <code>SessionInfo</code> (+<code>status</code>, <code>active_jobs</code>, <code>output_count</code>,</li>
+</ol>
+<p><code>last_user_request</code>) or introduce a separate task aggregate joining</p>
+<p>sessions with media jobs from <code>03-media-asset-contract.md</code>?</p>
+<ol>
+<li>Marketplace MVP source: local checked-in catalog vs server catalog</li>
+</ol>
+<p>(explicit open question in <code>06-delivery-plan.md</code>); reuse</p>
+<p><code>/api/dashboard/plugins/hub</code> + skills machinery or build a new catalog</p>
+<p>service? How does <code>installed | available | disabled | deprecated</code> map onto</p>
+<p>existing plugin enable/disable endpoints?</p>
+<ol>
+<li>Memory default scope: project-scoped vs user-scoped with project filters</li>
+</ol>
+<p>(explicit open question in <code>06-delivery-plan.md</code>); where does the dashboard</p>
+<p>read memory from? <code>plugins/memory</code> is an agent plugin with no dashboard</p>
+<p>API.</p>
+<ol>
+<li>Do Task Files and the Asset Library share storage keys or separate buckets</li>
+</ol>
+<p>(<code>06-delivery-plan.md</code> open question), and which existing store</p>
+<p>(<code>dashboard-uploads/</code>, sandbox) backs the Files page?</p>
+<ol>
+<li>Is &quot;Pricing / account&quot; in scope for this component at all? <code>00-index.md</code></li>
+</ol>
+<p>lists pricing copy as out of scope, but the IA tree includes the entry.</p>
+<ol>
+<li>Should nav entries show live badges (running job counts, unread</li>
+</ol>
+<p>approvals), and should they be event-driven via <code>/api/events</code> instead of</p>
+<p>the current 10s <code>/api/status</code> poll?</p>
+<ol>
+<li>Branding: how does the shell switch from &quot;Hermes Agent&quot; to Ultra Studio</li>
+</ol>
+<p>branding — theme <code>layoutVariant</code>, i18n brand key, or build-time flag?</p>
+<ol>
+<li>Task restore failure behavior: <code>02-agent-runtime-contract.md</code> defines what</li>
+</ol>
+<p><code>session.resume</code> restores, but partial-restore and missing-sandbox</p>
+<p>behavior is unspecified, and the web client implements none of the</p>
+<p>job/asset restoration today.</p>
+<ol>
+<li>Mobile IA: <code>01-product-surface.md</code> specifies a three-pane layout, but no</li>
+</ol>
+<p>responsive behavior is defined for 7+ nav entries plus the inspector on</p>
+<p>small screens; current code only handles the nav drawer.</p>
+</main></div>
+</body>
+</html>

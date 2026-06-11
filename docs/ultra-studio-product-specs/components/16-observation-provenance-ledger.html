@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observation / Provenance Ledger</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Observation / Provenance Ledger</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="16-observation-provenance-ledger.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Observation / Provenance Ledger</h1>
+<p>Status: spec-only as a unified component — no ledger service exists;</p>
+<p>substantial adjacent machinery is implemented (insights DB, persisted tool</p>
+<p>results, skill write-origin provenance, Langfuse tracing plugin), and the</p>
+<p>asset-side audit/lineage tables are designed in the asset library doc.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/00-index.md</code> (product shape:</li>
+</ul>
+<p>&quot;artifact/provenance ledgers&quot;; §Top-Level Acceptance: &quot;The agent cannot</p>
+<p>claim completion without an artifact, observation, or ledger record&quot;),</p>
+<p><code>02-agent-runtime-contract.md</code> (§Acceptance), <code>03-media-asset-contract.md</code></p>
+<p>(§QA observed-vs-inferred, §Lineage), <code>06-delivery-plan.md</code> (P2 item 8,</p>
+<p>P2 gate &quot;Browser/downloaded artifacts are captured with provenance&quot;),</p>
+<p><code>docs/hermes-asset-library-backend-design.md</code> (<code>asset_audit_events</code>,</p>
+<p><code>asset_lineage</code>), <code>docs/hermes-tokenrouter-credential-flow.md</code></p>
+<p>(§可观测性)</p>
+<ul>
+<li>Code (adjacent, verified this session): <code>agent/insights.py</code></li>
+</ul>
+<p>(<code>InsightsEngine</code> over a sessions/tool/skill usage DB),</p>
+<p><code>tools/tool_result_storage.py</code> (<code>maybe_persist_tool_result</code>),</p>
+<p><code>tools/skill_provenance.py</code> (<code>set_current_write_origin</code>,</p>
+<p><code>get_current_write_origin</code>, <code>is_background_review</code>),</p>
+<p><code>agent/trajectory.py</code>, <code>plugins/observability/langfuse/</code>,</p>
+<p><code>gateway/shutdown_forensics.py</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>The ledger is the anti-fabrication backbone: a durable record of what the</p>
+<p>agent actually observed and did, so completion claims are checkable. The</p>
+<p>top-level product acceptance depends on it: &quot;The agent cannot claim</p>
+<p>completion without an event, artifact, or ledger record&quot; (<code>00-index.md</code>).</p>
+<p>Two record families:</p>
+<ol>
+<li>Observations — verifiable facts captured at tool boundaries: file</li>
+</ol>
+<p>exists, media downloadable, duration/dimensions, job succeeded</p>
+<p>(<code>03-media-asset-contract.md</code> §QA &quot;Observed&quot; list).</p>
+<ol>
+<li>Provenance — where things came from and who/what acted: artifact</li>
+</ol>
+<p>origins (browser downloads, generation lineage), actor attribution</p>
+<p>(user vs agent vs background process), decision references (approvals,</p>
+<p>TokenRouter decisions).</p>
+<p>Scope: the ledger record model, write points, query surface, and retention.</p>
+<p>Asset lineage tables stay owned by the Asset Service; this component</p>
+<p>defines the cross-cutting record contract and the run-level ledger that</p>
+<p>joins them.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented (adjacent)</td><td>Sessions / tool usage / skill usage analytics DB with queries</td><td><code>agent/insights.py</code> (<code>_get_sessions</code>, <code>_get_tool_usage</code>, <code>_get_skill_usage</code>)</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Oversized tool results persisted as durable artifacts with previews</td><td><code>tools/tool_result_storage.py</code> (<code>maybe_persist_tool_result</code>)</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Write-origin attribution for skill writes (user vs background)</td><td><code>tools/skill_provenance.py</code> (<code>set_current_write_origin</code>, <code>is_background_review</code>)</td></tr>
+<tr><td>Implemented (adjacent)</td><td>Trajectory capture</td><td><code>agent/trajectory.py</code></td></tr>
+<tr><td>Implemented (adjacent)</td><td>External tracing integration</td><td><code>plugins/observability/langfuse/</code></td></tr>
+<tr><td>Implemented (adjacent)</td><td>Gateway shutdown forensics (crash evidence)</td><td><code>gateway/shutdown_forensics.py</code></td></tr>
+<tr><td>Specified, not built</td><td>Unified observation records at tool boundaries (typed observed facts)</td><td><code>03-media-asset-contract.md</code> §QA; no observation store exists (rg `observation</td><td>provenance</td><td>ledger` — doc hits only)</td></tr>
+<tr><td>Specified, not built</td><td>Run-level ledger joining events, artifacts, approvals, jobs</td><td><code>00-index.md</code> product shape; <code>06-delivery-plan.md</code> P2 item 8</td></tr>
+<tr><td>Specified, not built</td><td>Browser/downloaded artifact provenance capture</td><td><code>06-delivery-plan.md</code> P2 gate</td></tr>
+<tr><td>Specified (asset-side)</td><td><code>asset_audit_events</code> + <code>asset_lineage</code> tables</td><td><code>hermes-asset-library-backend-design.md</code> §核心实体 — owned by <code>09-asset-service.md</code></td></tr>
+<tr><td>Specified (control-plane)</td><td>TokenRouter per-request decision logging (request/run/tool ids, policy reason, quota delta)</td><td><code>hermes-tokenrouter-credential-flow.md</code> §可观测性 — owned by <code>17-tokenrouter.md</code>, joined here by ids</td></tr>
+<tr><td>Gap</td><td>Completion-claim enforcement: nothing today programmatically blocks &quot;done&quot; claims lacking records</td><td><code>00-index.md</code> acceptance has no enforcement point yet</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<p>Not a primary surface; reached through:</p>
+<ul>
+<li>Inspector &quot;QA result and observed evidence&quot; panel for a selected</li>
+</ul>
+<p>job/asset (<code>01-product-surface.md</code> §Right) — reads observations.</p>
+<ul>
+<li>Asset detail audit tab (<code>08-asset-library-ui.md</code>) — reads asset audit</li>
+</ul>
+<p>events.</p>
+<ul>
+<li>&quot;Why did this fail?&quot; flows — repair planning reads provenance + provider</li>
+</ul>
+<p>evidence (<code>03-media-asset-contract.md</code> §Lineage purpose).</p>
+<ul>
+<li>Admin/debug: insights/analytics pages (implemented:</li>
+</ul>
+<p><code>web/src/pages/AnalyticsPage.tsx</code> consumes the insights engine) and</p>
+<p>Langfuse traces where configured.</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Tool/session/skill usage records queryable by time window</td><td>Implemented (insights DB)</td></tr>
+<tr><td>Durable artifacts for large tool outputs</td><td>Implemented (<code>tool_result_storage</code>)</td></tr>
+<tr><td>Actor attribution on skill writes</td><td>Implemented (<code>skill_provenance</code>)</td></tr>
+<tr><td>Typed observation records (<code>file_exists</code>, <code>media_downloadable</code>, <code>dimensions</code>, <code>duration</code>, <code>thumbnail_present</code>, <code>job_succeeded</code>)</td><td>Planned</td></tr>
+<tr><td>Observation-backed QA verdicts (observed vs inferred separation)</td><td>Planned (contract in <code>03-media-asset-contract.md</code> §QA)</td></tr>
+<tr><td>Run ledger: ordered record of events/tools/jobs/approvals per run id</td><td>Planned</td></tr>
+<tr><td>Browser/download artifact provenance (source URL, capture time, session)</td><td>Planned</td></tr>
+<tr><td>Cross-component joins by <code>request_id</code> / <code>run_id</code> / <code>tool_call_id</code> / <code>job_id</code></td><td>Planned (id fields already appear in MediaJob envelope and TokenRouter logging specs)</td></tr>
+<tr><td>Completion-claim gate (agent claims checked against ledger)</td><td>Planned</td></tr>
+<tr><td>Retention and export policy</td><td>Planned</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Ledger records are append-only facts; they do not transition. The</p>
+<p>meaningful lifecycle is the QA verdict that consumes them:</p>
+<pre><code class="language-text">job/asset event
+  -&gt; observations captured (system, at tool boundary)
+  -&gt; verdict: observed_ok | observed_failed   (facts only)
+  -&gt; inferred quality layered separately      (model/user judgment)</code></pre>
+<p>Rules:</p>
+<ul>
+<li>Records are immutable once written; corrections append, never rewrite.</li>
+<li>An inferred judgment (prompt alignment, style fit) can never be stored as</li>
+</ul>
+<p>an observation — the two lists in <code>03-media-asset-contract.md</code> §QA are</p>
+<p>disjoint by construction.</p>
+<ul>
+<li>Absence of observation is reported as &quot;unverified&quot;, not as failure or</li>
+</ul>
+<p>success.</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (adjacent): insights queries (`InsightsEngine.generate(days,</p>
+<p>source)`), tool-result persistence on the tool channel, Langfuse export.</p>
+<p>Planned:</p>
+<pre><code class="language-http">GET /api/ledger/runs/{run_id}                 # ordered run ledger
+GET /api/ledger/observations?job_id=&amp;asset_id=
+GET /api/assets/{asset_id}/audit              # asset-side (Asset Service)</code></pre>
+<p>Write points (internal, planned):</p>
+<ul>
+<li>Tool executor boundary: after each media-relevant tool completes, capture</li>
+</ul>
+<p>typed observations (sizes, durations, URLs verified fetchable).</p>
+<ul>
+<li>Job finalize: observations for outputs (exists, dimensions, thumbnail).</li>
+<li>Approval resolution: provenance record linking decision to payload hash</li>
+</ul>
+<p>(<code>15-human-approval-gateway.md</code>).</p>
+<ul>
+<li>Browser/download tools: source URL + capture context.</li>
+</ul>
+<p>No new gateway event class: ledger writes are silent; surfaces read them on</p>
+<p>demand.</p>
+<h2>Data Model</h2>
+<p>Planned core records:</p>
+<pre><code class="language-text">observations
+- observation_id
+- run_id, session_id, tool_call_id, job_id?, asset_id?
+- kind: file_exists | media_downloadable | dimensions | duration
+        | thumbnail_present | job_succeeded | http_status | custom
+- value_json            (measured value, e.g. {w:1280,h:720})
+- evidence_ref          (artifact key / URL checked / command output ref)
+- observed_at
+
+provenance_records
+- record_id
+- subject: artifact | asset | message | decision
+- subject_id
+- origin: user_upload | generation | browser_download | tool_write
+          | external_import
+- actor: user | agent | background        (cf. skill_provenance origins)
+- source_detail (url, provider job id, parent ids)
+- run_id, session_id, created_at</code></pre>
+<p>Joins: <code>asset_lineage</code> and <code>asset_audit_events</code> (Asset Service) and</p>
+<p>TokenRouter decision logs are linked by shared ids, not duplicated here.</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Inspector QA panel renders observations as a checklist with evidence</li>
+</ul>
+<p>links (download check, dimensions, first frame) and clearly separates the</p>
+<p>inferred section (&quot;agent judgment&quot;), matching the observed/inferred split.</p>
+<ul>
+<li>The run ledger view (debug-level) shows the ordered timeline:</li>
+</ul>
+<p>prompt -&gt; route -&gt; tools -&gt; job -&gt; approval -&gt; asset, each row linking to</p>
+<p>its record.</p>
+<ul>
+<li>Unverified states render as &quot;unverified&quot;, never as a green check.</li>
+<li>No raw secrets or full provider payloads in ledger UI; evidence refs</li>
+</ul>
+<p>point to sanitized artifacts.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>Ledger reads follow the parent object&#x27;s scope (a user who can see the</li>
+</ul>
+<p>asset can see its observations/audit).</p>
+<ul>
+<li>Ledger writes are system-internal; failures on high-consequence paths</li>
+</ul>
+<p>fail closed: a finalize that cannot write its observation records must</p>
+<p>not report the job as verified-complete (mirrors TokenRouter&#x27;s</p>
+<p>audit-write fail-closed rule, <code>hermes-tokenrouter-credential-flow.md</code></p>
+<p>§失败行为).</p>
+<ul>
+<li>Errors: <code>ledger_unavailable</code> (degrades claims to &quot;unverified&quot; — visible,</li>
+</ul>
+<p>not silent), <code>observation_evidence_missing</code> (record without evidence ref</p>
+<p>rejected at write time).</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>For any completed media job, the inspector can show at least: output</li>
+</ul>
+<p>exists, downloadable, dimensions/duration, thumbnail — each backed by a</p>
+<p>stored observation with evidence (<code>03-media-asset-contract.md</code></p>
+<p>§Acceptance).</p>
+<ul>
+<li>The agent&#x27;s completion message for a generation links to a job/asset/</li>
+</ul>
+<p>observation record; a claim with no record is reproducibly flaggable</p>
+<p>(P2 enforcement point).</p>
+<ul>
+<li>A browser-downloaded artifact carries source URL provenance</li>
+</ul>
+<p>(<code>06-delivery-plan.md</code> P2 gate).</p>
+<ul>
+<li>Failed jobs have failure observations and remain inspectable.</li>
+<li>Records survive gateway restarts; immutability holds (no update path).</li>
+<li>TokenRouter decision ids on jobs resolve to decision log entries</li>
+</ul>
+<p>(once both exist).</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Replacing analytics (insights) or external tracing (Langfuse) — the</li>
+</ul>
+<p>ledger is product evidence, not telemetry; they may share storage but not</p>
+<p>contracts.</p>
+<ul>
+<li>Full conversation archival (transcripts are session data).</li>
+<li>Automated visual quality scoring as &quot;observation&quot; — defects/style are</li>
+</ul>
+<p>inferred judgments by definition.</p>
+<ul>
+<li>Tamper-proof cryptographic audit (append-only DB discipline suffices for</li>
+</ul>
+<p>MVP; signing is future work).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Storage: extend the existing insights DB schema vs a separate ledger</li>
+</ol>
+<p>store — one DB with two contracts risks coupling analytics churn to</p>
+<p>evidence durability.</p>
+<ol>
+<li>Enforcement mechanism for the completion-claim gate: prompt-level rule,</li>
+</ol>
+<p>gateway check on final messages, or eval-time audit?</p>
+<ol>
+<li>Observation capture cost: synchronous at tool boundary (adds latency) vs</li>
+</ol>
+<p>async with eventual evidence — which kinds must be synchronous</p>
+<p>(<code>job_succeeded</code>)?</p>
+<ol>
+<li>Retention: do observations expire with sessions, with assets, or never?</li>
+</ol>
+<p>Export format for compliance/debugging?</p>
+<ol>
+<li>How much of Langfuse&#x27;s trace model can back the run ledger before a</li>
+</ol>
+<p>native store exists (it is plugin-optional, so the ledger cannot</p>
+<p>require it)?</p>
+<ol>
+<li>Who writes browser-artifact provenance — the browser tools directly, or</li>
+</ol>
+<p>a download-intake path shared with Files (<code>06-files-task-file-browser.md</code></p>
+<p>Open Question 4)?</p>
+</main></div>
+</body>
+</html>

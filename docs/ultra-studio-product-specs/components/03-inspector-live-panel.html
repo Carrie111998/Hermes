@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inspector / Live Panel</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Inspector / Live Panel</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="03-inspector-live-panel.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Inspector / Live Panel</h1>
+<p>Status: partial — a generic chat/session inspector is implemented; the creative-asset</p>
+<p>inspector (selection, asset preview, QA, lineage, download, element/character actions)</p>
+<p>is spec-only with zero implementation.</p>
+<p>Date: 2026-06-10</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/00-index.md</code>,</li>
+</ul>
+<p><code>01-product-surface.md</code>, <code>02-agent-runtime-contract.md</code>,</p>
+<p><code>03-media-asset-contract.md</code>, <code>05-memory-marketplace-files.md</code>,</p>
+<p><code>06-delivery-plan.md</code></p>
+<ul>
+<li>Code: <code>web/src/components/chat/ChatInspector.tsx</code>,</li>
+</ul>
+<p><code>web/src/components/chat/PendingPromptPanel.tsx</code>,</p>
+<p><code>web/src/components/chat/contracts.ts</code>, <code>web/src/components/ToolCall.tsx</code>,</p>
+<p><code>web/src/hooks/useGatewayChat.ts</code>, <code>web/src/lib/gatewayClient.ts</code>,</p>
+<p><code>web/src/pages/ChatPage.tsx</code>, <code>tui_gateway/server.py</code>,</p>
+<p><code>tools/image_generation_tool.py</code>, <code>tools/video_generation_tool.py</code>,</p>
+<p><code>hermes_cli/ultra_studio_skills.py</code>, <code>skills/creative/media-qa/SKILL.md</code>,</p>
+<p><code>skills/creative/prompt-repair/SKILL.md</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Inspector / Live Panel is the right rail of Ultra Studio. Per</p>
+<p><code>01-product-surface.md</code> it is a context panel for the currently selected job,</p>
+<p>asset, or tool run. It is not a second chat. It is closer to an IDE inspector or</p>
+<p>a Figma properties panel.</p>
+<p>The target spec scope:</p>
+<ul>
+<li>Current job status and progress.</li>
+<li>Provider/model and input constraints.</li>
+<li>Selected asset preview: prompt, seed, dimensions, duration, lineage.</li>
+<li>QA result with observed evidence.</li>
+<li>Download/export actions.</li>
+<li>Convert to Element. Create Character.</li>
+<li>Retry/repair plan on failure.</li>
+</ul>
+<p>What ships today is narrower: a fixed 320px aside on the chat page that shows the</p>
+<p>session card, pending input prompts (clarify/approval/sudo/secret), and a live</p>
+<p>tool-call feed. There is no selection model, no asset or media-job concept, no</p>
+<p>preview, no QA panel, no lineage, no download, and no element/character actions</p>
+<p>anywhere in <code>web/src</code> or the gateway.</p>
+<p>Boundary (per <code>05-memory-marketplace-files.md</code>): the inspector is for the</p>
+<p>selected object. Marketplace, Files, Memory, and Tasks browse durable workspace</p>
+<p>state. The inspector never becomes a general browser.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Capability</th><th>Status</th><th>Source</th></tr></thead><tbody>
+<tr><td>Session card: connection badge, model, session id, status line</td><td>Implemented</td><td><code>web/src/components/chat/ChatInspector.tsx</code></td></tr>
+<tr><td>Status priority <code>error ?? credential_warning ?? currentStatus</code></td><td>Implemented</td><td><code>ChatInspector.tsx</code> line 62</td></tr>
+<tr><td>Live tool-call feed (expandable rows, args/preview/summary/error/diff, elapsed timer)</td><td>Implemented</td><td><code>ChatInspector.tsx</code>, <code>web/src/components/ToolCall.tsx</code>, <code>web/src/hooks/useGatewayChat.ts</code></td></tr>
+<tr><td>Tool feed cap: last 24 entries</td><td>Implemented</td><td><code>useGatewayChat.ts</code> <code>TOOL_LIMIT = 24</code> (lines 22, 181)</td></tr>
+<tr><td>&quot;Input needed&quot; panel: clarify / approval / sudo / secret</td><td>Implemented</td><td><code>web/src/components/chat/PendingPromptPanel.tsx</code></td></tr>
+<tr><td>Tools empty state (&quot;no tool calls yet&quot;)</td><td>Implemented</td><td><code>ChatInspector.tsx</code></td></tr>
+<tr><td>Generation backend the inspector would describe (<code>image_generate</code>, <code>video_generate</code>, Atlas plugins)</td><td>Implemented (synchronous tools, not durable jobs)</td><td><code>tools/image_generation_tool.py</code>, <code>tools/video_generation_tool.py</code>, <code>plugins/{image,video}_gen/atlas</code></td></tr>
+<tr><td>QA/repair capability as prompt-layer skills (chat text only)</td><td>Implemented</td><td><code>skills/creative/media-qa/SKILL.md</code>, <code>skills/creative/prompt-repair/SKILL.md</code>, <code>hermes_cli/ultra_studio_skills.py</code></td></tr>
+<tr><td>Selection model (selected job / asset / tool run)</td><td>Specified, not built</td><td><code>01-product-surface.md</code> &quot;Right: Inspector / Live Panel&quot;</td></tr>
+<tr><td>Media job status/progress from <code>media_job.*</code> events</td><td>Specified, not built</td><td><code>02-agent-runtime-contract.md</code> &quot;Event Stream&quot;</td></tr>
+<tr><td>Asset preview with prompt/seed/dimensions/duration/lineage</td><td>Specified, not built</td><td><code>01-product-surface.md</code>, <code>03-media-asset-contract.md</code></td></tr>
+<tr><td>Provider/model constraints display (<code>ultra_media_constraints_get</code>)</td><td>Specified, not built</td><td><code>03-media-asset-contract.md</code> &quot;Required Job Tools&quot;</td></tr>
+<tr><td>QA panel: observed facts vs inferred quality</td><td>Specified, not built</td><td><code>03-media-asset-contract.md</code> &quot;QA&quot;</td></tr>
+<tr><td>Download/export using real storage URLs</td><td>Specified, not built</td><td><code>03-media-asset-contract.md</code> &quot;Acceptance&quot;</td></tr>
+<tr><td>Convert to Element / Create Character actions</td><td>Specified, not built</td><td><code>01-product-surface.md</code>; <code>06-delivery-plan.md</code> P1 item 7</td></tr>
+<tr><td>Retry/repair plan card on failure</td><td>Specified, not built</td><td><code>01-product-surface.md</code>; <code>06-delivery-plan.md</code> P1 item 5</td></tr>
+<tr><td>Failed-state view with typed provider error + logs</td><td>Specified, not built</td><td><code>01-product-surface.md</code> &quot;Required States&quot;; <code>02-agent-runtime-contract.md</code> &quot;Error Contract&quot;</td></tr>
+<tr><td>Refresh-safe approvals from durable state</td><td>Specified, not built (current approvals are in-process <code>threading.Event</code>)</td><td><code>02-agent-runtime-contract.md</code>; <code>tui_gateway/server.py</code> <code>_block()</code></td></tr>
+<tr><td>Mobile/narrow-viewport inspector</td><td>Open gap (spec silent; code hides panel below <code>lg</code>, including pending prompts)</td><td><code>ChatInspector.tsx</code> line 65</td></tr>
+<tr><td>Thinking/reasoning phase display</td><td>Open gap (gateway emits <code>thinking.delta</code>/<code>reasoning.delta</code>; web hook discards them)</td><td><code>tui_gateway/server.py</code>, <code>useGatewayChat.ts</code></td></tr>
+<tr><td>Tool history beyond 24 entries; tool feed rehydration after <code>session.resume</code></td><td>Open gap</td><td><code>useGatewayChat.ts</code></td></tr>
+<tr><td>Rendering for <code>subagent.*</code> and <code>background.complete</code> events</td><td>Open gap (emitted, unspecified, unrendered)</td><td><code>tui_gateway/server.py</code></td></tr>
+</tbody></table>
+<p>Planned behavior in this document is never shipped behavior. Anything below</p>
+<p>tagged Planned or Gap does not exist in code as of 2026-06-10.</p>
+<h2>User Entry Points</h2>
+<table><thead><tr><th>Entry</th><th>Status</th><th>Behavior</th></tr></thead><tbody>
+<tr><td>Open chat page at <code>lg+</code> viewport</td><td>Implemented</td><td>Inspector is always present as the right rail of <code>ChatPage</code>; no action to open or close it (<code>web/src/pages/ChatPage.tsx</code>).</td></tr>
+<tr><td>Agent requests input (clarify/approval/sudo/secret)</td><td>Implemented</td><td>&quot;Input needed&quot; card appears in the inspector; it is the only place to answer (<code>PendingPromptPanel.tsx</code>).</td></tr>
+<tr><td>Agent runs any tool</td><td>Implemented</td><td>Tool call appears live in the tools feed; user expands rows to inspect args/results/errors (<code>ToolCall.tsx</code>).</td></tr>
+<tr><td>Resume session via <code>?resume=&lt;id&gt;</code> URL param</td><td>Implemented</td><td>Inspector shows resumed session id/model, but empty tools list and no pending prompt (<code>ChatPage.tsx</code>, <code>useGatewayChat.ts</code>).</td></tr>
+<tr><td>Click &quot;inspect&quot; on a media/asset card</td><td>Planned</td><td>Inspector opens the asset with model/job/prompt/input details (<code>03-media-asset-contract.md</code> &quot;Asset Card UI&quot;, &quot;Acceptance&quot;).</td></tr>
+<tr><td>Select a running job</td><td>Planned</td><td>Inspector shows job details, model, inputs, progress (<code>01-product-surface.md</code> &quot;Required States&quot;, Creating row).</td></tr>
+<tr><td>Ask &quot;Why did this fail?&quot; / &quot;Download this&quot;</td><td>Planned</td><td>Inspector is the answer surface: job, status, error, QA, download (<code>01-product-surface.md</code> &quot;Main Jobs&quot;).</td></tr>
+<tr><td>Inspector actions: Download/export, Convert to Element, Create Character, Retry with repair plan</td><td>Planned</td><td><code>01-product-surface.md</code> &quot;Right: Inspector / Live Panel&quot;.</td></tr>
+</tbody></table>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Tag</th><th>Source</th></tr></thead><tbody>
+<tr><td>Session card: connection state badge (idle/connecting/live/closed/error), short model name, session id, current status line</td><td>Implemented</td><td><code>ChatInspector.tsx</code></td></tr>
+<tr><td>Status text priority: error &gt; credential_warning &gt; currentStatus</td><td>Implemented</td><td><code>ChatInspector.tsx</code> line 62</td></tr>
+<tr><td>Live tool-call feed: tool.start/progress/complete as expandable rows with name, context/args, streaming preview, result summary, error, inline diff, elapsed timer; error rows auto-expand</td><td>Implemented</td><td><code>ChatInspector.tsx</code>, <code>ToolCall.tsx</code>, <code>useGatewayChat.ts</code></td></tr>
+<tr><td>&quot;Input needed&quot; panel: clarify (free text + choice buttons), approval (approve once / approve session / deny, command preview), sudo password, secret value</td><td>Implemented</td><td><code>PendingPromptPanel.tsx</code></td></tr>
+<tr><td>Tools empty state</td><td>Implemented</td><td><code>ChatInspector.tsx</code></td></tr>
+<tr><td>Backend generation tools: <code>image_generate</code> / <code>video_generate</code> with Atlas provider plugins</td><td>Implemented</td><td><code>tools/*.py</code>, <code>plugins/{image,video}_gen/atlas</code></td></tr>
+<tr><td>Backend QA/repair as prompt-layer skills (media-qa scorecard, prompt-repair retry plan) — output is chat text, not inspector data</td><td>Implemented</td><td><code>skills/creative/media-qa</code>, <code>skills/creative/prompt-repair</code></td></tr>
+<tr><td>Selection model: inspector bound to currently selected job, asset, or tool run</td><td>Planned</td><td><code>01-product-surface.md</code>; no selection state in code</td></tr>
+<tr><td>Media job status + progress from <code>media_job.created/updated</code></td><td>Planned</td><td><code>02-agent-runtime-contract.md</code>; events and job system do not exist</td></tr>
+<tr><td>Selected asset preview with prompt, seed, dimensions, duration, lineage</td><td>Planned</td><td><code>01-product-surface.md</code>, <code>03-media-asset-contract.md</code></td></tr>
+<tr><td>Provider/model + input constraints display (<code>ultra_media_constraints_get</code>)</td><td>Planned</td><td><code>03-media-asset-contract.md</code></td></tr>
+<tr><td>QA result panel separating observed evidence from inferred quality</td><td>Planned</td><td><code>03-media-asset-contract.md</code> &quot;QA&quot;</td></tr>
+<tr><td>Download / export using real storage URLs</td><td>Planned</td><td><code>03-media-asset-contract.md</code> &quot;Acceptance&quot;</td></tr>
+<tr><td>Convert to Element action</td><td>Planned</td><td><code>01-product-surface.md</code>; <code>06-delivery-plan.md</code> P1 item 7</td></tr>
+<tr><td>Create Character action</td><td>Planned</td><td><code>01-product-surface.md</code>; <code>06-delivery-plan.md</code> P1 item 7</td></tr>
+<tr><td>Retry / repair plan surface on failed generation, fed by prompt-repair</td><td>Planned</td><td><code>01-product-surface.md</code>; <code>06-delivery-plan.md</code> P1 item 5</td></tr>
+<tr><td>Failed-state view with typed provider error + logs</td><td>Planned</td><td><code>01-product-surface.md</code> &quot;Required States&quot;; <code>02-agent-runtime-contract.md</code> &quot;Error Contract&quot;</td></tr>
+<tr><td>&quot;Waiting for user&quot; state with missing-field context (today only raw question text shows)</td><td>Planned</td><td><code>01-product-surface.md</code> &quot;Required States&quot;</td></tr>
+<tr><td>Approval requests surviving page refresh via durable state</td><td>Planned</td><td><code>02-agent-runtime-contract.md</code>; current code loses them on refresh</td></tr>
+<tr><td>Mobile/narrow-viewport inspector (panel and pending prompts hidden below <code>lg</code>, no fallback)</td><td>Gap</td><td><code>ChatInspector.tsx</code> line 65; spec silent</td></tr>
+<tr><td>Thinking/reasoning phase display (&quot;Thinking&quot; state row); gateway events exist, hook discards</td><td>Gap</td><td><code>01-product-surface.md</code>; <code>useGatewayChat.ts</code></td></tr>
+<tr><td>Tool history beyond 24 entries; tool feed hydration after <code>session.resume</code></td><td>Gap</td><td><code>useGatewayChat.ts</code>; neither spec&#x27;d nor implemented</td></tr>
+<tr><td>Inspector behavior for <code>subagent.*</code> and <code>background.complete</code> events</td><td>Gap</td><td><code>tui_gateway/server.py</code>; unspecified and unrendered</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>The inspector itself holds no persisted state. It mirrors four state machines.</p>
+<p>Three are implemented; the asset/job machines are planned.</p>
+<h3>Connection state (implemented)</h3>
+<p><code>web/src/lib/gatewayClient.ts</code>; surfaced as the inspector badge via</p>
+<p><code>STATE_LABEL</code>/<code>STATE_TONE</code> in <code>ChatInspector.tsx</code>.</p>
+<pre><code class="language-text">idle -&gt; connecting -&gt; open -&gt; closed | error</code></pre>
+<p>Triggered by: page load and the Reconnect button (user), WebSocket lifecycle</p>
+<p>(transport).</p>
+<h3>Tool call state (implemented)</h3>
+<p><code>useGatewayChat.ts</code>, <code>ToolCall.tsx</code>. Triggered by gateway events emitted by the</p>
+<p>agent runtime.</p>
+<table><thead><tr><th>From</th><th>To</th><th>Trigger</th></tr></thead><tbody>
+<tr><td>(none)</td><td><code>running</code></td><td><code>tool.start</code></td></tr>
+<tr><td><code>running</code></td><td><code>running</code> (preview update)</td><td><code>tool.progress</code></td></tr>
+<tr><td><code>running</code></td><td><code>done</code></td><td><code>tool.complete</code> without error payload</td></tr>
+<tr><td><code>running</code></td><td><code>error</code></td><td><code>tool.complete</code> with error payload</td></tr>
+</tbody></table>
+<h3>Pending prompt lifecycle (implemented)</h3>
+<table><thead><tr><th>Step</th><th>Trigger</th><th>Effect</th></tr></thead><tbody>
+<tr><td>Prompt raised</td><td>gateway <code>clarify.request</code> / <code>approval.request</code> / <code>sudo.request</code> / <code>secret.request</code></td><td><code>pendingPrompt</code> set, <code>running=true</code>, card renders</td></tr>
+<tr><td>Prompt answered</td><td>user responds via respond RPC</td><td><code>pendingPrompt</code> cleared, status becomes <code>running</code> or <code>denied</code></td></tr>
+<tr><td>Interrupt</td><td>user <code>session.interrupt</code></td><td><code>_clear_pending</code> releases the owning session&#x27;s prompts; status <code>interrupted</code></td></tr>
+<tr><td>Timeout</td><td>server-side (clarify 300s, sudo 120s)</td><td>blocking <code>threading.Event</code> returns empty answer</td></tr>
+</tbody></table>
+<p>Server side is an in-process blocking call (<code>_block()</code> in</p>
+<p><code>tui_gateway/server.py</code> ~lines 728-740). State is lost on page refresh; see</p>
+<p>Permissions &amp; Error Handling.</p>
+<h3>Server session live status (implemented)</h3>
+<p><code>_session_live_status</code> in <code>tui_gateway/server.py</code> (~line 2500):</p>
+<p><code>waiting</code> (pending prompt) | <code>starting</code> (agent not ready) | <code>working</code> (running) |</p>
+<p><code>idle</code>.</p>
+<h3>Required product states (planned)</h3>
+<p><code>01-product-surface.md</code> &quot;Required States&quot; defines six per-state inspector</p>
+<p>behaviors. Only partial mapping exists today (status text + pending prompt).</p>
+<table><thead><tr><th>State</th><th>Inspector must show</th><th>Today</th></tr></thead><tbody>
+<tr><td>Empty</td><td>Nothing selected</td><td>Approximated by &quot;no session&quot; / empty tools</td></tr>
+<tr><td>Thinking</td><td>Current reasoning phase</td><td>Not rendered (events discarded)</td></tr>
+<tr><td>Waiting for user</td><td>Missing-field context</td><td>Raw question text only</td></tr>
+<tr><td>Creating</td><td>Job details, model, inputs</td><td>Not built</td></tr>
+<tr><td>Complete</td><td>Asset details and actions</td><td>Not built</td></tr>
+<tr><td>Failed</td><td>Provider error, logs, repair plan</td><td>Not built</td></tr>
+</tbody></table>
+<h3>Asset and job lifecycles the inspector must mirror (planned)</h3>
+<p>From <code>03-media-asset-contract.md</code>. No code exists.</p>
+<pre><code class="language-text">Asset:  uploading -&gt; processing -&gt; ready -&gt; archived
+        failure states: failed | revoked | deleted
+Job:    job.created -&gt; job.running -&gt; job.succeeded -&gt; asset.processing -&gt; asset.ready</code></pre>
+<p>The full <code>MediaJob.status</code> enum (queued? cancelled? timed_out?) and the</p>
+<p>cancel/retry transitions are unspecified; see Open Questions.</p>
+<h2>APIs &amp; Events</h2>
+<h3>WS JSON-RPC methods used by the inspector surface (implemented)</h3>
+<p>Transport: JSON-RPC over WebSocket at <code>/api/ws</code></p>
+<p>(<code>web/src/lib/gatewayClient.ts</code>; handlers in <code>tui_gateway/server.py</code>).</p>
+<table><thead><tr><th>Method</th><th>Payload</th><th>Used for</th></tr></thead><tbody>
+<tr><td><code>session.create</code></td><td>—</td><td>New session</td></tr>
+<tr><td><code>session.resume</code></td><td><code>{session_id}</code></td><td>Returns <code>{session_id, resumed, message_count, messages, info}</code> only; does not re-emit pending prompts or replay tool entries</td></tr>
+<tr><td><code>prompt.submit</code></td><td><code>{session_id, text}</code></td><td>Send user message</td></tr>
+<tr><td><code>session.interrupt</code></td><td>—</td><td>Clears pending prompt</td></tr>
+<tr><td><code>clarify.respond</code></td><td><code>{request_id, answer}</code></td><td>Answer clarify card</td></tr>
+<tr><td><code>approval.respond</code></td><td><code>{session_id, choice, all}</code></td><td>choices <code>once</code>/<code>session</code>/<code>deny</code>; <code>all: choice===&#x27;session&#x27;</code></td></tr>
+<tr><td><code>sudo.respond</code></td><td><code>{request_id, password}</code></td><td>Sudo card</td></tr>
+<tr><td><code>secret.respond</code></td><td><code>{request_id, value}</code></td><td>Secret card</td></tr>
+<tr><td><code>image.attach</code>, <code>input.detect_drop</code></td><td>—</td><td>Chat input, adjacent to inspector</td></tr>
+</tbody></table>
+<h3>Gateway events consumed by inspector state (implemented)</h3>
+<p>From <code>useGatewayChat.ts</code>:</p>
+<table><thead><tr><th>Event</th><th>Payload (relevant fields)</th></tr></thead><tbody>
+<tr><td><code>session.info</code></td><td><code>{cwd?, model?, provider?, profile_name?, credential_warning?}</code></td></tr>
+<tr><td><code>status.update</code></td><td><code>{text, kind}</code></td></tr>
+<tr><td><code>tool.start</code></td><td><code>{tool_id, name, context}</code></td></tr>
+<tr><td><code>tool.progress</code></td><td>`{tool_id\</td><td>name, preview}`</td></tr>
+<tr><td><code>tool.complete</code></td><td><code>{tool_id, summary, error, inline_diff}</code></td></tr>
+<tr><td><code>clarify.request</code></td><td><code>{request_id, question, choices}</code></td></tr>
+<tr><td><code>approval.request</code></td><td><code>{command, description}</code></td></tr>
+<tr><td><code>sudo.request</code></td><td><code>{request_id}</code></td></tr>
+<tr><td><code>secret.request</code></td><td><code>{request_id, env_var, prompt}</code></td></tr>
+<tr><td><code>error</code></td><td><code>{message}</code> (free text, untyped)</td></tr>
+</tbody></table>
+<h3>Emitted but unconsumed by the inspector (implemented backend, gap frontend)</h3>
+<p><code>tui_gateway/server.py</code> <code>_emit()</code> also produces: <code>thinking.delta</code>,</p>
+<p><code>reasoning.delta</code>, <code>reasoning.available</code>, <code>tool.generating</code>,</p>
+<p><code>background.complete</code>, <code>subagent.*</code>, <code>message.start/delta/complete</code>,</p>
+<p><code>skin.changed</code>. None are handled by <code>useGatewayChat.ts</code>.</p>
+<h3>Proposed events and tools (planned, zero code)</h3>
+<p>From <code>02-agent-runtime-contract.md</code> &quot;Event Stream&quot; and</p>
+<p><code>03-media-asset-contract.md</code> &quot;Required Job Tools&quot;. A repo-wide search excluding</p>
+<p>docs returns no implementation.</p>
+<table><thead><tr><th>Surface</th><th>Items</th></tr></thead><tbody>
+<tr><td>Events</td><td><code>media_job.created</code>, <code>media_job.updated</code>, <code>asset.ready</code>, <code>approval.requested</code>, <code>approval.resolved</code></td></tr>
+<tr><td>Job tools</td><td><code>ultra_media_job_create</code>, <code>ultra_media_job_status</code>, <code>ultra_media_job_cancel</code>, <code>ultra_media_job_retry</code>, <code>ultra_media_job_finalize</code>, <code>ultra_media_constraints_get</code></td></tr>
+</tbody></table>
+<p>No read API for fetching a job or asset by id exists or is specified; whether</p>
+<p>the inspector fetches on demand or accumulates from the event stream only is an</p>
+<p>open question.</p>
+<h3>Auth for the event channel (implemented)</h3>
+<p>Single-use ticket via <code>GET /api/auth/ws-ticket</code> when <code>__HERMES_AUTH_REQUIRED__</code>;</p>
+<p>otherwise a session token query param (<code>web/src/lib/gatewayClient.ts</code>).</p>
+<h2>Data Model</h2>
+<h3>Implemented (frontend state, not persisted)</h3>
+<pre><code class="language-ts">// web/src/components/ToolCall.tsx
+ToolEntry: {
+  kind: &#x27;tool&#x27;, id: string, tool_id: string, name: string,
+  context?: string, preview?: string, summary?: string,
+  error?: string, inline_diff?: string,
+  status: &#x27;running&#x27; | &#x27;done&#x27; | &#x27;error&#x27;,
+  startedAt: number, completedAt?: number
+}
+
+// web/src/components/chat/contracts.ts
+WebChatSessionInfo: { cwd?, model?, provider?, profile_name?, credential_warning?: string }
+
+WebChatPendingPrompt:
+  | clarify  { requestId, question, choices?: string[] }
+  | approval { command, description }
+  | sudo     { requestId, password }
+  | secret   { requestId, envVar, prompt, value }
+
+// web/src/lib/gatewayClient.ts
+ConnectionState: &#x27;idle&#x27; | &#x27;connecting&#x27; | &#x27;open&#x27; | &#x27;closed&#x27; | &#x27;error&#x27;</code></pre>
+<p>All of the above live in React state. Nothing the inspector shows is persisted</p>
+<p>client-side; a refresh or Reconnect wipes it.</p>
+<h3>Planned (no code, field types unspecified)</h3>
+<p>From <code>03-media-asset-contract.md</code>:</p>
+<table><thead><tr><th>Entity</th><th>Fields</th><th>Persistence</th></tr></thead><tbody>
+<tr><td><code>MediaJob</code></td><td><code>job_id, session_id, run_id, tool_call_id, provider, model, media_type, mode, status, input_assets, prompt, negative_prompt, provider_constraints, seed, tokenrouter_decision_id, output_assets, error</code></td><td>Durable store required; none exists</td></tr>
+<tr><td>Asset (typed)</td><td>Types: <code>media_input, image_job, video_job, audio_job, element, character, soul_id, task_file</code></td><td>None exists</td></tr>
+<tr><td>Lineage record</td><td>parent asset ids, source job id, provider job id, model/endpoint, prompt hash, seed/params, user/session/run, output asset ids</td><td>None exists</td></tr>
+<tr><td>QA result</td><td>Observed facts (downloadable, exists, duration/dimensions, thumbnail, job succeeded) vs inferred (prompt alignment, style fit, character consistency, readability, defects); media-qa skill adds a 0-5 scorecard with no serialized schema</td><td>None exists</td></tr>
+</tbody></table>
+<p>Note: <code>tokenrouter_decision_id</code> has no producer — TokenRouter is a research</p>
+<p>artifact only (<code>docs/hermes-tokenrouter-credential-flow.md</code>); keep-or-drop for</p>
+<p>P0 is an open question.</p>
+<h2>UI Behavior</h2>
+<p>Implemented behavior, all from code:</p>
+<ul>
+<li>The inspector is a fixed-width (<code>w-80</code>, 320px) right aside inside <code>ChatPage</code>,</li>
+</ul>
+<p>left-bordered. It renders only at <code>lg+</code> viewports: the <code>&lt;aside&gt;</code> className is</p>
+<p><code>hidden w-80 ... lg:flex</code> (<code>ChatInspector.tsx</code> line 65). Below <code>lg</code> it is</p>
+<p>fully hidden — including all pending prompts — with no drawer or sheet</p>
+<p>fallback.</p>
+<ul>
+<li>The session card always renders, showing &quot;no session&quot; when none exists. The</li>
+</ul>
+<p>status line shows <code>error ?? credential_warning ?? currentStatus</code> with a teal</p>
+<p>dot icon.</p>
+<ul>
+<li>The tools card scrolls independently (<code>min-h-0 overflow-y-auto</code>) and shows a</li>
+</ul>
+<p>newest-last list of up to 24 rows. Each row header shows name plus a status</p>
+<p>word colored by state (error=red, running=amber, done=teal). Clicking toggles</p>
+<p>the body with sections for context/streaming/diff/result/error. Error rows are</p>
+<p>expanded by default. Running rows show a pulsing dot and live elapsed time</p>
+<p>updating every 500ms. Resumed/historical tools with <code>startedAt === 0</code> hide the</p>
+<p>elapsed badge.</p>
+<ul>
+<li><code>PendingPromptPanel</code> appears between the session and tools cards with amber</li>
+</ul>
+<p>&quot;Input needed&quot; styling. Approval shows the command in a scrollable <code>&lt;pre&gt;</code> and</p>
+<p>three buttons (approve once / approve session / deny). Clarify shows choice</p>
+<p>buttons plus a free-text input. Sudo and secret are password inputs.</p>
+<ul>
+<li>Answering clarify appends the answer as a user message in the center</li>
+</ul>
+<p>transcript. Deny sets status <code>denied</code>. Interrupt clears the pending prompt and</p>
+<p>sets status <code>interrupted</code>.</p>
+<ul>
+<li>The Reconnect button (ChatPage header) resets tools, pendingPrompt, and the</li>
+</ul>
+<p>session id, and creates a fresh <code>GatewayClient</code> — inspector tool history is</p>
+<p>wiped (<code>useGatewayChat.ts</code> <code>reconnect()</code>).</p>
+<ul>
+<li>Chat errors render as a banner in the center column and as inspector status</li>
+</ul>
+<p>text simultaneously.</p>
+<p>Specified but absent UI (planned): asset preview pane, job progress bar, QA</p>
+<p>evidence section, download/export buttons, Convert to Element / Create Character</p>
+<p>buttons, repair-plan card, typed-error recovery actions.</p>
+<p>Spec constraints on any future design (<code>01-product-surface.md</code> &quot;Non-Goals&quot;):</p>
+<p>not a second chat; no raw provider dashboards; no internal prompt templates by</p>
+<p>default; no fake status panel disconnected from real Hermes events.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Implemented:</p>
+<ul>
+<li>WS connection requires auth. Gated mode uses a single-use ticket from</li>
+</ul>
+<p><code>/api/auth/ws-ticket</code>; legacy <code>?token=</code> is rejected when gated; a missing</p>
+<p>session token throws &quot;Session token not available&quot; and sets <code>state=error</code></p>
+<p>(<code>web/src/lib/gatewayClient.ts</code>).</p>
+<ul>
+<li>Command approvals stream into the inspector via <code>approval.request</code> and resolve</li>
+</ul>
+<p>with <code>once</code>/<code>session</code>/<code>deny</code>; &quot;approve session&quot; sends <code>all: true</code>. The spec&#x27;s</p>
+<p>decision set <code>approve/edit/reject/respond</code></p>
+<p>(<code>02-agent-runtime-contract.md</code> &quot;Human Approval Gateway&quot;) is not implemented;</p>
+<p><code>edit</code> has no UI or RPC at all.</p>
+<ul>
+<li>Approvals are not refresh-safe. The server blocks on an in-process</li>
+</ul>
+<p><code>threading.Event</code> and <code>session.resume</code> does not re-emit pending prompts, so a</p>
+<p>page refresh loses the approval/clarify card. This violates</p>
+<p><code>02-agent-runtime-contract.md</code> (&quot;a page refresh must not lose the approval</p>
+<p>request&quot;).</p>
+<ul>
+<li>Pending prompts time out server-side (clarify 300s, sudo 120s) returning empty</li>
+</ul>
+<p>answers. Interrupt releases only the owning session&#x27;s prompts</p>
+<p>(<code>_clear_pending</code> in <code>tui_gateway/server.py</code>).</p>
+<ul>
+<li>Sudo passwords and secret env-var values are typed into the inspector and sent</li>
+</ul>
+<p>over the WS RPC. Values are held in React state in plaintext until submit</p>
+<p>(<code>PendingPromptPanel.tsx</code>). No spec statement exists on masking or persistence</p>
+<p>rules beyond <code>input type=password</code>.</p>
+<ul>
+<li>Errors are untyped strings: the gateway <code>error</code> event carries <code>{message}</code>; the</li>
+</ul>
+<p>UI shows a red banner in the center column, a system message, and inspector</p>
+<p>status text. No recovery actions.</p>
+<ul>
+<li><code>credential_warning</code> in <code>session.info</code> surfaces missing-credential conditions</li>
+</ul>
+<p>as inspector status text — the only implemented hint toward the spec&#x27;s</p>
+<p><code>missing_credential</code> typed error.</p>
+<p>Planned:</p>
+<ul>
+<li>Typed error contract (<code>02-agent-runtime-contract.md</code> &quot;Error Contract&quot;):</li>
+</ul>
+<p><code>missing_credential</code>, <code>unsupported_model_capability</code>, <code>invalid_asset_ref</code>,</p>
+<p><code>provider_rejected_input</code>, <code>quota_exceeded</code>, <code>job_timeout</code>,</p>
+<p><code>asset_upload_failed</code>, <code>sandbox_unavailable</code>, <code>approval_required</code>. The</p>
+<p>inspector Failed state needs the type to show recovery actions. None of the</p>
+<p>nine codes are produced or consumed today.</p>
+<ul>
+<li>Privacy constraint: media cards and the inspector must not expose internal</li>
+</ul>
+<p>filesystem paths by default (<code>03-media-asset-contract.md</code> &quot;Asset Card UI&quot;).</p>
+<p>The current tool feed does show raw paths in tool context strings, which will</p>
+<p>conflict once creative jobs run through it.</p>
+<h2>Acceptance Criteria</h2>
+<p>Implemented today (verifiable now):</p>
+<ol>
+<li>At a <code>lg+</code> viewport, the chat page renders the inspector with session card,</li>
+</ol>
+<p>and the badge transitions idle -&gt; connecting -&gt; live on connect.</p>
+<ol>
+<li>A tool call by the agent appears in the tools feed as <code>running</code> and resolves</li>
+</ol>
+<p>to <code>done</code> or <code>error</code>; an error row is expanded by default and shows the error</p>
+<p>text.</p>
+<ol>
+<li>The tools feed never shows more than 24 entries.</li>
+<li>An <code>approval.request</code> renders the command and three buttons; <code>deny</code> sets</li>
+</ol>
+<p>status <code>denied</code>; &quot;approve session&quot; sends <code>approval.respond</code> with <code>all: true</code>.</p>
+<ol>
+<li>A clarify answer appears as a user message in the transcript and clears the</li>
+</ol>
+<p>card.</p>
+<p>Target spec (each currently fails; engineering done-when):</p>
+<ol>
+<li>Clicking &quot;inspect&quot; on any asset card opens that asset in the inspector with</li>
+</ol>
+<p>model, job, prompt, and input details (<code>03-media-asset-contract.md</code></p>
+<p>&quot;Acceptance&quot;).</p>
+<ol>
+<li>The inspector shows job/model/input/output details for the selected job</li>
+</ol>
+<p>(<code>06-delivery-plan.md</code> P0 acceptance) — driven by real <code>media_job.*</code> events,</p>
+<p>never by hardcoded results (Launch Gates: no fake media URLs, no hardcoded</p>
+<p>job results).</p>
+<ol>
+<li>Failed jobs remain inspectable: a failed job shows a typed error, logs, and a</li>
+</ol>
+<p>repair plan; failed provider calls stay visible.</p>
+<ol>
+<li>The QA panel renders observed facts and inferred quality as visually distinct</li>
+</ol>
+<p>sections; no inferred claim renders without an observation source or user</p>
+<p>review.</p>
+<ol>
+<li>The download action resolves to a real storage/object URL or local</li>
+</ol>
+<p>materialization; no fabricated URL.</p>
+<ol>
+<li>Convert to Element and Create Character are available from a selected</li>
+</ol>
+<p>eligible asset and produce the corresponding typed asset.</p>
+<ol>
+<li>A page refresh during a pending approval re-renders the approval card from</li>
+</ol>
+<p>durable state.</p>
+<ol>
+<li>The inspector shows the asset preview with prompt, seed,</li>
+</ol>
+<p>dimensions/duration, and lineage for the selected asset.</p>
+<ol>
+<li>Top-level gate (<code>00-index.md</code>): the inspector shows the current job,</li>
+</ol>
+<p>selected asset, QA evidence, download, element creation, and character</p>
+<p>creation.</p>
+<p>Test status: no frontend tests cover inspector rendering, event reduction, or</p>
+<p>pending-prompt flows (no <code>*.test.*</code> files under <code>web/</code>). The delivery plan</p>
+<p>requires frontend build/typecheck and a gateway event smoke test; no</p>
+<p>inspector-specific acceptance tests are defined yet.</p>
+<h2>Non-Goals</h2>
+<p>From <code>01-product-surface.md</code> &quot;Non-Goals&quot; and <code>05-memory-marketplace-files.md</code>:</p>
+<ul>
+<li>Not a second chat. The inspector never accepts free-form conversation.</li>
+<li>No raw provider dashboards in the main UI.</li>
+<li>No internal prompt templates shown by default.</li>
+<li>No fake run/status panel disconnected from real Hermes events.</li>
+<li>Not a workspace browser. Marketplace, Files, Memory, and Tasks own browsing of</li>
+</ul>
+<p>durable state; the inspector is scoped to the selected object.</p>
+<ul>
+<li>No internal filesystem paths exposed by default</li>
+</ul>
+<p>(<code>03-media-asset-contract.md</code> &quot;Asset Card UI&quot;).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Selection mechanism and priority: auto-select the latest job vs explicit</li>
+</ol>
+<p>click; does tool-run selection share the same panel as asset selection? No</p>
+<p>selection event or store is defined in spec or code.</p>
+<ol>
+<li>Data source: does the inspector fetch on demand (a job/asset read API, none</li>
+</ol>
+<p>specified) or accumulate from the event stream only — and what is the</p>
+<p>reconciliation story after refresh/resume?</p>
+<ol>
+<li>Full <code>MediaJob.status</code> enum and cancel/retry transitions: <code>queued</code>,</li>
+</ol>
+<p><code>cancelled</code>, <code>timed_out</code> are unmentioned in <code>03-media-asset-contract.md</code>.</p>
+<ol>
+<li>Structured schemas for QA results and repair plans: media-qa and</li>
+</ol>
+<p>prompt-repair currently emit prose; the inspector needs serialized data.</p>
+<ol>
+<li>Approval durability: keep the in-process <code>once/session/deny</code> protocol or</li>
+</ol>
+<p>implement the spec&#x27;s durable <code>approve/edit/reject/respond</code> gateway?</p>
+<ol>
+<li>Mobile layout: drawer/bottom-sheet inspector vs hiding it; where do pending</li>
+</ol>
+<p>prompts go on small screens?</p>
+<ol>
+<li>Eligibility rules and flows for Convert to Element / Create Character:</li>
+</ol>
+<p>&quot;when eligible&quot; is undefined; <code>docs/hermes-soulid-element-asset-model.md</code> is</p>
+<p>research-only.</p>
+<ol>
+<li>Download path: proxy through the gateway vs direct Atlas object URLs (auth,</li>
+</ol>
+<p>expiry, local materialization).</p>
+<ol>
+<li><code>tokenrouter_decision_id</code>: TokenRouter has zero code — keep the field in the</li>
+</ol>
+<p>inspector contract or drop it for P0?</p>
+<ol>
+<li>Should the inspector render thinking/reasoning deltas (events exist) or only</li>
+</ol>
+<p>coarse <code>status.update</code> phases per the &quot;Thinking&quot; state row?</p>
+<ol>
+<li>Tool feed retention: is 24 entries enough, and should tool history rehydrate</li>
+</ol>
+<p>on <code>session.resume</code>?</p>
+<ol>
+<li>Which inspector actions require explicit approval before executing? Retry</li>
+</ol>
+<p>spends money (<code>06-delivery-plan.md</code> open question: &quot;Which actions require</p>
+<p>explicit approval before first launch?&quot;).</p>
+<ol>
+<li>Repair-plan rendering and Retry semantics: new job vs same <code>job_id</code>, and</li>
+</ol>
+<p>whether retry requires cost confirmation.</p>
+</main></div>
+</body>
+</html>

@@ -24,6 +24,7 @@ document without reading everything.
 | [04-skill-tool-prompt-contract.md](04-skill-tool-prompt-contract.md) | Workflow router, skills, tools, prompt compiler, clarification rules. | Agent + workflow engineering |
 | [05-memory-marketplace-files.md](05-memory-marketplace-files.md) | Memory, Marketplace, Files, task filesystem, skill/templates catalog. | Product + platform |
 | [06-delivery-plan.md](06-delivery-plan.md) | Milestones, P0/P1/P2, acceptance checks, launch gates. | Everyone |
+| [components/README.md](components/README.md) | Per-component complete functional specs (19 components). | Engineering |
 
 ## Source References
 

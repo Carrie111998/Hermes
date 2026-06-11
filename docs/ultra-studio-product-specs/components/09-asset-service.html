@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asset Service</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Asset Service</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="09-asset-service.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Asset Service</h1>
+<p>Status: spec-only — the service, its entities, and its APIs are fully</p>
+<p>designed but no asset service code, tables, or endpoints exist in the repo;</p>
+<p>uploads today land as chat attachments without asset records.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/hermes-asset-library-backend-design.md</code> (entire doc: §架构形状,</li>
+</ul>
+<p>§核心实体, §API 面, §搜索和索引, §生成链路, §实时事件, §错误策略, §P0 切片),</p>
+<p><code>docs/ultra-studio-product-specs/03-media-asset-contract.md</code> (§Asset Types,</p>
+<p>§Asset Lifecycle, §Lineage, §QA, §Acceptance),</p>
+<p><code>docs/hermes-soulid-element-asset-model.md</code> (§资产类型, §最小数据模型,</p>
+<p>§工具映射, §安全要求), <code>02-agent-runtime-contract.md</code> (§Error Contract),</p>
+<p><code>06-delivery-plan.md</code> (P0 item 9, P1 items 6-7)</p>
+<ul>
+<li>Code: none — <code>rg -li &quot;asset&quot;</code> over <code>tools/</code>, <code>plugins/</code>, <code>gateway/</code></li>
+</ul>
+<p>returns only unrelated hits (UI themes, checkpoint manager); verified this</p>
+<p>session. Upload intake exists only as a chat attachment path</p>
+<p>(<code>web/src/components/chat/ChatComposer.tsx</code>).</p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Asset Service is the system of record for typed product assets: uploads,</p>
+<p>generated outputs, reusable Elements/Characters/Soul IDs, Collections, Smart</p>
+<p>Groups, ACLs, lineage, and audit. Its design rule: generation consumes</p>
+<p>structured asset refs — &quot;生成调用只消费结构化 asset refs，不能靠 prompt 里</p>
+<p>裸写 asset id&quot; (<code>hermes-asset-library-backend-design.md</code> §目标).</p>
+<p>State ownership (<code>§架构形状</code>): Asset Service owns strongly consistent asset</p>
+<p>state; Object Storage holds binaries/thumbnails only; the Search Indexer owns</p>
+<p>a rebuildable projection; the Media Job Service must register outputs back</p>
+<p>here; TokenRouter checks <code>asset_ref</code> permissions before generation.</p>
+<p>Scope: entities, API surface, ref validation, indexing pipeline, events,</p>
+<p>ACL/audit. The browsing UI is <code>08-asset-library-ui.md</code>; job execution is</p>
+<p><code>10-media-job-service.md</code>; credential policy is <code>17-tokenrouter.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Specified, not built</td><td><code>assets</code> / <code>asset_lineage</code> / <code>generation_jobs</code> / <code>collections</code> / <code>smart_groups</code> / <code>asset_references</code> / <code>asset_acl</code> / <code>asset_audit_events</code> entities</td><td><code>hermes-asset-library-backend-design.md</code> §核心实体</td></tr>
+<tr><td>Specified, not built</td><td>Two-phase upload (<code>uploads/init</code> signed URL -&gt; <code>uploads/complete</code> -&gt; async thumbnail/metadata/embedding)</td><td>§上传入库</td></tr>
+<tr><td>Specified, not built</td><td>List/detail/lineage/audit read APIs</td><td>§资产列表和详情</td></tr>
+<tr><td>Specified, not built</td><td>Collections CRUD (static membership)</td><td>§Collection</td></tr>
+<tr><td>Specified, not built</td><td>Smart Groups preview/save/query (dynamic, never materialized)</td><td>§Smart Group</td></tr>
+<tr><td>Specified, not built</td><td>References create/status for element/character/soul_id with honest <code>queued/training/ready</code></td><td>§Character / Element / Soul ID; <code>hermes-soulid-element-asset-model.md</code></td></tr>
+<tr><td>Specified, not built</td><td>Mention/picker search endpoint with ACL filtering</td><td>§<code>@</code> mention 查询</td></tr>
+<tr><td>Specified, not built</td><td>Ref validation step in the generation chain</td><td>§生成链路</td></tr>
+<tr><td>Specified, not built</td><td>Event emission (<code>asset.*</code>, <code>reference.status</code>, <code>collection.updated</code>, …)</td><td>§实时事件</td></tr>
+<tr><td>Specified, not built</td><td>Two-layer search (hard filter + FTS/embedding recall) with index-pending degradation</td><td>§搜索和索引</td></tr>
+<tr><td>Specified, not built</td><td>Typed error table, fail-closed generation</td><td>§错误策略</td></tr>
+<tr><td>Gap</td><td>No storage backend chosen (object store, DB, vector index)</td><td>see Open Questions</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<p>The service is not user-facing; it is reached through:</p>
+<ul>
+<li>Asset Library UI (gallery, detail, collections, mention menu) —</li>
+</ul>
+<p><code>08-asset-library-ui.md</code>.</p>
+<ul>
+<li>Chat composer structured submits (mentions + attachments).</li>
+<li>Agent tools: the asset tool group `ultra_asset_upload / list / inspect /</li>
+</ul>
+<p>download / promote<code> (</code>04-skill-tool-prompt-contract.md` §Asset Tools;</p>
+<p>spec-only) and the reference tools mapped in</p>
+<p><code>hermes-soulid-element-asset-model.md</code> §工具映射.</p>
+<ul>
+<li>Media Job Service output registration (<code>ultra_media_job_finalize</code> path).</li>
+<li>Files promotion (<code>06-files-task-file-browser.md</code> promote action).</li>
+</ul>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Register uploads as <code>media_input</code> with mime/size validation</td><td>Planned (P0 切片 1)</td></tr>
+<tr><td>Register generation outputs as <code>image_job</code>/<code>video_job</code>/<code>audio_job</code> assets</td><td>Planned (P0 item 9 in <code>06-delivery-plan.md</code>)</td></tr>
+<tr><td>Asset lifecycle management (<code>uploading -&gt; processing -&gt; ready -&gt; archived</code>)</td><td>Planned</td></tr>
+<tr><td>Lineage graph (parents, source job, provider job, model, prompt hash, seed, user/session/run)</td><td>Planned (<code>03-media-asset-contract.md</code> §Lineage)</td></tr>
+<tr><td>Element / Character / Soul ID references with provider training states</td><td>Planned (P0 切片 4: mock provider allowed, fake <code>ready</code> forbidden)</td></tr>
+<tr><td>Collections (manual) and Smart Groups (dynamic query)</td><td>Planned (P0 切片 2-3)</td></tr>
+<tr><td>Mention/picker search with <code>context=</code> variants</td><td>Planned (P0 切片 5)</td></tr>
+<tr><td>Ref validation before generation (<code>media_generate</code> pre-check)</td><td>Planned (P0 切片 6)</td></tr>
+<tr><td>Event fanout to UI</td><td>Planned (P0 切片 7)</td></tr>
+<tr><td>ACL enforcement (read/use/update/delete/revoke)</td><td>Planned</td></tr>
+<tr><td>Audit events incl. <code>mention_resolve</code></td><td>Planned</td></tr>
+<tr><td>Keyword extraction + prompt/visual embeddings</td><td>Planned; degradation to FTS-only is required behavior, not an error</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Asset lifecycle (<code>03-media-asset-contract.md</code> §Asset Lifecycle, status enum</p>
+<p>in §核心实体):</p>
+<pre><code class="language-text">uploading -&gt; processing -&gt; ready -&gt; archived
+                 |-&gt; failed
+ready -&gt; revoked
+any -&gt; deleted (explicit)</code></pre>
+<p>Generated outputs chain from jobs:</p>
+<pre><code class="language-text">job.created -&gt; job.running -&gt; job.succeeded -&gt; asset.processing -&gt; asset.ready</code></pre>
+<p>Reference (<code>asset_references.status</code>):</p>
+<pre><code class="language-text">queued -&gt; training -&gt; ready
+queued -&gt; failed
+ready -&gt; revoked</code></pre>
+<p>Transition triggers: upload completion (system), processing pipeline</p>
+<p>(system), revoke (user with <code>revoke</code> permission), archive (user), training</p>
+<p>progression (provider callbacks/polling). Revoked assets must drop out of</p>
+<p>the mention/search usable set via the index pipeline (`asset.revoked -&gt;</p>
+<p>remove from usable set`).</p>
+<h2>APIs &amp; Events</h2>
+<p>Verbatim API surface from <code>hermes-asset-library-backend-design.md</code>:</p>
+<pre><code class="language-http">POST /api/assets/uploads/init           # returns upload_id, asset_id, put_url
+POST /api/assets/uploads/complete
+GET  /api/assets?project_id=&amp;media_type=&amp;type=&amp;status=&amp;endpoint=&amp;source=&amp;collection_id=&amp;q=&amp;cursor=
+GET  /api/assets/{asset_id}
+GET  /api/assets/{asset_id}/lineage
+GET  /api/assets/{asset_id}/audit
+POST /api/assets/collections            (+ PATCH/DELETE, members add/remove)
+POST /api/assets/smart-groups/preview   (+ CRUD, /assets evaluation)
+POST /api/assets/references             # element | character | soul_id
+GET  /api/assets/mentions?q=&amp;project_id=&amp;types=&amp;context=</code></pre>
+<p>Detail responses include the generation <code>context</code> block (endpoint,</p>
+<p>model_route, prompt, params, seed, request/run/session ids), lineage, acl,</p>
+<p>audit.</p>
+<p>Events: <code>asset.upload.started</code>, <code>asset.processing</code>, <code>asset.ready</code>,</p>
+<p><code>asset.failed</code>, <code>asset.revoked</code>, <code>asset.indexed</code>, <code>collection.updated</code>,</p>
+<p><code>smart_group.updated</code>, <code>reference.status</code>, <code>job.status</code>.</p>
+<p>Agent tool mapping (spec-only): `ultra_asset_upload/list/inspect/download/</p>
+<p>promote` wrap these endpoints for the agent</p>
+<p>(<code>04-skill-tool-prompt-contract.md</code> §Asset Tools).</p>
+<h2>Data Model</h2>
+<p>Authoritative entity definitions are in</p>
+<p><code>hermes-asset-library-backend-design.md</code> §核心实体 and are not duplicated</p>
+<p>here in full. Summary:</p>
+<ul>
+<li><code>assets</code>: tenant/workspace/project scoping; <code>type</code> covers `media_input |</li>
+</ul>
+<p>image_job | video_job | audio_job | mesh_job | element | character |</p>
+<p>soul_id`; generation context fields (prompt, endpoint, model_route,</p>
+<p>params_json, seed); <code>object_key</code>/<code>thumbnail_key</code> into object storage.</p>
+<ul>
+<li><code>asset_lineage</code>: parent links with `relation: input | output |</li>
+</ul>
+<p>derived_from | saved_as | character_source` and ordering.</p>
+<ul>
+<li><code>generation_jobs</code>: provider job mirror with <code>request_json</code>,</li>
+</ul>
+<p><code>output_asset_id</code>, <code>usage_event_id</code>, <code>error_code</code> (shared boundary with</p>
+<p><code>10-media-job-service.md</code> — see Open Questions).</p>
+<ul>
+<li><code>asset_references</code>: element/character/soul_id with provider_reference_id.</li>
+<li><code>asset_acl</code>: subject (user/project/workspace/service_account) ×</li>
+</ul>
+<p>permission (read/use/update/delete/revoke).</p>
+<ul>
+<li><code>asset_audit_events</code>: actor, action (incl. <code>mention_resolve</code>), run/request</li>
+</ul>
+<p>ids.</p>
+<ul>
+<li><code>asset_search_index</code>: prompt text, keywords, endpoint family, embeddings —</li>
+</ul>
+<p>rebuildable, never authoritative.</p>
+<h2>UI Behavior</h2>
+<p>(Service-side obligations to the UI; full UI spec in</p>
+<p><code>08-asset-library-ui.md</code>.)</p>
+<ul>
+<li>List APIs return only <code>read</code>-permitted rows; <code>allowed_operations</code> are</li>
+</ul>
+<p>precomputed per mention item so the UI never guesses.</p>
+<ul>
+<li>Mention results exclude <code>revoked</code>, include <code>not_ready</code> as non-usable.</li>
+<li>Detail payloads carry everything the inspector needs in one call (asset +</li>
+</ul>
+<p>context + lineage + acl + audit).</p>
+<ul>
+<li>Events carry enough to update a card without refetch (<code>asset_id</code>, status,</li>
+</ul>
+<p><code>thumbnail_url</code>).</p>
+<ul>
+<li>Upload init returns size caps up front (<code>max_size</code>) so the UI can</li>
+</ul>
+<p>pre-validate.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>ACL verbs: <code>read | use | update | delete | revoke</code> per subject scopes</p>
+<p>user/project/workspace/service_account. Mention resolution writes audit</p>
+<p>events (<code>mention_resolve</code>). Plain-text identity claims are rejected: the</p>
+<p>backend must refuse ambiguous plain-text resolves and only trust structured</p>
+<p><code>entity_id</code>s (§前端交互契约).</p>
+<p>Typed errors (§错误策略): <code>asset_access_denied</code>, <code>asset_not_ready</code>,</p>
+<p><code>asset_revoked</code>, <code>asset_not_found</code>, <code>upload_mime_not_allowed</code>,</p>
+<p><code>smart_group_query_invalid</code>, <code>collection_expand_requires_confirmation</code>.</p>
+<p>Hard rules:</p>
+<ul>
+<li>Fail closed on any ref error in the generation chain — no</li>
+</ul>
+<p>warning-and-continue (§错误策略, consistent with U-29 semantics).</p>
+<ul>
+<li>Index unavailability degrades search (semantic recall &quot;pending&quot;), it never</li>
+</ul>
+<p>hides assets (§搜索和索引).</p>
+<ul>
+<li>Reference training may use a mock provider in P0 but must never fake</li>
+</ul>
+<p><code>ready</code> (§P0 切片 4).</p>
+<ul>
+<li>Never log or return provider secrets in context payloads</li>
+</ul>
+<p>(<code>hermes-soulid-element-asset-model.md</code> §安全要求).</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>Upload init/complete produces an <code>assets</code> row that transitions</li>
+</ul>
+<p><code>uploading -&gt; processing -&gt; ready</code> with a real thumbnail</p>
+<p>(<code>06-delivery-plan.md</code> P0; <code>03-media-asset-contract.md</code> §Acceptance:</p>
+<p>&quot;Uploads and generated media produce asset ids&quot;).</p>
+<ul>
+<li>A finalized media job&#x27;s outputs appear as assets with full lineage</li>
+</ul>
+<p>(&quot;All generation results have lineage&quot;).</p>
+<ul>
+<li><code>GET /api/assets/{id}</code> returns the generation context block sufficient for</li>
+</ul>
+<p>the inspector.</p>
+<ul>
+<li>A revoked asset disappears from mention results and fails <code>use</code> with</li>
+</ul>
+<p><code>asset_revoked</code>.</p>
+<ul>
+<li>Smart Group open re-evaluates the query live (no stored member list).</li>
+<li>Tenant/project isolation: cross-project asset ids return</li>
+</ul>
+<p><code>asset_not_found</code>.</p>
+<ul>
+<li>Every <code>use</code> in generation produces an audit event traceable by run id.</li>
+</ul>
+<h2>Non-Goals</h2>
+<ul>
+<li>Executing media jobs (Media Job Service) or holding provider credentials</li>
+</ul>
+<p>(TokenRouter).</p>
+<ul>
+<li>Storing binaries in the service DB — object storage owns bytes.</li>
+<li>Public sharing/publishing surfaces.</li>
+<li>Building the vector/semantic index before FTS + hard filters work.</li>
+<li>Auto-promotion of task files (explicit promotion only).</li>
+</ul>
+<h2>Open Questions</h2>
+<ol>
+<li>Storage selection: object store (S3-compatible? local disk for</li>
+</ol>
+<p>self-host?), relational DB, and FTS/vector engine are all unchosen.</p>
+<ol>
+<li><code>generation_jobs</code> table ownership: this design doc places it here, while</li>
+</ol>
+<p><code>10-media-job-service.md</code>&#x27;s MediaJob envelope implies the job service</p>
+<p>owns job state — one table with two writers, or mirror-by-event?</p>
+<ol>
+<li>Multi-tenant deployment shape for self-hosted Hermes: are tenant_id /</li>
+</ol>
+<p>workspace_id real boundaries in MVP or constant defaults?</p>
+<ol>
+<li>Thumbnail/embedding pipeline runtime: in-process worker vs queue; what</li>
+</ol>
+<p>is the P0-acceptable latency for <code>processing -&gt; ready</code>?</p>
+<ol>
+<li>Does <code>ultra_asset_download</code> materialize to the task file root (link to</li>
+</ol>
+<p><code>06-files-task-file-browser.md</code>) or stream signed URLs only?</p>
+<ol>
+<li>Soul ID provider abstraction: which provider backs <code>soul_id</code> training in</li>
+</ol>
+<p>P1, and what happens to <code>ready</code> references when that provider is</p>
+<p>disabled?</p>
+</main></div>
+</body>
+</html>

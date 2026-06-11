@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tasks / Session History</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Tasks / Session History</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="07-tasks-session-history.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Tasks / Session History</h1>
+<p>Status: partial — session storage, a sessions browser with message search,</p>
+<p>and session-context prompts are implemented; the Tasks product surface (task</p>
+<p>rows with jobs/outputs, full-context restore) is spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/05-memory-marketplace-files.md</code></li>
+</ul>
+<p>(§Tasks, §Search, §Access Control), <code>02-agent-runtime-contract.md</code></p>
+<p>(§Session Lifecycle, §Event Stream), <code>01-product-surface.md</code> (§Main Jobs:</p>
+<p>&quot;Continue work&quot;), <code>06-delivery-plan.md</code> (P0 gates, P2 gate on job</p>
+<p>survival)</p>
+<ul>
+<li>Code (verified this session): <code>gateway/session.py</code> (<code>SessionStore</code>,</li>
+</ul>
+<p><code>SessionEntry</code>, <code>SessionContext</code>, <code>SessionSource</code>, <code>build_session_key</code>,</p>
+<p><code>build_session_context_prompt</code>, hashed ids via <code>_hash_sender_id</code> /</p>
+<p><code>_hash_chat_id</code>), <code>web/src/pages/SessionsPage.tsx</code> (<code>SessionRow</code>,</p>
+<p><code>MessageList</code>, <code>SessionsPagination</code>, search highlighting),</p>
+<p><code>tools/session_search_tool.py</code>, <code>hermes_state.py</code>, <code>agent/insights.py</code></p>
+<p>(<code>InsightsEngine._get_sessions</code>)</p>
+<h2>Purpose &amp; Scope</h2>
+<p>Tasks represent work history and running jobs</p>
+<p>(<code>05-memory-marketplace-files.md</code> §Tasks). The product promise is</p>
+<p>&quot;Continue work&quot;: clicking a task restores the transcript, active/complete</p>
+<p>jobs, task files, selected model, active skill profile, and relevant memory</p>
+<p>(<code>01-product-surface.md</code> §Main Jobs; <code>05-memory-marketplace-files.md</code></p>
+<p>§Tasks).</p>
+<p>This spec covers the task list surface, the task row contract, restore</p>
+<p>semantics, and the relationship between &quot;session&quot; (runtime conversation</p>
+<p>state, owned by the gateway) and &quot;task&quot; (the product object users browse).</p>
+<p>Media job durability itself is owned by <code>10-media-job-service.md</code>; the chat</p>
+<p>surface that a restored task opens into is <code>02-creative-chat-ui.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Durable session store keyed by platform/source, with session entries and context</td><td><code>gateway/session.py</code> (<code>SessionStore</code>, <code>SessionEntry</code>, <code>build_session_key</code>)</td></tr>
+<tr><td>Implemented</td><td>Privacy-hashed identifiers in session records</td><td><code>gateway/session.py</code> (<code>_hash_sender_id</code>, <code>_hash_chat_id</code>)</td></tr>
+<tr><td>Implemented</td><td>Session-context prompt assembly for resumed/multi-user contexts</td><td><code>gateway/session.py</code> (<code>build_session_context_prompt</code>, <code>build_session_context</code>, <code>is_shared_multi_user_session</code>)</td></tr>
+<tr><td>Implemented</td><td>Sessions browser: list, paginate, open transcript, message search with hit highlighting and auto-scroll</td><td><code>web/src/pages/SessionsPage.tsx</code> (<code>SessionRow</code>, <code>MessageList</code>, <code>SnippetHighlight</code>, <code>SessionsPagination</code>)</td></tr>
+<tr><td>Implemented</td><td>Tool calls rendered inside historical transcripts</td><td><code>web/src/pages/SessionsPage.tsx</code> (<code>ToolCallBlock</code>)</td></tr>
+<tr><td>Implemented</td><td>Agent-facing search over past sessions</td><td><code>tools/session_search_tool.py</code></td></tr>
+<tr><td>Implemented</td><td>Session aggregates for analytics (count, duration, model/platform breakdowns)</td><td><code>agent/insights.py</code> (<code>InsightsEngine._get_sessions</code>, <code>_compute_overview</code>)</td></tr>
+<tr><td>Implemented</td><td>Process-level state persistence helpers</td><td><code>hermes_state.py</code></td></tr>
+<tr><td>Specified, not built</td><td><code>Tasks</code> nav entry distinct from the admin Sessions page</td><td><code>01-product-surface.md</code> §Left Nav Shell</td></tr>
+<tr><td>Specified, not built</td><td>Task row fields: title, last user request, status, active jobs, output count, source</td><td><code>05-memory-marketplace-files.md</code> §Tasks; <code>SessionsPage</code> rows show session metadata, not job/output counts</td></tr>
+<tr><td>Specified, not built</td><td>Full restore: transcript + jobs + task files + model + skill profile + memory</td><td><code>05-memory-marketplace-files.md</code> §Tasks; <code>02-agent-runtime-contract.md</code> <code>session.resume</code></td></tr>
+<tr><td>Specified, not built</td><td>Session state carrying active media jobs, selected assets, task file root, skill profile</td><td><code>02-agent-runtime-contract.md</code> §Session Lifecycle</td></tr>
+<tr><td>Specified, not built</td><td>&quot;Refreshing the browser during a media job does not lose the job&quot;</td><td><code>02-agent-runtime-contract.md</code> §Acceptance; depends on <code>10-media-job-service.md</code></td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li><code>Tasks</code> entry in the left nav (planned); today the closest surface is the</li>
+</ul>
+<p>dashboard Sessions page (<code>web/src/pages/SessionsPage.tsx</code>).</p>
+<ul>
+<li>&quot;Open the previous … task&quot; phrasing in chat — the agent finds prior work</li>
+</ul>
+<p>via session search (implemented: <code>tools/session_search_tool.py</code>) and the</p>
+<p>router/user restores it (restore flow planned).</p>
+<ul>
+<li>Cross-surface Search returning task results (planned,</li>
+</ul>
+<p><code>05-memory-marketplace-files.md</code> §Search).</p>
+<ul>
+<li>Deep link from a media job or asset back to its originating task</li>
+</ul>
+<p>(planned; lineage carries <code>user/session/run</code> per</p>
+<p><code>03-media-asset-contract.md</code> §Lineage).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>List past sessions with pagination</td><td>Implemented (<code>SessionsPage</code>)</td></tr>
+<tr><td>Search messages across sessions with highlighted hits</td><td>Implemented (<code>SessionsPage</code> search + <code>SnippetHighlight</code>)</td></tr>
+<tr><td>Open a historical transcript incl. tool calls</td><td>Implemented (<code>MessageList</code>, <code>ToolCallBlock</code>)</td></tr>
+<tr><td>Agent-side recall of past sessions</td><td>Implemented (<code>tools/session_search_tool.py</code>)</td></tr>
+<tr><td>Task rows with status, active jobs, output count, date, source</td><td>Planned</td></tr>
+<tr><td>Source labels <code>web / tui / cli / panel</code> on task rows</td><td>Planned (<code>SessionSource</code> exists in <code>gateway/session.py</code>; not surfaced as the spec&#x27;s four product values)</td></tr>
+<tr><td>One-click restore into a live chat session</td><td>Planned (<code>session.resume</code> contract)</td></tr>
+<tr><td>Restore selected model + active skill profile</td><td>Planned; session state fields not yet in <code>SessionEntry</code></td></tr>
+<tr><td>Restore active/complete media jobs into the task view</td><td>Planned; depends on durable MediaJob records</td></tr>
+<tr><td>Restore task files and relevant memory</td><td>Planned</td></tr>
+<tr><td>Running-job indicator on the task list</td><td>Planned</td></tr>
+<tr><td>Rename / archive / delete a task</td><td>Planned; not in spec pack — see Open Questions</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Task status (product-level, derived — not stored as a single enum today):</p>
+<pre><code class="language-text">active      (live session; gateway holds runtime state)
+  -&gt; idle   (no live connection; transcript + state durable)
+  -&gt; resumed -&gt; active
+idle | active
+  -&gt; archived (explicit user action; read-only)</code></pre>
+<p>Derived display status on a task row combines session liveness with job</p>
+<p>state from the Media Job Service:</p>
+<table><thead><tr><th>Display</th><th>Condition</th></tr></thead><tbody>
+<tr><td>Running</td><td>≥1 active media job, regardless of websocket liveness</td></tr>
+<tr><td>Waiting</td><td>Pending approval or ask-user question (<code>approval.requested</code> outstanding)</td></tr>
+<tr><td>Idle</td><td>No live connection, no active jobs</td></tr>
+<tr><td>Failed</td><td>Last job/turn ended in a typed error</td></tr>
+</tbody></table>
+<p>Rule: a refresh or disconnect must never transition a task to a terminal</p>
+<p>state; only explicit archive does (<code>02-agent-runtime-contract.md</code></p>
+<p>§Acceptance).</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented:</p>
+<ul>
+<li>Gateway session lifecycle and storage — <code>gateway/session.py</code></li>
+</ul>
+<p>(<code>SessionStore</code> create/lookup; session keys via <code>build_session_key</code>).</p>
+<ul>
+<li>Sessions listing/read APIs consumed by <code>SessionsPage</code> (served by the</li>
+</ul>
+<p>dashboard web server; page verified, route shape not re-derived here).</p>
+<ul>
+<li>Session search tool for the agent — <code>tools/session_search_tool.py</code>.</li>
+</ul>
+<p>Planned (per <code>02-agent-runtime-contract.md</code> §Session Lifecycle):</p>
+<ul>
+<li><code>session.create</code>, <code>session.resume</code> (restore messages, active jobs,</li>
+</ul>
+<p>selected assets, task files), <code>prompt.submit</code>, <code>slash.exec</code>.</p>
+<ul>
+<li>Task list API:</li>
+</ul>
+<pre><code class="language-http">GET /api/tasks?project_id=&amp;status=&amp;source=&amp;q=&amp;cursor=
+GET /api/tasks/{task_id}            # row + restore manifest
+POST /api/tasks/{task_id}/archive</code></pre>
+<p>Events: task rows update from the existing gateway event stream</p>
+<p>(<code>media_job.created/updated</code>, <code>asset.ready</code>, <code>approval.requested</code> — see</p>
+<p><code>02-agent-runtime-contract.md</code> §Event Stream); no separate task event</p>
+<p>channel.</p>
+<h2>Data Model</h2>
+<p>Implemented: session entries and context in the gateway store</p>
+<p>(<code>gateway/session.py</code>: <code>SessionEntry</code> with hashed sender/chat ids,</p>
+<p><code>SessionContext</code>), plus analytics projections in the insights DB</p>
+<p>(<code>agent/insights.py</code>).</p>
+<p>Planned task projection (a view over sessions + jobs, not a second source of</p>
+<p>truth):</p>
+<pre><code class="language-text">task_row
+- task_id            (= session id)
+- title              (generated; agent/title_generator.py exists)
+- last_user_request
+- status             (derived; see State Machine)
+- active_job_ids[]   (from Media Job Service)
+- output_count       (ready assets linked to this session)
+- source: web | tui | cli | panel
+- project_id, workspace_id
+- created_at, last_activity_at
+
+restore_manifest
+- transcript ref
+- active/complete job ids
+- task_files root
+- selected model
+- active skill profile
+- memory scope refs</code></pre>
+<p>Restore must read each element from its owning component (jobs from Media</p>
+<p>Job Service, files from task root, memory from Memory) — the manifest is</p>
+<p>pointers, not copies.</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Tasks page lists rows: title, status chip, last request snippet, active</li>
+</ul>
+<p>job spinner, output count, source badge, date. Default sort:</p>
+<p>last activity desc.</p>
+<ul>
+<li>Clicking a row opens the task view: restored transcript in the center,</li>
+</ul>
+<p>task file browser tab, and the Inspector showing the most recent job/asset</p>
+<p>(per <code>01-product-surface.md</code> §Required States).</p>
+<ul>
+<li>A running task opened mid-job shows live job state from resumed events,</li>
+</ul>
+<p>not a frozen snapshot.</p>
+<ul>
+<li>Search hits deep-link into the transcript position (the existing</li>
+</ul>
+<p>auto-scroll-to-hit behavior in <code>SessionsPage</code> <code>MessageList</code> is the</p>
+<p>reference implementation).</p>
+<ul>
+<li>Archived tasks render read-only with a visible archived banner.</li>
+<li>Empty state is blank; no demo tasks.</li>
+</ul>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Permissions: tasks are scoped like their sessions (user/workspace/project).</p>
+<p>Shared conversations do not imply shared sandbox or credentials</p>
+<p>(<code>05-memory-marketplace-files.md</code> §Access Control); a shared task view must</p>
+<p>exclude task files and credentials unless explicitly shared.</p>
+<p>Error contract:</p>
+<table><thead><tr><th>Error</th><th>Trigger</th></tr></thead><tbody>
+<tr><td><code>session_not_found</code></td><td>Stale task id or cross-project access.</td></tr>
+<tr><td><code>resume_state_incomplete</code></td><td>Restore manifest references missing pieces (e.g. job record gone). Must list what failed to restore; never silently render a partial state as complete.</td></tr>
+<tr><td><code>sandbox_unavailable</code></td><td>Resume requires a sandbox that cannot be attached (typed in <code>02-agent-runtime-contract.md</code> §Error Contract).</td></tr>
+<tr><td><code>archive_failed</code></td><td>Archive action failed; task stays in prior state.</td></tr>
+</tbody></table>
+<p>Partial restore is allowed only with an explicit per-element failure notice</p>
+<p>(e.g. &quot;2 task files missing&quot;); claiming a full restore without all elements</p>
+<p>verified violates the no-fake rule of the pack.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>Tasks page lists real sessions with derived status; a session with an</li>
+</ul>
+<p>active media job shows Running even after browser refresh</p>
+<p>(<code>02-agent-runtime-contract.md</code> §Acceptance).</p>
+<ul>
+<li>Clicking a task restores transcript and shows active jobs and their</li>
+</ul>
+<p>current states (&quot;A resumed session shows active media jobs and their</p>
+<p>current states&quot;).</p>
+<ul>
+<li>Restored task shows the same selected model and skill profile the session</li>
+</ul>
+<p>last used (once those fields land in session state).</p>
+<ul>
+<li>Message search finds a phrase from a prior session and deep-links to it.</li>
+<li>Source badges reflect the real origin surface.</li>
+<li>Archiving is explicit, reversible state is preserved, and archived tasks</li>
+</ul>
+<p>remain searchable.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Project management features (assignees, due dates, kanban) — the existing</li>
+</ul>
+<p><code>plugins/kanban</code> is a separate plugin, not this surface.</p>
+<ul>
+<li>Cross-user task assignment or shared editing.</li>
+<li>Storing job/asset state in the task projection (owned by Media Job /</li>
+</ul>
+<p>Asset services).</p>
+<ul>
+<li>Synthetic task titles that misrepresent content (titles come from the</li>
+</ul>
+<p>existing title generation path, <code>agent/title_generator.py</code>).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Is <code>task_id</code> literally the session id, or can one task span multiple</li>
+</ol>
+<p>sessions (e.g. resumed across surfaces)?</p>
+<ol>
+<li>Rename/archive/delete semantics are not in the spec pack — which verbs</li>
+</ol>
+<p>ship at P1?</p>
+<ol>
+<li>How do non-web sessions (TUI/CLI/gateway platforms) map to the four</li>
+</ol>
+<p>product source values, given <code>gateway/session.py</code> <code>SessionSource</code> carries</p>
+<p>richer platform info?</p>
+<ol>
+<li>Does restore re-attach the previous sandbox (<code>sandbox.attach</code>) or start</li>
+</ol>
+<p>cold with <code>restore_artifacts</code> (<code>02-agent-runtime-contract.md</code> §Sandbox</p>
+<p>Lifecycle)?</p>
+<ol>
+<li>Output count definition: ready assets only, or all finalized job outputs</li>
+</ol>
+<p>including failed-but-inspectable?</p>
+<ol>
+<li>Retention/TTL for idle tasks and their transcripts; relationship to the</li>
+</ol>
+<p>insights DB which already aggregates session stats.</p>
+</main></div>
+</body>
+</html>

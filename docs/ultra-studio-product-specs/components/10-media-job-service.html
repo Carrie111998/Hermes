@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Job Service</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Media Job Service</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="10-media-job-service.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Media Job Service</h1>
+<p>Status: partial — synchronous image/video generation tools with provider</p>
+<p>registries and Atlas submit/poll clients are implemented; the durable</p>
+<p>MediaJob envelope, <code>ultra_media_job_*</code> tool group, job persistence, and job</p>
+<p>events are spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/03-media-asset-contract.md</code></li>
+</ul>
+<p>(§Media Job Envelope, §Required Job Tools, §Asset Lifecycle, §QA),</p>
+<p><code>02-agent-runtime-contract.md</code> (§Event Stream, §Error Contract),</p>
+<p><code>04-skill-tool-prompt-contract.md</code> (§Media Job Tools),</p>
+<p><code>06-delivery-plan.md</code> (P0 items 5-7, Launch Gates),</p>
+<p><code>docs/hermes-asset-library-backend-design.md</code> (§生成链路,</p>
+<p><code>generation_jobs</code> entity)</p>
+<ul>
+<li>Code (verified this session): <code>tools/video_generation_tool.py</code></li>
+</ul>
+<p>(<code>_handle_video_generate</code>, <code>_resolve_active_provider</code>,</p>
+<p><code>check_video_generation_requirements</code>, <code>_format_model_caveats</code>,</p>
+<p><code>_build_dynamic_video_schema</code>, <code>_normalize_reference_images</code>),</p>
+<p><code>tools/image_generation_tool.py</code>, <code>agent/video_gen_provider.py</code>,</p>
+<p><code>agent/video_gen_registry.py</code>, <code>agent/image_gen_provider.py</code>,</p>
+<p><code>agent/image_gen_registry.py</code>, <code>agent/image_routing.py</code>,</p>
+<p><code>plugins/video_gen/atlas/client.py</code> (<code>submit</code>, <code>poll</code>, <code>build_payload</code>,</p>
+<p><code>extract_prediction_id</code>, <code>first_output_url</code>, <code>normalize_image_input</code>,</p>
+<p><code>resolve_credentials</code>), <code>plugins/video_gen/atlas/catalog.py</code></p>
+<p>(<code>ATLAS_FAMILIES</code>), <code>plugins/image_gen/atlas/</code> (<code>catalog.py</code>,</p>
+<p><code>client.py</code>), plus <code>fal</code>/<code>xai</code>/<code>openai</code> provider plugins under</p>
+<p><code>plugins/image_gen/</code>, <code>plugins/video_gen/</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Media Job Service runs image/video/audio generation as durable,</p>
+<p>provider-neutral jobs. The contract rule: &quot;Provider APIs should not be</p>
+<p>exposed raw to the agent. Use a provider-neutral job envelope&quot;</p>
+<p>(<code>03-media-asset-contract.md</code> §Media Job Envelope). A media job may outlive</p>
+<p>a websocket reconnect, browser refresh, or worker restart</p>
+<p>(<code>02-agent-runtime-contract.md</code>).</p>
+<p>Scope: job creation/status/cancel/retry/finalize, the MediaJob envelope,</p>
+<p>provider adapters, polling, output registration handoff to the Asset</p>
+<p>Service, and job events. Model/constraint metadata is</p>
+<p><code>19-model-catalog-provider-constraints.md</code>; prompt payload construction is</p>
+<p><code>13-prompt-compiler.md</code>; credential policy is <code>17-tokenrouter.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Agent video generation tool with config-driven provider/model resolution</td><td><code>tools/video_generation_tool.py</code> (<code>_read_configured_video_provider</code>, <code>_resolve_active_provider</code>, <code>_handle_video_generate</code>)</td></tr>
+<tr><td>Implemented</td><td>Agent image generation tool with routing</td><td><code>tools/image_generation_tool.py</code>, <code>agent/image_routing.py</code></td></tr>
+<tr><td>Implemented</td><td>Provider registry layer (Atlas, FAL, xAI, OpenAI) behind provider ABCs</td><td><code>agent/video_gen_registry.py</code>, <code>agent/image_gen_registry.py</code>, <code>plugins/video_gen/</code>, <code>plugins/image_gen/</code></td></tr>
+<tr><td>Implemented</td><td>Atlas async submit + poll with prediction-id extraction and output-URL discrimination (polling URLs are not outputs)</td><td><code>plugins/video_gen/atlas/client.py</code> (<code>submit</code>, <code>poll</code>, <code>extract_prediction_id</code>, <code>first_output_url</code>, <code>_looks_like_media_output</code>)</td></tr>
+<tr><td>Implemented</td><td>Server-side credential resolution (no key in prompts/UI)</td><td><code>plugins/video_gen/atlas/client.py</code> (<code>resolve_credentials</code>); launch gate &quot;Atlas credential path is explicit&quot; (<code>06-delivery-plan.md</code>)</td></tr>
+<tr><td>Implemented</td><td>Reference-image normalization (local file -&gt; data URI)</td><td><code>plugins/video_gen/atlas/client.py</code> (<code>normalize_image_input</code>, <code>_image_to_data_uri</code>)</td></tr>
+<tr><td>Implemented</td><td>Per-model constraint surfacing into the tool schema and caveats</td><td><code>tools/video_generation_tool.py</code> (<code>_build_dynamic_video_schema</code>, <code>_format_model_caveats</code>), <code>plugins/video_gen/atlas/catalog.py</code> (<code>ATLAS_FAMILIES</code> durations/resolutions/audio)</td></tr>
+<tr><td>Specified, not built</td><td>Durable MediaJob record (envelope with <code>job_id</code>, <code>session_id</code>, <code>run_id</code>, <code>tool_call_id</code>, <code>tokenrouter_decision_id</code>, …)</td><td><code>03-media-asset-contract.md</code> §Media Job Envelope; the current tool call is synchronous in-turn with no persisted job row</td></tr>
+<tr><td>Specified, not built</td><td><code>ultra_media_job_create / status / cancel / retry / finalize</code> tool group</td><td><code>03-media-asset-contract.md</code> §Required Job Tools; zero <code>media_job</code> hits in code (rg, this session)</td></tr>
+<tr><td>Specified, not built</td><td><code>media_job.created</code> / <code>media_job.updated</code> gateway events</td><td><code>02-agent-runtime-contract.md</code> §Event Stream</td></tr>
+<tr><td>Specified, not built</td><td>Output registration into the Asset Service (<code>finalize</code> -&gt; assets, thumbnails, lineage)</td><td><code>03-media-asset-contract.md</code>; <code>hermes-asset-library-backend-design.md</code> §生成链路</td></tr>
+<tr><td>Specified, not built</td><td>Job survival across worker/session interruption</td><td><code>06-delivery-plan.md</code> P2 gate</td></tr>
+<tr><td>Gap</td><td>Cancel/retry semantics per provider (which Atlas routes support cancel)</td><td>unspecified</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li>Chat generation requests routed by <code>workflow-router</code> into the media job</li>
+</ul>
+<p>path (<code>12-workflow-router.md</code>; today: direct tool calls</p>
+<p><code>tools/image_generation_tool.py</code> / <code>tools/video_generation_tool.py</code>).</p>
+<ul>
+<li>Inspector retry/repair action on a failed job (planned,</li>
+</ul>
+<p><code>03-inspector-live-panel.md</code>).</p>
+<ul>
+<li>Task restore re-attaching active jobs (planned,</li>
+</ul>
+<p><code>07-tasks-session-history.md</code>).</p>
+<ul>
+<li>No direct user-facing API; everything flows through agent tools and</li>
+</ul>
+<p>gateway events.</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Text-to-video and image-to-video via Atlas model routes</td><td>Implemented (<code>ATLAS_FAMILIES</code> <code>text_model</code>/<code>image_model</code> routes)</td></tr>
+<tr><td>Image generation via Atlas/FAL/xAI/OpenAI providers</td><td>Implemented (provider plugins + registries)</td></tr>
+<tr><td>Reference image inputs (upload -&gt; data URI)</td><td>Implemented (<code>normalize_image_input</code>)</td></tr>
+<tr><td>Provider/model selection from config with availability checks</td><td>Implemented (<code>check_video_generation_requirements</code>, <code>_resolve_active_provider</code>)</td></tr>
+<tr><td>Model caveat messaging to the agent (durations, resolution, audio)</td><td>Implemented (<code>_format_model_caveats</code>)</td></tr>
+<tr><td>Async polling of provider predictions</td><td>Implemented in-turn (<code>poll</code>); durable cross-turn polling planned</td></tr>
+<tr><td>Durable job records with status queries</td><td>Planned</td></tr>
+<tr><td>Cancel a queued/running job</td><td>Planned (<code>ultra_media_job_cancel</code>)</td></tr>
+<tr><td>Retry with compiled repair plan</td><td>Planned (<code>ultra_media_job_retry</code>; pairs with <code>prompt-repair</code> skill)</td></tr>
+<tr><td>Finalize: register outputs as assets with lineage + thumbnails</td><td>Planned (<code>ultra_media_job_finalize</code>)</td></tr>
+<tr><td>Job events to the UI</td><td>Planned</td></tr>
+<tr><td>Seed capture and reproducibility params in the envelope</td><td>Planned (envelope field exists in spec; not all providers return seeds)</td></tr>
+<tr><td>TokenRouter decision linkage (<code>tokenrouter_decision_id</code>)</td><td>Planned; depends on <code>17-tokenrouter.md</code></td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Job lifecycle (<code>03-media-asset-contract.md</code>):</p>
+<pre><code class="language-text">job.created -&gt; job.running -&gt; job.succeeded -&gt; asset.processing -&gt; asset.ready
+job.created | job.running -&gt; job.failed
+job.created | job.running -&gt; job.canceled        (where provider supports)
+job.running -&gt; job.timeout                       (maps to `job_timeout` error)</code></pre>
+<ul>
+<li><code>created -&gt; running</code>: provider accepted the submission</li>
+</ul>
+<p>(<code>extract_prediction_id</code> returns an id today).</p>
+<ul>
+<li><code>running -&gt; succeeded</code>: poll returns a real media output URL — a polling</li>
+</ul>
+<p>or status URL must never be treated as output</p>
+<p>(<code>first_output_url</code> / <code>_looks_like_media_output</code> encode this rule).</p>
+<ul>
+<li><code>succeeded -&gt; asset.*</code>: finalize hands off to the Asset Service; the job</li>
+</ul>
+<p>is not &quot;done&quot; for the UI until <code>asset.ready</code>.</p>
+<ul>
+<li><code>failed</code> keeps the full provider error and remains inspectable</li>
+</ul>
+<p>(<code>03-media-asset-contract.md</code> §Acceptance).</p>
+<ul>
+<li>Retry creates a new job linked to the old one; it never mutates the failed</li>
+</ul>
+<p>record.</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (agent tool surface): <code>generate_video</code> / image generation tools</p>
+<p>registered via the tool registry (<code>model_tools.py</code> dispatch); provider calls</p>
+<p>through <code>plugins/*/atlas/client.py</code> <code>submit</code>/<code>poll</code> against the Atlas API</p>
+<p>(<code>ATLAS_API_KEY</code> server-side via <code>resolve_credentials</code>).</p>
+<p>Planned tool group (verbatim, <code>03-media-asset-contract.md</code> §Required Job</p>
+<p>Tools):</p>
+<table><thead><tr><th>Tool</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>ultra_media_job_create</code></td><td>Create image/video/audio job with structured inputs.</td></tr>
+<tr><td><code>ultra_media_job_status</code></td><td>Return durable job state and progress.</td></tr>
+<tr><td><code>ultra_media_job_cancel</code></td><td>Cancel queued/running job if supported.</td></tr>
+<tr><td><code>ultra_media_job_retry</code></td><td>Retry with compiled repair plan.</td></tr>
+<tr><td><code>ultra_media_job_finalize</code></td><td>Register outputs as assets, thumbnails, lineage.</td></tr>
+<tr><td><code>ultra_media_constraints_get</code></td><td>Return model/provider limits before prompt compile.</td></tr>
+</tbody></table>
+<p>Planned events: <code>media_job.created</code>, <code>media_job.updated</code>, then <code>asset.ready</code></p>
+<p>(<code>02-agent-runtime-contract.md</code> §Event Stream). Job progress for the UI rides</p>
+<p><code>tool.progress</code> until durable jobs land.</p>
+<h2>Data Model</h2>
+<p>Implemented: none persisted — job state lives in the tool call&#x27;s in-memory</p>
+<p>flow for the duration of a turn.</p>
+<p>Planned: the MediaJob envelope (verbatim fields,</p>
+<p><code>03-media-asset-contract.md</code>):</p>
+<pre><code class="language-yaml">MediaJob:
+  job_id:
+  session_id:
+  run_id:
+  tool_call_id:
+  provider:
+  model:
+  media_type:
+  mode:
+  status:
+  input_assets:
+  prompt:
+  negative_prompt:
+  provider_constraints:
+  seed:
+  tokenrouter_decision_id:
+  output_assets:
+  error:</code></pre>
+<p>Boundary note: <code>hermes-asset-library-backend-design.md</code> defines a</p>
+<p><code>generation_jobs</code> table on the Asset Service side; reconciling that table</p>
+<p>with this envelope (single owner + event mirror) is an open question shared</p>
+<p>with <code>09-asset-service.md</code>.</p>
+<h2>UI Behavior</h2>
+<p>(Service obligations; rendering specs live in <code>02-creative-chat-ui.md</code> and</p>
+<p><code>03-inspector-live-panel.md</code>.)</p>
+<ul>
+<li>Every job submission yields a job card datum: id, provider/model,</li>
+</ul>
+<p>media_type, status, progress.</p>
+<ul>
+<li>Status updates are pushed, not polled by the browser; refresh re-hydrates</li>
+</ul>
+<p>from durable state (planned).</p>
+<ul>
+<li>Failed jobs expose the typed error and provider error class for the</li>
+</ul>
+<p>inspector&#x27;s repair plan.</p>
+<ul>
+<li>Outputs render only after asset registration (<code>asset.ready</code>), preventing</li>
+</ul>
+<p>fake completion claims — &quot;The agent cannot claim completion without an</p>
+<p>event, artifact, or ledger record&quot; (<code>00-index.md</code> §Top-Level Acceptance).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Jobs execute under the session&#x27;s user/workspace/project scope; input asset</p>
+<p>refs must pass Asset Service validation and (when present) TokenRouter</p>
+<p>ACL/quota checks before submission (<code>hermes-asset-library-backend-design.md</code></p>
+<p>§生成链路).</p>
+<p>Typed errors (from <code>02-agent-runtime-contract.md</code> §Error Contract):</p>
+<p><code>missing_credential</code>, <code>unsupported_model_capability</code>, <code>invalid_asset_ref</code>,</p>
+<p><code>provider_rejected_input</code>, <code>quota_exceeded</code>, <code>job_timeout</code>,</p>
+<p><code>asset_upload_failed</code>.</p>
+<p>Implemented today: missing provider/credential produces an explicit tool</p>
+<p>error (<code>_missing_provider_error</code>, <code>check_video_generation_requirements</code>);</p>
+<p>Atlas poll errors surface to the agent rather than faking success.</p>
+<p>Hard rules (launch gates, <code>06-delivery-plan.md</code>): no fake media URLs, no</p>
+<p>hardcoded job results, no accidental FAL/Comfy fallback — provider switching</p>
+<p>is config, never a silent runtime fallback.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>A clear video request creates a real provider job and returns either a</li>
+</ul>
+<p>real output or a typed blocker (<code>04-skill-tool-prompt-contract.md</code></p>
+<p>§Acceptance).</p>
+<ul>
+<li>Polling URLs are never registered as outputs (regression-guarded by</li>
+</ul>
+<p><code>first_output_url</code> behavior).</p>
+<ul>
+<li>Once durable jobs land: refreshing the browser mid-job preserves the job;</li>
+</ul>
+<p><code>ultra_media_job_status</code> returns the same state the UI shows.</p>
+<ul>
+<li><code>finalize</code> produces asset ids with lineage linking job, inputs, model,</li>
+</ul>
+<p>prompt hash, seed (<code>03-media-asset-contract.md</code> §Lineage).</p>
+<ul>
+<li>A failed job remains inspectable with provider error class intact.</li>
+<li>Cancel on a supporting route transitions to <code>canceled</code> without phantom</li>
+</ul>
+<p>outputs.</p>
+<ul>
+<li>No code path constructs a media URL that was not returned by a provider.</li>
+</ul>
+<h2>Non-Goals</h2>
+<ul>
+<li>Owning asset state after registration (Asset Service owns it).</li>
+<li>Provider credential storage or exchange (TokenRouter scope).</li>
+<li>Prompt construction logic (Prompt Compiler scope) — the job service takes</li>
+</ul>
+<p>compiled payloads.</p>
+<ul>
+<li>Media preprocessing/trimming pipelines (CometAPI scope,</li>
+</ul>
+<p><code>18-cometapi-media-gateway.md</code>).</p>
+<ul>
+<li>Exposing raw provider dashboards or API shapes to the agent or UI.</li>
+</ul>
+<h2>Open Questions</h2>
+<ol>
+<li>Durable job store location: gateway-side DB vs asset-service</li>
+</ol>
+<p><code>generation_jobs</code> — who is the single writer?</p>
+<ol>
+<li>Polling ownership once jobs are durable: gateway background worker vs</li>
+</ol>
+<p>per-session resume polling; what happens to in-flight polls on worker</p>
+<p>restart?</p>
+<ol>
+<li>Cancel support matrix per Atlas route (Wan/Seedance/Kling families in</li>
+</ol>
+<p><code>ATLAS_FAMILIES</code>) is unverified.</p>
+<ol>
+<li>Seed availability: which providers return seeds, and is <code>seed</code> required</li>
+</ol>
+<p>for the reproducibility promise or best-effort?</p>
+<ol>
+<li>Mapping from the current <code>generate_video</code>/image tool contracts to</li>
+</ol>
+<p><code>ultra_media_job_create</code>: rename-with-alias is disallowed by repo</p>
+<p>conventions — migrate tool names in one pass or keep current names as the</p>
+<p>implementation of the <code>ultra_*</code> contract?</p>
+<ol>
+<li>Concurrency limits per provider/workspace before TokenRouter exists —</li>
+</ol>
+<p>config-level caps or unlimited in P0?</p>
+<ol>
+<li>Audio jobs (<code>audio_job</code> type exists in the asset contract): which</li>
+</ol>
+<p>provider backs them first, and does TTS (<code>tools/tts_tool.py</code>,</p>
+<p><code>agent/tts_provider.py</code>) fold into this service or stay separate?</p>
+</main></div>
+</body>
+</html>

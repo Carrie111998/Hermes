@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Asset Library UI</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Asset Library UI</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="08-asset-library-ui.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Asset Library UI</h1>
+<p>Status: spec-only — no asset library page, gallery, mention menu, or picker</p>
+<p>exists in <code>web/src</code>; the design is fully specified in the asset library</p>
+<p>backend design doc, and a static layout demo exists outside the repo.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/hermes-asset-library-backend-design.md</code> (§前端交互契约,</li>
+</ul>
+<p>§<code>@</code> mention 查询, §Picker 与 ask_user_question 复用, §实时事件,</p>
+<p>§前端必须配合的点), <code>docs/ultra-studio-product-specs/03-media-asset-contract.md</code></p>
+<p>(§Asset Card UI, §Asset Types, §QA, §Acceptance),</p>
+<p><code>01-product-surface.md</code> (§Right: Inspector / Live Panel),</p>
+<p><code>06-delivery-plan.md</code> (P0 item 9, P1 items 6-7),</p>
+<p><code>docs/hermes-soulid-element-asset-model.md</code> (§UI 要求)</p>
+<ul>
+<li>Demo (layout reference only, outside the repo):</li>
+</ul>
+<p><code>/Users/lifcc/Desktop/code/work/infra/her/asset-library-demo.html</code></p>
+<ul>
+<li>Code: none — <code>web/src/pages/</code> contains no asset/library/gallery page</li>
+</ul>
+<p>(listing verified this session). The chat-side <code>ChatInspector.tsx</code> is</p>
+<p>specified separately in <code>03-inspector-live-panel.md</code>.</p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Asset Library UI is the browsing, search, and reuse surface for the</p>
+<p>project&#x27;s typed assets: uploads (<code>media_input</code>), generated outputs</p>
+<p>(<code>image_job</code> / <code>video_job</code> / <code>audio_job</code>), reusable <code>element</code> /</p>
+<p><code>character</code> / <code>soul_id</code> references, plus Collections and Smart Groups. It is</p>
+<p>&quot;项目级资产服务，而不是普通图库&quot; (<code>hermes-asset-library-backend-design.md</code></p>
+<p>§目标) — every card action feeds structured asset refs back into generation.</p>
+<p>Scope: gallery and filtering, asset detail view, Collections and Smart</p>
+<p>Groups UI, the <code>@</code> mention menu and picker in the chat composer, and</p>
+<p>realtime updates. Backend semantics (entities, ACL, lineage, indexing) are</p>
+<p>owned by <code>09-asset-service.md</code>; the per-selection context panel is</p>
+<p><code>03-inspector-live-panel.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Specified, not built</td><td>Asset gallery with hard filters (type, media_type, status, endpoint, source, collection)</td><td><code>hermes-asset-library-backend-design.md</code> §资产列表和详情 (list API params)</td></tr>
+<tr><td>Specified, not built</td><td>Asset detail view: prompt/params/seed/model context, lineage, ACL, audit</td><td><code>hermes-asset-library-backend-design.md</code> §资产列表和详情 (detail payload)</td></tr>
+<tr><td>Specified, not built</td><td>Asset card actions: download, inspect, reuse, convert to element, create character</td><td><code>03-media-asset-contract.md</code> §Asset Card UI</td></tr>
+<tr><td>Specified, not built</td><td>Collections UI (manual membership)</td><td><code>hermes-asset-library-backend-design.md</code> §Collection</td></tr>
+<tr><td>Specified, not built</td><td>Smart Group builder with preview-before-save</td><td><code>hermes-asset-library-backend-design.md</code> §Smart Group</td></tr>
+<tr><td>Specified, not built</td><td>Composer <code>@</code> mention menu with typed, grouped results</td><td><code>hermes-asset-library-backend-design.md</code> §<code>@</code> mention 查询</td></tr>
+<tr><td>Specified, not built</td><td>Shared picker for <code>ask_user_question(entity)</code> contexts</td><td><code>hermes-asset-library-backend-design.md</code> §Picker 与 ask_user_question 复用</td></tr>
+<tr><td>Specified, not built</td><td>Structured message submit (mention payload + attachments), not plain text</td><td><code>hermes-asset-library-backend-design.md</code> §前端交互契约</td></tr>
+<tr><td>Specified, not built</td><td>Realtime event subscription (<code>asset.ready</code>, <code>job.status</code>, …)</td><td><code>hermes-asset-library-backend-design.md</code> §实时事件</td></tr>
+<tr><td>Specified, not built</td><td>Element/Character creation entry points from result cards</td><td><code>06-delivery-plan.md</code> P1 item 7; <code>hermes-soulid-element-asset-model.md</code> §UI 要求</td></tr>
+<tr><td>Layout reference</td><td>Static gallery demo (no data wiring)</td><td><code>asset-library-demo.html</code> (outside repo; not a code claim)</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li>Asset library page (location in nav vs My office is an open question;</li>
+</ul>
+<p><code>01-product-surface.md</code> IA does not list a dedicated Assets entry — see</p>
+<p>§Non-Goals &quot;do not merge Marketplace, Memory, and Files into one generic</p>
+<p>Assets page&quot;, which implies assets are their own surface).</p>
+<ul>
+<li><code>@</code> mention in the chat composer (<code>@asset</code>, <code>@character</code>, <code>@element</code>,</li>
+</ul>
+<p><code>@collection</code>, <code>@group</code> prefixes).</p>
+<ul>
+<li>Picker opened by <code>ask_user_question(entity)</code> during a workflow.</li>
+<li>Inspector &quot;reuse&quot; / &quot;convert to element&quot; / &quot;create character&quot; actions on a</li>
+</ul>
+<p>selected asset (<code>03-inspector-live-panel.md</code>).</p>
+<ul>
+<li>Upload completion: a new upload appears in both the library and the chat</li>
+</ul>
+<p>side panel (<code>hermes-asset-library-backend-design.md</code> §前端必须配合的点).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Gallery grid with thumbnails per media type</td><td>Planned</td></tr>
+<tr><td>Hard filters: project, type, media_type, status, endpoint, source, collection, time</td><td>Planned</td></tr>
+<tr><td>Keyword + semantic search (degrades to FTS when index pending)</td><td>Planned (<code>hermes-asset-library-backend-design.md</code> §搜索和索引 degradation rule)</td></tr>
+<tr><td>Asset detail view with generation context (endpoint, model_route, prompt, seed, params, request/run/session ids)</td><td>Planned</td></tr>
+<tr><td>Lineage panel (&quot;where did this come from&quot;)</td><td>Planned</td></tr>
+<tr><td>Audit trail view</td><td>Planned</td></tr>
+<tr><td>Download via signed/real URLs</td><td>Planned</td></tr>
+<tr><td>Reuse asset into composer as structured ref</td><td>Planned</td></tr>
+<tr><td>Save as Element / build Character from eligible assets</td><td>Planned</td></tr>
+<tr><td>Collections: create, rename, add/remove members</td><td>Planned</td></tr>
+<tr><td>Smart Groups: build query, preview hit count, save; live evaluation on open</td><td>Planned</td></tr>
+<tr><td><code>@</code> mention menu grouped by type with status subtitles and thumbnails</td><td>Planned</td></tr>
+<tr><td>Picker contexts: <code>chat_prompt</code>, <code>asset_picker</code>, <code>character_picker</code>, <code>smart_group_builder</code>, <code>collection_member_add</code></td><td>Planned</td></tr>
+<tr><td>Revoked assets hidden from mention; <code>not_ready</code> shown but not usable</td><td>Planned</td></tr>
+<tr><td>Realtime status updates on cards (uploading -&gt; processing -&gt; ready)</td><td>Planned</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>The UI renders the asset lifecycle owned by the Asset Service:</p>
+<pre><code class="language-text">uploading -&gt; processing -&gt; ready -&gt; archived
+failed / revoked / deleted (terminal or gated)</code></pre>
+<p>UI rendering rules per state:</p>
+<table><thead><tr><th>State</th><th>Card behavior</th></tr></thead><tbody>
+<tr><td><code>uploading</code> / <code>processing</code></td><td>Placeholder thumbnail + progress; not selectable for <code>use</code></td></tr>
+<tr><td><code>ready</code></td><td>Full actions (reuse, download, element/character where eligible)</td></tr>
+<tr><td><code>failed</code></td><td>Visible with error chip; inspectable, not usable (<code>03-media-asset-contract.md</code> §Acceptance: &quot;Failed jobs remain inspectable&quot;)</td></tr>
+<tr><td><code>revoked</code></td><td>Excluded from mention/picker results; visible in library only with revoked badge</td></tr>
+<tr><td><code>archived</code></td><td>Hidden from default view; reachable via filter</td></tr>
+</tbody></table>
+<p>Reference (<code>element</code>/<code>character</code>/<code>soul_id</code>) statuses render</p>
+<p><code>queued -&gt; training -&gt; ready</code> / <code>failed</code> / <code>revoked</code> with no fake <code>ready</code></p>
+<p>(<code>hermes-asset-library-backend-design.md</code> §P0 切片 item 4).</p>
+<h2>APIs &amp; Events</h2>
+<p>The UI consumes the Asset Service API (defined in <code>09-asset-service.md</code>,</p>
+<p>verbatim from the design doc):</p>
+<ul>
+<li><code>GET /api/assets?…</code> list with hard filters; <code>GET /api/assets/{id}</code>,</li>
+</ul>
+<p><code>/lineage</code>, <code>/audit</code>.</p>
+<ul>
+<li><code>GET /api/assets/mentions?q=&amp;project_id=&amp;types=&amp;context=</code> — single shared</li>
+</ul>
+<p>endpoint for mention menu and all picker contexts.</p>
+<ul>
+<li>Collections and Smart Groups CRUD + <code>smart-groups/preview</code>.</li>
+<li><code>POST /api/assets/references</code> for element/character/soul_id creation.</li>
+</ul>
+<p>Submitted chat messages carry structure, not just text:</p>
+<pre><code class="language-json">{
+  &quot;text&quot;: &quot;用 @Luna 生成一个天台夜景视频&quot;,
+  &quot;mentions&quot;: [{ &quot;span&quot;: [2,7], &quot;entity_type&quot;: &quot;character&quot;,
+                 &quot;entity_id&quot;: &quot;char_luna&quot;, &quot;asset_ref_type&quot;: &quot;soul_id&quot;,
+                 &quot;operation&quot;: &quot;use&quot; }],
+  &quot;attachments&quot;: [{ &quot;asset_id&quot;: &quot;media_input_123&quot;, &quot;role&quot;: &quot;image_reference&quot; }]
+}</code></pre>
+<p>Subscribed events: <code>asset.upload.started</code>, <code>asset.processing</code>,</p>
+<p><code>asset.ready</code>, <code>asset.failed</code>, <code>asset.revoked</code>, <code>asset.indexed</code>,</p>
+<p><code>collection.updated</code>, <code>smart_group.updated</code>, <code>reference.status</code>,</p>
+<p><code>job.status</code> (<code>hermes-asset-library-backend-design.md</code> §实时事件).</p>
+<h2>Data Model</h2>
+<p>The UI owns no durable state. Client-side state it must maintain:</p>
+<ul>
+<li>Composer mention tokens as structured objects (id, type, span, ref type) —</li>
+</ul>
+<p>&quot;Composer 内部维护 mention token，不只存文本&quot;</p>
+<p>(<code>hermes-asset-library-backend-design.md</code> §前端必须配合的点).</p>
+<ul>
+<li>Gallery filter state and cursor pagination.</li>
+<li>Event-driven cache of asset cards (id -&gt; status/thumbnail), invalidated by</li>
+</ul>
+<p>the events above; no optimistic <code>ready</code> states.</p>
+<ul>
+<li>Smart Group builder draft (<code>query_json</code> mirror) until saved.</li>
+</ul>
+<p>All authoritative data comes from the Asset Service; the UI must not derive</p>
+<p>permissions client-side.</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Mention menu groups results: Assets, Characters, Elements, Collections,</li>
+</ul>
+<p>Smart Groups; each row shows label, type, status subtitle</p>
+<p>(&quot;face identity · ready · 4 source images&quot;), and thumbnail.</p>
+<ul>
+<li><code>@collection</code> / <code>@group</code> selection opens a preview (member list / hit</li>
+</ul>
+<p>count) and requires explicit confirm before expanding — never silently</p>
+<p>inserts many assets.</p>
+<ul>
+<li>Same-name entities require explicit disambiguation in the menu.</li>
+<li><code>not_ready</code> items render selectable-disabled with reason; submitting one</li>
+</ul>
+<p>anyway returns <code>asset_not_ready</code> from the backend and the composer shows</p>
+<p>it inline.</p>
+<ul>
+<li>Asset detail &quot;reuse&quot; inserts a structured ref into the composer; element /</li>
+</ul>
+<p>character buttons call the Asset Service, not local state.</p>
+<ul>
+<li>Cards never expose internal filesystem paths</li>
+</ul>
+<p>(<code>03-media-asset-contract.md</code> §Asset Card UI).</p>
+<ul>
+<li>Upload progress is visible; a finished upload appears in library and chat</li>
+</ul>
+<p>side panel simultaneously.</p>
+<ul>
+<li>Empty library renders blank with an upload affordance; no sample assets.</li>
+</ul>
+<h2>Permissions &amp; Error Handling</h2>
+<p>The list API returns only <code>read</code>-permitted assets; <code>use</code> is enforced again</p>
+<p>at submit time. UI surfaces the typed errors from the design doc:</p>
+<table><thead><tr><th>Error</th><th>UI behavior</th></tr></thead><tbody>
+<tr><td><code>asset_access_denied</code></td><td>Card action blocked with permission notice.</td></tr>
+<tr><td><code>asset_not_ready</code></td><td>Inline composer error on the mention chip.</td></tr>
+<tr><td><code>asset_revoked</code></td><td>Mention chip turns invalid; message blocked until removed.</td></tr>
+<tr><td><code>asset_not_found</code></td><td>Stale card removed; toast with refresh hint.</td></tr>
+<tr><td><code>upload_mime_not_allowed</code></td><td>Upload rejected pre-flight with allowed types.</td></tr>
+<tr><td><code>smart_group_query_invalid</code></td><td>Builder shows field-level validation.</td></tr>
+<tr><td><code>collection_expand_requires_confirmation</code></td><td>Preview/confirm dialog (the normal path, not an error toast).</td></tr>
+</tbody></table>
+<p>Fail-closed rule: generation submit with any invalid ref is blocked</p>
+<p>entirely; no warning-and-continue (<code>hermes-asset-library-backend-design.md</code></p>
+<p>§错误策略).</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>The mention flow works end to end: typing <code>@lun</code> lists Luna with status</li>
+</ul>
+<p>subtitle; selecting inserts a structured ref; submitting passes</p>
+<p><code>mentions[]</code> (verifiable in the request payload).</p>
+<ul>
+<li><code>@collection</code> cannot expand without a confirm step.</li>
+<li>A revoked asset disappears from mention results within one event cycle.</li>
+<li>Asset detail shows real model/job/prompt/input details for a generated</li>
+</ul>
+<p>asset (<code>03-media-asset-contract.md</code> §Acceptance).</p>
+<ul>
+<li>Download delivers the real binary via storage URL or local</li>
+</ul>
+<p>materialization.</p>
+<ul>
+<li>A Smart Group preview hit count matches the saved group&#x27;s first</li>
+</ul>
+<p>evaluation.</p>
+<ul>
+<li>Failed and <code>not_ready</code> assets render truthfully; no card ever fakes</li>
+</ul>
+<p><code>ready</code>.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Owning asset state, ACL evaluation, or lineage computation (Asset Service</li>
+</ul>
+<p>owns these).</p>
+<ul>
+<li>A public/shared gallery or publishing surface.</li>
+<li>Image editing tools inside the library (generation workflows own edits).</li>
+<li>Merging Marketplace/Memory/Files into this surface</li>
+</ul>
+<p>(<code>01-product-surface.md</code> §Non-Goals).</p>
+<ul>
+<li>Plain-text <code>@Luna</code> parsing as a permission mechanism — the backend rejects</li>
+</ul>
+<p>ambiguous plain-text resolves by design.</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Nav placement: dedicated Assets entry vs a tab inside My office — the IA</li>
+</ol>
+<p>tree in <code>01-product-surface.md</code> lists neither explicitly.</p>
+<ol>
+<li>Virtualized grid requirements: expected library sizes and thumbnail</li>
+</ol>
+<p>loading strategy are unspecified.</p>
+<ol>
+<li>Multi-select and bulk actions (add N assets to a collection) — not in</li>
+</ol>
+<p>the design doc; P1 need?</p>
+<ol>
+<li>Does the mention endpoint dedupe across types when one entity matches as</li>
+</ol>
+<p>both asset and element source?</p>
+<ol>
+<li>Video card preview behavior (hover-play vs static first frame) — QA</li>
+</ol>
+<p>contract guarantees a first frame (<code>03-media-asset-contract.md</code> §QA),</p>
+<p>nothing more.</p>
+<ol>
+<li>Where Smart Group similarity threshold UI lives (slider in builder?) and</li>
+</ol>
+<p>its default (design doc example uses 0.78).</p>
+</main></div>
+</body>
+</html>

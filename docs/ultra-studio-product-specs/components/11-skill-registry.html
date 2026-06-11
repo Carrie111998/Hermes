@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skill Registry</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Skill Registry</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="11-skill-registry.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Skill Registry</h1>
+<p>Status: partial — skill discovery, metadata scanning, progressive prompt</p>
+<p>loading, install/sync/guard tooling, usage tracking, and a Skills admin page</p>
+<p>are implemented; the Ultra Studio allowlist profile and the two skill evals</p>
+<p>are spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/04-skill-tool-prompt-contract.md</code></li>
+</ul>
+<p>(§Skill Layers, §Required Skill Runtime Objects, §Required Creative</p>
+<p>Skills, §Non-Goals, §Acceptance),</p>
+<p><code>docs/ultra-studio-agent-skill-tool-prompt-design.md</code> (§Skill Catalog</p>
+<p>Target, §Final Visible Catalog, §Progressive Disclosure Strategy, §Skill</p>
+<p>Package Structure, §Disabling and Deletion Plan),</p>
+<p><code>06-delivery-plan.md</code> (P0 item 1, P3 item 1)</p>
+<ul>
+<li>Code (verified this session): <code>agent/skill_bundles.py</code> (<code>scan_bundles</code>,</li>
+</ul>
+<p><code>list_bundles</code>, <code>save_bundle</code>, <code>delete_bundle</code>,</p>
+<p><code>resolve_bundle_command_key</code>, <code>build_bundle_invocation_message</code>),</p>
+<p><code>agent/prompt_builder.py</code> (<code>_build_skills_manifest</code>,</p>
+<p><code>_load_skills_snapshot</code>, <code>_write_skills_snapshot</code>, <code>_parse_skill_file</code>,</p>
+<p><code>clear_skills_system_prompt_cache</code>), <code>agent/skill_commands.py</code>,</p>
+<p><code>agent/skill_preprocessing.py</code>, <code>agent/skill_utils.py</code>,</p>
+<p><code>tools/skills_hub.py</code> (<code>SkillMeta</code>, <code>SkillBundle</code>, locked install paths,</p>
+<p><code>_guarded_http_get</code>), <code>tools/skill_manager_tool.py</code>, <code>tools/skills_tool.py</code>,</p>
+<p><code>tools/skills_sync.py</code>, <code>tools/skills_guard.py</code>,</p>
+<p><code>tools/skills_ast_audit.py</code>, <code>tools/skill_provenance.py</code>,</p>
+<p><code>tools/skill_usage.py</code>, <code>skills/</code> (category tree incl.</p>
+<p><code>skills/creative/</code>, <code>skills/index-cache</code>), <code>web/src/pages/SkillsPage.tsx</code>,</p>
+<p><code>agent/insights.py</code> (<code>_get_skill_usage</code>)</p>
+<h2>Purpose &amp; Scope</h2>
+<p>The Skill Registry owns discovery, enable/disable, versioning, and profile</p>
+<p>filtering of skills (<code>04-skill-tool-prompt-contract.md</code> §Required Skill</p>
+<p>Runtime Objects). Its product purpose: prevent the agent from &quot;behaving like</p>
+<p>a generic assistant with 87 unrelated skills&quot; — Ultra Studio exposes a</p>
+<p>focused creative skill set with progressive loading.</p>
+<p>Skill layering contract (§Skill Layers): startup loads only skill metadata;</p>
+<p><code>SKILL.md</code> loads after routing; large schemas/compilers/rubrics live in</p>
+<p><code>references/</code> and load only when needed.</p>
+<p>Scope: discovery and metadata, progressive loading, allowlist profiles,</p>
+<p>install/update/removal, safety gates, usage telemetry, and the two required</p>
+<p>evals. Routing decisions are <code>12-workflow-router.md</code>; the catalog shopping</p>
+<p>surface is <code>04-marketplace.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Skill tree on disk organized by category, with an index cache</td><td><code>skills/</code> (e.g. <code>skills/creative/infographic-md-flow/SKILL.md</code>), <code>skills/index-cache</code></td></tr>
+<tr><td>Implemented</td><td>Bundle scanning, listing, save/delete, slash-command resolution, invocation message assembly</td><td><code>agent/skill_bundles.py</code></td></tr>
+<tr><td>Implemented</td><td>Progressive disclosure into the system prompt: skills manifest + snapshot cache keyed by mtime, frontmatter parsing</td><td><code>agent/prompt_builder.py</code> (<code>_build_skills_manifest</code>, <code>_load_skills_snapshot</code>, <code>_parse_skill_file</code>)</td></tr>
+<tr><td>Implemented</td><td>Skill command handling and preprocessing on invocation</td><td><code>agent/skill_commands.py</code>, <code>agent/skill_preprocessing.py</code>, <code>agent/skill_utils.py</code></td></tr>
+<tr><td>Implemented</td><td>Hub install path with metadata model, locked install paths, guarded HTTP fetch</td><td><code>tools/skills_hub.py</code></td></tr>
+<tr><td>Implemented</td><td>Agent-facing skill management tools (list/install/manage/sync)</td><td><code>tools/skill_manager_tool.py</code>, <code>tools/skills_tool.py</code>, <code>tools/skills_sync.py</code></td></tr>
+<tr><td>Implemented</td><td>Safety gates: acquisition guard, AST audit, write-origin provenance</td><td><code>tools/skills_guard.py</code>, <code>tools/skills_ast_audit.py</code>, <code>tools/skill_provenance.py</code></td></tr>
+<tr><td>Implemented</td><td>Usage tracking and analytics</td><td><code>tools/skill_usage.py</code>, <code>agent/insights.py</code> (<code>_get_skill_usage</code>)</td></tr>
+<tr><td>Implemented</td><td>Skills admin page (browse/toggle)</td><td><code>web/src/pages/SkillsPage.tsx</code></td></tr>
+<tr><td>Specified, not built</td><td>Skill Allowlist Profile — the Ultra Studio visible skill set as a named, enforced profile</td><td><code>04-skill-tool-prompt-contract.md</code> §Required Skill Runtime Objects; <code>06-delivery-plan.md</code> P0 item 1 &quot;Ultra profile/allowlist bootstrap&quot;</td></tr>
+<tr><td>Specified, not built</td><td>Skill Trigger Eval (routing picks the right skill)</td><td><code>04-skill-tool-prompt-contract.md</code>; <code>06-delivery-plan.md</code> P3 item 1</td></tr>
+<tr><td>Specified, not built</td><td>Skill Output Contract Eval (handoff schema, missing fields)</td><td><code>04-skill-tool-prompt-contract.md</code></td></tr>
+<tr><td>Specified, not built</td><td>P0 creative skills: <code>workflow-router</code>, <code>media-qa</code>, <code>prompt-repair</code>, <code>product-photoshoot</code>, <code>product-md-flow</code> as shipped skills (<code>infographic-md-flow</code> exists: <code>skills/creative/infographic-md-flow/</code>)</td><td><code>04-skill-tool-prompt-contract.md</code> §Required Creative Skills</td></tr>
+<tr><td>Specified, not built</td><td>Phase A disable-first / Phase B archive plan for upstream skills</td><td><code>ultra-studio-agent-skill-tool-prompt-design.md</code> §Disabling and Deletion Plan</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li>Implicit: every routed request may activate a skill chosen by</li>
+</ul>
+<p><code>workflow-router</code> (planned routing) or slash command (implemented:</p>
+<p><code>resolve_bundle_command_key</code>).</p>
+<ul>
+<li>Slash commands <code>/skill-name</code> in chat/TUI (implemented).</li>
+<li>Skills admin page for browsing and toggling (implemented:</li>
+</ul>
+<p><code>SkillsPage.tsx</code>).</p>
+<ul>
+<li>Marketplace install flow (planned; wraps the hub install path).</li>
+<li>Agent self-service: skill management tools let the agent list/inspect</li>
+</ul>
+<p>skills (implemented), gated by guard rules.</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Metadata-only startup loading (name/description/commands)</td><td>Implemented (manifest + snapshot in <code>prompt_builder.py</code>)</td></tr>
+<tr><td>Load <code>SKILL.md</code> body only on activation</td><td>Implemented (bundle invocation path)</td></tr>
+<tr><td><code>references/</code> / <code>scripts/</code> / <code>assets/</code> lazy loading</td><td>Partial — package structure exists in skills tree; a formal Skill Resource Loader object is spec language (<code>04</code> §Required Skill Runtime Objects)</td></tr>
+<tr><td>Enable/disable individual skills</td><td>Implemented (admin page + config)</td></tr>
+<tr><td>Named allowlist profiles (Ultra profile filtering visible set)</td><td>Planned</td></tr>
+<tr><td>Install from hub with locked paths + guarded fetch</td><td>Implemented (<code>tools/skills_hub.py</code>)</td></tr>
+<tr><td>Acquisition safety: guard + AST audit + provenance</td><td>Implemented</td></tr>
+<tr><td>Version tracking per skill</td><td>Partial — hub bundles carry versions (<code>SkillBundle</code>); local tree versioning is git-level only</td></tr>
+<tr><td>Usage telemetry per skill</td><td>Implemented (<code>tools/skill_usage.py</code>, insights)</td></tr>
+<tr><td>Trigger eval harness</td><td>Planned</td></tr>
+<tr><td>Output contract eval harness</td><td>Planned</td></tr>
+<tr><td>Upstream skill disable-first migration</td><td>Planned (Phase A/B plan)</td></tr>
+<tr><td>Skill profiles per session (active skill profile in session state)</td><td>Planned (<code>02-agent-runtime-contract.md</code> §Session Lifecycle)</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Per-skill administrative state:</p>
+<pre><code class="language-text">discovered (on disk, scanned into manifest)
+  -&gt; enabled    (visible to routing/prompt for the active profile)
+  -&gt; disabled   (hidden from routing; files remain — disable-first rule)
+enabled &lt;-&gt; disabled (admin/profile toggle)
+disabled -&gt; archived  (Phase B physical move, only after allowlist verification)</code></pre>
+<p>Per-invocation lifecycle:</p>
+<pre><code class="language-text">metadata in prompt -&gt; routed/invoked -&gt; SKILL.md loaded
+  -&gt; references loaded on demand -&gt; executed -&gt; usage recorded</code></pre>
+<p>Rules: upstream skills are never deleted before disable/allowlist</p>
+<p>verification (<code>04-skill-tool-prompt-contract.md</code> §Non-Goals); enabling a</p>
+<p>hub-installed skill requires the guard + audit pass to have succeeded.</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (in-process / tool surface):</p>
+<ul>
+<li><code>scan_bundles()</code> / <code>list_bundles()</code> / <code>get_bundle(name)</code> /</li>
+</ul>
+<p><code>save_bundle(...)</code> / <code>delete_bundle(name)</code> — <code>agent/skill_bundles.py</code>.</p>
+<ul>
+<li>Slash resolution <code>resolve_bundle_command_key(command)</code> and invocation</li>
+</ul>
+<p>message assembly <code>build_bundle_invocation_message(...)</code>.</p>
+<ul>
+<li>Skill manifest/snapshot for the system prompt with cache invalidation</li>
+</ul>
+<p>(<code>clear_skills_system_prompt_cache</code>).</p>
+<ul>
+<li>Agent tools: skill listing/install/sync (<code>tools/skills_tool.py</code>,</li>
+</ul>
+<p><code>tools/skill_manager_tool.py</code>, <code>tools/skills_sync.py</code>).</p>
+<ul>
+<li>Dashboard skills API consumed by <code>SkillsPage.tsx</code> (page verified; route</li>
+</ul>
+<p>shapes not re-derived here).</p>
+<p>Planned:</p>
+<ul>
+<li>Profile API: resolve active profile -&gt; visible skill set; persisted as</li>
+</ul>
+<p>&quot;active skill profile&quot; in session state.</p>
+<ul>
+<li>Eval harness entry points (trigger eval, output contract eval) runnable in</li>
+</ul>
+<p>CI.</p>
+<p>No gateway events; registry changes surface through prompt rebuild and admin</p>
+<p>page refresh.</p>
+<h2>Data Model</h2>
+<p>Implemented:</p>
+<ul>
+<li>Skill package: directory with <code>SKILL.md</code> (frontmatter: name, description,</li>
+</ul>
+<p>triggers), optional <code>references/</code>, <code>scripts/</code>, <code>assets/</code></p>
+<p>(<code>ultra-studio-agent-skill-tool-prompt-design.md</code> §Skill Package</p>
+<p>Structure; parsing in <code>_parse_skill_file</code>).</p>
+<ul>
+<li>Bundle records: <code>SkillMeta</code> / <code>SkillBundle</code> (hub metadata, install path,</li>
+</ul>
+<p>category) — <code>tools/skills_hub.py</code>.</p>
+<ul>
+<li>Manifest snapshot: name -&gt; [offsets/mtimes] cache for prompt assembly</li>
+</ul>
+<p>(<code>_build_skills_manifest</code>).</p>
+<ul>
+<li>Usage records in the insights DB (<code>_get_skill_usage</code>).</li>
+</ul>
+<p>Planned:</p>
+<pre><code class="language-text">skill_profiles
+- profile_id            (e.g. &quot;ultra-studio&quot;)
+- visible_skills[]      (allowlist, not blocklist)
+- default_for_surface: web | tui | cli</code></pre>
+<h2>UI Behavior</h2>
+<ul>
+<li>Skills page groups by category, shows enabled state, description, and</li>
+</ul>
+<p>source (bundled vs hub-installed); toggling updates the active manifest.</p>
+<ul>
+<li>A disabled skill stays listed (visible-but-disabled), consistent with the</li>
+</ul>
+<p>Marketplace visibility rule.</p>
+<ul>
+<li>Hub installs surface guard/audit results before enablement; a rejected</li>
+</ul>
+<p>install shows the reason verbatim.</p>
+<ul>
+<li>The chat surface never shows the raw skill registry; users see the effect</li>
+</ul>
+<p>(workflows available) via Marketplace and router behavior.</p>
+<ul>
+<li>Slash command popover (<code>web/src/components/SlashPopover.tsx</code>) lists</li>
+</ul>
+<p>command-capable skills for the active profile.</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>Skill installation/modification is admin-scoped; agent-initiated writes</li>
+</ul>
+<p>carry write-origin provenance (<code>tools/skill_provenance.py</code></p>
+<p><code>set_current_write_origin</code>) so background/agent writes are</p>
+<p>distinguishable from user actions.</p>
+<ul>
+<li>Guard failures are terminal for the install (no partial enable);</li>
+</ul>
+<p><code>tools/skills_guard.py</code> rejections must surface verbatim.</p>
+<ul>
+<li>Errors: <code>skill_not_found</code> (unknown slash/bundle key), <code>skill_disabled</code></li>
+</ul>
+<p>(invocation against disabled skill — must state which profile disabled</p>
+<p>it), <code>skill_install_rejected</code> (guard/audit), <code>skill_sync_conflict</code></p>
+<p>(sync divergence via <code>tools/skills_sync.py</code>).</p>
+<ul>
+<li>Profile misconfiguration (empty visible set) must fail loudly at startup,</li>
+</ul>
+<p>not silently expose all skills — the failure mode the Ultra profile</p>
+<p>exists to prevent.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>With the Ultra profile active, the visible skill list contains only the</li>
+</ul>
+<p>catalog target set (&quot;The visible skills list is Ultra-focused&quot;,</p>
+<p><code>04-skill-tool-prompt-contract.md</code> §Acceptance).</p>
+<ul>
+<li>A generic video request does not trigger unrelated skills (ASCII / Comfy /</li>
+</ul>
+<p>Manim) — verified by trigger eval cases.</p>
+<ul>
+<li>Startup prompt contains metadata only; <code>SKILL.md</code> bodies load on</li>
+</ul>
+<p>activation (observable via prompt size/snapshot inspection).</p>
+<ul>
+<li>Disabling a skill removes it from routing within one prompt rebuild and</li>
+</ul>
+<p>the files remain on disk.</p>
+<ul>
+<li>A hub install with a failing AST audit never reaches enabled state.</li>
+<li>Skill usage rows appear in insights after invocations.</li>
+</ul>
+<h2>Non-Goals</h2>
+<ul>
+<li>Being the catalog UI (Marketplace) or the router (workflow-router).</li>
+<li>Deleting upstream skills as a cleanup strategy — disable/allowlist first.</li>
+<li>Letting plugins replace workflow skills</li>
+</ul>
+<p>(<code>04-skill-tool-prompt-contract.md</code> §Non-Goals).</p>
+<ul>
+<li>Skill marketplace publishing (P3).</li>
+<li>Per-skill sandboxing/runtime isolation (skills are prompt+resources;</li>
+</ul>
+<p>execution isolation belongs to <code>14-sandbox-lifecycle.md</code>).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Profile storage and precedence: config file vs DB; what happens when</li>
+</ol>
+<p>session state&#x27;s &quot;active skill profile&quot; conflicts with the deployment</p>
+<p>default?</p>
+<ol>
+<li>Eval harness shape: do trigger/output evals block CI (the existing</li>
+</ol>
+<p>workflow-router spec leaves the pass bar open — its Open Question 9)?</p>
+<ol>
+<li>Version pinning for hub installs vs git-tracked bundled skills — is an</li>
+</ol>
+<p>installed skill upgradeable in place, and who approves?</p>
+<ol>
+<li>Does the Ultra profile filter the admin Skills page too, or only</li>
+</ol>
+<p>runtime visibility?</p>
+<ol>
+<li>The formal Skill Resource Loader: is current lazy loading sufficient, or</li>
+</ol>
+<p>does <code>references/</code> need explicit load APIs with budget accounting?</p>
+<ol>
+<li>Multi-surface profiles: do TUI/CLI sessions get the Ultra profile or the</li>
+</ol>
+<p>full Hermes set by default?</p>
+</main></div>
+</body>
+</html>

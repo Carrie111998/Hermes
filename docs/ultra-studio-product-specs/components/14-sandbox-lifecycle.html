@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox Lifecycle</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Sandbox Lifecycle</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="14-sandbox-lifecycle.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Sandbox Lifecycle</h1>
+<p>Status: partial — a multi-backend execution environment abstraction (local,</p>
+<p>Docker, Modal, Daytona, Singularity, SSH) with file sync and session init</p>
+<p>exists; the product-level sandbox lifecycle verbs (`sandbox.create/attach/</p>
+<p>sleep/wake/recycle/restore_artifacts`) and the no-static-keys credential</p>
+<p>contract are spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/02-agent-runtime-contract.md</code></li>
+</ul>
+<p>(§Sandbox Lifecycle, §Session Lifecycle, §Error Contract),</p>
+<p><code>06-delivery-plan.md</code> (P2 items 1-2, P2 gates),</p>
+<p><code>docs/hermes-tokenrouter-credential-flow.md</code> (§核心合约: sandbox token</p>
+<p>rules), local config writeup</p>
+<p><code>/Users/lifcc/Desktop/code/work/infra/her/hermes-local-docker-sandbox.md</code></p>
+<p>(outside the repo)</p>
+<ul>
+<li>Code (verified this session): <code>tools/environments/base.py</code></li>
+</ul>
+<p>(<code>BaseEnvironment</code> ABC, <code>ProcessHandle</code>, <code>get_sandbox_dir</code>,</p>
+<p><code>init_session</code>, <code>cleanup</code>, <code>_run_bash</code>), <code>tools/environments/local.py</code>,</p>
+<p><code>tools/environments/docker.py</code>, <code>tools/environments/daytona.py</code>,</p>
+<p><code>tools/environments/modal.py</code>, <code>tools/environments/managed_modal.py</code>,</p>
+<p><code>tools/environments/modal_utils.py</code>, <code>tools/environments/singularity.py</code>,</p>
+<p><code>tools/environments/ssh.py</code>, <code>tools/environments/file_sync.py</code>,</p>
+<p><code>tools/terminal_tool.py</code>, <code>tools/process_registry.py</code>, <code>docker/</code></p>
+<p>(<code>entrypoint.sh</code>, <code>main-wrapper.sh</code>, <code>s6-rc.d/</code>, <code>cont-init.d/</code>,</p>
+<p><code>stage2-hook.sh</code>, <code>SOUL.md</code>), <code>docker-compose.yml</code></p>
+<h2>Purpose &amp; Scope</h2>
+<p>&quot;The sandbox is a task computer, not an implementation detail&quot;</p>
+<p>(<code>02-agent-runtime-contract.md</code> §Sandbox Lifecycle). It is where the agent</p>
+<p>runs commands, builds artifacts, and accumulates task files, with a</p>
+<p>lifecycle that outlives a single websocket connection.</p>
+<p>Credential rule: &quot;The sandbox must not hold static provider keys. It</p>
+<p>receives a short-lived, restricted token such as <code>HF_JWT_TOKEN</code>, then</p>
+<p>TokenRouter handles credential exchange and provider policy&quot; (§Sandbox</p>
+<p>Lifecycle; details in <code>17-tokenrouter.md</code>).</p>
+<p>Scope: environment backends, the session-level lifecycle verbs, artifact</p>
+<p>restore, resource limits, and the credential boundary. Task file semantics</p>
+<p>are <code>06-files-task-file-browser.md</code>; what runs inside (tools/skills) is out</p>
+<p>of scope here.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Environment abstraction: ABC with process handles, bash execution, temp dirs, session init and cleanup</td><td><code>tools/environments/base.py</code> (<code>BaseEnvironment</code>, <code>ProcessHandle</code>, <code>init_session</code>, <code>cleanup</code>)</td></tr>
+<tr><td>Implemented</td><td>Local backend (host execution with sandbox dir convention)</td><td><code>tools/environments/local.py</code>, <code>base.py</code> (<code>get_sandbox_dir</code>)</td></tr>
+<tr><td>Implemented</td><td>Docker backend (container-isolated execution)</td><td><code>tools/environments/docker.py</code></td></tr>
+<tr><td>Implemented</td><td>Remote/managed backends: Modal, managed Modal, Daytona, Singularity, SSH</td><td><code>tools/environments/modal.py</code>, <code>managed_modal.py</code>, <code>daytona.py</code>, <code>singularity.py</code>, <code>ssh.py</code></td></tr>
+<tr><td>Implemented</td><td>Host&lt;-&gt;environment file sync</td><td><code>tools/environments/file_sync.py</code></td></tr>
+<tr><td>Implemented</td><td>Container packaging with s6 supervision, init hooks, entrypoint</td><td><code>docker/</code> (<code>entrypoint.sh</code>, <code>s6-rc.d/</code>, <code>cont-init.d/</code>, <code>stage2-hook.sh</code>), <code>docker-compose.yml</code></td></tr>
+<tr><td>Implemented</td><td>Process tracking across tool calls</td><td><code>tools/process_registry.py</code>, <code>tools/terminal_tool.py</code></td></tr>
+<tr><td>Documented config (not in repo)</td><td>Local Docker sandbox hardening recipe (memory/network limits, secret hygiene)</td><td><code>hermes-local-docker-sandbox.md</code> at the workspace root</td></tr>
+<tr><td>Specified, not built</td><td><code>sandbox.create / attach / sleep / wake / recycle / restore_artifacts</code> operations</td><td><code>02-agent-runtime-contract.md</code> §Sandbox Lifecycle; no such verbs exist over the environments layer (rg for `sandbox.create</td><td>sandbox_attach` etc. — no hits)</td></tr>
+<tr><td>Specified, not built</td><td>Sandbox id in session state (<code>active sandbox id, if attached</code>)</td><td><code>02-agent-runtime-contract.md</code> §Session Lifecycle</td></tr>
+<tr><td>Specified, not built</td><td>Short-lived token injection (<code>HF_JWT_TOKEN</code>) replacing static env keys</td><td><code>hermes-tokenrouter-credential-flow.md</code> §核心合约; today provider keys are server-side env/config (e.g. <code>ATLAS_API_KEY</code> via <code>plugins/video_gen/atlas/client.py</code> <code>resolve_credentials</code>) — server-side, but static</td></tr>
+<tr><td>Specified, not built</td><td>Sleep/wake with artifact preservation across recycles</td><td><code>02-agent-runtime-contract.md</code>; <code>06-delivery-plan.md</code> P2 gate &quot;Running jobs survive worker/session interruption&quot;</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<p>No direct user surface. Reached via:</p>
+<ul>
+<li>Agent tool execution: terminal/file tools run inside the active</li>
+</ul>
+<p>environment (implemented; backend chosen by config).</p>
+<ul>
+<li>Session attach: resuming a task should re-attach its sandbox or restore</li>
+</ul>
+<p>artifacts (planned; <code>07-tasks-session-history.md</code> Open Question 4).</p>
+<ul>
+<li>Inspector/live panel showing sandbox status for the current run</li>
+</ul>
+<p>(planned; <code>01-product-surface.md</code> lists sandbox/task filesystem in the</p>
+<p>product shape).</p>
+<ul>
+<li>Admin/config: backend selection and limits in deployment config</li>
+</ul>
+<p>(<code>docker-compose.yml</code>, cli config).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Pluggable execution backends behind one ABC</td><td>Implemented</td></tr>
+<tr><td>Per-session working dir / sandbox dir convention</td><td>Implemented (<code>get_sandbox_dir</code>, cwd markers in <code>base.py</code>)</td></tr>
+<tr><td>Streamed process output with poll/kill/wait handles</td><td>Implemented (<code>ProcessHandle</code>, <code>_ThreadedProcessHandle</code>)</td></tr>
+<tr><td>File sync in/out of environments</td><td>Implemented (<code>file_sync.py</code>)</td></tr>
+<tr><td>Container isolation with resource limits</td><td>Implemented capability (Docker backend + compose); limit policy is deployment config, not product-enforced</td></tr>
+<tr><td>Named lifecycle: create/attach as explicit gateway operations</td><td>Planned</td></tr>
+<tr><td>Sleep/wake (pause billing/resources, preserve state)</td><td>Planned</td></tr>
+<tr><td>Recycle with <code>restore_artifacts</code> (rebuild env, restore task files)</td><td>Planned</td></tr>
+<tr><td>Sandbox id tracked in session state and shown in inspector</td><td>Planned</td></tr>
+<tr><td>Short-lived scoped tokens instead of static keys inside the sandbox</td><td>Planned (TokenRouter-dependent)</td></tr>
+<tr><td>Browser context store within the sandbox boundary</td><td>Planned (P2 item 4 in <code>06-delivery-plan.md</code>; browser tooling exists — <code>tools/browser_*</code> — but context persistence as product state does not)</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>Planned product lifecycle (<code>02-agent-runtime-contract.md</code> §Sandbox</p>
+<p>Lifecycle):</p>
+<pre><code class="language-text">(none) -&gt; created            sandbox.create
+created -&gt; attached          sandbox.attach (bound to session)
+attached -&gt; sleeping         sandbox.sleep (idle policy or explicit)
+sleeping -&gt; attached         sandbox.wake
+attached|sleeping -&gt; recycled  sandbox.recycle (env destroyed)
+recycled -&gt; attached         sandbox.restore_artifacts (new env, restored files)
+any -&gt; failed                backend error -&gt; `sandbox_unavailable`</code></pre>
+<p>Implemented today: environments are created per run/session by the tool</p>
+<p>layer (<code>init_session</code>) and torn down via <code>cleanup</code>; there is no sleep/wake</p>
+<p>or restore — a destroyed environment&#x27;s state survives only through synced</p>
+<p>files.</p>
+<p>Rules:</p>
+<ul>
+<li>Recycling must never silently lose task files: restore_artifacts is the</li>
+</ul>
+<p>defined path back.</p>
+<ul>
+<li>A media job must not depend on sandbox liveness — jobs are durable in the</li>
+</ul>
+<p>Media Job Service, sandboxes are disposable.</p>
+<ul>
+<li>Sleep/wake transitions must be invisible to a queued approval (approvals</li>
+</ul>
+<p>pause the agent, not the sandbox contract).</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (internal): <code>BaseEnvironment</code> interface — construction with</p>
+<p>cwd/timeout/env, <code>_run_bash</code> execution, <code>init_session</code>, <code>cleanup</code>, temp dir</p>
+<p>access; backend selection by configuration; file sync helpers.</p>
+<p>Planned (gateway operations, verbatim from the runtime contract):</p>
+<p><code>sandbox.create</code>, <code>sandbox.attach</code>, <code>sandbox.sleep</code>, <code>sandbox.wake</code>,</p>
+<p><code>sandbox.recycle</code>, <code>sandbox.restore_artifacts</code>.</p>
+<p>Planned events: sandbox state changes surface via <code>status.update</code> (the</p>
+<p>event stream has no dedicated sandbox event; phase changes are high-level</p>
+<p>status per <code>02-agent-runtime-contract.md</code> §Event Stream).</p>
+<p>Credential injection (planned): environment env-var surface carries only</p>
+<p><code>HF_JWT_TOKEN</code>-class scoped tokens; static provider keys remain outside</p>
+<p>(see <code>17-tokenrouter.md</code> four-phase flow).</p>
+<h2>Data Model</h2>
+<p>Implemented: in-process environment objects with cwd, timeout, env map;</p>
+<p>JSON stores for cwd markers/state under the sandbox dir</p>
+<p>(<code>base.py</code> <code>_load_json_store</code>/<code>_save_json_store</code>); process registry entries.</p>
+<p>Planned:</p>
+<pre><code class="language-text">sandboxes
+- sandbox_id
+- session_id (current binding; nullable when sleeping)
+- backend: local | docker | modal | daytona | singularity | ssh
+- state: created | attached | sleeping | recycled | failed
+- task_files_root
+- resource_profile (cpu/mem/net limits)
+- created_at, last_active_at
+
+sandbox_artifacts (for restore)
+- sandbox_id
+- manifest of synced paths -&gt; object storage keys
+- captured_at</code></pre>
+<h2>UI Behavior</h2>
+<ul>
+<li>The inspector/live panel shows the current sandbox state (backend,</li>
+</ul>
+<p>attached/sleeping, last activity) for the active session — sandbox as</p>
+<p>visible task computer, not hidden infra.</p>
+<ul>
+<li>Wake latency is shown honestly (a waking sandbox renders &quot;waking&quot;, not a</li>
+</ul>
+<p>frozen spinner).</p>
+<ul>
+<li>Recycle/restore is an explicit, confirmable action when user-initiated;</li>
+</ul>
+<p>automatic recycles (idle policy) must be visible in the task timeline.</p>
+<ul>
+<li>Shared sessions never expose sandbox file contents or env to viewers</li>
+</ul>
+<p>(&quot;Shared conversations do not imply shared sandbox or credentials&quot;,</p>
+<p><code>05-memory-marketplace-files.md</code> §Access Control).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>Sandbox operations are session-owner actions; service accounts (e.g.</li>
+</ul>
+<p>schedulers) need explicit scope.</p>
+<ul>
+<li>Typed error: <code>sandbox_unavailable</code> (<code>02-agent-runtime-contract.md</code></li>
+</ul>
+<p>§Error Contract) — surfaced when attach/create/wake fails; the agent must</p>
+<p>report it, not degrade to pretending execution happened.</p>
+<ul>
+<li>Credential boundary checks (post-TokenRouter): the environment&#x27;s env map</li>
+</ul>
+<p>must contain no static provider keys — acceptance test greps the sandbox</p>
+<p>env and mounted files (&quot;Sandbox environment and mounted files contain no</p>
+<p>real provider key&quot;, <code>hermes-tokenrouter-credential-flow.md</code></p>
+<p>§MVP 验收检查).</p>
+<ul>
+<li>Resource exhaustion inside the sandbox (OOM, disk) must map to visible</li>
+</ul>
+<p>tool errors with the backend&#x27;s evidence attached, never to silent</p>
+<p>truncation of outputs.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>Switching backend config (local -&gt; docker) changes execution isolation</li>
+</ul>
+<p>without changing tool behavior (the ABC contract holds).</p>
+<ul>
+<li>Files written in a session are present after environment teardown via</li>
+</ul>
+<p>sync, and (post-P2) after recycle via <code>restore_artifacts</code>.</p>
+<ul>
+<li>A resumed session either re-attaches its sandbox or restores artifacts —</li>
+</ul>
+<p>and tells the user which happened.</p>
+<ul>
+<li>Killing the environment mid-媒体-job does not kill the job (durability</li>
+</ul>
+<p>boundary holds once durable jobs exist).</p>
+<ul>
+<li>With TokenRouter integrated: no static provider key is readable from</li>
+</ul>
+<p>inside any sandbox backend; expired tokens fail closed.</p>
+<ul>
+<li><code>sandbox_unavailable</code> reaches the UI as a typed, actionable error.</li>
+</ul>
+<h2>Non-Goals</h2>
+<ul>
+<li>Multi-tenant container orchestration (K8s scheduling, autoscaling) in</li>
+</ul>
+<p>P0-P2 — single-deployment backends only.</p>
+<ul>
+<li>Sandbox as a security boundary against the deployment operator (it</li>
+</ul>
+<p>protects providers/credentials and isolates task execution; it is not a</p>
+<p>hostile-multitenant jail in MVP).</p>
+<ul>
+<li>GUI/VNC desktop streaming (the local browser/desktop bridge is P2 item 5,</li>
+</ul>
+<p>specified separately).</p>
+<ul>
+<li>Owning task file product semantics (Files component) or job durability</li>
+</ul>
+<p>(Media Job Service).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Default backend for the hosted product: Docker-per-session vs</li>
+</ol>
+<p>Modal/managed — cost and cold-start tradeoffs are undecided.</p>
+<ol>
+<li>Sleep implementation per backend: Docker pause vs checkpoint vs</li>
+</ol>
+<p>teardown+restore; which backends can honestly support <code>sleep</code> vs only</p>
+<p><code>recycle</code>?</p>
+<ol>
+<li>Idle policy: who decides sleep (gateway timer? cost budget?) and what is</li>
+</ol>
+<p>the default TTL?</p>
+<ol>
+<li><code>restore_artifacts</code> scope: full task root vs manifest-selected paths;</li>
+</ol>
+<p>where are artifacts staged (object storage keys per the planned</p>
+<p><code>sandbox_artifacts</code> table)?</p>
+<ol>
+<li>One sandbox per session, or shareable across a project&#x27;s sessions</li>
+</ol>
+<p>(the runtime contract binds by session; product phrasing &quot;task computer&quot;</p>
+<p>suggests per-task)?</p>
+<ol>
+<li>How the existing <code>tools/environments</code> config surface maps to per-session</li>
+</ol>
+<p>product choices — is backend ever user-visible/selectable?</p>
+</main></div>
+</body>
+</html>

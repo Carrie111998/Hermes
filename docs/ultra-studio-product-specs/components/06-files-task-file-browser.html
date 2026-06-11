@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Files / Task File Browser</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>Files / Task File Browser</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="06-files-task-file-browser.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>Files / Task File Browser</h1>
+<p>Status: partial — agent-side file tooling, chat attachment upload, sandbox</p>
+<p>file sync, and tool-result persistence are implemented; the Files navigation</p>
+<p>surface, task file browser UI, and promote-to-asset flow are spec-only.</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/ultra-studio-product-specs/05-memory-marketplace-files.md</code></li>
+</ul>
+<p>(§Files, §Search, §Access Control), <code>02-agent-runtime-contract.md</code></p>
+<p>(§Task Files, §Session Lifecycle), <code>01-product-surface.md</code></p>
+<p>(§Left Nav Shell), <code>03-media-asset-contract.md</code> (<code>task_file</code> asset type),</p>
+<p><code>06-delivery-plan.md</code> (P0 item 3, P2 items 2-3)</p>
+<ul>
+<li>Code (verified this session): <code>tools/file_tools.py</code>,</li>
+</ul>
+<p><code>tools/file_operations.py</code>, <code>tools/file_state.py</code>,</p>
+<p><code>tools/path_security.py</code>, <code>tools/tool_result_storage.py</code>,</p>
+<p><code>tools/environments/file_sync.py</code>,</p>
+<p><code>web/src/components/chat/ChatComposer.tsx</code> (<code>uploadAttachment</code>)</p>
+<h2>Purpose &amp; Scope</h2>
+<p>Files are task/workspace objects, not necessarily reusable assets</p>
+<p>(<code>05-memory-marketplace-files.md</code> §Files): uploaded originals, downloaded web</p>
+<p>artifacts, generated task files, logs, prompt plans, storyboard sheets, and</p>
+<p>rendered outputs. Task files become asset library entries only through</p>
+<p>explicit registration or promotion (<code>02-agent-runtime-contract.md</code></p>
+<p>§Task Files).</p>
+<p>This spec covers: the per-session task file root, file categories, the Files</p>
+<p>nav surface and task file browser, upload intake, promotion to assets, and</p>
+<p>the safety rules on file access. Asset semantics after promotion are owned by</p>
+<p><code>09-asset-service.md</code>; sandbox lifecycle by <code>14-sandbox-lifecycle.md</code>.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Implemented</td><td>Agent file tools with per-task path resolution (<code>task_id</code>-scoped cwd)</td><td><code>tools/file_tools.py</code> (<code>_resolve_path</code>, <code>_resolve_path_for_task</code>, <code>read_file_tool</code>)</td></tr>
+<tr><td>Implemented</td><td>Path safety: blocked device paths, sensitive-path checks, cross-profile checks</td><td><code>tools/file_tools.py</code> (<code>_is_blocked_device_path</code>, <code>_check_sensitive_path</code>, <code>_check_cross_profile_path</code>), <code>tools/path_security.py</code></td></tr>
+<tr><td>Implemented</td><td>Shell-backed file operations layer behind the tools</td><td><code>tools/file_operations.py</code> (<code>ShellFileOperations</code>, via <code>_get_file_ops</code>), <code>tools/file_state.py</code></td></tr>
+<tr><td>Implemented</td><td>Read budget + dedup guards (capped read chars, repeated-read tracking, patch-failure tracking)</td><td><code>tools/file_tools.py</code> (<code>_get_max_read_chars</code>, <code>_cap_read_tracker_data</code>, <code>_record_patch_failure</code>)</td></tr>
+<tr><td>Implemented</td><td>Oversized tool results persisted to files with preview stubs</td><td><code>tools/tool_result_storage.py</code> (<code>maybe_persist_tool_result</code>, <code>generate_preview</code>, <code>enforce_turn_budget</code>)</td></tr>
+<tr><td>Implemented</td><td>Host/sandbox file sync for execution environments</td><td><code>tools/environments/file_sync.py</code></td></tr>
+<tr><td>Implemented</td><td>Chat attachment upload from the composer (one file per action, disabled while uploading)</td><td><code>web/src/components/chat/ChatComposer.tsx</code> (<code>uploadAttachment</code>, <code>uploadingAttachment</code>)</td></tr>
+<tr><td>Specified, not built</td><td>Files nav entry and browsable Files page</td><td><code>01-product-surface.md</code> §Left Nav Shell; no files page in <code>web/src/pages/</code> (listing verified this session)</td></tr>
+<tr><td>Specified, not built</td><td>Task file browser (per-session tree of task files)</td><td><code>06-delivery-plan.md</code> P2 item 2</td></tr>
+<tr><td>Specified, not built</td><td>Upload becomes a typed <code>media_input</code> asset record</td><td><code>06-delivery-plan.md</code> P0 item 3, <code>03-media-asset-contract.md</code>; upload today lands as a chat attachment, not an asset row</td></tr>
+<tr><td>Specified, not built</td><td>Promote file -&gt; asset action</td><td><code>05-memory-marketplace-files.md</code> §Files (&quot;Files can be promoted into assets&quot;)</td></tr>
+<tr><td>Specified, not built</td><td>File category labels (log, prompt plan, storyboard, rendered output, …)</td><td><code>05-memory-marketplace-files.md</code> §Files</td></tr>
+<tr><td>Specified, not built</td><td>Files in unified Search with typed cards</td><td><code>05-memory-marketplace-files.md</code> §Search</td></tr>
+<tr><td>Specified, not built</td><td>Artifact bundle export</td><td><code>06-delivery-plan.md</code> P2 item 3</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<ul>
+<li>Composer attachment button in chat (implemented:</li>
+</ul>
+<p><code>web/src/components/chat/ChatComposer.tsx</code>).</p>
+<ul>
+<li><code>Files</code> entry in the left nav opening the Files page (planned).</li>
+<li>Task detail view -&gt; task file browser for that session (planned; task</li>
+</ul>
+<p>restore must include task files per <code>05-memory-marketplace-files.md</code></p>
+<p>§Tasks).</p>
+<ul>
+<li>Inspector download/export actions referencing task files (see</li>
+</ul>
+<p><code>03-inspector-live-panel.md</code>).</p>
+<ul>
+<li>Agent-initiated file creation during tool runs (implemented: file tools</li>
+</ul>
+<p>write under the task root; oversized tool results auto-persist via</p>
+<p><code>tools/tool_result_storage.py</code>).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td>Per-session task file root tracked in session state</td><td>Partial — task-scoped path resolution exists (<code>_resolve_path_for_task</code>); &quot;active task files root&quot; as session state field is planned (<code>02-agent-runtime-contract.md</code> §Session Lifecycle)</td></tr>
+<tr><td>Upload original files from chat</td><td>Implemented (composer) — typed <code>media_input</code> registration planned</td></tr>
+<tr><td>Agent read/write/edit files with safety checks</td><td>Implemented (<code>tools/file_tools.py</code>, <code>tools/path_security.py</code>)</td></tr>
+<tr><td>Persist oversized tool output as files</td><td>Implemented (<code>tools/tool_result_storage.py</code>)</td></tr>
+<tr><td>Sync files into/out of sandbox environments</td><td>Implemented (<code>tools/environments/file_sync.py</code>)</td></tr>
+<tr><td>Browse task files per session (tree + preview)</td><td>Planned</td></tr>
+<tr><td>File categories (uploaded, downloaded, generated, log, prompt plan, storyboard, rendered)</td><td>Planned</td></tr>
+<tr><td>Promote file to asset (explicit action)</td><td>Planned</td></tr>
+<tr><td>Download a file from the UI</td><td>Planned (downloads must use real storage URLs or local materialization, <code>03-media-asset-contract.md</code> §Acceptance)</td></tr>
+<tr><td>Search files with typed result cards</td><td>Planned</td></tr>
+<tr><td>Artifact bundle export</td><td>Planned (P2)</td></tr>
+<tr><td>Auto-promotion of files into assets</td><td>Excluded by spec (&quot;should not automatically become reusable project assets&quot;)</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>A task file&#x27;s lifecycle:</p>
+<pre><code class="language-text">created (upload | tool write | result persistence | download capture)
+  -&gt; available           (readable in task root)
+  -&gt; promoted            (explicit promotion -&gt; asset id minted; file remains)
+  -&gt; archived            (session archived; file kept per retention policy)
+  -&gt; deleted             (explicit delete or retention expiry)</code></pre>
+<ul>
+<li><code>created -&gt; available</code> is immediate for tool writes; uploads pass through</li>
+</ul>
+<p>the upload-in-progress state visible in the composer</p>
+<p>(<code>uploadingAttachment</code>).</p>
+<ul>
+<li><code>promoted</code> is one-way and explicit; the resulting asset&#x27;s lifecycle is then</li>
+</ul>
+<p>owned by the Asset Service (<code>uploading -&gt; processing -&gt; ready</code>, see</p>
+<p><code>09-asset-service.md</code>). The task file does not change identity.</p>
+<ul>
+<li>No state may be faked: a file row must correspond to a real file in the</li>
+</ul>
+<p>task root or object storage.</p>
+<h2>APIs &amp; Events</h2>
+<p>Implemented (agent tool surface): file read/write/edit tools registered in</p>
+<p>the tool registry (<code>tools/file_tools.py</code>, dispatched through</p>
+<p><code>model_tools.py</code>); chat attachment upload via the web app&#x27;s session API</p>
+<p>(consumed by <code>ChatComposer</code>).</p>
+<p>Planned (HTTP, for Files page and browser; no code exists):</p>
+<pre><code class="language-http">GET  /api/files?session_id=&amp;category=&amp;q=&amp;cursor=     # list/filter
+GET  /api/files/{file_id}                            # metadata + preview
+GET  /api/files/{file_id}/download
+POST /api/files/{file_id}/promote                    # -&gt; asset id</code></pre>
+<p>Planned events (gateway event naming per <code>02-agent-runtime-contract.md</code>):</p>
+<ul>
+<li><code>task_file.created</code></li>
+<li><code>task_file.promoted</code> (carries the new <code>asset_id</code>)</li>
+</ul>
+<p>Promotion must call the Asset Service registration path</p>
+<p>(<code>docs/hermes-asset-library-backend-design.md</code> §上传入库) rather than</p>
+<p>duplicating asset creation logic.</p>
+<h2>Data Model</h2>
+<p>Implemented: files live on disk under task-scoped roots; read/patch state is</p>
+<p>tracked in-memory per task (<code>tools/file_tools.py</code> trackers). No file metadata</p>
+<p>table exists.</p>
+<p>Planned entity:</p>
+<pre><code class="language-text">task_files
+- id
+- session_id
+- path                  (relative to task root)
+- category: uploaded | downloaded | generated | log
+            | prompt_plan | storyboard | rendered_output
+- mime, size
+- source_tool_call_id   (nullable)
+- promoted_asset_id     (nullable)
+- created_at</code></pre>
+<p><code>task_file</code> is also a declared asset type in <code>03-media-asset-contract.md</code></p>
+<p>§Asset Types — meaning a not-yet-promoted file. The browser should read from</p>
+<p>the task root as ground truth and treat the table as an index, so files</p>
+<p>created directly by tools are never invisible.</p>
+<h2>UI Behavior</h2>
+<ul>
+<li>Files page lists files across sessions with category filter chips and a</li>
+</ul>
+<p>session filter; default scope is the current project.</p>
+<ul>
+<li>Task file browser inside a task view shows a tree of the session&#x27;s task</li>
+</ul>
+<p>root with file preview (text, image thumbnails) and download.</p>
+<ul>
+<li>Each file row: name, category chip, size, source (upload / tool / result),</li>
+</ul>
+<p>created time, and a <code>Promote to asset</code> action where eligible.</p>
+<ul>
+<li>Promotion opens a confirm dialog stating the target asset type</li>
+</ul>
+<p>(<code>media_input</code> for originals) and never auto-selects bulk promotion.</p>
+<ul>
+<li>Internal filesystem paths are not exposed by default</li>
+</ul>
+<p>(<code>03-media-asset-contract.md</code> §Asset Card UI rule applies to file cards</p>
+<p>too); show task-root-relative paths.</p>
+<ul>
+<li>Empty state is blank, no sample files.</li>
+</ul>
+<h2>Permissions &amp; Error Handling</h2>
+<p>Permissions: files are scoped by session/project</p>
+<p>(<code>05-memory-marketplace-files.md</code> §Access Control). Shared conversations do</p>
+<p>not imply shared task files (&quot;Shared conversations do not imply shared</p>
+<p>sandbox or credentials&quot;). Promotion requires <code>use</code> on the file and create</p>
+<p>rights in the target project&#x27;s asset scope.</p>
+<p>Error contract:</p>
+<table><thead><tr><th>Error</th><th>Trigger</th><th>Today</th></tr></thead><tbody>
+<tr><td><code>file_path_blocked</code></td><td>Device/sensitive/cross-profile path access</td><td>Implemented as tool-level rejections (<code>tools/file_tools.py</code>, <code>tools/path_security.py</code>)</td></tr>
+<tr><td><code>file_read_budget_exceeded</code></td><td>Read exceeds char cap</td><td>Implemented (<code>_get_max_read_chars</code> cap behavior)</td></tr>
+<tr><td><code>upload_mime_not_allowed</code></td><td>Disallowed upload type</td><td>Planned (shared with Asset Service error table)</td></tr>
+<tr><td><code>file_not_found</code></td><td>Stale id or deleted file</td><td>Planned</td></tr>
+<tr><td><code>promotion_failed</code></td><td>Asset Service registration error</td><td>Planned; must surface the Asset Service error, not a generic apology</td></tr>
+<tr><td><code>asset_upload_failed</code></td><td>Storage write failure during promotion</td><td>Typed in <code>02-agent-runtime-contract.md</code> §Error Contract</td></tr>
+</tbody></table>
+<p>Failures must be loud: a failed promotion leaves the file un-promoted with a</p>
+<p>visible error; it must never mint a fake asset id.</p>
+<h2>Acceptance Criteria</h2>
+<ul>
+<li>An uploaded image appears in the session&#x27;s task files and (post-P0) as a</li>
+</ul>
+<p>typed <code>media_input</code> asset usable as a generation reference</p>
+<p>(<code>06-delivery-plan.md</code> P0 gates).</p>
+<ul>
+<li>Files created during a work session are browsable from the task view</li>
+</ul>
+<p>(<code>06-delivery-plan.md</code> P2 gate: &quot;Files created during work are</p>
+<p>browseable&quot;).</p>
+<ul>
+<li>Promoting a file produces a real asset id traceable in the Asset Service,</li>
+</ul>
+<p>and the file row links to it.</p>
+<ul>
+<li>A blocked path access from the agent produces a visible typed error in the</li>
+</ul>
+<p>tool stream.</p>
+<ul>
+<li>Search returns file results typed as files, distinct from assets.</li>
+<li>No file row exists without a real backing file.</li>
+</ul>
+<h2>Non-Goals</h2>
+<ul>
+<li>Auto-promotion of any file into the asset library.</li>
+<li>A general-purpose cloud drive (sharing, collaborative editing, versioning</li>
+</ul>
+<p>beyond what sessions need).</p>
+<ul>
+<li>Exposing absolute host filesystem paths in the UI.</li>
+<li>Replacing object storage for promoted assets (Asset Service owns that).</li>
+<li>Indexing file contents for semantic search in P0/P1 (filename/category</li>
+</ul>
+<p>filter first).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Retention: how long do task files of archived sessions live, and where</li>
+</ol>
+<p>(host disk vs object storage)?</p>
+<ol>
+<li>Is the Files page scoped to project or workspace by default, and how do</li>
+</ol>
+<p>CLI/TUI sessions&#x27; files appear (<code>source: web | tui | cli | panel</code> exists</p>
+<p>for tasks in <code>05-memory-marketplace-files.md</code> §Tasks)?</p>
+<ol>
+<li>Does promotion copy the binary into object storage immediately or</li>
+</ol>
+<p>lazily on first use?</p>
+<ol>
+<li>Are downloaded web artifacts (browser tool captures) auto-categorized as</li>
+</ol>
+<p><code>downloaded</code>, and do they carry provenance (source URL) for the ledger</p>
+<p>(<code>16-observation-provenance-ledger.md</code>)?</p>
+<ol>
+<li>Multi-file upload: the composer currently takes one file per action;</li>
+</ol>
+<p>is batch upload a P0 need?</p>
+<ol>
+<li>Where does the task-files-root session field live in gateway session</li>
+</ol>
+<p>state (<code>gateway/session.py</code> <code>SessionEntry</code>) vs sandbox state?</p>
+</main></div>
+</body>
+</html>

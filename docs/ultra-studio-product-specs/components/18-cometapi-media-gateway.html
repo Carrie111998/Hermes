@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CometAPI Media Gateway</title>
+<style>
+:root{color-scheme:light;--bg:#f7f8f6;--panel:#fff;--ink:#18211f;--muted:#66736f;--line:#d7dfdc;--accent:#1f6f62;--soft:#edf7f3;--code:#eef3f1}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.58;letter-spacing:0}.wrap{max-width:1080px;margin:0 auto;padding:28px}header{background:#fff;border-bottom:1px solid var(--line)}main{background:var(--panel);border:1px solid var(--line);border-radius:10px;margin-top:20px;padding:22px;box-shadow:0 10px 30px rgba(20,32,28,.06)}h1{font-size:32px;line-height:1.16;margin:0 0 10px}h2{font-size:22px;margin:30px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line)}h3{font-size:17px;margin:22px 0 8px}h4{font-size:15px;margin:18px 0 6px}p{margin:8px 0}a{color:#176a7a;text-decoration:none}a:hover{text-decoration:underline}code{background:var(--code);border:1px solid #dde6e3;border-radius:5px;padding:1px 5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.92em}pre{background:#101816;color:#eff8f4;border-radius:9px;padding:14px;overflow:auto}pre code{background:transparent;border:0;color:inherit;padding:0}table{width:100%;border-collapse:collapse;margin:14px 0;background:#fff;font-size:14px}th,td{border:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}th{background:var(--soft)}ul,ol{padding-left:22px}li{margin:5px 0}.meta{display:flex;gap:8px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{border:1px solid var(--line);background:#fff;border-radius:999px;padding:5px 10px}@media(max-width:720px){.wrap{padding:18px 12px}main{padding:16px}h1{font-size:26px}table,thead,tbody,tr,th,td{display:block;width:100%}thead{display:none}tr{border:1px solid var(--line);margin-bottom:10px}th,td{border:0;border-bottom:1px solid var(--line)}td:last-child{border-bottom:0}p,li,td,th,code{overflow-wrap:anywhere}}
+</style>
+</head>
+<body>
+<header><div class="wrap"><h1>CometAPI Media Gateway</h1><div class="meta"><span class="pill">Ultra Studio Component Specs</span><span class="pill">2026-06-11</span><a class="pill" href="README.html">Components Index</a><a class="pill" href="18-cometapi-media-gateway.md">Markdown</a></div></div></header>
+<div class="wrap"><main>
+<h1>CometAPI Media Gateway</h1>
+<p>Status: spec-only — explicitly a future service, &quot;not an MVP default</p>
+<p>capability&quot;; zero code exists (rg for <code>cometapi</code>/<code>comet</code> over the repo</p>
+<p>returns no source hits, verified this session).</p>
+<p>Date: 2026-06-11</p>
+<p>Sources:</p>
+<ul>
+<li>Docs: <code>docs/hermes-cometapi-media-gateway.md</code> (entire doc; itself sourced</li>
+</ul>
+<p>from <code>docs/notion-source/hermes/pages/07-cometapi.md</code>),</p>
+<p><code>docs/hermes-tokenrouter-credential-flow.md</code> (control-plane counterpart),</p>
+<p><code>docs/ultra-studio-product-specs/02-agent-runtime-contract.md</code></p>
+<p>(§Error Contract), <code>03-media-asset-contract.md</code> (asset refs),</p>
+<p><code>00-index.md</code> (source references)</p>
+<ul>
+<li>Code: none. The nearest implemented machinery is small-file handling in</li>
+</ul>
+<p>the upload/attachment path and vision tools (<code>tools/vision_tools.py</code>,</p>
+<p><code>tools/transcription_tools.py</code>), which are per-turn tools, not a media</p>
+<p>data plane.</p>
+<h2>Purpose &amp; Scope</h2>
+<p>CometAPI is the media data-plane gateway for images, audio, and video. It is</p>
+<p>separate from TokenRouter by design: TokenRouter handles control</p>
+<p>(credentials, policy, quota, billing); CometAPI handles large binary/media</p>
+<p>retrieval, trimming, sampling, packaging, and native multimodal injection</p>
+<p>(<code>hermes-cometapi-media-gateway.md</code> §范围).</p>
+<p>Build trigger: &quot;should not be built into the first web MVP unless the</p>
+<p>product needs long-video analysis, external social URL ingestion, or</p>
+<p>expensive multimodal preprocessing at scale&quot; (§范围). Until then, the MVP</p>
+<p>path is normal upload storage plus simple file parsing, with <code>video_analyze</code></p>
+<p>kept as a tool contract backed by a simple worker (§MVP 定位).</p>
+<p>Scope: responsibility layers, the <code>video_analyze</code>/<code>audio_analyze</code> tool</p>
+<p>contracts, the TokenRouter relationship, caching, and failure rules.</p>
+<h2>Implementation Status</h2>
+<table><thead><tr><th>Status</th><th>Item</th><th>Citation</th></tr></thead><tbody>
+<tr><td>Specified, not built</td><td>Resolver layer for external media URLs (YouTube, TikTok, Instagram, direct uploads)</td><td><code>hermes-cometapi-media-gateway.md</code> §职责</td></tr>
+<tr><td>Specified, not built</td><td>Physical preprocessing: time-window trim, frame downsampling, transcode, audio/subtitle extraction</td><td>§职责</td></tr>
+<tr><td>Specified, not built</td><td>Multimodal packaging: timestamp-aligned frames + audio + transcript + metadata</td><td>§职责</td></tr>
+<tr><td>Specified, not built</td><td>Model injection: convert processed media into target-model native multimodal parts</td><td>§职责</td></tr>
+<tr><td>Specified, not built</td><td>Tenant-safe processed-chunk cache keyed on source/time-window/fps/resolution/scope</td><td>§职责, §失败策略</td></tr>
+<tr><td>Specified, not built</td><td><code>video_analyze</code> / <code>audio_analyze</code> tool contracts</td><td>§请求形态</td></tr>
+<tr><td>Specified, not built</td><td>Delegated-token integration with TokenRouter, usage signals back to control plane</td><td>§与 TokenRouter 的关系</td></tr>
+<tr><td>Gap</td><td>MVP &quot;simple worker path&quot; for <code>video_analyze</code> also does not exist yet — the tool contract is unimplemented in any form (no <code>video_analyze</code> hits in <code>tools/</code>, verified this session)</td><td>§MVP 定位</td></tr>
+</tbody></table>
+<h2>User Entry Points</h2>
+<p>None directly; CometAPI is agent-infrastructure. Reached via:</p>
+<ul>
+<li>Agent tool calls <code>video_analyze</code> / <code>audio_analyze</code> during creative</li>
+</ul>
+<p>workflows (&quot;analyze this YouTube reference&quot;, &quot;what happens at 02:10&quot;).</p>
+<ul>
+<li>Workflow skills that take external reference URLs as inputs (UGC,</li>
+</ul>
+<p>cinematic flows in <code>04-skill-tool-prompt-contract.md</code> P1 skills).</p>
+<ul>
+<li>Never via raw large binaries in the prompt: &quot;accept a stable media ID or</li>
+</ul>
+<p>URL, not raw large binaries from the Agent prompt&quot; (§请求形态).</p>
+<h2>Feature List</h2>
+<table><thead><tr><th>Feature</th><th>Status</th></tr></thead><tbody>
+<tr><td><code>video_analyze(video_source, prompt, start/end offsets, fps, media_resolution, text_only)</code></td><td>Planned (contract defined verbatim in §请求形态)</td></tr>
+<tr><td><code>audio_analyze</code> equivalent</td><td>Planned</td></tr>
+<tr><td>External URL resolution incl. social platforms</td><td>Planned</td></tr>
+<tr><td>Bounded time-window analysis without full-frame context stuffing</td><td>Planned (acceptance: 30-minute video analyzable through a bounded window)</td></tr>
+<tr><td>Frame/audio cache with tenant-safe keys</td><td>Planned</td></tr>
+<tr><td>Usage signal emission to TokenRouter/control plane</td><td>Planned</td></tr>
+<tr><td>Text-only fallback explicitly marked when frames/audio unavailable</td><td>Planned (§失败策略)</td></tr>
+<tr><td>MVP interim: simple worker behind the same tool contract</td><td>Planned, precedes the service itself</td></tr>
+</tbody></table>
+<h2>State Machine</h2>
+<p>A CometAPI request is a bounded pipeline, not a long-lived stateful object:</p>
+<pre><code class="language-text">received -&gt; resolved -&gt; preprocessing -&gt; packaged -&gt; injected -&gt; completed
+              |             |                                     |
+              v             v                                     v
+        resolve_failed  preprocess_failed                  model_call_failed
+(any stage) -&gt; cache_hit shortcut for previously processed chunks</code></pre>
+<ul>
+<li><code>resolved</code>: source fetched or located (cache key computed from source,</li>
+</ul>
+<p>time window, fps, resolution, access scope).</p>
+<ul>
+<li><code>cache_hit</code>: identical chunk reused — must validate tenant scope before</li>
+</ul>
+<p>reuse (§失败策略: &quot;Cached media chunks must be tenant-safe&quot;).</p>
+<ul>
+<li>Failures are terminal per request and must be structured; there is no</li>
+</ul>
+<p>retry state inside the gateway (callers decide).</p>
+<h2>APIs &amp; Events</h2>
+<p>Tool contract (verbatim, §请求形态):</p>
+<pre><code class="language-text">video_analyze(
+  video_source,
+  prompt,
+  start_offset_sec?,
+  end_offset_sec?,
+  fps?,
+  media_resolution?,
+  text_only?
+)</code></pre>
+<p>Flow (§未来架构):</p>
+<pre><code class="language-text">Agent tool call
+  -&gt; TokenRouter policy and quota check
+  -&gt; CometAPI delegated media request
+  -&gt; resolver/download/cache
+  -&gt; trim/downsample/transcode
+  -&gt; multimodal packaging
+  -&gt; model call through approved provider route
+  -&gt; result and usage event returned to Agent</code></pre>
+<p>Division of labor with TokenRouter (§与 TokenRouter 的关系): TokenRouter owns</p>
+<p>JWT validation, provider secrets, quota/billing; CometAPI receives verified</p>
+<p>scoped requests (or validates a delegated token), performs large binary</p>
+<p>fetch and preprocessing, builds native multimodal payloads, and emits usage</p>
+<p>signals back. No gateway events are defined for the UI; results return on</p>
+<p>the tool channel (<code>tool.progress</code>/<code>tool.complete</code>).</p>
+<h2>Data Model</h2>
+<p>Planned (no persistence exists):</p>
+<pre><code class="language-text">media_chunks (cache)
+- chunk_id
+- source            (url or asset/media id)
+- time_window       (start_sec, end_sec)
+- fps, resolution
+- access_scope      (tenant/workspace boundary key)
+- artifact_keys     (frames, audio, transcript, metadata in object storage)
+- created_at, last_hit_at
+
+cometapi_requests (audit)
+- request_id, run_id, tool_call_id
+- tenant_id, workspace_id, project_id
+- source, time_window, params
+- cache_hit: bool
+- status, error_class
+- usage_event_id    (links into TokenRouter usage records)</code></pre>
+<p>Cache keys must include access scope — identical public URLs fetched for two</p>
+<p>tenants may share, but private uploads never cross tenants (§验收检查:</p>
+<p>&quot;Tenant A cannot reuse Tenant B&#x27;s private upload cache&quot;).</p>
+<h2>UI Behavior</h2>
+<p>CometAPI has no UI of its own. Obligations to the UI through the tool</p>
+<p>channel:</p>
+<ul>
+<li>Long analyses surface as <code>tool.progress</code> updates, not silence.</li>
+<li>A text-only degraded response is visibly marked as degraded</li>
+</ul>
+<p>(&quot;Text-only fallback is allowed only when the response explicitly marks</p>
+<p>that frames/audio were unavailable&quot;, §失败策略) — the chat renderer must</p>
+<p>show that marker.</p>
+<ul>
+<li>Resolver failures render as structured tool errors with a user-actionable</li>
+</ul>
+<p>message (bad URL, region-blocked, private video), never as fabricated</p>
+<p>analysis (§失败策略: no &quot;silently switch to fake analysis&quot;).</p>
+<h2>Permissions &amp; Error Handling</h2>
+<ul>
+<li>Every request passes TokenRouter policy first (tool scope, quota, tenant)</li>
+</ul>
+<p>before CometAPI does any fetch (§未来架构).</p>
+<ul>
+<li>Social/external resolver failures must not leak proxy credentials or</li>
+</ul>
+<p>internal fetch infrastructure details (§失败策略).</p>
+<ul>
+<li>Error classes (minimum): <code>resolve_failed</code>, <code>unsupported_source</code>,</li>
+</ul>
+<p><code>window_out_of_range</code>, <code>preprocess_failed</code>, <code>quota_exceeded</code> (from</p>
+<p>TokenRouter), <code>provider_rejected_input</code> — mapped onto the typed error</p>
+<p>channel of <code>02-agent-runtime-contract.md</code>.</p>
+<ul>
+<li>Degradation rule: partial results (e.g. frames ok, transcript missing)</li>
+</ul>
+<p>must enumerate what is missing; silent partial analysis is forbidden.</p>
+<h2>Acceptance Criteria</h2>
+<p>Verbatim checks from <code>hermes-cometapi-media-gateway.md</code> §验收检查:</p>
+<ul>
+<li>A 30-minute video can be analyzed through a bounded time window without</li>
+</ul>
+<p>placing all frames in prompt context.</p>
+<ul>
+<li>Repeated analysis of the same URL/time window hits cache.</li>
+<li>Tenant A cannot reuse Tenant B&#x27;s private upload cache.</li>
+<li>A failed resolver returns a structured error that the UI can display.</li>
+<li>TokenRouter can trace the CometAPI request into usage and billing records.</li>
+</ul>
+<p>Plus the MVP-phase check: <code>video_analyze</code> exists as a tool contract backed</p>
+<p>by the simple worker path, and swapping the backend to CometAPI later does</p>
+<p>not change the tool&#x27;s schema.</p>
+<h2>Non-Goals</h2>
+<ul>
+<li>Building this service for the first web MVP (explicit in §范围/§MVP 定位).</li>
+<li>Generation of media (Media Job Service scope) — CometAPI only analyzes</li>
+</ul>
+<p>and packages inputs.</p>
+<ul>
+<li>Credential management or billing decisions (TokenRouter scope).</li>
+<li>A general scraping platform: resolvers exist for media analysis inputs,</li>
+</ul>
+<p>not bulk content harvesting.</p>
+<ul>
+<li>Storing analysis results as product assets automatically (callers decide</li>
+</ul>
+<p>what to persist via task files / Asset Service).</p>
+<h2>Open Questions</h2>
+<ol>
+<li>Build trigger metrics: what measured threshold (repeat-analysis volume,</li>
+</ol>
+<p>preprocessing cost) justifies replacing the simple worker with the</p>
+<p>service?</p>
+<ol>
+<li>The simple worker path itself: process-local in the gateway vs a queue</li>
+</ol>
+<p>worker; where do interim artifacts (extracted frames) live — task file</p>
+<p>root?</p>
+<ol>
+<li>Delegated token shape: does CometAPI validate <code>HF_JWT_TOKEN</code> itself or</li>
+</ol>
+<p>only accept TokenRouter-forwarded verified requests?</p>
+<ol>
+<li>Social platform resolver legality/ToS boundaries per platform — which</li>
+</ol>
+<p>resolvers ship at all?</p>
+<ol>
+<li>Which models&#x27; &quot;native multimodal parts&quot; are targeted first (the</li>
+</ol>
+<p>packaging layer is model-specific by definition)?</p>
+<ol>
+<li>Cache eviction policy and storage budget for processed chunks.</li>
+</ol>
+</main></div>
+</body>
+</html>
