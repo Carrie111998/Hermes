@@ -16,6 +16,7 @@ import pytest
 import json
 import os
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -210,10 +211,15 @@ class TestReadFile:
         _assert_clean(result.content)
 
     def test_tilde_expansion(self, ops):
-        test_path = Path.home() / ".hermes_test_tilde_9f8a7b"
+        # Must live under the real $HOME to exercise ~ expansion (can't move to
+        # tmp_path). The name is made unique per process/run so two concurrent
+        # pytest invocations of this file don't race on a shared fixed path --
+        # one unlinking in its finally while the other is mid-read.
+        name = f".hermes_test_tilde_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        test_path = Path.home() / name
         try:
             test_path.write_text("TILDE_EXPANSION_OK\n")
-            result = ops.read_file("~/.hermes_test_tilde_9f8a7b")
+            result = ops.read_file(f"~/{name}")
             assert result.error is None
             assert "TILDE_EXPANSION_OK" in result.content
             _assert_clean(result.content)
