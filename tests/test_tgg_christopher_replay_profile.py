@@ -222,3 +222,94 @@ def test_prepare_hermes_home_writes_session_reset_none_in_continue_mode(tmp_path
     )
     cont_config = yaml.safe_load((cont_home / "config.yaml").read_text(encoding="utf-8"))
     assert cont_config["session_reset"]["mode"] == "none"
+
+
+# ── nightly-compact: end-of-day compaction step (v6.3 item 3) ─────────────
+
+
+def test_nightly_compact_flag_parses():
+    from scripts.tgg_christopher_hermes_replay import _build_arg_parser
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(["--nightly-compact"])
+    assert args.nightly_compact is True
+    assert parser.parse_args([]).nightly_compact is False
+
+
+class _FakeSessionEntry:
+    def __init__(self, session_id):
+        self.session_id = session_id
+
+
+class _FakeSessionStore:
+    """Session store whose session id rotates once compress has fired —
+    mirrors _compress_context ending the old session + minting a new id."""
+
+    def __init__(self):
+        self.compressed = False
+
+    def get_or_create_session(self, source):
+        return _FakeSessionEntry("sess-new" if self.compressed else "sess-old")
+
+    def load_transcript(self, session_id):
+        if session_id == "sess-new":
+            return [{"role": "assistant", "content": "summary"}]
+        return [
+            {"role": "user", "content": "day of messages " * 50},
+            {"role": "assistant", "content": "replies " * 50},
+        ]
+
+
+class _FakeRunner:
+    def __init__(self):
+        self.session_store = _FakeSessionStore()
+        self.compress_events = []
+
+    async def _handle_compress_command(self, event):
+        self.compress_events.append(event)
+        self.session_store.compressed = True
+        return "🗜️ Compressed 2 → 1 messages\n~1,200 → ~40 tokens"
+
+
+def test_run_nightly_compact_fires_gateway_compress_path():
+    """The post-drain compact step goes through the SAME callable the
+    gateway's manual /compress uses (no reimplemented compression), with no
+    focus topic, and reports pre/post tokens + the rotated session id."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from scripts.tgg_christopher_hermes_replay import _run_nightly_compact
+
+    runner = _FakeRunner()
+    source = SimpleNamespace(chat_id="chat-1", platform="whatsapp")
+    last_event = SimpleNamespace(
+        source=source, pa_job_type="tgg_ops_ingest", pa_context={"k": "v"}
+    )
+    result = asyncio.run(
+        _run_nightly_compact(runner, [{"event": last_event}])
+    )
+
+    assert len(runner.compress_events) == 1
+    event = runner.compress_events[0]
+    assert event.text == "/compress"
+    assert event.get_command() == "compress"
+    assert event.get_command_args() == ""  # no focus topic — standing guidance governs
+    assert event.source is source
+    assert event.pa_job_type == "tgg_ops_ingest"
+    assert event.pa_context == {"k": "v"}
+
+    assert result["pre_session_id"] == "sess-old"
+    assert result["post_session_id"] == "sess-new"
+    assert result["session_rotated"] is True
+    assert result["pre_estimated_tokens"] > result["post_estimated_tokens"] > 0
+    assert "Compressed" in result["gateway_reply"]
+
+
+def test_run_nightly_compact_skips_when_no_turns():
+    import asyncio
+
+    from scripts.tgg_christopher_hermes_replay import _run_nightly_compact
+
+    runner = _FakeRunner()
+    assert asyncio.run(_run_nightly_compact(runner, [])) is None
+    assert runner.compress_events == []

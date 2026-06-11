@@ -2394,6 +2394,62 @@ def _html_report_from_published_run(*, db_path: Path, run_id: str, output_path: 
     }
 
 
+async def _run_nightly_compact(runner: Any, turn_results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """End-of-day compaction step (--nightly-compact; v6.3 item 3, WB f6845320).
+
+    AFTER the day's messages drain, fire a compaction on the chat's session via
+    the SAME internal path the gateway's manual /compress command uses
+    (GatewayRunner._handle_compress_command: builds a tmp_agent, applies the PA
+    compression behavior, runs _compress_context, rewrites the transcript under
+    the new session id, updates the session entry). Compression itself is NOT
+    reimplemented here. The manual-compress path has no 200k autocompact
+    threshold gate, so this runs even when the session is far below threshold —
+    that is the point of a nightly: emulate the production 3am scheduled
+    per-session compact so the NEXT day's --continue run resumes a compacted
+    session instead of treadmilling into the threshold mid-day.
+    """
+    if not turn_results:
+        print("[nightly-compact] skipped: no turns processed", file=sys.stderr, flush=True)
+        return None
+    from agent.model_metadata import estimate_messages_tokens_rough
+    from gateway.platforms.base import MessageEvent
+
+    last_event = turn_results[-1]["event"]
+    source = last_event.source
+    pre_entry = runner.session_store.get_or_create_session(source)
+    pre_session_id = pre_entry.session_id
+    pre_tokens = estimate_messages_tokens_rough(
+        runner.session_store.load_transcript(pre_session_id) or []
+    )
+    event = MessageEvent(
+        text="/compress",
+        source=source,
+        pa_job_type=getattr(last_event, "pa_job_type", None),
+        pa_context=getattr(last_event, "pa_context", None),
+    )
+    gateway_reply = await runner._handle_compress_command(event)
+    post_entry = runner.session_store.get_or_create_session(source)
+    post_session_id = post_entry.session_id
+    post_tokens = estimate_messages_tokens_rough(
+        runner.session_store.load_transcript(post_session_id) or []
+    )
+    result = {
+        "pre_session_id": pre_session_id,
+        "post_session_id": post_session_id,
+        "session_rotated": post_session_id != pre_session_id,
+        "pre_estimated_tokens": pre_tokens,
+        "post_estimated_tokens": post_tokens,
+        "gateway_reply": str(gateway_reply or ""),
+    }
+    print(
+        f"[nightly-compact] tokens ~{pre_tokens:,} -> ~{post_tokens:,}; "
+        f"session {pre_session_id} -> {post_session_id}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return result
+
+
 async def _run(args: argparse.Namespace) -> int:
     profile = _resolve_replay_profile(args)
     _validate_provider_model_args(
@@ -2652,6 +2708,10 @@ async def _run(args: argparse.Namespace) -> int:
     if processed != len(feed_records):
         print(f"processed {processed}/{len(feed_records)} bridge rows", file=sys.stderr)
 
+    nightly_compact_result = None
+    if args.nightly_compact:
+        nightly_compact_result = await _run_nightly_compact(runner, turn_results)
+
     session_ids = sorted({str(r.get("session_id") or "") for r in turn_results if r.get("session_id")})
     session_id = session_ids[-1] if session_ids else ""
     _html_report(
@@ -2708,6 +2768,7 @@ async def _run(args: argparse.Namespace) -> int:
         "estimated_cost_usd": sum(_as_number(r.get("estimated_cost_usd")) for r in turn_results),
         "llm_call_count": sum(_as_int(r.get("llm_call_count")) for r in turn_results),
         "published": published,
+        "nightly_compact": nightly_compact_result,
     }
     print(json.dumps(summary, indent=2))
     if args.cleanup_hermes_home and not args.hermes_home:
@@ -2715,7 +2776,7 @@ async def _run(args: argparse.Namespace) -> int:
     return 0
 
 
-def main() -> int:
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="tgg-eval-gpt54-mini", choices=_replay_profile_names())
     parser.add_argument("--db", default=str(DEFAULT_DB))
@@ -2750,6 +2811,19 @@ def main() -> int:
             "wall-clock session reset policy for the run."
         ),
     )
+    parser.add_argument(
+        "--nightly-compact",
+        action="store_true",
+        help=(
+            "After the day's messages drain, fire a compaction on the chat's "
+            "session via the gateway's manual-compress path (same machinery as "
+            "/compress: tmp_agent + _compress_context + transcript rewrite under "
+            "the new session id). Runs even below the autocompact threshold — "
+            "replay emulation of the production 3am scheduled per-session "
+            "compact, so the next day's --continue run resumes a compacted "
+            "session. Prints a one-line pre/post token + session-id result."
+        ),
+    )
     parser.add_argument("--secrets", default=str(DEFAULT_SECRETS))
     parser.add_argument("--cleanup-hermes-home", action="store_true")
     parser.add_argument(
@@ -2762,7 +2836,11 @@ def main() -> int:
             "<media-root>/<basename>. Defaults to $TGG_REPLAY_MEDIA_ROOT."
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    args = _build_arg_parser().parse_args()
     global _MEDIA_ROOT
     if args.media_root:
         _MEDIA_ROOT = Path(args.media_root).expanduser().resolve()
