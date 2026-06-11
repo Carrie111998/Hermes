@@ -12191,6 +12191,12 @@ class AIAgent:
         # fields.
         _turn_input_tokens_baseline = self.session_input_tokens
         _turn_output_tokens_baseline = self.session_output_tokens
+        # Per-turn context-window peak: the largest prompt the model actually
+        # saw on any single API call this turn (prompt_tokens = input + cache
+        # read + cache write). The deltas above answer "what did this turn
+        # cost"; this answers "how full was the context window" — the signal
+        # autocompact analysis needs.
+        _turn_context_window_peak = 0
 
         self._ensure_db_session()
 
@@ -13627,6 +13633,9 @@ class AIAgent:
                         self.session_cache_read_tokens += canonical_usage.cache_read_tokens
                         self.session_cache_write_tokens += canonical_usage.cache_write_tokens
                         self.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                        _turn_context_window_peak = max(
+                            _turn_context_window_peak, canonical_usage.prompt_tokens
+                        )
 
                         # Log API call details for debugging/observability
                         _cache_pct = ""
@@ -16057,6 +16066,8 @@ class AIAgent:
             "turn_output_tokens": max(
                 0, self.session_output_tokens - _turn_output_tokens_baseline
             ),
+            # Largest single-call prompt this turn (context the model saw).
+            "turn_context_window_peak": _turn_context_window_peak,
             "cache_read_tokens": self.session_cache_read_tokens,
             "cache_write_tokens": self.session_cache_write_tokens,
             "reasoning_tokens": self.session_reasoning_tokens,

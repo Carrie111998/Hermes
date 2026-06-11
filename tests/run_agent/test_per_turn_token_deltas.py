@@ -109,3 +109,23 @@ def test_turn_tokens_sum_multiple_api_calls_within_one_turn(monkeypatch):
     assert r1["turn_input_tokens"] == 1000 * n1
     assert r2["turn_input_tokens"] == 1000 * n2
     assert r2["input_tokens"] == 1000 * (n1 + n2)  # cumulative
+
+
+def test_turn_context_window_peak_resets_per_turn(monkeypatch):
+    """turn_context_window_peak is the largest single-call prompt THIS turn
+    (the context the model actually saw). It must reset per
+    run_conversation call — a smaller second turn reports its own smaller
+    peak, not a session-lifetime max (and never a sum)."""
+    sizes = iter([9000, 2000, 2000, 2000])
+
+    def _resp():
+        return _chat_resp(next(sizes), 10)
+
+    agent = _make_agent(monkeypatch, _resp)
+    r1 = agent.run_conversation("hi")
+    r2 = agent.run_conversation("again")
+
+    assert r1["turn_context_window_peak"] == 9000
+    # Turn 2's calls all saw 2000-token prompts: per-turn max, not the
+    # session max (9000) and not a sum of turn-2 calls.
+    assert r2["turn_context_window_peak"] == 2000

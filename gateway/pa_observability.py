@@ -125,6 +125,9 @@ class PaTurnRecord:
     provider: Optional[str] = None
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    # Largest single-call prompt this turn (the context size the model
+    # actually saw) — max input/prompt tokens across the turn's model calls.
+    context_window_peak: Optional[int] = None
     cost_usd: Optional[float] = None
     # turn_status / error are the HIGHEST-VALUE observability fields (seeing
     # FAILURES) and free at this boundary.
@@ -149,6 +152,7 @@ class PaTurnRecord:
             "provider": self.provider,
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "context_window_peak": self.context_window_peak,
             "cost_usd": self.cost_usd,
             "turn_status": self.turn_status,
             "error": self.error,
@@ -382,6 +386,14 @@ def build_turn_record(
             agent_result.get("turn_output_tokens")
             if agent_result.get("turn_output_tokens") is not None
             else (agent_result.get("output_tokens") or agent_result.get("completion_tokens"))
+        ),
+        # Context-window peak: max single-call prompt size this turn, emitted
+        # by run_conversation as turn_context_window_peak. No legacy fallback
+        # — callers that don't emit it record NULL, never a cumulative proxy.
+        context_window_peak=(
+            _as_int(agent_result.get("turn_context_window_peak"))
+            if agent_result.get("turn_context_window_peak") is not None
+            else None
         ),
         cost_usd=_as_float(
             agent_result.get("estimated_cost_usd") or agent_result.get("cost_usd")

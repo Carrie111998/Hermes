@@ -274,6 +274,7 @@ CREATE TABLE IF NOT EXISTS pa_turns (
     provider TEXT,
     input_tokens INTEGER,
     output_tokens INTEGER,
+    context_window_peak INTEGER,
     cost_usd REAL,
     turn_status TEXT,
     error_json TEXT,
@@ -1052,6 +1053,7 @@ class SessionDB:
         provider: Optional[str] = None,
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
+        context_window_peak: Optional[int] = None,
         cost_usd: Optional[float] = None,
         turn_status: Optional[str] = None,
         error: Optional[Any] = None,
@@ -1135,10 +1137,11 @@ class SessionDB:
             conn.execute(
                 """INSERT OR REPLACE INTO pa_turns (
                     turn_id, agent_id, chat_id, session_id, message_refs_json,
-                    model, provider, input_tokens, output_tokens, cost_usd,
+                    model, provider, input_tokens, output_tokens,
+                    context_window_peak, cost_usd,
                     turn_status, error_json, latency_ms, raw_turn_envelope_json,
                     started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     turn_id,
                     agent_id,
@@ -1149,6 +1152,7 @@ class SessionDB:
                     provider,
                     input_tokens,
                     output_tokens,
+                    context_window_peak,
                     cost_usd,
                     turn_status,
                     error_json,

@@ -67,9 +67,9 @@ def test_pa_turns_columns_match_universal_shape(tmp_path):
             for expected in (
                 "turn_id", "agent_id", "chat_id", "session_id",
                 "message_refs_json", "model", "provider", "input_tokens",
-                "output_tokens", "cost_usd", "turn_status", "error_json",
-                "latency_ms", "raw_turn_envelope_json", "started_at",
-                "completed_at",
+                "output_tokens", "context_window_peak", "cost_usd",
+                "turn_status", "error_json", "latency_ms",
+                "raw_turn_envelope_json", "started_at", "completed_at",
             ):
                 assert expected in cols, f"missing pa_turns column: {expected}"
         finally:
@@ -689,3 +689,83 @@ def test_build_turn_record_falls_back_to_legacy_token_fields():
     )
     assert record.input_tokens == 1234
     assert record.output_tokens == 56
+
+
+def test_build_turn_record_extracts_context_window_peak():
+    """context_window_peak comes from run_conversation's
+    turn_context_window_peak (max single-call prompt this turn)."""
+    record = po.build_turn_record(
+        session_id="s",
+        agent_id="christopher",
+        chat_id="c",
+        agent_result={
+            "final_response": "ok",
+            "completed": True,
+            "messages": [],
+            "turn_input_tokens": 111899,
+            "turn_output_tokens": 894,
+            "turn_context_window_peak": 98342,
+        },
+        final_response="ok",
+        started_at=1.0,
+        completed_at=1.1,
+    )
+    assert record.context_window_peak == 98342
+
+
+def test_build_turn_record_context_window_peak_absent_records_none():
+    """Callers that don't emit turn_context_window_peak (string-only paths,
+    replay backfill) record NULL — never a cumulative/legacy proxy."""
+    record = po.build_turn_record(
+        session_id="s",
+        agent_id="a",
+        chat_id="c",
+        agent_result={
+            "final_response": "ok",
+            "completed": True,
+            "messages": [],
+            "input_tokens": 500,
+            "output_tokens": 50,
+        },
+        final_response="ok",
+        started_at=1.0,
+        completed_at=1.1,
+    )
+    assert record.context_window_peak is None
+
+
+def test_record_pa_turn_persists_context_window_peak(tmp_path):
+    """The column round-trips through record_pa_turn — and the
+    schema-reconcile auto-migration adds it to pre-existing DBs."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_pa_turn(
+            turn_id="t-peak-1",
+            agent_id="christopher",
+            chat_id="chat",
+            session_id="s",
+            input_tokens=120,
+            output_tokens=30,
+            context_window_peak=98342,
+        )
+        db.record_pa_turn(
+            turn_id="t-peak-2",
+            agent_id="christopher",
+            chat_id="chat",
+            session_id="s",
+        )
+        conn = sqlite3.connect(tmp_path / "state.db")
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = {
+                row["turn_id"]: row
+                for row in conn.execute(
+                    "SELECT turn_id, context_window_peak FROM pa_turns"
+                ).fetchall()
+            }
+            assert rows["t-peak-1"]["context_window_peak"] == 98342
+            assert rows["t-peak-2"]["context_window_peak"] is None
+        finally:
+            conn.close()
+    finally:
+        db.close()
