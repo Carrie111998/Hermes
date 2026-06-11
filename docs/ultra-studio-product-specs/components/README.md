@@ -3,6 +3,8 @@
 Status: per-component functional specifications  
 Date: 2026-06-11
 
+Chinese reading version: [components-zh/README.html](../components-zh/README.html)
+
 This directory holds the complete per-component functional specs that
 complement the contract-level pack in the parent directory. Each doc follows
 the same 12 sections: Purpose & Scope, Implementation Status, User Entry

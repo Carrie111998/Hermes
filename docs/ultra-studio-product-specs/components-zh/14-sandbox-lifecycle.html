@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>14 沙箱生命周期 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">14 / 19</span>
+      </nav>
+      <h1>14 沙箱生命周期</h1>
+      <p class="lede">管理每个任务的执行环境：创建、挂载文件、运行工具、暂停、唤醒、销毁。Atlas-only P0 可以先弱化，但不能把它当已经完整。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Sandbox Lifecycle</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 local/docker/modal/daytona/singularity/ssh 等 environment 后端。</li>
+          <li>已有 terminal/session 相关抽象。</li>
+          <li>代码证据：tools/environments/*、agent/runtime 相关模块。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有产品级 sandbox.create/attach/sleep/wake/destroy lifecycle。</li>
+          <li>session 与 sandbox id、task files、browser context 没有统一绑定。</li>
+          <li>没有云模式隔离和 TokenRouter delegated token 注入。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>如果当前 MVP 只走 Atlas API，要明确标记 sandbox 不参与媒体生成。</li>
+          <li>需要本地文件工具时，记录 cwd、session_id、文件访问边界。</li>
+          <li>禁止把 API key 直接写进 sandbox 可读文件。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>Cloud sandbox、sleep/wake、browser session、task filesystem、quota。</li>
+          <li>和 TokenRouter、CometAPI、Files 页面集成。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>用户能知道当前任务是否用了 sandbox。</li>
+          <li>sandbox 错误不会被包装成普通生成失败。</li>
+          <li>关闭任务后临时文件清理策略明确。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../components/14-sandbox-lifecycle.md">英文 Markdown 原文</a></td><td>完整审计版，包含更细的状态机、API、数据模型和开放问题。</td></tr>
+          <tr><td><a href="../components/14-sandbox-lifecycle.html">英文 HTML 原文</a></td><td>由英文 Markdown 生成的网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="13-prompt-compiler.html">上一页：13 提示词编译器</a>
+        <a class="chip" href="15-human-approval-gateway.html">下一页：15 人工审批网关</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

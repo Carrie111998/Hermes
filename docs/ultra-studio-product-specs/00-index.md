@@ -25,6 +25,7 @@ document without reading everything.
 | [05-memory-marketplace-files.md](05-memory-marketplace-files.md) | Memory, Marketplace, Files, task filesystem, skill/templates catalog. | Product + platform |
 | [06-delivery-plan.md](06-delivery-plan.md) | Milestones, P0/P1/P2, acceptance checks, launch gates. | Everyone |
 | [components/README.md](components/README.md) | Per-component complete functional specs (19 components). | Engineering |
+| [components-zh/README.html](components-zh/README.html) | 中文可读版组件规格，按状态、缺口、P0 和验收点整理。 | Product + engineering |
 
 ## Source References
 

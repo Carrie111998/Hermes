@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>08 资产库界面 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">08 / 19</span>
+      </nav>
+      <h1>08 资产库界面</h1>
+      <p class="lede">统一浏览生成资产、上传素材、角色、合集、智能分组和散装资产。它是创作复用的核心页面，不只是图库。</p>
+      <div class="meta">
+        <span class="badge spec-only">仅设计</span>
+        <span class="badge info">Asset Library UI</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>仅设计：文档已定义，代码里还没有可用实现。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>产品设计已有角色、合集、智能分组、散装资产边界。</li>
+          <li>当前代码没有完整 asset library page、gallery、picker。</li>
+          <li>邻近材料：asset library backend design、Notion source、demo HTML。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有 asset API，因此 UI 没有真实数据源。</li>
+          <li>没有语义搜索、filters、collections、smart groups、characters。</li>
+          <li>没有从 chat/inspector 复用资产的统一入口。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>先依赖 Asset Service 的最小 media_assets 列表。</li>
+          <li>支持查看生成图片/视频、下载、复制 URL、回到来源任务。</li>
+          <li>没有后端时只显示明确未接入空态。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>Collection、Smart Group、Character、相似搜索、prompt 搜索。</li>
+          <li>从聊天里 @asset 或选择 reference image/video。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>新生成资产自动出现在资产库。</li>
+          <li>资产卡能显示来源模型、prompt、创建时间。</li>
+          <li>用户可以从资产库把图片重新用于下一次生成。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../components/08-asset-library-ui.md">英文 Markdown 原文</a></td><td>完整审计版，包含更细的状态机、API、数据模型和开放问题。</td></tr>
+          <tr><td><a href="../components/08-asset-library-ui.html">英文 HTML 原文</a></td><td>由英文 Markdown 生成的网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="07-tasks-session-history.html">上一页：07 任务 / 会话历史</a>
+        <a class="chip" href="09-asset-service.html">下一页：09 资产服务</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

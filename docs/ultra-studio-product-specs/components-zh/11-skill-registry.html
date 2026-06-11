@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>11 技能注册表 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">11 / 19</span>
+      </nav>
+      <h1>11 技能注册表</h1>
+      <p class="lede">管理 agent 可见技能、渐进加载、安装守卫、Ultra allowlist、评估和版本。它决定“做视频”时 agent 应该看到哪些技能。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Skill Registry</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 skill discovery、metadata scan、progressive loading、install guard。</li>
+          <li>已有 creative skills 和 ultra_studio_skills allowlist 辅助代码。</li>
+          <li>代码证据：agent/skill*、hermes_cli/ultra_studio_skills.py、skills/creative/*。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有完整 Ultra profile，把无关 87 个 skills 从运行时视野隔离。</li>
+          <li>没有 skill eval、capability contract、tool schema binding。</li>
+          <li>没有 marketplace/registry 的统一状态源。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>定义 Ultra creative allowlist：workflow-router、infographic-md-flow、product-photoshoot、media-qa、prompt-repair 等。</li>
+          <li>默认创作 agent 只暴露视频/图片/资产相关技能。</li>
+          <li>缺依赖时阻止加载并给用户可理解错误。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>技能版本、评分、测试样例、provider compatibility。</li>
+          <li>Marketplace 安装和团队级 allowlist。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>用户说“我要做视频”时不会加载 ascii-video、manim 等无关技能。</li>
+          <li>router 能看到有限且正确的 creative skills。</li>
+          <li>禁用技能不会出现在 tool plan 里。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../components/11-skill-registry.md">英文 Markdown 原文</a></td><td>完整审计版，包含更细的状态机、API、数据模型和开放问题。</td></tr>
+          <tr><td><a href="../components/11-skill-registry.html">英文 HTML 原文</a></td><td>由英文 Markdown 生成的网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="10-media-job-service.html">上一页：10 媒体任务服务</a>
+        <a class="chip" href="12-workflow-router.html">下一页：12 工作流路由器</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

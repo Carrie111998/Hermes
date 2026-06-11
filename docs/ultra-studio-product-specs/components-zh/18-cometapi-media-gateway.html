@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>18 CometAPI 媒体网关 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">18 / 19</span>
+      </nav>
+      <h1>18 CometAPI 媒体网关</h1>
+      <p class="lede">处理长视频、外部社媒 URL、抽帧、转码、音频/字幕提取、多模态打包。它是媒体数据面，不是 TokenRouter。</p>
+      <div class="meta">
+        <span class="badge spec-only">仅设计</span>
+        <span class="badge info">CometAPI Media Gateway</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>仅设计：文档已定义，代码里还没有可用实现。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>CometAPI 文档明确说不是 MVP 默认能力。</li>
+          <li>代码里没有 cometapi/comet source hits。</li>
+          <li>邻近实现只有上传、小文件处理、vision/transcription tools。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有 resolver、preprocess、packaging、cache、video_analyze/audio_analyze 工具。</li>
+          <li>没有和 TokenRouter 的 delegated token 与 usage signal 集成。</li>
+          <li>MVP 的 simple worker path 也还没做。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>不把 CometAPI 放进第一版生成链路。</li>
+          <li>如果用户上传普通图片/短视频，走普通 upload + Media Job。</li>
+          <li>外部长视频分析请求要明确提示未接入，或走后续 video_analyze contract。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>YouTube/TikTok/Instagram resolver、窗口化分析、抽帧缓存、转写对齐。</li>
+          <li>大媒体计费、缓存权限、模型原生多模态 payload。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>30 分钟视频不会被整段塞进 prompt。</li>
+          <li>失败 fallback 标明是 text-only 还是缺帧。</li>
+          <li>数据面和凭证控制面职责不混淆。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../components/18-cometapi-media-gateway.md">英文 Markdown 原文</a></td><td>完整审计版，包含更细的状态机、API、数据模型和开放问题。</td></tr>
+          <tr><td><a href="../components/18-cometapi-media-gateway.html">英文 HTML 原文</a></td><td>由英文 Markdown 生成的网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="17-tokenrouter.html">上一页：17 TokenRouter 凭证与额度路由</a>
+        <a class="chip" href="19-model-catalog-provider-constraints.html">下一页：19 模型目录与供应商约束</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>

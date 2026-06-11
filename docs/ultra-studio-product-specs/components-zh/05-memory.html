@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>05 记忆系统 | Ultra Studio 中文组件规格</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文组件索引</a>
+        <a href="../components/README.html">英文审计版</a>
+        <span class="chip">05 / 19</span>
+      </nav>
+      <h1>05 记忆系统</h1>
+      <p class="lede">保存项目偏好、品牌设定、角色设定、用户选择和长期上下文。它要能被 agent 使用，也要能被用户审计。</p>
+      <div class="meta">
+        <span class="badge partial">部分实现</span>
+        <span class="badge info">Memory</span>
+        <span class="chip">阅读版 HTML</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout">
+        <strong>状态说明：</strong>部分实现：有真实底座，但产品合同还没完整接上。 本页是中文阅读版，英文 Markdown 仍是更细的审计原文。
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <h2>已有实现证据</h2>
+          <ul>
+          <li>已有 MemoryStore、memory tool、provider 插件、prompt injection 和多 provider 架构。</li>
+          <li>已有 honcho、mem0、supermemory 等 memory provider 插件。</li>
+          <li>代码证据：agent/memory*、tools/memory*、plugins/memory/*。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>主要缺口</h2>
+          <ul>
+          <li>没有 Ultra Memory 页面。</li>
+          <li>没有项目记忆、创作偏好、角色记忆的清晰 UI 分层。</li>
+          <li>没有 memory citation 在生成结果和会话中的一致展示。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>P0 要做</h2>
+          <ul>
+          <li>Memory 导航页至少能显示当前 memory 是否启用、provider、最近条目或空态。</li>
+          <li>生成时用到的 memory 需要能在结果上看到引用线索。</li>
+          <li>用户可以禁用某条错误记忆或关闭本会话 memory 注入。</li>
+          </ul>
+        </article>
+      </div>
+
+      <h2>P1 / P2 后续</h2>
+      <ul>
+          <li>品牌记忆、角色记忆、项目记忆、团队记忆的独立命名空间。</li>
+          <li>Memory diff、回滚、审核和过期策略。</li>
+      </ul>
+
+      <h2>验收点</h2>
+      <ul>
+          <li>Memory 关闭时 agent 不应声称读取了长期记忆。</li>
+          <li>Memory provider 错误要明确暴露。</li>
+          <li>错误记忆可被用户定位和移除。</li>
+      </ul>
+
+      <h2>原文与上下文</h2>
+      <table class="table">
+        <thead><tr><th>材料</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td><a href="../components/05-memory.md">英文 Markdown 原文</a></td><td>完整审计版，包含更细的状态机、API、数据模型和开放问题。</td></tr>
+          <tr><td><a href="../components/05-memory.html">英文 HTML 原文</a></td><td>由英文 Markdown 生成的网页版，保留给审计和对照。</td></tr>
+          <tr><td><a href="../00-index.md">Ultra Studio Spec Pack</a></td><td>顶层产品、运行时、资产、技能、交付计划入口。</td></tr>
+        </tbody>
+      </table>
+
+      <nav class="crumbs" aria-label="next">
+        <a class="chip" href="README.html">返回中文索引</a>
+        <a class="chip" href="04-marketplace.html">上一页：04 技能市场</a>
+        <a class="chip" href="06-files-task-file-browser.html">下一页：06 文件 / 任务文件浏览器</a>
+      </nav>
+      <p class="footer">生成时间：2026-06-11。用途：中文阅读和实施排期，不替代英文审计原文。</p>
+    </section>
+  </main>
+</body>
+</html>
