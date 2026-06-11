@@ -2770,9 +2770,15 @@ async def _run(args: argparse.Namespace) -> int:
         "published": published,
         "nightly_compact": nightly_compact_result,
     }
-    print(json.dumps(summary, indent=2))
+    # Flush explicitly (v6.3 item 5c, WB f6845320): with stdout redirected to
+    # a log file the stream is block-buffered, and the day-30 AMK run exited 0
+    # with this summary never reaching the log. Flush the JSON itself and
+    # drain both streams before returning.
+    print(json.dumps(summary, indent=2), flush=True)
     if args.cleanup_hermes_home and not args.hermes_home:
         shutil.rmtree(hermes_home, ignore_errors=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
     return 0
 
 
@@ -2853,10 +2859,17 @@ def main() -> int:
             run_id=args.render_review_run,
             output_path=output_path,
         )
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(summary, indent=2), flush=True)
+        sys.stdout.flush()
         return 0
     _validate_replay_args(args)
-    return asyncio.run(_run(args))
+    try:
+        return asyncio.run(_run(args))
+    finally:
+        # Belt for the redirected-log loss class (v6.3 item 5c): make sure
+        # everything written reaches the log even on exception exits.
+        sys.stdout.flush()
+        sys.stderr.flush()
 
 
 if __name__ == "__main__":
