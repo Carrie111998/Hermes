@@ -1,6 +1,7 @@
 """Tests for tools/file_operations.py — deny list, result dataclasses, helpers."""
 
 import os
+import stat
 import sys
 
 import pytest
@@ -1346,3 +1347,365 @@ class TestLocalNativePatchReplaceFastPath:
         ops = ShellFileOperations(env)
         ops.patch_replace("/x/whatever.txt", "a", "b")
         assert env.execute.called
+
+
+# =========================================================================
+# Local-backend native delete / move fast paths
+# =========================================================================
+
+class TestLocalNativeDeleteFastPath:
+    """delete_file on the local backend must not shell out for regular files.
+
+    ``delete_file`` shelled a single ``rm -f`` per call — one of the last
+    per-call Git Bash spawns in the mutating set (0.3-1s each on Windows).
+    Regular local files (including read-only ones) are removed with native
+    Python I/O instead; anything ``rm -f`` handles specially falls back to
+    the shell so its exact semantics and error text survive.
+
+    The pinned expectations are ``rm -f``'s empirically captured behavior:
+    deleting a MISSING file SUCCEEDS (idempotent — ``os.remove`` would
+    raise FileNotFoundError); a READ-ONLY file is removed (GNU ``rm -f``
+    clears the attribute, so the native path clears the read-only bit via
+    ``os.chmod`` before ``os.remove``, which would otherwise raise
+    PermissionError on Windows); and a DIRECTORY target is left to the
+    shell, which fails it with the exact "Is a directory" message.
+    """
+
+    @pytest.fixture
+    def local_ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        class _NoSpawnLocal(LocalEnvironment):
+            """Real LocalEnvironment, minus the init-time bash snapshot."""
+
+            def init_session(self):
+                self._snapshot_ready = False
+
+        env = _NoSpawnLocal(cwd=str(tmp_path))
+        env.execute = _must_not_execute
+        return ShellFileOperations(env, cwd=str(tmp_path))
+
+    def test_delete_existing_file_uses_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "gone.txt"
+        f.write_bytes(b"bye\n")
+        r = local_ops.delete_file(str(f))
+        assert r.error is None
+        assert not f.exists()
+
+    def test_delete_missing_file_is_idempotent_no_shell(self, local_ops, tmp_path):
+        # rm -f on a missing file succeeds; os.remove would raise
+        # FileNotFoundError, so the native path must treat absent as success.
+        r = local_ops.delete_file(str(tmp_path / "never.txt"))
+        assert r.error is None
+
+    def test_delete_readonly_file_no_shell(self, local_ops, tmp_path):
+        # Windows read-only attribute (git object files): rm -f removes it;
+        # os.remove raises PermissionError, so the native path clears the
+        # read-only bit first.
+        f = tmp_path / "ro.txt"
+        f.write_bytes(b"ro\n")
+        os.chmod(str(f), stat.S_IREAD)
+        r = local_ops.delete_file(str(f))
+        assert r.error is None
+        assert not f.exists()
+
+    def test_delete_empty_file_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "empty.txt"
+        f.write_bytes(b"")
+        r = local_ops.delete_file(str(f))
+        assert r.error is None
+        assert not f.exists()
+
+    def test_delete_deny_listed_path_blocked(self, local_ops):
+        # Deny check precedes the native gate; must still block with no
+        # delete and no shell spawn.
+        denied = os.path.join(str(Path.home()), ".ssh", "id_rsa")
+        r = local_ops.delete_file(denied)
+        assert r.error is not None
+        assert "denied" in r.error.lower()
+
+    def test_delete_directory_falls_back_to_shell(self, tmp_path):
+        # rm -f on a directory fails with a specific "Is a directory"
+        # message; the native path must defer so that exact error survives.
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "rm: cannot remove: Is a directory", "returncode": 1}
+
+        d = tmp_path / "adir"
+        d.mkdir()
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        r = ops.delete_file(str(d))
+        assert calls, "directory delete should defer to the shell rm"
+        assert r.error is not None
+        assert d.exists()
+
+    def test_delete_non_local_env_keeps_shell_pipeline(self):
+        env = MagicMock()
+        env.cwd = "/x"
+        env.execute.return_value = {"output": "", "returncode": 0}
+        ops = ShellFileOperations(env)
+        ops.delete_file("/x/whatever.txt")
+        assert env.execute.called
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_delete_msys_drive_path_no_shell(self, local_ops, tmp_path):
+        f = tmp_path / "msys.txt"
+        f.write_bytes(b"x\n")
+        drive = f.drive.rstrip(":").lower()
+        msys = "/" + drive + str(f)[len(f.drive):].replace("\\", "/")
+        r = local_ops.delete_file(msys)
+        assert r.error is None
+        assert not f.exists()
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_delete_posix_root_path_falls_back_on_windows(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        # /tmp/... resolves inside Git Bash's filesystem, not C:\tmp — the
+        # native path must not guess; the shell pipeline owns this delete.
+        ops.delete_file("/tmp/hermes-native-delpath-probe.txt")
+        assert calls, "POSIX-root path should defer to the shell pipeline"
+
+
+class TestLocalNativeMoveFastPath:
+    """move_file on the local backend must not shell out for regular files.
+
+    ``move_file`` shelled a single ``mv`` per call.  A regular file moved
+    to a non-directory destination on the same volume is renamed with
+    native ``os.replace`` (which overwrites an existing file, matching
+    ``mv``); everything ``mv`` handles specially — moving INTO a target
+    directory (``dst/basename``), a read-only destination, a missing
+    source, a missing destination parent, a cross-device move, or
+    src == dst — falls back to the shell so its exact behavior and error
+    text survive.
+
+    The pinned expectations are ``mv``'s empirically captured behavior:
+    a non-existent dst is created; an existing regular dst is overwritten
+    (``os.replace`` matches); an existing-directory dst means "move into
+    it" (which ``os.replace`` raises on, so we defer); and a read-only dst
+    is force-overwritten by ``mv`` but raises PermissionError under
+    ``os.replace`` on Windows (so we defer).
+    """
+
+    @pytest.fixture
+    def local_ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        class _NoSpawnLocal(LocalEnvironment):
+            """Real LocalEnvironment, minus the init-time bash snapshot."""
+
+            def init_session(self):
+                self._snapshot_ready = False
+
+        env = _NoSpawnLocal(cwd=str(tmp_path))
+        env.execute = _must_not_execute
+        return ShellFileOperations(env, cwd=str(tmp_path))
+
+    def test_move_to_nonexistent_dst_uses_no_shell(self, local_ops, tmp_path):
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_bytes(b"payload\n")
+        r = local_ops.move_file(str(src), str(dst))
+        assert r.error is None
+        assert not src.exists()
+        assert dst.read_bytes() == b"payload\n"
+
+    def test_move_overwrites_existing_file_no_shell(self, local_ops, tmp_path):
+        # mv overwrites an existing regular dst; os.replace matches it.
+        src = tmp_path / "src.txt"
+        dst = tmp_path / "dst.txt"
+        src.write_bytes(b"NEW\n")
+        dst.write_bytes(b"OLD-and-longer\n")
+        r = local_ops.move_file(str(src), str(dst))
+        assert r.error is None
+        assert not src.exists()
+        assert dst.read_bytes() == b"NEW\n"
+
+    def test_move_deny_listed_src_blocked(self, local_ops, tmp_path):
+        # Deny check precedes the native gate; no move, no shell spawn.
+        denied = os.path.join(str(Path.home()), ".ssh", "id_rsa")
+        r = local_ops.move_file(denied, str(tmp_path / "dst.txt"))
+        assert r.error is not None
+        assert "denied" in r.error.lower()
+
+    def test_move_deny_listed_dst_blocked(self, local_ops, tmp_path):
+        src = tmp_path / "src.txt"
+        src.write_bytes(b"x\n")
+        denied = os.path.join(str(Path.home()), ".aws", "credentials")
+        r = local_ops.move_file(str(src), denied)
+        assert r.error is not None
+        assert "denied" in r.error.lower()
+        # deny precedes the native gate -> src untouched, no shell spawn
+        assert src.exists()
+
+    def test_move_into_existing_directory_falls_back(self, tmp_path):
+        # mv moves a file INTO a target directory (dst/basename); os.replace
+        # raises on that, so the native path must defer to the shell.
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        src = tmp_path / "src.txt"
+        src.write_bytes(b"x\n")
+        dstdir = tmp_path / "destdir"
+        dstdir.mkdir()
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        ops.move_file(str(src), str(dstdir))
+        assert calls, "move into a directory should defer to the shell mv"
+
+    def test_move_readonly_dst_falls_back(self, tmp_path):
+        # os.replace over a read-only dst raises PermissionError on Windows;
+        # mv force-overwrites it. Defer so the shell wins.
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        src = tmp_path / "src.txt"
+        src.write_bytes(b"x\n")
+        dst = tmp_path / "dst_ro.txt"
+        dst.write_bytes(b"old\n")
+        os.chmod(str(dst), stat.S_IREAD)
+        try:
+            ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+            ops.move_file(str(src), str(dst))
+            assert calls, "read-only dst should defer to the shell mv"
+        finally:
+            os.chmod(str(dst), stat.S_IWRITE)  # let tmp_path teardown remove it
+
+    def test_move_missing_src_falls_back(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "mv: cannot stat: No such file or directory", "returncode": 1}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        r = ops.move_file(str(tmp_path / "ghost.txt"), str(tmp_path / "dst.txt"))
+        assert calls, "missing src should defer to the shell mv"
+        assert r.error is not None
+
+    def test_move_dst_parent_missing_falls_back(self, tmp_path):
+        # os.replace raises FileNotFoundError (atomically, src intact) when
+        # the dst parent is missing; mv reports a specific error. Defer.
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "mv: cannot move: No such file or directory", "returncode": 1}
+
+        src = tmp_path / "src.txt"
+        src.write_bytes(b"x\n")
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        r = ops.move_file(str(src), str(tmp_path / "nodir" / "dst.txt"))
+        assert calls, "missing dst parent should defer to the shell mv"
+        assert r.error is not None
+        assert src.exists()  # os.replace failed atomically — src untouched
+
+    def test_move_same_path_falls_back(self, tmp_path):
+        # mv on src == dst is a successful no-op; os.replace(p, p) semantics
+        # are murky across platforms, so the native path defers.
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        p = tmp_path / "same.txt"
+        p.write_bytes(b"same\n")
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        ops.move_file(str(p), str(p))
+        assert calls, "src == dst should defer to the shell mv"
+        assert p.read_bytes() == b"same\n"  # not lost
+
+    def test_move_non_local_env_keeps_shell_pipeline(self):
+        env = MagicMock()
+        env.cwd = "/x"
+        env.execute.return_value = {"output": "", "returncode": 0}
+        ops = ShellFileOperations(env)
+        ops.move_file("/x/a.txt", "/x/b.txt")
+        assert env.execute.called
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_move_msys_drive_path_no_shell(self, local_ops, tmp_path):
+        src = tmp_path / "src.txt"
+        src.write_bytes(b"MSYS\n")
+        dst = tmp_path / "dst.txt"
+        drive = src.drive.rstrip(":").lower()
+        msys_src = "/" + drive + str(src)[len(src.drive):].replace("\\", "/")
+        msys_dst = "/" + drive + str(dst)[len(dst.drive):].replace("\\", "/")
+        r = local_ops.move_file(msys_src, msys_dst)
+        assert r.error is None
+        assert not src.exists()
+        assert dst.read_bytes() == b"MSYS\n"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="MSYS path semantics are Windows-only")
+    def test_move_posix_root_path_falls_back_on_windows(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        calls = []
+
+        class _CannedLocal(LocalEnvironment):
+            def init_session(self):
+                self._snapshot_ready = False
+
+            def execute(self, command, cwd="", **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        ops = ShellFileOperations(_CannedLocal(cwd=str(tmp_path)), cwd=str(tmp_path))
+        # /tmp/... resolves inside Git Bash, not C:\tmp — defer to the shell.
+        ops.move_file("/tmp/hermes-native-movesrc.txt", str(tmp_path / "d.txt"))
+        assert calls, "POSIX-root src should defer to the shell pipeline"

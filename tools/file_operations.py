@@ -27,6 +27,7 @@ Usage:
 
 import os
 import re
+import stat
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1164,6 +1165,16 @@ class ShellFileOperations(FileOperations):
         path = self._expand_path(path)
         if _is_write_denied(path):
             return WriteResult(error=f"Delete denied: {path} is a protected path")
+        # Local backend: remove regular files (including read-only ones)
+        # with direct Python I/O instead of shelling a ``rm -f`` — one of
+        # the last per-call Git Bash spawns (0.3-1s on Windows) in the
+        # mutating set.  A None return means "the shell owns this" — fall
+        # through so ``rm -f``'s exact semantics (idempotent-on-missing,
+        # the "Is a directory" failure, POSIX-root paths) are preserved.
+        if self._lsp_local_only():
+            native = self._delete_file_native(path)
+            if native is not None:
+                return native
         result = self._exec(f"rm -f {self._escape_shell_arg(path)}")
         if result.exit_code != 0:
             return WriteResult(error=f"Failed to delete {path}: {result.stdout}")
@@ -1176,12 +1187,148 @@ class ShellFileOperations(FileOperations):
         for p in (src, dst):
             if _is_write_denied(p):
                 return WriteResult(error=f"Move denied: {p} is a protected path")
+        # Local backend: rename a regular file to a non-directory dst on
+        # the same volume with native ``os.replace`` instead of shelling a
+        # ``mv``.  A None return means "the shell owns this" — fall through
+        # so ``mv``'s exact semantics (move INTO a directory, read-only
+        # dst, cross-device, missing src/dst-parent, src == dst, POSIX-root
+        # paths) are preserved byte-for-byte.
+        if self._lsp_local_only():
+            native = self._move_file_native(src, dst)
+            if native is not None:
+                return native
         result = self._exec(
             f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"
         )
         if result.exit_code != 0:
             return WriteResult(error=f"Failed to move {src} -> {dst}: {result.stdout}")
         return WriteResult()
+
+    def _delete_file_native(self, path: str) -> Optional[WriteResult]:
+        """Native (no-shell) delete for regular files on the local backend.
+
+        Replaces the shell ``rm -f`` with direct Python I/O, reproducing
+        its exact observable behavior — captured empirically before
+        implementation (a throwaway %TEMP% probe driving the real
+        LocalEnvironment + ShellFileOperations):
+
+          * deleting a MISSING file SUCCEEDS — ``rm -f`` is idempotent,
+            while ``os.remove`` raises FileNotFoundError, so absence is
+            mapped to ``WriteResult()``;
+          * a READ-ONLY file is removed — GNU ``rm -f`` clears the
+            attribute, but ``os.remove`` raises PermissionError on the
+            Windows read-only bit (e.g. git object files; cf. the
+            read-only-bit clearing in checkpoint_manager's tree delete),
+            so the bit is cleared via ``os.chmod`` before a retry.
+
+        Returns None — so the caller falls through to ``rm -f`` — for
+        anything the shell handles with semantics native I/O can't match
+        byte-for-byte: a POSIX-root path on Windows, a symlink, a
+        directory or other non-regular file (``rm -f`` without ``-r``
+        fails a directory with a specific "Is a directory" message), or
+        any unexpected I/O error.  Deny-list checks and ``~`` expansion
+        are handled by the caller before this runs.
+        """
+        try:
+            native_path = self._resolve_native_path(path)
+            if native_path is None:
+                return None
+            # Symlinks: ``rm`` unlinks the link itself; the read-only and
+            # directory branches below don't model links — let the shell
+            # own them (rare, especially on Windows).
+            if os.path.islink(native_path):
+                return None
+            if not os.path.lexists(native_path):
+                # ``rm -f`` is idempotent: deleting a missing file succeeds.
+                return WriteResult()
+            if not os.path.isfile(native_path):
+                # Directory / FIFO / device: ``rm -f`` (no ``-r``) fails a
+                # directory with a specific "Is a directory" message; keep
+                # every non-regular target on the shell so that exact error
+                # text is preserved.
+                return None
+            try:
+                os.remove(native_path)
+            except PermissionError:
+                # Windows read-only attribute: clear the bit and retry,
+                # matching GNU ``rm -f``.  Any failure here (file locked by
+                # another process, etc.) falls back to the shell, which
+                # reproduces the same failure.
+                try:
+                    os.chmod(native_path, stat.S_IWRITE)
+                    os.remove(native_path)
+                except OSError:
+                    return None
+            return WriteResult()
+        except Exception:
+            # Any surprise (permission change, deletion race, exotic
+            # filesystem) falls back to the shell rather than failing the
+            # delete outright.
+            return None
+
+    def _move_file_native(self, src: str, dst: str) -> Optional[WriteResult]:
+        """Native (no-shell) move for regular files on the local backend.
+
+        Replaces the shell ``mv`` with a native ``os.replace`` for the
+        common case — a regular file renamed to a non-directory
+        destination on the same volume — reproducing ``mv``'s exact
+        behavior, captured empirically before implementation:
+
+          * a non-existent dst is created;
+          * an EXISTING regular dst is OVERWRITTEN — ``os.replace``
+            replaces atomically, matching ``mv``'s default.
+
+        Returns None — so the caller falls through to ``mv`` — for every
+        case ``mv`` handles with semantics ``os.replace`` can't match:
+
+          * dst is an existing DIRECTORY → ``mv`` moves the file INTO it
+            (``dst/basename``); ``os.replace`` raises PermissionError;
+          * dst is read-only → ``mv`` force-overwrites; ``os.replace``
+            raises PermissionError on Windows;
+          * dst's parent dir is missing, or src is missing → ``mv``
+            reports specific errors; ``os.replace`` raises atomically
+            (src untouched) and the shell reproduces the exact text;
+          * a cross-device move → ``mv`` copies + unlinks; ``os.replace``
+            raises EXDEV;
+          * src == dst → ``mv`` is a successful no-op; ``os.replace``'s
+            same-path behavior is murky across platforms;
+          * src is a directory or symlink, dst is a symlink, or either is
+            a POSIX-root path on Windows.
+
+        Deny-list checks and ``~`` expansion are handled by the caller.
+        """
+        try:
+            native_src = self._resolve_native_path(src)
+            native_dst = self._resolve_native_path(dst)
+            if native_src is None or native_dst is None:
+                return None
+            # src == dst -> ``mv`` is a successful no-op; ``os.replace(p, p)``
+            # behaviour is murky across platforms, so let the shell own it.
+            if os.path.normcase(os.path.abspath(native_src)) == \
+                    os.path.normcase(os.path.abspath(native_dst)):
+                return None
+            # src must be an existing regular (non-symlink) file.  ``mv``
+            # also moves directories and symlinks and reports a specific
+            # error for a missing src — keep all of those on the shell.
+            if os.path.islink(native_src) or not os.path.isfile(native_src):
+                return None
+            # A dst that is an existing directory means "move INTO it" for
+            # ``mv``; a dst symlink is ambiguous.  Both fall back.
+            if os.path.islink(native_dst) or os.path.isdir(native_dst):
+                return None
+            try:
+                os.replace(native_src, native_dst)
+            except OSError:
+                # Missing dst parent, read-only dst, cross-device, or any
+                # other case ``mv`` handles specially / errors on.  Fall
+                # back so the shell reproduces mv's behaviour + error text.
+                # ``os.replace`` is atomic — a failure leaves src untouched.
+                return None
+            return WriteResult()
+        except Exception:
+            # Any surprise (permission change, race, exotic filesystem)
+            # falls back to the shell rather than failing the move.
+            return None
 
     # =========================================================================
     # WRITE Implementation
