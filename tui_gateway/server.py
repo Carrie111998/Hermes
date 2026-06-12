@@ -36,7 +36,7 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
-from tui_gateway.wiki_api import wiki_scan, wiki_page, resolve_wiki, wiki_list
+from tui_gateway.wiki_api import wiki_scan, wiki_page, resolve_wiki, wiki_list, wiki_taxonomy, wiki_flatten_taxonomy, wiki_expand_links
 import tui_gateway.wiki_api as wiki_api
 
 logger = logging.getLogger(__name__)
@@ -15690,6 +15690,40 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("wiki.list failed")
         return _err(rid, 5052, str(e))
+
+
+@method("wiki.taxonomy")
+def _(rid, params: dict) -> dict:
+    """Return the hierarchical taxonomy tree from taxonomy.yaml."""
+    try:
+        wiki_name = params.get("wiki")
+        wiki_path = resolve_wiki(wiki_name)
+        tax = wiki_taxonomy(wiki_path)
+        if tax is None:
+            return _err(rid, 4040, "taxonomy.yaml not found")
+        flat = wiki_flatten_taxonomy(wiki_path)
+        return _ok(rid, {"taxonomy": tax, "flat_paths": flat})
+    except Exception as e:
+        logger.exception("wiki.taxonomy failed")
+        return _err(rid, 5053, str(e))
+
+
+@method("wiki.expand_links")
+def _(rid, params: dict) -> dict:
+    """Expand integration_links for a wiki page to live status objects."""
+    try:
+        slug = params.get("slug")
+        if not slug:
+            return _err(rid, 4001, "slug is required")
+        wiki_name = params.get("wiki")
+        wiki_path = resolve_wiki(wiki_name)
+        result = wiki_expand_links(slug, wiki_path)
+        if "error" in result:
+            return _err(rid, 4040, result["error"])
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("wiki.expand_links failed")
+        return _err(rid, 5054, str(e))
 
 @method("feed.get")
 def _(rid, params: dict) -> dict:
