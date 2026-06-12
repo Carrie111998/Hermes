@@ -77,7 +77,8 @@ class TestMemPalaceWrite:
             return "mock-collection"
 
         with patch("mempalace.miner.add_drawer", fake_add_drawer), \
-             patch("mempalace.palace.get_collection", fake_get_collection):
+             patch("mempalace.palace.get_collection", fake_get_collection), \
+             patch.object(writer, "_write_gbrain"):  # don't spawn the real gbrain CLI
             writer.handle(event)
 
         assert captured_call, "mempalace.add_drawer should have been called"
@@ -111,7 +112,10 @@ class TestMemPalaceWrite:
                 raise ImportError("no mempalace")
             return real_import(name, *args, **kwargs)
 
-        with patch("builtins.__import__", stub_import):
+        # patch.object first so _write_gbrain is stubbed before __import__ is
+        # swapped — guarantees no real gbrain CLI spawn even with the import stub active.
+        with patch.object(writer, "_write_gbrain"), \
+             patch("builtins.__import__", stub_import):
             # Should not raise
             writer.handle(event)
 
@@ -162,18 +166,21 @@ class TestCorrelationIdDedup:
             correlation_id="corr-abc-123",
         )
 
-        # First call should process
-        writer.handle(event1)
-        assert "corr-abc-123" in writer._seen_correlation_ids
+        # Stub the gbrain write so handle() never spawns the real CLI; the rate
+        # counters we assert on are bumped by _check_rate_limit(), independent of it.
+        with patch.object(writer, "_write_gbrain"):
+            # First call should process
+            writer.handle(event1)
+            assert "corr-abc-123" in writer._seen_correlation_ids
 
-        # Second call with same correlation_id should be skipped
-        # We verify by checking rate counters: only one write should have been attempted
-        gbrain_count_before = len(writer._rate_counters.get("gbrain", []))
+            # Second call with same correlation_id should be skipped
+            # We verify by checking rate counters: only one write should have been attempted
+            gbrain_count_before = len(writer._rate_counters.get("gbrain", []))
 
-        writer.handle(event2)
+            writer.handle(event2)
 
-        gbrain_count_after = len(writer._rate_counters.get("gbrain", []))
-        assert gbrain_count_after == gbrain_count_before  # no new write
+            gbrain_count_after = len(writer._rate_counters.get("gbrain", []))
+            assert gbrain_count_after == gbrain_count_before  # no new write
 
     def test_different_correlation_ids_both_processed(self, tmp_path):
         bus = EventBus(db_path=tmp_path / "events" / "test.db")
@@ -190,8 +197,10 @@ class TestCorrelationIdDedup:
             correlation_id="corr-222",
         )
 
-        writer.handle(event1)
-        writer.handle(event2)
+        # Stub the gbrain write so handle() never spawns the real CLI.
+        with patch.object(writer, "_write_gbrain"):
+            writer.handle(event1)
+            writer.handle(event2)
 
         # Both correlation_ids should be recorded as seen
         assert "corr-111" in writer._seen_correlation_ids
