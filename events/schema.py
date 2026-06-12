@@ -275,6 +275,26 @@ class EventType(Enum):
     BACKEND_CONTRACT_DRIFT = ("backend_contract_drift", Priority.HIGH)
     AGENT_LOOP_FAULT = ("agent_loop_fault", Priority.HIGH)
 
+    # System-resource exhaustion early-warning — added 2026-06-11 after the
+    # pagefile-expansion disk burst (commit charge hit 84.2/85.6 GB = 98.4%,
+    # Windows expanded pagefile.sys 36->54.4 GB in ~22 min, eating ~18 GB of
+    # C: with ZERO alerting; Windows' own Resource-Exhaustion-Detector logged
+    # nothing). Emitted by events.producers.resource_monitor.ResourcePressureMonitor,
+    # which samples commit charge / pagefile allocation / C: free on the
+    # gateway poll loop and fires on the rising edge of any pressure trigger:
+    #   - commit charge > 85% of the commit limit, OR
+    #   - C: free < 15 GB, OR
+    #   - pagefile allocation grew > 2 GB within 10 minutes.
+    # HIGH so it survives significant_only / digest_only verbosity and reaches
+    # Telegram (watchdog_alerts) BEFORE absolute exhaustion. Payload schema:
+    #   reasons (list[str])              — which triggers fired this edge
+    #   commit_used_gb / commit_limit_gb / commit_pct (float)
+    #   pagefile_allocated_gb (float)    — approx Win32_PageFileUsage.AllocatedBaseSize
+    #   pagefile_growth_gb_10min (float) — rise over the trailing 10-min window
+    #   disk_c_free_gb (float)
+    #   thresholds (dict)                — the limits that were evaluated
+    RESOURCE_PRESSURE = ("resource_pressure", Priority.HIGH)
+
     def __init__(self, type_string: str, default_priority: Priority):
         self.type_string = type_string
         self.default_priority = default_priority

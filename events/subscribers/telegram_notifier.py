@@ -126,6 +126,12 @@ TOPIC_ROUTING: Dict[str, str] = {
     # System" topic the operator watches. agent_loop_fault stays on watchdog.
     'backend_contract_drift': 'security_and_system',
     'agent_loop_fault': 'watchdog_alerts',
+    # Resource-pressure early-warning (2026-06-11 pagefile-burst remediation).
+    # System-health signal — commit/disk/pagefile exhaustion — so it lands in
+    # watchdog_alerts alongside gateway_health and the watchdog signals, the
+    # stream the operator already watches for infrastructure trouble. HIGH
+    # priority => not batched, survives significant_only/digest_only.
+    'resource_pressure': 'watchdog_alerts',
     # Notification delivery reverse-signal (2026-04-30). These entries
     # exist so test_all_event_types_have_routing covers them, but the
     # primary defense is the cycle guard in handle() — both delivery
@@ -517,6 +523,20 @@ class TelegramNotifier(BaseSubscriber):
 
         if et == EventType.GATEWAY_HEALTH:
             return f"Platform: {p.get('platform', '?')} → {p.get('status', '?')}\n{p.get('detail', '')}"
+
+        if et == EventType.RESOURCE_PRESSURE:
+            # 2026-06-11 pagefile-burst remediation. Render a tight operator
+            # line; the generic fallback would splat the nested ``thresholds``
+            # dict and the raw ``reasons`` list verbatim.
+            reasons = ", ".join(p.get("reasons", [])) or "?"
+            return (
+                f"⚠ Resource pressure: {reasons}\n"
+                f"Commit: {p.get('commit_pct', '?')}% "
+                f"({p.get('commit_used_gb', '?')}/{p.get('commit_limit_gb', '?')} GB)\n"
+                f"Pagefile: {p.get('pagefile_allocated_gb', '?')} GB "
+                f"(+{p.get('pagefile_growth_gb_10min', '?')} GB/10m)\n"
+                f"C: free: {p.get('disk_c_free_gb', '?')} GB"
+            )
 
         if et == EventType.MAILBOX_MESSAGE:
             return f"{p.get('from', '?')} → {p.get('to', '?')}: {p.get('message_type', '?')}\n{p.get('summary', '')}"

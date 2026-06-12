@@ -119,6 +119,11 @@ EVENT_TYPE_EMOJI = {
     # 📐 = contract/conformance check; 💥 = loop fault at non-retryable abort.
     EventType.BACKEND_CONTRACT_DRIFT:   "📐",
     EventType.AGENT_LOOP_FAULT:         "💥",
+    # Resource-pressure early-warning (2026-06-11 pagefile-burst remediation).
+    # Fire extinguisher = "resource exhaustion fire, grab it now." Distinct
+    # from every other watchdog_alerts icon and (deliberately) not a priority
+    # dot, so it doesn't render adjacent to its own HIGH 🟠 dot in the header.
+    EventType.RESOURCE_PRESSURE:        "🧯",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

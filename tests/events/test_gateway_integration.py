@@ -1,11 +1,13 @@
 """Tests for events.gateway_integration — startup/shutdown wiring."""
 
+import inspect
 import json
 import time
 
 import pytest
 
 from events import gateway_integration as gi
+from events.producers.resource_monitor import ResourcePressureMonitor
 from events.paths import gateway_heartbeat_path
 from events.schema import EventType
 from events.subscribers.mailbox_translator import MailboxTranslator
@@ -336,3 +338,35 @@ class TestEmitGatewayStopped:
         # No exception, and the dedupe flag stays unflipped so a later call
         # (after the bus comes back) can still emit the canonical event.
         assert gi._gateway_stopped_emitted is False
+
+
+class TestResourceMonitorWiring:
+    """The ResourcePressureMonitor (2026-06-11 pagefile-burst remediation) must
+    be constructed at startup and sampled by the poll loop. Verified via the
+    accessor + source introspection — calling the real startup() would touch
+    the canonical ~/.hermes event bus (events.paths is NOT HERMES_HOME-scoped),
+    so no test in this suite spins it; same reason the parallel _health_monitor
+    hook is not integration-tested here.
+    """
+
+    def test_getter_returns_module_global(self):
+        assert gi.get_resource_monitor() is gi._resource_monitor
+
+    def test_startup_constructs_resource_monitor(self):
+        src = inspect.getsource(gi.startup)
+        assert "_resource_monitor = ResourcePressureMonitor(_bus)" in src
+
+    def test_poll_loop_samples_resource_pressure(self):
+        # Guards against the per-tick sampling hook being dropped from the
+        # subscriber poll loop.
+        src = inspect.getsource(gi._subscriber_poll_loop)
+        assert "_resource_monitor.check()" in src
+
+    def test_default_sampler_is_real_resource_reader(self, tmp_path):
+        # startup() constructs ResourcePressureMonitor(_bus) with no sampler
+        # argument, so the gateway must fall back to the real in-process
+        # sampler (GlobalMemoryStatusEx + shutil), not a test stub.
+        from events.bus import EventBus
+        from events.producers.resource_monitor import sample_resources
+        bus = EventBus(db_path=tmp_path / "events" / "event_bus.db")
+        assert ResourcePressureMonitor(bus)._sampler is sample_resources

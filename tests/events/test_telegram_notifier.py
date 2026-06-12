@@ -258,6 +258,41 @@ class TestTelegramNotifier:
         assert "job_discovered" in msg.lower() or "JOB_DISCOVERED" in msg
         assert "scout" in msg.lower()
 
+    def test_formats_resource_pressure_readably(
+        self, bus, topics_config, verbosity_config,
+    ):
+        """RESOURCE_PRESSURE renders a single operator-readable line, not a
+        raw dump of the nested ``thresholds`` dict (which the generic
+        fallback would splat verbatim)."""
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        event = Event.create(
+            EventType.RESOURCE_PRESSURE, "system",
+            {
+                "reasons": ["commit_high", "pagefile_growth"],
+                "commit_used_gb": 84.2,
+                "commit_limit_gb": 85.6,
+                "commit_pct": 98.4,
+                "pagefile_allocated_gb": 54.4,
+                "pagefile_growth_gb_10min": 18.0,
+                "disk_c_free_gb": 12.3,
+                "thresholds": {
+                    "commit_pct": 85.0, "disk_free_gb": 15.0,
+                    "pagefile_growth_gb": 2.0, "growth_window_min": 10.0,
+                },
+            },
+        )
+        body = notifier._format_payload(event)
+        assert "98.4" in body                          # commit %
+        assert "84.2" in body and "85.6" in body       # commit used/limit
+        assert "54.4" in body                           # pagefile alloc
+        assert "12.3" in body                           # C: free
+        assert "commit_high" in body and "pagefile_growth" in body
+        # The raw thresholds dict must NOT leak into the message.
+        assert "growth_window_min" not in body
+        assert "thresholds" not in body
+
     def test_resolves_topic_for_event(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,

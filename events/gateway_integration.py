@@ -22,6 +22,7 @@ from events.paths import (
 )
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
+from events.producers.resource_monitor import ResourcePressureMonitor
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
@@ -58,6 +59,7 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
+_resource_monitor: Optional[ResourcePressureMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
@@ -76,7 +78,7 @@ _gateway_started_at_monotonic: Optional[float] = None
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _mailbox_watcher, _subscriber_thread, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _mailbox_watcher, _subscriber_thread, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -87,6 +89,7 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _bus = EventBus()
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
+    _resource_monitor = ResourcePressureMonitor(_bus)
     _mailbox_watcher = MailboxWatcher(_bus)
 
     # Register subscribers
@@ -259,6 +262,11 @@ def emit_gateway_stopped(stop_payload: Optional[Dict[str, Any]] = None) -> Optio
 def get_health_monitor() -> Optional[GatewayHealthMonitor]:
     """Get the health monitor (for gateway adapter health checks)."""
     return _health_monitor
+
+
+def get_resource_monitor() -> Optional[ResourcePressureMonitor]:
+    """Get the resource-pressure monitor (commit/pagefile/disk sampling)."""
+    return _resource_monitor
 
 
 def _check_subscriber_lag(
@@ -439,6 +447,7 @@ def _subscriber_poll_loop() -> None:
     last_poll_times: Dict[str, float] = {}
     last_mailbox_scan: float = 0
     last_health_check: float = 0
+    last_resource_check: float = 0
     last_lag_check: float = 0
     last_cleanup: float = 0
     last_checkpoint: float = 0
@@ -570,6 +579,16 @@ def _subscriber_poll_loop() -> None:
                 except Exception:
                     logger.exception("Health check failed")
                 last_health_check = now
+
+            # Resource-pressure sampling every 60 seconds — commit charge,
+            # pagefile allocation, and C: free. Emits RESOURCE_PRESSURE on the
+            # rising edge of any trigger (2026-06-11 pagefile-burst remediation).
+            if _resource_monitor and now - last_resource_check >= 60:
+                try:
+                    _resource_monitor.check()
+                except Exception:
+                    logger.exception("Resource pressure check failed")
+                last_resource_check = now
 
             # Scan mailbox every 60 seconds
             if _mailbox_watcher and now - last_mailbox_scan >= 60:

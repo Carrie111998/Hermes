@@ -117,3 +117,25 @@ def test_watchdog_burst_renders_with_burst_icon():
     # the convention SECRET_DETECTED's docstring articulates.
     from events.formatting import PRIORITY_EMOJI
     assert EVENT_TYPE_EMOJI[EventType.WATCHDOG_BURST] not in PRIORITY_EMOJI.values()
+
+
+def test_resource_pressure_has_distinct_icon():
+    """RESOURCE_PRESSURE (2026-06-11 pagefile-burst remediation) must have a
+    present, distinct icon so an operator scanning watchdog_alerts can spot a
+    commit/disk/pagefile-pressure alert at a glance. Like SECRET_DETECTED and
+    WATCHDOG_BURST, the icon must not collide with a priority dot (the event is
+    HIGH-priority, so a colored-dot icon would render adjacent to its own dot).
+    """
+    e = Event.create(
+        event_type=EventType.RESOURCE_PRESSURE,
+        source="system",
+        payload={
+            "reasons": ["commit_high"],
+            "commit_pct": 98.4,
+            "disk_c_free_gb": 12.3,
+        },
+        priority=Priority.HIGH,
+    )
+    icon = event_icon(e)
+    assert icon, "RESOURCE_PRESSURE must have a non-empty icon"
+    assert icon not in PRIORITY_EMOJI.values()
