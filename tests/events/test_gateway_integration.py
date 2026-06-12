@@ -198,8 +198,18 @@ def test_poll_loop_writes_heartbeat_file():
     gi.startup()
     try:
         # First tick initializes last_heartbeat=0, so the write should fire on
-        # the first iteration (within ~1s).  Give it 2.5s to be safe.
-        time.sleep(2.5)
+        # the first iteration (within ~1s).  Wait-until rather than a fixed
+        # 2.5s sleep: the first tick also runs every subscriber poll and the
+        # tick-zero health probes, which on a loaded host can take far longer
+        # than the window (same failure mode as the flush test above, observed
+        # >20s under the 2026-06-11 commit-charge incident).  The guarded
+        # behaviour is "the poll timer writes the heartbeat at all", not
+        # "within 2.5s".
+        deadline = time.monotonic() + 20.0
+        while not (
+            heartbeat.exists() and heartbeat.stat().st_mtime > prev_mtime
+        ) and time.monotonic() < deadline:
+            time.sleep(0.1)
 
         assert heartbeat.exists(), (
             f"Gateway heartbeat file was not written to {heartbeat}"
