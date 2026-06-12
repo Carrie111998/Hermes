@@ -7442,6 +7442,7 @@ class GatewayRunner:
                         source=source,
                         quick_key=_quick_key,
                         run_generation=_run_generation,
+                        event=event,
                         agent_result={
                             "completed": False,
                             "failed": True,
@@ -7492,6 +7493,7 @@ class GatewayRunner:
                     source=source,
                     quick_key=_quick_key,
                     run_generation=_run_generation,
+                    event=event,
                     agent_result=_agent_result,
                     started_at=_pa_turn_started_at,
                 )
@@ -10775,6 +10777,7 @@ class GatewayRunner:
         run_generation: Any,
         agent_result: Any,
         started_at: Optional[float],
+        event: Any = None,
     ) -> None:
         """Turn-boundary PA recording shared by the success and failure paths.
 
@@ -10799,6 +10802,26 @@ class GatewayRunner:
                     _pa_record_result = _stashed
         except Exception:
             pass
+        # Deterministic turn->message link (teren 2026-06-12): the turn's input
+        # event ALREADY carries the WA source message ids (bundle
+        # raw_message.sourceMessageIds; single message_id). Record them so
+        # pa_turns.message_refs_json is populated at source, never
+        # reconstructed from content downstream.
+        _src_msg_ids: list = []
+        try:
+            _raw = getattr(event, "raw_message", None)
+            if isinstance(_raw, dict):
+                _ids = _raw.get("sourceMessageIds")
+                if isinstance(_ids, list):
+                    _src_msg_ids = [str(i) for i in _ids if i]
+            if not _src_msg_ids:
+                _mid = getattr(event, "message_id", None)
+                if _mid:
+                    _src_msg_ids = [m for m in str(_mid).split("+") if m]
+        except Exception:
+            _src_msg_ids = []
+        if _src_msg_ids and isinstance(_pa_record_result, dict):
+            _pa_record_result.setdefault("turn_source_message_ids", _src_msg_ids)
         _pa_final_text = ""
         if isinstance(_pa_record_result, dict):
             _pa_final_text = str(_pa_record_result.get("final_response") or "")
