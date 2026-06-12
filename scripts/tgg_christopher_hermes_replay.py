@@ -2450,6 +2450,57 @@ async def _run_nightly_compact(runner: Any, turn_results: list[dict[str, Any]]) 
     return result
 
 
+
+def _stamp_replay_run(hermes_home: Path, *, run_label: str, chat_id: str,
+                      since_sgt: str, until_sgt: str) -> int | None:
+    """Record this invocation in the sandbox state DB (replay_runs).
+
+    The replay-for window is a RUN INPUT (--since-sgt/--until-sgt) — recording
+    it at run time is the deterministic source for "which day was this run
+    for" (teren 2026-06-12: runs are named by the day we run FOR, not the day
+    the run executed). Readers join pa_turns.started_at between
+    started_wall/ended_wall — no content inference.
+    """
+    import sqlite3 as _sq
+    state_db = hermes_home / "state.db"
+    try:
+        conn = _sq.connect(str(state_db))
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS replay_runs ("
+            " id INTEGER PRIMARY KEY,"
+            " run_label TEXT, chat_id TEXT,"
+            " since_sgt TEXT, until_sgt TEXT,"
+            " started_wall REAL, ended_wall REAL)"
+        )
+        cur = conn.execute(
+            "INSERT INTO replay_runs (run_label, chat_id, since_sgt, until_sgt, started_wall)"
+            " VALUES (?,?,?,?,?)",
+            (run_label, chat_id, since_sgt, until_sgt, time.time()),
+        )
+        conn.commit()
+        rid = cur.lastrowid
+        conn.close()
+        return rid
+    except Exception as exc:  # stamp is best-effort; never blocks a run
+        print(f"[replay-runs] stamp failed: {exc}", file=sys.stderr)
+        return None
+
+
+def _finalize_replay_run(hermes_home: Path, run_row_id: int | None) -> None:
+    if run_row_id is None:
+        return
+    import sqlite3 as _sq
+    try:
+        conn = _sq.connect(str(hermes_home / "state.db"))
+        conn.execute(
+            "UPDATE replay_runs SET ended_wall=? WHERE id=?", (time.time(), run_row_id)
+        )
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"[replay-runs] finalize failed: {exc}", file=sys.stderr)
+
+
 async def _run(args: argparse.Namespace) -> int:
     profile = _resolve_replay_profile(args)
     _validate_provider_model_args(
@@ -2483,6 +2534,13 @@ async def _run(args: argparse.Namespace) -> int:
     output_path = Path(args.output) if args.output else DOCS_DIR / f"{run_label}.html"
 
     _prepare_env(hermes_home, secrets=Path(args.secrets))
+    _replay_run_row = _stamp_replay_run(
+        hermes_home,
+        run_label=run_label,
+        chat_id=args.chat_id or "",
+        since_sgt=args.since_sgt or "",
+        until_sgt=args.until_sgt or "",
+    )
     business_base_url = args.business_base_url
     local_backend: _ReplayOperatorBackend | None = None
     if not business_base_url and profile.business_mode == "copied-db-local-operator":
@@ -2774,6 +2832,7 @@ async def _run(args: argparse.Namespace) -> int:
     # a log file the stream is block-buffered, and the day-30 AMK run exited 0
     # with this summary never reaching the log. Flush the JSON itself and
     # drain both streams before returning.
+    _finalize_replay_run(hermes_home, _replay_run_row)
     print(json.dumps(summary, indent=2), flush=True)
     if args.cleanup_hermes_home and not args.hermes_home:
         shutil.rmtree(hermes_home, ignore_errors=True)
