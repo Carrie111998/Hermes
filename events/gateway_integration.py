@@ -447,7 +447,15 @@ def _subscriber_poll_loop() -> None:
     last_poll_times: Dict[str, float] = {}
     last_mailbox_scan: float = 0
     last_health_check: float = 0
-    last_resource_check: float = 0
+    # Deliberately NOT 0: resource pressure is a continuous condition, so the
+    # first sample can wait a full interval. Sampling on tick zero would
+    # re-fire the rising edge on EVERY gateway restart while an episode
+    # persists (the monitor's edge state is in-process), so a crash-loop
+    # under sustained pressure would alert once per restart, bypassing the
+    # re-alert cooldown. It also keeps the first tick light: the sampler
+    # reads the real host (kernel32 + disk stat) and fires real emits, which
+    # gi.startup()-based tests would otherwise pay on every startup.
+    last_resource_check: float = time.monotonic()
     last_lag_check: float = 0
     last_cleanup: float = 0
     last_checkpoint: float = 0

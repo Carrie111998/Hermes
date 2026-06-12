@@ -161,9 +161,15 @@ def test_poll_loop_flushes_telegram_notifier_batches():
 
         # The first poll-loop tick satisfies ``now - last_batch_flush >= 60``
         # (last_batch_flush starts at 0, time.monotonic() is always larger),
-        # so the flush fires within the first 1s iteration.  Give it 2s to
-        # absorb scheduling jitter on slow runners.
-        time.sleep(2.0)
+        # so the flush fires on the first ~1s iteration. Wait-until rather
+        # than a fixed 2s sleep: the first tick also runs every subscriber
+        # poll and the tick-zero health probes, which on a loaded host can
+        # take far longer than 2s (observed >20s under the 2026-06-11
+        # commit-charge incident). The regression being guarded is "the
+        # flush is driven by the poll timer at all", not "within 2s".
+        deadline = time.monotonic() + 20.0
+        while not flush_mock.called and time.monotonic() < deadline:
+            time.sleep(0.1)
 
         assert flush_mock.called, (
             "Poll loop did not invoke TelegramNotifier._flush_stale_batches — "
@@ -343,10 +349,13 @@ class TestEmitGatewayStopped:
 class TestResourceMonitorWiring:
     """The ResourcePressureMonitor (2026-06-11 pagefile-burst remediation) must
     be constructed at startup and sampled by the poll loop. Verified via the
-    accessor + source introspection — calling the real startup() would touch
-    the canonical ~/.hermes event bus (events.paths is NOT HERMES_HOME-scoped),
-    so no test in this suite spins it; same reason the parallel _health_monitor
-    hook is not integration-tested here.
+    accessor + source introspection rather than running the real startup():
+    that boots the full subscriber registry + poll thread, which is heavy and
+    timing-sensitive on loaded hosts — same reason the parallel
+    _health_monitor poll-loop hook is asserted statically here. (Under pytest
+    the bus is hermetic anyway: conftest points HERMES_HOME at a tempdir and
+    ``get_default_hermes_root()`` returns a HERMES_HOME that lies outside
+    ``~/.hermes`` as-is, so events.paths resolves into the tempdir.)
     """
 
     def test_getter_returns_module_global(self):
