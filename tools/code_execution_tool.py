@@ -745,8 +745,12 @@ def _rpc_server_loop(
                 # their status prints don't leak into the CLI spinner.
                 try:
                     with thread_scoped_silence():
+                        dispatch_kwargs = {"task_id": task_id}
+                        if tool_name == "read_file":
+                            dispatch_kwargs["suppress_read_dedup"] = True
                         result = handle_function_call(
-                            tool_name, tool_args, task_id=task_id
+                            tool_name, tool_args,
+                            **dispatch_kwargs,
                         )
                 except Exception as exc:
                     logger.error("Tool call failed in sandbox: %s", exc, exc_info=True)
@@ -1022,8 +1026,12 @@ def _rpc_poll_loop(
                     # Dispatch through the standard tool handler
                     try:
                         with thread_scoped_silence():
+                            dispatch_kwargs = {"task_id": task_id}
+                            if tool_name == "read_file":
+                                dispatch_kwargs["suppress_read_dedup"] = True
                             tool_result = handle_function_call(
-                                tool_name, tool_args, task_id=task_id
+                                tool_name, tool_args,
+                                **dispatch_kwargs,
                             )
                     except Exception as exc:
                         logger.error("Tool call failed in remote sandbox: %s",
