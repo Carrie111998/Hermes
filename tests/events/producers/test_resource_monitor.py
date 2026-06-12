@@ -222,6 +222,119 @@ class TestEdgeTriggerAndCooldown:
         assert len(_pressure_events(bus)) == 2
 
 
+class TestHysteresis:
+    """Disarm-level hysteresis (added 2026-06-12): a breached axis re-arms only
+    once *comfortably* clear of its trigger, so hovering right at a threshold
+    cannot alert-storm past the re-alert cooldown.
+    """
+
+    def test_threshold_hover_storm_is_suppressed(self, bus):
+        # Live incident 2026-06-11 22:52-23:21Z: commit charge oscillated right
+        # at the 85% trigger and fired SIX alerts in 29 minutes (payload
+        # commit_pct 88.2, 85.3, 85.0, 85.3, 85.3, 85.0) — every dip below the
+        # trigger re-armed the edge, so every re-cross bypassed the cooldown.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        trace = [
+            (0, 88.2), (2, 84.9), (5, 85.3), (7, 84.8), (10, 85.04), (12, 84.9),
+            (15, 85.3), (17, 84.7), (20, 85.3), (24, 84.9), (27, 85.04), (29, 84.9),
+        ]
+        fired = [
+            minute for minute, pct in trace
+            if monitor.evaluate(make_sample(commit_pct=pct), now=minute * 60.0)
+        ]
+        # The 84.x dips sit inside the hysteresis band (above the 80% disarm),
+        # so the episode never re-arms: one rising edge + one cooldown re-ping.
+        assert fired == [0, 15]
+        assert len(_pressure_events(bus)) == 2
+
+    def test_band_dip_does_not_rearm_edge(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(commit_pct=88.0), now=0.0)
+        # 80.5% is below the trigger but above the 80% disarm: same episode.
+        assert monitor.evaluate(make_sample(commit_pct=80.5), now=60.0) is None
+        # Re-cross inside the cooldown stays quiet — NOT a fresh rising edge.
+        assert monitor.evaluate(make_sample(commit_pct=88.0), now=120.0) is None
+        assert len(_pressure_events(bus)) == 1
+
+    def test_comfortable_clearance_rearms_immediately(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(commit_pct=88.0), now=0.0)
+        # 79% is below the 80% disarm: genuine recovery ends the episode.
+        assert monitor.evaluate(make_sample(commit_pct=79.0), now=60.0) is None
+        # The next breach is a fresh emergency — fires immediately, no cooldown.
+        assert monitor.evaluate(make_sample(commit_pct=88.0), now=120.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_disk_band_holds_episode(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=0.0)
+        # 17 GB free is between the 15 GB trigger and the 20 GB disarm: holds.
+        assert monitor.evaluate(make_sample(disk_free_gb=17.0), now=60.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=120.0) is None
+        # Recovery above the disarm clears; the next breach fires immediately.
+        assert monitor.evaluate(make_sample(disk_free_gb=25.0), now=180.0) is None
+        assert monitor.evaluate(make_sample(disk_free_gb=12.0), now=240.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_pagefile_growth_band_holds_episode(self, bus):
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(pagefile_gb=20.0), now=0.0) is None
+        # +2.5 GB inside the 10-min window crosses the 2 GB trigger.
+        assert monitor.evaluate(make_sample(pagefile_gb=22.5), now=60.0)
+        # Growth reads 1.5 GB: under the trigger, above the 1 GB disarm — holds.
+        assert monitor.evaluate(make_sample(pagefile_gb=21.5), now=120.0) is None
+        assert monitor.evaluate(make_sample(pagefile_gb=22.5), now=180.0) is None
+        # By t=700 the 20 GB anchor aged out: growth reads 0.5 GB (< disarm).
+        assert monitor.evaluate(make_sample(pagefile_gb=22.0), now=700.0) is None
+        # A fresh burst (+3 GB over the surviving window) fires immediately.
+        assert monitor.evaluate(make_sample(pagefile_gb=25.0), now=760.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_phys_band_holds_episode_and_clears(self, bus):
+        # REGRESSION (2026-08-11): the phys axis (2026-07-16) postdates the
+        # original disarm set (2026-06-12). When the two were finally brought
+        # together, phys had a trigger but NO disarm level — so "phys_high"
+        # could enter ``_latched`` via ``reasons`` yet never leave through
+        # ``comfortably_clear``. One phys breach would latch the episode
+        # forever: ``was_in_episode`` stays True, no later rising edge ever
+        # fires, and the monitor silently degrades to cooldown-only re-pings.
+        # The last two asserts are what fail without DEFAULT_PHYS_PCT_DISARM.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(make_sample(phys_pct=96.4), now=0.0)
+        # 89% is below the 92% trigger but above the 87% disarm: episode holds.
+        assert monitor.evaluate(make_sample(phys_pct=89.0), now=60.0) is None
+        assert monitor.evaluate(make_sample(phys_pct=96.4), now=120.0) is None
+        # 85% clears comfortably -> episode really ends...
+        assert monitor.evaluate(make_sample(phys_pct=85.0), now=180.0) is None
+        # ...so the next breach is a fresh rising edge, NOT gated by cooldown.
+        assert monitor.evaluate(make_sample(phys_pct=96.4), now=240.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_unbreached_axis_in_band_does_not_hold_episode(self, bus):
+        # Guard for the latch design: only axes that actually BREACHED hold the
+        # episode open. Disk hovers in its band (17 GB) throughout but never
+        # crossed its 15 GB trigger, so commit clearing comfortably ends the
+        # episode — disk must not suppress the next fresh commit emergency.
+        monitor = ResourcePressureMonitor(bus, re_alert_cooldown_seconds=900.0)
+        assert monitor.evaluate(
+            make_sample(commit_pct=88.0, disk_free_gb=17.0), now=0.0)
+        assert monitor.evaluate(
+            make_sample(commit_pct=70.0, disk_free_gb=17.0), now=60.0) is None
+        assert monitor.evaluate(
+            make_sample(commit_pct=88.0, disk_free_gb=17.0), now=120.0)
+        assert len(_pressure_events(bus)) == 2
+
+    def test_custom_disarm_levels_are_honored(self, bus):
+        monitor = ResourcePressureMonitor(
+            bus, commit_pct_disarm=84.0, re_alert_cooldown_seconds=900.0,
+        )
+        assert monitor.evaluate(make_sample(commit_pct=88.0), now=0.0)
+        # 83% clears the custom 84% disarm (the default 80% would have held).
+        assert monitor.evaluate(make_sample(commit_pct=83.0), now=60.0) is None
+        assert monitor.evaluate(make_sample(commit_pct=88.0), now=120.0)
+        assert len(_pressure_events(bus)) == 2
+
+
 class TestPayloadContents:
     def test_payload_carries_all_metrics(self, bus):
         monitor = ResourcePressureMonitor(bus)
