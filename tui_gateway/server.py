@@ -658,7 +658,7 @@ _INDICATOR_DEFAULT = "kaomoji"
 def _load_cfg() -> dict:
     global _cfg_cache, _cfg_mtime, _cfg_path
     try:
-        import yaml
+        import yaml  # type: ignore
 
         p = _hermes_home / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
@@ -682,7 +682,7 @@ def _load_cfg() -> dict:
 
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
-    import yaml
+    import yaml  # type: ignore
 
     path = _hermes_home / "config.yaml"
     with open(path, "w", encoding="utf-8") as f:
@@ -1788,7 +1788,7 @@ def _apply_personality_to_session(
         with session["history_lock"]:
             session["history"].append({"role": "user", "content": marker})
             session["history_version"] = int(session.get("history_version", 0)) + 1
-        info = _session_info(agent)
+        info: dict[str, Any] = _session_info(agent)
         _emit("session.info", sid, info)
         return False, info
     return False, None
@@ -1874,7 +1874,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     with session["history_lock"]:
         session["history"] = []
         session["history_version"] = int(session.get("history_version", 0)) + 1
-    info = _session_info(new_agent)
+    info: dict[str, Any] = _session_info(new_agent)
     _emit("session.info", sid, info)
     _restart_slash_worker(session)
     return info
@@ -2605,7 +2605,7 @@ def _(rid, params: dict) -> dict:
             summary = summarize_manual_compression(
                 before_messages, messages, before_tokens, after_tokens
             )
-            info = _session_info(agent)
+            info: dict[str, Any] = _session_info(agent)
             _emit("session.info", sid, info)
             return _ok(
                 rid,
@@ -4125,7 +4125,7 @@ def _(rid, params: dict) -> dict:
                 _write_config_key("agent.system_prompt", new_prompt)
                 nv = str(value or "default")
                 history_reset = False
-                info = None
+                info: dict[str, Any] | None = None
                 if session is not None:
                     history_reset, info = _apply_personality_to_session(
                         sid_key, session, new_prompt
@@ -5242,8 +5242,8 @@ def _(rid, params: dict) -> dict:
 
     try:
         from hermes_cli.commands import SlashCommandCompleter
-        from prompt_toolkit.document import Document
-        from prompt_toolkit.formatted_text import to_plain_text
+        from prompt_toolkit.document import Document  # type: ignore
+        from prompt_toolkit.formatted_text import to_plain_text  # type: ignore
 
         from agent.skill_commands import get_skill_commands
         from agent.skill_bundles import get_skill_bundles
@@ -6318,7 +6318,7 @@ def _(rid, params: dict) -> dict:
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
-            info = get_toolset_info(name)
+            info: dict[str, Any] | None = get_toolset_info(name)
             if not info:
                 continue
             items.append(
@@ -6414,7 +6414,7 @@ def _(rid, params: dict) -> dict:
         save_config(cfg)
 
         session = _sessions.get(params.get("session_id", ""))
-        info = (
+        info: dict[str, Any] | None = (
             _reset_session_agent(params.get("session_id", ""), session)
             if session
             else None
@@ -6458,7 +6458,7 @@ def _(rid, params: dict) -> dict:
 
         items = []
         for name in sorted(get_all_toolsets().keys()):
-            info = get_toolset_info(name)
+            info: dict[str, Any] | None = get_toolset_info(name)
             if not info:
                 continue
             items.append(
@@ -6564,7 +6564,7 @@ def _(rid, params: dict) -> dict:
                 def print(self, *a, **k):
                     pass
 
-            do_install(query, skip_confirm=True, console=_Q())  # type: ignore
+            do_install(query, skip_confirm=True, console=_Q())  # type: ignore[arg-type]
             return _ok(rid, {"installed": True, "name": query})
         if action == "browse":
             from hermes_cli.skills_hub import browse_skills

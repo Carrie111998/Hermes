@@ -5,7 +5,7 @@ import json
 import os
 from collections import Counter
 
-import yaml
+import yaml  # type: ignore
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LOCAL_SKILL_DIRS = [
@@ -186,7 +186,7 @@ def extract_local_skills():
                 "description": fm.get("description", ""),
                 "overview": overview,
                 "category": category,
-                "categoryLabel": CATEGORY_LABELS.get(category, category.replace("-", " ").title()),
+                "str(category)Label": CATEGORY_LABELS.get(str(category), str(category).replace("-", " ").title()),
                 "source": source_label,
                 "tags": tags or [],
                 "platforms": fm.get("platforms", []),
