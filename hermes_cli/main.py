@@ -5076,6 +5076,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_ensure_acp_launcher",
         "_ensure_fhs_path_guard",
         "_ensure_uv_for_termux",
+        "_fetch_with_stale_ref_recovery",
         "_finish_dashboard_update_cleanup",
         "_fleet_probe_expected_runtimes",
         "_filter_non_gateway_concurrent_instances",
