@@ -1,0 +1,59 @@
+name: PR Quality Checks
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  history:
+    name: History Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Reject PRs with no common ancestor on main
+        run: |
+          if  ! BASE=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$BASE" ]; then
+            echo "::error::This PR has no common ancestor with main."
+            exit 1
+          fi
+          echo "::notice::Common ancestor with main: $BASE"
+
+  uv-lock:
+    name: uv lock --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+      - uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081  # v5
+      - name: Verify uv.lock is up-to-date
+        run: uv lock --check
+
+  contributors:
+    name: Contributor Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b  # v5.3.0
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: |
+          pip install httpx
+      - name: Audit contributors
+        run: |
+          # Use the latest tag from the repo as the baseline
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.15.1")
+          python3 scripts/contributor_audit.py \
+            --since-tag "$LATEST_TAG" \
+            --diff-base "origin/${{ github.base_ref }}" \
+            --strict
