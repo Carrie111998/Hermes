@@ -107,23 +107,27 @@ def log_memory_usage(prefix: str = "") -> None:
         thread_count = 0
 
     tag = f"{prefix} " if prefix else ""
-    if rss is None:
-        logger.info(
-            "[MEMORY] %srss=unavailable gc=%s threads=%d uptime=%ds",
-            tag,
-            gc_counts,
-            thread_count,
-            uptime,
-        )
-    else:
-        logger.info(
-            "[MEMORY] %srss=%dMB gc=%s threads=%d uptime=%ds",
-            tag,
-            rss,
-            gc_counts,
-            thread_count,
-            uptime,
-        )
+    try:
+        if rss is None:
+            logger.info(
+                "[MEMORY] %srss=unavailable gc=%s threads=%d uptime=%ds",
+                tag,
+                gc_counts,
+                thread_count,
+                uptime,
+            )
+        else:
+            logger.info(
+                "[MEMORY] %srss=%dMB gc=%s threads=%d uptime=%ds",
+                tag,
+                rss,
+                gc_counts,
+                thread_count,
+                uptime,
+            )
+    except (ValueError, OSError):
+        # Prevent "I/O operation on closed file" during process/stream teardown
+        pass
 
 
 def _monitor_loop(stop_event: threading.Event, interval: float) -> None:
