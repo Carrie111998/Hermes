@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 Terminal Tool Module
 
@@ -406,8 +407,8 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
         except Exception:
             return ""
 
-    result = {"password": None, "done": False}
-    
+    result: dict[str, Any] = {"password": None, "done": False}
+
     def read_password_thread():
         """Read password with echo disabled. Uses msvcrt on Windows, /dev/tty on Unix."""
         tty_fd = None
@@ -415,9 +416,10 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
         try:
             if platform.system() == "Windows":
                 import msvcrt
+                msvcrt_any: Any = msvcrt
                 chars = []
                 while True:
-                    c = msvcrt.getwch()
+                    c = msvcrt_any.getwch()  # type: ignore[attr-defined]
                     if c in {"\r", "\n"}:
                         break
                     if c == "\x03":
@@ -1104,10 +1106,10 @@ def _get_modal_backend_state(modal_mode: object | None) -> Dict[str, Any]:
 
 
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
-                        ssh_config: dict = None, container_config: dict = None,
-                        local_config: dict = None,
+                        ssh_config: dict | None = None, container_config: dict | None = None,
+                        local_config: dict | None = None,
                         task_id: str = "default",
-                        host_cwd: str = None):
+                        host_cwd: str | None = None):
     """
     Create an execution environment for sandboxed command execution.
     
@@ -1144,7 +1146,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             cpu=cpu, memory=memory, disk=disk,
             persistent_filesystem=persistent, task_id=task_id,
             volumes=volumes,
-            host_cwd=host_cwd,
+            host_cwd=host_cwd or "",
             auto_mount_cwd=cc.get("docker_mount_cwd_to_workspace", False),
             forward_env=docker_forward_env,
             env=docker_env,
@@ -1167,7 +1169,8 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             sandbox_kwargs["memory"] = memory
         if disk > 0:
             try:
-                import inspect, modal
+                import inspect
+                import modal
                 if "ephemeral_disk" in inspect.signature(modal.Sandbox.create).parameters:
                     sandbox_kwargs["ephemeral_disk"] = disk
             except Exception:
@@ -1935,7 +1938,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
-                        env_vars=env.env if hasattr(env, 'env') else None,
+                        env_vars=getattr(env, 'env', None) or {},
                         use_pty=effective_pty,
                     )
                 else:
@@ -1947,7 +1950,7 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                result_data = {
+                result_data: dict[str, Any] = {
                     "output": "Background process started",
                     "session_id": proc_session.id,
                     "pid": proc_session.pid,
@@ -2070,7 +2073,8 @@ def terminal_tool(
                 
                 # Got a result
                 break
-            
+
+            assert result is not None
             # Extract output
             output = result.get("output", "")
             returncode = result.get("returncode", 0)
@@ -2243,7 +2247,7 @@ def check_terminal_requirements() -> bool:
             return _check_vercel_sandbox_requirements(config)
 
         elif env_type == "daytona":
-            from daytona import Daytona  # noqa: F401 — SDK presence check
+            from daytona import Daytona  # type: ignore[import-unresolved] # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
         else:
