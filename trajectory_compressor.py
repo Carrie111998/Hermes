@@ -33,7 +33,7 @@ Usage:
 import json
 import os
 import time
-import yaml  # type: ignore
+import yaml
 import logging
 import asyncio
 from pathlib import Path
@@ -42,9 +42,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from utils import base_url_host_matches, base_url_hostname
-import fire  # type: ignore
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn  # type: ignore
-from rich.console import Console  # type: ignore
+import fire
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.console import Console
 from hermes_constants import OPENROUTER_BASE_URL, get_hermes_home
 from agent.retry_utils import jittered_backoff
 
@@ -404,7 +404,7 @@ class TrajectoryCompressor:
                 raise RuntimeError(
                     f"Missing API key. Set {self.config.api_key_env} "
                     f"environment variable.")
-            from openai import OpenAI  # type: ignore
+            from openai import OpenAI
             from agent.auxiliary_client import _to_openai_base_url
             self.client = OpenAI(
                 api_key=api_key, base_url=_to_openai_base_url(self.config.base_url))
@@ -425,7 +425,7 @@ class TrajectoryCompressor:
         ``process_directory()`` gets a client tied to its own loop,
         avoiding "Event loop is closed" errors on repeated calls.
         """
-        from openai import AsyncOpenAI  # type: ignore
+        from openai import AsyncOpenAI
         from agent.auxiliary_client import _to_openai_base_url
         # Always create a fresh client so it binds to the running loop.
         self.async_client = AsyncOpenAI(

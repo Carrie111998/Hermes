@@ -580,7 +580,7 @@ def _transcribe_groq(file_path: str, model_name: str) -> Dict[str, Any]:
         model_name = DEFAULT_GROQ_STT_MODEL
 
     try:
-        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError  # type: ignore
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
         client = OpenAI(api_key=api_key, base_url=GROQ_BASE_URL, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
@@ -637,7 +637,7 @@ def _transcribe_openai(file_path: str, model_name: str) -> Dict[str, Any]:
         model_name = DEFAULT_STT_MODEL
 
     try:
-        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError  # type: ignore
+        from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=30, max_retries=0)
         try:
             with open(file_path, "rb") as audio_file:
@@ -750,7 +750,7 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
     use_diarize = is_truthy_value(xai_config.get("diarize", False))
 
     try:
-        import requests  # type: ignore
+        import requests
         from tools.xai_http import hermes_xai_user_agent
 
         data: Dict[str, str] = {}

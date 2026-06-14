@@ -525,7 +525,7 @@ def _get_session_platform() -> str:
         return ""
 
 
-def _is_skill_disabled(name: str, platform: str = None) -> bool:
+def _is_skill_disabled(name: str, platform: str | None = None) -> bool:
     """Check if a skill is disabled in config.
 
     Resolves the active platform from (in order of precedence):
@@ -672,7 +672,7 @@ def _load_category_description(category_dir: Path) -> Optional[str]:
         return None
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def skills_list(category: str | None = None, task_id: str | None = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -745,7 +745,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
 def _serve_plugin_skill(
     skill_md: Path,
-    namespace: str,
+    namespace: str | None,
     bare: str,
     *,
     preprocess: bool = True,
@@ -849,8 +849,8 @@ def _serve_plugin_skill(
 
 def skill_view(
     name: str,
-    file_path: str = None,
-    task_id: str = None,
+    file_path: str | None = None,
+    task_id: str | None = None,
     preprocess: bool = True,
 ) -> str:
     """
@@ -919,7 +919,7 @@ def skill_view(
                 )
 
             # Plugin exists but this specific skill is missing?
-            available = pm.list_plugin_skills(namespace)
+            available = pm.list_plugin_skills(str(namespace))
             if available:
                 return json.dumps(
                     {

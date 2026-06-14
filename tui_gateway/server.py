@@ -658,7 +658,7 @@ _INDICATOR_DEFAULT = "kaomoji"
 def _load_cfg() -> dict:
     global _cfg_cache, _cfg_mtime, _cfg_path
     try:
-        import yaml  # type: ignore
+        import yaml
 
         p = _hermes_home / "config.yaml"
         mtime = p.stat().st_mtime if p.exists() else None
@@ -682,7 +682,7 @@ def _load_cfg() -> dict:
 
 def _save_cfg(cfg: dict):
     global _cfg_cache, _cfg_mtime, _cfg_path
-    import yaml  # type: ignore
+    import yaml
 
     path = _hermes_home / "config.yaml"
     with open(path, "w", encoding="utf-8") as f:
@@ -5242,8 +5242,8 @@ def _(rid, params: dict) -> dict:
 
     try:
         from hermes_cli.commands import SlashCommandCompleter
-        from prompt_toolkit.document import Document  # type: ignore
-        from prompt_toolkit.formatted_text import to_plain_text  # type: ignore
+        from prompt_toolkit.document import Document
+        from prompt_toolkit.formatted_text import to_plain_text
 
         from agent.skill_commands import get_skill_commands
         from agent.skill_bundles import get_skill_bundles

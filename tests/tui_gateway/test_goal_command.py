@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -27,6 +28,11 @@ def hermes_home(tmp_path, monkeypatch):
 
     # Bust the goal-module DB cache so it re-resolves HERMES_HOME.
     from hermes_cli import goals
+    import hermes_state
+
+    # Ensure DEFAULT_DB_PATH points to the test home, otherwise it may
+    # point to a stale path from a previous test in the same worker.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
 
     goals._DB_CACHE.clear()
     yield home
@@ -53,8 +59,8 @@ def server(hermes_home):
 
 @pytest.fixture()
 def session(server):
-    sid = "sid-test"
-    session_key = "tui-goal-session-1"
+    sid = f"sid-{uuid.uuid4().hex[:8]}"
+    session_key = f"tui-goal-session-{uuid.uuid4().hex[:8]}"
     s = {
         "session_key": session_key,
         "history": [],
