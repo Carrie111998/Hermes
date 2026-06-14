@@ -328,6 +328,47 @@
     } catch (_e) { /* URL/history unavailable (for example, an embedded preview) */ }
   }
 
+  function buildKanbanTaskUrl(board, taskId) {
+    const url = new URL(window.location.href);
+    if (board) url.searchParams.set("board", board);
+    else url.searchParams.delete("board");
+    url.searchParams.delete("task_id");
+    if (taskId) url.searchParams.set("task", taskId);
+    else url.searchParams.delete("task");
+    return url;
+  }
+
+  function copyTextWithTextarea(text) {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.setAttribute("readonly", "readonly");
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    document.body.appendChild(el);
+    el.select();
+    try {
+      if (typeof document.execCommand !== "function") {
+        throw new Error("Copy command is not available");
+      }
+      const copied = document.execCommand("copy");
+      if (!copied) throw new Error("Copy command was not accepted");
+    } catch (e) {
+      return Promise.reject(e);
+    } finally {
+      document.body.removeChild(el);
+    }
+    return Promise.resolve();
+  }
+
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(function () {
+        return copyTextWithTextarea(text);
+      });
+    }
+    return copyTextWithTextarea(text);
+  }
+
   function withBoard(url, board) {
     // Always append ?board=<slug> when we have one picked — including
     // "default". Omitting the param would fall through to the backend's
@@ -3539,6 +3580,7 @@
     const [homeChannels, setHomeChannels] = useState([]);
     const [homeBusy, setHomeBusy] = useState({});
     const boardSlug = props.boardSlug;
+    const [linkCopied, setLinkCopied] = useState(false);
 
     const load = useCallback(function () {
       return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(props.taskId)}`, boardSlug))
@@ -3565,6 +3607,16 @@
       window.addEventListener("keydown", onKey);
       return function () { window.removeEventListener("keydown", onKey); };
     }, [props.onClose, editing]);
+
+    const handleCopyLink = function () {
+      const link = buildKanbanTaskUrl(boardSlug, props.taskId).toString();
+      copyTextToClipboard(link)
+        .then(function () {
+          setLinkCopied(true);
+          setTimeout(function () { setLinkCopied(false); }, 1800);
+        })
+        .catch(function (e) { setErr(String(e.message || e)); });
+    };
 
     const handleComment = function () {
       const body = newComment.trim();
@@ -3804,12 +3856,20 @@
       },
         h("div", { className: "hermes-kanban-drawer-head" },
           h("span", { className: "text-xs text-muted-foreground" }, props.taskId),
-          h("button", {
-            type: "button",
-            onClick: props.onClose,
-            className: "hermes-kanban-drawer-close",
-            title: tx(t, "close", "Close (Esc)"),
-          }, "×"),
+          h("div", { className: "hermes-kanban-drawer-actions" },
+            h("button", {
+              type: "button",
+              onClick: handleCopyLink,
+              className: "hermes-kanban-drawer-linkcopy",
+              title: tx(t, "copyTaskLink", "Copy link to this task"),
+            }, linkCopied ? tx(t, "copied", "Copied") : tx(t, "copyLink", "Copy link")),
+            h("button", {
+              type: "button",
+              onClick: props.onClose,
+              className: "hermes-kanban-drawer-close",
+              title: tx(t, "close", "Close (Esc)"),
+            }, "×"),
+          ),
         ),
         loading ? h("div", { className: "p-4 text-sm text-muted-foreground" },
           tx(t, "loadingDetail", "Loading…")) :
