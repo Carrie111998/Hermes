@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -304,6 +304,28 @@ CREATE TABLE IF NOT EXISTS pa_events (
     recorded_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS session_mailbox (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    from_session_name TEXT NOT NULL,
+    from_session_key TEXT,
+    from_session_id TEXT,
+    to_session_name TEXT NOT NULL,
+    to_session_key TEXT,
+    to_session_id TEXT,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    source_turn_id TEXT,
+    source_message_id TEXT,
+    correlation_id TEXT,
+    created_at REAL NOT NULL,
+    claimed_at REAL,
+    delivered_at REAL,
+    failed_at REAL,
+    last_error TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -316,6 +338,8 @@ CREATE INDEX IF NOT EXISTS idx_pa_turns_chat ON pa_turns(agent_id, chat_id, star
 CREATE INDEX IF NOT EXISTS idx_pa_turns_session ON pa_turns(session_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pa_tool_calls_turn ON pa_tool_calls(turn_id, id);
 CREATE INDEX IF NOT EXISTS idx_pa_events_turn ON pa_events(turn_id, id);
+CREATE INDEX IF NOT EXISTS idx_session_mailbox_pending
+    ON session_mailbox(agent_id, status, created_at ASC);
 """
 
 FTS_SQL = """
@@ -3178,6 +3202,180 @@ class SessionDB:
             except Exception:
                 pass
             self._conn.execute("VACUUM")
+
+    # ── Inter-session mailbox ────────────────────────────────────────────
+
+    def create_session_mailbox_message(
+        self,
+        *,
+        agent_id: str,
+        from_session_name: str,
+        to_session_name: str,
+        body: str,
+        from_session_key: Optional[str] = None,
+        from_session_id: Optional[str] = None,
+        to_session_key: Optional[str] = None,
+        to_session_id: Optional[str] = None,
+        source_turn_id: Optional[str] = None,
+        source_message_id: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist a pending inter-session mailbox row."""
+        import uuid
+
+        mailbox_id = str(uuid.uuid4())
+        corr = correlation_id or str(uuid.uuid4())
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO session_mailbox (
+                    id, agent_id, from_session_name, from_session_key,
+                    from_session_id, to_session_name, to_session_key,
+                    to_session_id, body, status, attempts, source_turn_id,
+                    source_message_id, correlation_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+                """,
+                (
+                    mailbox_id,
+                    str(agent_id),
+                    str(from_session_name),
+                    from_session_key,
+                    from_session_id,
+                    str(to_session_name),
+                    to_session_key,
+                    to_session_id,
+                    str(body),
+                    source_turn_id,
+                    source_message_id,
+                    corr,
+                    now,
+                ),
+            )
+
+        self._execute_write(_do)
+        return {
+            "id": mailbox_id,
+            "agent_id": str(agent_id),
+            "from_session_name": str(from_session_name),
+            "to_session_name": str(to_session_name),
+            "status": "pending",
+            "correlation_id": corr,
+            "created_at": now,
+        }
+
+    def list_pending_session_mailbox(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return pending mailbox rows, oldest first."""
+        try:
+            sql = "SELECT * FROM session_mailbox WHERE status = 'pending'"
+            params: list[Any] = []
+            if agent_id:
+                sql += " AND agent_id = ?"
+                params.append(str(agent_id))
+            sql += " ORDER BY created_at ASC LIMIT ?"
+            params.append(max(1, int(limit)))
+            cur = self._conn.execute(sql, tuple(params))
+            return [dict(r) for r in cur.fetchall()]
+        except Exception:
+            return []
+
+    def get_session_mailbox_message(self, mailbox_id: str) -> Optional[Dict[str, Any]]:
+        """Return one mailbox row by id."""
+        try:
+            cur = self._conn.execute(
+                "SELECT * FROM session_mailbox WHERE id = ?",
+                (str(mailbox_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    def claim_session_mailbox(self, mailbox_id: str) -> bool:
+        """Atomically transition a pending mailbox row to running."""
+        now = time.time()
+
+        def _do(conn):
+            cur = conn.execute(
+                """
+                UPDATE session_mailbox
+                SET status = 'running',
+                    attempts = attempts + 1,
+                    claimed_at = ?,
+                    last_error = NULL
+                WHERE id = ? AND status = 'pending'
+                """,
+                (now, str(mailbox_id)),
+            )
+            return cur.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def defer_session_mailbox(self, mailbox_id: str, reason: str = "") -> None:
+        """Return a claimed row to pending, preserving durability."""
+        def _do(conn):
+            conn.execute(
+                """
+                UPDATE session_mailbox
+                SET status = 'pending',
+                    claimed_at = NULL,
+                    last_error = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                ((reason or "")[:500], str(mailbox_id)),
+            )
+
+        self._execute_write(_do)
+
+    def complete_session_mailbox(
+        self,
+        mailbox_id: str,
+        *,
+        to_session_key: Optional[str] = None,
+        to_session_id: Optional[str] = None,
+    ) -> None:
+        """Mark a mailbox row delivered."""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                UPDATE session_mailbox
+                SET status = 'delivered',
+                    delivered_at = ?,
+                    to_session_key = COALESCE(?, to_session_key),
+                    to_session_id = COALESCE(?, to_session_id),
+                    last_error = NULL
+                WHERE id = ?
+                """,
+                (now, to_session_key, to_session_id, str(mailbox_id)),
+            )
+
+        self._execute_write(_do)
+
+    def fail_session_mailbox(self, mailbox_id: str, error: str) -> None:
+        """Mark a mailbox row failed with diagnostic text."""
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                """
+                UPDATE session_mailbox
+                SET status = 'failed',
+                    failed_at = ?,
+                    last_error = ?
+                WHERE id = ?
+                """,
+                (now, (error or "")[:1000], str(mailbox_id)),
+            )
+
+        self._execute_write(_do)
 
     def maybe_auto_prune_and_vacuum(
         self,

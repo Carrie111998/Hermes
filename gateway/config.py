@@ -486,6 +486,11 @@ class GatewayConfig:
     # fresh session exactly as if the reset policy had fired.  0 = disabled.
     session_store_max_age_days: int = 90
 
+    # Generic session-to-session mailbox configuration.  Parsed by
+    # ``gateway.inter_session`` so the core GatewayConfig can preserve the
+    # raw, profile-scoped shape without hard-coding a client.
+    inter_session: Dict[str, Any] = field(default_factory=dict)
+
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
         connected = []
@@ -579,6 +584,7 @@ class GatewayConfig:
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
+            "inter_session": self.inter_session,
         }
     
     @classmethod
@@ -632,6 +638,10 @@ class GatewayConfig:
         except (TypeError, ValueError):
             session_store_max_age_days = 90
 
+        inter_session = data.get("inter_session", {})
+        if not isinstance(inter_session, dict):
+            inter_session = {}
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,
@@ -647,6 +657,7 @@ class GatewayConfig:
             unauthorized_dm_behavior=unauthorized_dm_behavior,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
+            inter_session=inter_session,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -747,6 +758,9 @@ def load_gateway_config() -> GatewayConfig:
 
             if "always_log_local" in yaml_cfg:
                 gw_data["always_log_local"] = yaml_cfg["always_log_local"]
+
+            if isinstance(yaml_cfg.get("inter_session"), dict):
+                gw_data["inter_session"] = yaml_cfg["inter_session"]
 
             if "unauthorized_dm_behavior" in yaml_cfg:
                 gw_data["unauthorized_dm_behavior"] = _normalize_unauthorized_dm_behavior(

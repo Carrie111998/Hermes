@@ -86,6 +86,7 @@ def set_session_vars(
     user_id: str = "",
     user_name: str = "",
     session_key: str = "",
+    session_id: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -103,6 +104,7 @@ def set_session_vars(
         _SESSION_USER_ID.set(user_id),
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
+        _SESSION_ID.set(session_id),
     ]
     return tokens
 
@@ -126,6 +128,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
         _SESSION_KEY,
+        _SESSION_ID,
     ):
         var.set("")
 

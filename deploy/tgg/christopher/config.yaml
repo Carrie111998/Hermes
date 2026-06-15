@@ -7,6 +7,80 @@ model:
     secrets_env_key: GEMINI_API_KEY_PCL_PA_SHARED
 agent:
   profile: pa
+group_sessions_per_user: false
+inter_session:
+  enabled: true
+  agent_id: christopher
+  sessions:
+    management:
+      label: "Christopher x TGG Management"
+      role: management
+      source:
+        platform: whatsapp
+        chat_type: group
+        chat_id: "120363407903158826@g.us"
+        user_id: "system:inter-session"
+        user_name: "Christopher"
+      pa_job_type: tgg_management
+      can_send_to:
+      - amk_ops
+      - pg_ops
+      - hg_ops
+      - sk_ops
+      external_output: normal
+      description: "Receives ops captures and decides whether to message the management WhatsApp chat."
+    amk_ops:
+      label: "MM1A Maintenance (AMK, SRG)"
+      role: ops
+      source:
+        platform: whatsapp
+        chat_type: group
+        chat_id: "120363421424519051@g.us"
+        user_id: "system:inter-session"
+        user_name: "Christopher"
+      pa_job_type: tgg_ops_ingest
+      can_send_to:
+      - management
+      external_output: never
+    pg_ops:
+      label: "MM2 Maintenance (PG)"
+      role: ops
+      source:
+        platform: whatsapp
+        chat_type: group
+        chat_id: "120363423568509280@g.us"
+        user_id: "system:inter-session"
+        user_name: "Christopher"
+      pa_job_type: tgg_ops_ingest
+      can_send_to:
+      - management
+      external_output: never
+    hg_ops:
+      label: "MM1B Maintenance (HG, Bedok Resv)"
+      role: ops
+      source:
+        platform: whatsapp
+        chat_type: group
+        chat_id: "120363422582425366@g.us"
+        user_id: "system:inter-session"
+        user_name: "Christopher"
+      pa_job_type: tgg_ops_ingest
+      can_send_to:
+      - management
+      external_output: never
+    sk_ops:
+      label: "MM2 Maintenance (SK)"
+      role: ops
+      source:
+        platform: whatsapp
+        chat_type: group
+        chat_id: "120363403845802098@g.us"
+        user_id: "system:inter-session"
+        user_name: "Christopher"
+      pa_job_type: tgg_ops_ingest
+      can_send_to:
+      - management
+      external_output: never
 pa:
   enabled: true
   constitution_path: /home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml

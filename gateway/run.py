@@ -4392,6 +4392,22 @@ class GatewayRunner:
         # turn so the agent kicks off the new chat.
         asyncio.create_task(self._handoff_watcher())
 
+        # Start background inter-session mailbox watcher — picks up durable
+        # session_mailbox rows and dispatches them as normal internal gateway
+        # turns without rebinding transcripts.
+        try:
+            from gateway.inter_session import parse_inter_session_config
+
+            _inter_session_cfg = parse_inter_session_config(_load_gateway_config())
+            if _inter_session_cfg.enabled and _inter_session_cfg.sessions:
+                asyncio.create_task(
+                    self._inter_session_mailbox_watcher(
+                        interval=_inter_session_cfg.poll_interval_seconds,
+                    )
+                )
+        except Exception as exc:
+            logger.debug("inter_session watcher not started: %s", exc)
+
         logger.info("Press Ctrl+C to stop")
         
         return True
@@ -4610,6 +4626,187 @@ class GatewayRunner:
         except Exception as exc:
             raise RuntimeError(f"adapter.send failed: {exc}") from exc
 
+        if not getattr(result, "success", True):
+            err = getattr(result, "error", "send returned success=False")
+            raise RuntimeError(f"adapter.send failed: {err}")
+
+    def _inter_session_target_busy(self, session_key: str) -> bool:
+        """Return True when a target session currently has a running turn."""
+        if not session_key:
+            return False
+        try:
+            return session_key in self._running_agents
+        except Exception:
+            return False
+
+    async def _inter_session_mailbox_watcher(self, interval: float = 2.0) -> None:
+        """Deliver pending inter-session mailbox rows as internal turns."""
+        await asyncio.sleep(1)
+        while self._running:
+            try:
+                if self._session_db is None:
+                    await asyncio.sleep(interval)
+                    continue
+
+                from gateway.inter_session import parse_inter_session_config
+
+                raw_cfg = _load_gateway_config()
+                inter_cfg = parse_inter_session_config(raw_cfg)
+                if not inter_cfg.enabled or not inter_cfg.sessions:
+                    await asyncio.sleep(interval)
+                    continue
+
+                pending = self._session_db.list_pending_session_mailbox(
+                    agent_id=inter_cfg.agent_id,
+                    limit=25,
+                )
+                for row in pending:
+                    mailbox_id = row.get("id")
+                    if not mailbox_id:
+                        continue
+                    target_key = str(row.get("to_session_key") or "").strip()
+                    if target_key and self._inter_session_target_busy(target_key):
+                        continue
+                    if not self._session_db.claim_session_mailbox(mailbox_id):
+                        continue
+                    try:
+                        delivered = await self._process_inter_session_mailbox_row(row, raw_cfg=raw_cfg)
+                        if delivered is False:
+                            self._session_db.defer_session_mailbox(
+                                mailbox_id,
+                                "target session busy",
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "Inter-session mailbox row %s failed: %s",
+                            mailbox_id,
+                            exc,
+                            exc_info=True,
+                        )
+                        self._session_db.fail_session_mailbox(mailbox_id, str(exc))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "inter_session mailbox watcher tick error: %s",
+                    exc,
+                    exc_info=True,
+                )
+            await asyncio.sleep(interval)
+
+    async def _process_inter_session_mailbox_row(
+        self,
+        row: Dict[str, Any],
+        *,
+        raw_cfg: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        """Deliver one claimed mailbox row.
+
+        Returns False when the target session is currently active and the row
+        should stay pending for a later turn.  Raises on real delivery failure.
+        """
+        from gateway.inter_session import (
+            configured_session_key,
+            parse_inter_session_config,
+            rendered_mailbox_body,
+            source_for_peer,
+        )
+        from gateway.platforms.base import MessageEvent
+
+        if self._session_db is None:
+            raise RuntimeError("session DB unavailable")
+
+        raw_config = raw_cfg if raw_cfg is not None else _load_gateway_config()
+        inter_cfg = parse_inter_session_config(raw_config)
+        if not inter_cfg.enabled:
+            raise RuntimeError("inter_session disabled")
+
+        mailbox_id = str(row.get("id") or "")
+        from_name = str(row.get("from_session_name") or "").strip()
+        to_name = str(row.get("to_session_name") or "").strip()
+        from_peer = inter_cfg.peer(from_name)
+        to_peer = inter_cfg.peer(to_name)
+        if from_peer is None:
+            raise RuntimeError(f"unknown from_session_name '{from_name}'")
+        if to_peer is None:
+            raise RuntimeError(f"unknown to_session_name '{to_name}'")
+        if to_peer.name not in from_peer.can_send_to:
+            raise RuntimeError(f"session '{from_peer.name}' cannot send to '{to_peer.name}'")
+
+        target_source = source_for_peer(to_peer)
+        target_entry = self.session_store.get_or_create_session(target_source)
+        target_key = target_entry.session_key or configured_session_key(to_peer, raw_config)
+        if self._inter_session_target_busy(target_key):
+            return False
+
+        target_session_id = target_entry.session_id
+        body = str(row.get("body") or "").strip()
+        if not body:
+            raise RuntimeError("mailbox body is empty")
+        rendered = rendered_mailbox_body(
+            from_peer=from_peer,
+            body=body,
+            agent_id=inter_cfg.agent_id,
+        )
+
+        pa_context = {
+            "inter_session": {
+                "mailbox_id": mailbox_id,
+                "agent_id": inter_cfg.agent_id,
+                "from_session_name": from_peer.name,
+                "to_session_name": to_peer.name,
+                "correlation_id": row.get("correlation_id"),
+            }
+        }
+        synthetic_event = MessageEvent(
+            text=rendered,
+            source=target_source,
+            message_id=f"inter-session:{mailbox_id}",
+            internal=True,
+            pa_job_type=to_peer.pa_job_type,
+            pa_context=pa_context,
+        )
+
+        logger.info(
+            "Inter-session: dispatching mailbox %s %s → %s (session_key=%s)",
+            mailbox_id,
+            from_peer.name,
+            to_peer.name,
+            target_key,
+        )
+        response_text = await self._handle_message(synthetic_event)
+
+        if response_text and to_peer.external_output != "never":
+            await self._send_inter_session_response(
+                target_source,
+                str(response_text),
+            )
+
+        self._session_db.complete_session_mailbox(
+            mailbox_id,
+            to_session_key=target_key,
+            to_session_id=target_session_id,
+        )
+        return True
+
+    async def _send_inter_session_response(self, source: SessionSource, response_text: str) -> None:
+        """Send a target session's external reply through its platform adapter."""
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            raise RuntimeError(
+                "inter-session external response cannot be sent: "
+                f"platform {getattr(source.platform, 'value', source.platform)} adapter is not active"
+            )
+
+        metadata = self._thread_metadata_for_source(source)
+        try:
+            result = await adapter.send(
+                chat_id=source.chat_id,
+                content=response_text,
+                metadata=metadata or None,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"adapter.send failed: {exc}") from exc
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
@@ -7859,6 +8056,18 @@ class GatewayRunner:
 
         # Build the context prompt to inject
         context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
+        try:
+            from gateway.inter_session import render_prompt_for_turn
+
+            _inter_session_prompt = render_prompt_for_turn(
+                _load_gateway_config(),
+                session_key=session_key,
+                source=source,
+            )
+            if _inter_session_prompt:
+                context_prompt = f"{context_prompt}\n\n{_inter_session_prompt}"
+        except Exception as exc:
+            logger.debug("inter_session prompt injection skipped: %s", exc)
         
         # If the previous session expired and was auto-reset, prepend a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
@@ -14247,6 +14456,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
         )
 
     def _clear_session_env(self, tokens: list) -> None:

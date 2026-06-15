@@ -573,6 +573,12 @@ DEFAULT_CONFIG = {
         "constitution_path": "",
         "business": {},
     },
+    "inter_session": {
+        "enabled": False,
+        "agent_id": "",
+        "sessions": {},
+        "poll_interval_seconds": 2.0,
+    },
     
     "terminal": {
         "backend": "local",
