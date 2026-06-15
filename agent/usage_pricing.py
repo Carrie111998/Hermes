@@ -231,6 +231,39 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
     # OpenAI
     (
         "openai",
+        "gpt-5.4",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("2.50"),
+        output_cost_per_million=Decimal("15.00"),
+        cache_read_cost_per_million=Decimal("0.25"),
+        source="official_docs_snapshot",
+        source_url="https://openai.com/api/pricing/",
+        pricing_version="openai-pricing-2026-05-15",
+    ),
+    (
+        "openai",
+        "gpt-5.4-mini",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.75"),
+        output_cost_per_million=Decimal("4.50"),
+        cache_read_cost_per_million=Decimal("0.075"),
+        source="official_docs_snapshot",
+        source_url="https://openai.com/api/pricing/",
+        pricing_version="openai-pricing-2026-05-15",
+    ),
+    (
+        "openai",
+        "gpt-5.4-nano",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.20"),
+        output_cost_per_million=Decimal("1.25"),
+        cache_read_cost_per_million=Decimal("0.020"),
+        source="official_docs_snapshot",
+        source_url="https://openai.com/api/pricing/",
+        pricing_version="openai-pricing-2026-05-15",
+    ),
+    (
+        "openai",
         "gpt-4o",
     ): PricingEntry(
         input_cost_per_million=Decimal("2.50"),

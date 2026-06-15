@@ -139,6 +139,42 @@ pa:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1
             timeout: 10
+          tgg_message_history_search:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/messages/search
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          message_history_search:
+            type: http
+            tenant: tgg
+            method: GET
+            url: https://systems.papercut-labs.com/api/operator/messages/search
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_clarification_request:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/clarifications
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          clarification_request:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/clarifications
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
           tgg_case_update:
             type: http
             tenant: tgg
@@ -146,6 +182,15 @@ pa:
             url: https://systems.papercut-labs.com/api/operator/cases/{jobNo}/state
             path_params:
             - jobNo
+            headers:
+              X-PS-Tenant: tgg
+              User-Agent: curl/8.7.1
+            timeout: 10
+          tgg_case_update_state:
+            type: http
+            tenant: tgg
+            method: POST
+            url: https://systems.papercut-labs.com/api/operator/cases/state
             headers:
               X-PS-Tenant: tgg
               User-Agent: curl/8.7.1

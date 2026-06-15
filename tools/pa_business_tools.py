@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.parse
@@ -30,6 +31,7 @@ ILINKED_ALLOW_PAYLOAD_KEYS = (
     "source_system_requested",
     "ilinked_requested",
 )
+JOB_NO_RE = r"^[A-Z]{2}/JOB/\d{4}/\d{4}$"
 
 
 @dataclass(frozen=True)
@@ -294,6 +296,135 @@ def _parse_jsonish(text: str) -> dict[str, Any]:
     return {"result": parsed}
 
 
+CASE_SEARCH_ADDRESS_KEYS = (
+    "address",
+    "block",
+    "street",
+    "unit",
+)
+CASE_SEARCH_WORK_KEYS = (
+    "workType",
+    "work_type",
+    "problem",
+    "issue",
+)
+CASE_SEARCH_TEXT_KEYS = CASE_SEARCH_ADDRESS_KEYS + CASE_SEARCH_WORK_KEYS
+
+
+def _dedupe_text_parts(raw_parts: list[str]) -> str:
+    seen: set[str] = set()
+    parts: list[str] = []
+    for part in raw_parts:
+        normalized = " ".join(part.split())
+        if not normalized:
+            continue
+        marker = normalized.lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        parts.append(normalized)
+    return " ".join(parts)
+
+
+def _case_search_address_text(payload: Mapping[str, Any]) -> str:
+    raw_parts: list[str] = []
+    address = str(payload.get("address") or "").strip()
+    if address:
+        raw_parts.append(address)
+    else:
+        block = str(payload.get("block") or "").strip()
+        street = str(payload.get("street") or "").strip()
+        unit = str(payload.get("unit") or "").strip()
+        if block:
+            raw_parts.append(f"Blk {block}" if not block.lower().startswith("blk") else block)
+        if street:
+            raw_parts.append(street)
+        if unit:
+            raw_parts.append(unit if unit.startswith("#") else f"#{unit}")
+    return _dedupe_text_parts(raw_parts)
+
+
+def _case_search_work_text(payload: Mapping[str, Any]) -> str:
+    raw_parts: list[str] = []
+    for key in ("workType", "work_type", "problem", "issue"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            raw_parts.append(value)
+    return _dedupe_text_parts(raw_parts)
+
+
+def _normalize_case_search_payload(clean: dict[str, Any]) -> dict[str, Any]:
+    """Shape a case-search payload for the operator candidate-search API.
+
+    Structured anchors (block / unit / job number) are PRESERVED as payload
+    keys — the API runs a tiered candidate search on them (unit_exact >
+    job_no > block_street_fuzzy > text_like) and each returned row carries a
+    match_basis naming why it surfaced. The free `search` text is still
+    composed from address/street parts and feeds the text + street-fuzzy
+    tiers. (The old behavior squashed everything into one whole-string LIKE,
+    which made "Rivervale Cres" vs "Rivervale Crescent" return zero results.)
+    """
+    if "search" not in clean and clean.get("query") is not None:
+        clean["search"] = clean["query"]
+    address_text = _case_search_address_text(clean)
+    work_text = _case_search_work_text(clean)
+    has_address_terms = any(str(clean.get(key) or "").strip() for key in CASE_SEARCH_ADDRESS_KEYS)
+    has_work_terms = any(str(clean.get(key) or "").strip() for key in CASE_SEARCH_WORK_KEYS)
+    if address_text and has_address_terms:
+        clean["search"] = address_text
+    elif work_text and (has_work_terms or not str(clean.get("search") or "").strip()):
+        clean["search"] = work_text
+    # Partial/typo'd job fragments are allowed on the candidate search — use
+    # the non-path 'job_no' key (contains-match), never strict-validated jobNo.
+    job_no = str(clean.get("job_no") or clean.get("jobNo") or "").strip()
+    clean.pop("jobNo", None)
+    clean.pop("job_no", None)
+    block = str(clean.get("block") or "").strip()
+    unit = str(clean.get("unit") or "").strip()
+    clean.pop("query", None)
+    clean.pop("zone", None)
+    for key in CASE_SEARCH_TEXT_KEYS:
+        clean.pop(key, None)
+    if job_no:
+        clean["job_no"] = job_no
+    if block:
+        clean["block"] = block
+    if unit:
+        clean["unit"] = unit
+    return clean
+
+
+def _normalize_operation_payload(operation: str, payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    clean = _json_payload(payload)
+    op = operation.strip().lower()
+    if op.endswith("case_search"):
+        clean = _normalize_case_search_payload(clean)
+    return clean
+
+
+def _validate_operation_payload(op: PABusinessOperation, payload: Mapping[str, Any] | None) -> None:
+    request_payload = _json_payload(payload)
+    if "jobNo" in request_payload:
+        value = str(request_payload.get("jobNo") or "").strip().upper()
+        if value and not re.match(JOB_NO_RE, value):
+            raise ValueError(
+                "INVALID_JOB_NO: jobNo must look like SK/JOB/2604/2376; "
+                f"{request_payload.get('jobNo')!r} looks like a unit or free-text reference. "
+                "Use case_search/tgg_case_search with search=<address, unit, or work text> first."
+            )
+    for param_name in op.path_params:
+        if param_name not in request_payload:
+            raise ValueError(f"operation {op.name!r} requires path_param {param_name!r} in payload")
+        if param_name == "jobNo":
+            value = str(request_payload.get(param_name) or "").strip().upper()
+            if not value or not re.match(JOB_NO_RE, value):
+                raise ValueError(
+                    "INVALID_JOB_NO: jobNo must look like SK/JOB/2604/2376; "
+                    f"{request_payload.get(param_name)!r} looks like a unit or free-text reference. "
+                    "Use case_search/tgg_case_search with search=<address, unit, or work text> first."
+                )
+
+
 def _execute_http_operation(
     op: PABusinessOperation,
     payload: Mapping[str, Any] | None,
@@ -396,10 +527,13 @@ def execute_business_operation(
             operation=operation,
         )
 
+    normalized_payload = _normalize_operation_payload(operation, payload)
+    _validate_operation_payload(op, normalized_payload)
+
     if op.kind == "http":
-        return _execute_http_operation(op, payload, bridge_config)
+        return _execute_http_operation(op, normalized_payload, bridge_config)
     if op.kind == "command":
-        return _execute_command_operation(op, payload)
+        return _execute_command_operation(op, normalized_payload)
     raise ValueError(f"unsupported PA business operation type {op.kind!r}")
 
 
@@ -452,6 +586,15 @@ AGENT_ACTION_STATUSES = {
 }
 
 
+def _env_truthy(*names: str) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
 def _resolve_bridge(
     config: Mapping[str, Any] | PABusinessBridgeConfig | None,
 ) -> PABusinessBridgeConfig | None:
@@ -482,6 +625,8 @@ def record_agent_action(
 ) -> bool:
     """Record an agent action to dev.agent_actions. Fails soft."""
     try:
+        if _env_truthy("HERMES_PA_AGENT_ACTION_DRY_RUN", "HERMES_PA_BUSINESS_DRY_RUN"):
+            return True
         if not agent_id or not engagement_id:
             return False
         if action_type not in AGENT_ACTION_TYPES or status not in AGENT_ACTION_STATUSES:
@@ -647,7 +792,437 @@ def _handle_business_read(args: Mapping[str, Any], **kwargs: Any) -> str:
 
 
 def _handle_business_write(args: Mapping[str, Any], **kwargs: Any) -> str:
+    if _env_truthy("HERMES_PA_BUSINESS_DRY_RUN"):
+        operation = str(args.get("operation") or "").strip()
+        if not operation:
+            return tool_error("operation is required")
+        payload = _normalize_operation_payload(operation, _strip_control_payload_keys(args.get("payload") or {}))
+        try:
+            bridge = _load_runtime_bridge_config()
+            op = bridge.operations.get(operation)
+            if op is None:
+                known = ", ".join(sorted(bridge.operations)) or "none configured"
+                return tool_error(f"unknown PA business operation {operation!r}; known: {known}")
+            _validate_operation_payload(op, payload)
+        except Exception as exc:
+            return tool_error(exc)
+        return tool_result({
+            "ok": True,
+            "dry_run": True,
+            "operation": operation,
+            "payload": payload,
+        })
     return _handle_business_call(args, user_task=kwargs.get("user_task"))
+
+
+def _dry_run_business_result(operation: str, payload: Mapping[str, Any]) -> str | None:
+    if not _env_truthy("HERMES_PA_BUSINESS_DRY_RUN"):
+        return None
+    try:
+        bridge = _load_runtime_bridge_config()
+        op = bridge.operations.get(operation)
+        if op is None:
+            known = ", ".join(sorted(bridge.operations)) or "none configured"
+            return tool_error(f"unknown PA business operation {operation!r}; known: {known}")
+        _validate_operation_payload(op, payload)
+    except Exception as exc:
+        return tool_error(exc)
+    return tool_result({
+        "ok": True,
+        "dry_run": True,
+        "operation": operation,
+        "payload": dict(payload),
+    })
+
+
+# ── last-seen case state (v6.3 item 4b, WB f6845320 — 1018/1092 receipt) ──
+#
+# The tgg_case_observation backend response carries only {observationId}; the
+# agent attaching evidence therefore never sees the case's CURRENT state in
+# the tool result, and a stale "completed" carried in conversation memory can
+# survive right past a same-turn lookup that said "open". A fresh fetch per
+# observation is not worth an extra round-trip, so instead we remember the
+# most recent backend-returned state per jobNo from lookup/search/write
+# results and echo it prominently into the observation success result.
+# Deterministic, code-layer surface (match-the-layer); the constitution
+# carries the judgment-side rule ("this-turn tool result wins").
+
+_LAST_SEEN_CASE_STATE: dict[str, str] = {}
+_LAST_SEEN_CASE_STATE_MAX = 512
+
+
+def _case_state_key(job_no: Any) -> str | None:
+    text = " ".join(str(job_no or "").split()).upper()
+    return text or None
+
+
+def _remember_case_state(job_no: Any, state: Any) -> None:
+    key = _case_state_key(job_no)
+    state_text = str(state or "").strip()
+    if not key or not state_text:
+        return
+    # Bounded cache: drop the oldest entry past the cap (long-lived gateway).
+    if key not in _LAST_SEEN_CASE_STATE and len(_LAST_SEEN_CASE_STATE) >= _LAST_SEEN_CASE_STATE_MAX:
+        _LAST_SEEN_CASE_STATE.pop(next(iter(_LAST_SEEN_CASE_STATE)), None)
+    _LAST_SEEN_CASE_STATE[key] = state_text
+
+
+def _harvest_case_states(result: Any, _depth: int = 0) -> None:
+    """Record state for every case-shaped dict (jobNo/job_no + state) in a
+    backend result — covers lookup ({data: {case: ...}}), search candidates,
+    and any write response that echoes the case."""
+    if _depth > 6:
+        return
+    try:
+        if isinstance(result, Mapping):
+            job_no = result.get("jobNo") or result.get("job_no")
+            if job_no is not None and "state" in result:
+                _remember_case_state(job_no, result.get("state"))
+            for value in result.values():
+                if isinstance(value, (Mapping, list, tuple)):
+                    _harvest_case_states(value, _depth + 1)
+        elif isinstance(result, (list, tuple)):
+            for item in result:
+                _harvest_case_states(item, _depth + 1)
+    except Exception:
+        pass
+
+
+def _annotate_observation_result(raw: str, job_no: Any) -> str:
+    """Echo the last-known backend state for the observed case into the
+    observation tool result so fresh state is in-face at attach time."""
+    key = _case_state_key(job_no)
+    state = _LAST_SEEN_CASE_STATE.get(key) if key else None
+    if not state:
+        return raw
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return raw
+    if not isinstance(data, dict) or data.get("error") or "caseState" in data:
+        return raw
+    if data.get("ok") is False:
+        return raw
+    data["caseState"] = state
+    data["caseStateNote"] = (
+        "current backend state for this case (from the most recent "
+        "lookup/search result) — any state claim must restate THIS value, "
+        "not conversation memory"
+    )
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _handle_tgg_read(operation: str, payload: Mapping[str, Any]) -> str:
+    try:
+        result = execute_business_operation(
+            _load_runtime_bridge_config(),
+            operation=operation,
+            payload=payload,
+        )
+    except Exception as exc:
+        return tool_error(exc)
+    _harvest_case_states(result)
+    return tool_result(result)
+
+
+def _handle_tgg_write(operation: str, payload: Mapping[str, Any]) -> str:
+    dry = _dry_run_business_result(operation, payload)
+    if dry is not None:
+        return dry
+    try:
+        result = execute_business_operation(
+            _load_runtime_bridge_config(),
+            operation=operation,
+            payload=payload,
+        )
+    except Exception as exc:
+        return tool_error(exc)
+    _harvest_case_states(result)
+    return tool_result(result)
+
+
+def _handle_tgg_case_lookup(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    return _handle_tgg_read("tgg_case_lookup", {"jobNo": args.get("jobNo")})
+
+
+def _handle_tgg_case_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    payload = _normalize_case_search_payload(dict(args))
+    payload["limit"] = payload.get("limit", 10)
+    for key in ("serviceLine", "sourceStatus", "progressStatus", "state"):
+        if args.get(key) is not None:
+            payload[key] = args.get(key)
+    return _handle_tgg_read("tgg_case_search", payload)
+
+
+def _history_before_ts_cap() -> int | None:
+    """Replay-only future cap for message-history search.
+
+    The replay harness sets HERMES_PA_HISTORY_BEFORE_TS per turn (epoch seconds
+    of the turn's latest message + 1) so a replayed agent can never see archive
+    messages from after the moment being replayed. Live runtime never sets the
+    variable, so live searches are uncapped.
+    """
+    raw = os.getenv("HERMES_PA_HISTORY_BEFORE_TS")
+    if not raw:
+        return None
+    try:
+        return int(float(raw))
+    except ValueError:
+        return None
+
+
+def _apply_before_ts(payload: dict[str, Any], args: Mapping[str, Any]) -> None:
+    """Apply caller-supplied before_ts, clamped by the replay future-cap.
+
+    The replay cap always wins when present (a replayed agent must never see
+    archive messages from after the moment being replayed)."""
+    before_ts: int | None = None
+    raw = args.get("before_ts")
+    if raw is not None:
+        try:
+            before_ts = int(float(raw))
+        except (TypeError, ValueError):
+            before_ts = None
+    cap = _history_before_ts_cap()
+    if before_ts is not None and cap is not None:
+        payload["before_ts"] = min(before_ts, cap)
+    elif before_ts is not None:
+        payload["before_ts"] = before_ts
+    elif cap is not None:
+        payload["before_ts"] = cap
+
+
+def _handle_tgg_message_history_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    payload: dict[str, Any] = {}
+    for key in ("q", "block", "unit"):
+        value = str(args.get(key) or "").strip()
+        if value:
+            payload[key] = value
+    job_no = str(args.get("jobNo") or args.get("job_no") or "").strip()
+    if job_no:
+        # Deliberately the non-path 'job_no' key: partial/typo'd fragments are
+        # allowed here (contains-match), unlike the strict jobNo validation on
+        # lookup/observation operations.
+        payload["job_no"] = job_no
+    chat_jid = str(args.get("chat_jid") or args.get("chatJid") or "").strip()
+    if chat_jid:
+        payload["chat_jid"] = chat_jid
+    limit = args.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        payload["limit"] = min(limit, 50)
+    _apply_before_ts(payload, args)
+    return _handle_tgg_read("tgg_message_history_search", payload)
+
+
+def _handle_generic_message_history_search(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    """Client-agnostic message-history search: q/chat_jid/before_ts/limit ONLY.
+
+    The generic alias deliberately carries no client-shaped params (no
+    block/unit/job_no) — those live on the tgg_-prefixed variant.  Any extra
+    keys a model passes are ignored rather than forwarded."""
+    payload: dict[str, Any] = {}
+    q = str(args.get("q") or "").strip()
+    if q:
+        payload["q"] = q
+    chat_jid = str(args.get("chat_jid") or args.get("chatJid") or "").strip()
+    if chat_jid:
+        payload["chat_jid"] = chat_jid
+    limit = args.get("limit")
+    if isinstance(limit, int) and limit > 0:
+        payload["limit"] = min(limit, 50)
+    _apply_before_ts(payload, args)
+    return _handle_tgg_read("tgg_message_history_search", payload)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _handle_tgg_clarification_request(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return tool_error("clarification_request requires a non-empty question")
+    payload: dict[str, Any] = {"question": question}
+    candidates = _string_list(args.get("candidate_job_nos") or args.get("candidateJobNos"))
+    if candidates:
+        payload["candidate_job_nos"] = candidates
+    evidence = _string_list(args.get("evidence_message_refs") or args.get("evidenceMessageRefs"))
+    if evidence:
+        payload["evidence_message_refs"] = evidence
+    context = str(args.get("context") or "").strip()
+    if context:
+        payload["context"] = context
+    return _handle_tgg_write("tgg_clarification_request", payload)
+
+
+def _handle_generic_clarification_request(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    """Client-agnostic clarification: question/candidate_refs/evidence/context.
+
+    ``candidate_refs`` is the agnostic name for candidate entity identifiers
+    (the tgg_ variant uses candidate_job_nos); the wire payload keeps the
+    backend's key so the endpoint is unchanged."""
+    question = str(args.get("question") or "").strip()
+    if not question:
+        return tool_error("clarification_request requires a non-empty question")
+    payload: dict[str, Any] = {"question": question}
+    candidates = _string_list(args.get("candidate_refs") or args.get("candidateRefs"))
+    if candidates:
+        payload["candidate_job_nos"] = candidates
+    evidence = _string_list(args.get("evidence_message_refs") or args.get("evidenceMessageRefs"))
+    if evidence:
+        payload["evidence_message_refs"] = evidence
+    context = str(args.get("context") or "").strip()
+    if context:
+        payload["context"] = context
+    return _handle_tgg_write("tgg_clarification_request", payload)
+
+
+def _coerce_observed_at_epoch(value: Any) -> Any:
+    """Coerce an observed_at value to epoch SECONDS (int) when possible.
+
+    The tgg_case_update_state backend expects epoch seconds; agents naturally
+    produce ISO-8601 strings (sk-day26-v6: christopher sent
+    '2026-05-26T11:02:58+08:00', got rejected, and burned a retry call with
+    epoch). Accept both shapes at the tool boundary:
+
+      * int/float (or numeric string)  -> int(value)
+      * ISO-8601 string                -> int(datetime.timestamp());
+        naive timestamps are treated as SGT (UTC+8) — TGG operates in
+        Asia/Singapore and all message timestamps in scope are SGT.
+
+    Anything unparseable is returned UNCHANGED so the backend stays the
+    authority on rejection (no new tool-side validation surface).
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return text
+    try:
+        return int(float(text))
+    except ValueError:
+        pass
+    from datetime import datetime, timedelta, timezone
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=8)))
+    return int(parsed.timestamp())
+
+
+def _handle_tgg_case_update_state(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    job_no = str(args.get("job_no") or args.get("jobNo") or "").strip()
+    if not job_no:
+        return tool_error("tgg_case_update_state requires job_no")
+    state = str(args.get("state") or "").strip().lower()
+    if state != "completed":
+        return tool_error(
+            "tgg_case_update_state only accepts state='completed' (v1); "
+            f"got {state!r}"
+        )
+    payload: dict[str, Any] = {"jobNo": job_no, "state": "completed"}
+    evidence = _string_list(
+        args.get("evidence_message_refs") or args.get("evidenceMessageRefs")
+    )
+    if evidence:
+        payload["evidenceMessageRefs"] = evidence
+    observed_at_raw = args.get("observed_at")
+    if observed_at_raw is None:
+        observed_at_raw = args.get("observedAt")
+    observed_at = _coerce_observed_at_epoch(observed_at_raw)
+    if observed_at is not None and observed_at != "":
+        payload["observedAt"] = observed_at
+    return _handle_tgg_write("tgg_case_update_state", payload)
+
+
+def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    raw = dict(args)
+    fields = raw.get("fields") if isinstance(raw.get("fields"), Mapping) else {}
+    fields = dict(fields)
+    for source_key, field_key in (
+        ("observedAt", "observed_at"),
+        ("sourceRefs", "source_refs"),
+        ("mediaRefs", "media_refs"),
+        ("messageText", "message_text"),
+        ("senderName", "sender_name"),
+        ("chatName", "chat_name"),
+        ("photoCount", "photo_count"),
+    ):
+        if raw.get(source_key) is not None and field_key not in fields:
+            fields[field_key] = raw.get(source_key)
+    payload = {
+        "jobNo": raw.get("jobNo"),
+        "source": raw.get("source") or "whatsapp",
+        "fields": fields,
+        "notes": raw.get("notes"),
+        "confidence": raw.get("confidence"),
+    }
+    # v6.3 item 4b: the backend observation response carries only
+    # {observationId} — echo the case's last-known backend state into the
+    # success result so fresh state is in-face at evidence-attach time.
+    return _annotate_observation_result(
+        _handle_tgg_write("tgg_case_observation", payload),
+        payload.get("jobNo"),
+    )
+
+
+_JOB_NO_TOKEN_RE = re.compile(r"\b[A-Z]{2}/JOB/\d{4}/\d{1,4}\b")
+
+_CREATE_JOB_NO_ALIASES = ("reportedJobNo", "reported_job_no", "job_no", "jobno", "jobNumber")
+
+
+def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
+    payload = dict(args)
+
+    # Alias coercion: the model sometimes invents sibling names for the job
+    # number param (PG day-26 run passed reportedJobNo); the backend only
+    # honors jobNo and silently mints a WA/JOB placeholder otherwise.
+    if not str(payload.get("jobNo") or "").strip():
+        for alias in _CREATE_JOB_NO_ALIASES:
+            value = str(payload.get(alias) or "").strip()
+            if value and _JOB_NO_TOKEN_RE.search(value.upper()):
+                payload["jobNo"] = value.upper()
+                break
+    for alias in _CREATE_JOB_NO_ALIASES:
+        payload.pop(alias, None)
+
+    # Corrective gate: cases enter the ledger only from HDB job sheets, so a
+    # create without jobNo is bounced. When the evidence text plainly carries
+    # a job number the param almost always got lost — bounce with the found
+    # token(s) so the model self-corrects in-turn. confirmNoJobNo=true is the
+    # explicit-operator-instruction escape hatch.
+    if not str(payload.get("jobNo") or "").strip() and not payload.get("confirmNoJobNo"):
+        evidence_blob = json.dumps(payload.get("evidence") or {}, ensure_ascii=False)
+        found = sorted(set(_JOB_NO_TOKEN_RE.findall(evidence_blob.upper())))
+        if found:
+            return tool_error(
+                "JOB_NO_OMITTED: the evidence text contains job number(s) "
+                f"{', '.join(found)} but no jobNo was passed — cases are "
+                "created only under an HDB job number. If the number belongs "
+                "to THIS case, re-call with jobNo set to it exactly. If it "
+                "only references a different/previous case, this report is "
+                "not a new case: record a tgg_case_observation against the "
+                "matched case or hold it via tgg_clarification_request."
+            )
+        return tool_error(
+            "JOB_NO_REQUIRED: cases enter the ledger only from HDB job "
+            "sheets — tgg_case_create requires an explicit HDB jobNo. A "
+            "worker report with no job sheet is not a new case: record it "
+            "with tgg_case_observation against a matched case, or hold it "
+            "via tgg_clarification_request (\"no HDB job sheet found for "
+            "this report — holding it as pending; send the job number when "
+            "issued\"). confirmNoJobNo: true is allowed only on explicit "
+            "operator instruction."
+        )
+    payload.pop("confirmNoJobNo", None)
+    return _handle_tgg_write("tgg_case_create", payload)
 
 
 def _handle_business_call(args: Mapping[str, Any], *, user_task: Any = None) -> str:
@@ -725,6 +1300,331 @@ PA_BUSINESS_WRITE_SCHEMA = {
 }
 
 
+TGG_CASE_LOOKUP_SCHEMA = {
+    "name": "tgg_case_lookup",
+    "description": "Look up exactly one TGG operator case by real job number, e.g. SK/JOB/2604/2376. Do not use for unit numbers.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "jobNo": {
+                "type": "string",
+                "description": "Exact TGG/HDB job number such as SK/JOB/2604/2376.",
+            },
+        },
+        "required": ["jobNo"],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CASE_SEARCH_SCHEMA = {
+    "name": "tgg_case_search",
+    "description": (
+        "Search TGG operator cases. Returns a compact candidate list "
+        "{candidates: [{jobNo, address, block, unit, state, problem, "
+        "matchBasis}], count} (limit 10). matchBasis names why each candidate "
+        "surfaced (unit_exact, unit_exact_block_mismatch, job_no, "
+        "block_street_fuzzy, text_like). The search is deliberately generous "
+        "(recall) — it returns CANDIDATES with matchBasis; YOU judge which "
+        "(if any) is the same job. Multiple plausible candidates or "
+        "conflicting evidence → use tgg_clarification_request instead of "
+        "guessing. Identity params (jobNo, block, unit — taken from the "
+        "message AND its quoted context) are the primary search keys; "
+        "free-text search is a last resort when none of them exist. "
+        "workType/problem are reasoning hints, only used as search text when "
+        "no address or job number exists."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "search": {
+                "type": "string",
+                "description": "Free text LAST-RESORT fallback — never put work-description prose here when a jobNo, block, or unit is available in the message or its quoted context. If block/street/unit or address is known, keep this to address text only.",
+            },
+            "address": {"type": "string", "description": "Structured address if known, e.g. 'Blk 350 Anchorvale Rd #11-109'."},
+            "block": {"type": "string", "description": "Structured block number if known, e.g. '350'."},
+            "street": {"type": "string", "description": "Structured street/name if known, e.g. 'Anchorvale Rd'."},
+            "unit": {"type": "string", "description": "Structured unit if known, e.g. '#11-109'. Matches stored units with or without '#'."},
+            "jobNo": {"type": "string", "description": "Full or partial job number, e.g. 'SK/JOB/2605/2480' or '2605/2480'. Contains-match; typo'd fragments are fine here."},
+            "workType": {"type": "string", "description": "Structured work type/problem if known. Used for reasoning after address candidates return, not mixed into address search."},
+            "problem": {"type": "string", "description": "Structured problem/work description if known. Used for reasoning after address candidates return, not mixed into address search."},
+            "limit": {"type": "integer", "description": "Maximum candidates to return.", "default": 10},
+            "serviceLine": {"type": "string", "description": "Optional service line, usually maintenance or sprucing."},
+            "sourceStatus": {"type": "string", "description": "Optional source status filter."},
+            "progressStatus": {"type": "string", "description": "Optional progress status filter."},
+            "state": {"type": "string", "description": "Optional raw case state filter."},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_MESSAGE_HISTORY_SEARCH_SCHEMA = {
+    "name": "tgg_message_history_search",
+    "description": (
+        "Search the WhatsApp message archive (all group chats, full history) "
+        "for prior announcements/reports about a unit, job number, or topic. "
+        "Use BEFORE creating any case with a WA/JOB placeholder number — the "
+        "real job number is often in an earlier announcement (possibly in a "
+        "different chat or with a typo'd street name; prefer block+unit search)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "q": {
+                "type": "string",
+                "description": "Free text search over message text. Multiple words are ANDed; keep it to 1-3 distinctive words.",
+            },
+            "block": {"type": "string", "description": "Block number to match in message text, e.g. '446A'."},
+            "unit": {"type": "string", "description": "Unit to match in message text, e.g. '#03-326' (matches with or without '#'/spaces)."},
+            "jobNo": {"type": "string", "description": "Full or partial job number to match, e.g. 'SK/JOB/2605/2480' or '2605/2480'."},
+            "chat_jid": {"type": "string", "description": "Optional: restrict to one chat jid. Usually omit — announcements often live in a different chat."},
+            "before_ts": {"type": "integer", "description": "Optional: only return messages sent before this epoch-seconds timestamp."},
+            "limit": {"type": "integer", "description": "Maximum messages to return (default 20, max 50)."},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+
+# Client-agnostic alias: deliberately NOT a spread of the tgg_ schema — the
+# generic surface carries ONLY client-agnostic params (q, chat_jid, before_ts,
+# limit).  Structured client anchors (block/unit/job_no) belong to the
+# tgg_-prefixed variant.
+MESSAGE_HISTORY_SEARCH_SCHEMA = {
+    "name": "message_history_search",
+    "description": (
+        "Search the message archive (all chats, full history) for prior "
+        "messages about a topic. Free-text search; restrict to one chat or a "
+        "time window when needed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "q": {
+                "type": "string",
+                "description": "Free text search over message text. Multiple words are ANDed; keep it to 1-3 distinctive words.",
+            },
+            "chat_jid": {"type": "string", "description": "Optional: restrict to one chat jid. Usually omit."},
+            "before_ts": {"type": "integer", "description": "Optional: only return messages sent before this epoch-seconds timestamp."},
+            "limit": {"type": "integer", "description": "Maximum messages to return (default 20, max 50)."},
+        },
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CLARIFICATION_REQUEST_SCHEMA = {
+    "name": "tgg_clarification_request",
+    "description": (
+        "Record a clarification for the OPERATOR when case-matching evidence "
+        "is ambiguous: multiple plausible candidate cases, a completed case "
+        "matching new same-shape work, or a report whose unit/job cannot be "
+        "resolved. Shape: propose and confirm, not an open question — state "
+        "your read, the action you will take by default, and invite "
+        "correction (e.g. \"we'll add it to the existing case, let me know if "
+        "you want me to record otherwise\"). The proposed default must never "
+        "be opening a new case. The clarification is recorded for the "
+        "operator to review later; it is NEVER sent to any WhatsApp chat and "
+        "no answer will arrive this turn. After calling: proceed on your "
+        "stated default without assuming a different answer, and do NOT "
+        "create a placeholder case for the work you just asked about — the "
+        "clarification IS the record. Do not use this when evidence is clear "
+        "(over-asking is noise). Max one clarification per case decision."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": (
+                    "Propose-and-confirm text naming the unit/address and "
+                    "candidate job(s): your one-line read, the default action "
+                    "you will take, and an invite to correct — not an "
+                    "open-ended question."
+                ),
+            },
+            "candidate_job_nos": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Job numbers of the candidate cases under consideration.",
+            },
+            "evidence_message_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "WhatsApp message refs/ids that triggered the question.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Short factual context: what was reported, what the candidates show, what is missing.",
+            },
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+}
+
+
+# Client-agnostic alias: same recording semantics, but the candidate list is
+# the agnostic ``candidate_refs`` (no client-shaped candidate_job_nos param).
+CLARIFICATION_REQUEST_SCHEMA = {
+    "name": "clarification_request",
+    "description": TGG_CLARIFICATION_REQUEST_SCHEMA["description"],
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": (
+                    "Propose-and-confirm text naming the entity/candidates "
+                    "involved: your one-line read, the default action you "
+                    "will take, and an invite to correct — not an open-ended "
+                    "question."
+                ),
+            },
+            "candidate_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Identifiers of the candidate records under consideration.",
+            },
+            "evidence_message_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Message refs/ids that triggered the question.",
+            },
+            "context": {
+                "type": "string",
+                "description": "Short factual context: what was reported, what the candidates show, what is missing.",
+            },
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CASE_UPDATE_STATE_SCHEMA = {
+    "name": "tgg_case_update_state",
+    "description": (
+        "Mark a TGG case COMPLETED from worker-report evidence. Use ONLY when "
+        "the case's scope is clearly what the report says is done (e.g. case "
+        "says pipe leak, report says 'epoxy applied, done') — cite the report "
+        "messages as evidence_message_refs. If the report covers only part of "
+        "the scope, or the scope is unclear, do NOT complete: record a "
+        "tgg_case_observation and ask via tgg_clarification_request ('is this "
+        "completed?') instead. Never complete on ambiguity. Only "
+        "state='completed' is accepted in v1."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "job_no": {
+                "type": "string",
+                "description": "Exact job number of the case to mark completed, e.g. SK/JOB/2604/2376.",
+            },
+            "state": {
+                "type": "string",
+                "enum": ["completed"],
+                "description": "Target state. Only 'completed' is accepted (v1).",
+            },
+            "evidence_message_refs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "WhatsApp message refs/ids evidencing the completion (the worker report).",
+            },
+            "observed_at": {
+                "type": "string",
+                "description": (
+                    "When the completion was observed, as epoch SECONDS "
+                    "(integer), e.g. 1779700000 — this is what the backend "
+                    "expects. ISO-8601 strings (e.g. "
+                    "'2026-05-26T11:02:58+08:00') are also accepted and "
+                    "coerced to epoch seconds; naive timestamps are treated "
+                    "as SGT."
+                ),
+            },
+        },
+        "required": ["job_no", "state"],
+        "additionalProperties": False,
+    },
+}
+
+
+TGG_CASE_OBSERVATION_SCHEMA = {
+    "name": "tgg_case_observation",
+    "description": "Record WhatsApp evidence or worker updates against an existing TGG case. Requires a real job number; dry-run mode validates without writing.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "jobNo": {"type": "string", "description": "Exact job number to attach the observation to."},
+            "source": {"type": "string", "description": "Observation source, e.g. whatsapp."},
+            "observedAt": {"type": "string", "description": "Observed time in SGT or ISO format."},
+            "notes": {"type": "string", "description": "Short factual observation notes."},
+            "confidence": {"type": "string", "description": "Evidence confidence, e.g. observed, high, low."},
+            "fields": {"type": "object", "description": "Structured extracted facts.", "additionalProperties": True},
+            "messageText": {"type": "string", "description": "Original message text or bundled message summary."},
+            "senderName": {"type": "string", "description": "WhatsApp sender name/id."},
+            "chatName": {"type": "string", "description": "WhatsApp group/chat name."},
+            "photoCount": {"type": "integer", "description": "Number of attached photos."},
+            "sourceRefs": {"type": "array", "items": {"type": "string"}, "description": "Source WhatsApp message IDs/refs."},
+            "mediaRefs": {"type": "array", "items": {"type": "string"}, "description": "Attached media paths/refs."},
+        },
+        "required": ["jobNo", "source", "observedAt", "notes", "confidence"],
+        "additionalProperties": True,
+    },
+}
+
+
+TGG_CASE_CREATE_SCHEMA = {
+    "name": "tgg_case_create",
+    "description": (
+        "Create a new TGG case from an HDB job sheet after search finds no "
+        "matching existing case. Creation requires an HDB job number — "
+        "creates without jobNo are not allowed. A worker report with no job "
+        "sheet is never a new case: record it with tgg_case_observation "
+        "against a matched case, or hold it via tgg_clarification_request. "
+        "Dry-run mode validates without writing."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "jobNo": {
+                "type": "string",
+                "description": (
+                    "The HDB job number stated in the message (e.g. 'Job no: "
+                    "PG/JOB/2605/0973'). REQUIRED — pass it EXACTLY as "
+                    "written; the case is created under this number. Cases "
+                    "enter the ledger only from HDB job sheets; there is no "
+                    "placeholder path for creates without a job number."
+                ),
+            },
+            "confirmNoJobNo": {
+                "type": "boolean",
+                "description": (
+                    "Set true ONLY when the OPERATOR has explicitly "
+                    "instructed you to record this as a case despite no HDB "
+                    "job number. Never set it on your own judgment — a "
+                    "worker report without a job sheet is an observation or "
+                    "a clarification, not a case."
+                ),
+            },
+            "zone": {"type": "string", "description": "TGG zone if known."},
+            "serviceLine": {"type": "string", "description": "maintenance or sprucing."},
+            "address": {"type": "string", "description": "Case address."},
+            "problem": {"type": "string", "description": "Problem or work description."},
+            "source": {"type": "string", "description": "Source, e.g. whatsapp."},
+            "observedAt": {"type": "string", "description": "Observed time in SGT or ISO format."},
+            "evidence": {"type": "object", "description": "Evidence used to decide this is new.", "additionalProperties": True},
+        },
+        "required": ["zone", "address", "problem", "source"],
+        "additionalProperties": True,
+    },
+}
+
+
 registry.register(
     name="pa_business_read",
     toolset="pa-business",
@@ -738,5 +1638,77 @@ registry.register(
     toolset="pa-business",
     schema=PA_BUSINESS_WRITE_SCHEMA,
     handler=_handle_business_write,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_lookup",
+    toolset="pa-business",
+    schema=TGG_CASE_LOOKUP_SCHEMA,
+    handler=_handle_tgg_case_lookup,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_search",
+    toolset="pa-business",
+    schema=TGG_CASE_SEARCH_SCHEMA,
+    handler=_handle_tgg_case_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_message_history_search",
+    toolset="pa-business",
+    schema=TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
+    handler=_handle_tgg_message_history_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="message_history_search",
+    toolset="pa-business",
+    schema=MESSAGE_HISTORY_SEARCH_SCHEMA,
+    handler=_handle_generic_message_history_search,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_clarification_request",
+    toolset="pa-business",
+    schema=TGG_CLARIFICATION_REQUEST_SCHEMA,
+    handler=_handle_tgg_clarification_request,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="clarification_request",
+    toolset="pa-business",
+    schema=CLARIFICATION_REQUEST_SCHEMA,
+    handler=_handle_generic_clarification_request,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_update_state",
+    toolset="pa-business",
+    schema=TGG_CASE_UPDATE_STATE_SCHEMA,
+    handler=_handle_tgg_case_update_state,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_observation",
+    toolset="pa-business",
+    schema=TGG_CASE_OBSERVATION_SCHEMA,
+    handler=_handle_tgg_case_observation,
+    check_fn=_bridge_available,
+)
+
+registry.register(
+    name="tgg_case_create",
+    toolset="pa-business",
+    schema=TGG_CASE_CREATE_SCHEMA,
+    handler=_handle_tgg_case_create,
     check_fn=_bridge_available,
 )

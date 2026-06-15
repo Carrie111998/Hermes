@@ -552,14 +552,27 @@ def test_bridge_module_does_not_import_or_call_hermes_state_writers():
 def test_pa_business_toolset_is_registered_without_all_tools():
     from toolsets import get_toolset, resolve_toolset
 
+    expected = {
+        "pa_business_read",
+        "pa_business_write",
+        "tgg_case_lookup",
+        "tgg_case_search",
+        "tgg_message_history_search",
+        "message_history_search",
+        "tgg_clarification_request",
+        "clarification_request",
+        "tgg_case_observation",
+        "tgg_case_create",
+        "tgg_case_update_state",
+    }
     toolset = get_toolset("pa-business")
     assert toolset is not None
-    assert set(toolset["tools"]) == {"pa_business_read", "pa_business_write"}
-    assert resolve_toolset("pa-business") == ["pa_business_read", "pa_business_write"]
+    assert set(toolset["tools"]) == expected
+    assert set(resolve_toolset("pa-business")) == expected
     custom = get_toolset("custom")
     assert custom is not None
-    assert set(custom["tools"]) == {"pa_business_read", "pa_business_write"}
-    assert resolve_toolset("custom") == ["pa_business_read", "pa_business_write"]
+    assert set(custom["tools"]) == expected
+    assert set(resolve_toolset("custom")) == expected
 
 
 def test_tenant_scoped_http_operation_injects_client_auth(fake_business_endpoint):
@@ -685,6 +698,102 @@ def test_path_param_interpolation_get(path_param_endpoint):
     assert last["ps_tenant"] == "tgg"
 
 
+def test_case_search_accepts_model_query_alias(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_case_search": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config, "tgg_case_search", {"query": "350 Anchorvale Rd", "limit": 10}
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    assert "search=350+Anchorvale+Rd" in last["path"]
+    assert "query=" not in last["path"]
+    assert "limit=10" in last["path"]
+
+
+def test_case_search_accepts_structured_fields_as_single_query(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_case_search": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "tgg_case_search",
+        {
+            "block": "350",
+            "street": "Anchorvale Rd",
+            "unit": "11-109",
+            "workType": "window grille install",
+            "zone": "SK",
+            "limit": 10,
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    assert "search=Blk+350+Anchorvale+Rd+%2311-109" in last["path"]
+    assert "window+grille+install" not in last["path"]
+    # Structured anchors are PRESERVED — the API runs the tiered candidate
+    # search on them (unit_exact > job_no > block_street_fuzzy > text_like).
+    assert "block=350" in last["path"]
+    assert "unit=11-109" in last["path"]
+    # Street feeds the composed search text only; work/zone never pass through.
+    assert "street=" not in last["path"]
+    assert "workType=" not in last["path"]
+    assert "zone=SK" not in last["path"]
+    assert "limit=10" in last["path"]
+
+
+def test_case_search_uses_work_text_only_when_no_address(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_case_search": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "tgg_case_search",
+        {
+            "workType": "window grille install",
+            "limit": 10,
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "GET"
+    assert "search=window+grille+install" in last["path"]
+    assert "workType=" not in last["path"]
+
+
 def test_path_param_interpolation_patch_keeps_remaining_payload_in_body(path_param_endpoint):
     """PATCH with path param: jobNo goes in URL, remaining payload becomes JSON body."""
     config = {
@@ -766,6 +875,56 @@ def test_path_param_missing_from_payload_fails_loudly(path_param_endpoint):
         execute_business_operation(config, "case_lookup", {})
 
 
+def test_clarification_request_posts_to_clarifications_endpoint(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "tgg_clarification_request": {
+                    "type": "http",
+                    "method": "POST",
+                    "url": f"{path_param_endpoint}/api/operator/clarifications",
+                }
+            }
+        }
+    }
+
+    result = execute_business_operation(
+        config,
+        "tgg_clarification_request",
+        {
+            "question": "Is the 182 Rivervale grille report the same job as SK/JOB/2603/1728?",
+            "candidate_job_nos": ["SK/JOB/2603/1728"],
+            "evidence_message_refs": ["wa:12345"],
+            "context": "Completed case matches new same-shape work.",
+        },
+    )
+
+    assert result["ok"] is True
+    last = _PathParamHandler.last_request
+    assert last["method"] == "POST"
+    assert last["path"].startswith("/api/operator/clarifications")
+    assert last["payload"]["question"].startswith("Is the 182 Rivervale")
+    assert last["payload"]["candidate_job_nos"] == ["SK/JOB/2603/1728"]
+    assert last["payload"]["evidence_message_refs"] == ["wa:12345"]
+
+
+def test_case_lookup_rejects_unit_as_job_number(path_param_endpoint):
+    config = {
+        "pa_business": {
+            "operations": {
+                "case_lookup": {
+                    "type": "http",
+                    "method": "GET",
+                    "url": f"{path_param_endpoint}/api/operator/cases/{{jobNo}}",
+                    "path_params": ["jobNo"],
+                }
+            }
+        }
+    }
+    with pytest.raises(ValueError, match="INVALID_JOB_NO"):
+        execute_business_operation(config, "case_lookup", {"jobNo": "11-109"})
+
+
 def test_path_param_without_placeholder_fails_loudly(path_param_endpoint):
     config = {
         "pa_business": {
@@ -780,7 +939,7 @@ def test_path_param_without_placeholder_fails_loudly(path_param_endpoint):
         }
     }
     with pytest.raises(ValueError, match="URL has no \\{jobNo\\} placeholder"):
-        execute_business_operation(config, "broken", {"jobNo": "X"})
+        execute_business_operation(config, "broken", {"jobNo": "SK/JOB/2604/2376"})
 
 
 def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):
@@ -821,3 +980,313 @@ def test_wrong_tenant_operation_fails_loudly(fake_business_endpoint):
             {"case_id": "M-1"},
             pa_context=pa_context,
         )
+
+
+# ── generic-vs-tgg tool param hygiene + completion verb (v6) ──────────────
+
+
+@pytest.fixture
+def captured_reads(monkeypatch):
+    """Capture (operation, payload) from the read handlers without HTTP."""
+    import tools.pa_business_tools as pbt
+
+    captured = []
+
+    def _fake_read(operation, payload):
+        captured.append((operation, dict(payload)))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(pbt, "_handle_tgg_read", _fake_read)
+    return captured
+
+
+@pytest.fixture
+def captured_writes(monkeypatch):
+    """Capture (operation, payload) from the write handlers without HTTP."""
+    import tools.pa_business_tools as pbt
+
+    captured = []
+
+    def _fake_write(operation, payload):
+        captured.append((operation, dict(payload)))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(pbt, "_handle_tgg_write", _fake_write)
+    return captured
+
+
+def test_generic_message_history_search_carries_agnostic_params_only(
+    captured_reads, monkeypatch
+):
+    import tools.pa_business_tools as pbt
+
+    monkeypatch.delenv("HERMES_PA_HISTORY_BEFORE_TS", raising=False)
+    pbt._handle_generic_message_history_search(
+        {
+            "q": "epoxy leak",
+            "chat_jid": "123@g.us",
+            "before_ts": 1760000000,
+            "limit": 10,
+            # Client-shaped params a model might pass anyway — must be DROPPED
+            "block": "350",
+            "unit": "#11-109",
+            "jobNo": "SK/JOB/2604/2376",
+        }
+    )
+    op, payload = captured_reads[0]
+    assert op == "tgg_message_history_search"
+    assert payload == {
+        "q": "epoxy leak",
+        "chat_jid": "123@g.us",
+        "before_ts": 1760000000,
+        "limit": 10,
+    }
+
+
+def test_generic_message_history_search_schema_is_agnostic():
+    from tools.pa_business_tools import (
+        MESSAGE_HISTORY_SEARCH_SCHEMA,
+        TGG_MESSAGE_HISTORY_SEARCH_SCHEMA,
+    )
+
+    generic = set(MESSAGE_HISTORY_SEARCH_SCHEMA["parameters"]["properties"])
+    assert generic == {"q", "chat_jid", "before_ts", "limit"}
+    tgg = set(TGG_MESSAGE_HISTORY_SEARCH_SCHEMA["parameters"]["properties"])
+    assert {"block", "unit", "jobNo"} <= tgg
+
+
+def test_before_ts_clamped_by_replay_future_cap(captured_reads, monkeypatch):
+    import tools.pa_business_tools as pbt
+
+    monkeypatch.setenv("HERMES_PA_HISTORY_BEFORE_TS", "1700000000")
+    pbt._handle_generic_message_history_search(
+        {"q": "leak", "before_ts": 1760000000}
+    )
+    _, payload = captured_reads[0]
+    assert payload["before_ts"] == 1700000000  # cap wins over later agent value
+
+    pbt._handle_tgg_message_history_search({"q": "leak", "before_ts": 1600000000})
+    _, payload2 = captured_reads[1]
+    assert payload2["before_ts"] == 1600000000  # earlier agent value kept
+
+
+def test_generic_clarification_request_maps_candidate_refs(captured_writes):
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_generic_clarification_request(
+        {
+            "question": "Same job?",
+            "candidate_refs": ["SK/JOB/2603/1728"],
+            "evidence_message_refs": ["wa:1"],
+            "context": "ambiguous",
+        }
+    )
+    op, payload = captured_writes[0]
+    assert op == "tgg_clarification_request"
+    assert payload["candidate_job_nos"] == ["SK/JOB/2603/1728"]
+    assert payload["question"] == "Same job?"
+
+
+def test_generic_clarification_request_schema_is_agnostic():
+    from tools.pa_business_tools import CLARIFICATION_REQUEST_SCHEMA
+
+    props = set(CLARIFICATION_REQUEST_SCHEMA["parameters"]["properties"])
+    assert props == {"question", "candidate_refs", "evidence_message_refs", "context"}
+
+
+def test_case_update_state_maps_contract_payload(captured_writes):
+    import tools.pa_business_tools as pbt
+
+    out = pbt._handle_tgg_case_update_state(
+        {
+            "job_no": "SK/JOB/2604/2376",
+            "state": "completed",
+            "evidence_message_refs": ["wa:9", "wa:10"],
+            "observed_at": "2026-06-10T14:00:00+08:00",
+        }
+    )
+    assert json.loads(out)["ok"] is True
+    op, payload = captured_writes[0]
+    assert op == "tgg_case_update_state"
+    assert payload == {
+        "jobNo": "SK/JOB/2604/2376",
+        "state": "completed",
+        "evidenceMessageRefs": ["wa:9", "wa:10"],
+        # ISO-8601 input is coerced to epoch seconds at the tool boundary
+        # (the backend expects epoch; see the observed_at coercion tests).
+        "observedAt": 1781071200,
+    }
+
+
+def test_case_update_state_coerces_iso_observed_at_to_epoch(captured_writes):
+    """REPRO of the sk-day26-v6 wasted retry: christopher sent observed_at as
+    ISO-8601 ('2026-05-26T11:02:58+08:00'), the backend rejected it, and the
+    agent burned a second call resending epoch. The tool must coerce ISO to
+    epoch seconds BEFORE posting. FAILS on pre-fix code (ISO string passed
+    through verbatim)."""
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_tgg_case_update_state(
+        {
+            "job_no": "SK/JOB/2601/2304",
+            "state": "completed",
+            "observed_at": "2026-05-26T11:02:58+08:00",
+        }
+    )
+    _, payload = captured_writes[0]
+    assert payload["observedAt"] == 1779764578
+    assert isinstance(payload["observedAt"], int)
+
+
+def test_case_update_state_naive_iso_observed_at_assumed_sgt(captured_writes):
+    """Naive ISO timestamps are treated as SGT (TGG operates Asia/Singapore)."""
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_tgg_case_update_state(
+        {
+            "job_no": "SK/JOB/2601/2304",
+            "state": "completed",
+            "observed_at": "2026-05-26T11:02:58",
+        }
+    )
+    _, payload = captured_writes[0]
+    assert payload["observedAt"] == 1779764578
+
+
+def test_case_update_state_epoch_observed_at_passthrough(captured_writes):
+    """Epoch input (int or numeric string) lands as an int; unparseable text
+    passes through unchanged so the backend stays the rejection authority."""
+    import tools.pa_business_tools as pbt
+
+    pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2601/2304", "state": "completed", "observed_at": 1779764578}
+    )
+    pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2601/2304", "state": "completed", "observed_at": "1779764578"}
+    )
+    pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2601/2304", "state": "completed", "observed_at": "around noon"}
+    )
+    assert captured_writes[0][1]["observedAt"] == 1779764578
+    assert captured_writes[1][1]["observedAt"] == 1779764578
+    assert captured_writes[2][1]["observedAt"] == "around noon"
+
+
+def test_case_update_state_schema_says_epoch_seconds():
+    """The schema description must steer the model to epoch seconds (the
+    'SGT or ISO format' description caused the ISO-first attempt)."""
+    from tools.pa_business_tools import TGG_CASE_UPDATE_STATE_SCHEMA
+
+    desc = TGG_CASE_UPDATE_STATE_SCHEMA["parameters"]["properties"]["observed_at"][
+        "description"
+    ]
+    assert "epoch" in desc.lower()
+    assert "seconds" in desc.lower()
+
+
+def test_case_update_state_rejects_non_completed(captured_writes):
+    import tools.pa_business_tools as pbt
+
+    out = pbt._handle_tgg_case_update_state(
+        {"job_no": "SK/JOB/2604/2376", "state": "cancelled"}
+    )
+    assert "only accepts state='completed'" in out
+    assert captured_writes == []
+
+    out2 = pbt._handle_tgg_case_update_state({"state": "completed"})
+    assert "requires job_no" in out2
+    assert captured_writes == []
+
+
+def test_case_update_state_operation_in_production_config():
+    raw = yaml.safe_load(TGG_PRODUCTION_CONFIG.read_text(encoding="utf-8"))
+    pa_context = SimpleNamespace(
+        constitution=SimpleNamespace(client=raw["pa"]["overlay"]["client"])
+    )
+    bridge = load_business_bridge_config(raw, pa_context=pa_context)
+    op = bridge.operations["tgg_case_update_state"]
+    assert op.method == "POST"
+    assert op.url.endswith("/api/operator/cases/state")
+
+
+class TestCaseCreateJobNoContract:
+    """jobNo alias coercion + omission gate (PG day-26 WA-mint regression)."""
+
+    def _create(self, monkeypatch, args):
+        import tools.pa_business_tools as pbt
+        captured = {}
+
+        def fake_write(op, payload):
+            captured.update(payload)
+            return '{"ok": true}'
+
+        monkeypatch.setattr(pbt, "_handle_tgg_write", fake_write)
+        result = pbt._handle_tgg_case_create(args)
+        return result, captured
+
+    def test_reported_job_no_alias_coerced(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "reportedJobNo": "PG/JOB/2605/0973",
+        })
+        assert captured.get("jobNo") == "PG/JOB/2605/0973"
+        assert "reportedJobNo" not in captured
+
+    def test_omitted_job_no_with_evidence_token_bounces(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "evidence": {"messageText": "Job no: PG/JOB/2605/0980\nRemarks: y"},
+        })
+        assert "JOB_NO_OMITTED" in result
+        assert "PG/JOB/2605/0980" in result
+        assert not captured  # write never happened
+
+    def test_confirm_no_job_no_escape_hatch(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "confirmNoJobNo": True,
+            "evidence": {"messageText": "previous job SK/JOB/2603/1709 not attended"},
+        })
+        assert "JOB_NO_OMITTED" not in result
+        assert "confirmNoJobNo" not in captured
+
+    def test_create_without_job_no_bounces(self, monkeypatch):
+        """No jobNo + no confirmNoJobNo = corrective error: cases enter the
+        ledger only from HDB job sheets (no WA placeholder minting)."""
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "evidence": {"messageText": "tenant reports leak, no job sheet"},
+        })
+        assert "JOB_NO_REQUIRED" in result
+        assert "tgg_case_observation" in result
+        assert "tgg_clarification_request" in result
+        assert not captured  # write never happened
+
+    def test_operator_instructed_no_job_no_create_passes(self, monkeypatch):
+        """confirmNoJobNo is the explicit-operator-instruction escape hatch."""
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "confirmNoJobNo": True,
+            "evidence": {"messageText": "tenant reports leak, no job sheet"},
+        })
+        assert "JOB_NO_REQUIRED" not in result
+        assert "JOB_NO_OMITTED" not in result
+        assert "confirmNoJobNo" not in captured
+
+    def test_create_schema_requires_hdb_job_no(self):
+        from tools.pa_business_tools import TGG_CASE_CREATE_SCHEMA
+
+        desc = TGG_CASE_CREATE_SCHEMA["description"]
+        assert "HDB job number" in desc
+        assert "not allowed" in desc
+        job_no_desc = TGG_CASE_CREATE_SCHEMA["parameters"]["properties"]["jobNo"]["description"]
+        assert "minted" not in job_no_desc
+        confirm_desc = TGG_CASE_CREATE_SCHEMA["parameters"]["properties"]["confirmNoJobNo"]["description"]
+        assert "operator" in confirm_desc.lower()
+
+    def test_explicit_job_no_passes_through(self, monkeypatch):
+        result, captured = self._create(monkeypatch, {
+            "address": "Blk 1 Test St #01-01", "problem": "x",
+            "jobNo": "SK/JOB/2605/2564",
+        })
+        assert captured.get("jobNo") == "SK/JOB/2605/2564"

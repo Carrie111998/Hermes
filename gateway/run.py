@@ -276,6 +276,36 @@ def _build_replay_entry(role: str, content: Any, msg: Dict[str, Any]) -> Dict[st
     return entry
 
 
+# Turn-scoped telemetry keys run_conversation emits for PA turn-recording.
+# run_sync REBUILDS the agent_result dict with an explicit field whitelist
+# (two return sites); these keys were dropped by that whitelist, so every
+# LIVE turn recorded NULL context_window_peak even though run_conversation
+# emitted the value (v6.3 item 5a, WB f6845320). Lifted out of the closure —
+# like _build_replay_entry above — so the passthrough is unit-testable.
+_TURN_TELEMETRY_FIELDS: tuple[str, ...] = (
+    "turn_input_tokens",
+    "turn_output_tokens",
+    "turn_context_window_peak",
+)
+
+
+def _turn_telemetry_fields(result: Any) -> Dict[str, Any]:
+    """Extract the turn-scoped telemetry fields for run_sync's rebuilt dicts.
+
+    Only present-and-non-None keys pass through: build_turn_record treats a
+    missing key as "caller doesn't emit this" and falls back (tokens) or
+    records NULL (context peak) — synthesizing zeros here would corrupt that
+    contract for string-only/legacy callers.
+    """
+    if not isinstance(result, dict):
+        return {}
+    return {
+        key: result[key]
+        for key in _TURN_TELEMETRY_FIELDS
+        if result.get(key) is not None
+    }
+
+
 def _last_transcript_timestamp(history: Optional[List[Dict[str, Any]]]) -> Any:
     """Return the ``timestamp`` of the last usable transcript row, if any.
 
@@ -1205,19 +1235,41 @@ def _render_pa_ephemeral_prompt(pa_context: Any) -> str:
 
 
 def _apply_pa_compression_policy(agent: Any, pa_context: Any) -> None:
-    """Attach job-brief compression policy to an agent compressor when supported."""
+    """Attach job-brief compression behavior to an agent compressor when supported.
+
+    Two distinct knobs live under ``response_policy.compression``:
+
+    * ``strategy`` (+ window/fields) — the legacy PA compression POLICY. It
+      REPLACES the native pipeline with a deterministic keep/drop filter
+      (``_compress_with_pa_policy`` short-circuits ``compress()``). Only set
+      when a strategy is actually declared.
+    * ``compaction_guidance`` — standing guidance string threaded into the
+      NATIVE summarizer prompt (auto-trigger compactions; composes with any
+      per-call /compress focus). Keeps the native pipeline running.
+    """
     compressor = getattr(agent, "context_compressor", None)
     setter = getattr(compressor, "set_pa_compression_policy", None)
     if not callable(setter):
         return
     policy = None
+    guidance = None
     job_brief = getattr(pa_context, "job_brief", None) if pa_context is not None else None
     response_policy = getattr(job_brief, "response_policy", None) if job_brief is not None else None
     if isinstance(response_policy, Mapping):
         raw_policy = response_policy.get("compression")
         if isinstance(raw_policy, Mapping):
-            policy = raw_policy
+            # Guidance-only mappings (no strategy) must NOT register as a
+            # policy: a policy short-circuits the native pipeline at the top
+            # of compress(), which is exactly what guidance-mode avoids.
+            if str(raw_policy.get("strategy") or "").strip():
+                policy = raw_policy
+            raw_guidance = raw_policy.get("compaction_guidance")
+            if isinstance(raw_guidance, str) and raw_guidance.strip():
+                guidance = raw_guidance
     setter(policy)
+    guidance_setter = getattr(compressor, "set_pa_compaction_guidance", None)
+    if callable(guidance_setter):
+        guidance_setter(guidance)
 
 
 def _pa_response_policy(pa_context: Any) -> Mapping[str, Any]:
@@ -7630,7 +7682,30 @@ class GatewayRunner:
         _pa_turn_started_at = time.time()
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            try:
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            except BaseException:
+                # Turn died mid-flight. Flush a best-effort PA turn record so
+                # the dead turn still exists in observability and its tool
+                # calls (recovered from the stash / persisted transcript) are
+                # attributed to THIS turn instead of leaking into the NEXT
+                # turn's record. Never masks the original exception.
+                try:
+                    await self._record_pa_turn_boundary(
+                        source=source,
+                        quick_key=_quick_key,
+                        run_generation=_run_generation,
+                        event=event,
+                        agent_result={
+                            "completed": False,
+                            "failed": True,
+                            "error": "turn died mid-flight (exception before turn boundary)",
+                        },
+                        started_at=_pa_turn_started_at,
+                    )
+                except Exception:
+                    pass
+                raise
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -7667,20 +7742,12 @@ class GatewayRunner:
             # non-blocking — wrapped in try/except + bounded executor timeout so
             # a recording failure can NEVER break live processing or the reply.
             try:
-                _pa_final_text = ""
-                if isinstance(_agent_result, dict):
-                    _pa_final_text = str(_agent_result.get("final_response") or "")
-                elif isinstance(_agent_result, str):
-                    _pa_final_text = _agent_result
-                try:
-                    _pa_session_entry = self.session_store.get_or_create_session(source)
-                except Exception:
-                    _pa_session_entry = None
-                await self._record_pa_turn_safe(
+                await self._record_pa_turn_boundary(
                     source=source,
-                    session_entry=_pa_session_entry,
+                    quick_key=_quick_key,
+                    run_generation=_run_generation,
+                    event=event,
                     agent_result=_agent_result,
-                    final_response=_pa_final_text,
                     started_at=_pa_turn_started_at,
                 )
             except Exception as _pa_rec_exc:
@@ -8653,6 +8720,26 @@ class GatewayRunner:
 
             response = agent_result.get("final_response") or ""
 
+            # PA universal turn-recording needs the FULL agent_result dict
+            # (messages, api_calls, tool_calls, model/provider). This method's
+            # public contract is to return the response STRING, and it has
+            # several early-return paths (notably PA `never_send_replies` ->
+            # `return None`, plus already-sent/streaming/voice paths) that never
+            # reach the final `return response`. Stash the rich dict HERE — right
+            # after a non-stale agent_result exists — keyed by (quick_key,
+            # run_generation), so the turn-recording boundary in _handle_message
+            # can read it regardless of which return path this method takes.
+            # Without this, build_turn_record received a str/None -> result_dict
+            # None -> empty pa_tool_calls + null message_refs + skeletal envelope.
+            try:
+                _rec_stash = getattr(self, "_last_agent_result_by_run", None)
+                if _rec_stash is None:
+                    _rec_stash = {}
+                    self._last_agent_result_by_run = _rec_stash
+                _rec_stash[(_quick_key, run_generation)] = agent_result
+            except Exception:
+                pass
+
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
             # produce visible content after exhausting all retries (nudge,
@@ -9037,8 +9124,13 @@ class GatewayRunner:
                     status="executed",
                     turn_id=_pa_action_turn_id,
                 )
+            # NB: the agent_result stash for PA turn-recording is set EARLIER
+            # (right after the non-stale agent_result is obtained), so it is
+            # captured on every return path — including the PA
+            # `never_send_replies` / already-sent / voice early returns that
+            # never reach this final `return response`.
             return response
-            
+
         except Exception as e:
             # Stop typing indicator on error too
             try:
@@ -10941,6 +11033,93 @@ class GatewayRunner:
         except Exception as exc:
             logger.debug("PA turn-record: agent_id resolve failed: %s", exc)
             return None
+
+    async def _record_pa_turn_boundary(
+        self,
+        *,
+        source: Any,
+        quick_key: Any,
+        run_generation: Any,
+        agent_result: Any,
+        started_at: Optional[float],
+        event: Any = None,
+    ) -> None:
+        """Turn-boundary PA recording shared by the success and failure paths.
+
+        ``_handle_message_with_agent`` returns the response STRING for
+        backward-compat, but stashes the full agent_result dict keyed by
+        (quick_key, run_generation). Prefer the rich dict so the turn record
+        carries messages/tool_calls/api_calls instead of a skeletal
+        string-derived envelope.
+
+        When no rich dict is available (turn died before the stash, or a
+        string-only path), fall back to the persisted session transcript for
+        the ``messages`` payload so the turn's tool calls survive turn death.
+        Over-extraction from the full transcript is safe: the DB layer dedups
+        per-session by call_id, so only not-yet-recorded calls persist.
+        """
+        _pa_record_result = agent_result
+        try:
+            _stash = getattr(self, "_last_agent_result_by_run", None)
+            if isinstance(_stash, dict):
+                _stashed = _stash.pop((quick_key, run_generation), None)
+                if isinstance(_stashed, dict):
+                    _pa_record_result = _stashed
+        except Exception:
+            pass
+        # Deterministic turn->message link (teren 2026-06-12): the turn's input
+        # event ALREADY carries the WA source message ids (bundle
+        # raw_message.sourceMessageIds; single message_id). Record them so
+        # pa_turns.message_refs_json is populated at source, never
+        # reconstructed from content downstream.
+        _src_msg_ids: list = []
+        try:
+            _raw = getattr(event, "raw_message", None)
+            if isinstance(_raw, dict):
+                _ids = _raw.get("sourceMessageIds")
+                if isinstance(_ids, list):
+                    _src_msg_ids = [str(i) for i in _ids if i]
+            if not _src_msg_ids:
+                _mid = getattr(event, "message_id", None)
+                if _mid:
+                    _src_msg_ids = [m for m in str(_mid).split("+") if m]
+        except Exception:
+            _src_msg_ids = []
+        if _src_msg_ids and isinstance(_pa_record_result, dict):
+            _pa_record_result.setdefault("turn_source_message_ids", _src_msg_ids)
+        _pa_final_text = ""
+        if isinstance(_pa_record_result, dict):
+            _pa_final_text = str(_pa_record_result.get("final_response") or "")
+        elif isinstance(_pa_record_result, str):
+            _pa_final_text = _pa_record_result
+        try:
+            _pa_session_entry = self.session_store.get_or_create_session(source)
+        except Exception:
+            _pa_session_entry = None
+        if not (isinstance(_pa_record_result, dict) and _pa_record_result.get("messages")):
+            # Failure/skeletal fallback: recover tool calls from the persisted
+            # transcript (run_agent persists messages even on failure returns).
+            try:
+                if _pa_session_entry is not None:
+                    _transcript = self.session_store.load_transcript(
+                        _pa_session_entry.session_id
+                    )
+                    if _transcript:
+                        _base = (
+                            _pa_record_result
+                            if isinstance(_pa_record_result, dict)
+                            else {}
+                        )
+                        _pa_record_result = {**_base, "messages": _transcript}
+            except Exception:
+                pass
+        await self._record_pa_turn_safe(
+            source=source,
+            session_entry=_pa_session_entry,
+            agent_result=_pa_record_result,
+            final_response=_pa_final_text,
+            started_at=started_at,
+        )
 
     def _record_pa_turn_blocking(
         self,
@@ -14493,6 +14672,18 @@ class GatewayRunner:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
+    def _vision_preanalysis_max_concurrency(self) -> int:
+        """Return configured concurrency for text-mode image pre-analysis."""
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            raw = cfg_get(cfg, "auxiliary", "vision", "max_concurrency", default=1)
+            value = int(raw or 1)
+        except Exception:
+            value = 1
+        return max(1, min(value, 16))
+
     async def _enrich_message_with_vision(
         self,
         user_text: str,
@@ -14523,36 +14714,46 @@ class GatewayRunner:
             "and any other notable visual information."
         )
 
-        enriched_parts = []
-        for path in image_paths:
+        max_concurrency = self._vision_preanalysis_max_concurrency()
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def analyze_one(path: str) -> str:
             try:
-                logger.debug("Auto-analyzing user image: %s", path)
-                result_json = await vision_analyze_tool(
-                    image_url=path,
-                    user_prompt=analysis_prompt,
-                )
+                async with semaphore:
+                    logger.debug("Auto-analyzing user image: %s", path)
+                    result_json = await vision_analyze_tool(
+                        image_url=path,
+                        user_prompt=analysis_prompt,
+                    )
                 result = json.loads(result_json)
                 if result.get("success"):
                     description = result.get("analysis", "")
                     description = sanitize_context(description)
-                    enriched_parts.append(
+                    return (
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
                         f"[If you need a closer look, use vision_analyze with "
                         f"image_url: {path} ~]"
                     )
-                else:
-                    enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
-                        "this time (>_<) You can try looking at it yourself "
-                        f"with vision_analyze using image_url: {path}]"
-                    )
+                return (
+                    "[The user sent an image but I couldn't quite see it "
+                    "this time (>_<) You can try looking at it yourself "
+                    f"with vision_analyze using image_url: {path}]"
+                )
             except Exception as e:
                 logger.error("Vision auto-analysis error: %s", e)
-                enriched_parts.append(
+                return (
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
                     f"with vision_analyze using image_url: {path}]"
                 )
+
+        if max_concurrency > 1 and len(image_paths) > 1:
+            logger.info(
+                "Image pre-analysis fan-out: %d image(s), max_concurrency=%d.",
+                len(image_paths),
+                max_concurrency,
+            )
+        enriched_parts = await asyncio.gather(*(analyze_one(path) for path in image_paths))
 
         # Combine: vision descriptions first, then the user's original text
         if enriched_parts:
@@ -16992,6 +17193,8 @@ class GatewayRunner:
                     "provider": _resolved_provider,
                     "estimated_cost_usd": result.get("estimated_cost_usd", 0.0),
                     "context_length": _context_length,
+                    # Turn-scoped telemetry passthrough (PA turn-recording).
+                    **_turn_telemetry_fields(result),
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -17115,6 +17318,8 @@ class GatewayRunner:
                 "context_length": _context_length,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                # Turn-scoped telemetry passthrough (PA turn-recording).
+                **_turn_telemetry_fields(result),
             }
         
         # Start progress message sender if enabled
