@@ -1,7 +1,7 @@
 ---
 name: hermes-agent
 description: "Configure, extend, or contribute to Hermes Agent."
-version: 2.1.0
+version: 2.2.0
 author: Hermes Agent + Teknium
 license: MIT
 platforms: [linux, macos, windows]
@@ -48,6 +48,17 @@ Good verification targets:
 - `references/full-cli-runtime-guide.md` — full preserved CLI/runtime/developer guide: slash commands, config paths, privacy toggles, voice, spawning agents, cron/background systems, Windows quirks, troubleshooting, and contributor map.
 - `references/context-budget-and-surface-audit-2026-05-07.md` — Scaffolde/Hermes context-budget and wrong-surface instruction audit pattern, when present in the installed skill copy.
 - `references/scaffolde-agent-profiles-2026-05.md` — Scaffolde-named Hermes profile projection pattern, when present in the installed skill copy.
+
+## Project Context Files
+
+Hermes injects project-level instructions from context files in first-match-wins order:
+
+1. `.hermes.md` / `HERMES.md` — walks parent directories up to the git root.
+2. `AGENTS.md` / `agents.md` — current working directory only.
+3. `CLAUDE.md` / `claude.md` — current working directory only.
+4. `.cursorrules` / `.cursor/rules/*.mdc` — current working directory only.
+
+Each context file is capped at 20,000 characters with head+tail truncation. Context file content passes through the threat-pattern scanner before prompt injection. `hermes --ignore-rules` skips these project context files, `SOUL.md`, user config, plugins, and MCP servers for one isolated session.
 
 ## Operating Rules
 
