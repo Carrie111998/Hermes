@@ -1,0 +1,16 @@
+{
+  "name": "agent-workspace",
+  "label": "Workspace",
+  "description": "FRIDAY-OS agent workspace — lanes + learnings (aux model) beside the Kanban board. Backend proxies the FRIDAI kernel over MCP through the dashboard's own auth.",
+  "icon": "LayoutDashboard",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/workspace",
+    "position": "after:kanban",
+    "hidden": true
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "css": null,
+  "api": "plugin_api.py"
+}
