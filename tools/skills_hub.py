@@ -258,6 +258,8 @@ class GitHubAuth:
             return None
 
         try:
+            if key_path is None:
+                return None
             key_file = Path(key_path)
             if not key_file.exists():
                 return None
@@ -403,10 +405,11 @@ class GitHubSource(SkillSource):
         repo = f"{parts[0]}/{parts[1]}"
         skill_path = parts[2]
 
-        files = self._download_directory(repo, skill_path)
-        if not files or "SKILL.md" not in files:
+        files_raw = self._download_directory(repo, skill_path)
+        if not files_raw or "SKILL.md" not in files_raw:
             return None
 
+        files: Dict[str, Union[str, bytes]] = dict(files_raw)
         skill_name = skill_path.rstrip("/").split("/")[-1]
         trust = self.trust_level_for(identifier)
 
@@ -836,12 +839,12 @@ class WellKnownSkillSource(SkillSource):
         if not entry:
             return None
 
-        files = entry.get("files", ["SKILL.md"])
-        if not isinstance(files, list) or not files:
-            files = ["SKILL.md"]
+        files_list = entry.get("files", ["SKILL.md"])
+        if not isinstance(files_list, list) or not files_list:
+            files_list = ["SKILL.md"]
 
-        downloaded: Dict[str, str] = {}
-        for rel_path in files:
+        downloaded: Dict[str, Union[str, bytes]] = {}
+        for rel_path in files_list:
             if not isinstance(rel_path, str) or not rel_path:
                 continue
             try:
@@ -871,7 +874,7 @@ class WellKnownSkillSource(SkillSource):
                 "index_url": parsed["index_url"],
                 "base_url": parsed["base_url"],
                 "endpoint": parsed["skill_url"],
-                "files": files,
+                "files": files_list,
             },
         )
 
@@ -1856,11 +1859,15 @@ class ClawHubSource(SkillSource):
             version_data = self._get_json(f"{self.BASE_URL}/skills/{slug}/versions/{latest_version}")
             if isinstance(version_data, dict):
                 # Files may be nested under version_data["version"]["files"]
-                files = self._extract_files(version_data) or files
+                files_extracted = self._extract_files(version_data)
+                if files_extracted:
+                    files.update(files_extracted)
                 if "SKILL.md" not in files:
                     nested = version_data.get("version", {})
                     if isinstance(nested, dict):
-                        files = self._extract_files(nested) or files
+                        files_extracted_nested = self._extract_files(nested)
+                        if files_extracted_nested:
+                            files.update(files_extracted_nested)
 
         if "SKILL.md" not in files:
             logger.warning(
@@ -1870,9 +1877,10 @@ class ClawHubSource(SkillSource):
             )
             return None
 
+        files_bundle: Dict[str, Union[str, bytes]] = dict(files)
         return SkillBundle(
             name=slug,
-            files=files,
+            files=files_bundle,
             source="clawhub",
             identifier=slug,
             trust_level="community",

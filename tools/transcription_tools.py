@@ -385,7 +385,7 @@ def _load_local_whisper_model(model_name: str):
     We try ``auto`` first (fast CUDA path when it works), and on any CUDA
     library load failure fall back to CPU + int8.
     """
-    from faster_whisper import WhisperModel  # type: ignore
+    from faster_whisper import WhisperModel
     try:
         return WhisperModel(model_name, device="auto", compute_type="auto")
     except Exception as exc:
@@ -442,7 +442,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             )
             _local_model = None
             _local_model_name = None
-            from faster_whisper import WhisperModel  # type: ignore
+            from faster_whisper import WhisperModel
             _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
             _local_model_name = model_name
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
