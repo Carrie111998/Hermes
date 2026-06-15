@@ -13,13 +13,17 @@ dashboard's dev-only vite proxy + browser-held Bearer key:
 
 Connection doctrine (FRIDAY-OS, 2026-06-12): internal services reach the kernel
 over MCP, not the external gateway GraphQL. Hermes is internal, so we call the
-kernel's /mcp directly — same path the fridai-memory provider uses.
+kernel's /mcp directly.
 
-Reuse, don't duplicate: the kernel MCP client (call_kernel) already ships with
-the deployed fridai-memory plugin. We import that one implementation rather than
-vendoring a second copy. TODO(promote): once the frontend lands and there are
-two committed consumers, lift call_kernel.py into a shared Hermes FRIDAI module
-both plugins import, and drop this cross-plugin importlib shim.
+Kernel client: this plugin carries its own stdlib-only MCP Streamable HTTP
+client (call_kernel.py, sibling file) — the same self-contained pattern every
+Hermes plugin uses. We deliberately do NOT import it from the fridai-memory
+plugin: that copy diverges per profile (some deployments still ship the stale
+pre-#278 /call client, which 404s against the current kernel), so depending on
+it is fragile. Self-containing the client guarantees the tab works regardless of
+which fridai-memory version a given profile happens to have.
+TODO(promote): if a third consumer appears, lift call_kernel.py into one shared
+Hermes FRIDAI module and have all plugins import it.
 """
 
 from __future__ import annotations
@@ -40,31 +44,23 @@ _call_kernel: Optional[Callable[..., Any]] = None
 
 
 def _load_call_kernel() -> Callable[..., Any]:
-    """Import the deployed fridai-memory kernel client (stdlib-only MCP
-    Streamable HTTP). Cached after first load. Raises RuntimeError if the
-    fridai-memory plugin is not present (it carries the only implementation)."""
+    """Load this plugin's own MCP kernel client (sibling call_kernel.py).
+    Cached after first load. Loaded by path because the dashboard imports
+    plugin_api.py via spec_from_file_location, so the plugin dir isn't on
+    sys.path for a plain `import call_kernel`."""
     global _call_kernel
     if _call_kernel is not None:
         return _call_kernel
-    home = os.getenv("HERMES_HOME", "/opt/data")
-    candidates = [
-        Path(home) / "plugins" / "fridai-memory" / "call_kernel.py",
-        # co-deployed alongside this plugin (bundled set / repo layout)
-        Path(__file__).resolve().parents[2] / "fridai-memory" / "call_kernel.py",
-    ]
-    for path in candidates:
-        if path.is_file():
-            spec = importlib.util.spec_from_file_location("fridai_call_kernel", path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                _call_kernel = mod.call_kernel
-                log.info("agent-workspace: loaded call_kernel from %s", path)
-                return _call_kernel
-    raise RuntimeError(
-        "agent-workspace: fridai-memory/call_kernel.py not found "
-        "(the kernel MCP client lives with the fridai-memory plugin)"
-    )
+    path = Path(__file__).resolve().parent / "call_kernel.py"
+    if not path.is_file():
+        raise RuntimeError(f"agent-workspace: kernel client missing at {path}")
+    spec = importlib.util.spec_from_file_location("agent_workspace_call_kernel", path)
+    if not (spec and spec.loader):
+        raise RuntimeError("agent-workspace: cannot load call_kernel.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _call_kernel = mod.call_kernel
+    return _call_kernel
 
 
 @router.get("/health")
