@@ -823,14 +823,26 @@ class WhatsAppAdapter(BasePlatformAdapter):
         return self._message_is_direct_trigger(raw)
 
     async def _queue_or_handle_event(self, event: MessageEvent) -> None:
-        """Debounce WhatsApp events into one turn per chat window."""
-        debounce_s = self._debounce_seconds_for_event(event)
-        if debounce_s <= 0:
-            await self.handle_message(event)
-            return
+        """Debounce WhatsApp events into one turn per chat window.
 
+        Window resolution priority:
+        1. turn_policy (per-chat, from _debounce_seconds_for_event / recon path)
+        2. brief-based addressed/passive windows (_debounce_window_ms / main PA Phase 1 path)
+        3. Global turn_debounce_ms default
+
+        When neither turn_policy nor brief sets a window, falls through to _debounce_disabled.
+        """
         source = event.source
         chat_id = source.chat_id if source else ""
+
+        # Check debounce via recon's per-event path (turn_policy).
+        debounce_s = self._debounce_seconds_for_event(event)
+        if debounce_s <= 0:
+            # No turn_policy debounce; also check the legacy switch.
+            if self._debounce_disabled():
+                await self.handle_message(event)
+                return
+
         if not chat_id:
             await self.handle_message(event)
             return
@@ -844,14 +856,33 @@ class WhatsAppAdapter(BasePlatformAdapter):
             tasks = self._turn_tasks
 
         buffers.setdefault(chat_id, []).append(event)
+        # Addressed over the WHOLE buffered burst: a single mention/reply pulls
+        # the chat out of passive patience. Used by the brief-based window resolution.
+        burst_addressed = any(
+            getattr(buffered, "addressed", False) for buffered in buffers[chat_id]
+        )
+        # Main PA Phase 1: brief-based addressed/passive window (_debounce_window_ms).
+        # This reads brief settings (debounce_addressed_ms / debounce_passive_ms) and
+        # overrides the turn_policy debounce when the brief provides a window.
+        window_ms = self._debounce_window_ms(chat_id, burst_addressed)
+        window_s = max(0.0, window_ms / 1000.0)
+        # Use the addressed/passive window when it's meaningful; otherwise fall back
+        # to the per-event turn_policy debounce.
+        effective_s = window_s if window_s > 0 else debounce_s
+
         existing = tasks.get(chat_id)
         if existing and not existing.done():
+            # Cancel + reschedule. When a new addressed event collapses a
+            # passive burst, this reschedules on the (shorter) addressed window.
             existing.cancel()
         if self._should_flush_turn_immediately(event):
             tasks.pop(chat_id, None)
             await self._flush_turn(chat_id)
             return
-        tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, debounce_s))
+        if effective_s <= 0:
+            await self._flush_turn(chat_id)
+            return
+        tasks[chat_id] = asyncio.create_task(self._flush_turn_after(chat_id, effective_s))
 
     # Replay-only hard cap on messages per simulated turn bundle. Without it,
     # a busy chat whose consecutive messages each land inside the debounce
