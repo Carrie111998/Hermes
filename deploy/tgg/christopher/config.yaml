@@ -13,12 +13,12 @@ inter_session:
   agent_id: christopher
   sessions:
     management:
-      label: "Christopher x TGG Management"
+      label: "TGG Management (TEST target — Mgmt Live Test 20260528)"
       role: management
       source:
         platform: whatsapp
         chat_type: group
-        chat_id: "120363407903158826@g.us"
+        chat_id: "120363426509183563@g.us"  # TEST mgmt (Mgmt Live Test 20260528); flip to prod 120363407903158826@g.us later
         user_id: "system:inter-session"
         user_name: "Christopher"
       pa_job_type: tgg_management

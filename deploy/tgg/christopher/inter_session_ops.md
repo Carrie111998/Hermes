@@ -4,7 +4,7 @@ TGG is the first consumer of Hermes generic `inter_session`.
 
 ## Active v1 sessions
 
-- `management` → `120363407903158826@g.us` (`Christopher x TGG Management`), `tgg_management`, external output normal.
+- `management` → `120363426509183563@g.us` (`TGG Christopher Mgmt Live Test 20260528`), `tgg_management`, external output normal. **TEST target for v1; flip to prod `120363407903158826@g.us` (`Christopher x TGG Management`) after testing.**
 - `amk_ops` → `120363421424519051@g.us`, `tgg_ops_ingest`, external output never.
 - `pg_ops` → `120363423568509280@g.us`, `tgg_ops_ingest`, external output never.
 - `hg_ops` → `120363422582425366@g.us`, `tgg_ops_ingest`, external output never.
