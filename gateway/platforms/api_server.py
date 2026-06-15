@@ -1944,8 +1944,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 }))
                 # request_input is non-blocking and turn-ending: stop the agent loop
                 # now so the SSE stream closes and the user's answer becomes the next
-                # turn. interrupt() makes the loop return cleanly (the streaming
-                # writer still finalizes finish_reason="stop"), unlike a raised error.
+                # turn. interrupt() makes the loop return cleanly (the streaming writer
+                # still finalizes finish_reason="stop"), unlike a raised error. (The
+                # connector write-tool approval does NOT end the turn — it blocks the
+                # worker thread inside the guard and resumes the same call inline.)
                 if function_name == "request_input" and agent_ref[0] is not None:
                     try:
                         agent_ref[0].interrupt("awaiting user interaction (request_input)")
@@ -1973,6 +1975,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         progress[key] = kwargs[key]
                 _stream_q.put(("__tool_progress__", progress))
 
+            # Connector write-tool approval: the guard blocks the agent worker
+            # thread and pushes the approval card onto this stream via this
+            # notify; the user's resolve (POST /v1/omnio/tool-approval) unblocks
+            # it and the SAME tool call runs inline. The card rides the tool's
+            # "running" lifecycle (same toolCallId), so the client renders it in
+            # place. _stream_q is a thread-safe queue.Queue, so the guard thread
+            # can enqueue directly. Keyed by session_id (== the conversation's
+            # X-Hermes-Session-Id), which the resolve endpoint also uses.
+            def _approval_notify(event: "Dict[str, Any]") -> None:
+                try:
+                    _stream_q.put(("__tool_progress__", event))
+                except Exception:
+                    pass
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             #
@@ -1995,6 +2011,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 response_format=response_format,
+                approval_session_key=session_id,
+                approval_notify=_approval_notify,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3588,6 +3606,8 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
+        approval_session_key: Optional[str] = None,
+        approval_notify: Optional[Any] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3599,41 +3619,66 @@ class APIServerAdapter(BasePlatformAdapter):
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
         callers (e.g. the SSE writer) to call ``agent.interrupt()`` from
         another thread to stop in-progress LLM calls.
+
+        ``approval_session_key`` + ``approval_notify`` arm the connector
+        write-tool approval gate: the key is bound for the worker thread (so the
+        guard's ``get_current_session_key()`` matches) and the notify (which
+        pushes the approval card onto this run's stream) is registered for the
+        duration of the run. Omit them for non-interactive callers — a gated
+        write then fails closed instead of blocking.
         """
         loop = asyncio.get_running_loop()
 
         def _run():
-            agent = self._create_agent(
-                ephemeral_system_prompt=ephemeral_system_prompt,
-                session_id=session_id,
-                stream_delta_callback=stream_delta_callback,
-                reasoning_callback=reasoning_callback,
-                tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback,
-                tool_complete_callback=tool_complete_callback,
-                gateway_session_key=gateway_session_key,
-                response_format=response_format,
+            from tools.approval import reset_current_session_key, set_current_session_key
+            from tools.tool_approval import (
+                register_tool_approval_notify,
+                unregister_tool_approval_notify,
             )
-            if agent_ref is not None:
-                agent_ref[0] = agent
-            effective_task_id = session_id or str(uuid.uuid4())
-            result = agent.run_conversation(
-                user_message=user_message,
-                conversation_history=conversation_history,
-                task_id=effective_task_id,
-            )
-            usage = {
-                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-            }
-            # Include the effective session ID in the result so callers
-            # (e.g. X-Hermes-Session-Id header) can track compression-
-            # triggered session rotations. (#16938)
-            _eff_sid = getattr(agent, "session_id", session_id)
-            if isinstance(_eff_sid, str) and _eff_sid:
-                result["session_id"] = _eff_sid
-            return result, usage
+
+            approval_token = None
+            if approval_session_key:
+                approval_token = set_current_session_key(approval_session_key)
+                if approval_notify is not None:
+                    register_tool_approval_notify(approval_session_key, approval_notify)
+            try:
+                agent = self._create_agent(
+                    ephemeral_system_prompt=ephemeral_system_prompt,
+                    session_id=session_id,
+                    stream_delta_callback=stream_delta_callback,
+                    reasoning_callback=reasoning_callback,
+                    tool_progress_callback=tool_progress_callback,
+                    tool_start_callback=tool_start_callback,
+                    tool_complete_callback=tool_complete_callback,
+                    gateway_session_key=gateway_session_key,
+                    response_format=response_format,
+                )
+                if agent_ref is not None:
+                    agent_ref[0] = agent
+                effective_task_id = session_id or str(uuid.uuid4())
+                result = agent.run_conversation(
+                    user_message=user_message,
+                    conversation_history=conversation_history,
+                    task_id=effective_task_id,
+                )
+                usage = {
+                    "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                    "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                    "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                }
+                # Include the effective session ID in the result so callers
+                # (e.g. X-Hermes-Session-Id header) can track compression-
+                # triggered session rotations. (#16938)
+                _eff_sid = getattr(agent, "session_id", session_id)
+                if isinstance(_eff_sid, str) and _eff_sid:
+                    result["session_id"] = _eff_sid
+                return result, usage
+            finally:
+                if approval_session_key:
+                    if approval_notify is not None:
+                        unregister_tool_approval_notify(approval_session_key)
+                    if approval_token is not None:
+                        reset_current_session_key(approval_token)
 
         return await loop.run_in_executor(None, _run)
 
@@ -4155,6 +4200,112 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_omnio_tool_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/omnio/tool-approval — record a user's decision on a gated
+        connector WRITE tool.
+
+        The guard is BLOCKING: the agent worker is parked on this exact call
+        waiting for the decision. The request is keyed by the conversation's
+        session id (the ``X-Hermes-Session-Id`` header the proxy derives from the
+        source id — the value the guard scoped its prompt to) AND the tool's call
+        id, so resolution unblocks THIS specific call (approve → it proceeds
+        inline; deny → a denial) rather than whichever waiter is at the queue
+        head — which is what keeps two writes pending in one turn from
+        cross-talking. A `session`-scope decision is also remembered so later
+        calls of the same tool skip the prompt.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        tool = str(body.get("tool", "")).strip()
+        scope = str(body.get("scope", "")).strip().lower()
+        tool_call_id = str(body.get("toolCallId", "") or body.get("tool_call_id", "")).strip()
+        if not tool:
+            return web.json_response(
+                _openai_error("Missing 'tool'", code="approval_missing_tool"), status=400
+            )
+
+        session_key = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if not session_key:
+            return web.json_response(
+                _openai_error("Missing X-Hermes-Session-Id", code="approval_no_session"),
+                status=400,
+            )
+
+        try:
+            from tools.tool_approval import APPROVAL_SCOPES, resolve_tool_approval
+
+            if scope not in APPROVAL_SCOPES:
+                return web.json_response(
+                    _openai_error(
+                        f"Invalid scope; expected one of: {', '.join(sorted(APPROVAL_SCOPES))}",
+                        code="invalid_approval_scope",
+                    ),
+                    status=400,
+                )
+            recorded = resolve_tool_approval(session_key, tool, scope, tool_call_id)
+        except Exception as exc:
+            logger.exception("[api_server] tool approval resolution failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        return web.json_response({
+            "object": "omnio.tool_approval_response",
+            "tool": tool,
+            "scope": scope,
+            "recorded": recorded,
+        })
+
+    async def _handle_mcp_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/mcp/reload — reconnect MCP servers so a tool connected (or
+        disconnected) mid-conversation is picked up without restarting the gateway.
+
+        Re-reads config.yaml and re-fetches each server's tools/list — the same
+        shutdown+discover the ``/reload-mcp`` slash command runs. The chat path
+        builds a fresh agent per turn from the live registry (``_create_agent``),
+        so the next turn in any conversation on this gateway sees the updated tool
+        set — no ``/new``, no restart, no history loss. Used by Omnia after a
+        brand connects/disconnects a connector.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        loop = asyncio.get_running_loop()
+        try:
+            from tools.mcp_tool import _lock, _servers, discover_mcp_tools, shutdown_mcp_servers
+
+            with _lock:
+                old_servers = set(_servers.keys())
+            await loop.run_in_executor(None, shutdown_mcp_servers)
+            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            with _lock:
+                connected = set(_servers.keys())
+        except Exception as exc:
+            logger.exception("[api_server] MCP reload failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        # No server-side "tools changed" nudge here on purpose. The only caller is
+        # Omnia's OpenAI /v1/chat/completions path, which is client-authoritative
+        # for history (it builds the agent's messages from the request body, not
+        # this gateway's session DB — see _handle_chat_completions). A nudge
+        # appended to the session DB would never reach that agent, so the awareness
+        # is injected by the client into its own transcript instead (mirroring how
+        # the TUI's /reload-mcp injects into its in-memory conversation_history). A
+        # future STATEFUL caller of this endpoint would need to add its own nudge.
+        return web.json_response({
+            "object": "hermes.mcp.reload",
+            "servers": sorted(connected),
+            "added": sorted(connected - old_servers),
+            "removed": sorted(old_servers - connected),
+            "tools": len(new_tools),
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4280,6 +4431,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Omnia non-blocking connector-write approval (see _handle_omnio_tool_approval).
+            self._app.router.add_post("/v1/omnio/tool-approval", self._handle_omnio_tool_approval)
+            # Mid-session MCP reconnect (see _handle_mcp_reload) — Omnia triggers it
+            # after a brand connects/disconnects a connector.
+            self._app.router.add_post("/v1/mcp/reload", self._handle_mcp_reload)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

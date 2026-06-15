@@ -476,8 +476,10 @@ class TestMCPInitialConnectionRetry:
 
         asyncio.get_event_loop().run_until_complete(_run())
 
-    def test_initial_connect_gives_up_after_max_retries(self):
-        """Server gives up after _MAX_INITIAL_CONNECT_RETRIES failures."""
+    def test_initial_connect_unblocks_startup_but_keeps_retrying(self):
+        """After the fast retries, the server stops blocking startup (error set,
+        _ready fired) but does NOT give up — it keeps retrying in the background
+        so a startup transient can self-heal."""
         from tools.mcp_tool import MCPServerTask, _MAX_INITIAL_CONNECT_RETRIES
 
         call_count = 0
@@ -495,13 +497,123 @@ class TestMCPInitialConnectionRetry:
                 task = asyncio.ensure_future(server.run({"command": "fake"}))
                 await server._ready.wait()
 
-                # Should have an error after exhausting retries
+                # Startup is unblocked with the error surfaced, after exactly the
+                # fast-retry budget (1 initial + N retries).
                 assert server._error is not None
                 assert "DNS resolution failed" in str(server._error)
-                # 1 initial + N retries = _MAX_INITIAL_CONNECT_RETRIES + 1 total attempts
                 assert call_count == _MAX_INITIAL_CONNECT_RETRIES + 1
+                # Degraded-but-serving: the flag that makes start() RETURN (so
+                # the caller tracks this task in _servers) instead of raising.
+                assert server._serving_degraded is True
+                # Crucially: the task is still alive, retrying in the background —
+                # it did not give up for good.
+                assert not task.done()
 
-                await task
+                # Shutdown interrupts the background backoff promptly.
+                server._shutdown_event.set()
+                await asyncio.wait_for(task, timeout=5)
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_discover_tools_registers_live_on_background_recovery(self):
+        """A connect that lands AFTER startup proceeded without the server
+        (background-retry recovery) registers its tools live via a scheduled
+        refresh — the same path /v1/mcp/reload uses."""
+        from tools.mcp_tool import MCPServerTask
+
+        class _FakeTool:
+            name = "do_thing"
+
+        class _FakeResult:
+            tools = [_FakeTool()]
+
+        class _FakeSession:
+            async def list_tools(self):
+                return _FakeResult()
+
+        async def _run():
+            server = MCPServerTask("test-recover")
+            server._ready.set()            # startup already proceeded without us
+            server._registered_tool_names = []   # nothing registered yet
+            server.session = _FakeSession()
+            with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_refresh:
+                await server._discover_tools()
+                assert server._connected_once is True
+                assert server._error is None
+                assert mock_refresh.called, "recovery connect should register tools live"
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_discover_tools_no_recovery_refresh_on_first_connect(self):
+        """The first/normal connect (before _ready) registers via the startup
+        path, so it must NOT schedule a recovery refresh."""
+        from tools.mcp_tool import MCPServerTask
+
+        class _FakeTool:
+            name = "do_thing"
+
+        class _FakeResult:
+            tools = [_FakeTool()]
+
+        class _FakeSession:
+            async def list_tools(self):
+                return _FakeResult()
+
+        async def _run():
+            server = MCPServerTask("test-first")
+            server._registered_tool_names = []   # _ready NOT set: first connect
+            server.session = _FakeSession()
+            with patch.object(MCPServerTask, "_schedule_tools_refresh") as mock_refresh:
+                await server._discover_tools()
+                assert server._connected_once is True
+                assert not mock_refresh.called
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_start_returns_for_a_degraded_server_so_it_stays_trackable(self):
+        """A never-connected server that exhausted its fast retries is degraded:
+        start() must RETURN (not raise) so the caller records the still-running
+        task in _servers, reachable by shutdown / reload."""
+        from tools.mcp_tool import MCPServerTask
+
+        # run() is patched on the CLASS — MCPServerTask uses __slots__, so the
+        # instance attribute is read-only.
+        async def fake_run(self, config):
+            # Emulate run() exhausting fast retries: degraded, error surfaced,
+            # ready fired, task still looping until shutdown.
+            self._serving_degraded = True
+            self._error = ConnectionError("still down")
+            self._ready.set()
+            await self._shutdown_event.wait()
+
+        async def _run():
+            with patch.object(MCPServerTask, "run", fake_run):
+                server = MCPServerTask("test-degraded-start")
+                # Must NOT raise even though _error is set.
+                await asyncio.wait_for(server.start({"command": "fake"}), timeout=5)
+                assert server._serving_degraded is True
+                assert server._error is not None
+                assert server._task is not None and not server._task.done()
+
+                server._shutdown_event.set()
+                await asyncio.wait_for(server._task, timeout=5)
+
+        asyncio.get_event_loop().run_until_complete(_run())
+
+    def test_start_raises_for_a_permanent_failure(self):
+        """A permanent failure (e.g. initial OAuth auth error) is NOT degraded:
+        run() has exited, so start() must raise and the caller must not track it."""
+        from tools.mcp_tool import MCPServerTask
+
+        async def fake_run(self, config):
+            self._error = PermissionError("initial OAuth failed")
+            self._ready.set()
+
+        async def _run():
+            with patch.object(MCPServerTask, "run", fake_run):
+                server = MCPServerTask("test-permanent-start")
+                with pytest.raises(PermissionError):
+                    await asyncio.wait_for(server.start({"command": "fake"}), timeout=5)
 
         asyncio.get_event_loop().run_until_complete(_run())
 

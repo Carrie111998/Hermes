@@ -260,8 +260,12 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 _DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
-_MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
+_MAX_INITIAL_CONNECT_RETRIES = 3 # fast retries before serving without the server
 _MAX_BACKOFF_SECONDS = 60
+# After the fast initial retries are exhausted, a never-connected server keeps
+# retrying at this steady interval in the background (instead of giving up for
+# good), so a startup transient self-heals on a later connect.
+_BACKGROUND_RECONNECT_SECONDS = 30
 
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
@@ -1124,7 +1128,7 @@ class MCPServerTask:
         "_tools", "_error", "_config",
         "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
-        "initialize_result",
+        "initialize_result", "_connected_once", "_serving_degraded",
     )
 
     def __init__(self, name: str):
@@ -1161,6 +1165,19 @@ class MCPServerTask:
         # ``.capabilities.prompts``) instead of assuming every ``ClientSession``
         # method attribute corresponds to a supported server method. See #18051.
         self.initialize_result: Optional[Any] = None
+        # Flips True after the FIRST successful connect+discover. Gates the
+        # run() loop's resilience: while False, a failed connection retries
+        # (fast, then in the background) and never permanently gives up — a
+        # startup transient must not disable the server for the gateway's life.
+        self._connected_once: bool = False
+        # True once a never-connected server exhausts its fast retries and
+        # switches to background retry: it is "serving" the gateway (without its
+        # tools) but still trying to connect. Distinguishes that recoverable
+        # degraded state from a permanent failure (initial auth error), so
+        # start() returns normally — and the caller records the task in
+        # _servers — instead of raising and orphaning a live background task.
+        # Cleared once the server actually connects.
+        self._serving_degraded: bool = False
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1752,6 +1769,23 @@ class MCPServerTask:
             if hasattr(tools_result, "tools")
             else []
         )
+        # We have a live session with its tool list. If startup already proceeded
+        # without us (the fast retries were exhausted, _ready was set, and our
+        # tools were never registered), this is a BACKGROUND-retry recovery —
+        # register the tools live now, the same path /v1/mcp/reload and
+        # tools/list_changed use. This is what lets a server that hit a transient
+        # at startup self-heal on a later connect. On the first/normal connect
+        # _ready is not set yet here, so this is a no-op.
+        recovered = self._ready.is_set() and not self._registered_tool_names and self._tools
+        self._connected_once = True
+        self._error = None
+        self._serving_degraded = False
+        if recovered:
+            logger.info(
+                "MCP server '%s' connected on a background retry; registering "
+                "%d tool(s) live", self.name, len(self._tools),
+            )
+            self._schedule_tools_refresh()
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -1859,11 +1893,22 @@ class MCPServerTask:
             except Exception as exc:
                 self.session = None
 
-                # If this is the first connection attempt, retry with backoff
-                # before giving up. A transient DNS/network blip at startup
-                # should not permanently kill the server.
-                # (Ported from Kilo Code's MCP resilience fix.)
-                if not self._ready.is_set():
+                # Never successfully connected yet. A transient at startup (a
+                # cold/slow endpoint, a DNS blip, a server still warming up) must
+                # NOT permanently kill the server. Retry FAST a few times for a
+                # quick recovery; once those are exhausted, stop blocking gateway
+                # startup (serve without this server) but keep retrying in the
+                # BACKGROUND at a steady interval until it connects. The eventual
+                # connect registers the tools live (see _discover_tools), so the
+                # server self-heals without a reload/restart.
+                # (Extends Kilo Code's MCP resilience fix.)
+                if not self._connected_once:
+                    # Non-retryable initial failures fail PERMANENTLY (run() exits,
+                    # start() raises) instead of degrade-and-retry-forever, because
+                    # retrying cannot fix them:
+                    #  - an OAuth auth error (credentials rejected), and
+                    #  - a structural config error (no command/url, blocked
+                    #    package), surfaced as a ValueError from the transports.
                     if _is_auth_error(exc):
                         logger.warning(
                             "MCP server '%s' failed initial OAuth authentication, "
@@ -1873,31 +1918,62 @@ class MCPServerTask:
                         self._error = exc
                         self._ready.set()
                         return
-
-                    initial_retries += 1
-                    if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:
+                    if isinstance(exc, ValueError):
                         logger.warning(
-                            "MCP server '%s' failed initial connection after "
-                            "%d attempts, giving up: %s",
-                            self.name, _MAX_INITIAL_CONNECT_RETRIES, exc,
+                            "MCP server '%s' has an invalid config, not retrying: %s",
+                            self.name, exc,
                         )
                         self._error = exc
                         self._ready.set()
                         return
 
-                    logger.warning(
-                        "MCP server '%s' initial connection failed "
-                        "(attempt %d/%d), retrying in %.0fs: %s",
-                        self.name, initial_retries,
-                        _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                    initial_retries += 1
+                    if initial_retries <= _MAX_INITIAL_CONNECT_RETRIES:
+                        logger.warning(
+                            "MCP server '%s' initial connection failed "
+                            "(attempt %d/%d), retrying in %.0fs: %s",
+                            self.name, initial_retries,
+                            _MAX_INITIAL_CONNECT_RETRIES, backoff, exc,
+                        )
+                        delay = backoff
+                        backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
+                    else:
+                        # Fast retries exhausted. Unblock startup ONCE (serve
+                        # without this server), then retry quietly in the
+                        # background — don't give up for good.
+                        if not self._ready.is_set():
+                            logger.warning(
+                                "MCP server '%s' not up after %d attempts; serving "
+                                "without it and retrying every %.0fs in the "
+                                "background until it connects: %s",
+                                self.name, _MAX_INITIAL_CONNECT_RETRIES,
+                                _BACKGROUND_RECONNECT_SECONDS, exc,
+                            )
+                            # Degraded-but-serving: start() must RETURN (so the
+                            # caller records this still-running task in _servers,
+                            # reachable by shutdown / reload) rather than raise.
+                            self._serving_degraded = True
+                            self._error = exc
+                            self._ready.set()
+                        else:
+                            logger.debug(
+                                "MCP server '%s' still unreachable, retrying in "
+                                "%.0fs: %s",
+                                self.name, _BACKGROUND_RECONNECT_SECONDS, exc,
+                            )
+                        delay = _BACKGROUND_RECONNECT_SECONDS
 
-                    # Check if shutdown was requested during the sleep
+                    # Interruptible backoff: a shutdown wakes us immediately
+                    # rather than after `delay` (critical for the 30s background
+                    # interval — shutdown must not block on it).
+                    try:
+                        await asyncio.wait_for(self._shutdown_event.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
                     if self._shutdown_event.is_set():
-                        self._error = exc
-                        self._ready.set()
+                        if not self._ready.is_set():
+                            self._error = exc
+                            self._ready.set()
                         return
                     continue
 
@@ -1934,10 +2010,19 @@ class MCPServerTask:
                 self.session = None
 
     async def start(self, config: dict):
-        """Create the background Task and wait until ready (or failed)."""
+        """Create the background Task and wait until ready (or failed).
+
+        Raises ``_error`` only for a PERMANENT failure (e.g. an initial OAuth
+        auth error), where run() has already exited. A never-connected server
+        that merely exhausted its fast retries is ``_serving_degraded``: its
+        task keeps retrying in the background, so start() returns normally and
+        the caller records it in ``_servers`` — otherwise that live task would be
+        untracked (leaking, and invisible to shutdown / reload). It self-heals
+        via _discover_tools on a later connect.
+        """
         self._task = asyncio.ensure_future(self.run(config))
         await self._ready.wait()
-        if self._error:
+        if self._error and not self._serving_degraded:
             raise self._error
 
     async def shutdown(self):
@@ -2362,6 +2447,12 @@ _parallel_safe_servers: set = set()
 # captured at registration time so parallel safety never relies on prefix
 # guessing.
 _mcp_tool_server_names: Dict[str, str] = {}
+
+# Per-tool MCP ``readOnlyHint`` annotation captured at registration (None when
+# the server didn't advertise one). The connector write-tool approval gate reads
+# this via ``mcp_tool_is_read_only`` so its gated set tracks the LIVE advertised
+# tools rather than a provision-time snapshot. Protected by _lock.
+_mcp_tool_read_only_hints: Dict[str, Optional[bool]] = {}
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -3271,10 +3362,28 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
         _mcp_tool_server_names[tool_name] = safe_server_name
 
 
+def _track_mcp_tool_read_only(tool_name: str, read_only_hint: Optional[bool]) -> None:
+    """Record a tool's MCP ``readOnlyHint`` annotation (None if unadvertised)."""
+    with _lock:
+        _mcp_tool_read_only_hints[tool_name] = read_only_hint
+
+
 def _forget_mcp_tool_server(tool_name: str) -> None:
-    """Forget MCP server provenance for a deregistered tool."""
+    """Forget MCP provenance (server + read-only hint) for a deregistered tool."""
     with _lock:
         _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_read_only_hints.pop(tool_name, None)
+
+
+def mcp_tool_is_read_only(tool_name: str) -> bool:
+    """True only when *tool_name*'s MCP annotation explicitly marks it read-only
+    (``readOnlyHint=True``).
+
+    A missing or False hint returns False, so a caller gating "unless read-only"
+    fails CLOSED on an un-advertised tool rather than treating it as a safe read.
+    """
+    with _lock:
+        return _mcp_tool_read_only_hints.get(tool_name) is True
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -3412,6 +3521,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             description=schema["description"],
         )
         _track_mcp_tool_server(tool_name_prefixed, name)
+        _track_mcp_tool_read_only(
+            tool_name_prefixed,
+            getattr(getattr(mcp_tool, "annotations", None), "readOnlyHint", None),
+        )
         registered_names.append(tool_name_prefixed)
 
     # Register MCP Resources & Prompts utility tools, filtered by config and
