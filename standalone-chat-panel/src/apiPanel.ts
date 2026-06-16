@@ -112,6 +112,11 @@ function formatHttpError(status: number, path: string, body: unknown): string {
 function isAuthFailure(err: unknown): boolean {
   return err instanceof PanelHttpError && (err.status === 401 || err.status === 403);
 }
+function isSessionStreamFailure(err: unknown): boolean {
+  return err instanceof PanelHttpError
+    && (err.status === 403 || err.status === 404)
+    && err.path.includes("/chat/stream");
+}
 
 function showLogin(message = ""): void {
   document.body.append(loginOverlay(message));
@@ -222,6 +227,9 @@ async function refreshSessions(): Promise<void> {
   renderHistory();
 }
 async function newSession(): Promise<void> {
+  await createSession(true);
+}
+async function createSession(clearMessages: boolean): Promise<void> {
   const payload = await api<{ session: SessionRow }>("/api/sessions", {
     method: "POST",
     body: JSON.stringify({
@@ -230,7 +238,7 @@ async function newSession(): Promise<void> {
     }),
   });
   sid = payload.session.id;
-  messages = [];
+  if (clearMessages) messages = [];
   await refreshSessions();
   renderShell();
 }
@@ -271,7 +279,19 @@ async function submit(): Promise<void> {
     await streamChat(assistantId, buildChatMessage(text, outbound));
     await refreshSessions();
   } catch (err) {
-    showError(err);
+    if (isSessionStreamFailure(err)) {
+      const msg = messages.find((entry) => entry.id === assistantId);
+      if (msg) msg.text = "当前会话不可用，已切换到新会话重试。";
+      try {
+        await createSession(false);
+        await streamChat(assistantId, buildChatMessage(text, outbound));
+        await refreshSessions();
+      } catch (retryErr) {
+        showError(retryErr);
+      }
+    } else {
+      showError(err);
+    }
   } finally {
     running = false;
     runState = "idle";
