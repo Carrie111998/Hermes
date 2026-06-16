@@ -165,7 +165,9 @@ async function boot(): Promise<void> {
   renderShell();
   try {
     await refreshSessions();
-    await newSession();
+    if (sessions[0]) {
+      await openSession(sessions[0].id);
+    }
   } catch (err) {
     if (isAuthFailure(err)) {
       me = null;
