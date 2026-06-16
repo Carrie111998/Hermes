@@ -62,6 +62,20 @@ let streamMessageSeq = 0
 
 const nextStreamMessageId = (prefix: string) => `${prefix}-${Date.now()}-${++streamMessageSeq}`
 
+export function applyReasoningAvailable(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+  if (parts.some(part => part.type === 'reasoning')) {
+    return parts
+  }
+
+  const textIndex = parts.findIndex(part => part.type === 'text')
+
+  if (textIndex < 0) {
+    return [...parts, reasoningPart(text)]
+  }
+
+  return [...parts.slice(0, textIndex), reasoningPart(text), ...parts.slice(textIndex)]
+}
+
 export function useMessageStream({
   activeGatewayProfile = 'default',
   activeSessionIdRef,
@@ -321,17 +335,7 @@ export function useMessageStream({
 
       mutateStream(
         sessionId,
-        (parts, message) => {
-          if (replace && chatMessageText(message).trim()) {
-            return parts
-          }
-
-          if (replace) {
-            return [...parts.filter(part => part.type !== 'reasoning'), reasoningPart(delta)]
-          }
-
-          return appendReasoningPart(parts, delta)
-        },
+        parts => (replace ? applyReasoningAvailable(parts, delta) : appendReasoningPart(parts, delta)),
         () => [reasoningPart(delta)]
       )
     },
