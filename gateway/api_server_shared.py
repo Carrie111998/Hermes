@@ -545,7 +545,12 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Hermes-Tenant-Id, X-Hermes-Workspace-Id, X-Hermes-Project-Id, "
+        "X-Hermes-User-Id, X-Hermes-Roles, X-Hermes-Sandbox-Id, "
+        "X-Hermes-Session-Id, X-Hermes-Session-Key"
+    ),
 }
 
 

@@ -9,7 +9,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.api_server_shared import ResponseStore
 from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 from hermes_state import SessionDB
 
 
@@ -44,6 +44,13 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    return app
+
+
+def _cors_app(adapter: APIServerAdapter) -> web.Application:
+    app = web.Application(middlewares=[cors_middleware])
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     return app
 
 
@@ -255,3 +262,35 @@ async def test_idempotency_cache_is_scoped_to_principal(scoped_adapter):
     assert first.status == 200
     assert second.status == 200
     assert mock_run.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_cors_allows_principal_scope_headers(session_db):
+    adapter = APIServerAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"key": "sk-test", "cors_origins": ["http://127.0.0.1:9132"]},
+        )
+    )
+    adapter._session_db = session_db
+    app = _cors_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.options(
+            "/v1/chat/completions",
+            headers={
+                "Origin": "http://127.0.0.1:9132",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": (
+                    "authorization,content-type,x-hermes-tenant-id,"
+                    "x-hermes-workspace-id,x-hermes-project-id,x-hermes-user-id"
+                ),
+            },
+        )
+
+    assert resp.status == 200
+    allow = resp.headers.get("Access-Control-Allow-Headers", "").lower()
+    assert "x-hermes-tenant-id" in allow
+    assert "x-hermes-workspace-id" in allow
+    assert "x-hermes-project-id" in allow
+    assert "x-hermes-user-id" in allow
