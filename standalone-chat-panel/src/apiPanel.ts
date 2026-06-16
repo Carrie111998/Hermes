@@ -11,6 +11,12 @@ interface Message { id: string; role: Role; text: string; streaming?: boolean }
 interface SessionRow { id: string; title?: string; preview?: string; message_count?: number; source?: string; started_at?: number }
 interface Attachment { id: string; name: string; dataUrl: string; previewUrl: string }
 
+class PanelHttpError extends Error {
+  constructor(public status: number, public path: string, public body: unknown) {
+    super(formatHttpError(status, path, body));
+  }
+}
+
 const AUTH_KEY = "ultra-studio-agent.auth.v2";
 const MODEL_OPTIONS = [
   { value: "grok-4.3", label: "grok-4.3 / xai-oauth" },
@@ -85,14 +91,26 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`/hermes-api${path}`, { ...init, headers });
   const text = await res.text();
   const body = text ? safeJson(text) : {};
-  if (!res.ok) {
-    const msg = typeof body === "object" && body && "error" in body ? JSON.stringify(body) : text;
-    throw new Error(msg || `HTTP ${res.status}`);
-  }
+  if (!res.ok) throw new PanelHttpError(res.status, path, body || text);
   return body as T;
 }
 function safeJson(text: string): unknown {
   try { return JSON.parse(text); } catch { return text; }
+}
+function formatHttpError(status: number, path: string, body: unknown): string {
+  let detail = "";
+  if (typeof body === "string") detail = body;
+  else if (body && typeof body === "object") {
+    const error = (body as Record<string, unknown>).error;
+    if (typeof error === "string") detail = error;
+    else if (error && typeof error === "object") {
+      detail = String((error as Record<string, unknown>).message || (error as Record<string, unknown>).code || "");
+    }
+  }
+  return detail ? `${path} -> HTTP ${status}: ${detail}` : `${path} -> HTTP ${status}`;
+}
+function isAuthFailure(err: unknown): boolean {
+  return err instanceof PanelHttpError && (err.status === 401 || err.status === 403);
 }
 
 function showLogin(message = ""): void {
@@ -149,6 +167,13 @@ async function boot(): Promise<void> {
     await refreshSessions();
     await newSession();
   } catch (err) {
+    if (isAuthFailure(err)) {
+      me = null;
+      saveAuth(null);
+      clearError();
+      showLogin(err instanceof Error ? err.message : "登录状态失效");
+      return;
+    }
     showError(err);
   }
 }
@@ -261,7 +286,14 @@ async function streamChat(assistantId: string, message: unknown): Promise<void> 
     body: JSON.stringify({ message, model: refs.modelSelect.value }),
     signal: aborter.signal,
   });
-  if (!res.ok || !res.body) throw new Error(await res.text());
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    throw new PanelHttpError(
+      res.status,
+      `/api/sessions/${sid}/chat/stream`,
+      text ? safeJson(text) : "stream unavailable",
+    );
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
