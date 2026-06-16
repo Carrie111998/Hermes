@@ -197,6 +197,13 @@ function labelForStatus(value: Status): string {
   return "Ready";
 }
 function showError(err: unknown): void {
+  if (isAuthFailure(err)) {
+    me = null;
+    saveAuth(null);
+    clearError();
+    showLogin(err instanceof Error ? err.message : "登录状态失效");
+    return;
+  }
   runState = "error";
   refs.error.hidden = false;
   refs.error.textContent = err instanceof Error ? err.message : String(err);

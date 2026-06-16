@@ -155,6 +155,17 @@ function panelAuthPlugin() {
 function applyPrincipalHeaders(proxyReq, req) {
   const userKey = String(req.headers["x-ultra-user"] || "").trim().toLowerCase();
   const user = PANEL_USERS[userKey]?.principal;
+  for (const header of [
+    "X-Hermes-Tenant-Id",
+    "X-Hermes-Workspace-Id",
+    "X-Hermes-Project-Id",
+    "X-Hermes-User-Id",
+    "X-Hermes-Roles",
+    "X-Hermes-Sandbox-Id",
+    "X-Hermes-Session-Key",
+  ]) {
+    proxyReq.removeHeader(header);
+  }
   proxyReq.setHeader("Authorization", `Bearer ${apiServerKey()}`);
   if (!user) return;
   proxyReq.setHeader("X-Hermes-Tenant-Id", user.tenant_id);
