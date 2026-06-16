@@ -13,18 +13,14 @@ import time
 import uuid
 from typing import Any
 
+from gateway.media_prompt_router import (
+    generate_atlas_image,
+    image_response_text,
+    is_direct_image_prompt,
+)
 from tui_gateway import server
 
 
-_IMAGE_NOUN_RE = re.compile(
-    r"(图片|图像|照片|海报|插画|头像|壁纸|封面|配图|image|picture|photo|poster|illustration|avatar|wallpaper)",
-    re.IGNORECASE,
-)
-_IMAGE_VERB_RE = re.compile(
-    r"(生成|做|画|创建|制作|出一张|来一张|generate|create|draw|make)",
-    re.IGNORECASE,
-)
-_VIDEO_NOUN_RE = re.compile(r"(视频|影片|短片|动画|video|movie|clip|reel)", re.IGNORECASE)
 _ATTACHMENT_MARKER_RE = re.compile(
     r"\[(?:Attached image path for tools|User attached image):", re.IGNORECASE
 )
@@ -42,7 +38,7 @@ def try_handle_prompt_submit(req: Any, transport: Any) -> dict | None:
 
     rid = req.get("id")
     text = str(params.get("text") or "").strip()
-    if not _is_direct_image_generation_request(text):
+    if not is_direct_image_prompt(text):
         return None
 
     session, err = server._sess_nowait(params, rid)
@@ -68,26 +64,6 @@ def try_handle_prompt_submit(req: Any, transport: Any) -> dict | None:
     return server._ok(rid, {"status": "streaming", "router": "atlas_image"})
 
 
-def _is_direct_image_generation_request(text: str) -> bool:
-    value = (text or "").strip()
-    if not value:
-        return False
-    if _VIDEO_NOUN_RE.search(value):
-        return False
-    return bool(_IMAGE_NOUN_RE.search(value) and _IMAGE_VERB_RE.search(value))
-
-
-def _infer_aspect_ratio(text: str) -> str:
-    value = (text or "").lower()
-    if any(token in value for token in ("9:16", "竖版", "竖图", "portrait")):
-        return "portrait"
-    if any(token in value for token in ("16:9", "横版", "横图", "landscape")):
-        return "landscape"
-    if any(token in value for token in ("1:1", "方图", "头像", "icon", "avatar", "square")):
-        return "square"
-    return "square"
-
-
 def _run_atlas_image_turn(sid: str, session: dict, prompt: str) -> None:
     tool_id = f"image_generate_{uuid.uuid4().hex[:8]}"
     status = "complete"
@@ -105,13 +81,12 @@ def _run_atlas_image_turn(sid: str, session: dict, prompt: str) -> None:
             {"tool_id": tool_id, "name": "image_generate", "context": prompt},
         )
 
-        result = _generate_atlas_image(prompt, _infer_aspect_ratio(prompt))
+        result = generate_atlas_image(prompt)
         if not isinstance(result, dict):
             raise RuntimeError("Atlas image provider returned a non-dict result")
 
         if result.get("success") and isinstance(result.get("image"), str):
-            image = str(result["image"])
-            assistant_text = _format_image_success(result, image)
+            assistant_text = image_response_text(result)
             server._emit(
                 "tool.complete",
                 sid,
@@ -149,19 +124,6 @@ def _run_atlas_image_turn(sid: str, session: dict, prompt: str) -> None:
             session["running"] = False
             session["last_active"] = time.time()
             server._clear_inflight_turn(session)
-
-
-def _generate_atlas_image(prompt: str, aspect_ratio: str) -> dict:
-    from plugins.image_gen.atlas import AtlasImageGenProvider
-
-    return AtlasImageGenProvider().generate(prompt=prompt, aspect_ratio=aspect_ratio)
-
-
-def _format_image_success(result: dict, image: str) -> str:
-    model = str(result.get("model") or result.get("atlas_model") or "atlas").strip()
-    if image.startswith(("http://", "https://")):
-        return f"已通过 Atlas 生成图片。\n\n![Atlas generated image]({image})\n\n模型：{model}"
-    return f"已通过 Atlas 生成图片。\n\n生成结果：{image}\n\n模型：{model}"
 
 
 def _append_turn_to_history(session: dict, user_text: str, assistant_text: str, sid: str) -> None:

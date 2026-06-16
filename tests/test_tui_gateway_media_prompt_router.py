@@ -40,8 +40,8 @@ def test_prompt_submit_routes_direct_image_request_to_atlas(monkeypatch):
     monkeypatch.setattr(server, "_session_db", lambda _session: contextlib.nullcontext(None))
     monkeypatch.setattr(
         router,
-        "_generate_atlas_image",
-        lambda prompt, aspect_ratio: {
+        "generate_atlas_image",
+        lambda prompt: {
             "success": True,
             "image": "https://atlas-media.example/cat.png",
             "model": "nano-banana-2",

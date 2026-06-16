@@ -40,6 +40,7 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
+    app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -146,6 +147,52 @@ async def test_session_chat_refuses_other_users_history(scoped_adapter, session_
         {"role": "user", "content": "private prompt"},
         {"role": "assistant", "content": "private answer"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_adapter):
+    app = _app(scoped_adapter)
+    fake_result = {
+        "success": True,
+        "image": "https://atlas-media.example/images/cat.png",
+        "model": "google/nano-banana-2/text-to-image",
+    }
+
+    with patch("gateway.api_server_sessions.generate_atlas_image", return_value=fake_result) as mock_generate:
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/api/sessions",
+                headers=_principal("user-a"),
+                json={"id": "image-owned-by-a", "title": "Image"},
+            )
+            assert create.status == 201
+
+            stream = await cli.post(
+                "/api/sessions/image-owned-by-a/chat/stream",
+                headers=_principal("user-a"),
+                json={"message": "帮我生成一个猫的图片"},
+            )
+            assert stream.status == 200, await stream.text()
+            body = await stream.text()
+
+            messages_a = await cli.get(
+                "/api/sessions/image-owned-by-a/messages",
+                headers=_principal("user-a"),
+            )
+            messages_b = await cli.get(
+                "/api/sessions/image-owned-by-a/messages",
+                headers=_principal("user-b"),
+            )
+            assert messages_a.status == 200
+            payload_a = await messages_a.json()
+            assert messages_b.status == 404
+
+    mock_generate.assert_called_once_with("帮我生成一个猫的图片")
+    assert "event: tool.started" in body
+    assert "event: assistant.completed" in body
+    assert "https://atlas-media.example/images/cat.png" in body
+    assert [item["role"] for item in payload_a["data"]] == ["user", "assistant"]
+    assert "https://atlas-media.example/images/cat.png" in payload_a["data"][1]["content"]
 
 
 @pytest.mark.asyncio
