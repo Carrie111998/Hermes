@@ -8,6 +8,8 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
 from __future__ import annotations
 
 import logging
+import json
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -196,6 +198,10 @@ def run_tool_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
+    policy_block = _authorize_tool_execution(tool_name, args, context)
+    if policy_block is not None:
+        return policy_block
+
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
         return next_call(args)
@@ -208,6 +214,42 @@ def run_tool_execution_middleware(
         original_args=context.pop("original_args", args),
         **context,
     )
+
+
+def _authorize_tool_execution(
+    tool_name: str,
+    args: Dict[str, Any],
+    context: Dict[str, Any],
+) -> Optional[str]:
+    """Fail-closed policy preflight for every tool execution."""
+
+    try:
+        from agent.ultra_security import authorize_tool_call, decision_to_tool_error
+
+        decision = authorize_tool_call(
+            tool_name,
+            args,
+            task_id=str(context.get("task_id") or ""),
+            session_id=str(context.get("session_id") or ""),
+            tool_call_id=str(context.get("tool_call_id") or ""),
+            turn_id=str(context.get("turn_id") or ""),
+            api_request_id=str(context.get("api_request_id") or ""),
+        )
+        if decision.allowed:
+            return None
+        return decision_to_tool_error(decision)
+    except Exception as exc:
+        decision_id = f"dec_policy_error_{int(time.time() * 1000)}"
+        return json.dumps(
+            {
+                "error": "Tool blocked by policy",
+                "error_type": "policy_error",
+                "decision_id": decision_id,
+                "reason": f"policy_checker_failed:{type(exc).__name__}",
+                "tool_name": tool_name,
+            },
+            ensure_ascii=False,
+        )
 
 
 def run_api_execution_middleware(

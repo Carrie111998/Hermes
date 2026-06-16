@@ -3,6 +3,12 @@ import os
 
 import pytest
 
+from agent.ultra_security import (
+    get_current_principal,
+    get_current_sandbox_lease,
+    set_current_principal,
+    set_current_sandbox_lease,
+)
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionContext, SessionSource
@@ -28,6 +34,8 @@ def _reset_contextvars():
     for var in _VAR_MAP.values():
         # Can't use var.reset() without a token; just set back to sentinel.
         var.set(_UNSET)
+    set_current_principal(None)
+    set_current_sandbox_lease(None)
 
 
 def test_set_session_env_sets_contextvars(monkeypatch):
@@ -201,6 +209,118 @@ def test_session_id_set_via_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_ID") == ""
 
 
+def test_set_session_vars_binds_principal_scope():
+    """set_session_vars should bind the server-resolved principal for the turn."""
+    tokens = set_session_vars(
+        chat_id="chat-1",
+        user_id="user-1",
+        session_id="session-1",
+        tenant_id="tenant-1",
+        workspace_id="workspace-1",
+        project_id="project-1",
+        roles=("admin", "member"),
+    )
+
+    principal = get_current_principal()
+    assert principal is not None
+    assert principal.tenant_id == "tenant-1"
+    assert principal.workspace_id == "workspace-1"
+    assert principal.project_id == "project-1"
+    assert principal.user_id == "user-1"
+    assert principal.session_id == "session-1"
+    assert principal.roles == ("admin", "member")
+    assert principal.source == "session_context"
+    lease = get_current_sandbox_lease()
+    assert lease is not None
+    assert lease.tenant_id == "tenant-1"
+    assert lease.workspace_id == "workspace-1"
+    assert lease.project_id == "project-1"
+    assert lease.owner_user_id == "user-1"
+    assert lease.session_id == "session-1"
+    assert lease.is_active()
+
+    clear_session_vars(tokens)
+    assert get_current_principal() is None
+    assert get_current_sandbox_lease() is None
+
+
+def test_set_session_vars_uses_local_principal_for_legacy_gateway_callers():
+    """Existing callers get a local owner principal until auth passes real scope."""
+    tokens = set_session_vars(user_id="user-1", session_key="legacy-session")
+
+    principal = get_current_principal()
+    assert principal is not None
+    assert principal.tenant_id == "local-tenant"
+    assert principal.workspace_id == "local-workspace"
+    assert principal.project_id == "legacy-session"
+    assert principal.user_id == "user-1"
+    assert principal.session_id == "legacy-session"
+    assert principal.roles == ("owner",)
+    assert principal.source == "session_context_fallback"
+
+    clear_session_vars(tokens)
+    assert get_current_principal() is None
+    assert get_current_sandbox_lease() is None
+
+
+def test_set_session_vars_empty_explicit_roles_are_viewer():
+    """An auth layer that sends no roles should not grant write/admin power."""
+    tokens = set_session_vars(
+        user_id="user-1",
+        session_id="session-1",
+        tenant_id="tenant-1",
+        workspace_id="workspace-1",
+        project_id="project-1",
+        roles=[],
+    )
+
+    principal = get_current_principal()
+    assert principal is not None
+    assert principal.roles == ("viewer",)
+
+    clear_session_vars(tokens)
+
+
+def test_set_session_vars_server_scope_without_roles_is_viewer():
+    """A scoped multi-tenant principal must not become owner by omission."""
+    tokens = set_session_vars(
+        user_id="user-1",
+        session_id="session-1",
+        tenant_id="tenant-1",
+        workspace_id="workspace-1",
+        project_id="project-1",
+    )
+
+    principal = get_current_principal()
+    assert principal is not None
+    assert principal.roles == ("viewer",)
+    assert principal.source == "session_context"
+
+    clear_session_vars(tokens)
+
+
+def test_set_session_vars_can_bind_explicit_sandbox_lease_fields():
+    tokens = set_session_vars(
+        user_id="user-1",
+        session_id="session-1",
+        tenant_id="tenant-1",
+        workspace_id="workspace-1",
+        project_id="project-1",
+        roles=("member",),
+        sandbox_id="sandbox-1",
+        sandbox_status="active",
+        sandbox_expires_at=9_999_999_999,
+    )
+
+    lease = get_current_sandbox_lease()
+    assert lease is not None
+    assert lease.sandbox_id == "sandbox-1"
+    assert lease.status == "active"
+    assert lease.expires_at == 9_999_999_999
+
+    clear_session_vars(tokens)
+
+
 def test_set_session_env_includes_session_key():
     """_set_session_env should propagate session_key from SessionContext."""
     runner = object.__new__(GatewayRunner)
@@ -263,6 +383,71 @@ def test_session_key_no_race_condition_with_contextvars(monkeypatch):
     )
     assert results["session-B"] == "session-B", (
         f"Session B got '{results['session-B']}' instead of 'session-B' — race condition!"
+    )
+
+
+def test_principal_no_race_condition_with_contextvars():
+    """Principal binding must remain task-local across concurrent sessions."""
+    results = {}
+
+    async def handler(label: str, delay: float):
+        tokens = set_session_vars(
+            user_id=f"user-{label}",
+            session_id=f"session-{label}",
+            tenant_id=f"tenant-{label}",
+            workspace_id=f"workspace-{label}",
+            project_id=f"project-{label}",
+            roles=("member",),
+        )
+        try:
+            await asyncio.sleep(delay)
+            principal = get_current_principal()
+            lease = get_current_sandbox_lease()
+            assert principal is not None
+            assert lease is not None
+            results[label] = (
+                principal.tenant_id,
+                principal.workspace_id,
+                principal.project_id,
+                principal.user_id,
+                principal.session_id,
+                principal.roles,
+                lease.tenant_id,
+                lease.session_id,
+                lease.owner_user_id,
+            )
+        finally:
+            clear_session_vars(tokens)
+
+    async def run():
+        task_a = asyncio.create_task(handler("A", 0.15))
+        await asyncio.sleep(0.05)
+        task_b = asyncio.create_task(handler("B", 0.05))
+        await asyncio.gather(task_a, task_b)
+
+    asyncio.run(run())
+
+    assert results["A"] == (
+        "tenant-A",
+        "workspace-A",
+        "project-A",
+        "user-A",
+        "session-A",
+        ("member",),
+        "tenant-A",
+        "session-A",
+        "user-A",
+    )
+    assert results["B"] == (
+        "tenant-B",
+        "workspace-B",
+        "project-B",
+        "user-B",
+        "session-B",
+        ("member",),
+        "tenant-B",
+        "session-B",
+        "user-B",
     )
 
 

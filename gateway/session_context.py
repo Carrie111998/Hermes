@@ -83,6 +83,70 @@ _VAR_MAP = {
 }
 
 
+def _normalize_roles(roles: Any, *, default: tuple[str, ...]) -> tuple[str, ...]:
+    if roles is None:
+        return default
+    if isinstance(roles, str):
+        values = roles.split(",")
+    else:
+        try:
+            values = list(roles)
+        except TypeError:
+            values = [roles]
+    normalized: list[str] = []
+    for value in values:
+        role = str(value).strip()
+        if role:
+            normalized.append(role)
+    return tuple(normalized) or ("viewer",)
+
+
+def _bind_security_context(
+    *,
+    tenant_id: str,
+    workspace_id: str,
+    project_id: str,
+    user_id: str,
+    session_key: str,
+    session_id: str,
+    chat_id: str,
+    roles: Any,
+    sandbox_id: str,
+    sandbox_status: str,
+    sandbox_expires_at: Any,
+) -> list:
+    from agent.ultra_security import (
+        Principal,
+        issue_sandbox_lease,
+        set_current_principal,
+        set_current_sandbox_lease,
+    )
+
+    resolved_session_id = session_id or session_key or chat_id or "local-session"
+    has_server_scope = any((tenant_id, workspace_id, project_id, roles is not None))
+    default_roles = ("viewer",) if has_server_scope else ("owner",)
+    principal = Principal(
+        tenant_id=tenant_id or "local-tenant",
+        workspace_id=workspace_id or "local-workspace",
+        project_id=project_id or resolved_session_id or "local-project",
+        user_id=user_id or "local-user",
+        roles=_normalize_roles(roles, default=default_roles),
+        session_id=resolved_session_id,
+        source="session_context" if has_server_scope else "session_context_fallback",
+    )
+    lease = issue_sandbox_lease(
+        principal,
+        sandbox_id=sandbox_id,
+        status=sandbox_status,
+        expires_at=sandbox_expires_at,
+        source="session_context" if has_server_scope else "session_context_fallback",
+    )
+    return [
+        set_current_principal(principal),
+        set_current_sandbox_lease(lease),
+    ]
+
+
 def set_current_session_id(session_id: str) -> None:
     """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
 
@@ -109,6 +173,13 @@ def set_session_vars(
     session_id: str = "",
     message_id: str = "",
     cwd: str = "",
+    tenant_id: str = "",
+    workspace_id: str = "",
+    project_id: str = "",
+    roles: Any = None,
+    sandbox_id: str = "",
+    sandbox_status: str = "active",
+    sandbox_expires_at: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -131,6 +202,21 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_MESSAGE_ID.set(message_id),
     ]
+    tokens.extend(
+        _bind_security_context(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            user_id=user_id,
+            session_key=session_key,
+            session_id=session_id,
+            chat_id=chat_id,
+            roles=roles,
+            sandbox_id=sandbox_id,
+            sandbox_status=sandbox_status,
+            sandbox_expires_at=sandbox_expires_at,
+        )
+    )
     try:
         from agent.runtime_cwd import set_session_cwd
 
@@ -163,6 +249,10 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_MESSAGE_ID,
     ):
         var.set("")
+    from agent.ultra_security import set_current_principal, set_current_sandbox_lease
+
+    set_current_principal(None)
+    set_current_sandbox_lease(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
