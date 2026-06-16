@@ -88,7 +88,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   headers.set("Authorization", `Bearer ${me.token}`);
-  const res = await fetch(`/hermes-api${path}`, { ...init, headers });
+  const res = await fetch(`/panel-api${path}`, { ...init, headers });
   const text = await res.text();
   const body = text ? safeJson(text) : {};
   if (!res.ok) throw new PanelHttpError(res.status, path, body || text);
@@ -309,7 +309,7 @@ function buildChatMessage(text: string, outbound: Attachment[]): unknown {
 async function streamChat(assistantId: string, message: unknown): Promise<void> {
   if (!me) throw new Error("not logged in");
   aborter = new AbortController();
-  const res = await fetch(`/hermes-api/api/sessions/${encodeURIComponent(sid)}/chat/stream`, {
+  const res = await fetch(`/panel-api/api/sessions/${encodeURIComponent(sid)}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": `Bearer ${me.token}` },
     body: JSON.stringify({ message, model: refs.modelSelect.value }),

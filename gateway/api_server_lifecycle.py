@@ -6,6 +6,7 @@ This module is mechanically split from gateway.platforms.api_server.
 from __future__ import annotations
 
 from gateway.api_server_shared import *
+from gateway.api_server_audit import request_audit_middleware
 
 
 class APIServerLifecycleMixin:
@@ -16,7 +17,16 @@ class APIServerLifecycleMixin:
             return False
 
         try:
-            mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+            mws = [
+                mw
+                for mw in (
+                    request_audit_middleware,
+                    cors_middleware,
+                    body_limit_middleware,
+                    security_headers_middleware,
+                )
+                if mw is not None
+            ]
             self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)

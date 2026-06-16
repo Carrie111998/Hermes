@@ -6,6 +6,7 @@ This module is mechanically split from gateway.platforms.api_server.
 from __future__ import annotations
 
 from gateway.api_server_shared import *
+from gateway.api_server_audit import log_api_decision, request_id_headers
 from gateway.principal_headers import parse_principal_scope_headers
 
 
@@ -186,9 +187,17 @@ class APIServerCoreMixin:
             "API server rejected invalid API key: %s",
             self._request_audit_log_suffix(request),
         )
+        log_api_decision(
+            request,
+            action="auth.check",
+            result="denied",
+            status=401,
+            reason="invalid_api_key",
+        )
         return web.json_response(
             {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
             status=401,
+            headers=request_id_headers(request),
         )
 
     # ------------------------------------------------------------------
@@ -270,7 +279,14 @@ class APIServerCoreMixin:
 
         status = 403 if "API key" in error else 400
         logger.warning("Principal scope headers rejected: %s", error)
-        return {}, web.json_response(_openai_error(error), status=status)
+        log_api_decision(
+            request,
+            action="principal.parse",
+            result="denied",
+            status=status,
+            reason=error,
+        )
+        return {}, web.json_response(_openai_error(error), status=status, headers=request_id_headers(request))
 
     # ------------------------------------------------------------------
     # Session DB helper

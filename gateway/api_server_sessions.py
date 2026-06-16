@@ -6,6 +6,7 @@ This module is mechanically split from gateway.platforms.api_server.
 from __future__ import annotations
 
 from gateway.session_acl import has_principal_scope
+from gateway.api_server_audit import log_api_decision, request_id_headers
 from gateway.session_scope_store import (
     bind_session_scope,
     can_access_session,
@@ -71,13 +72,34 @@ class APIServerSessionsMixin:
         self,
         session_id: str,
         principal_scope: Optional[Dict[str, Any]] = None,
+        request: Optional["web.Request"] = None,
     ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
         if db is None:
-            return None, web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+            headers = request_id_headers(request) if request is not None else None
+            return None, web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+                headers=headers,
+            )
         session = db.get_session(session_id)
         if not session or not can_access_session(db, session_id, principal_scope):
-            return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
+            if request is not None:
+                log_api_decision(
+                    request,
+                    action="session.access",
+                    result="denied",
+                    status=404,
+                    principal_scope=principal_scope,
+                    session_id=session_id,
+                    reason="not_found_or_scope_denied",
+                )
+            headers = request_id_headers(request) if request is not None else None
+            return None, web.json_response(
+                _openai_error(f"Session not found: {session_id}", code="session_not_found"),
+                status=404,
+                headers=headers,
+            )
         return session, None
 
     def _conversation_history_for_session(
@@ -194,6 +216,14 @@ class APIServerSessionsMixin:
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
         db.create_session(session_id, "api_server", model=str(model) if model else None, system_prompt=system_prompt)
         bind_session_scope(db, session_id, principal_scope)
+        log_api_decision(
+            request,
+            action="session.create",
+            result="allowed",
+            status=201,
+            principal_scope=principal_scope,
+            session_id=session_id,
+        )
         title = body.get("title")
         if title is not None:
             try:
@@ -212,7 +242,11 @@ class APIServerSessionsMixin:
         principal_scope, principal_err = self._parse_principal_scope_headers(request)
         if principal_err is not None:
             return principal_err
-        session, err = self._get_existing_session_or_404(request.match_info["session_id"], principal_scope)
+        session, err = self._get_existing_session_or_404(
+            request.match_info["session_id"],
+            principal_scope,
+            request=request,
+        )
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
@@ -226,7 +260,7 @@ class APIServerSessionsMixin:
         principal_scope, principal_err = self._parse_principal_scope_headers(request)
         if principal_err is not None:
             return principal_err
-        session, err = self._get_existing_session_or_404(session_id, principal_scope)
+        session, err = self._get_existing_session_or_404(session_id, principal_scope, request=request)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -257,7 +291,7 @@ class APIServerSessionsMixin:
         principal_scope, principal_err = self._parse_principal_scope_headers(request)
         if principal_err is not None:
             return principal_err
-        session, err = self._get_existing_session_or_404(session_id, principal_scope)
+        session, err = self._get_existing_session_or_404(session_id, principal_scope, request=request)
         if err:
             return err
         db = self._ensure_session_db()
@@ -273,7 +307,7 @@ class APIServerSessionsMixin:
         principal_scope, principal_err = self._parse_principal_scope_headers(request)
         if principal_err is not None:
             return principal_err
-        _, err = self._get_existing_session_or_404(session_id, principal_scope)
+        _, err = self._get_existing_session_or_404(session_id, principal_scope, request=request)
         if err:
             return err
         db = self._ensure_session_db()
@@ -303,7 +337,7 @@ class APIServerSessionsMixin:
         principal_scope, principal_err = self._parse_principal_scope_headers(request)
         if principal_err is not None:
             return principal_err
-        source, err = self._get_existing_session_or_404(source_id, principal_scope)
+        source, err = self._get_existing_session_or_404(source_id, principal_scope, request=request)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -365,7 +399,7 @@ class APIServerSessionsMixin:
         if principal_err is not None:
             return principal_err
         session_id = request.match_info["session_id"]
-        _, err = self._get_existing_session_or_404(session_id, principal_scope)
+        _, err = self._get_existing_session_or_404(session_id, principal_scope, request=request)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -374,6 +408,13 @@ class APIServerSessionsMixin:
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        log_api_decision(
+            request,
+            action="session.chat",
+            result="started",
+            principal_scope=principal_scope,
+            session_id=session_id,
+        )
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -386,6 +427,15 @@ class APIServerSessionsMixin:
             db.append_message(session_id, "user", user_message)
             db.append_message(session_id, "assistant", final_response)
             bind_session_scope(db, session_id, principal_scope)
+            log_api_decision(
+                request,
+                action="session.chat",
+                result="completed",
+                status=200,
+                principal_scope=principal_scope,
+                session_id=session_id,
+                reason="direct_image",
+            )
             return web.json_response(
                 {
                     "object": "hermes.session.chat.completion",
@@ -410,6 +460,14 @@ class APIServerSessionsMixin:
         headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
+        log_api_decision(
+            request,
+            action="session.chat",
+            result="completed",
+            status=200,
+            principal_scope=principal_scope,
+            session_id=effective_session_id or session_id,
+        )
         return web.json_response(
             {
                 "object": "hermes.session.chat.completion",
@@ -432,7 +490,7 @@ class APIServerSessionsMixin:
         if principal_err is not None:
             return principal_err
         session_id = request.match_info["session_id"]
-        _, err = self._get_existing_session_or_404(session_id, principal_scope)
+        _, err = self._get_existing_session_or_404(session_id, principal_scope, request=request)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -441,6 +499,13 @@ class APIServerSessionsMixin:
         user_message, err = _session_chat_user_message(body)
         if err is not None:
             return err
+        log_api_decision(
+            request,
+            action="session.chat_stream",
+            result="started",
+            principal_scope=principal_scope,
+            session_id=session_id,
+        )
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
@@ -451,6 +516,7 @@ class APIServerSessionsMixin:
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
                 "X-Hermes-Session-Id": session_id,
+                **request_id_headers(request),
             }
             response = web.StreamResponse(status=200, headers=headers)
             await response.prepare(request)
@@ -486,6 +552,15 @@ class APIServerSessionsMixin:
                 },
             )
             await _write("done", {})
+            log_api_decision(
+                request,
+                action="session.chat_stream",
+                result="completed",
+                status=200,
+                principal_scope=principal_scope,
+                session_id=session_id,
+                reason="direct_image",
+            )
             return response
 
         loop = asyncio.get_running_loop()
@@ -561,8 +636,25 @@ class APIServerSessionsMixin:
                     "messages": turn_messages,
                     "usage": usage,
                 }))
+                log_api_decision(
+                    request,
+                    action="session.chat_stream",
+                    result="completed",
+                    status=200,
+                    principal_scope=principal_scope,
+                    session_id=effective_session_id,
+                )
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
+                log_api_decision(
+                    request,
+                    action="session.chat_stream",
+                    result="failed",
+                    status=500,
+                    principal_scope=principal_scope,
+                    session_id=session_id,
+                    reason=str(exc),
+                )
                 await queue.put(_event_payload("error", {"message": str(exc)}))
             finally:
                 await queue.put(_event_payload("done", {}))
@@ -581,6 +673,7 @@ class APIServerSessionsMixin:
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "X-Hermes-Session-Id": session_id,
+            **request_id_headers(request),
         }
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key

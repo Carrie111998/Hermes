@@ -1,5 +1,6 @@
 """API-server multi-user session and response ACL tests."""
 
+import logging
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -8,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.api_server_shared import ResponseStore
+from gateway.api_server_audit import REQUEST_ID_HEADER, request_audit_middleware
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware
 from hermes_state import SessionDB
@@ -30,8 +32,9 @@ def scoped_adapter(session_db):
     return adapter
 
 
-def _app(adapter: APIServerAdapter) -> web.Application:
-    app = web.Application()
+def _app(adapter: APIServerAdapter, *, audit: bool = False) -> web.Application:
+    app = web.Application(middlewares=[request_audit_middleware] if audit else [])
+    app["api_server_adapter"] = adapter
     app.router.add_get("/api/sessions", adapter._handle_list_sessions)
     app.router.add_post("/api/sessions", adapter._handle_create_session)
     app.router.add_get("/api/sessions/{session_id}", adapter._handle_get_session)
@@ -46,6 +49,14 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     return app
+
+
+def _audit_messages(caplog) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "gateway.api_server.audit"
+    ]
 
 
 def _cors_app(adapter: APIServerAdapter) -> web.Application:
@@ -63,6 +74,61 @@ def _principal(user_id: str) -> dict[str, str]:
         "X-Hermes-Project-Id": "project-1",
         "X-Hermes-User-Id": user_id,
     }
+
+
+@pytest.mark.asyncio
+async def test_api_server_audit_logs_invalid_api_key(scoped_adapter, caplog):
+    app = _app(scoped_adapter, audit=True)
+    caplog.set_level(logging.INFO, logger="gateway.api_server.audit")
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/api/sessions",
+            headers={
+                "Authorization": "Bearer wrong",
+                "X-Hermes-Request-Id": "req-auth-test",
+            },
+        )
+        payload = await resp.json()
+
+    assert resp.status == 401
+    assert resp.headers[REQUEST_ID_HEADER] == "req-auth-test"
+    assert payload["error"]["code"] == "invalid_api_key"
+    joined = "\n".join(_audit_messages(caplog))
+    assert "req-auth-test" in joined
+    assert "auth.check" in joined
+    assert "invalid_api_key" in joined
+    assert "api.request" in joined
+    assert "'status': 401" in joined
+
+
+@pytest.mark.asyncio
+async def test_api_server_audit_logs_cross_user_session_denial(scoped_adapter, caplog):
+    app = _app(scoped_adapter, audit=True)
+    caplog.set_level(logging.INFO, logger="gateway.api_server.audit")
+    async with TestClient(TestServer(app)) as cli:
+        create = await cli.post(
+            "/api/sessions",
+            headers=_principal("user-a"),
+            json={"id": "audit-owned-by-a"},
+        )
+        assert create.status == 201
+        caplog.clear()
+
+        denied = await cli.get(
+            "/api/sessions/audit-owned-by-a/messages",
+            headers={**_principal("user-b"), "X-Hermes-Request-Id": "req-denied-test"},
+        )
+        payload = await denied.json()
+
+    assert denied.status == 404
+    assert denied.headers[REQUEST_ID_HEADER] == "req-denied-test"
+    assert payload["error"]["code"] == "session_not_found"
+    joined = "\n".join(_audit_messages(caplog))
+    assert "req-denied-test" in joined
+    assert "session.access" in joined
+    assert "not_found_or_scope_denied" in joined
+    assert "audit-owned-by-a" in joined
+    assert "user-b" in joined
 
 
 @pytest.mark.asyncio
@@ -150,8 +216,8 @@ async def test_session_chat_refuses_other_users_history(scoped_adapter, session_
 
 
 @pytest.mark.asyncio
-async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_adapter):
-    app = _app(scoped_adapter)
+async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_adapter, caplog):
+    app = _app(scoped_adapter, audit=True)
     fake_result = {
         "success": True,
         "image": "https://atlas-media.example/images/cat.png",
@@ -159,6 +225,7 @@ async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_
     }
 
     with patch("gateway.api_server_sessions.generate_atlas_image", return_value=fake_result) as mock_generate:
+        caplog.set_level(logging.INFO, logger="gateway.api_server.audit")
         async with TestClient(TestServer(app)) as cli:
             create = await cli.post(
                 "/api/sessions",
@@ -169,10 +236,11 @@ async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_
 
             stream = await cli.post(
                 "/api/sessions/image-owned-by-a/chat/stream",
-                headers=_principal("user-a"),
+                headers={**_principal("user-a"), "X-Hermes-Request-Id": "req-stream-test"},
                 json={"message": "帮我生成一个猫的图片"},
             )
             assert stream.status == 200, await stream.text()
+            assert stream.headers[REQUEST_ID_HEADER] == "req-stream-test"
             body = await stream.text()
 
             messages_a = await cli.get(
@@ -193,6 +261,10 @@ async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_
     assert "https://atlas-media.example/images/cat.png" in body
     assert [item["role"] for item in payload_a["data"]] == ["user", "assistant"]
     assert "https://atlas-media.example/images/cat.png" in payload_a["data"][1]["content"]
+    joined = "\n".join(_audit_messages(caplog))
+    assert "req-stream-test" in joined
+    assert "session.chat_stream" in joined
+    assert "direct_image" in joined
 
 
 @pytest.mark.asyncio
