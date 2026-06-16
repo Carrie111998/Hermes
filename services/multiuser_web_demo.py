@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
+import json
 import os
+import re
 import secrets
 import time
-from urllib.parse import parse_qs
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs
 
 import httpx
 from fastapi import FastAPI, Request
@@ -22,6 +25,11 @@ API_KEY = os.getenv("ULTRA_DEMO_API_KEY", "dev-multiuser-test-key")
 COOKIE_NAME = "ultra_demo_sid"
 COOKIE_MAX_AGE = 60 * 60 * 8
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEMO_ATLAS_API_BASE = os.getenv("ULTRA_DEMO_ATLAS_API_BASE", "https://api.atlascloud.ai/v1")
+IMAGE_REQUEST_RE = re.compile(
+    r"(生成|做|画|创建|create|generate|make|draw).{0,18}(图片|图像|猫|image|picture|photo|illustration)",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -114,7 +122,7 @@ def _require_user(request: Request) -> DemoUser | JSONResponse:
     return user
 
 
-async def _call_hermes(
+async def _request_hermes_json(
     user: DemoUser,
     method: str,
     path: str,
@@ -122,7 +130,7 @@ async def _call_hermes(
     params: dict[str, Any] | None = None,
     json_body: Any = None,
     timeout_s: float = 120.0,
-) -> JSONResponse:
+) -> tuple[int, Any]:
     url = f"{API_BASE}{path}"
     async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_s)) as client:
         try:
@@ -134,15 +142,78 @@ async def _call_hermes(
                 headers=_principal_headers(user),
             )
         except httpx.RequestError as exc:
-            return JSONResponse(
-                {"error": "hermes_api_unreachable", "detail": str(exc), "api_base": API_BASE},
-                status_code=502,
-            )
+            return 502, {"error": "hermes_api_unreachable", "detail": str(exc), "api_base": API_BASE}
     try:
         payload = resp.json()
     except ValueError:
         payload = {"text": resp.text}
-    return JSONResponse(payload, status_code=resp.status_code)
+    return resp.status_code, payload
+
+
+async def _call_hermes(
+    user: DemoUser,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: Any = None,
+    timeout_s: float = 120.0,
+) -> JSONResponse:
+    status, payload = await _request_hermes_json(
+        user,
+        method,
+        path,
+        params=params,
+        json_body=json_body,
+        timeout_s=timeout_s,
+    )
+    return JSONResponse(payload, status_code=status)
+
+
+def _is_image_generation_request(message: str) -> bool:
+    text = (message or "").strip()
+    return bool(text and IMAGE_REQUEST_RE.search(text))
+
+
+def _generate_image_sync(prompt: str) -> dict[str, Any]:
+    previous_base = os.environ.get("ATLAS_API_BASE")
+    os.environ["ATLAS_API_BASE"] = DEMO_ATLAS_API_BASE
+    try:
+        from tools.image_generation_tool import _handle_image_generate
+
+        raw = _handle_image_generate({"prompt": prompt, "aspect_ratio": "square"})
+        result = _parse_image_tool_result(raw)
+        if result.get("error_type") in {"timeout", "connection_error"}:
+            raw = _handle_image_generate({"prompt": prompt, "aspect_ratio": "square"})
+            result = _parse_image_tool_result(raw)
+        return result
+    finally:
+        if previous_base is None:
+            os.environ.pop("ATLAS_API_BASE", None)
+        else:
+            os.environ["ATLAS_API_BASE"] = previous_base
+
+
+def _parse_image_tool_result(raw: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {"success": False, "image": None, "error": raw, "error_type": "invalid_tool_result"}
+    return parsed if isinstance(parsed, dict) else {"success": False, "image": None, "error": str(parsed)}
+
+
+def _append_session_message(session_id: str, role: str, content: str) -> None:
+    from hermes_state import SessionDB
+
+    SessionDB().append_message(session_id, role, content)
+
+
+def _image_response_content(result: dict[str, Any]) -> str:
+    image = str(result.get("image") or "").strip()
+    if result.get("success") and image:
+        return f"已用 Atlas 生成图片：\n\n![生成图片]({image})"
+    error = result.get("error") or "图片生成失败"
+    return f"图片生成失败：{error}"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -239,6 +310,27 @@ async def session_chat(request: Request, session_id: str) -> JSONResponse:
     if isinstance(user, JSONResponse):
         return user
     body = await request.json()
+    message = body.get("message") or body.get("input")
+    if isinstance(message, str) and _is_image_generation_request(message):
+        status, payload = await _request_hermes_json(
+            user,
+            "GET",
+            f"/api/sessions/{session_id}",
+            timeout_s=20.0,
+        )
+        if status >= 400:
+            return JSONResponse(payload, status_code=status)
+        result = await asyncio.to_thread(_generate_image_sync, message)
+        content = _image_response_content(result)
+        _append_session_message(session_id, "user", message)
+        _append_session_message(session_id, "assistant", content)
+        return JSONResponse({
+            "object": "hermes.session.chat.completion",
+            "session_id": session_id,
+            "message": {"role": "assistant", "content": content},
+            "tool": {"name": "image_generate", "result": result},
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        })
     return await _call_hermes(
         user,
         "POST",
@@ -332,6 +424,7 @@ APP_HTML = """<!doctype html>
     .msg { max-width: min(760px, 82%); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; white-space: pre-wrap; line-height: 1.55; background: rgba(27,29,25,.88); }
     .msg.user { align-self: flex-end; border-color: rgba(139,221,227,.45); background: rgba(139,221,227,.1); }
     .msg.assistant { align-self: flex-start; border-color: rgba(199,255,46,.25); }
+    .msg img { display: block; max-width: min(520px, 100%); margin-top: 12px; border-radius: 8px; border: 1px solid var(--line); }
     .composer { border-top: 1px solid var(--line); padding: 16px 28px 22px; display: grid; grid-template-columns: 1fr 96px; gap: 12px; align-items: end; }
     textarea { width: 100%; min-height: 74px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; background: #171915; color: var(--text); padding: 14px; }
     .toast { color: #ffb1b1; font: 13px ui-monospace, Menlo, monospace; margin-top: 10px; min-height: 18px; }
@@ -402,7 +495,16 @@ APP_HTML = """<!doctype html>
       root.replaceChildren(...state.messages.map((msg) => {
         const div = document.createElement("div");
         div.className = `msg ${msg.role === "user" ? "user" : "assistant"}`;
-        div.textContent = msg.content || "";
+        const content = msg.content || "";
+        div.append(document.createTextNode(content));
+        const urls = content.match(/https?:\/\/[^\s)]+?\.(?:png|jpg|jpeg|webp|gif)(?:\?[^\s)]*)?/gi) || [];
+        urls.forEach((url) => {
+          const img = document.createElement("img");
+          img.src = url;
+          img.alt = "Generated media";
+          img.loading = "lazy";
+          div.append(img);
+        });
         return div;
       }));
       root.scrollTop = root.scrollHeight;

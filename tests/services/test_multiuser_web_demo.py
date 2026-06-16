@@ -77,3 +77,47 @@ def test_logout_clears_session(monkeypatch) -> None:
 
     assert logout.status_code == 303
     assert me.status_code == 401
+
+
+def test_image_generation_request_routes_to_real_tool_layer(monkeypatch) -> None:
+    checked: list[str] = []
+    appended: list[tuple[str, str, str]] = []
+
+    async def fake_request_hermes_json(
+        user: demo.DemoUser,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        timeout_s: float = 120.0,
+    ) -> tuple[int, dict[str, Any]]:
+        checked.append(f"{method} {path} {user.workspace_id}")
+        return 200, {"session": {"id": "s1"}}
+
+    def fake_generate_image(prompt: str) -> dict[str, Any]:
+        assert prompt == "帮我做一个猫的图片"
+        return {
+            "success": True,
+            "image": "https://atlas-media.example/cat.jpg",
+            "provider": "atlas",
+        }
+
+    def fake_append(session_id: str, role: str, content: str) -> None:
+        appended.append((session_id, role, content))
+
+    monkeypatch.setattr(demo, "_request_hermes_json", fake_request_hermes_json)
+    monkeypatch.setattr(demo, "_generate_image_sync", fake_generate_image)
+    monkeypatch.setattr(demo, "_append_session_message", fake_append)
+    client = _client(monkeypatch)
+    assert client.post("/login", data={"username": "alice", "password": "alice123"}).status_code == 303
+
+    response = client.post("/app/api/sessions/s1/chat", json={"message": "帮我做一个猫的图片"})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["tool"]["name"] == "image_generate"
+    assert "https://atlas-media.example/cat.jpg" in payload["message"]["content"]
+    assert checked == ["GET /api/sessions/s1 workspace-brand"]
+    assert appended[0] == ("s1", "user", "帮我做一个猫的图片")
+    assert appended[1][0:2] == ("s1", "assistant")
