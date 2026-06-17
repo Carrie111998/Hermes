@@ -13,11 +13,6 @@ from gateway.session_scope_store import (
     filter_sessions_for_scope,
     inherit_or_bind_session_scope,
 )
-from gateway.media_prompt_router import (
-    generate_atlas_image,
-    image_response_text,
-    is_direct_image_prompt,
-)
 from gateway.api_server_shared import *
 
 
@@ -418,34 +413,6 @@ class APIServerSessionsMixin:
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        if is_direct_image_prompt(user_message):
-            result = await asyncio.to_thread(generate_atlas_image, user_message)
-            final_response = image_response_text(result)
-            db = self._ensure_session_db()
-            if db is None:
-                return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
-            db.append_message(session_id, "user", user_message)
-            db.append_message(session_id, "assistant", final_response)
-            bind_session_scope(db, session_id, principal_scope)
-            log_api_decision(
-                request,
-                action="session.chat",
-                result="completed",
-                status=200,
-                principal_scope=principal_scope,
-                session_id=session_id,
-                reason="direct_image",
-            )
-            return web.json_response(
-                {
-                    "object": "hermes.session.chat.completion",
-                    "session_id": session_id,
-                    "message": {"role": "assistant", "content": final_response},
-                    "tool": {"name": "image_generate", "provider": "atlas", "result": result},
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                },
-                headers={"X-Hermes-Session-Id": session_id},
-            )
         history = self._conversation_history_for_session(session_id, principal_scope)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -509,59 +476,6 @@ class APIServerSessionsMixin:
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-
-        if is_direct_image_prompt(user_message):
-            headers = {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-                "X-Hermes-Session-Id": session_id,
-                **request_id_headers(request),
-            }
-            response = web.StreamResponse(status=200, headers=headers)
-            await response.prepare(request)
-            run_id = f"run_{uuid.uuid4().hex}"
-            message_id = f"msg_{uuid.uuid4().hex}"
-
-            async def _write(name: str, payload: Dict[str, Any]) -> None:
-                payload.setdefault("session_id", session_id)
-                payload.setdefault("run_id", run_id)
-                payload.setdefault("ts", time.time())
-                data = json.dumps(payload, ensure_ascii=False)
-                await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
-
-            await _write("run.started", {"user_message": {"role": "user", "content": user_message}})
-            await _write("message.started", {"message": {"id": message_id, "role": "assistant"}})
-            await _write("tool.started", {"message_id": message_id, "tool_name": "image_generate", "preview": "Creating image with Atlas"})
-            result = await asyncio.to_thread(generate_atlas_image, user_message)
-            final_response = image_response_text(result)
-            db = self._ensure_session_db()
-            if db is not None:
-                db.append_message(session_id, "user", user_message)
-                db.append_message(session_id, "assistant", final_response)
-                bind_session_scope(db, session_id, principal_scope)
-            await _write("tool.completed", {"message_id": message_id, "tool_name": "image_generate", "result": result})
-            await _write("assistant.completed", {"message_id": message_id, "content": final_response, "completed": True})
-            await _write(
-                "run.completed",
-                {
-                    "message_id": message_id,
-                    "completed": True,
-                    "messages": [{"role": "assistant", "content": final_response}],
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                },
-            )
-            await _write("done", {})
-            log_api_decision(
-                request,
-                action="session.chat_stream",
-                result="completed",
-                status=200,
-                principal_scope=principal_scope,
-                session_id=session_id,
-                reason="direct_image",
-            )
-            return response
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()

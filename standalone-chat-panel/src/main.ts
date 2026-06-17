@@ -1,6 +1,5 @@
-// Legacy WebSocket gateway panel source retained for feature migration.
-// It is not loaded by standalone-chat-panel/index.html; the active product
-// entrypoint is src/apiPanel.ts.
+// WebSocket gateway panel. All chat behavior goes through the real Hermes
+// TUI gateway protocol; the frontend does not shortcut media generation.
 import {
   createPanelHistoryController,
   type PanelHistoryActivation,

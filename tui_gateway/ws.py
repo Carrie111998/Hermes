@@ -29,7 +29,7 @@ import logging
 import socket
 from typing import Any
 
-from tui_gateway import media_prompt_router, server
+from tui_gateway import server
 
 _log = logging.getLogger(__name__)
 
@@ -245,13 +245,7 @@ async def handle_ws(ws: Any) -> None:
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
             try:
-                resp = await asyncio.to_thread(
-                    media_prompt_router.try_handle_prompt_submit,
-                    req,
-                    transport,
-                )
-                if resp is None:
-                    resp = await asyncio.to_thread(server.dispatch, req, transport)
+                resp = await asyncio.to_thread(server.dispatch, req, transport)
             except Exception:
                 dispatch_crashes += 1
                 _log.exception(

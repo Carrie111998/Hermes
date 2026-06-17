@@ -220,15 +220,37 @@ async def test_session_chat_refuses_other_users_history(scoped_adapter, session_
 
 
 @pytest.mark.asyncio
-async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_adapter, caplog):
+async def test_image_prompt_stream_routes_through_agent_inside_principal_scope(scoped_adapter, caplog):
     app = _app(scoped_adapter, audit=True)
-    fake_result = {
-        "success": True,
-        "image": "https://atlas-media.example/images/cat.png",
-        "model": "google/nano-banana-2/text-to-image",
-    }
 
-    with patch("gateway.api_server_sessions.generate_atlas_image", return_value=fake_result) as mock_generate:
+    async def fake_run_agent(**kwargs):
+        assert kwargs["user_message"] == "帮我生成一个猫的图片"
+        kwargs["tool_progress_callback"](
+            "tool.started",
+            tool_name="image_generate",
+            preview="agent-routed image tool",
+        )
+        kwargs["tool_progress_callback"](
+            "tool.completed",
+            tool_name="image_generate",
+            preview="agent completed image tool",
+        )
+        db = scoped_adapter._ensure_session_db()
+        db.append_message("image-owned-by-a", "user", kwargs["user_message"])
+        db.append_message("image-owned-by-a", "assistant", "agent routed image response")
+        return (
+            {
+                "final_response": "agent routed image response",
+                "session_id": "image-owned-by-a",
+                "messages": [
+                    {"role": "user", "content": kwargs["user_message"]},
+                    {"role": "assistant", "content": "agent routed image response"},
+                ],
+            },
+            {"total_tokens": 3},
+        )
+
+    with patch.object(scoped_adapter, "_run_agent", side_effect=fake_run_agent) as mock_run:
         caplog.set_level(logging.INFO, logger="gateway.api_server.audit")
         async with TestClient(TestServer(app)) as cli:
             create = await cli.post(
@@ -259,16 +281,16 @@ async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_
             payload_a = await messages_a.json()
             assert messages_b.status == 404
 
-    mock_generate.assert_called_once_with("帮我生成一个猫的图片")
+    mock_run.assert_awaited_once()
     assert "event: tool.started" in body
     assert "event: assistant.completed" in body
-    assert "https://atlas-media.example/images/cat.png" in body
+    assert "agent routed image response" in body
     assert [item["role"] for item in payload_a["data"]] == ["user", "assistant"]
-    assert "https://atlas-media.example/images/cat.png" in payload_a["data"][1]["content"]
+    assert payload_a["data"][1]["content"] == "agent routed image response"
     joined = "\n".join(_audit_messages(caplog))
     assert "req-stream-test" in joined
     assert "session.chat_stream" in joined
-    assert "direct_image" in joined
+    assert "direct_" + "image" not in joined
 
 
 @pytest.mark.asyncio
