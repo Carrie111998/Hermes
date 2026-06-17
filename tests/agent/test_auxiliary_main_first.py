@@ -111,6 +111,9 @@ class TestResolveAutoMainFirst:
         ), patch(
             "agent.auxiliary_client._try_openrouter",
             return_value=(chain_client, "google/gemini-3-flash-preview"),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={},
         ):
             from agent.auxiliary_client import _resolve_auto
 
@@ -118,6 +121,77 @@ class TestResolveAutoMainFirst:
 
         assert client is chain_client
         assert model == "google/gemini-3-flash-preview"
+
+    def test_main_unavailable_uses_task_fallback_before_builtin_chain(self):
+        """Task fallback_chain wins before the hardcoded discovery chain."""
+        fallback_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="anthropic",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="claude-opus",
+        ), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={
+                "fallback_chain": [
+                    {
+                        "provider": "openrouter",
+                        "model": "openai/gpt-5-mini",
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "api_key": "or-fallback",
+                    }
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(None, None), (fallback_client, "openai/gpt-5-mini")],
+        ) as mock_resolve, patch(
+            "agent.auxiliary_client._get_provider_chain",
+            side_effect=AssertionError("builtin chain should not run"),
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto(task="judge")
+
+        assert client is fallback_client
+        assert model == "openai/gpt-5-mini"
+        assert mock_resolve.call_args_list[1].kwargs == {
+            "provider": "openrouter",
+            "model": "openai/gpt-5-mini",
+            "explicit_base_url": "https://openrouter.ai/api/v1",
+            "explicit_api_key": "or-fallback",
+            "api_mode": None,
+        }
+
+    def test_main_unavailable_uses_top_level_fallback_before_builtin_chain(self):
+        """Default auto aux honors the main agent fallback_providers chain."""
+        fallback_client = MagicMock()
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="anthropic",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="claude-opus",
+        ), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={},
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "fallback_providers": [
+                    {"provider": "openrouter", "model": "openai/gpt-5-mini"}
+                ]
+            },
+        ), patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(None, None), (fallback_client, "openai/gpt-5-mini")],
+        ), patch(
+            "agent.auxiliary_client._get_provider_chain",
+            side_effect=AssertionError("builtin chain should not run"),
+        ):
+            from agent.auxiliary_client import _resolve_auto
+
+            client, model = _resolve_auto(task="judge")
+
+        assert client is fallback_client
+        assert model == "openai/gpt-5-mini"
 
     def test_no_main_config_uses_chain_directly(self):
         """No main provider configured → skip step 1, use chain (no regression)."""
@@ -129,6 +203,9 @@ class TestResolveAutoMainFirst:
         ), patch(
             "agent.auxiliary_client._try_openrouter",
             return_value=(chain_client, "google/gemini-3-flash-preview"),
+        ), patch(
+            "hermes_cli.config.load_config",
+            return_value={},
         ):
             from agent.auxiliary_client import _resolve_auto
 
