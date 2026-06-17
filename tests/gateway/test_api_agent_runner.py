@@ -82,6 +82,49 @@ def test_run_agent_sync_binds_principal_scope_and_sandbox_lease(tmp_path):
     assert usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
 
 
+def test_run_agent_sync_issues_persistent_sandbox_lease(tmp_path):
+    from gateway.session_scope_store import get_sandbox_lease
+
+    db = SessionDB(tmp_path / "state.db")
+    adapter = _FakeAdapter(db)
+    scope = {
+        "tenant_id": "tenant-1",
+        "workspace_id": "workspace-1",
+        "project_id": "project-1",
+        "user_id": "user-1",
+        "roles": ("member",),
+    }
+
+    try:
+        first, _ = run_agent_sync(
+            adapter,
+            user_message="hello",
+            conversation_history=[],
+            session_id="session-lease",
+            principal_scope=scope,
+        )
+        lease = get_sandbox_lease(db, "session-lease")
+        second, _ = run_agent_sync(
+            adapter,
+            user_message="again",
+            conversation_history=[],
+            session_id="session-lease",
+            principal_scope=scope,
+        )
+    finally:
+        db.close()
+
+    assert first["observed"]["sandbox_id"].startswith("sbx_")
+    assert lease is not None
+    assert lease["sandbox_id"] == first["observed"]["sandbox_id"]
+    assert lease["tenant_id"] == "tenant-1"
+    assert lease["workspace_id"] == "workspace-1"
+    assert lease["project_id"] == "project-1"
+    assert lease["user_id"] == "user-1"
+    assert lease["status"] == "active"
+    assert second["observed"]["sandbox_id"] == first["observed"]["sandbox_id"]
+
+
 def test_run_agent_sync_clears_context_after_turn(tmp_path):
     from agent.ultra_security import get_current_principal, get_current_sandbox_lease
 

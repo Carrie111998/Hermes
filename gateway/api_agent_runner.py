@@ -9,7 +9,11 @@ import uuid
 from typing import Any
 
 from gateway.session_acl import has_principal_scope
-from gateway.session_scope_store import bind_session_scope, inherit_or_bind_session_scope
+from gateway.session_scope_store import (
+    bind_session_scope,
+    inherit_or_bind_session_scope,
+    issue_or_refresh_sandbox_lease,
+)
 
 
 def run_agent_sync(
@@ -33,7 +37,18 @@ def run_agent_sync(
 ) -> tuple[dict[str, Any], dict[str, int]]:
     from gateway.session_context import clear_session_vars, set_session_vars
 
-    scope = principal_scope or {}
+    scope = dict(principal_scope or {})
+    if has_principal_scope(scope) and session_id:
+        db = adapter._ensure_session_db()
+        if db is None:
+            raise RuntimeError("Session database unavailable for scoped session binding")
+        bind_session_scope(db, session_id, scope)
+        lease = issue_or_refresh_sandbox_lease(db, session_id, scope)
+        if lease:
+            scope.setdefault("sandbox_id", lease["sandbox_id"])
+            scope.setdefault("sandbox_status", lease["status"])
+            scope.setdefault("sandbox_expires_at", lease["expires_at"])
+
     tokens = set_session_vars(
         platform="api_server",
         chat_id=session_id or "",
@@ -45,6 +60,8 @@ def run_agent_sync(
         user_id=str(scope.get("user_id") or ""),
         roles=scope.get("roles"),
         sandbox_id=str(scope.get("sandbox_id") or ""),
+        sandbox_status=str(scope.get("sandbox_status") or "active"),
+        sandbox_expires_at=scope.get("sandbox_expires_at"),
     )
     approval_token = None
     prompt_callbacks_enabled = bool(prompt_session_key and prompt_notify_callback)
@@ -128,6 +145,7 @@ def run_agent_sync(
                 raise RuntimeError("Session database unavailable for scoped session binding")
             if session_id:
                 bind_session_scope(db, session_id, scope)
+                issue_or_refresh_sandbox_lease(db, session_id, scope)
             if effective_session_id and effective_session_id != session_id:
                 inherit_or_bind_session_scope(
                     db,
@@ -135,6 +153,7 @@ def run_agent_sync(
                     scope=scope,
                     parent_session_id=session_id,
                 )
+                issue_or_refresh_sandbox_lease(db, effective_session_id, scope)
         return result, usage
     finally:
         if prompt_callbacks_enabled:
