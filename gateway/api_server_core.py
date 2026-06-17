@@ -37,6 +37,10 @@ class APIServerCoreMixin:
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Active session chat streams: session_id -> stream control state.
+        # Session ACL is still checked by the stop endpoint before this map is
+        # consulted, so callers cannot stop or probe another principal's run.
+        self._active_session_streams: Dict[str, Dict[str, Any]] = {}
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -319,6 +323,7 @@ class APIServerCoreMixin:
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        clarify_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -366,6 +371,7 @@ class APIServerCoreMixin:
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            clarify_callback=clarify_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -470,6 +476,9 @@ class APIServerCoreMixin:
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
+                "session_chat_stop": True,
+                "session_chat_approval": True,
+                "session_chat_prompt": True,
                 "session_fork": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -503,6 +512,9 @@ class APIServerCoreMixin:
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "session_chat_stop": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stop"},
+                "session_chat_approval": {"method": "POST", "path": "/api/sessions/{session_id}/chat/approval"},
+                "session_chat_prompt": {"method": "POST", "path": "/api/sessions/{session_id}/chat/prompt"},
             },
         })
 

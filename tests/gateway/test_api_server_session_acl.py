@@ -1,5 +1,6 @@
 """API-server multi-user session and response ACL tests."""
 
+import asyncio
 import logging
 import uuid
 from unittest.mock import AsyncMock, patch
@@ -44,6 +45,9 @@ def _app(adapter: APIServerAdapter, *, audit: bool = False) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
+    app.router.add_post("/api/sessions/{session_id}/chat/stop", adapter._handle_session_chat_stop)
+    app.router.add_post("/api/sessions/{session_id}/chat/approval", adapter._handle_session_chat_approval)
+    app.router.add_post("/api/sessions/{session_id}/chat/prompt", adapter._handle_session_chat_prompt)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -265,6 +269,188 @@ async def test_direct_atlas_image_stream_persists_inside_principal_scope(scoped_
     assert "req-stream-test" in joined
     assert "session.chat_stream" in joined
     assert "direct_image" in joined
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_emits_tool_lifecycle_events(scoped_adapter):
+    app = _app(scoped_adapter)
+
+    async def fake_run_agent(**kwargs):
+        kwargs["stream_delta_callback"]("hello ")
+        kwargs["tool_progress_callback"](
+            "tool.started",
+            tool_name="image_generate",
+            preview="Creating image",
+        )
+        kwargs["tool_progress_callback"](
+            "reasoning.available",
+            tool_name="_thinking",
+            preview="Planning",
+        )
+        kwargs["tool_progress_callback"](
+            "tool.completed",
+            tool_name="image_generate",
+            preview="Created image",
+        )
+        kwargs["prompt_notify_callback"]({
+            "kind": "clarify",
+            "request_id": "clarify-stream-tools",
+            "question": "Pick one",
+            "choices": ["A", "B"],
+        })
+        return (
+            {"final_response": "hello done", "session_id": "stream-tools"},
+            {"total_tokens": 2},
+        )
+
+    with patch.object(scoped_adapter, "_run_agent", side_effect=fake_run_agent):
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/api/sessions",
+                headers=_principal("user-a"),
+                json={"id": "stream-tools", "title": "Tools"},
+            )
+            assert create.status == 201
+
+            stream = await cli.post(
+                "/api/sessions/stream-tools/chat/stream",
+                headers=_principal("user-a"),
+                json={"message": "run a tool"},
+            )
+            body = await stream.text()
+
+    assert stream.status == 200
+    assert "event: assistant.delta" in body
+    assert "event: tool.started" in body
+    assert "event: tool.progress" in body
+    assert "event: tool.completed" in body
+    assert "event: clarify.request" in body
+    assert "hello done" in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stop_is_scoped_to_principal(scoped_adapter):
+    app = _app(scoped_adapter)
+
+    class FakeAgent:
+        interrupted = ""
+
+        def interrupt(self, message):
+            self.interrupted = message
+
+    async def sleeper():
+        await asyncio.sleep(30)
+
+    fake_agent = FakeAgent()
+    task = asyncio.create_task(sleeper())
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/api/sessions",
+                headers=_principal("user-a"),
+                json={"id": "stop-owned", "title": "Stop"},
+            )
+            assert create.status == 201
+            scoped_adapter._active_session_streams["stop-owned"] = {
+                "task": task,
+                "agent_ref": [fake_agent],
+                "run_id": "run-stop-owned",
+                "principal_scope": {},
+            }
+
+            denied = await cli.post(
+                "/api/sessions/stop-owned/chat/stop",
+                headers=_principal("user-b"),
+            )
+            allowed = await cli.post(
+                "/api/sessions/stop-owned/chat/stop",
+                headers=_principal("user-a"),
+            )
+            payload = await allowed.json()
+    finally:
+        task.cancel()
+
+    assert denied.status == 404
+    assert allowed.status == 200
+    assert payload["status"] == "stopping"
+    assert payload["run_id"] == "run-stop-owned"
+    assert fake_agent.interrupted == "Stop requested via API"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_approval_is_scoped_to_principal(scoped_adapter):
+    app = _app(scoped_adapter)
+
+    with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/api/sessions",
+                headers=_principal("user-a"),
+                json={"id": "approval-owned", "title": "Approval"},
+            )
+            assert create.status == 201
+            scoped_adapter._active_session_streams["approval-owned"] = {
+                "approval_session_key": "approval-key",
+                "run_id": "run-approval-owned",
+            }
+
+            denied = await cli.post(
+                "/api/sessions/approval-owned/chat/approval",
+                headers=_principal("user-b"),
+                json={"choice": "once"},
+            )
+            allowed = await cli.post(
+                "/api/sessions/approval-owned/chat/approval",
+                headers=_principal("user-a"),
+                json={"choice": "approve"},
+            )
+            payload = await allowed.json()
+
+    assert denied.status == 404
+    assert allowed.status == 200
+    assert payload["choice"] == "once"
+    assert payload["resolved"] == 1
+    mock_resolve.assert_called_once_with("approval-key", "once", resolve_all=False)
+
+
+@pytest.mark.asyncio
+async def test_session_chat_prompt_is_scoped_to_principal(scoped_adapter):
+    app = _app(scoped_adapter)
+    from tools.clarify_gateway import clear_session, register
+
+    register("prompt-owned-1", "prompt-key", "Need input?", None)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/api/sessions",
+                headers=_principal("user-a"),
+                json={"id": "prompt-owned", "title": "Prompt"},
+            )
+            assert create.status == 201
+            scoped_adapter._active_session_streams["prompt-owned"] = {
+                "prompt_session_key": "prompt-key",
+                "prompt_request_ids": {"prompt-owned-1"},
+                "run_id": "run-prompt-owned",
+            }
+
+            denied = await cli.post(
+                "/api/sessions/prompt-owned/chat/prompt",
+                headers=_principal("user-b"),
+                json={"request_id": "prompt-owned-1", "answer": "nope"},
+            )
+            allowed = await cli.post(
+                "/api/sessions/prompt-owned/chat/prompt",
+                headers=_principal("user-a"),
+                json={"request_id": "prompt-owned-1", "answer": "yes"},
+            )
+            payload = await allowed.json()
+    finally:
+        clear_session("prompt-key")
+
+    assert denied.status == 404
+    assert allowed.status == 200
+    assert payload["resolved"] is True
+    assert payload["request_id"] == "prompt-owned-1"
 
 
 @pytest.mark.asyncio

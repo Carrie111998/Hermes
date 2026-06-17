@@ -23,6 +23,10 @@ class APIServerRunsMixin:
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        approval_session_key: Optional[str] = None,
+        approval_notify_callback=None,
+        prompt_session_key: Optional[str] = None,
+        prompt_notify_callback=None,
         principal_scope: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
@@ -53,6 +57,10 @@ class APIServerRunsMixin:
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                approval_session_key=approval_session_key,
+                approval_notify_callback=approval_notify_callback,
+                prompt_session_key=prompt_session_key,
+                prompt_notify_callback=prompt_notify_callback,
                 principal_scope=principal_scope,
             )
 

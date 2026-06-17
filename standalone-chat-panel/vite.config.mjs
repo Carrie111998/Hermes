@@ -317,6 +317,10 @@ function panelAuthPlugin() {
           const auth = verifyPanelToken(req.headers.authorization || req.headers["x-ultra-auth"]);
           return forwardPanelApi(req, res, apiPrefix, auth);
         }
+        if (path === "/hermes/upload") {
+          const auth = verifyPanelToken(req.headers.authorization || req.headers["x-ultra-auth"]);
+          if (!auth) return sendJson(res, 401, { error: "not_authenticated" });
+        }
         next();
       });
     },

@@ -9,6 +9,7 @@ from __future__ import annotations
 from gateway.api_server_shared import *
 from gateway.api_server_core import APIServerCoreMixin
 from gateway.api_server_sessions import APIServerSessionsMixin
+from gateway.api_server_session_control import APIServerSessionControlMixin
 from gateway.api_server_chat import APIServerChatMixin
 from gateway.api_server_sse import APIServerSSEMixin
 from gateway.api_server_responses import APIServerResponsesMixin
@@ -20,6 +21,7 @@ from gateway.api_server_lifecycle import APIServerLifecycleMixin
 class APIServerAdapter(
     APIServerCoreMixin,
     APIServerSessionsMixin,
+    APIServerSessionControlMixin,
     APIServerChatMixin,
     APIServerSSEMixin,
     APIServerResponsesMixin,

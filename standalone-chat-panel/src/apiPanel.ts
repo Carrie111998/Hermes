@@ -1,5 +1,6 @@
 type Role = "user" | "assistant" | "system" | "tool";
-type Status = "idle" | "thinking" | "creating" | "streaming" | "error";
+type Status = "idle" | "thinking" | "creating" | "streaming" | "uploading" | "stopping" | "error";
+type ToolStatus = "running" | "done" | "error";
 
 interface UserProfile {
   username: string;
@@ -7,9 +8,15 @@ interface UserProfile {
   workspace: string;
   token: string;
 }
-interface Message { id: string; role: Role; text: string; streaming?: boolean }
+interface Message { id: string; role: Role; text: string; streaming?: boolean; attachments?: Attachment[]; toolId?: string }
 interface SessionRow { id: string; title?: string; preview?: string; message_count?: number; source?: string; started_at?: number }
-interface Attachment { id: string; name: string; dataUrl: string; previewUrl: string }
+interface Attachment { id: string; name: string; previewUrl: string; path: string; promptText: string; meta?: string }
+interface ToolCall { id: string; name: string; status: ToolStatus; preview?: string; summary?: string; error?: string }
+type PendingPrompt =
+  | { kind: "clarify"; requestId: string; runId?: string; question: string; choices?: string[] }
+  | { kind: "approval"; runId?: string; command: string; description: string }
+  | { kind: "sudo"; requestId: string; runId?: string }
+  | { kind: "secret"; requestId: string; runId?: string; prompt: string };
 
 class PanelHttpError extends Error {
   constructor(public status: number, public path: string, public body: unknown) {
@@ -35,6 +42,7 @@ const refs = {
   file: el("image-input") as HTMLInputElement,
   shelf: el("attachment-shelf"),
   error: el("error-banner"),
+  pending: el("pending-panel"),
   fresh: el("new-session") as HTMLButtonElement,
   history: el("history-list"),
   historyRefresh: el("refresh-history") as HTMLButtonElement,
@@ -50,6 +58,8 @@ let sessions: SessionRow[] = [];
 let sid = "";
 let messages: Message[] = [];
 let attachments: Attachment[] = [];
+let tools: ToolCall[] = [];
+let pendingPrompt: PendingPrompt | null = null;
 let runState: Status = "idle";
 let running = false;
 let seq = 0;
@@ -169,6 +179,7 @@ async function boot(): Promise<void> {
   runState = "idle";
   renderShell();
   try {
+    await refreshModels().catch(() => undefined);
     await refreshSessions();
     if (sessions[0]) {
       await openSession(sessions[0].id);
@@ -195,11 +206,14 @@ function renderShell(): void {
   renderMessages();
   renderHistory();
   renderAttachments();
+  renderPendingPrompt();
 }
 function labelForStatus(value: Status): string {
   if (value === "thinking") return "Thinking";
   if (value === "creating") return "Creating";
   if (value === "streaming") return "Streaming";
+  if (value === "uploading") return "Uploading";
+  if (value === "stopping") return "Stopping";
   if (value === "error") return "Error";
   return "Ready";
 }
@@ -226,6 +240,22 @@ async function refreshSessions(): Promise<void> {
   sessions = payload.data || [];
   renderHistory();
 }
+async function refreshModels(): Promise<void> {
+  const payload = await api<{ data?: Array<{ id?: string }> }>("/v1/models");
+  const models = (payload.data || [])
+    .map((item) => String(item.id || "").trim())
+    .filter(Boolean);
+  if (!models.length) return;
+  const current = refs.modelSelect.value;
+  refs.modelSelect.replaceChildren();
+  for (const value of models) {
+    const node = document.createElement("option");
+    node.value = value;
+    node.textContent = value;
+    refs.modelSelect.append(node);
+  }
+  if (models.includes(current)) refs.modelSelect.value = current;
+}
 async function newSession(): Promise<void> {
   await createSession(true);
 }
@@ -238,7 +268,11 @@ async function createSession(clearMessages: boolean): Promise<void> {
     }),
   });
   sid = payload.session.id;
-  if (clearMessages) messages = [];
+  if (clearMessages) {
+    messages = [];
+    tools = [];
+    pendingPrompt = null;
+  }
   await refreshSessions();
   renderShell();
 }
@@ -253,6 +287,8 @@ async function openSession(nextSid: string): Promise<void> {
     role: normalizeRole(msg.role),
     text: String(msg.content || ""),
   })).filter((msg) => msg.text);
+  tools = [];
+  pendingPrompt = null;
   renderShell();
 }
 function normalizeRole(role: unknown): Role {
@@ -269,7 +305,12 @@ async function submit(): Promise<void> {
   attachments = [];
   resizeInput();
   clearError();
-  messages.push({ id: id("user"), role: "user", text: text || `[${outbound.length} image attachment]` });
+  messages.push({
+    id: id("user"),
+    role: "user",
+    text: text || `[${outbound.length} image attachment]`,
+    attachments: outbound,
+  });
   const assistantId = id("assistant");
   messages.push({ id: assistantId, role: "assistant", text: "", streaming: true });
   running = true;
@@ -279,7 +320,9 @@ async function submit(): Promise<void> {
     await streamChat(assistantId, buildChatMessage(text, outbound));
     await refreshSessions();
   } catch (err) {
-    if (isSessionStreamFailure(err)) {
+    if (isAbortError(err)) {
+      finishAssistant(assistantId, "已停止。");
+    } else if (isSessionStreamFailure(err)) {
       const msg = messages.find((entry) => entry.id === assistantId);
       if (msg) msg.text = "当前会话不可用，已切换到新会话重试。";
       try {
@@ -301,10 +344,10 @@ async function submit(): Promise<void> {
 }
 function buildChatMessage(text: string, outbound: Attachment[]): unknown {
   if (!outbound.length) return text;
-  const parts: Array<Record<string, unknown>> = [];
-  if (text) parts.push({ type: "input_text", text });
-  for (const item of outbound) parts.push({ type: "input_image", image_url: item.dataUrl });
-  return parts;
+  return [...outbound.map((item) => item.promptText), text].filter(Boolean).join("\n\n");
+}
+function isAbortError(err: unknown): boolean {
+  return err instanceof DOMException && err.name === "AbortError";
 }
 async function streamChat(assistantId: string, message: unknown): Promise<void> {
   if (!me) throw new Error("not logged in");
@@ -346,16 +389,61 @@ function handleSseChunk(assistantId: string, chunk: string): void {
   const payload = safeJson(dataLines.join("\n"));
   if (!payload || typeof payload !== "object") return;
   const data = payload as Record<string, unknown>;
-  if (event === "assistant.delta") {
+  if (event === "run.started") {
+    runState = "thinking";
+  } else if (event === "message.started") {
+    runState = "streaming";
+  } else if (event === "assistant.delta") {
+    runState = "streaming";
     appendAssistant(assistantId, String(data.delta || ""));
   } else if (event === "assistant.completed") {
     finishAssistant(assistantId, String(data.content || ""));
+  } else if (event === "run.completed" || event === "done") {
+    pendingPrompt = null;
   } else if (event === "tool.started") {
-    runState = String(data.tool_name || "").includes("image") ? "creating" : "thinking";
-  } else if (event === "tool.failed" || event === "error") {
+    startTool(data);
+  } else if (event === "tool.progress" || event === "reasoning.available") {
+    updateTool(data);
+  } else if (event === "tool.completed") {
+    finishTool(data, false);
+  } else if (event === "tool.failed") {
+    finishTool(data, true);
+  } else if (event === "approval.request") {
+    pendingPrompt = {
+      kind: "approval",
+      runId: stringField(data, "run_id"),
+      command: stringField(data, "command"),
+      description: stringField(data, "description") || "Approval needed",
+    };
+  } else if (event === "clarify.request") {
+    pendingPrompt = {
+      kind: "clarify",
+      runId: stringField(data, "run_id"),
+      requestId: stringField(data, "request_id"),
+      question: stringField(data, "question") || "Clarification needed",
+      choices: arrayField(data, "choices"),
+    };
+  } else if (event === "sudo.request") {
+    pendingPrompt = { kind: "sudo", runId: stringField(data, "run_id"), requestId: stringField(data, "request_id") };
+  } else if (event === "secret.request") {
+    pendingPrompt = {
+      kind: "secret",
+      runId: stringField(data, "run_id"),
+      requestId: stringField(data, "request_id"),
+      prompt: stringField(data, "prompt") || "Secret required",
+    };
+  } else if (event === "error") {
     throw new Error(String(data.message || data.preview || "stream error"));
   }
   renderShell();
+}
+function stringField(data: Record<string, unknown>, key: string): string {
+  const value = data[key];
+  return typeof value === "string" ? value : "";
+}
+function arrayField(data: Record<string, unknown>, key: string): string[] | undefined {
+  const value = data[key];
+  return Array.isArray(value) ? value.map(String).filter(Boolean) : undefined;
 }
 function appendAssistant(messageId: string, delta: string): void {
   const msg = messages.find((entry) => entry.id === messageId);
@@ -366,6 +454,55 @@ function finishAssistant(messageId: string, content: string): void {
   if (!msg) return;
   if (content.trim()) msg.text = content;
   msg.streaming = false;
+}
+function startTool(data: Record<string, unknown>): void {
+  const name = stringField(data, "tool_name") || stringField(data, "tool") || "tool";
+  const preview = stringField(data, "preview") || stringField(data, "delta");
+  const tool: ToolCall = { id: id("tool"), name, status: "running", preview };
+  tools.push(tool);
+  tools = tools.slice(-20);
+  messages.push({
+    id: tool.id,
+    role: "tool",
+    text: toolText(tool),
+    streaming: true,
+    toolId: tool.id,
+  });
+  runState = name.includes("image") || name.includes("video") || name.includes("media") ? "creating" : "thinking";
+}
+function updateTool(data: Record<string, unknown>): void {
+  const name = stringField(data, "tool_name") || stringField(data, "tool") || "_thinking";
+  const preview = stringField(data, "preview") || stringField(data, "delta") || stringField(data, "text");
+  let tool = [...tools].reverse().find((item) => item.status === "running" && (item.name === name || name === "_thinking"));
+  if (!tool) {
+    tool = { id: id("tool"), name, status: "running" };
+    tools.push(tool);
+    messages.push({ id: tool.id, role: "tool", text: toolText(tool), streaming: true, toolId: tool.id });
+  }
+  if (preview) tool.preview = preview;
+  const msg = messages.find((entry) => entry.toolId === tool.id);
+  if (msg) msg.text = toolText(tool);
+  runState = "thinking";
+}
+function finishTool(data: Record<string, unknown>, failed: boolean): void {
+  const name = stringField(data, "tool_name") || stringField(data, "tool") || "tool";
+  const tool = [...tools].reverse().find((item) => item.status === "running" && item.name === name)
+    || [...tools].reverse().find((item) => item.status === "running");
+  if (!tool) return;
+  tool.status = failed ? "error" : "done";
+  tool.summary = stringField(data, "summary") || stringField(data, "preview") || (failed ? "" : `${tool.name} complete`);
+  tool.error = stringField(data, "error") || stringField(data, "message");
+  const msg = messages.find((entry) => entry.toolId === tool.id);
+  if (msg) {
+    msg.streaming = false;
+    msg.text = toolText(tool);
+  }
+  runState = failed ? "error" : "streaming";
+}
+function toolText(tool: ToolCall): string {
+  const state = tool.status === "running" ? "running" : tool.status;
+  const detail = tool.error || tool.summary || tool.preview || "";
+  return [`${tool.name} ${state}`, detail].filter(Boolean).join("\n");
 }
 
 function renderHistory(): void {
@@ -405,6 +542,11 @@ function renderMessages(): void {
     card.append(div("message-label", msg.role));
     const body = div("message-body", msg.text || labelForStatus(runState));
     card.append(body);
+    if (msg.attachments?.length) {
+      const list = div("message-attachments", "");
+      for (const item of msg.attachments) list.append(div("", item.name, "span"));
+      card.insertBefore(list, body);
+    }
     const media = mediaPreview(msg.text);
     if (media) card.append(media);
     refs.messages.append(card);
@@ -441,9 +583,77 @@ function renderAttachments(): void {
     const image = document.createElement("img");
     image.src = item.previewUrl;
     image.alt = "";
-    chip.append(image, div("", item.name, "span"));
+    chip.append(image, div("", item.meta ? `${item.name} / ${item.meta}` : item.name, "span"));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.title = "Remove";
+    remove.textContent = "x";
+    remove.addEventListener("click", () => {
+      attachments = attachments.filter((entry) => entry.id !== item.id);
+      URL.revokeObjectURL(item.previewUrl);
+      renderShell();
+    });
+    chip.append(remove);
     refs.shelf.append(chip);
   }
+}
+function renderPendingPrompt(): void {
+  refs.pending.replaceChildren();
+  refs.pending.hidden = !pendingPrompt;
+  if (!pendingPrompt) return;
+  refs.pending.append(div("", pendingPrompt.kind, "strong"));
+  if (pendingPrompt.kind === "approval") {
+    refs.pending.append(
+      div("", pendingPrompt.description || pendingPrompt.command, "p"),
+      promptButton("Approve once", () => answerApproval("once")),
+      promptButton("Approve session", () => answerApproval("session")),
+      promptButton("Deny", () => answerApproval("deny")),
+    );
+    return;
+  }
+  refs.pending.append(div("", promptText(pendingPrompt), "p"));
+  if (pendingPrompt.kind === "clarify" && pendingPrompt.choices?.length) {
+    for (const choice of pendingPrompt.choices) refs.pending.append(promptButton(choice, () => answerPrompt(choice)));
+    return;
+  }
+  const input = document.createElement("input");
+  input.type = pendingPrompt.kind === "clarify" ? "text" : "password";
+  input.autocomplete = "off";
+  refs.pending.append(input, promptButton("Send", () => answerPrompt(input.value)));
+}
+function promptText(prompt: PendingPrompt): string {
+  if (prompt.kind === "clarify") return prompt.question;
+  if (prompt.kind === "secret") return prompt.prompt;
+  return "Password";
+}
+function promptButton(text: string, fn: () => Promise<void>): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "prompt-action";
+  button.textContent = text;
+  button.addEventListener("click", () => void fn());
+  return button;
+}
+async function answerApproval(choice: "once" | "session" | "deny"): Promise<void> {
+  if (!pendingPrompt || pendingPrompt.kind !== "approval" || !sid) {
+    return showError("当前会话没有可响应的 approval。");
+  }
+  await api(`/api/sessions/${encodeURIComponent(sid)}/chat/approval`, {
+    method: "POST",
+    body: JSON.stringify({ choice }),
+  });
+  pendingPrompt = null;
+  renderShell();
+}
+async function answerPrompt(value: string): Promise<void> {
+  if (!pendingPrompt || pendingPrompt.kind === "approval" || !sid) return showError("当前会话没有可响应的 prompt。");
+  if (pendingPrompt.kind === "secret") return showError("Secret 捕获底层仍未接入多用户安全回调，本轮不提交密钥。");
+  await api(`/api/sessions/${encodeURIComponent(sid)}/chat/prompt`, {
+    method: "POST",
+    body: JSON.stringify({ request_id: pendingPrompt.requestId, answer: value, password: value }),
+  });
+  pendingPrompt = null;
+  renderShell();
 }
 function div(className: string, text: string, tag = "div"): HTMLElement {
   const node = document.createElement(tag);
@@ -457,14 +667,64 @@ function resizeInput(): void {
 }
 async function attachFile(file: File): Promise<void> {
   if (!file.type.startsWith("image/")) return showError("Only image files are accepted.");
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Could not read image"));
-    reader.onload = () => resolve(String(reader.result || ""));
-    reader.readAsDataURL(file);
-  });
-  attachments.push({ id: id("attach"), name: file.name || "image", dataUrl, previewUrl: URL.createObjectURL(file) });
+  runState = "uploading";
+  refs.attach.disabled = true;
   renderShell();
+  try {
+    const uploaded = await uploadFile(file);
+    const previewUrl = URL.createObjectURL(file);
+    const path = String(uploaded.path || "");
+    const name = String(uploaded.name || file.name || "image");
+    const meta = uploaded.size ? `${uploaded.size} bytes` : undefined;
+    attachments.push({
+      id: id("attach"),
+      name,
+      previewUrl,
+      path,
+      meta,
+      promptText: [
+        `[User attached image: ${name}]`,
+        `[Attached image path for tools: ${path}]`,
+      ].join("\n"),
+    });
+  } catch (err) {
+    showError(err);
+  } finally {
+    refs.attach.disabled = false;
+    if (runState === "uploading") runState = running ? "thinking" : "idle";
+    renderShell();
+  }
+}
+async function uploadFile(file: File): Promise<{ path?: string; name?: string; size?: number }> {
+  const res = await fetch("/hermes/upload", {
+    method: "POST",
+    headers: {
+      "Content-Type": file.type || "application/octet-stream",
+      "X-Hermes-Filename": file.name || "upload.png",
+      ...(me ? { "Authorization": `Bearer ${me.token}` } : {}),
+    },
+    body: file,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || !body?.path) throw new Error(typeof body === "string" ? body : "图片上传失败。");
+  return body;
+}
+
+async function stopRun(): Promise<void> {
+  if (!running) return;
+  runState = "stopping";
+  renderShell();
+  try {
+    if (sid) await api(`/api/sessions/${encodeURIComponent(sid)}/chat/stop`, { method: "POST" });
+  } catch (err) {
+    showError(err);
+  } finally {
+    aborter?.abort();
+  }
+}
+
+function attachDroppedFiles(files: FileList | File[]): void {
+  for (const file of Array.from(files).slice(0, 4)) void attachFile(file);
 }
 
 refs.form.addEventListener("submit", (event) => { event.preventDefault(); void submit(); });
@@ -475,16 +735,36 @@ refs.file.addEventListener("change", () => { const file = refs.file.files?.[0]; 
 refs.fresh.addEventListener("click", () => void newSession());
 refs.historyRefresh.addEventListener("click", () => void refreshSessions().catch(showError));
 refs.reconnect.addEventListener("click", () => void refreshSessions().catch(showError));
-refs.stop.addEventListener("click", () => aborter?.abort());
+refs.stop.addEventListener("click", () => void stopRun());
 refs.logout.addEventListener("click", () => {
   me = null;
   saveAuth(null);
   sid = "";
   sessions = [];
   messages = [];
+  tools = [];
+  pendingPrompt = null;
+  for (const item of attachments) URL.revokeObjectURL(item.previewUrl);
+  attachments = [];
   showLogin("已退出，可以切换账号。");
 });
 window.addEventListener("beforeunload", () => { for (const item of attachments) URL.revokeObjectURL(item.previewUrl); });
+for (const name of ["dragenter", "dragover"]) {
+  refs.form.addEventListener(name, (event) => {
+    event.preventDefault();
+    refs.form.classList.add("drop-active");
+  });
+}
+for (const name of ["dragleave", "drop"]) {
+  refs.form.addEventListener(name, (event) => {
+    event.preventDefault();
+    refs.form.classList.remove("drop-active");
+  });
+}
+refs.form.addEventListener("drop", (event) => {
+  const files = event.dataTransfer?.files;
+  if (files?.length) attachDroppedFiles(files);
+});
 
 for (const option of MODEL_OPTIONS) {
   const node = document.createElement("option");

@@ -25,6 +25,10 @@ def run_agent_sync(
     tool_complete_callback: Any = None,
     agent_ref: list | None = None,
     gateway_session_key: str | None = None,
+    approval_session_key: str | None = None,
+    approval_notify_callback: Any = None,
+    prompt_session_key: str | None = None,
+    prompt_notify_callback: Any = None,
     principal_scope: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     from gateway.session_context import clear_session_vars, set_session_vars
@@ -42,7 +46,56 @@ def run_agent_sync(
         roles=scope.get("roles"),
         sandbox_id=str(scope.get("sandbox_id") or ""),
     )
+    approval_token = None
+    prompt_callbacks_enabled = bool(prompt_session_key and prompt_notify_callback)
+
+    def _prompt(kind: str, payload: dict[str, Any], *, timeout: float) -> str:
+        from tools.clarify_gateway import register, wait_for_response
+
+        request_id = f"{kind}_{uuid.uuid4().hex}"
+        question = str(payload.get("question") or payload.get("prompt") or kind)
+        choices = payload.get("choices")
+        register(
+            request_id,
+            str(prompt_session_key or ""),
+            question,
+            list(choices) if isinstance(choices, list) else None,
+        )
+        notify_payload = dict(payload)
+        notify_payload.update({"kind": kind, "request_id": request_id})
+        prompt_notify_callback(notify_payload)
+        return wait_for_response(request_id, timeout) or ""
+
+    def _clarify_callback(question: str, choices=None) -> str:
+        if not prompt_callbacks_enabled:
+            return ""
+        return _prompt(
+            "clarify",
+            {"question": question, "choices": list(choices) if choices else None},
+            timeout=600,
+        )
+
+    def _sudo_callback() -> str:
+        if not prompt_callbacks_enabled:
+            return ""
+        return _prompt("sudo", {"prompt": "Sudo password required"}, timeout=120)
+
     try:
+        if approval_session_key:
+            from tools.approval import (
+                register_gateway_notify,
+                reset_current_session_key,
+                set_current_session_key,
+                unregister_gateway_notify,
+            )
+
+            approval_token = set_current_session_key(approval_session_key)
+            if approval_notify_callback is not None:
+                register_gateway_notify(approval_session_key, approval_notify_callback)
+        if prompt_callbacks_enabled:
+            from tools.terminal_tool import set_sudo_password_callback
+
+            set_sudo_password_callback(_sudo_callback)
         agent = adapter._create_agent(
             ephemeral_system_prompt=ephemeral_system_prompt,
             session_id=session_id,
@@ -51,6 +104,7 @@ def run_agent_sync(
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
             gateway_session_key=gateway_session_key,
+            clarify_callback=_clarify_callback if prompt_callbacks_enabled else None,
         )
         if agent_ref is not None:
             agent_ref[0] = agent
@@ -83,4 +137,17 @@ def run_agent_sync(
                 )
         return result, usage
     finally:
+        if prompt_callbacks_enabled:
+            from tools.clarify_gateway import clear_session
+            from tools.terminal_tool import set_sudo_password_callback
+
+            clear_session(str(prompt_session_key or ""))
+            set_sudo_password_callback(None)
+        if approval_session_key:
+            from tools.approval import reset_current_session_key, unregister_gateway_notify
+
+            if approval_notify_callback is not None:
+                unregister_gateway_notify(approval_session_key)
+            if approval_token is not None:
+                reset_current_session_key(approval_token)
         clear_session_vars(tokens)

@@ -567,6 +567,8 @@ class APIServerSessionsMixin:
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        approval_session_key = gateway_session_key or f"api-session:{session_id}:{run_id}"
+        prompt_session_key = f"api-session-prompts:{session_id}:{run_id}"
         seq = 0
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -603,6 +605,27 @@ class APIServerSessionsMixin:
                 event_name = event_type.replace("tool.", "tool.")
                 _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
 
+        def _approval_notify(approval_data: Dict[str, Any]) -> None:
+            payload = dict(approval_data or {})
+            payload.update({
+                "message_id": message_id,
+                "run_id": run_id,
+                "choices": ["once", "session", "always", "deny"],
+            })
+            _enqueue("approval.request", payload)
+
+        def _prompt_notify(prompt_data: Dict[str, Any]) -> None:
+            payload = dict(prompt_data or {})
+            kind = str(payload.pop("kind", "clarify") or "clarify")
+            request_id = str(payload.get("request_id") or "")
+            active = self._active_session_streams.get(session_id)
+            if active is not None and request_id:
+                active.setdefault("prompt_request_ids", set()).add(request_id)
+            payload.update({"message_id": message_id, "run_id": run_id})
+            _enqueue(f"{kind}.request", payload)
+
+        agent_ref: List[Any] = [None]
+
         async def _run_and_signal() -> None:
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
@@ -615,7 +638,12 @@ class APIServerSessionsMixin:
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    agent_ref=agent_ref,
                     gateway_session_key=gateway_session_key,
+                    approval_session_key=approval_session_key,
+                    approval_notify_callback=_approval_notify,
+                    prompt_session_key=prompt_session_key,
+                    prompt_notify_callback=_prompt_notify,
                     principal_scope=principal_scope,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
@@ -659,8 +687,21 @@ class APIServerSessionsMixin:
             finally:
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
+                current = self._active_session_streams.get(session_id)
+                if current and current.get("task") is asyncio.current_task():
+                    self._active_session_streams.pop(session_id, None)
 
         task = asyncio.create_task(_run_and_signal())
+        self._active_session_streams[session_id] = {
+            "task": task,
+            "agent_ref": agent_ref,
+            "run_id": run_id,
+            "approval_session_key": approval_session_key,
+            "prompt_session_key": prompt_session_key,
+            "prompt_request_ids": set(),
+            "principal_scope": principal_scope,
+            "started_at": time.time(),
+        }
         try:
             self._background_tasks.add(task)
         except TypeError:

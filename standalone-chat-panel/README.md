@@ -19,7 +19,7 @@
 - `standalone-chat-panel/src/main.ts`
   - 旧 WebSocket gateway 面板源码。
   - 当前不被 `standalone-chat-panel/index.html` 加载。
-  - 里面仍有未迁移功能：gateway JSON-RPC、工具进度、审批/澄清 prompt、server-side upload、动态模型列表、真实 interrupt。
+  - 作为迁移参考保留；当前产品入口已经迁走工具进度、server-side upload、动态模型、服务端 stop、approval 响应。
 - `web/src/pages/UltraStudioChatPage.tsx`
   - 旧 React 实验页源码。
   - 当前没有被 `web/src/App.tsx` 路由引用。
@@ -33,19 +33,20 @@
 - 多用户 session 列表、创建、打开。
 - `/panel-api` BFF 注入服务端身份 header。
 - `/api/sessions/:id/chat/stream` SSE 聊天。
-- 基础图片附件预览和请求携带。
+- 图片附件预览、拖拽上传、`/hermes/upload` 服务端落盘、路径注入 prompt。
 - 助手输出中的图片、视频 URL 预览。
-- 基础模型选择。
-- 客户端停止当前 stream。
+- `/v1/models` 动态模型列表。
+- `tool.started`、`tool.progress`、`tool.completed`、`tool.failed` 工具卡片。
+- `/api/sessions/:id/chat/stop` 服务端停止当前 stream。
+- `approval.request` pending panel 与 `/api/sessions/:id/chat/approval` 响应。
+- `clarify.request` / `sudo.request` pending panel 与 `/api/sessions/:id/chat/prompt` 响应。
 
 ## 尚未迁移的旧面板能力
 
 - 旧 gateway WebSocket 事件流和 JSON-RPC method 调用。
-- `clarify.request`、`approval.request`、`sudo.request`、`secret.request` 这类交互式 pending prompt。
-- `tool.started`、`tool.completed`、`tool.failed` 的完整工具卡片。
-- `/hermes/upload` 的服务端上传路径，以及 `input.detect_drop` / `image.attach` 附件注册。
-- 动态模型列表 `model.options` 和 `config.set`。
-- `session.interrupt` 服务端中断。
+- `secret.request` 的多用户安全捕获回调；当前 UI 能显示但不会提交密钥。
+- 旧 gateway 的 `input.detect_drop` / `image.attach` 精确附件注册；当前实现是 `/hermes/upload` 后把本地路径写入 prompt。
+- `config.set`；当前实现是每次 session/chat 请求携带 model，不改全局配置。
 - slash command。
 
 ## 运行关系
