@@ -28,8 +28,11 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, cast
 from urllib.parse import urlparse, parse_qs, urlunparse
+
+if TYPE_CHECKING:
+    from agent.rate_limit_tracker import RateLimitState
 
 from agent.context_compressor import ContextCompressor
 from agent.iteration_budget import IterationBudget
@@ -554,7 +557,11 @@ def init_agent(
             # the third-party identity-injection bug.
             from agent.anthropic_adapter import _is_oauth_token as _is_oat
             agent._is_anthropic_oauth = _is_oat(effective_key) if _is_native_anthropic else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+            agent._anthropic_client = build_anthropic_client(
+                effective_key,
+                cast(str, base_url),
+                timeout=cast(float, _provider_timeout),
+            )
             # No OpenAI client needed for Anthropic mode
             agent.client = None
             agent._client_kwargs = {}
@@ -610,13 +617,13 @@ def init_agent(
                 _query_params = {
                     k: v[0] for k, v in parse_qs(_parsed_url.query).items()
                 }
-                client_kwargs = {
+                client_kwargs: Dict[str, Any] = {
                     "api_key": api_key,
                     "base_url": _clean_url,
                     "default_query": _query_params,
                 }
             else:
-                client_kwargs = {"api_key": api_key, "base_url": base_url}
+                client_kwargs: Dict[str, Any] = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
             if agent.provider == "copilot-acp":
@@ -661,7 +668,7 @@ def init_agent(
             _routed_client, _ = resolve_provider_client(
                 agent.provider or "auto", model=agent.model, raw_codex=True)
             if _routed_client is not None:
-                client_kwargs = {
+                client_kwargs: Dict[str, Any] = {
                     "api_key": _routed_client.api_key,
                     "base_url": str(_routed_client.base_url),
                 }
@@ -711,14 +718,14 @@ def init_agent(
                                 _fb_explicit_key = os.getenv(_fb_key_env, "").strip() or None
                         _fb_client, _fb_model = resolve_provider_client(
                             _fb["provider"], model=_fb["model"], raw_codex=True,
-                            explicit_base_url=_fb.get("base_url"),
-                            explicit_api_key=_fb_explicit_key,
+                            explicit_base_url=cast(str, _fb.get("base_url")),
+                            explicit_api_key=cast(str, _fb_explicit_key),
                         )
                         if _fb_client is not None:
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
-                            client_kwargs = {
+                            client_kwargs: Dict[str, Any] = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),
                             }
@@ -755,7 +762,7 @@ def init_agent(
         # connection alive.
         _effective_base = str(client_kwargs.get("base_url", "")).lower()
         if base_url_host_matches(_effective_base, "openrouter.ai") and "claude" in (agent.model or "").lower():
-            headers = client_kwargs.get("default_headers") or {}
+            headers: Dict[str, Any] = client_kwargs.get("default_headers") or {}
             existing_beta = headers.get("x-anthropic-beta", "")
             _FINE_GRAINED = "fine-grained-tool-streaming-2025-05-14"
             if _FINE_GRAINED not in existing_beta:
@@ -1325,7 +1332,7 @@ def init_agent(
             protect_first_n=compression_protect_first,
             protect_last_n=compression_protect_last,
             summary_target_ratio=compression_target_ratio,
-            summary_model_override=None,
+            summary_model_override=cast(str, None),
             quiet_mode=agent.quiet_mode,
             base_url=agent.base_url,
             api_key=getattr(agent, "api_key", ""),

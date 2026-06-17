@@ -86,7 +86,7 @@ def _import_edge_tts():
         pass
     except Exception as e:
         raise ImportError(str(e))
-    import edge_tts
+    import edge_tts  # type: ignore
     return edge_tts
 
 def _import_elevenlabs():
@@ -107,7 +107,7 @@ def _import_elevenlabs():
         pass
     except Exception as e:  # FeatureUnavailable or any unexpected error
         raise ImportError(str(e))
-    from elevenlabs.client import ElevenLabs
+    from elevenlabs.client import ElevenLabs  # type: ignore
     return ElevenLabs
 
 def _import_openai_client():
@@ -117,7 +117,7 @@ def _import_openai_client():
 
 def _import_mistral_client():
     """Lazy import Mistral client. Returns the class or raises ImportError."""
-    from mistralai.client import Mistral
+    from mistralai.client import Mistral  # type: ignore
     return Mistral
 
 def _import_sounddevice():
@@ -128,7 +128,7 @@ def _import_sounddevice():
 
 def _import_kittentts():
     """Lazy import KittenTTS. Returns the class or raises ImportError."""
-    from kittentts import KittenTTS
+    from kittentts import KittenTTS  # type: ignore
     return KittenTTS
 
 
@@ -140,7 +140,7 @@ def _import_piper():
     wheels (Linux / macOS / Windows, x86_64 + ARM64) with embedded espeak-ng.
     Voice models (.onnx + .onnx.json) are downloaded on first use.
     """
-    from piper import PiperVoice
+    from piper import PiperVoice  # type: ignore
     return PiperVoice
 
 
@@ -1594,7 +1594,7 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
     audio = model.generate(text, voice=voice, speed=speed, clean_text=clean_text)
 
     # Save as WAV
-    import soundfile as sf
+    import soundfile as sf  # type: ignore
     wav_path = output_path
     if not output_path.endswith(".wav"):
         wav_path = output_path.rsplit(".", 1)[0] + ".wav"

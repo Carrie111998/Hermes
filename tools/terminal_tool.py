@@ -1170,7 +1170,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
         if disk > 0:
             try:
                 import inspect
-                import modal
+                import modal  # type: ignore
                 if "ephemeral_disk" in inspect.signature(modal.Sandbox.create).parameters:
                     sandbox_kwargs["ephemeral_disk"] = disk
             except Exception:
