@@ -1015,6 +1015,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
@@ -1063,6 +1064,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -3733,6 +3735,23 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Wire the genuine reasoning channel (agent.reasoning_callback) so the
+        # model's chain-of-thought streams as a distinct event, separate from
+        # the answer carried by message.delta. Fires as deltas while streaming
+        # or as one block in non-streaming mode (chat_completion_helpers).
+        def _reasoning_cb(text: Optional[str]) -> None:
+            if not text:
+                return
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "reasoning.delta",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "delta": text,
+                })
+            except Exception:
+                pass
+
         self._set_run_status(
             run_id,
             "queued",
@@ -3749,6 +3768,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    reasoning_callback=_reasoning_cb,
                     gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent
