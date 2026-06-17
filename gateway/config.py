@@ -155,6 +155,7 @@ class Platform(Enum):
     SMS = "sms"
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
+    API_SERVER_FLAGOPS = "api_server_flagops"
     WEBHOOK = "webhook"
     MSGRAPH_WEBHOOK = "msgraph_webhook"
     FEISHU = "feishu"
@@ -286,7 +287,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "api_server_flagops", "webhook")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -310,7 +311,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=_coerce_bool(notify, True),
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "api_server_flagops", "webhook"),
         )
 
 
@@ -470,6 +471,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
     Platform.API_SERVER: lambda cfg: True,
+    Platform.API_SERVER_FLAGOPS: lambda cfg: True,
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
@@ -1665,6 +1667,34 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # API Server (FlagOps) — independent OpenAI-compatible server, same code as
+    # API_SERVER but its own platform/enable flag so it can run alongside it.
+    api_server_flagops_enabled = os.getenv("API_SERVER_FLAGOPS_ENABLED", "").lower() in {"true", "1", "yes"}
+    api_server_flagops_key = os.getenv("API_SERVER_FLAGOPS_KEY", "")
+    api_server_flagops_cors_origins = os.getenv("API_SERVER_FLAGOPS_CORS_ORIGINS", "")
+    api_server_flagops_port = os.getenv("API_SERVER_FLAGOPS_PORT")
+    api_server_flagops_host = os.getenv("API_SERVER_FLAGOPS_HOST")
+    if api_server_flagops_enabled or api_server_flagops_key:
+        if Platform.API_SERVER_FLAGOPS not in config.platforms:
+            config.platforms[Platform.API_SERVER_FLAGOPS] = PlatformConfig()
+        config.platforms[Platform.API_SERVER_FLAGOPS].enabled = True
+        if api_server_flagops_key:
+            config.platforms[Platform.API_SERVER_FLAGOPS].extra["key"] = api_server_flagops_key
+        if api_server_flagops_cors_origins:
+            origins = [origin.strip() for origin in api_server_flagops_cors_origins.split(",") if origin.strip()]
+            if origins:
+                config.platforms[Platform.API_SERVER_FLAGOPS].extra["cors_origins"] = origins
+        if api_server_flagops_port:
+            try:
+                config.platforms[Platform.API_SERVER_FLAGOPS].extra["port"] = int(api_server_flagops_port)
+            except ValueError:
+                pass
+        if api_server_flagops_host:
+            config.platforms[Platform.API_SERVER_FLAGOPS].extra["host"] = api_server_flagops_host
+        api_server_flagops_model_name = os.getenv("API_SERVER_FLAGOPS_MODEL_NAME", "")
+        if api_server_flagops_model_name:
+            config.platforms[Platform.API_SERVER_FLAGOPS].extra["model_name"] = api_server_flagops_model_name
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}

@@ -8,3 +8,9 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# s6-overlay service definitions and init scripts are extensionless and are
+# read/exec'd inside the container. CRLF makes s6-rc-compile reject `type`
+# ("must be oneshot, longrun, or bundle") and breaks `run`/`finish`/cont-init.
+docker/s6-rc.d/**      text eol=lf
+docker/cont-init.d/**  text eol=lf

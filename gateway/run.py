@@ -2496,7 +2496,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         connected = self.config.get_connected_platforms()
-        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
+        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.API_SERVER_FLAGOPS, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
 
@@ -6624,6 +6624,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("API Server: aiohttp not installed")
                 return None
             return APIServerAdapter(config)
+
+        elif platform == Platform.API_SERVER_FLAGOPS:
+            from gateway.platforms.api_server_flagops import APIServerFlagOpsAdapter, check_api_server_flagops_requirements
+            if not check_api_server_flagops_requirements():
+                logger.warning("API Server (FlagOps): aiohttp not installed")
+                return None
+            return APIServerFlagOpsAdapter(config)
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
