@@ -140,6 +140,11 @@ _SENSITIVE_WRITE_TARGET = (
     rf'{_SHELL_RC_FILES}|'
     rf'{_CREDENTIAL_FILES})'
 )
+_USER_SENSITIVE_WRITE_TARGET = (
+    rf'(?:{_SSH_SENSITIVE_PATH}|'
+    rf'{_SHELL_RC_FILES}|'
+    rf'{_CREDENTIAL_FILES})'
+)
 _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
 _COMMAND_TAIL = r'(?:\s*(?:&&|\|\||;).*)?$'
 
@@ -354,6 +359,13 @@ DANGEROUS_PATTERNS = [
     # File copy/move/edit into sensitive system paths
     (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
     (rf'\b(cp|mv|install)\b.*\s["\']?{_PROJECT_SENSITIVE_WRITE_TARGET}["\']?{_COMMAND_TAIL}', "overwrite project env/config file"),
+    # In-place edits mutate the target file directly, bypassing redirection,
+    # tee, and copy/move/install coverage. Gate user-controlled startup and
+    # credential files so `sed -i ... ~/.bashrc` and `perl -i ...
+    # ~/.ssh/authorized_keys` cannot silently plant login commands or keys.
+    (rf'\bsed\s+-[^\s]*i.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path"),
+    (rf'\bsed\s+--in-place\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (long flag)"),
+    (rf'\b(?:perl|ruby)\b.*(?:^|\s)-[^\s]*i\b.*(?:{_USER_SENSITIVE_WRITE_TARGET})[^\s"\']*', "in-place edit of sensitive credential/SSH/shell-rc path (perl/ruby)"),
     (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
     (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
     # Script execution via heredoc — bypasses the -e/-c flag patterns above.
@@ -441,7 +453,26 @@ def _normalize_command_for_detection(command: str) -> str:
     command = command.replace('\x00', '')
     # Normalize Unicode (fullwidth Latin, halfwidth Katakana, etc.)
     command = unicodedata.normalize('NFKC', command)
+    # Fold the current user's resolved absolute home path into ~/ at detection
+    # time so static user-sensitive patterns catch /home/alice/.bashrc the same
+    # way they catch ~/.bashrc. Do not snapshot this at import time: tests and
+    # profile/session launchers can set HOME after this module is imported.
+    command = _rewrite_resolved_user_home(command)
     return command
+
+
+def _rewrite_resolved_user_home(command: str) -> str:
+    """Rewrite the current user's absolute home prefix to ``~/``."""
+    candidates = []
+    for candidate in (os.path.expanduser("~"), os.path.realpath(os.path.expanduser("~"))):
+        if candidate and candidate != "/" and candidate not in candidates:
+            candidates.append(candidate.rstrip("/"))
+
+    rewritten = command
+    for home in candidates:
+        pattern = re.escape(home) + r'(?=/|["\'\s;|&`]|$)'
+        rewritten = re.sub(pattern, "~", rewritten)
+    return rewritten
 
 
 def detect_dangerous_command(command: str) -> tuple:

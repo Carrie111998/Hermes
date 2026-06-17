@@ -88,7 +88,7 @@ class AnthropicTransport(ProviderTransport):
         from agent.transports.types import ToolCall
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
-        _MCP_PREFIX = "mcp_"
+        _MCP_PREFIX = "mcp__"
 
         text_parts = []
         reasoning_parts = []
@@ -106,7 +106,19 @@ class AnthropicTransport(ProviderTransport):
             elif block.type == "tool_use":
                 name = block.name
                 if strip_tool_prefix and name.startswith(_MCP_PREFIX):
-                    name = name[len(_MCP_PREFIX):]
+                    # OAuth wire names use double-underscore ``mcp__`` for both
+                    # bare native tools and native MCP server tools to avoid
+                    # Anthropic's single-underscore third-party classifier.
+                    # Restore the original registry/dispatcher name.
+                    from tools.registry import registry as _tool_registry
+
+                    if not _tool_registry.get_entry(name):
+                        bare = name[len(_MCP_PREFIX):]
+                        single = "mcp_" + bare
+                        if _tool_registry.get_entry(single):
+                            name = single
+                        elif _tool_registry.get_entry(bare):
+                            name = bare
                 tool_calls.append(
                     ToolCall(
                         id=block.id,

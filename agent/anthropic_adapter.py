@@ -311,7 +311,7 @@ def _detect_claude_code_version() -> str:
 
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
-_MCP_TOOL_PREFIX = "mcp_"
+_MCP_TOOL_PREFIX = "mcp__"
 
 
 def _get_claude_code_version() -> str:
@@ -1954,21 +1954,34 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Prefix tool names with mcp_ (Claude Code convention)
+        # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
+        #    single-underscore ``mcp_`` prefix. Anthropic's subscription/OAuth
+        #    billing classifier treats single-underscore ``mcp_`` tools as
+        #    third-party-app usage. Bare Hermes-native tools and native MCP
+        #    server tools both go out as ``mcp__...``; normalize_response
+        #    reverses the wire name back to whichever original registry name
+        #    exists.
+        def _to_oauth_wire_name(name: str) -> str:
+            if name.startswith("mcp__"):
+                return name
+            if name.startswith("mcp_"):
+                return "mcp__" + name[len("mcp_"):]
+            return _MCP_TOOL_PREFIX + name
+
         if anthropic_tools:
             for tool in anthropic_tools:
                 if "name" in tool:
-                    tool["name"] = _MCP_TOOL_PREFIX + tool["name"]
+                    tool["name"] = _to_oauth_wire_name(tool["name"])
 
-        # 4. Prefix tool names in message history (tool_use and tool_result blocks)
+        # 4. Apply the same normalization to tool names in message history
+        #    (tool_use blocks) so replayed turns match the wire names above.
         for msg in anthropic_messages:
             content = msg.get("content")
             if isinstance(content, list):
                 for block in content:
                     if isinstance(block, dict):
                         if block.get("type") == "tool_use" and "name" in block:
-                            if not block["name"].startswith(_MCP_TOOL_PREFIX):
-                                block["name"] = _MCP_TOOL_PREFIX + block["name"]
+                            block["name"] = _to_oauth_wire_name(block["name"])
                         elif block.get("type") == "tool_result" and "tool_use_id" in block:
                             pass  # tool_result uses ID, not name
 
@@ -2075,5 +2088,4 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
 

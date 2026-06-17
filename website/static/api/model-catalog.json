@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-05-11T16:41:16Z",
+  "updated_at": "2026-06-17T14:13:11Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -12,6 +12,10 @@
         "note": "Descriptions drive picker badges. Live /api/v1/models filters curated ids by tool-calling support and free pricing."
       },
       "models": [
+        {
+          "id": "anthropic/claude-fable-5",
+          "description": ""
+        },
         {
           "id": "anthropic/claude-opus-4.7",
           "description": ""
@@ -97,6 +101,10 @@
           "description": ""
         },
         {
+          "id": "z-ai/glm-5.2",
+          "description": ""
+        },
+        {
           "id": "z-ai/glm-5.1",
           "description": ""
         },
@@ -144,6 +152,9 @@
         "note": "Free-tier gating is determined live via Portal pricing (partition_nous_models_by_tier), not this manifest."
       },
       "models": [
+        {
+          "id": "anthropic/claude-fable-5"
+        },
         {
           "id": "anthropic/claude-opus-4.7"
         },
@@ -203,6 +214,9 @@
         },
         {
           "id": "minimax/minimax-m2.7"
+        },
+        {
+          "id": "z-ai/glm-5.2"
         },
         {
           "id": "z-ai/glm-5.1"
