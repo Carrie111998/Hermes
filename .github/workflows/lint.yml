@@ -44,10 +44,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081  # v5
 
-      - name: Install ruff + ty
+      - name: Install dependencies and tools
         run: |
           uv tool install ruff
           uv tool install ty
+          uv python install 3.13
+          uv venv .venv --python 3.13
+          source .venv/bin/activate
+          uv pip install -e ".[all]"
 
       - name: Determine base ref
         id: base
@@ -71,7 +75,7 @@ jobs:
           mkdir -p .lint-reports/head
           ruff check --output-format json --exit-zero \
             > .lint-reports/head/ruff.json || true
-          ty check --output-format gitlab --exit-zero \
+          ty check --python .venv/bin/python --output-format gitlab --exit-zero \
             > .lint-reports/head/ty.json || true
           echo "HEAD ruff: $(wc -c < .lint-reports/head/ruff.json) bytes"
           echo "HEAD ty:   $(wc -c < .lint-reports/head/ty.json) bytes"
@@ -94,7 +98,7 @@ jobs:
               cd /tmp/lint-base
               ruff check --output-format json --exit-zero \
                 > "$GITHUB_WORKSPACE/.lint-reports/base/ruff.json" || true
-              ty check --output-format gitlab --exit-zero \
+              ty check --python "$GITHUB_WORKSPACE/.venv/bin/python" --output-format gitlab --exit-zero \
                 > "$GITHUB_WORKSPACE/.lint-reports/base/ty.json" || true
             )
             git worktree remove --force /tmp/lint-base
