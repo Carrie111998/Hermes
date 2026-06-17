@@ -13,15 +13,11 @@
 
 当前入口只做一件事：把用户输入、上传、模型切换、审批、澄清、密钥输入等事件转发给真实 Hermes gateway。前端不根据关键词直接生成图片/视频，也不调用 Atlas/FAL/其它媒体 API。
 
-## 不再作为产品入口，但保留为迁移参考的 UI
+## 不再作为产品入口的 UI
 
 - `web/src/pages/ChatPage.tsx`
   - Hermes 自带 dashboard 的 PTY/TUI 调试入口。
   - 只作为 Hermes 原生管理面板保留，不作为 Ultra Studio 产品 UI。
-- `standalone-chat-panel/src/apiPanel.ts`
-  - 旧 API/SSE 多用户面板源码。
-  - 当前不被 `standalone-chat-panel/index.html` 加载。
-  - 保留为后续多用户 BFF 迁移参考，不能作为当前产品入口。
 - `web/src/pages/UltraStudioChatPage.tsx`
   - 旧 React 实验页源码。
   - 当前没有被 `web/src/App.tsx` 路由引用。
@@ -51,9 +47,4 @@
 - `/hermes/upload` 代理到 `9119 /api/chat/uploads`。
 - `/hermes/status` 代理到 `9119 /api/status`。
 
-`9120` API server 和 `/panel-api` 仍可用于后续多用户 BFF 验证，但不是当前默认聊天入口。
-
-## 旧 API 面板测试账号
-
-- `alice / alice123`
-- `bob / bob123`
+默认面板不提供本地测试账号、不注入伪造 principal，也不代理 `/panel-api` 或 `/hermes-api`。多用户身份应由真实服务端认证层进入 Hermes gateway，而不是由前端开发服务器模拟。
