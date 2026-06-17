@@ -17,6 +17,7 @@ export interface PanelAuthState {
 export interface PanelAuthStatus {
   configured?: boolean;
   needs_bootstrap?: boolean;
+  signup_enabled?: boolean;
   api_server_url?: string;
   user_count?: number;
 }
@@ -85,6 +86,19 @@ export async function authBootstrap(input: {
   workspace?: string;
 }): Promise<PanelAuthState> {
   const body = await authFetch<{ token: string; user: PanelUser }>("/panel-auth/bootstrap", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return { token: body.token, user: normalizeUser(body.user) };
+}
+
+export async function authSignup(input: {
+  username: string;
+  password: string;
+  label?: string;
+  workspace?: string;
+}): Promise<PanelAuthState> {
+  const body = await authFetch<{ token: string; user: PanelUser }>("/panel-auth/signup", {
     method: "POST",
     body: JSON.stringify(input),
   });

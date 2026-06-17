@@ -122,6 +122,8 @@
       .auth-card label { display: block; margin: .8rem 0 .3rem; color: var(--dim); font-size: .7rem; text-transform: uppercase; }
       .auth-card input, .auth-card button { width: 100%; padding: .75rem; color: var(--ink); background: var(--field); border: 1px solid var(--line); border-radius: .45rem; }
       .auth-card button { margin-top: 1rem; color: #071113; background: var(--cyan); border-color: var(--cyan); }
+      .auth-card .auth-secondary { color: var(--muted); background: transparent; border-color: var(--line); }
+      .auth-card .auth-secondary:hover { color: var(--cyan); border-color: rgba(139,221,227,.5); }
       @media (max-width: 1040px) { .shell { grid-template-columns: minmax(14rem,17rem) minmax(0,1fr); } }
       @media (max-width: 700px) { .shell { display: block; } .rail { display: none; } .workspace { height: 100vh; } .topbar { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: flex-start; gap: .75rem; padding: 1rem; } .topbar h1 { font-size: 1.35rem; } .runtime-strip { flex-wrap: nowrap; justify-content: flex-end; gap: .4rem; } .status-pill { max-width: 7.5rem; padding: .5rem .6rem; } .icon-button { width: 2.35rem; height: 2.35rem; } .messages { padding: 1rem; } .message, .message.system, .message.tool { width: 100%; } .composer { margin: 0 1rem 1rem; } }
     </style>

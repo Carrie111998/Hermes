@@ -39,6 +39,9 @@ class PanelBff {
     if (url.pathname === "/panel-auth/login" && req.method === "POST") {
       return this.handleLogin(req, res);
     }
+    if (url.pathname === "/panel-auth/signup" && req.method === "POST") {
+      return this.handleSignup(req, res);
+    }
     if (url.pathname === "/panel-auth/me") {
       return this.handleMe(req, res);
     }
@@ -94,6 +97,25 @@ class PanelBff {
     }
     logDecision("auth.login", "allowed", { username: login.user.username, workspace_id: login.user.workspace_id });
     sendJson(res, 200, login);
+    return true;
+  }
+
+  async handleSignup(req, res) {
+    if (process.env.HERMES_PANEL_ALLOW_SIGNUP !== "1") {
+      logDecision("auth.signup", "denied", { reason: "signup_disabled" });
+      sendJson(res, 403, { error: { message: "signup_disabled" } });
+      return true;
+    }
+    const body = await readJsonBody(req);
+    try {
+      const user = this.authStore.createUser(body);
+      const login = this.authStore.login(body.username, body.password);
+      logDecision("auth.signup", "allowed", { username: user.username, workspace_id: user.workspace_id });
+      sendJson(res, 201, { user: login.user, token: login.token });
+    } catch (error) {
+      logDecision("auth.signup", "denied", { reason: error instanceof Error ? error.message : "signup_failed" });
+      sendJson(res, 400, { error: { message: error instanceof Error ? error.message : "signup_failed" } });
+    }
     return true;
   }
 

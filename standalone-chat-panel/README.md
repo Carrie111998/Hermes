@@ -29,7 +29,7 @@
 
 ## 当前 WebSocket 入口能力
 
-- `panel-auth/status`、`panel-auth/bootstrap`、`panel-auth/login`、`panel-auth/me`。
+- `panel-auth/status`、`panel-auth/bootstrap`、`panel-auth/signup`、`panel-auth/login`、`panel-auth/me`。
 - 登录后浏览器 WebSocket 连接 `/hermes/ws?token=...`，token 是 BFF 颁发的不透明 session token。
 - BFF 从 SQLite 用户表解析 `tenant_id/workspace_id/project_id/user_id/roles`，再向 Hermes API Server 注入 `X-Hermes-*` principal headers。
 - `session.create`、`session.list`、`session.resume`。
@@ -70,4 +70,10 @@ cd standalone-chat-panel
 API_SERVER_KEY=sk-local npm run dev
 ```
 
-第一次打开 `http://127.0.0.1:9131/` 时会出现 bootstrap 表单，用来创建第一个账号。SQLite 是 P0 存储实现；后续迁移 MySQL 时应替换 `panelAuth.mjs` 的 store adapter，而不是改变浏览器协议或让浏览器传 principal。
+第一次打开 `http://127.0.0.1:9131/` 时会出现 bootstrap 表单，用来创建第一个账号。要在本地继续创建多个测试用户，启动面板时加：
+
+```bash
+HERMES_PANEL_ALLOW_SIGNUP=1 API_SERVER_KEY=sk-local npm run dev
+```
+
+SQLite 是 P0 存储实现；后续迁移 MySQL 时应替换 `panelAuth.mjs` 的 store adapter，而不是改变浏览器协议或让浏览器传 principal。
