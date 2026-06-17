@@ -32,7 +32,11 @@ def test_atlas_unavailable_without_key(monkeypatch):
     from plugins.video_gen.atlas import AtlasVideoGenProvider
 
     monkeypatch.delenv("ATLAS_API_KEY", raising=False)
+    monkeypatch.delenv("ATLAS_DEV_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("ATLAS_API_BASE", raising=False)
+    monkeypatch.delenv("ATLAS_BASE_URL", raising=False)
+    monkeypatch.delenv("ATLAS_INTERNAL_ENV", raising=False)
 
     assert AtlasVideoGenProvider().is_available() is False
 
@@ -41,11 +45,40 @@ def test_atlas_generate_requires_key(monkeypatch):
     from plugins.video_gen.atlas import AtlasVideoGenProvider
 
     monkeypatch.delenv("ATLAS_API_KEY", raising=False)
+    monkeypatch.delenv("ATLAS_DEV_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("ATLAS_API_BASE", raising=False)
+    monkeypatch.delenv("ATLAS_BASE_URL", raising=False)
+    monkeypatch.delenv("ATLAS_INTERNAL_ENV", raising=False)
 
     result = AtlasVideoGenProvider().generate("a dog running")
     assert result["success"] is False
     assert result["error_type"] == "auth_required"
+
+
+def test_resolve_credentials_prefers_dev_key_for_dev_base(monkeypatch):
+    from plugins.video_gen.atlas import client
+
+    monkeypatch.setenv("ATLAS_API_BASE", "https://api.dev.atlascloud.ai/v1")
+    monkeypatch.setenv("ATLAS_API_KEY", "prod-key")
+    monkeypatch.setenv("ATLAS_DEV_API_KEY", "dev-key")
+
+    key, root = client.resolve_credentials()
+
+    assert key == "dev-key"
+    assert root == "https://api.dev.atlascloud.ai"
+
+
+def test_headers_include_extra_api_header(monkeypatch):
+    from plugins.video_gen.atlas import client
+
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_NAME", "atlas")
+    monkeypatch.setenv("ATLAS_API_EXTRA_HEADER_VALUE", "gateway-secret")
+
+    headers = client.headers("api-key")
+
+    assert headers["Authorization"] == "Bearer api-key"
+    assert headers["atlas"] == "gateway-secret"
 
 
 def test_payload_uses_top_level_atlas_image_data_uri(tmp_path):

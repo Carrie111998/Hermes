@@ -39,27 +39,49 @@ _EXT_BY_MIME = {
 }
 
 
+def _is_internal_dev(base: str) -> bool:
+    env = (os.environ.get("ATLAS_INTERNAL_ENV") or "").strip().lower()
+    return env in {"dev", "development", "internal-dev"} or "api.dev.atlascloud.ai" in base
+
+
 def resolve_credentials() -> Tuple[str, str]:
-    key = (
-        os.environ.get("ATLAS_API_KEY")
-        or os.environ.get("LLM_API_KEY")
-        or ""
-    ).strip()
     base = (
         os.environ.get("ATLAS_API_BASE")
         or os.environ.get("ATLAS_BASE_URL")
         or DEFAULT_API_BASE
     ).strip().rstrip("/")
+    if _is_internal_dev(base):
+        key = (
+            os.environ.get("ATLAS_DEV_API_KEY")
+            or os.environ.get("ATLAS_API_KEY")
+            or os.environ.get("LLM_API_KEY")
+            or ""
+        ).strip()
+    else:
+        key = (
+            os.environ.get("ATLAS_API_KEY")
+            or os.environ.get("LLM_API_KEY")
+            or ""
+        ).strip()
     root = base[:-3] if base.endswith("/v1") else base
     return key, root
 
 
 def headers(api_key: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {api_key}",
+    values = {
         "Content-Type": "application/json",
         "User-Agent": "hermes-agent/image_gen_atlas",
     }
+    extra_name = (os.environ.get("ATLAS_API_EXTRA_HEADER_NAME") or "").strip()
+    extra_value = (os.environ.get("ATLAS_API_EXTRA_HEADER_VALUE") or "").strip()
+    if extra_name and extra_value and extra_name.lower() not in {
+        "authorization",
+        "content-type",
+        "user-agent",
+    }:
+        values[extra_name] = extra_value
+    values["Authorization"] = f"Bearer {api_key}"
+    return values
 
 
 def normalize_aspect_ratio(value: str) -> str:
