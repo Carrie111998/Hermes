@@ -1,6 +1,7 @@
 """API-server multi-user session and response ACL tests."""
 
 import asyncio
+import json
 import logging
 import uuid
 from unittest.mock import AsyncMock, patch
@@ -348,6 +349,54 @@ async def test_session_chat_stream_emits_tool_lifecycle_events(scoped_adapter):
     assert "event: tool.completed" in body
     assert "event: clarify.request" in body
     assert "hello done" in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_emits_failed_tool_when_result_is_error(scoped_adapter):
+    app = _app(scoped_adapter)
+
+    async def fake_run_agent(**kwargs):
+        kwargs["tool_progress_callback"](
+            "tool.started",
+            tool_name="image_generate",
+            preview="Creating image",
+        )
+        kwargs["tool_progress_callback"](
+            "tool.completed",
+            tool_name="image_generate",
+            result=json.dumps({
+                "success": False,
+                "error": "Tool blocked by policy",
+                "reason": "insufficient_role",
+            }),
+            is_error=True,
+        )
+        return (
+            {"final_response": "could not generate", "session_id": "failed-tool"},
+            {"total_tokens": 2},
+        )
+
+    with patch.object(scoped_adapter, "_run_agent", side_effect=fake_run_agent):
+        async with TestClient(TestServer(app)) as cli:
+            create = await cli.post(
+                "/api/sessions",
+                headers=_principal("user-a"),
+                json={"id": "failed-tool", "title": "Failed tool"},
+            )
+            assert create.status == 201
+
+            stream = await cli.post(
+                "/api/sessions/failed-tool/chat/stream",
+                headers=_principal("user-a"),
+                json={"message": "帮我生成一个猫的图片"},
+            )
+            body = await stream.text()
+
+    assert stream.status == 200
+    assert "event: tool.started" in body
+    assert "event: tool.failed" in body
+    assert "Tool blocked by policy" in body
+    assert "insufficient_role" in body
 
 
 @pytest.mark.asyncio

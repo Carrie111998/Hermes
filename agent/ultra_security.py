@@ -44,6 +44,8 @@ HIGH_RISK_TOOLS = frozenset(
 
 WRITE_TOOLS = frozenset({"write_file", "patch", "memory", "todo"})
 SANDBOX_LEASE_REQUIRED_TOOLS = frozenset({"terminal", "execute_code"})
+HIGH_RISK_ROLES = frozenset({"owner", "admin", "member"})
+MEDIA_GENERATE_ROLES = frozenset({"owner", "admin", "member", "creator"})
 
 
 @dataclass(frozen=True)
@@ -286,9 +288,8 @@ class PolicyChecker:
                 sandbox_id=request.sandbox_id,
             )
 
-        if risk in {"high", "write"} and not set(roles).intersection(
-            {"owner", "admin", "member"}
-        ):
+        allowed_roles = MEDIA_GENERATE_ROLES if action == "media.generate" else HIGH_RISK_ROLES
+        if risk in {"high", "write"} and not set(roles).intersection(allowed_roles):
             return self._decision(
                 decision_id,
                 False,

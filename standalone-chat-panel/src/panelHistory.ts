@@ -41,7 +41,8 @@ interface PanelHistoryControllerOptions {
 const CACHE_KEY = "ultra-studio-agent.history.v1";
 
 export function createPanelHistoryController(options: PanelHistoryControllerOptions) {
-  let rows = loadPanelHistoryCache();
+  let cacheScope = "anonymous";
+  let rows = loadPanelHistoryCache(cacheScope);
   let activeId = "";
 
   const render = () => {
@@ -67,7 +68,7 @@ export function createPanelHistoryController(options: PanelHistoryControllerOpti
     try {
       const result = await options.request<PanelHistoryListResult>("session.list", { limit: 40 }, 15_000);
       rows = mergePanelHistory(normalizePanelHistory(result.sessions), rows);
-      savePanelHistoryCache(rows);
+      savePanelHistoryCache(rows, cacheScope);
     } catch (err) {
       options.onError(`history refresh failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -80,12 +81,19 @@ export function createPanelHistoryController(options: PanelHistoryControllerOpti
     const sid = options.getSessionId();
     if (!sid) return;
     rows = mergePanelHistory([rowFromPanelMessages(activeId || sid, options.getMessages(), seed)], rows);
-    savePanelHistoryCache(rows);
+    savePanelHistoryCache(rows, cacheScope);
     render();
   };
 
   const setActive = (id: string) => {
     activeId = id;
+    render();
+  };
+
+  const setCacheScope = (scope: string) => {
+    cacheScope = scope || "anonymous";
+    rows = loadPanelHistoryCache(cacheScope);
+    activeId = "";
     render();
   };
 
@@ -113,7 +121,7 @@ export function createPanelHistoryController(options: PanelHistoryControllerOpti
 
   options.refreshButton.addEventListener("click", () => void refresh());
   render();
-  return { render, refresh, remember, setActive, ensureActive };
+  return { render, refresh, remember, setActive, setCacheScope, ensureActive };
 }
 
 export function normalizePanelHistory(input: unknown): PanelHistoryRow[] {
@@ -135,20 +143,24 @@ export function normalizePanelHistory(input: unknown): PanelHistoryRow[] {
   return rows;
 }
 
-export function loadPanelHistoryCache(): PanelHistoryRow[] {
+export function loadPanelHistoryCache(scope = "anonymous"): PanelHistoryRow[] {
   try {
-    return normalizePanelHistory(JSON.parse(localStorage.getItem(CACHE_KEY) || "[]"));
+    return normalizePanelHistory(JSON.parse(localStorage.getItem(cacheKey(scope)) || "[]"));
   } catch {
     return [];
   }
 }
 
-export function savePanelHistoryCache(rows: PanelHistoryRow[]): void {
+export function savePanelHistoryCache(rows: PanelHistoryRow[], scope = "anonymous"): void {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify(rows.slice(0, 50)));
+    localStorage.setItem(cacheKey(scope), JSON.stringify(rows.slice(0, 50)));
   } catch {
     return;
   }
+}
+
+function cacheKey(scope: string): string {
+  return `${CACHE_KEY}:${scope || "anonymous"}`;
 }
 
 export function mergePanelHistory(primary: PanelHistoryRow[], secondary: PanelHistoryRow[] = []): PanelHistoryRow[] {

@@ -64,6 +64,8 @@ environments/benchmarks/evals/
 
 # Web UI build output
 hermes_cli/web_dist/
+standalone-chat-panel/dist/
+standalone-chat-panel/.ultra-studio-panel-auth.sqlite*
 apps/desktop/build/
 apps/desktop/dist/
 apps/desktop/release/

@@ -10,6 +10,51 @@ from gateway.api_server_audit import log_api_decision, request_id_headers
 from gateway.principal_headers import parse_principal_scope_headers
 
 
+_API_SERVER_CLI_INHERITED_TOOLSETS = frozenset({"video_gen"})
+
+
+def _resolve_api_server_toolsets(
+    user_config: dict,
+    *,
+    include_default_mcp_servers: bool = True,
+) -> List[str]:
+    """Resolve the API-server agent toolsets.
+
+    The API server predates the standalone creative web panel, so its
+    built-in composite intentionally omits default-off interactive media
+    tools.  When the user has not configured ``platform_toolsets.api_server``
+    explicitly, mirror the CLI's enabled video generation switch so the web
+    agent can do the same creative work as the local agent.  A saved
+    ``api_server`` list remains authoritative.
+    """
+    from hermes_cli.tools_config import _get_platform_tools
+
+    config = user_config if isinstance(user_config, dict) else {}
+    enabled = set(
+        _get_platform_tools(
+            config,
+            "api_server",
+            include_default_mcp_servers=include_default_mcp_servers,
+        )
+    )
+    platform_toolsets = config.get("platform_toolsets") or {}
+    api_server_explicit = (
+        isinstance(platform_toolsets, dict)
+        and "api_server" in platform_toolsets
+    )
+    if not api_server_explicit:
+        cli_enabled = set(
+            _get_platform_tools(
+                config,
+                "cli",
+                include_default_mcp_servers=include_default_mcp_servers,
+            )
+        )
+        enabled.update(_API_SERVER_CLI_INHERITED_TOOLSETS & cli_enabled)
+
+    return sorted(enabled)
+
+
 class APIServerCoreMixin:
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
@@ -342,14 +387,13 @@ class APIServerCoreMixin:
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
-        from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = _resolve_api_server_toolsets(user_config)
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
 
@@ -566,17 +610,12 @@ class APIServerCoreMixin:
             from hermes_cli.config import load_config
             from hermes_cli.tools_config import (
                 _get_effective_configurable_toolsets,
-                _get_platform_tools,
                 _toolset_has_keys,
             )
             from toolsets import resolve_toolset
 
             config = load_config()
-            enabled_toolsets = _get_platform_tools(
-                config,
-                "api_server",
-                include_default_mcp_servers=False,
-            )
+            enabled_toolsets = set(_resolve_api_server_toolsets(config, include_default_mcp_servers=False))
             data: List[Dict[str, Any]] = []
             for name, label, desc in _get_effective_configurable_toolsets():
                 try:

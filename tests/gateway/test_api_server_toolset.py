@@ -63,6 +63,30 @@ class TestApiServerPlatformConfig:
         assert "api_server" in PLATFORMS
         assert PLATFORMS["api_server"]["default_toolset"] == "hermes-api-server"
 
+    def test_api_server_inherits_cli_video_gen_when_not_explicit(self):
+        from gateway.api_server_core import _resolve_api_server_toolsets
+
+        config = {"platform_toolsets": {"cli": ["hermes-cli", "video_gen"]}}
+
+        toolsets = _resolve_api_server_toolsets(config, include_default_mcp_servers=False)
+
+        assert "image_gen" in toolsets
+        assert "video_gen" in toolsets
+
+    def test_api_server_explicit_toolsets_do_not_inherit_cli_video_gen(self):
+        from gateway.api_server_core import _resolve_api_server_toolsets
+
+        config = {
+            "platform_toolsets": {
+                "cli": ["hermes-cli", "video_gen"],
+                "api_server": ["web", "terminal"],
+            }
+        }
+
+        toolsets = _resolve_api_server_toolsets(config, include_default_mcp_servers=False)
+
+        assert sorted(toolsets) == ["terminal", "web"]
+
 
 class TestApiServerAdapterToolset:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)

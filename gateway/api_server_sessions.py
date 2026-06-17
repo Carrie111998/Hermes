@@ -5,6 +5,8 @@ This module is mechanically split from gateway.platforms.api_server.
 
 from __future__ import annotations
 
+import json
+
 from gateway.session_acl import has_principal_scope
 from gateway.api_server_audit import log_api_decision, request_id_headers
 from gateway.session_scope_store import (
@@ -516,8 +518,28 @@ class APIServerSessionsMixin:
             if event_type == "reasoning.available":
                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
             elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
-                event_name = event_type.replace("tool.", "tool.")
-                _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+                is_error = bool(kwargs.get("is_error")) or event_type == "tool.failed"
+                result = kwargs.get("result")
+                error_text = ""
+                if is_error and isinstance(result, str):
+                    error_text = result[:500]
+                    try:
+                        parsed = json.loads(result)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        reason = str(parsed.get("reason") or parsed.get("error_type") or "")
+                        message = str(parsed.get("error") or "")
+                        error_text = ": ".join(part for part in (message, reason) if part) or error_text
+                event_name = "tool.failed" if is_error else event_type
+                payload = {
+                    "message_id": message_id,
+                    "tool_name": tool_name,
+                    "preview": error_text or preview,
+                    "args": args,
+                    "is_error": is_error,
+                }
+                _enqueue(event_name, payload)
 
         def _approval_notify(approval_data: Dict[str, Any]) -> None:
             payload = dict(approval_data or {})

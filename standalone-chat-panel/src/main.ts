@@ -8,12 +8,22 @@ import {
   createPanelModelController,
   type PanelModelInfo,
 } from "./panelModels";
+import {
+  authLogout,
+  authScope,
+  loadAuth,
+  PanelGatewayClient,
+  saveAuth,
+  type PanelConn,
+  type PanelEvent,
+  type PanelAuthState,
+} from "./panelAuthClient";
+import { resolvePanelAuth } from "./panelLogin";
 
-type Conn = "idle" | "connecting" | "open" | "closed" | "error";
+type Conn = PanelConn;
 type Role = "user" | "assistant" | "system" | "tool";
 type ToolState = "running" | "done" | "error";
 
-interface PanelEvent { type: string; session_id?: string; payload?: unknown }
 interface PanelInfo { provider?: string; model?: string }
 interface PanelCreate { session_id: string; info?: PanelInfo }
 interface PanelAttach { id: string; name: string; path: string; text: string; meta?: string; previewUrl?: string }
@@ -25,9 +35,6 @@ type PanelPrompt =
   | { kind: "approval"; command: string; description: string }
   | { kind: "sudo"; requestId: string }
   | { kind: "secret"; requestId: string; prompt: string };
-interface PanelDrop { matched?: boolean; path?: string; name?: string; text?: string; width?: number; height?: number; token_estimate?: number; count?: number }
-interface PanelPending<T> { resolve: (value: T) => void; reject: (error: Error) => void; timer: number }
-
 const refs = {
   messages: el("messages"),
   pending: el("pending-panel"),
@@ -45,6 +52,7 @@ const refs = {
   stop: el("interrupt-button") as HTMLButtonElement,
   reconnect: el("reconnect-button") as HTMLButtonElement,
   fresh: el("new-session") as HTMLButtonElement,
+  logout: el("logout-button") as HTMLButtonElement,
   history: el("history-list"),
   historyRefresh: el("refresh-history") as HTMLButtonElement,
 };
@@ -52,6 +60,7 @@ const refs = {
 let conn: Conn = "idle";
 let sid: string | null = null;
 let info: PanelInfo = {};
+let auth: PanelAuthState | null = loadAuth();
 let run = false;
 let runStatus = "idle";
 let errorText = "";
@@ -88,76 +97,6 @@ const modelPicker = createPanelModelController({
   onInfo: updateModelInfo,
   onError: showError,
 });
-
-class PanelGatewayClient {
-  private ws: WebSocket | null = null;
-  private seq = 0;
-  private pending = new Map<string, PanelPending<unknown>>();
-  constructor(private onEvent: (event: PanelEvent) => void, private onState: (state: Conn) => void, private onError: (message: string) => void) {}
-  connect(): Promise<void> {
-    this.close();
-    this.onState("connecting");
-    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${scheme}//${location.host}/hermes/ws`);
-    this.ws = ws;
-    ws.addEventListener("message", (event) => this.dispatch(event.data));
-    ws.addEventListener("close", () => {
-      this.rejectAll(new Error("WebSocket closed"));
-      this.onState("closed");
-    });
-    return new Promise((resolve, reject) => {
-      const onOpen = () => { ws.removeEventListener("error", onErr); this.onState("open"); resolve(); };
-      const onErr = () => { ws.removeEventListener("open", onOpen); this.onState("error"); reject(new Error("WebSocket connection failed")); };
-      ws.addEventListener("open", onOpen, { once: true });
-      ws.addEventListener("error", onErr, { once: true });
-    });
-  }
-  request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs = 120_000): Promise<T> {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return Promise.reject(new Error(`gateway not connected (${conn})`));
-    const id = `p${++this.seq}`;
-    return new Promise<T>((resolve, reject) => {
-      const timer = window.setTimeout(() => {
-        if (this.pending.delete(id)) reject(new Error(`request timed out: ${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve: (value) => resolve(value as T), reject, timer });
-      this.ws?.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-    });
-  }
-  close(): void {
-    this.ws?.close();
-    this.ws = null;
-    this.rejectAll(new Error("WebSocket closed"));
-  }
-  private dispatch(data: unknown): void {
-    try {
-      const raw: unknown = JSON.parse(String(data));
-      if (!rec(raw)) return;
-      const id = typeof raw.id === "string" ? raw.id : "";
-      if (id && this.pending.has(id)) {
-        const waiting = this.pending.get(id);
-        if (!waiting) return;
-        this.pending.delete(id);
-        window.clearTimeout(waiting.timer);
-        const msg = rec(raw.error) ? str(raw.error, "message") : "";
-        if (msg) waiting.reject(new Error(msg));
-        else waiting.resolve(raw.result);
-        return;
-      }
-      if (raw.method === "event" && rec(raw.params) && typeof raw.params.type === "string") {
-        this.onEvent(raw.params as unknown as PanelEvent);
-      }
-    } catch (err) {
-      this.onError(err instanceof Error ? err.message : String(err));
-    }
-  }
-  private rejectAll(err: Error): void {
-    for (const waiting of this.pending.values()) {
-      window.clearTimeout(waiting.timer);
-      waiting.reject(err);
-    }
-    this.pending.clear();
-  }
-}
 
 function el(id: string): HTMLElement {
   const node = document.getElementById(id);
@@ -222,6 +161,8 @@ function toolMessageText(name: string, context = "", detail = ""): string {
 
 async function connect(): Promise<void> {
   reset();
+  auth = await resolvePanelAuth(auth);
+  history.setCacheScope(authScope(auth));
   let client: PanelGatewayClient;
   client = new PanelGatewayClient(
     (event) => { if (client === gw) onEvent(event); },
@@ -230,8 +171,8 @@ async function connect(): Promise<void> {
   );
   gw = client;
   try {
-    await client.connect();
-    const created = await client.request<PanelCreate>("session.create", {});
+    await client.connect(auth.token);
+    const created = await client.request<PanelCreate>("session.create", { model: refs.modelSelect.value || undefined });
     sid = created.session_id;
     history.setActive(sid);
     info = created.info ?? {};
@@ -401,14 +342,18 @@ function finishTool(payload: Record<string, unknown>): void {
 
 async function upload(file: File): Promise<void> {
   if (!file.type.startsWith("image/")) return showError("Only image files are accepted.");
-  if (!gw || !sid) return showError("Session is not ready.");
+  if (!auth || !gw || !sid) return showError("Session is not ready.");
   refs.attach.disabled = true;
   runStatus = "uploading";
   render();
   try {
     const res = await fetch("/hermes/upload", {
       method: "POST",
-      headers: { "Content-Type": file.type || "application/octet-stream", "X-Hermes-Filename": file.name || "upload.png" },
+      headers: {
+        "Authorization": `Bearer ${auth.token}`,
+        "Content-Type": file.type || "application/octet-stream",
+        "X-Hermes-Filename": file.name || "upload.png",
+      },
       body: file,
     });
     if (!res.ok) throw new Error(await res.text());
@@ -425,26 +370,16 @@ async function upload(file: File): Promise<void> {
 }
 
 async function attachPath(path: string, file?: File): Promise<void> {
-  if (!gw || !sid) throw new Error("Session is not ready.");
-  const detected = await gw.request<PanelDrop>("input.detect_drop", { session_id: sid, text: path });
-  const result = detected.matched ? detected : await gw.request<PanelDrop>("image.attach", { session_id: sid, path });
-  const realPath = result.path || path;
-  const name = result.name || file?.name || basename(realPath);
-  const meta = attachMeta(result);
-  const label = result.text || `[User attached image: ${name}]`;
+  if (!sid) throw new Error("Session is not ready.");
+  const realPath = path;
+  const name = file?.name || basename(realPath);
+  const meta = file ? `${Math.ceil(file.size / 1024)} KB` : undefined;
+  const label = `[User attached image: ${name}]`;
   const toolHint = `[Attached image path for tools: ${realPath}]`;
   attached.push({ id: id("attach"), name, path: realPath, text: `${label}\n${toolHint}`, meta, previewUrl: file ? URL.createObjectURL(file) : undefined });
   renderAttachments();
   render();
 }
-function attachMeta(result: PanelDrop): string | undefined {
-  const bits: string[] = [];
-  if (result.width && result.height) bits.push(`${result.width}x${result.height}`);
-  if (result.token_estimate) bits.push(`~${result.token_estimate} tokens`);
-  if (result.count) bits.push(`image #${result.count}`);
-  return bits.length ? bits.join(" / ") : undefined;
-}
-
 async function submit(): Promise<void> {
   if (!gw || !sid || run) return;
   const text = refs.input.value.trim();
@@ -462,15 +397,19 @@ async function submit(): Promise<void> {
   render();
   try {
     if (!outboundAttachments.length && text.startsWith("/")) await slash(text);
-    else await sendAgent([outboundAttachments.map((item) => item.text).join("\n"), text].filter(Boolean).join("\n\n"));
+    else await sendAgent(text, outboundAttachments);
   } catch (err) {
     run = false;
     showError(err instanceof Error ? err.message : String(err));
   }
 }
-async function sendAgent(text: string): Promise<void> {
+async function sendAgent(text: string, outboundAttachments: PanelAttach[] = []): Promise<void> {
   if (!gw || !sid) throw new Error("Session is not ready.");
-  await gw.request("prompt.submit", { session_id: sid, text });
+  await gw.request("prompt.submit", {
+    session_id: sid,
+    text,
+    attachments: outboundAttachments.map((item) => ({ name: item.name, url: item.path })),
+  });
 }
 async function slash(command: string): Promise<void> {
   if (!gw || !sid) return;
@@ -512,10 +451,10 @@ async function stopRun(): Promise<void> {
 }
 
 async function answerClarify(answer: string): Promise<void> {
-  if (!gw || pendingPrompt?.kind !== "clarify") return;
+  if (!gw || !sid || pendingPrompt?.kind !== "clarify") return;
   const requestId = pendingPrompt.requestId;
   pendingPrompt = null;
-  await gw.request("clarify.respond", { request_id: requestId, answer });
+  await gw.request("clarify.respond", { session_id: sid, request_id: requestId, answer });
   addMsg("user", answer);
   runStatus = "running";
   render();
@@ -528,13 +467,24 @@ async function answerApproval(choice: "once" | "deny"): Promise<void> {
   render();
 }
 async function answerSecret(value: string): Promise<void> {
-  if (!gw || !pendingPrompt) return;
+  if (!gw || !sid || !pendingPrompt) return;
   const current = pendingPrompt;
   pendingPrompt = null;
-  if (current.kind === "sudo") await gw.request("sudo.respond", { request_id: current.requestId, password: value });
-  if (current.kind === "secret") await gw.request("secret.respond", { request_id: current.requestId, value });
+  if (current.kind === "sudo") await gw.request("sudo.respond", { session_id: sid, request_id: current.requestId, password: value });
+  if (current.kind === "secret") await gw.request("secret.respond", { session_id: sid, request_id: current.requestId, value });
   runStatus = "running";
   render();
+}
+
+async function logout(): Promise<void> {
+  const current = auth;
+  auth = null;
+  saveAuth(null);
+  await authLogout(current);
+  history.setCacheScope("anonymous");
+  reset();
+  render();
+  void connect();
 }
 
 function activateHistory(view: PanelHistoryActivation): void {
@@ -562,8 +512,13 @@ function updateModelInfo(next: PanelModelInfo): void {
 
 function render(): void {
   const displayStatus = run ? phaseStatusLabel(runStatus) : runStatus;
-  refs.statusLabel.textContent = run ? displayStatus : conn;
+  refs.statusLabel.textContent = auth ? (run ? displayStatus : conn) : "login";
   refs.statusPill.dataset.state = conn;
+  refs.logout.hidden = !auth;
+  const brandSubline = document.querySelector(".brand small");
+  if (brandSubline) {
+    brandSubline.textContent = auth ? `${auth.user.label} / ${auth.user.workspace_id}` : "Login required";
+  }
   renderInputState();
   refs.stop.disabled = !run || !sid;
   refs.error.hidden = !errorText;
@@ -764,7 +719,7 @@ function resizeInput(): void {
   refs.input.style.height = `${Math.min(180, refs.input.scrollHeight)}px`;
 }
 function renderInputState(): void {
-  refs.send.disabled = conn !== "open" || !sid || run || (!refs.input.value.trim() && !attached.length);
+  refs.send.disabled = !auth || conn !== "open" || !sid || run || (!refs.input.value.trim() && !attached.length);
 }
 
 refs.form.addEventListener("submit", (event) => { event.preventDefault(); void submit(); });
@@ -778,6 +733,7 @@ refs.form.addEventListener("drop", (event) => { event.preventDefault(); refs.for
 refs.stop.addEventListener("click", () => void stopRun());
 refs.reconnect.addEventListener("click", () => void connect());
 refs.fresh.addEventListener("click", () => void connect());
+refs.logout.addEventListener("click", () => void logout());
 window.addEventListener("beforeunload", () => { gw?.close(); for (const item of attached) if (item.previewUrl) URL.revokeObjectURL(item.previewUrl); });
 
 render();

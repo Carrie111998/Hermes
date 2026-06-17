@@ -39,6 +39,17 @@ def _viewer() -> Principal:
     )
 
 
+def _creator() -> Principal:
+    return Principal(
+        tenant_id="ten_1",
+        workspace_id="ws_1",
+        project_id="proj_1",
+        user_id="user_creator",
+        roles=("creator",),
+        session_id="sess_1",
+    )
+
+
 def _lease(principal: Principal | None = None) -> SandboxLease:
     return issue_sandbox_lease(principal or _owner(), sandbox_id="sbx_1")
 
@@ -150,6 +161,44 @@ def test_tool_execution_middleware_allows_owner_and_logs_decision():
     assert records[-1]["allowed"] is True
     assert records[-1]["reason"] == "allowed"
     assert records[-1]["tool_call_id"] == "tc_allow"
+
+
+def test_policy_checker_allows_creator_for_media_generation_only():
+    image_decision = PolicyChecker().authorize(
+        _creator(),
+        ToolRequest(
+            tool_name="image_generate",
+            args={"prompt": "cat"},
+            session_id="sess_1",
+            tool_call_id="tc_creator_image",
+        ),
+    )
+    video_decision = PolicyChecker().authorize(
+        _creator(),
+        ToolRequest(
+            tool_name="video_generate",
+            args={"prompt": "running car"},
+            session_id="sess_1",
+            tool_call_id="tc_creator_video",
+        ),
+    )
+    terminal_decision = PolicyChecker().authorize(
+        _creator(),
+        ToolRequest(
+            tool_name="terminal",
+            args={"command": "pwd"},
+            session_id="sess_1",
+            tool_call_id="tc_creator_terminal",
+        ),
+        _lease(_creator()),
+    )
+
+    assert image_decision.allowed is True
+    assert image_decision.action == "media.generate"
+    assert video_decision.allowed is True
+    assert video_decision.action == "media.generate"
+    assert terminal_decision.allowed is False
+    assert terminal_decision.reason == "insufficient_role"
 
 
 def test_model_tools_dispatch_is_blocked_by_policy_before_registry(monkeypatch):
