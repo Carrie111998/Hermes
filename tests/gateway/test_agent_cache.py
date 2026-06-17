@@ -24,6 +24,7 @@ def _make_runner():
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._agent_cache = {}
     runner._agent_cache_lock = threading.Lock()
+    runner._running_agents = {}
     return runner
 
 
@@ -398,6 +399,73 @@ class TestAgentCacheLifecycle:
         with runner._agent_cache_lock:
             assert "session-A" not in runner._agent_cache
             assert "session-B" in runner._agent_cache
+
+    def test_evict_soft_releases_evicted_agent_clients(self, monkeypatch):
+        """Command eviction releases evicted clients instead of waiting for GC."""
+        runner = _make_runner()
+        agent = MagicMock()
+        agent._session_messages = [{"role": "user", "content": "heavy"}]
+
+        class _ImmediateThread:
+            def __init__(self, target, args=(), daemon=None, name=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        monkeypatch.setattr("gateway.run.threading.Thread", _ImmediateThread)
+        with runner._agent_cache_lock:
+            runner._agent_cache["session-A"] = (agent, "sig-A")
+
+        runner._evict_cached_agent("session-A")
+
+        with runner._agent_cache_lock:
+            assert "session-A" not in runner._agent_cache
+        agent.release_clients.assert_called_once()
+        assert agent._session_messages == []
+
+    def test_evict_skips_soft_release_for_running_agent(self, monkeypatch):
+        """Mid-turn agents are popped but not soft-released under them."""
+        runner = _make_runner()
+        agent = MagicMock()
+        runner._running_agents["session-A"] = agent
+
+        class _ForbiddenThread:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("running agent should not be released")
+
+        monkeypatch.setattr("gateway.run.threading.Thread", _ForbiddenThread)
+        with runner._agent_cache_lock:
+            runner._agent_cache["session-A"] = (agent, "sig-A")
+
+        runner._evict_cached_agent("session-A")
+
+        with runner._agent_cache_lock:
+            assert "session-A" not in runner._agent_cache
+        agent.release_clients.assert_not_called()
+
+    def test_evict_without_lock_still_pops_and_releases(self, monkeypatch):
+        """No-lock fixtures take the same eviction path as locked runners."""
+        runner = _make_runner()
+        runner._agent_cache_lock = None
+        agent = MagicMock()
+
+        class _ImmediateThread:
+            def __init__(self, target, args=(), daemon=None, name=None):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        monkeypatch.setattr("gateway.run.threading.Thread", _ImmediateThread)
+        runner._agent_cache["session-A"] = (agent, "sig-A")
+
+        runner._evict_cached_agent("session-A")
+
+        assert "session-A" not in runner._agent_cache
+        agent.release_clients.assert_called_once()
 
     def test_reasoning_config_updates_in_place(self):
         """Reasoning config can be set on a cached agent without eviction."""
