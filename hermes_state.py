@@ -1303,12 +1303,19 @@ class SessionDB:
         agent_id: Optional[str] = None,
         chat_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        replay_run_id: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Return universal PA turns (newest first), with children attached.
 
         Each turn dict carries ``tool_calls`` and ``events`` lists in the
         universal shape.  JSON columns are decoded back to Python objects.
+
+        Aggregate/live reads (``session_id`` omitted) exclude replay rows by
+        default so replay attempts cannot contaminate live PA telemetry.  Pass
+        ``replay_run_id`` explicitly to inspect one replay run.  Session-scoped
+        reads preserve historical behavior because the session key itself is
+        the scope boundary.
         """
         where: List[str] = []
         params: List[Any] = []
@@ -1321,6 +1328,11 @@ class SessionDB:
         if session_id is not None:
             where.append("session_id = ?")
             params.append(session_id)
+        elif replay_run_id is None:
+            where.append("replay_run_id IS NULL")
+        if replay_run_id is not None:
+            where.append("replay_run_id = ?")
+            params.append(replay_run_id)
 
         sql = "SELECT * FROM pa_turns"
         if where:

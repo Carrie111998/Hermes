@@ -750,13 +750,19 @@ class SessionStore:
         )
         try:
             from gateway.replay import current_replay_context
-
-            replay_ctx = current_replay_context()
-            if replay_ctx is not None:
-                return replay_ctx.namespace_session_key(session_key)
         except Exception:
-            pass
-        return session_key
+            return session_key
+
+        replay_ctx = current_replay_context()
+        if replay_ctx is None:
+            return session_key
+
+        try:
+            return replay_ctx.namespace_session_key(session_key)
+        except Exception as exc:
+            raise RuntimeError(
+                "replay session namespace failed; refusing to fall back to live session key"
+            ) from exc
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.

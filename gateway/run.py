@@ -2335,28 +2335,37 @@ class GatewayRunner:
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        replay_ctx = None
+        try:
+            from gateway.replay import current_replay_context
+
+            replay_ctx = current_replay_context()
+        except Exception:
+            replay_ctx = None
+
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
-                pass
+                if replay_ctx is not None:
+                    raise
         config = getattr(self, "config", None)
         session_key = build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
-        try:
-            from gateway.replay import current_replay_context
+        if replay_ctx is None:
+            return session_key
 
-            replay_ctx = current_replay_context()
-            if replay_ctx is not None:
-                return replay_ctx.namespace_session_key(session_key)
-        except Exception:
-            pass
-        return session_key
+        try:
+            return replay_ctx.namespace_session_key(session_key)
+        except Exception as exc:
+            raise RuntimeError(
+                "replay session namespace failed; refusing to fall back to live session key"
+            ) from exc
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""

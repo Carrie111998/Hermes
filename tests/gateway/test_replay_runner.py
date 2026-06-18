@@ -165,6 +165,27 @@ async def test_gateway_runner_replay_persists_attempt_provenance(tmp_path, monke
     runner._session_db.close()
 
 
+def test_gateway_runner_session_key_namespace_failure_fails_closed(monkeypatch):
+    runner = GatewayRunner(GatewayConfig(platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, extra={})}))
+    runner.session_store = None
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        chat_id="120363111@g.us",
+        chat_type="group",
+        user_id="60120000000@s.whatsapp.net",
+    )
+
+    def boom(self, session_key):
+        assert session_key.startswith("agent:main:")
+        raise ValueError("namespace broke")
+
+    monkeypatch.setattr("gateway.replay.ReplayExecutionContext.namespace_session_key", boom)
+
+    with replay_context(ReplayPlan(platform="whatsapp", run_id="run-bad", attempt_id="attempt-bad")):
+        with pytest.raises(RuntimeError, match="refusing to fall back to live session key"):
+            runner._session_key_for_source(source)
+
+
 def _wa_adapter(tmp_path):
     from gateway.platforms.whatsapp import WhatsAppAdapter
 

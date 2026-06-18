@@ -128,7 +128,7 @@ def test_record_pa_turn_writes_all_three_tables(tmp_path):
         )
         assert turn_id == "paturn_unit_1"
 
-        turns = db.list_pa_turns(agent_id="christopher")
+        turns = db.list_pa_turns(agent_id="christopher", replay_run_id="run-1")
         assert len(turns) == 1
         turn = turns[0]
         assert turn["turn_id"] == "paturn_unit_1"
@@ -293,6 +293,42 @@ def test_list_pa_turns_scopes_by_chat(tmp_path):
         db.record_pa_turn(turn_id="t2", agent_id="a", chat_id="y", started_at=2.0)
         x_turns = db.list_pa_turns(agent_id="a", chat_id="x")
         assert [t["turn_id"] for t in x_turns] == ["t1"]
+    finally:
+        db.close()
+
+
+def test_list_pa_turns_unscoped_reads_exclude_replay_rows_by_default(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_pa_turn(
+            turn_id="paturn_live",
+            agent_id="christopher",
+            chat_id="chat-42",
+            session_id="agent:main:whatsapp:group:chat-42",
+            started_at=2.0,
+        )
+        db.record_pa_turn(
+            turn_id="paturn_replay",
+            agent_id="christopher",
+            chat_id="chat-42",
+            session_id="agent:replay:run-telemetry:whatsapp:group:chat-42",
+            replay_run_id="run-telemetry",
+            replay_attempt_id="attempt-telemetry",
+            started_at=1.0,
+        )
+
+        unscoped = db.list_pa_turns(agent_id="christopher")
+        assert [turn["turn_id"] for turn in unscoped] == ["paturn_live"]
+
+        explicit_replay = db.list_pa_turns(
+            agent_id="christopher", replay_run_id="run-telemetry"
+        )
+        assert [turn["turn_id"] for turn in explicit_replay] == ["paturn_replay"]
+
+        session_scoped = db.list_pa_turns(
+            session_id="agent:replay:run-telemetry:whatsapp:group:chat-42"
+        )
+        assert [turn["turn_id"] for turn in session_scoped] == ["paturn_replay"]
     finally:
         db.close()
 

@@ -834,6 +834,32 @@ class TestWhatsAppSessionKeyConsistency:
         )
         assert store._generate_session_key(source) == build_session_key(source)
 
+    def test_active_replay_namespace_failure_fails_closed(self, store, monkeypatch):
+        from gateway.replay import ReplayExecutionContext, ReplayPlan, replay_context
+
+        source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="120363000000000000@g.us",
+            chat_type="group",
+            user_id="15551234567@s.whatsapp.net",
+            user_name="Group Member",
+        )
+        live_key = build_session_key(source)
+        assert live_key.startswith("agent:main:")
+
+        def boom(self, session_key):
+            assert session_key == live_key
+            raise ValueError("namespace broke")
+
+        monkeypatch.setattr(ReplayExecutionContext, "namespace_session_key", boom)
+
+        assert store._generate_session_key(source) == live_key
+        with replay_context(ReplayPlan(platform="whatsapp", run_id="run-bad", attempt_id="attempt-bad")):
+            with pytest.raises(RuntimeError, match="refusing to fall back to live session key") as exc_info:
+                store._generate_session_key(source)
+
+        assert isinstance(exc_info.value.__cause__, ValueError)
+
     def test_store_creates_distinct_group_sessions_per_user(self, store):
         first = SessionSource(
             platform=Platform.DISCORD,
