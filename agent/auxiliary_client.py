@@ -853,7 +853,7 @@ class _CodexCompletionsAdapter:
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
-                timed_out.set()
+                _close_client_on_timeout()
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
@@ -877,10 +877,52 @@ class _CodexCompletionsAdapter:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
+            def _stream_events_with_total_timeout(stream):
+                if deadline is None:
+                    for event in stream:
+                        yield event
+                    return
+
+                import queue as _queue
+                q: _queue.Queue = _queue.Queue(maxsize=1)
+
+                def _produce_events() -> None:
+                    try:
+                        for event in stream:
+                            q.put((True, event))
+                        q.put((False, StopIteration()))
+                    except BaseException as exc:  # includes stream transport errors
+                        q.put((False, exc))
+
+                producer = threading.Thread(target=_produce_events, daemon=True)
+                producer.start()
+                while True:
+                    _check_cancelled()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        _close_client_on_timeout()
+                        raise TimeoutError(_timeout_message())
+                    try:
+                        ok, value = q.get(timeout=min(remaining, 0.005))
+                    except _queue.Empty:
+                        if time.monotonic() >= deadline:
+                            _close_client_on_timeout()
+                            raise TimeoutError(_timeout_message())
+                        continue
+                    if time.monotonic() >= deadline:
+                        _close_client_on_timeout()
+                        raise TimeoutError(_timeout_message())
+                    if ok:
+                        yield value
+                        continue
+                    if isinstance(value, StopIteration):
+                        return
+                    raise value
+
             _check_cancelled()
             try:
                 with self._client.responses.stream(**resp_kwargs) as stream:
-                    for _event in stream:
+                    for _event in _stream_events_with_total_timeout(stream):
                         _check_cancelled()
                         _etype = getattr(_event, "type", "")
                         if _etype == "response.output_item.done":

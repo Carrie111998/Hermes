@@ -4222,10 +4222,7 @@ class GatewayRunner:
                 continue
             
             # Set up message + fatal error handlers
-            adapter.set_message_handler(self._handle_message)
-            adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
-            adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            self._wire_adapter(adapter)
             
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
@@ -5722,10 +5719,7 @@ class GatewayRunner:
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._handle_message)
-                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                    adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    self._wire_adapter(adapter)
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
@@ -6115,6 +6109,132 @@ class GatewayRunner:
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
         await self._shutdown_event.wait()
+
+    def _wire_adapter(self, adapter: BasePlatformAdapter) -> BasePlatformAdapter:
+        """Apply the live gateway callbacks to an adapter without connecting it."""
+        adapter.set_message_handler(self._handle_message)
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        return adapter
+
+    async def _build_adapter(
+        self,
+        platform: Platform,
+        platform_config: Any,
+        *,
+        connect: bool = True,
+    ) -> tuple[Optional[BasePlatformAdapter], Optional[bool]]:
+        """Create, wire, and optionally connect an adapter.
+
+        ``connect=False`` is the replay entrypoint: it reuses the same adapter
+        construction and callback wiring as live gateway startup, but never
+        opens the platform connection.
+        """
+        adapter = self._create_adapter(platform, platform_config)
+        if not adapter:
+            return None, None
+        self._wire_adapter(adapter)
+        if not connect:
+            return adapter, None
+        success = await self._connect_adapter_with_timeout(adapter, platform)
+        return adapter, success
+
+    async def _drain_replay_adapter_tasks(self, adapter: BasePlatformAdapter) -> None:
+        """Wait for replay-spawned adapter background tasks to finish."""
+        for _ in range(20):
+            tasks = [
+                task for task in getattr(adapter, "_background_tasks", set())
+                if hasattr(task, "done") and not task.done()
+            ]
+            if not tasks:
+                return
+            await asyncio.gather(*tasks, return_exceptions=True)
+        remaining = [
+            task for task in getattr(adapter, "_background_tasks", set())
+            if hasattr(task, "done") and not task.done()
+        ]
+        if remaining:
+            raise TimeoutError(f"replay adapter still has {len(remaining)} background task(s)")
+
+    def _install_replay_delivery_guard(self, adapter: BasePlatformAdapter, ctx: Any) -> None:
+        """Capture/drop outbound adapter sends during replay.
+
+        Replay must exercise the real gateway response path while guaranteeing
+        that no platform API receives a live send. Wrapping the adapter send
+        surface keeps the rest of the pipeline untouched.
+        """
+        from gateway.platforms.base import SendResult
+
+        def _make_guard(kind: str):
+            async def _guard(*args, **kwargs):
+                message_id = ctx.record_outbound(kind=kind, args=args, kwargs=kwargs)
+                if ctx.delivery_mode == "drop":
+                    return SendResult(success=True, message_id=None, raw_response={"replay": "drop"})
+                return SendResult(success=True, message_id=message_id, raw_response={"replay": "capture"})
+            return _guard
+
+        for name in (
+            "send",
+            "send_image",
+            "send_image_file",
+            "send_animation",
+            "send_voice",
+            "send_video",
+            "send_document",
+            "send_multiple_images",
+            "send_slash_confirm",
+            "send_clarify",
+            "send_private_notice",
+        ):
+            if hasattr(adapter, name):
+                setattr(adapter, name, _make_guard(name))
+
+    async def replay(self, plan: Any):
+        """Replay bridge-message corpus through the native gateway path."""
+        from gateway.config import Platform, PlatformConfig
+        from gateway.replay import ReplayPlan, ReplayResult, replay_context
+
+        if isinstance(plan, (str, Path)):
+            plan = ReplayPlan.from_path(plan)
+        elif isinstance(plan, dict):
+            plan = ReplayPlan.from_mapping(plan)
+        if not isinstance(plan, ReplayPlan):
+            raise TypeError("replay() expects a ReplayPlan, plan mapping, or plan path")
+
+        platform = Platform(plan.platform)
+        platform_config = self.config.platforms.get(platform)
+        if platform_config is None:
+            platform_config = PlatformConfig(enabled=True, extra={})
+        elif hasattr(platform_config, "enabled") and not platform_config.enabled:
+            platform_config.enabled = True
+
+        with replay_context(plan) as ctx:
+            adapter, _ = await self._build_adapter(platform, platform_config, connect=False)
+            if adapter is None:
+                raise RuntimeError(f"No adapter available for {platform.value}")
+            if not hasattr(adapter, "replay_bridge_messages"):
+                raise RuntimeError(f"Adapter {platform.value!r} does not support replay_bridge_messages")
+            self.adapters[platform] = adapter
+            self.delivery_router.adapters = self.adapters
+            self._install_replay_delivery_guard(adapter, ctx)
+
+            replay_fn = getattr(adapter, "replay_bridge_messages")
+            processed = await replay_fn(
+                list(plan.messages),
+                bypass_require_mention=plan.bypass_require_mention,
+            )
+            await self._drain_replay_adapter_tasks(adapter)
+
+            return ReplayResult(
+                run_id=ctx.run_id,
+                attempt_id=ctx.attempt_id,
+                platform=platform.value,
+                processed=int(processed or 0),
+                outbound=list(ctx.outbound),
+                blocked_commands=list(ctx.blocked_commands),
+                delivery_mode=ctx.delivery_mode,
+            )
 
     def _create_adapter(
         self, 
@@ -6661,6 +6781,17 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        try:
+            from gateway.replay import (
+                current_replay_context as _current_replay_context,
+                history_before_ts_for_event as _replay_history_before_ts_for_event,
+                set_replay_turn_history_before_ts as _set_replay_turn_history_before_ts,
+            )
+            _replay_ctx = _current_replay_context()
+            if _replay_ctx is not None:
+                _set_replay_turn_history_before_ts(_replay_history_before_ts_for_event(event))
+        except Exception:
+            _replay_ctx = None
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -6673,7 +6804,7 @@ class GatewayRunner:
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
+        if not is_internal and _replay_ctx is None:
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -6708,6 +6839,8 @@ class GatewayRunner:
                     break
 
         if is_internal:
+            pass
+        elif _replay_ctx is not None and getattr(_replay_ctx, "bypass_auth", False):
             pass
         elif source.user_id is None:
             # Messages with no user identity (Telegram service messages,
@@ -7325,6 +7458,18 @@ class GatewayRunner:
                         _cmd_def = _resolve_cmd(command) if command else None
                         canonical = _cmd_def.name if _cmd_def else command
 
+        if command and canonical and _replay_ctx is not None and not _replay_ctx.command_allowed(canonical):
+            try:
+                _replay_ctx.record_blocked_command(
+                    command=canonical,
+                    platform=source.platform.value if source.platform else "",
+                    chat_id=source.chat_id or "",
+                )
+            except Exception:
+                pass
+            logger.info("Replay blocked slash/quick command /%s", canonical)
+            return None
+
         # Per-platform slash command access control. Only kicks in when the
         # operator has set ``allow_admin_from`` for the source's scope (DM
         # vs group). When unset → backward-compat: every allowed user can
@@ -7348,7 +7493,7 @@ class GatewayRunner:
         # the previous fire-and-forget emit(): return values are now
         # honored, but handlers that return nothing behave exactly as
         # before (telemetry-style hooks keep working).
-        if command and is_gateway_known_command(canonical):
+        if command and is_gateway_known_command(canonical) and _replay_ctx is None:
             raw_args = event.get_command_args().strip()
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -8091,6 +8236,12 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        try:
+            from gateway.replay import current_replay_context as _current_replay_context
+
+            _replay_ctx = _current_replay_context()
+        except Exception:
+            _replay_ctx = None
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -8148,7 +8299,7 @@ class GatewayRunner:
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
-        if _is_new_session:
+        if _is_new_session and _replay_ctx is None:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -8725,7 +8876,8 @@ class GatewayRunner:
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
             }
-            await self.hooks.emit("agent:start", hook_ctx)
+            if _replay_ctx is None:
+                await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
             agent_result = await self._run_agent(
@@ -8740,7 +8892,7 @@ class GatewayRunner:
                 channel_prompt=event.channel_prompt,
                 pa_job_type=event.pa_job_type,
                 pa_context=event.pa_context,
-                suppress_delivery=_pa_suppress_reply_send,
+                suppress_delivery=(_pa_suppress_reply_send or _replay_ctx is not None),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -8904,10 +9056,11 @@ class GatewayRunner:
             )
 
             # Emit agent:end hook
-            await self.hooks.emit("agent:end", {
-                **hook_ctx,
-                "response": (response or "")[:500],
-            })
+            if _replay_ctx is None:
+                await self.hooks.emit("agent:end", {
+                    **hook_ctx,
+                    "response": (response or "")[:500],
+                })
             
             # Check for pending process watchers (check_interval on background processes)
             try:

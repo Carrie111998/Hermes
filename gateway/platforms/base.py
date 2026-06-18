@@ -2948,6 +2948,38 @@ class BasePlatformAdapter(ABC):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
 
+        try:
+            from gateway.replay import current_replay_context as _current_replay_context
+            _replay_ctx = _current_replay_context()
+        except Exception:
+            _replay_ctx = None
+        if _replay_ctx is not None:
+            # Replay needs deterministic, sequential turn execution through the
+            # real gateway handler. The live background/busy-session machinery
+            # is for real-time interruption and would collapse later replay
+            # turns as "busy" before earlier replay tasks finish.
+            try:
+                response = await self._message_handler(event)
+                _text, _eph_ttl = self._unwrap_ephemeral(response)
+                if _text:
+                    _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    _r = await self._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=_text,
+                        reply_to=_reply_anchor_for_event(event),
+                        metadata=_thread_meta,
+                    )
+                    if _eph_ttl > 0 and _r.success and _r.message_id:
+                        self._schedule_ephemeral_delete(
+                            chat_id=event.source.chat_id,
+                            message_id=_r.message_id,
+                            ttl_seconds=_eph_ttl,
+                        )
+            except Exception as e:
+                logger.error("[%s] Replay dispatch failed: %s", self.name, e, exc_info=True)
+                raise
+            return
+
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
         # cancelled), the lock is stale.  Clear it and fall through to

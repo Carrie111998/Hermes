@@ -316,8 +316,13 @@ class WhatsAppAdapter(BasePlatformAdapter):
         # notification before the normal "✓ whatsapp disconnected" fires.
         self._shutting_down: bool = False
 
+    def _config_extra(self) -> Dict[str, Any]:
+        config = getattr(self, "config", None)
+        extra = getattr(config, "extra", None)
+        return extra if isinstance(extra, dict) else {}
+
     def _config_bool(self, key: str, env_key: str, default: bool) -> bool:
-        configured = self.config.extra.get(key)
+        configured = self._config_extra().get(key)
         if configured is None:
             configured = os.getenv(env_key)
         if configured is None:
@@ -327,7 +332,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
         return bool(configured)
 
     def _config_json_object(self, key: str, env_key: str) -> Dict[str, Any]:
-        configured = self.config.extra.get(key)
+        configured = self._config_extra().get(key)
         if configured is None:
             configured = os.getenv(env_key)
         if not configured:
@@ -743,19 +748,19 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if addressed:
             ms = self._coerce_window_ms(brief.get("debounce_addressed_ms")) if brief else None
             if ms is None:
-                ms = self._coerce_window_ms(self.config.extra.get("debounce_addressed_ms"))
+                ms = self._coerce_window_ms(self._config_extra().get("debounce_addressed_ms"))
             if ms is None:
                 ms = self._coerce_window_ms(os.getenv("WHATSAPP_DEBOUNCE_ADDRESSED_MS"))
             if ms is None:
-                ms = self._debounce_addressed_ms_default
+                ms = getattr(self, "_debounce_addressed_ms_default", int(getattr(self, "_turn_debounce_ms", 0) or 0))
         else:
             ms = self._coerce_window_ms(brief.get("debounce_passive_ms")) if brief else None
             if ms is None:
-                ms = self._coerce_window_ms(self.config.extra.get("debounce_passive_ms"))
+                ms = self._coerce_window_ms(self._config_extra().get("debounce_passive_ms"))
             if ms is None:
                 ms = self._coerce_window_ms(os.getenv("WHATSAPP_DEBOUNCE_PASSIVE_MS"))
             if ms is None:
-                ms = self._debounce_passive_ms_default
+                ms = getattr(self, "_debounce_passive_ms_default", int(getattr(self, "_turn_debounce_ms", 0) or 0))
         return ms
 
     def _debounce_disabled(self) -> bool:
@@ -768,9 +773,9 @@ class WhatsAppAdapter(BasePlatformAdapter):
         if self._debounce_seconds() > 0:
             return False
         # Legacy switch is 0; conditional windows can still enable debounce.
-        if self.config.extra.get("debounce_passive_ms") is not None:
+        if self._config_extra().get("debounce_passive_ms") is not None:
             return False
-        if self.config.extra.get("debounce_addressed_ms") is not None:
+        if self._config_extra().get("debounce_addressed_ms") is not None:
             return False
         if os.getenv("WHATSAPP_DEBOUNCE_PASSIVE_MS") is not None:
             return False

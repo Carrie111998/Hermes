@@ -13,6 +13,7 @@ The messaging gateway is the long-running process that connects Hermes to 20+ ex
 | File | Purpose |
 |------|---------|
 | `gateway/run.py` | `GatewayRunner` — main loop, slash commands, message dispatch (large file; check git for current LOC) |
+| `gateway/replay.py` | Native replay plan/context/result types for no-connect gateway replay |
 | `gateway/session.py` | `SessionStore` — conversation persistence and session key construction |
 | `gateway/delivery.py` | Outbound message delivery to target platforms/channels |
 | `gateway/pairing.py` | DM pairing flow for user authorization |
@@ -48,6 +49,30 @@ The messaging gateway is the long-running process that connects Hermes to 20+ ex
 │              (SQLite persistence)               │
 └───────┴─────────────┴─────────────┴─────────────┘
 ```
+
+## Native Replay Flow
+
+`GatewayRunner.replay(plan)` is the supported no-connect entrypoint for rerunning
+captured bridge messages through the real gateway engine.
+
+1. `ReplayPlan` (`gateway/replay.py`) loads a typed plan or JSON/JSONL corpus.
+2. `GatewayRunner._build_adapter(platform, config, connect=False)` creates the
+   same platform adapter and callback wiring used by live startup, but does not
+   call `adapter.connect()`.
+3. The runner installs a replay delivery guard on the adapter send surface, sets
+   `execution_mode=replay` via contextvars, and registers the adapter in the
+   delivery router so tool calls still hit the in-process adapter.
+4. The adapter's `replay_bridge_messages(...)` method converts raw bridge
+   messages into `MessageEvent`s and feeds them through the normal base-adapter
+   session path into `_handle_message()`.
+5. `_handle_message()` bypasses live auth only when the plan says so, blocks
+   slash/quick-command side effects unless explicitly replay-safe, suppresses
+   live streaming delivery, and lets outbound sends be captured/dropped by the
+   replay guard.
+
+Replay context also carries `X-Replay-Run-Id` and `X-Replay-Attempt-Id` into PA
+business bridge calls and sets a per-turn history-before timestamp for
+future-read fences.
 
 ## Message Flow
 

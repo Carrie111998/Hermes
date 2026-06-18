@@ -171,6 +171,23 @@ def _handle_send(args):
     if not target or not message:
         return tool_error("Both 'target' and 'message' are required when action='send'")
 
+    try:
+        from gateway.replay import current_replay_context
+        _replay_ctx = current_replay_context()
+        if _replay_ctx is not None:
+            message_id = _replay_ctx.record_outbound(
+                kind="send_message_tool",
+                args=(),
+                kwargs={"target": target, "message": message},
+            )
+            return json.dumps({
+                "success": True,
+                "message_id": None if _replay_ctx.delivery_mode == "drop" else message_id,
+                "replay": _replay_ctx.delivery_mode,
+            })
+    except Exception:
+        pass
+
     parts = target.split(":", 1)
     platform_name = parts[0].strip().lower()
     target_ref = parts[1].strip() if len(parts) > 1 else None

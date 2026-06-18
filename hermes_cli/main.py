@@ -9604,7 +9604,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "config", "cron", "curator", "dashboard", "debug", "doctor",
         "dump", "fallback", "gateway", "hooks", "import", "insights",
         "kanban", "login", "logout", "logs", "lsp", "mcp", "memory",
-        "model", "pairing", "plugins", "postinstall", "profile", "proxy", "sessions", "setup",
+        "model", "pairing", "plugins", "postinstall", "profile", "proxy", "replay", "sessions", "setup",
         "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "chat",
         # Help-ish invocations — plugin commands not being listed in
@@ -9992,6 +9992,12 @@ def main():
     )
     proxy_parser.set_defaults(func=cmd_proxy)
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # replay command
+    # =========================================================================
+    from hermes_cli.replay import add_replay_parser as _add_replay_parser
+    _add_replay_parser(subparsers)
 
     # =========================================================================
     # lsp command

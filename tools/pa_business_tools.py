@@ -435,6 +435,14 @@ def _execute_http_operation(
     data: bytes | None = None
     headers = {"Accept": "application/json", **dict(op.headers or {})}
     headers.update(_auth_headers(op.auth or bridge_config.auth or {}))
+    try:
+        from gateway.replay import current_replay_context
+        _replay_ctx = current_replay_context()
+        if _replay_ctx is not None:
+            headers.setdefault("X-Replay-Run-Id", _replay_ctx.run_id)
+            headers.setdefault("X-Replay-Attempt-Id", _replay_ctx.attempt_id)
+    except Exception:
+        pass
 
     # Path-param substitution: extract listed keys from payload, URL-encode,
     # and replace {name} placeholders in op.url. Remaining payload becomes
@@ -962,6 +970,13 @@ def _history_before_ts_cap() -> int | None:
     messages from after the moment being replayed. Live runtime never sets the
     variable, so live searches are uncapped.
     """
+    try:
+        from gateway.replay import current_history_before_ts
+        replay_cap = current_history_before_ts()
+        if replay_cap is not None:
+            return int(replay_cap)
+    except Exception:
+        pass
     raw = os.getenv("HERMES_PA_HISTORY_BEFORE_TS")
     if not raw:
         return None

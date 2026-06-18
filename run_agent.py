@@ -11050,13 +11050,18 @@ class AIAgent:
         elif function_name == "delegate_task":
             return self._dispatch_delegate_task(function_args)
         else:
+            call_kwargs = {
+                "tool_call_id": tool_call_id,
+                "session_id": self.session_id or "",
+                "enabled_tools": list(self.valid_tool_names) if self.valid_tool_names else None,
+                "skip_pre_tool_call_hook": True,
+            }
+            user_task = getattr(self, "_current_user_task", None)
+            if user_task is not None:
+                call_kwargs["user_task"] = user_task
             return handle_function_call(
                 function_name, function_args, effective_task_id,
-                user_task=getattr(self, "_current_user_task", None),
-                tool_call_id=tool_call_id,
-                session_id=self.session_id or "",
-                enabled_tools=list(self.valid_tool_names) if self.valid_tool_names else None,
-                skip_pre_tool_call_hook=True,
+                **call_kwargs,
             )
 
     @staticmethod

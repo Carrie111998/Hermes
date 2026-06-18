@@ -40,6 +40,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes model` | Interactively choose the default provider and model. |
 | `hermes fallback` | Manage fallback providers tried when the primary model errors. |
 | `hermes gateway` | Run or manage the messaging gateway service. |
+| `hermes replay` | Replay bridge-message corpora through the real gateway without live sends. |
 | `hermes proxy` | Local OpenAI-compatible proxy that attaches OAuth provider credentials. See [Subscription Proxy](../user-guide/features/subscription-proxy.md). |
 | `hermes lsp` | Manage Language Server Protocol integration (semantic diagnostics for write_file/patch). |
 | `hermes setup` | Interactive setup wizard for all or part of the configuration. |
@@ -195,6 +196,35 @@ If you've only configured OpenRouter, `/model` will only show OpenRouter models.
 :::
 
 Provider and base URL changes are persisted to `config.yaml` automatically. When switching away from a custom endpoint, the stale base URL is cleared to prevent it leaking into other providers.
+
+## `hermes replay`
+
+```bash
+hermes replay --plan replay-plan.json
+hermes replay --corpus bridge-messages.jsonl --platform whatsapp --delivery-mode capture
+```
+
+Runs a typed bridge-message corpus through the native gateway replay path:
+
+- builds the platform adapter with the same gateway wiring, but `connect=False`
+- calls the adapter's `replay_bridge_messages(...)` entrypoint
+- sets `execution_mode=replay` for downstream tools
+- captures or drops outbound adapter sends instead of delivering to live platforms
+
+Plan shape:
+
+```json
+{
+  "platform": "whatsapp",
+  "delivery_mode": "capture",
+  "bypass_require_mention": true,
+  "bypass_auth": true,
+  "corpus": {"path": "bridge-messages.jsonl"}
+}
+```
+
+A plan may also include a top-level `messages` array. `--corpus` accepts a JSON
+array, JSON object with `messages`/`bridge_messages`/`events`, or JSONL file.
 
 ## `hermes gateway`
 
