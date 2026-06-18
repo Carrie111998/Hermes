@@ -7,7 +7,15 @@ prompts to the user. In CLI mode, choices are navigable with arrow keys. On
 messaging platforms, choices are rendered as a numbered list.
 
 Supports both single-select (radio) and multi-select (checkbox) modes via the
-``multi_select`` parameter.
+``multi_select`` parameter, and two option shapes:
+
+1. **Simple** -- provide ``choices`` (up to 4 strings). Auto-appends
+   'Other (type your answer)'.
+2. **Rich** -- provide ``options`` (up to 25 objects with label, value,
+   style, and optional modal forms). The caller controls the full options
+   array -- no synthetic 'Other' is appended.
+
+``choices`` and ``options`` are mutually exclusive.
 
 The actual user-interaction logic lives in the platform layer (cli.py for CLI,
 gateway/run.py for messaging). This module defines the schema, validation, and
@@ -15,7 +23,7 @@ a thin dispatcher that delegates to a platform-provided callback.
 """
 
 import json
-from typing import Dict, List, Optional, Callable
+from typing import Any, Callable, Dict, List, Optional
 
 
 # Maximum number of predefined choices the agent can offer.
@@ -38,6 +46,28 @@ TIMEOUT_RESPONSE = (
 # option the agent actually recommends. Applied here rather than per-surface so
 # CLI, TUI, desktop, and messaging adapters all render the same label.
 RECOMMENDED_LABEL = "(Recommended)"
+
+# -- Rich-option validation constants ----------------------------------------
+
+MAX_OPTIONS = 25
+MAX_LABEL_LEN = 80
+MAX_VALUE_LEN = 100
+MAX_DESC_LEN = 100
+MAX_MODAL_TITLE_LEN = 45
+MIN_MODAL_FIELDS = 1
+MAX_MODAL_FIELDS = 5
+MAX_QUESTION_LEN = 2000
+
+VALID_DISPLAY_TYPES = {"buttons"}
+VALID_AUTH_POLICIES = {
+    "session_owner_only",
+    "any_allowed_user",
+    "any_allowed_role",
+    "any_allowed_user_or_role",
+}
+VALID_FIELD_TYPES = {"text", "select", "radio", "checkbox", "file_upload"}
+VALID_STYLES = {"primary", "secondary", "success", "danger"}
+VALID_ACTIONS = {"return", "modal"}
 
 
 def _flatten_choice(c) -> str:
@@ -331,6 +361,10 @@ def clarify_tool(
     choices: Optional[List[str]] = None,
     multi_select: bool = False,
     questions: Optional[List[dict]] = None,
+    options: Optional[List[Dict[str, Any]]] = None,
+    display_type: str = "buttons",
+    auth_policy: str = "session_owner_only",
+    timeout_seconds: Optional[float] = None,
     callback: Optional[Callable] = None,
 ) -> str:
     """
@@ -387,6 +421,32 @@ def clarify_tool(
 
     question = question.strip()
 
+    # -- Rich options path (mutually exclusive with choices) --
+    if len(question) > MAX_QUESTION_LEN:
+        return tool_error(
+            f"Question text too long ({len(question)} chars, max {MAX_QUESTION_LEN})."
+        )
+    if options is not None and choices is not None:
+        return tool_error("Use either 'choices' (simple) or 'options' (rich), not both.")
+    if options is not None:
+        err = _validate_options(options)
+        if err:
+            return tool_error(err)
+        if display_type not in VALID_DISPLAY_TYPES:
+            return tool_error(
+                f"Unsupported display_type '{display_type}'. "
+                f"Must be one of {sorted(VALID_DISPLAY_TYPES)}."
+            )
+        if auth_policy not in VALID_AUTH_POLICIES:
+            return tool_error(
+                f"Unsupported auth_policy '{auth_policy}'. "
+                f"Must be one of {sorted(VALID_AUTH_POLICIES)}."
+            )
+        if timeout_seconds is not None:
+            if not isinstance(timeout_seconds, (int, float)):
+                return tool_error("timeout_seconds must be a number.")
+            timeout_seconds = max(60, min(3600, int(timeout_seconds)))
+
     # Validate and trim choices
     if choices is not None:
         if not isinstance(choices, list):
@@ -413,7 +473,24 @@ def clarify_tool(
         choices = mark_recommended(choices)
 
     try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
+        if options is not None:
+            # Rich path -- delegate to callback with structured params.
+            raw_response = callback(
+                question, choices=None, options=options,
+                display_type=display_type, auth_policy=auth_policy,
+                timeout_seconds=timeout_seconds,
+            )
+            # Rich callbacks return a JSON string (ClarifyResult.to_dict());
+            # pass through to avoid double-encoding.
+            if isinstance(raw_response, str):
+                try:
+                    parsed = json.loads(raw_response)
+                    if isinstance(parsed, dict) and "status" in parsed:
+                        return raw_response
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        else:
+            raw_response = _invoke_callback(callback, question, choices, multi_select)
     except Exception as exc:
         return tool_error(f"Failed to get user input: {exc}")
 
@@ -456,7 +533,11 @@ CLARIFY_SCHEMA = {
         "can't click). Result: {responses: [...]} in question order (plus "
         "timed_out=true if the user stopped part-way). Prefer deciding "
         "low-stakes questions yourself; don't use this for dangerous-command "
-        "confirmation (the terminal tool handles that)."
+        "confirmation (the terminal tool handles that). Alternatively, for a "
+        "single rich question provide `options` (up to 25 objects with "
+        "label, value, style, and optional modal forms) — the caller "
+        "controls the full options array and no synthetic 'Other' is "
+        "appended. `choices` and `options` are mutually exclusive."
     ),
     "parameters": {
         "type": "object",
@@ -491,13 +572,174 @@ CLARIFY_SCHEMA = {
             # single-question shape (`question` + `choices` + `multi_select`
             # at top level; a top-level `question` beside `questions` is the
             # batch form's title). One documented way to call.
+            "options": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_OPTIONS,
+                "description": (
+                    "Rich option objects (1-25). Each has at least `label` "
+                    "and `value`; may include `description`, `style` "
+                    "(primary/secondary/success/danger), `action` "
+                    "(return/modal), and `modal` (form spec). Mutually "
+                    "exclusive with `choices`."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label":       {"type": "string", "maxLength": MAX_LABEL_LEN},
+                        "value":       {"type": "string", "maxLength": MAX_VALUE_LEN},
+                        "description": {"type": "string", "maxLength": MAX_DESC_LEN},
+                        "style":       {"type": "string", "enum": sorted(VALID_STYLES)},
+                        "action":      {"type": "string", "enum": sorted(VALID_ACTIONS)},
+                        "modal": {
+                            "type": "object",
+                            "properties": {
+                                "title":  {"type": "string", "maxLength": MAX_MODAL_TITLE_LEN},
+                                "fields": {
+                                    "type": "array", "minItems": MIN_MODAL_FIELDS, "maxItems": MAX_MODAL_FIELDS,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "key":         {"type": "string"},
+                                            "label":       {"type": "string"},
+                                            "description": {"type": "string"},
+                                            "type":        {"type": "string", "enum": sorted(VALID_FIELD_TYPES)},
+                                            "required":    {"type": "boolean"},
+                                            "placeholder": {"type": "string"},
+                                            "options":     {"type": "array", "items": {"type": "string"}},
+                                            "min_length":  {"type": "integer"},
+                                            "max_length":  {"type": "integer"},
+                                            "multiline":   {"type": "boolean"},
+                                            "file_policy": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "max_files":         {"type": "integer", "minimum": 1, "maximum": 10},
+                                                    "min_files":         {"type": "integer", "minimum": 0, "maximum": 10},
+                                                },
+                                            },
+                                        },
+                                        "required": ["key", "label", "type"],
+                                    },
+                                },
+                            },
+                            "required": ["title", "fields"],
+                        },
+                    },
+                    "required": ["label", "value", "action"],
+                },
+            },
+            "display_type":    {"type": "string", "enum": sorted(VALID_DISPLAY_TYPES), "default": "buttons"},
+            "auth_policy":     {"type": "string", "enum": sorted(VALID_AUTH_POLICIES), "default": "session_owner_only"},
+            "timeout_seconds": {"type": "integer", "minimum": 60, "maximum": 3600},
         },
         "required": ["questions"],
     },
 }
 
 
-# --- Registry ---
+# =============================================================================
+# Validation helpers (rich path)
+# =============================================================================
+
+def _validate_options(options: list) -> Optional[str]:
+    """Validate the rich ``options`` array.
+
+    Returns an error message string on failure, or ``None`` if valid.
+    """
+    if not options or not isinstance(options, list):
+        return "options must be a non-empty list of option objects."
+
+    if len(options) > MAX_OPTIONS:
+        return f"Too many options ({len(options)}). Maximum is {MAX_OPTIONS}."
+
+    for idx, opt in enumerate(options):
+        if not isinstance(opt, dict):
+            return f"Option {idx} must be a dict."
+
+        label = opt.get("label")
+        value = opt.get("value")
+
+        if not label or not isinstance(label, str) or not label.strip():
+            return f"Option {idx} is missing a non-empty 'label'."
+        if not value or not isinstance(value, str) or not value.strip():
+            return f"Option {idx} is missing a non-empty 'value'."
+
+        if len(label) > MAX_LABEL_LEN:
+            return f"Option {idx} label exceeds {MAX_LABEL_LEN} characters ({len(label)})."
+        if len(value) > MAX_VALUE_LEN:
+            return f"Option {idx} value exceeds {MAX_VALUE_LEN} characters ({len(value)})."
+
+        desc = opt.get("description")
+        if desc is not None and len(str(desc)) > MAX_DESC_LEN:
+            return f"Option {idx} description exceeds {MAX_DESC_LEN} characters ({len(str(desc))})."
+
+        style = opt.get("style", "secondary")
+        if style not in VALID_STYLES:
+            return f"Option {idx} has invalid style '{style}'. Must be one of {sorted(VALID_STYLES)}."
+
+        action = opt.get("action", "return")
+        if action not in VALID_ACTIONS:
+            return f"Option {idx} has invalid action '{action}'. Must be one of {sorted(VALID_ACTIONS)}."
+
+        if action == "modal":
+            modal = opt.get("modal")
+            if not isinstance(modal, dict):
+                return f"Option {idx} has action='modal' but no valid 'modal' object."
+            title = modal.get("title")
+            if not title or not isinstance(title, str) or not title.strip():
+                return f"Option {idx} modal is missing a non-empty 'title'."
+            if len(title) > MAX_MODAL_TITLE_LEN:
+                return f"Option {idx} modal title exceeds {MAX_MODAL_TITLE_LEN} characters ({len(title)})."
+            fields = modal.get("fields")
+            if not isinstance(fields, list):
+                return f"Option {idx} modal 'fields' must be a list."
+            if len(fields) < MIN_MODAL_FIELDS or len(fields) > MAX_MODAL_FIELDS:
+                return (
+                    f"Option {idx} modal must have {MIN_MODAL_FIELDS}-"
+                    f"{MAX_MODAL_FIELDS} fields (got {len(fields)})."
+                )
+
+            seen_keys: set = set()
+            for fi, fld in enumerate(fields):
+                if not isinstance(fld, dict):
+                    return f"Option {idx} modal field {fi} must be a dict."
+                key = fld.get("key", "")
+                if not key or not isinstance(key, str) or not key.strip():
+                    return f"Option {idx} modal field {fi} is missing a non-empty 'key'."
+                if key in seen_keys:
+                    return f"Option {idx} modal field {fi} has duplicate key '{key}'."
+                seen_keys.add(key)
+                lbl = fld.get("label")
+                if not lbl or not isinstance(lbl, str) or not lbl.strip():
+                    return f"Option {idx} modal field {fi} is missing a non-empty 'label'."
+                field_type = fld.get("type", "text")
+                if field_type not in VALID_FIELD_TYPES:
+                    return (
+                        f"Option {idx} modal field {fi} has invalid type "
+                        f"'{field_type}'. Must be one of {sorted(VALID_FIELD_TYPES)}."
+                    )
+
+    return None
+
+
+# =============================================================================
+# Tool handler
+# =============================================================================
+
+# Note: rich-options support (options/display_type/auth_policy/timeout_seconds)
+# is merged into clarify_tool above -- validated then dispatched through the
+# same callback contract, keeping one canonical function.
+
+
+def check_clarify_requirements() -> bool:
+    """Clarify tool has no external requirements -- always available."""
+    return True
+
+
+# =============================================================================
+# Registry
+# =============================================================================
+
 from tools.registry import registry, tool_error
 
 registry.register(
@@ -509,6 +751,10 @@ registry.register(
         choices=args.get("choices"),
         multi_select=args.get("multi_select", False),
         questions=args.get("questions"),
+        options=args.get("options"),
+        display_type=args.get("display_type", "buttons"),
+        auth_policy=args.get("auth_policy", "session_owner_only"),
+        timeout_seconds=args.get("timeout_seconds"),
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
     emoji="❓",
