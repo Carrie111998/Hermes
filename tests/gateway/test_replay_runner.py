@@ -1,14 +1,16 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.delivery import DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.replay import ReplayPlan, current_replay_context
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 
 class FakeReplayAdapter(BasePlatformAdapter):
@@ -166,6 +168,187 @@ def _small_tgg_bridge_corpus():
             "timestamp": 110,
         },
     ]
+
+
+class _BridgePostRecorder:
+    """Connected-looking WhatsApp bridge session that records real POST attempts."""
+
+    def __init__(self):
+        self.posts = []
+
+    def post(self, url, *, json=None, timeout=None):
+        self.posts.append({"url": url, "json": json, "timeout": timeout})
+        return _BridgePostResponse(message_id=f"bridge-leak-{len(self.posts)}")
+
+
+class _BridgePostResponse:
+    def __init__(self, *, message_id: str):
+        self.status = 200
+        self._message_id = message_id
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def json(self):
+        return {"messageId": self._message_id}
+
+    async def text(self):
+        return "ok"
+
+
+class _FakeSessionStore:
+    _entries = {}
+
+    def _ensure_loaded(self) -> None:
+        return None
+
+    def get_or_create_session(self, source):
+        return SimpleNamespace(session_key=build_session_key(source))
+
+    def switch_session(self, session_key: str, target_session_id: str):
+        return SimpleNamespace(session_key=session_key, session_id=target_session_id)
+
+
+class _DirectSendProbeWhatsAppAdapter:
+    """Mixin for replay probes that intentionally calls direct adapter.send paths."""
+
+    async def replay_bridge_messages(self, messages, *, bypass_require_mention=True) -> int:
+        runner = self._probe_runner
+
+        # delivery.py:254 — cron/delivery router direct adapter.send path.
+        await runner.delivery_router._deliver_to_platform(
+            DeliveryTarget(Platform.WHATSAPP, chat_id="delivery-chat@g.us"),
+            "delivery.py direct send should be captured",
+            {"job_id": "replay-probe"},
+        )
+
+        # run.py:3528 — active-session shutdown/restart notice direct send.
+        active_source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="shutdown-active@g.us",
+            chat_name="Active",
+            chat_type="group",
+            user_id="active-user@s.whatsapp.net",
+            user_name="Active User",
+        )
+        active_key = build_session_key(
+            active_source,
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+        runner._running_agents[active_key] = object()
+        runner._cache_session_source(active_key, active_source)
+
+        # run.py:3574 — home-channel shutdown/restart notice direct send
+        # (home has thread metadata so the 3574 branch, not 3576, is exercised).
+        await runner._notify_active_sessions_of_shutdown()
+
+        # run.py:4709 — CLI→gateway handoff response direct send.
+        runner.session_store = _FakeSessionStore()
+        runner._handle_message = AsyncMock(return_value="handoff reply should be captured")
+        await runner._process_handoff({
+            "id": "cli-session-123456",
+            "handoff_platform": "whatsapp",
+            "title": "Replay Probe",
+        })
+
+        return len(messages)
+
+
+@pytest.mark.asyncio
+async def test_replay_guard_blocks_direct_whatsapp_sends_before_bridge_post(tmp_path, monkeypatch):
+    """Direct adapter.send callers in replay must be captured before WA bridge POST."""
+    from gateway.platforms.whatsapp import WhatsAppAdapter
+
+    class ProbeAdapter(_DirectSendProbeWhatsAppAdapter, WhatsAppAdapter):
+        def __init__(self, config, runner, http_session):
+            super().__init__(config)
+            self._probe_runner = runner
+            self._running = True
+            self._http_session = http_session
+
+    platform_config = PlatformConfig(
+        enabled=True,
+        home_channel=HomeChannel(
+            platform=Platform.WHATSAPP,
+            chat_id="shutdown-home@g.us",
+            name="Home",
+            thread_id="home-thread",
+        ),
+        extra={
+            "bridge_port": 39123,
+            "session_path": str(tmp_path / "wa-session"),
+            "turn_debounce_ms": 0,
+            "group_policy": "open",
+            "dm_policy": "open",
+            "group_sessions_per_user": False,
+            "thread_sessions_per_user": False,
+        },
+    )
+    runner = GatewayRunner(GatewayConfig(platforms={Platform.WHATSAPP: platform_config}))
+    runner.session_store = _FakeSessionStore()
+    http_session = _BridgePostRecorder()
+    adapter = ProbeAdapter(platform_config, runner, http_session)
+
+    async def fake_build(platform, platform_config, *, connect=True):
+        runner._wire_adapter(adapter)
+        return adapter, None
+
+    monkeypatch.setattr(runner, "_build_adapter", fake_build)
+
+    result = await runner.replay(ReplayPlan(
+        platform="whatsapp",
+        run_id="run-direct-send",
+        attempt_id="attempt-direct-send",
+        messages=({"messageId": "m1", "body": "trigger direct-send probes", "timestamp": 100},),
+    ))
+
+    assert http_session.posts == []
+    assert result.processed == 1
+    outbound_contents = [
+        entry["kwargs"].get("content") or (entry["args"][1] if len(entry["args"]) > 1 else "")
+        for entry in result.outbound
+    ]
+    assert any("delivery.py direct send" in content for content in outbound_contents)
+    assert any("Gateway shutting down" in content for content in outbound_contents)
+    assert any("handoff reply should be captured" in content for content in outbound_contents)
+    assert len([entry for entry in result.outbound if entry["kind"] == "send"]) >= 4
+
+
+@pytest.mark.asyncio
+async def test_replay_guard_blocks_yuanbao_adapter_send_direct_path():
+    """YuanbaoAdapter.send delegates to outbound.send_text unless replay guard captures it."""
+    from gateway.platforms.yuanbao import YuanbaoAdapter
+    from gateway.replay import replay_context
+
+    class FakeYuanbaoOutbound:
+        def __init__(self):
+            self.calls = []
+
+        async def send_text(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return SendResult(success=True, message_id="yuanbao-leak")
+
+    adapter = YuanbaoAdapter(PlatformConfig(
+        enabled=True,
+        extra={"app_id": "app", "app_secret": "secret"},
+    ))
+    fake_outbound = FakeYuanbaoOutbound()
+    adapter._outbound = fake_outbound
+    runner = GatewayRunner(GatewayConfig(platforms={Platform.YUANBAO: adapter.config}))
+
+    with replay_context(ReplayPlan(platform="yuanbao", run_id="run-yuanbao")) as ctx:
+        runner._install_replay_delivery_guard(adapter, ctx)
+        result = await adapter.send("direct:account", "yuanbao direct send should be captured")
+
+    assert result.success is True
+    assert result.message_id == "replay-1"
+    assert fake_outbound.calls == []
+    assert ctx.outbound[0]["kind"] == "send"
+    assert ctx.outbound[0]["args"][1] == "yuanbao direct send should be captured"
 
 
 @pytest.mark.asyncio
