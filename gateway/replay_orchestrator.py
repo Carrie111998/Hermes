@@ -26,6 +26,7 @@ from gateway.replay import ReplayPlan, canonical_digest, canonical_json
 
 RUN_MANIFEST_VERSION = 1
 PROVIDER_CONFIRM_PROMOTE = "SWAP_TGG_TARGET"
+NON_DELIVERING_REPLAY_DELIVERY_MODES = {"capture", "drop"}
 
 
 def _utc_now() -> str:
@@ -730,10 +731,16 @@ class PAReplayOrchestrator:
             for entry in outbound_entries
             if str(entry.get("delivery_mode") or "").strip().lower() == "capture"
         ]
+        dropped_outbound = [
+            entry
+            for entry in outbound_entries
+            if str(entry.get("delivery_mode") or "").strip().lower() == "drop"
+        ]
         escaped_outbound = [
             entry
             for entry in outbound_entries
-            if str(entry.get("delivery_mode") or "").strip().lower() != "capture"
+            if str(entry.get("delivery_mode") or "").strip().lower()
+            not in NON_DELIVERING_REPLAY_DELIVERY_MODES
         ]
         allowed_kinds = set(gate.allowed_outbound_kinds)
         unexpected_outbound = [
@@ -753,6 +760,8 @@ class PAReplayOrchestrator:
                 actual={
                     "captured_count": len(captured_outbound),
                     "captured": captured_outbound[:5],
+                    "dropped_count": len(dropped_outbound),
+                    "dropped": dropped_outbound[:5],
                     "escaped_count": len(escaped_outbound),
                     "escaped": escaped_outbound[:5],
                     "unexpected_count": len(unexpected_outbound),
@@ -762,9 +771,10 @@ class PAReplayOrchestrator:
                 },
                 expected={"escaped_count": 0},
                 detail=(
-                    "Captured replay outbounds (delivery_mode=capture) are "
-                    "reported but non-failing. Any non-capture delivery mode "
-                    "is treated as escaped and hard-fails this gate."
+                    "Captured/dropped replay outbounds "
+                    "(delivery_mode=capture|drop) are reported but non-failing. "
+                    "Any other delivery mode is treated as escaped and "
+                    "hard-fails this gate."
                 ),
             )
         )
