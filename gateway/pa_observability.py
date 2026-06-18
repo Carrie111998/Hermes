@@ -87,6 +87,8 @@ class PaToolCall:
     # dedup per-session so a payload extracted from the full conversation
     # history persists only the recording turn's delta.
     call_id: Optional[str] = None
+    replay_run_id: Optional[str] = None
+    replay_attempt_id: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         return asdict(self)
@@ -107,6 +109,8 @@ class PaEvent:
     evidence_message_refs: Optional[List[Any]] = None
     source: str = "agent_recorded"
     recorded_at: Optional[float] = None
+    replay_run_id: Optional[str] = None
+    replay_attempt_id: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
         return asdict(self)
@@ -137,6 +141,8 @@ class PaTurnRecord:
     raw_turn_envelope: Optional[Any] = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
+    replay_run_id: Optional[str] = None
+    replay_attempt_id: Optional[str] = None
     tool_calls: List[PaToolCall] = field(default_factory=list)
     events: List[PaEvent] = field(default_factory=list)
 
@@ -160,6 +166,8 @@ class PaTurnRecord:
             "raw_turn_envelope": self.raw_turn_envelope,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "replay_run_id": self.replay_run_id,
+            "replay_attempt_id": self.replay_attempt_id,
             "tool_calls": [tc.to_row() for tc in self.tool_calls],
             "events": [ev.to_row() for ev in self.events],
         }
@@ -215,6 +223,17 @@ def stage_agent_event(
     evidence_message_refs: Optional[List[Any]] = None,
 ) -> None:
     """Stage an agent_recorded event (called by the record_event tool)."""
+    replay_run_id = None
+    replay_attempt_id = None
+    try:
+        from gateway.replay import current_replay_context
+
+        replay_ctx = current_replay_context()
+        if replay_ctx is not None:
+            replay_run_id = replay_ctx.run_id
+            replay_attempt_id = replay_ctx.attempt_id
+    except Exception:
+        pass
     _EVENT_BUFFER.stage(
         session_id,
         PaEvent(
@@ -223,6 +242,8 @@ def stage_agent_event(
             evidence_message_refs=evidence_message_refs,
             source="agent_recorded",
             recorded_at=time.time(),
+            replay_run_id=replay_run_id,
+            replay_attempt_id=replay_attempt_id,
         ),
     )
 
@@ -253,7 +274,12 @@ def _as_float(value: Any) -> Optional[float]:
         return None
 
 
-def extract_tool_calls(messages: Optional[List[Dict[str, Any]]]) -> List[PaToolCall]:
+def extract_tool_calls(
+    messages: Optional[List[Dict[str, Any]]],
+    *,
+    replay_run_id: Optional[str] = None,
+    replay_attempt_id: Optional[str] = None,
+) -> List[PaToolCall]:
     """Flatten tool-calls out of the agent's conversation messages.
 
     The agent_result["messages"] list is the full conversation, where assistant
@@ -295,6 +321,8 @@ def extract_tool_calls(messages: Optional[List[Dict[str, Any]]]) -> List[PaToolC
                     duration_ms=None,
                     client_entity_pointer=None,
                     call_id=str(tcid) if tcid is not None else None,
+                    replay_run_id=replay_run_id,
+                    replay_attempt_id=replay_attempt_id,
                 )
             )
     return calls
@@ -309,6 +337,8 @@ def build_turn_record(
     final_response: Optional[str],
     started_at: Optional[float],
     completed_at: Optional[float],
+    replay_run_id: Optional[str] = None,
+    replay_attempt_id: Optional[str] = None,
 ) -> PaTurnRecord:
     """Assemble a universal PaTurnRecord from a completed turn.
 
@@ -327,7 +357,11 @@ def build_turn_record(
     else:
         turn_status = "completed"
 
-    tool_calls = extract_tool_calls(agent_result.get("messages"))
+    tool_calls = extract_tool_calls(
+        agent_result.get("messages"),
+        replay_run_id=replay_run_id,
+        replay_attempt_id=replay_attempt_id,
+    )
 
     # Tool-call counts/timing from the result if present (best-effort).
     started = started_at if started_at is not None else None
@@ -342,6 +376,12 @@ def build_turn_record(
     events: List[PaEvent] = []
     if session_id:
         events.extend(drain_agent_events(session_id))
+    if replay_run_id or replay_attempt_id:
+        for event in events:
+            if event.replay_run_id is None:
+                event.replay_run_id = replay_run_id
+            if event.replay_attempt_id is None:
+                event.replay_attempt_id = replay_attempt_id
 
     # message_refs: the WA source message ids of the turn's INPUT (injected at
     # the gateway boundary from the MessageEvent — deterministic, recorded at
@@ -366,6 +406,10 @@ def build_turn_record(
         "model": agent_result.get("model"),
         "provider": agent_result.get("provider"),
     }
+    if replay_run_id or replay_attempt_id:
+        raw_envelope["execution_mode"] = "replay"
+        raw_envelope["replay_run_id"] = replay_run_id
+        raw_envelope["replay_attempt_id"] = replay_attempt_id
 
     return PaTurnRecord(
         turn_id=new_turn_id(),
@@ -409,6 +453,8 @@ def build_turn_record(
         raw_turn_envelope=raw_envelope,
         started_at=started,
         completed_at=completed,
+        replay_run_id=replay_run_id,
+        replay_attempt_id=replay_attempt_id,
         tool_calls=tool_calls,
         events=events,
     )

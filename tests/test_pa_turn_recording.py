@@ -38,6 +38,7 @@ def test_pa_turn_tables_and_indexes_created(tmp_path):
             assert "pa_turns" in tables
             assert "pa_tool_calls" in tables
             assert "pa_events" in tables
+            assert "replay_attempts" in tables
 
             indexes = {
                 row[0]
@@ -49,6 +50,7 @@ def test_pa_turn_tables_and_indexes_created(tmp_path):
             assert "idx_pa_turns_chat" in indexes
             assert "idx_pa_tool_calls_turn" in indexes
             assert "idx_pa_events_turn" in indexes
+            assert "idx_replay_attempts_run" in indexes
         finally:
             conn.close()
     finally:
@@ -70,6 +72,7 @@ def test_pa_turns_columns_match_universal_shape(tmp_path):
                 "output_tokens", "context_window_peak", "cost_usd",
                 "turn_status", "error_json", "latency_ms",
                 "raw_turn_envelope_json", "started_at", "completed_at",
+                "replay_run_id", "replay_attempt_id",
             ):
                 assert expected in cols, f"missing pa_turns column: {expected}"
         finally:
@@ -101,6 +104,8 @@ def test_record_pa_turn_writes_all_three_tables(tmp_path):
             raw_turn_envelope={"final_response": "ok"},
             started_at=100.0,
             completed_at=100.8,
+            replay_run_id="run-1",
+            replay_attempt_id="attempt-1",
             tool_calls=[
                 {
                     "tool_name": "pa_business_read",
@@ -136,6 +141,8 @@ def test_record_pa_turn_writes_all_three_tables(tmp_path):
         assert turn["output_tokens"] == 45
         assert turn["turn_status"] == "completed"
         assert turn["latency_ms"] == 812
+        assert turn["replay_run_id"] == "run-1"
+        assert turn["replay_attempt_id"] == "attempt-1"
         # JSON columns decode back to objects
         assert turn["message_refs"] == ["m1", "m2"]
         assert turn["raw_turn_envelope"] == {"final_response": "ok"}
@@ -146,14 +153,117 @@ def test_record_pa_turn_writes_all_three_tables(tmp_path):
         assert tc["input"] == {"operation": "case_lookup"}
         assert tc["result"] == {"jobNo": "WC-9"}
         assert tc["client_entity_pointer"] == "WC-9"
+        assert tc["replay_run_id"] == "run-1"
+        assert tc["replay_attempt_id"] == "attempt-1"
 
         assert len(turn["events"]) == 1
         ev = turn["events"][0]
         assert ev["event_type"] == "case_update_confirmed"
         assert ev["source"] == "agent_recorded"
         assert ev["evidence_message_refs"] == ["m2"]
+        assert ev["replay_run_id"] == "run-1"
+        assert ev["replay_attempt_id"] == "attempt-1"
     finally:
         db.close()
+
+
+def test_replay_execution_report_derives_from_pa_records(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.record_replay_attempt(
+            attempt_id="attempt-report",
+            run_id="run-report",
+            replay_namespace="agent:replay:run-report",
+            platform="whatsapp",
+            delivery_mode="capture",
+            status="running",
+            corpus_manifest={"message_count": 1},
+            corpus_digest="sha256:" + "0" * 64,
+            config_overlay_manifest={},
+            config_overlay_digest="sha256:" + "1" * 64,
+            target_descriptor_manifest={"provider": "systems-pcl"},
+            target_descriptor_digest="sha256:" + "2" * 64,
+            target_baseline_manifest={"snapshot_id": "snap"},
+            target_baseline_digest="sha256:" + "3" * 64,
+            code_manifest={"git_commit": "abc"},
+            code_digest="sha256:" + "4" * 64,
+            replay_policy_manifest={"execution_mode": "replay"},
+            replay_policy_digest="sha256:" + "5" * 64,
+            plan_manifest={"run_id": "run-report"},
+            plan_digest="sha256:" + "6" * 64,
+        )
+        db.record_pa_turn(
+            turn_id="paturn_report",
+            agent_id="christopher",
+            chat_id="chat-42",
+            session_id="sess-1",
+            replay_run_id="run-report",
+            replay_attempt_id="attempt-report",
+            turn_status="completed",
+            tool_calls=[{"tool_name": "pa_business_read", "call_id": "call-1"}],
+            events=[{"event_type": "case_update", "source": "agent_recorded"}],
+        )
+        db.finish_replay_attempt(attempt_id="attempt-report", status="completed")
+
+        report = db.replay_execution_report(
+            run_id="run-report",
+            attempt_id="attempt-report",
+        )
+
+        assert report["summary"] == {
+            "turn_count": 1,
+            "tool_call_count": 1,
+            "event_count": 1,
+            "status_counts": {"completed": 1},
+            "failed_turn_count": 0,
+        }
+        assert report["turn_ids"] == ["paturn_report"]
+        assert report["attempt"]["target_descriptor_manifest"]["provider"] == "systems-pcl"
+    finally:
+        db.close()
+
+
+def test_build_turn_record_stamps_replay_ids_on_turn_tools_and_events():
+    po.stage_agent_event(
+        "sess-replay",
+        event_type="case_update",
+        reason="agent recorded during replay",
+        evidence_message_refs=["m1"],
+    )
+    record = po.build_turn_record(
+        session_id="sess-replay",
+        agent_id="christopher",
+        chat_id="chat-42",
+        agent_result={
+            "completed": True,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "pa_business_write",
+                                "arguments": "{\"operation\":\"case_update\"}",
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call-1", "content": "{\"ok\":true}"},
+            ],
+        },
+        final_response="done",
+        started_at=1.0,
+        completed_at=2.0,
+        replay_run_id="run-build",
+        replay_attempt_id="attempt-build",
+    )
+
+    assert record.replay_run_id == "run-build"
+    assert record.replay_attempt_id == "attempt-build"
+    assert record.raw_turn_envelope["execution_mode"] == "replay"
+    assert record.tool_calls[0].replay_run_id == "run-build"
+    assert record.events[0].replay_attempt_id == "attempt-build"
 
 
 def test_record_pa_turn_idempotent_on_same_turn_id(tmp_path):

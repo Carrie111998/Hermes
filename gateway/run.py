@@ -2343,11 +2343,20 @@ class GatewayRunner:
             except Exception:
                 pass
         config = getattr(self, "config", None)
-        return build_session_key(
+        session_key = build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+        try:
+            from gateway.replay import current_replay_context
+
+            replay_ctx = current_replay_context()
+            if replay_ctx is not None:
+                return replay_ctx.namespace_session_key(session_key)
+        except Exception:
+            pass
+        return session_key
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -6193,7 +6202,7 @@ class GatewayRunner:
     async def replay(self, plan: Any):
         """Replay bridge-message corpus through the native gateway path."""
         from gateway.config import Platform, PlatformConfig
-        from gateway.replay import ReplayPlan, ReplayResult, replay_context
+        from gateway.replay import ReplayAttempt, ReplayPlan, ReplayResult, replay_context
 
         if isinstance(plan, (str, Path)):
             plan = ReplayPlan.from_path(plan)
@@ -6209,32 +6218,68 @@ class GatewayRunner:
         elif hasattr(platform_config, "enabled") and not platform_config.enabled:
             platform_config.enabled = True
 
-        with replay_context(plan) as ctx:
-            adapter, _ = await self._build_adapter(platform, platform_config, connect=False)
-            if adapter is None:
-                raise RuntimeError(f"No adapter available for {platform.value}")
-            if not hasattr(adapter, "replay_bridge_messages"):
-                raise RuntimeError(f"Adapter {platform.value!r} does not support replay_bridge_messages")
-            self.adapters[platform] = adapter
-            self.delivery_router.adapters = self.adapters
-            self._install_replay_delivery_guard(adapter, ctx)
+        attempt = ReplayAttempt.from_plan(plan)
+        session_db = getattr(self, "_session_db", None)
+        if session_db is not None and hasattr(session_db, "record_replay_attempt"):
+            session_db.record_replay_attempt(**attempt.to_db_kwargs())
 
-            replay_fn = getattr(adapter, "replay_bridge_messages")
-            processed = await replay_fn(
-                list(plan.messages),
-                bypass_require_mention=plan.bypass_require_mention,
-            )
-            await self._drain_replay_adapter_tasks(adapter)
+        try:
+            with replay_context(plan) as ctx:
+                adapter, _ = await self._build_adapter(platform, platform_config, connect=False)
+                if adapter is None:
+                    raise RuntimeError(f"No adapter available for {platform.value}")
+                if not hasattr(adapter, "replay_bridge_messages"):
+                    raise RuntimeError(f"Adapter {platform.value!r} does not support replay_bridge_messages")
+                self.adapters[platform] = adapter
+                self.delivery_router.adapters = self.adapters
+                self._install_replay_delivery_guard(adapter, ctx)
 
-            return ReplayResult(
-                run_id=ctx.run_id,
-                attempt_id=ctx.attempt_id,
-                platform=platform.value,
-                processed=int(processed or 0),
-                outbound=list(ctx.outbound),
-                blocked_commands=list(ctx.blocked_commands),
-                delivery_mode=ctx.delivery_mode,
-            )
+                replay_fn = getattr(adapter, "replay_bridge_messages")
+                processed = await replay_fn(
+                    list(plan.messages),
+                    bypass_require_mention=plan.bypass_require_mention,
+                )
+                await self._drain_replay_adapter_tasks(adapter)
+
+                completed_at = time.time()
+                if session_db is not None and hasattr(session_db, "finish_replay_attempt"):
+                    session_db.finish_replay_attempt(
+                        attempt_id=ctx.attempt_id,
+                        status="completed",
+                        completed_at=completed_at,
+                    )
+                execution_report = None
+                if session_db is not None and hasattr(session_db, "replay_execution_report"):
+                    execution_report = session_db.replay_execution_report(
+                        run_id=ctx.run_id,
+                        attempt_id=ctx.attempt_id,
+                    )
+                attempt_dict = attempt.to_dict()
+                attempt_dict["status"] = "completed"
+                attempt_dict["completed_at"] = completed_at
+                return ReplayResult(
+                    run_id=ctx.run_id,
+                    attempt_id=ctx.attempt_id,
+                    platform=platform.value,
+                    processed=int(processed or 0),
+                    outbound=list(ctx.outbound),
+                    blocked_commands=list(ctx.blocked_commands),
+                    delivery_mode=ctx.delivery_mode,
+                    attempt=attempt_dict,
+                    execution_report=execution_report,
+                )
+        except Exception as exc:
+            if session_db is not None and hasattr(session_db, "finish_replay_attempt"):
+                try:
+                    session_db.finish_replay_attempt(
+                        attempt_id=attempt.attempt_id,
+                        status="failed",
+                        completed_at=time.time(),
+                        error={"type": type(exc).__name__, "message": str(exc)},
+                    )
+                except Exception:
+                    pass
+            raise
 
     def _create_adapter(
         self, 
@@ -8254,7 +8299,7 @@ class GatewayRunner:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
-        if self._is_telegram_topic_lane(source):
+        if _replay_ctx is None and self._is_telegram_topic_lane(source):
             try:
                 binding = self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
@@ -11331,6 +11376,8 @@ class GatewayRunner:
         agent_result: Any,
         final_response: str,
         started_at: Optional[float],
+        replay_run_id: Optional[str] = None,
+        replay_attempt_id: Optional[str] = None,
     ) -> None:
         """Synchronous body of PA turn-recording. Runs in an executor.
 
@@ -11351,6 +11398,8 @@ class GatewayRunner:
                 final_response=final_response,
                 started_at=started_at,
                 completed_at=time.time(),
+                replay_run_id=replay_run_id,
+                replay_attempt_id=replay_attempt_id,
             )
             session_db = getattr(self, "_session_db", None)
             turn_id = pa_observability.safe_record_turn(session_db, record)
@@ -11392,6 +11441,17 @@ class GatewayRunner:
             session_id = getattr(session_entry, "session_id", None) or None
             chat_id = getattr(source, "chat_id", None)
             agent_id = self._resolve_pa_agent_id_safe(source)
+            replay_run_id = None
+            replay_attempt_id = None
+            try:
+                from gateway.replay import current_replay_context
+
+                replay_ctx = current_replay_context()
+                if replay_ctx is not None:
+                    replay_run_id = replay_ctx.run_id
+                    replay_attempt_id = replay_ctx.attempt_id
+            except Exception:
+                pass
 
             # Only record for PA-deployed agents. Without an agent_id this is a
             # non-PA session (TUI, plain DM) and universal PA observability does
@@ -11417,6 +11477,8 @@ class GatewayRunner:
                         agent_result=agent_result,
                         final_response=final_response,
                         started_at=started_at,
+                        replay_run_id=replay_run_id,
+                        replay_attempt_id=replay_attempt_id,
                     ),
                 ),
                 timeout=5.0,

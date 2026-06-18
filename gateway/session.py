@@ -743,11 +743,20 @@ class SessionStore:
     
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
-        return build_session_key(
+        session_key = build_session_key(
             source,
             group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
         )
+        try:
+            from gateway.replay import current_replay_context
+
+            replay_ctx = current_replay_context()
+            if replay_ctx is not None:
+                return replay_ctx.namespace_session_key(session_key)
+        except Exception:
+            pass
+        return session_key
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.

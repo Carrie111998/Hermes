@@ -209,6 +209,9 @@ Runs a typed bridge-message corpus through the native gateway replay path:
 - builds the platform adapter with the same gateway wiring, but `connect=False`
 - calls the adapter's `replay_bridge_messages(...)` entrypoint
 - sets `execution_mode=replay` for downstream tools
+- runs under a replay session namespace (`agent:replay:<run_id>` by default)
+- writes a `ReplayAttempt` provenance card with readable manifests + digests
+- stamps PA turn/tool/event records with `replay_run_id` / `replay_attempt_id`
 - captures or drops outbound adapter sends instead of delivering to live platforms
 
 Plan shape:
@@ -216,12 +219,26 @@ Plan shape:
 ```json
 {
   "platform": "whatsapp",
+  "run_id": "run-tgg-2026-06-18",
+  "attempt_id": "attempt-tgg-001",
   "delivery_mode": "capture",
   "bypass_require_mention": true,
   "bypass_auth": true,
-  "corpus": {"path": "bridge-messages.jsonl"}
+  "corpus": {"path": "bridge-messages.jsonl"},
+  "target_descriptor": {
+    "provider": "systems-pcl",
+    "base_url": "http://127.0.0.1:5191",
+    "auth_ref": "SYSTEMS_PCL_REPLAY_TOKEN"
+  },
+  "target_baseline": {"snapshot_id": "baseline-2026-06-18"},
+  "config_overlay": {"pa": {"enabled": true}},
+  "code_manifest": {"git_commit": "abc123"}
 }
 ```
+
+The CLI result includes the run id, attempt id, captured outbound attempts,
+the attempt manifest/digests, and a derived execution summary from normal Hermes
+state rows. It does not create a parallel replay-report store.
 
 A plan may also include a top-level `messages` array. `--corpus` accepts a JSON
 array, JSON object with `messages`/`bridge_messages`/`events`, or JSONL file.

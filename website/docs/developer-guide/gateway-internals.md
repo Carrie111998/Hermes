@@ -55,24 +55,31 @@ The messaging gateway is the long-running process that connects Hermes to 20+ ex
 `GatewayRunner.replay(plan)` is the supported no-connect entrypoint for rerunning
 captured bridge messages through the real gateway engine.
 
-1. `ReplayPlan` (`gateway/replay.py`) loads a typed plan or JSON/JSONL corpus.
+1. `ReplayPlan` (`gateway/replay.py`) loads a typed plan or JSON/JSONL corpus,
+   computes readable provenance manifests, and assigns the replay namespace
+   (`agent:replay:<run_id>` by default).
 2. `GatewayRunner._build_adapter(platform, config, connect=False)` creates the
    same platform adapter and callback wiring used by live startup, but does not
    call `adapter.connect()`.
-3. The runner installs a replay delivery guard on the adapter send surface, sets
+3. The runner persists a `ReplayAttempt` provenance card in `state.db`, installs
+   a replay delivery guard on the adapter send surface, sets
    `execution_mode=replay` via contextvars, and registers the adapter in the
    delivery router so tool calls still hit the in-process adapter.
 4. The adapter's `replay_bridge_messages(...)` method converts raw bridge
    messages into `MessageEvent`s and feeds them through the normal base-adapter
    session path into `_handle_message()`.
-5. `_handle_message()` bypasses live auth only when the plan says so, blocks
+5. `_handle_message()` resolves normal Hermes session keys under the replay
+   namespace so live sessions are never continued/reset, bypasses live auth only
+   when the plan says so, blocks
    slash/quick-command side effects unless explicitly replay-safe, suppresses
    live streaming delivery, and lets outbound sends be captured/dropped by the
    replay guard.
 
 Replay context also carries `X-Replay-Run-Id` and `X-Replay-Attempt-Id` into PA
-business bridge calls and sets a per-turn history-before timestamp for
-future-read fences.
+business bridge calls, stamps `pa_turns` / `pa_tool_calls` / `pa_events` with
+run and attempt ids, and sets a per-turn history-before timestamp for future-read
+fences. Execution reports are derived from those normal rows plus the attempt
+provenance row; there is no separate replay-report store.
 
 ## Message Flow
 

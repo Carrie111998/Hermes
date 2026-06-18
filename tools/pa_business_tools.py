@@ -439,8 +439,15 @@ def _execute_http_operation(
         from gateway.replay import current_replay_context
         _replay_ctx = current_replay_context()
         if _replay_ctx is not None:
-            headers.setdefault("X-Replay-Run-Id", _replay_ctx.run_id)
-            headers.setdefault("X-Replay-Attempt-Id", _replay_ctx.attempt_id)
+            if hasattr(_replay_ctx, "bridge_headers"):
+                headers.update({
+                    key: value
+                    for key, value in _replay_ctx.bridge_headers().items()
+                    if key not in headers
+                })
+            else:
+                headers.setdefault("X-Replay-Run-Id", _replay_ctx.run_id)
+                headers.setdefault("X-Replay-Attempt-Id", _replay_ctx.attempt_id)
     except Exception:
         pass
 

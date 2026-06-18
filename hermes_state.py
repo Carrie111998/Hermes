@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -281,7 +281,9 @@ CREATE TABLE IF NOT EXISTS pa_turns (
     latency_ms INTEGER,
     raw_turn_envelope_json TEXT,
     started_at REAL,
-    completed_at REAL
+    completed_at REAL,
+    replay_run_id TEXT,
+    replay_attempt_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pa_tool_calls (
@@ -293,7 +295,9 @@ CREATE TABLE IF NOT EXISTS pa_tool_calls (
     cost_usd REAL,
     duration_ms INTEGER,
     client_entity_pointer TEXT,
-    call_id TEXT
+    call_id TEXT,
+    replay_run_id TEXT,
+    replay_attempt_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pa_events (
@@ -303,7 +307,35 @@ CREATE TABLE IF NOT EXISTS pa_events (
     reason TEXT,
     evidence_message_refs_json TEXT,
     source TEXT,
-    recorded_at REAL
+    recorded_at REAL,
+    replay_run_id TEXT,
+    replay_attempt_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS replay_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    replay_namespace TEXT NOT NULL,
+    platform TEXT,
+    delivery_mode TEXT,
+    status TEXT,
+    started_at REAL,
+    completed_at REAL,
+    corpus_manifest_json TEXT,
+    corpus_digest TEXT,
+    config_overlay_manifest_json TEXT,
+    config_overlay_digest TEXT,
+    target_descriptor_manifest_json TEXT,
+    target_descriptor_digest TEXT,
+    target_baseline_manifest_json TEXT,
+    target_baseline_digest TEXT,
+    code_manifest_json TEXT,
+    code_digest TEXT,
+    replay_policy_manifest_json TEXT,
+    replay_policy_digest TEXT,
+    plan_manifest_json TEXT,
+    plan_digest TEXT,
+    error_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_mailbox (
@@ -338,8 +370,12 @@ CREATE INDEX IF NOT EXISTS idx_pa_behavior_events_timestamp ON pa_behavior_event
 CREATE INDEX IF NOT EXISTS idx_pa_turns_agent ON pa_turns(agent_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pa_turns_chat ON pa_turns(agent_id, chat_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pa_turns_session ON pa_turns(session_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_pa_turns_replay ON pa_turns(replay_run_id, replay_attempt_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pa_tool_calls_turn ON pa_tool_calls(turn_id, id);
+CREATE INDEX IF NOT EXISTS idx_pa_tool_calls_replay ON pa_tool_calls(replay_run_id, replay_attempt_id, id);
 CREATE INDEX IF NOT EXISTS idx_pa_events_turn ON pa_events(turn_id, id);
+CREATE INDEX IF NOT EXISTS idx_pa_events_replay ON pa_events(replay_run_id, replay_attempt_id, id);
+CREATE INDEX IF NOT EXISTS idx_replay_attempts_run ON replay_attempts(run_id, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session_mailbox_pending
     ON session_mailbox(agent_id, status, created_at ASC);
 """
@@ -1085,6 +1121,8 @@ class SessionDB:
         raw_turn_envelope: Optional[Any] = None,
         started_at: Optional[float] = None,
         completed_at: Optional[float] = None,
+        replay_run_id: Optional[str] = None,
+        replay_attempt_id: Optional[str] = None,
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         events: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
@@ -1139,8 +1177,10 @@ class SessionDB:
                     tc.get("cost_usd"),
                     tc.get("duration_ms"),
                     tc.get("client_entity_pointer"),
-                    # KEEP LAST — the per-session dedup below keys on row[-1].
+                    # Position 7 — the per-session dedup below keys on call_id.
                     str(tc["call_id"]) if tc.get("call_id") is not None else None,
+                    tc.get("replay_run_id") or replay_run_id,
+                    tc.get("replay_attempt_id") or replay_attempt_id,
                 )
             )
 
@@ -1156,6 +1196,8 @@ class SessionDB:
                     else None,
                     ev.get("source"),
                     ev.get("recorded_at") if ev.get("recorded_at") is not None else now,
+                    ev.get("replay_run_id") or replay_run_id,
+                    ev.get("replay_attempt_id") or replay_attempt_id,
                 )
             )
 
@@ -1166,8 +1208,8 @@ class SessionDB:
                     model, provider, input_tokens, output_tokens,
                     context_window_peak, cost_usd,
                     turn_status, error_json, latency_ms, raw_turn_envelope_json,
-                    started_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    started_at, completed_at, replay_run_id, replay_attempt_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     turn_id,
                     agent_id,
@@ -1186,6 +1228,8 @@ class SessionDB:
                     raw_envelope_json,
                     ts_started,
                     ts_completed,
+                    replay_run_id,
+                    replay_attempt_id,
                 ),
             )
             # Clear any prior children for an idempotent re-record of the turn.
@@ -1229,22 +1273,24 @@ class SessionDB:
                 if already_recorded:
                     insert_rows = [
                         row for row in tool_call_rows
-                        if row[-1] is None or row[-1] not in already_recorded
+                        if row[7] is None or row[7] not in already_recorded
                     ]
             if insert_rows:
                 conn.executemany(
                     """INSERT INTO pa_tool_calls (
                         turn_id, tool_name, input_json, result_json,
-                        cost_usd, duration_ms, client_entity_pointer, call_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        cost_usd, duration_ms, client_entity_pointer, call_id,
+                        replay_run_id, replay_attempt_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     insert_rows,
                 )
             if event_rows:
                 conn.executemany(
                     """INSERT INTO pa_events (
                         turn_id, event_type, reason,
-                        evidence_message_refs_json, source, recorded_at
-                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        evidence_message_refs_json, source, recorded_at,
+                        replay_run_id, replay_attempt_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     event_rows,
                 )
             return turn_id
@@ -1323,6 +1369,212 @@ class SessionDB:
                     except (json.JSONDecodeError, TypeError):
                         ev["evidence_message_refs"] = None
         return turns
+
+    def record_replay_attempt(
+        self,
+        *,
+        attempt_id: str,
+        run_id: str,
+        replay_namespace: str,
+        platform: Optional[str] = None,
+        delivery_mode: Optional[str] = None,
+        status: Optional[str] = None,
+        started_at: Optional[float] = None,
+        completed_at: Optional[float] = None,
+        corpus_manifest: Optional[Dict[str, Any]] = None,
+        corpus_digest: Optional[str] = None,
+        config_overlay_manifest: Optional[Dict[str, Any]] = None,
+        config_overlay_digest: Optional[str] = None,
+        target_descriptor_manifest: Optional[Dict[str, Any]] = None,
+        target_descriptor_digest: Optional[str] = None,
+        target_baseline_manifest: Optional[Dict[str, Any]] = None,
+        target_baseline_digest: Optional[str] = None,
+        code_manifest: Optional[Dict[str, Any]] = None,
+        code_digest: Optional[str] = None,
+        replay_policy_manifest: Optional[Dict[str, Any]] = None,
+        replay_policy_digest: Optional[str] = None,
+        plan_manifest: Optional[Dict[str, Any]] = None,
+        plan_digest: Optional[str] = None,
+        error: Optional[Any] = None,
+    ) -> str:
+        """Store the replay attempt provenance card.
+
+        This is intentionally not an execution-report table. The row stores the
+        readable manifests and canonical digests that identify the run inputs;
+        reports are derived from normal Hermes/PA rows tagged with the run ids.
+        """
+        now = time.time()
+
+        def _json(value: Any) -> Optional[str]:
+            if value is None:
+                return None
+            return json.dumps(value, sort_keys=True, default=str)
+
+        def _do(conn):
+            conn.execute(
+                """INSERT OR REPLACE INTO replay_attempts (
+                    attempt_id, run_id, replay_namespace, platform,
+                    delivery_mode, status, started_at, completed_at,
+                    corpus_manifest_json, corpus_digest,
+                    config_overlay_manifest_json, config_overlay_digest,
+                    target_descriptor_manifest_json, target_descriptor_digest,
+                    target_baseline_manifest_json, target_baseline_digest,
+                    code_manifest_json, code_digest,
+                    replay_policy_manifest_json, replay_policy_digest,
+                    plan_manifest_json, plan_digest, error_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    attempt_id,
+                    run_id,
+                    replay_namespace,
+                    platform,
+                    delivery_mode,
+                    status or "running",
+                    started_at if started_at is not None else now,
+                    completed_at,
+                    _json(corpus_manifest),
+                    corpus_digest,
+                    _json(config_overlay_manifest),
+                    config_overlay_digest,
+                    _json(target_descriptor_manifest),
+                    target_descriptor_digest,
+                    _json(target_baseline_manifest),
+                    target_baseline_digest,
+                    _json(code_manifest),
+                    code_digest,
+                    _json(replay_policy_manifest),
+                    replay_policy_digest,
+                    _json(plan_manifest),
+                    plan_digest,
+                    _json(error),
+                ),
+            )
+            return attempt_id
+
+        return str(self._execute_write(_do))
+
+    def finish_replay_attempt(
+        self,
+        *,
+        attempt_id: str,
+        status: str,
+        completed_at: Optional[float] = None,
+        error: Optional[Any] = None,
+    ) -> str:
+        completed = time.time() if completed_at is None else completed_at
+        error_json = (
+            json.dumps(error, sort_keys=True, default=str)
+            if error is not None
+            else None
+        )
+
+        def _do(conn):
+            conn.execute(
+                """UPDATE replay_attempts
+                   SET status = ?, completed_at = ?, error_json = ?
+                   WHERE attempt_id = ?""",
+                (status, completed, error_json, attempt_id),
+            )
+            return attempt_id
+
+        return str(self._execute_write(_do))
+
+    def get_replay_attempt(
+        self,
+        *,
+        attempt_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        where: List[str] = []
+        params: List[Any] = []
+        if attempt_id is not None:
+            where.append("attempt_id = ?")
+            params.append(attempt_id)
+        if run_id is not None:
+            where.append("run_id = ?")
+            params.append(run_id)
+        if not where:
+            raise ValueError("attempt_id or run_id is required")
+        sql = "SELECT * FROM replay_attempts WHERE " + " AND ".join(where)
+        sql += " ORDER BY started_at DESC LIMIT 1"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        if row is None:
+            return None
+        attempt = dict(row)
+        for field in (
+            "corpus_manifest_json",
+            "config_overlay_manifest_json",
+            "target_descriptor_manifest_json",
+            "target_baseline_manifest_json",
+            "code_manifest_json",
+            "replay_policy_manifest_json",
+            "plan_manifest_json",
+            "error_json",
+        ):
+            raw_value = attempt.pop(field, None)
+            if raw_value:
+                try:
+                    attempt[field[:-5]] = json.loads(raw_value)
+                except (json.JSONDecodeError, TypeError):
+                    attempt[field[:-5]] = None
+        return attempt
+
+    def replay_execution_report(
+        self,
+        *,
+        run_id: str,
+        attempt_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Derive a replay execution report from normal Hermes/PA records."""
+        where = ["replay_run_id = ?"]
+        params: List[Any] = [run_id]
+        if attempt_id is not None:
+            where.append("replay_attempt_id = ?")
+            params.append(attempt_id)
+        sql = "SELECT * FROM pa_turns WHERE " + " AND ".join(where)
+        sql += " ORDER BY started_at ASC, turn_id ASC"
+
+        with self._lock:
+            turn_rows = [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+            turn_ids = [r["turn_id"] for r in turn_rows]
+            tool_count = 0
+            event_count = 0
+            if turn_ids:
+                placeholders = ",".join("?" for _ in turn_ids)
+                tool_count = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM pa_tool_calls WHERE turn_id IN ({placeholders})",
+                        turn_ids,
+                    ).fetchone()[0]
+                )
+                event_count = int(
+                    self._conn.execute(
+                        f"SELECT COUNT(*) FROM pa_events WHERE turn_id IN ({placeholders})",
+                        turn_ids,
+                    ).fetchone()[0]
+                )
+
+        status_counts: Dict[str, int] = {}
+        for row in turn_rows:
+            status = str(row.get("turn_status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        return {
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "attempt": self.get_replay_attempt(attempt_id=attempt_id) if attempt_id else self.get_replay_attempt(run_id=run_id),
+            "summary": {
+                "turn_count": len(turn_rows),
+                "tool_call_count": tool_count,
+                "event_count": event_count,
+                "status_counts": status_counts,
+                "failed_turn_count": sum(
+                    1 for row in turn_rows if row.get("turn_status") == "failed"
+                ),
+            },
+            "turn_ids": turn_ids,
+        }
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
