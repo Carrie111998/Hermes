@@ -473,10 +473,10 @@ class ProcessRegistry:
     def spawn_local(
         self,
         command: str,
-        cwd: str = None,
+        cwd: Optional[str] = None,
         task_id: str = "",
         session_key: str = "",
-        env_vars: dict = None,
+        env_vars: Optional[dict] = None,
         use_pty: bool = False,
     ) -> ProcessSession:
         """
@@ -502,11 +502,11 @@ class ProcessRegistry:
             # Try PTY mode for interactive CLI tools
             try:
                 if _IS_WINDOWS:
-                    from winpty import PtyProcess as _PtyProcessCls
+                    from winpty import PtyProcess as _PtyProcessCls  # type: ignore
                 else:
                     from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
-                pty_env = _sanitize_subprocess_env(os.environ, env_vars)
+                pty_env = _sanitize_subprocess_env(dict(os.environ), env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
                     [user_shell, "-lic", f"set +m; {command}"],
@@ -547,7 +547,7 @@ class ProcessRegistry:
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = _sanitize_subprocess_env(os.environ, env_vars)
+        bg_env = _sanitize_subprocess_env(dict(os.environ), env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
             [user_shell, "-lic", f"set +m; {command}"],
@@ -560,7 +560,7 @@ class ProcessRegistry:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
-            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0,
         )
 
         session.process = proc
@@ -608,7 +608,7 @@ class ProcessRegistry:
         self,
         env: Any,
         command: str,
-        cwd: str = None,
+        cwd: Optional[str] = None,
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
@@ -691,6 +691,8 @@ class ProcessRegistry:
         first_chunk = True
         try:
             while True:
+                if not session.process or not session.process.stdout:
+                    break
                 chunk = session.process.stdout.read(4096)
                 if not chunk:
                     break
@@ -707,11 +709,12 @@ class ProcessRegistry:
         finally:
             # Always reap the child to prevent zombie processes.
             try:
-                session.process.wait(timeout=5)
+                if session.process:
+                    session.process.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
             session.exited = True
-            session.exit_code = session.process.returncode
+            session.exit_code = session.process.returncode if session.process else -1
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -990,7 +993,7 @@ class ProcessRegistry:
             self._completion_consumed.add(session_id)
         return result
 
-    def wait(self, session_id: str, timeout: int = None) -> dict:
+    def wait(self, session_id: str, timeout: Optional[int] = None) -> dict:
         """
         Block until a process exits, timeout, or interrupt.
 
@@ -1030,6 +1033,8 @@ class ProcessRegistry:
 
         while time.monotonic() < deadline:
             session = self._refresh_detached_session(session)
+            if session is None:
+                return {"status": "not_found", "error": f"No process with ID {session_id}"}
             # Reconcile against real child state — guards against orphaned-
             # pipe reader hangs where the reader is blocked but the direct
             # child has already exited (issue #17327).
@@ -1056,6 +1061,9 @@ class ProcessRegistry:
                 return result
 
             time.sleep(1)
+
+        if session is None:
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         result = {
             "status": "timeout",
@@ -1191,19 +1199,23 @@ class ProcessRegistry:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    def list_sessions(self, task_id: str = None) -> list:
+    def list_sessions(self, task_id: Optional[str] = None) -> list:
         """List all running and recently-finished processes."""
         with self._lock:
-            all_sessions = list(self._running.values()) + list(self._finished.values())
+            all_sessions_raw = list(self._running.values()) + list(self._finished.values())
 
-        all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
+        all_sessions: List[ProcessSession] = []
+        for s_raw in all_sessions_raw:
+            refreshed = self._refresh_detached_session(s_raw)
+            if refreshed is not None:
+                all_sessions.append(refreshed)
 
         if task_id:
             all_sessions = [s for s in all_sessions if s.task_id == task_id]
 
         result = []
         for s in all_sessions:
-            entry = {
+            entry: Dict[str, Any] = {
                 "session_id": s.id,
                 "command": s.command[:200],
                 "cwd": s.cwd,
@@ -1250,7 +1262,7 @@ class ProcessRegistry:
                 for s in self._running.values()
             )
 
-    def kill_all(self, task_id: str = None) -> int:
+    def kill_all(self, task_id: Optional[str] = None) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
             targets = [

@@ -52,11 +52,14 @@ jobs:
         with:
           python-version: '3.13'
       - name: Install dependencies
-        run: uv pip install --system httpx==0.28.1 pyyaml==6.0.2
+        run: |
+          uv venv .venv --python 3.13
+          source .venv/bin/activate
+          uv pip install httpx==0.28.1 pyyaml==6.0.2
       - name: Build skills index
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python scripts/build_skills_index.py
+        run: .venv/bin/python scripts/build_skills_index.py
       - name: Upload index artifact
         uses: actions/upload-artifact@b4b15b8c7cac21ea08fcf65892d2ee8f75cf882  # v4.4.3
         with:
@@ -92,20 +95,23 @@ jobs:
           path: website/static/api/
 
       - name: Install build dependencies
-        run: uv pip install --system pyyaml==6.0.2 httpx==0.28.1
+        run: |
+          uv venv .venv --python 3.13
+          source .venv/bin/activate
+          uv pip install pyyaml==6.0.2 httpx==0.28.1
 
       - name: Extract skill metadata
-        run: python3 website/scripts/extract-skills.py
+        run: .venv/bin/python website/scripts/extract-skills.py
 
       - name: Regenerate skill docs
-        run: python3 website/scripts/generate-skill-docs.py
+        run: .venv/bin/python website/scripts/generate-skill-docs.py
 
       - name: Build skills index (fallback)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ ! -f website/static/api/skills-index.json ]; then
-            python3 scripts/build_skills_index.py || echo "Skills index build failed"
+            .venv/bin/python scripts/build_skills_index.py || echo "Skills index build failed"
           fi
 
       - name: Install website dependencies
