@@ -6265,6 +6265,7 @@ class GatewayRunner:
                     outbound=list(ctx.outbound),
                     blocked_commands=list(ctx.blocked_commands),
                     delivery_mode=ctx.delivery_mode,
+                    corpus_report=dict(plan.corpus_manifest.get("report") or {}),
                     attempt=attempt_dict,
                     execution_report=execution_report,
                 )

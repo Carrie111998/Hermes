@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -8,7 +9,7 @@ import pytest
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.delivery import DeliveryTarget
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.replay import ReplayAttempt, ReplayPlan, current_replay_context, replay_context
+from gateway.replay import ReplayAttempt, ReplayCorpus, ReplayPlan, current_replay_context, replay_context
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore, build_session_key
 
@@ -213,6 +214,70 @@ def _small_tgg_bridge_corpus():
             "timestamp": 110,
         },
     ]
+
+
+def _bridge_log_row(
+    source_ref: str,
+    ts: int,
+    body: str,
+    *,
+    message_kind: str = "text",
+    has_media: bool = False,
+    media_refs=None,
+    quoted_text: str = "",
+    reply_to_source_ref: str = "",
+    raw_json=None,
+) -> tuple:
+    return (
+        source_ref,
+        "120363111@g.us",
+        "TGG Ops",
+        "60120000000@s.whatsapp.net",
+        ts,
+        f"2026-05-24 00:{ts:02d}:00 SGT",
+        body,
+        message_kind,
+        1 if has_media else 0,
+        json.dumps(media_refs or []),
+        quoted_text,
+        reply_to_source_ref,
+        json.dumps(raw_json or {}, ensure_ascii=False),
+    )
+
+
+def _write_bridge_message_log(tmp_path: Path, rows: list[tuple]) -> Path:
+    db_path = tmp_path / "bridge.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE bridge_message_log (
+              source_ref TEXT,
+              chat_jid TEXT,
+              chat_name TEXT,
+              sender_id TEXT,
+              ts INTEGER,
+              sgt TEXT,
+              text TEXT,
+              message_kind TEXT,
+              has_media INTEGER,
+              media_refs TEXT,
+              quoted_text TEXT,
+              reply_to_source_ref TEXT,
+              raw_json TEXT
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO bridge_message_log
+              (source_ref, chat_jid, chat_name, sender_id, ts, sgt, text,
+               message_kind, has_media, media_refs, quoted_text,
+               reply_to_source_ref, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+    return db_path
 
 
 class _BridgePostRecorder:
@@ -434,6 +499,156 @@ async def test_native_replay_matches_current_whatsapp_harness_turn_grouping(tmp_
     assert native_ids == harness_ids == golden_source_ids
 
 
+def test_replay_corpus_loads_bridge_message_log_with_explicit_determinism_report(tmp_path):
+    from scripts import tgg_christopher_hermes_replay as legacy_harness
+
+    missing_media = tmp_path / "missing-photo.jpg"
+    rows = [
+        _bridge_log_row("chat::skip0", 90, "offset skip"),
+        # Deliberately inserted out of order; corpus ordering is ts, source_ref.
+        _bridge_log_row("chat::m2", 101, "second update", quoted_text="Job sheet SK/JOB/2605/1954", reply_to_source_ref="q1"),
+        _bridge_log_row("chat::m1", 100, "first update"),
+        _bridge_log_row("chat::reaction", 102, "[reaction: 👍]", message_kind="reaction"),
+        _bridge_log_row(
+            "chat::m3",
+            110,
+            "later update",
+            has_media=True,
+            message_kind="image",
+            media_refs=[{"local_path": str(missing_media)}],
+        ),
+    ]
+    db_path = _write_bridge_message_log(tmp_path, rows)
+
+    corpus = ReplayCorpus.from_bridge_message_log(
+        db_path,
+        chat_id="120363111@g.us",
+        since_sgt="2026-05-24 00:00:00 SGT",
+        skip_messages=1,
+    )
+
+    assert [message["messageId"] for message in corpus.messages] == ["m1", "m2", "m3"]
+    assert corpus.messages[1]["quotedText"] == "Job sheet SK/JOB/2605/1954"
+    assert corpus.messages[2]["mediaUrls"] == [str(missing_media)]
+    assert corpus.report["messages_skipped"] == [
+        {"reason": "offset", "count": 1},
+        {"reason": "bare_reaction", "source_ref": "chat::reaction", "message_kind": "reaction"},
+    ]
+    assert corpus.report["missing_media"] == [
+        {
+            "source_ref": "chat::m3",
+            "path": str(missing_media),
+            "basename": "missing-photo.jpg",
+            "reason": "media_path_missing",
+        }
+    ]
+    policy = corpus.manifest()["policy"]
+    assert policy["ordering"] == ["timestamp", "source_ref"]
+    assert policy["dedup"] == "first_by_message_id_or_source_ref"
+    assert policy["reaction_policy"] == "skip_bare_reactions"
+    assert policy["future_read_fence"] == "per_turn_latest_message_timestamp_plus_one"
+
+    # Parity with the current TGG harness corpus loader/converter: same ordered
+    # feed after its offset + reaction policy, before the native ReplayPlan.
+    legacy_records = legacy_harness._load_records(
+        db_path,
+        chat_id="120363111@g.us",
+        since_sgt="2026-05-24 00:00:00 SGT",
+        until_sgt=None,
+        limit=None,
+        skip_messages=1,
+    )
+    legacy_messages = [
+        legacy_harness._record_to_bridge_message(record)
+        for record in legacy_records
+        if not legacy_harness._is_bare_reaction_record(record)
+    ]
+    assert [
+        (m["messageId"], m["chatId"], m["body"], m["quotedText"], m["mediaUrls"])
+        for m in corpus.messages
+    ] == [
+        (m["messageId"], m["chatId"], m["body"], m["quotedText"], m["mediaUrls"])
+        for m in legacy_messages
+    ]
+
+
+def test_replay_corpus_dedup_reports_skipped_duplicates(tmp_path):
+    db_path = _write_bridge_message_log(
+        tmp_path,
+        [
+            _bridge_log_row("chat::m1", 100, "first", raw_json={"id": "same-id"}),
+            _bridge_log_row("chat::m1-duplicate", 101, "duplicate", raw_json={"id": "same-id"}),
+            _bridge_log_row("chat::m2", 102, "second", raw_json={"id": "m2"}),
+        ],
+    )
+
+    corpus = ReplayCorpus.from_bridge_message_log(
+        db_path,
+        chat_id="120363111@g.us",
+        since_sgt="2026-05-24 00:00:00 SGT",
+    )
+
+    assert [message["messageId"] for message in corpus.messages] == ["same-id", "m2"]
+    assert corpus.report["duplicates_skipped"] == [
+        {"reason": "duplicate_message", "dedup_key": "same-id", "source_ref": "chat::m1-duplicate"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_replay_corpus_fixture_matches_current_harness_turn_boundaries(tmp_path, monkeypatch):
+    db_path = _write_bridge_message_log(
+        tmp_path,
+        [
+            _bridge_log_row("chat::m1", 100, "first update"),
+            _bridge_log_row("chat::m2", 101, "second update"),
+            _bridge_log_row("chat::m3", 110, "later update"),
+        ],
+    )
+    corpus = ReplayCorpus.from_bridge_message_log(
+        db_path,
+        chat_id="120363111@g.us",
+        since_sgt="2026-05-24 00:00:00 SGT",
+    )
+    plan = ReplayPlan(
+        platform="whatsapp",
+        messages=corpus.messages,
+        corpus_manifest=corpus.manifest(),
+        replay_policy=corpus.replay_policy_manifest(),
+    )
+
+    harness_adapter = _wa_adapter(tmp_path / "harness")
+    harness_events = []
+
+    async def capture_harness(event):
+        harness_events.append(event)
+
+    harness_adapter.handle_message = capture_harness
+    await harness_adapter.replay_bridge_messages(list(corpus.messages))
+    harness_ids = [event.raw_message.get("sourceMessageIds", [event.message_id]) for event in harness_events]
+
+    runner = GatewayRunner(GatewayConfig(platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, extra={})}))
+    runner._session_db = None
+    native_adapter = _wa_adapter(tmp_path / "native")
+    native_events = []
+
+    async def fake_build(platform, platform_config, *, connect=True):
+        runner._wire_adapter(native_adapter)
+        return native_adapter, None
+
+    async def capture_native(event):
+        native_events.append(event)
+        return None
+
+    monkeypatch.setattr(runner, "_build_adapter", fake_build)
+    monkeypatch.setattr(runner, "_handle_message", AsyncMock(side_effect=capture_native))
+
+    result = await runner.replay(plan)
+    native_ids = [event.raw_message.get("sourceMessageIds", [event.message_id]) for event in native_events]
+
+    assert result.corpus_report == {}
+    assert native_ids == harness_ids == [["m1", "m2"], ["m3"]]
+
+
 def test_replay_plan_loads_typed_plan_and_corpus(tmp_path):
     corpus_path = tmp_path / "bridge.jsonl"
     corpus_path.write_text('\n'.join(json.dumps(row) for row in _small_tgg_bridge_corpus()), encoding="utf-8")
@@ -451,6 +666,30 @@ def test_replay_plan_loads_typed_plan_and_corpus(tmp_path):
     assert len(plan.messages) == 3
     assert plan.source_path == str(corpus_path)
     assert plan.replay_namespace.startswith("agent:replay:")
+
+
+def test_replay_plan_loads_bridge_message_log_corpus_spec(tmp_path):
+    db_path = _write_bridge_message_log(
+        tmp_path,
+        [
+            _bridge_log_row("chat::m1", 100, "first update"),
+            _bridge_log_row("chat::reaction", 101, "[reaction: 👍]", message_kind="reaction"),
+        ],
+    )
+    plan = ReplayPlan.from_mapping({
+        "platform": "whatsapp",
+        "corpus": {
+            "source": "bridge_message_log",
+            "db_path": str(db_path),
+            "chat_id": "120363111@g.us",
+            "since_sgt": "2026-05-24 00:00:00 SGT",
+        },
+    })
+
+    assert [message["messageId"] for message in plan.messages] == ["m1"]
+    assert plan.corpus_manifest["source_type"] == "bridge_message_log"
+    assert plan.corpus_manifest["report"]["messages_skipped"][0]["reason"] == "bare_reaction"
+    assert plan.replay_policy["future_read_fence"]["mode"] == "per_turn_latest_message_timestamp_plus_one"
 
 
 def test_replay_plan_and_attempt_manifests_have_canonical_digests(tmp_path):
