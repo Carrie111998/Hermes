@@ -74,6 +74,22 @@ from hermes_constants import get_hermes_home
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
+def _json_capture_default(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    if isinstance(value, SimpleNamespace):
+        return vars(value)
+    if hasattr(value, "to_dict"):
+        try:
+            return value.to_dict()
+        except Exception:
+            pass
+    return repr(value)
+
+
 def _load_openai_cls() -> type:
     """Import and cache ``openai.OpenAI``."""
     global _OPENAI_CLS_CACHE
@@ -3817,6 +3833,28 @@ class AIAgent:
 
         return not self._has_natural_response_ending(visible_text)
 
+    @staticmethod
+    def _has_unparseable_tool_args(assistant_message) -> bool:
+        """True when any tool call carries non-empty arguments that fail to
+        parse as JSON — the signature of a response cut off mid-tool-call.
+
+        Used by the truncated-tool-call handler to distinguish a stream that
+        died while emitting tool-call arguments ("Stream interrupted
+        mid-tool-call") from a genuine provider length stop whose tool calls
+        arrived intact.
+        """
+        for tc in (getattr(assistant_message, "tool_calls", None) or []):
+            args = getattr(getattr(tc, "function", None), "arguments", None)
+            if isinstance(args, (dict, list)):
+                continue
+            if args is None or not str(args).strip():
+                continue
+            try:
+                json.loads(args)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return True
+        return False
+
     def _looks_like_codex_intermediate_ack(
         self,
         user_message: str,
@@ -4361,6 +4399,17 @@ class AIAgent:
                     # if a future code path bypasses the cache.
                     review_agent.session_start = self.session_start
                     review_agent.session_id = self.session_id
+                    # AIAgent.__init__ above generated a throwaway session_id
+                    # and wrote it to the PROCESS-GLOBAL HERMES_SESSION_ID
+                    # env var. Restore the parent's id so ambient session-id
+                    # resolution (e.g. PA record_event staging fallback)
+                    # keeps pointing at the live session instead of the
+                    # review fork's. Without this, every later env-resolved
+                    # session id in the process was wrong (sk-day26-v6:
+                    # record_event stagings for turns 11-14 landed under the
+                    # fork's id and were never drained into pa_events).
+                    if self.session_id:
+                        os.environ["HERMES_SESSION_ID"] = self.session_id
 
                     from model_tools import get_tool_definitions
                     from hermes_cli.plugins import (
@@ -7722,6 +7771,51 @@ class AIAgent:
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
 
+        capture_dir_raw = os.environ.get("HERMES_OPENAI_CAPTURE_DIR", "").strip()
+        capture_dir = Path(capture_dir_raw).expanduser() if capture_dir_raw else None
+
+        def _write_api_capture(kind: str, payload: Any) -> None:
+            if capture_dir is None:
+                return
+            try:
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                seq = int(getattr(self, "_openai_capture_seq", 0)) + 1
+                setattr(self, "_openai_capture_seq", seq)
+                envelope = {
+                    "captured_at": datetime.now().isoformat(),
+                    "kind": kind,
+                    "api_mode": self.api_mode,
+                    "provider": self.provider,
+                    "model": api_kwargs.get("model", getattr(self, "model", None)),
+                    "payload": payload,
+                }
+                # Replays may intentionally reuse HERMES_HOME to keep the same
+                # session state across multiple invocations. Include time+pid so
+                # a later process cannot overwrite earlier request/response
+                # captures when its per-agent sequence restarts at 1.
+                path = capture_dir / f"{time.time_ns()}-{os.getpid()}-{seq:04d}-{kind}.json"
+                path.write_text(
+                    json.dumps(envelope, ensure_ascii=False, indent=2, default=_json_capture_default),
+                    encoding="utf-8",
+                )
+            except Exception:
+                logger.debug("Failed to capture OpenAI API %s payload", kind, exc_info=True)
+
+        def _error_payload(exc: Exception) -> dict:
+            response = getattr(exc, "response", None)
+            response_text = getattr(response, "text", None)
+            response_status = getattr(response, "status_code", None)
+            return {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "status_code": getattr(exc, "status_code", response_status),
+                "request_id": getattr(exc, "request_id", None),
+                "body": getattr(exc, "body", None),
+                "response_text": response_text,
+            }
+
+        _write_api_capture("request", api_kwargs)
+
         def _call():
             try:
                 if self.api_mode == "codex_responses":
@@ -7767,6 +7861,7 @@ class AIAgent:
                     result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
             except Exception as e:
                 result["error"] = e
+                _write_api_capture("error", _error_payload(e))
             finally:
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
@@ -7855,6 +7950,7 @@ class AIAgent:
                 raise InterruptedError("Agent interrupted during API call")
         if result["error"] is not None:
             raise result["error"]
+        _write_api_capture("response", result["response"])
         return result["response"]
 
     # ── Unified streaming API call ─────────────────────────────────────────
@@ -8420,6 +8516,12 @@ class AIAgent:
                 model=model_name,
                 choices=[mock_choice],
                 usage=usage_obj,
+                # True when finish_reason="length" was FORCED above because the
+                # stream died mid-tool-call (unrepairable JSON args), as opposed
+                # to the provider genuinely reporting a length stop.  The retry
+                # handler uses this to label the failure correctly
+                # ("Stream interrupted mid-tool-call" vs output length limit).
+                truncated_tool_args=has_truncated_tool_args,
             )
 
         def _call_anthropic():
@@ -12058,6 +12160,49 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Public entry for a conversation turn — see _run_conversation_impl.
+
+        Thin wrapper that guarantees the TURN-SCOPED telemetry keys
+        (turn_input_tokens / turn_output_tokens / turn_context_window_peak)
+        are present on EVERY dict return path. The impl has ~20 early-return
+        sites (failure / interrupt / retry-exhaustion); before this wrapper
+        only the happy-path result dict carried the keys, so PA turn
+        recording (gateway/pa_observability.build_turn_record) saw NULL
+        context_window_peak on those turns. setdefault keeps the impl's own
+        values when present.
+        """
+        result = self._run_conversation_impl(
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            persist_user_message=persist_user_message,
+        )
+        if isinstance(result, dict):
+            result.setdefault(
+                "turn_input_tokens",
+                max(0, self.session_input_tokens - getattr(self, "_turn_input_tokens_baseline", 0)),
+            )
+            result.setdefault(
+                "turn_output_tokens",
+                max(0, self.session_output_tokens - getattr(self, "_turn_output_tokens_baseline", 0)),
+            )
+            result.setdefault(
+                "turn_context_window_peak",
+                int(getattr(self, "_turn_context_window_peak", 0) or 0),
+            )
+        return result
+
+    def _run_conversation_impl(
+        self,
+        user_message: str,
+        system_message: str = None,
+        conversation_history: List[Dict[str, Any]] = None,
+        task_id: str = None,
+        stream_callback: Optional[callable] = None,
+        persist_user_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Run a complete conversation with tool calling until completion.
 
@@ -12080,6 +12225,28 @@ class AIAgent:
         # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
         # Installed once, transparent when streams are healthy, prevents crash on write.
         _install_safe_stdio()
+
+        # Per-turn usage baseline. The session_* counters are CUMULATIVE for
+        # the agent's lifetime, and gateway agents are cached across turns —
+        # so result["input_tokens"] grows monotonically per turn. Snapshot
+        # the counters here so the result can also expose this call's
+        # turn-scoped deltas (turn_input_tokens / turn_output_tokens), which
+        # per-turn consumers (PA turn-recording) prefer over the cumulative
+        # fields.
+        _turn_input_tokens_baseline = self.session_input_tokens
+        _turn_output_tokens_baseline = self.session_output_tokens
+        # Per-turn context-window peak: the largest prompt the model actually
+        # saw on any single API call this turn (prompt_tokens = input + cache
+        # read + cache write). The deltas above answer "what did this turn
+        # cost"; this answers "how full was the context window" — the signal
+        # autocompact analysis needs.
+        _turn_context_window_peak = 0
+        # Mirror the per-turn telemetry to self so the run_conversation
+        # wrapper can stamp the keys onto EARLY-RETURN result dicts (the ~20
+        # failure/interrupt sites that don't build the full result below).
+        self._turn_input_tokens_baseline = _turn_input_tokens_baseline
+        self._turn_output_tokens_baseline = _turn_output_tokens_baseline
+        self._turn_context_window_peak = 0
 
         self._ensure_db_session()
 
@@ -12432,6 +12599,10 @@ class AIAgent:
         codex_ack_continuations = 0
         length_continue_retries = 0
         truncated_tool_call_retries = 0
+        # One-shot guard for the truncated-tool-call continuation path: after
+        # retries exhaust we inject an in-turn continuation nudge at most ONCE
+        # per turn so a persistently-broken stream cannot loop forever.
+        stream_cut_continuation_used = False
         truncated_response_parts: List[str] = []
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
@@ -12830,6 +13001,7 @@ class AIAgent:
             has_retried_429 = False
             restart_with_compressed_messages = False
             restart_with_length_continuation = False
+            restart_with_stream_cut_continuation = False
 
             finish_reason = "stop"
             response = None  # Guard against UnboundLocalError if all retries fail
@@ -13375,16 +13547,61 @@ class AIAgent:
                         if self.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                             assistant_message = _trunc_msg
                             if assistant_message is not None and _trunc_has_tool_calls:
-                                if truncated_tool_call_retries < 1:
+                                # Distinguish a stream that died mid-tool-call
+                                # (unparseable args; finish_reason="length" was
+                                # forced by the streaming accumulator) from a
+                                # genuine provider length stop.  Streaming path
+                                # carries an explicit flag; non-streaming falls
+                                # back to a JSON-parse check of the args.
+                                _stream_cut = bool(
+                                    getattr(response, "truncated_tool_args", False)
+                                ) or self._has_unparseable_tool_args(assistant_message)
+                                _trunc_error_label = (
+                                    "Stream interrupted mid-tool-call"
+                                    if _stream_cut
+                                    else "Response truncated due to output length limit"
+                                )
+                                if truncated_tool_call_retries < 3:
                                     truncated_tool_call_retries += 1
+                                    _backoff_s = (1, 3, 8)[truncated_tool_call_retries - 1]
                                     self._vprint(
-                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call...",
+                                        f"{self.log_prefix}⚠️  Truncated tool call detected — retrying API call "
+                                        f"({truncated_tool_call_retries}/3) in {_backoff_s}s...",
                                         force=True,
                                     )
                                     # Don't append the broken response to messages;
                                     # just re-run the same API call from the current
                                     # message state, giving the model another chance.
+                                    time.sleep(_backoff_s)
                                     continue
+                                if not stream_cut_continuation_used:
+                                    # Retries exhausted — instead of failing the
+                                    # turn, roll back to the last complete state
+                                    # (the broken responses were never appended,
+                                    # so `messages` already IS that state),
+                                    # nudge the model to continue, and restart
+                                    # the OUTER loop so the rebuilt API payload
+                                    # includes the nudge.  Bounded to once per
+                                    # turn to avoid loops.
+                                    stream_cut_continuation_used = True
+                                    truncated_tool_call_retries = 0
+                                    self._vprint(
+                                        f"{self.log_prefix}⏪ Truncated tool-call retries exhausted — "
+                                        f"injecting in-turn continuation and resuming.",
+                                        force=True,
+                                    )
+                                    messages.append({
+                                        "role": "user",
+                                        "content": (
+                                            "[System: Your previous response was interrupted "
+                                            "mid-tool-call. Continue processing the remaining "
+                                            "messages from where you left off.]"
+                                        ),
+                                    })
+                                    self._session_messages = messages
+                                    self._save_session_log(messages)
+                                    restart_with_stream_cut_continuation = True
+                                    break
                                 self._vprint(
                                     f"{self.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
                                     force=True,
@@ -13397,7 +13614,7 @@ class AIAgent:
                                     "api_calls": api_call_count,
                                     "completed": False,
                                     "partial": True,
-                                    "error": "Response truncated due to output length limit",
+                                    "error": _trunc_error_label,
                                 }
 
                         # If we have prior messages, roll back to last complete state
@@ -13466,6 +13683,10 @@ class AIAgent:
                         self.session_cache_read_tokens += canonical_usage.cache_read_tokens
                         self.session_cache_write_tokens += canonical_usage.cache_write_tokens
                         self.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                        _turn_context_window_peak = max(
+                            _turn_context_window_peak, canonical_usage.prompt_tokens
+                        )
+                        self._turn_context_window_peak = _turn_context_window_peak
 
                         # Log API call details for debugging/observability
                         _cache_pct = ""
@@ -14784,6 +15005,12 @@ class AIAgent:
                 self._ephemeral_max_output_tokens = min(_boost, 32768)
                 continue
 
+            if restart_with_stream_cut_continuation:
+                # Truncated-tool-call retries exhausted; an in-turn
+                # continuation nudge was appended to `messages`.  Restart the
+                # outer loop so the rebuilt API payload includes it.
+                continue
+
             # Guard: if all retries exhausted without a successful response
             # (e.g. repeated context-length errors that exhausted retry_count),
             # the `response` variable is still None. Break out cleanly.
@@ -15079,7 +15306,7 @@ class AIAgent:
                                 "api_calls": api_call_count,
                                 "completed": False,
                                 "partial": True,
-                                "error": "Response truncated due to output length limit",
+                                "error": "Stream interrupted mid-tool-call",
                             }
 
                         # Track retries for invalid JSON arguments
@@ -15880,6 +16107,18 @@ class AIAgent:
             "base_url": self.base_url,
             "input_tokens": self.session_input_tokens,
             "output_tokens": self.session_output_tokens,
+            # Turn-scoped deltas (THIS call's API usage only). The session_*
+            # fields above are cumulative across the agent's lifetime; cached
+            # gateway agents span many turns, so per-turn consumers (PA
+            # turn-recording) must use these instead.
+            "turn_input_tokens": max(
+                0, self.session_input_tokens - _turn_input_tokens_baseline
+            ),
+            "turn_output_tokens": max(
+                0, self.session_output_tokens - _turn_output_tokens_baseline
+            ),
+            # Largest single-call prompt this turn (context the model saw).
+            "turn_context_window_peak": _turn_context_window_peak,
             "cache_read_tokens": self.session_cache_read_tokens,
             "cache_write_tokens": self.session_cache_write_tokens,
             "reasoning_tokens": self.session_reasoning_tokens,

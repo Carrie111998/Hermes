@@ -69,6 +69,104 @@ if TYPE_CHECKING:
 _OPENAI_CLS_CACHE: Optional[type] = None
 
 
+def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
+    val = getattr(obj, key, None)
+    if val is None and isinstance(obj, dict):
+        val = obj.get(key, default)
+    return val if val is not None else default
+
+
+def _usage_int(usage: Any, *keys: str) -> int:
+    for key in keys:
+        value = _obj_get(usage, key)
+        try:
+            if value is not None:
+                return int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _usage_cached_tokens(usage: Any) -> int:
+    details = _obj_get(usage, "input_tokens_details") or _obj_get(usage, "prompt_tokens_details") or {}
+    cached = _obj_get(details, "cached_tokens")
+    if cached is None:
+        cached = _obj_get(usage, "cache_read_input_tokens")
+    if cached is None:
+        cached = _obj_get(details, "cachedContentTokenCount")
+    try:
+        return int(cached or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _log_auxiliary_llm_call(
+    *,
+    task: str | None,
+    provider: str | None,
+    model: str | None,
+    base_url: str | None,
+    response: Any,
+    started_at: float,
+    status: str = "ok",
+) -> None:
+    path = os.environ.get("HERMES_LLM_CALL_LOG")
+    if not path:
+        return
+    try:
+        usage = _obj_get(response, "usage")
+        if usage is None:
+            return
+        prompt_tokens = _usage_int(usage, "prompt_tokens", "input_tokens")
+        output_tokens = _usage_int(usage, "completion_tokens", "output_tokens")
+        cached_tokens = _usage_cached_tokens(usage)
+        reasoning_details = _obj_get(usage, "output_tokens_details") or {}
+        reasoning_tokens = _usage_int(reasoning_details, "reasoning_tokens")
+        response_model = str(_obj_get(response, "model", model or "") or model or "")
+        cost_usd: float | None = None
+        cost_status = "unknown"
+        try:
+            from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+            result = estimate_usage_cost(
+                response_model,
+                CanonicalUsage(
+                    input_tokens=max(0, prompt_tokens - cached_tokens),
+                    cache_read_tokens=cached_tokens,
+                    output_tokens=output_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                ),
+                provider=provider,
+                base_url=base_url,
+            )
+            if result.amount_usd is not None:
+                cost_usd = float(result.amount_usd)
+            cost_status = result.status
+        except Exception:
+            pass
+        row = {
+            "ts": time.time(),
+            "turn_id": os.environ.get("HERMES_LLM_TURN_ID"),
+            "task": task or "auxiliary",
+            "provider": provider,
+            "model": response_model,
+            "base_url": base_url,
+            "input_tokens": prompt_tokens,
+            "cached_input_tokens": cached_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cost_usd": cost_usd,
+            "cost_status": cost_status,
+            "status": status,
+            "latency_ms": int((time.time() - started_at) * 1000),
+        }
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.debug("Failed to write auxiliary LLM call log", exc_info=True)
+
+
 def _load_openai_cls() -> type:
     """Import and cache ``openai.OpenAI``."""
     global _OPENAI_CLS_CACHE
@@ -780,28 +878,46 @@ class _CodexCompletionsAdapter:
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
+            try:
+                with self._client.responses.stream(**resp_kwargs) as stream:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
                     _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
+                    final = stream.get_final_response()
+            except AttributeError as exc:
+                if "to_dict" not in str(exc):
+                    raise
+                logger.warning(
+                    "Codex auxiliary: Responses stream returned a raw dict snapshot; retrying non-streaming"
+                )
                 _check_cancelled()
-                final = stream.get_final_response()
+                final = self._client.responses.create(**resp_kwargs)
 
             # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
+            def _response_get(obj: Any, key: str, default: Any = None) -> Any:
+                val = getattr(obj, key, None)
+                if val is None and isinstance(obj, dict):
+                    val = obj.get(key, default)
+                return val if val is not None else default
+
+            _output = _response_get(final, "output")
             if isinstance(_output, list) and not _output:
                 if collected_output_items:
-                    final.output = list(collected_output_items)
+                    if isinstance(final, dict):
+                        final["output"] = list(collected_output_items)
+                    else:
+                        final.output = list(collected_output_items)
                     logger.debug(
                         "Codex auxiliary: backfilled %d output items from stream events",
                         len(collected_output_items),
@@ -811,10 +927,14 @@ class _CodexCompletionsAdapter:
                     # a function_call response with incidental text should not
                     # be collapsed into a plain-text message.
                     assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
+                    synthesized_output = [SimpleNamespace(
                         type="message", role="assistant", status="completed",
                         content=[SimpleNamespace(type="output_text", text=assembled)],
                     )]
+                    if isinstance(final, dict):
+                        final["output"] = synthesized_output
+                    else:
+                        final.output = synthesized_output
                     logger.debug(
                         "Codex auxiliary: synthesized from %d deltas (%d chars)",
                         len(collected_text_deltas), len(assembled),
@@ -829,7 +949,7 @@ class _CodexCompletionsAdapter:
                     val = obj.get(key, default)
                 return val if val is not None else default
 
-            for item in getattr(final, "output", []):
+            for item in _response_get(final, "output", []):
                 item_type = _item_get(item, "type")
                 if item_type == "message":
                     for part in (_item_get(item, "content") or []):
@@ -846,12 +966,12 @@ class _CodexCompletionsAdapter:
                         ),
                     ))
 
-            resp_usage = getattr(final, "usage", None)
+            resp_usage = _response_get(final, "usage")
             if resp_usage:
                 usage = SimpleNamespace(
-                    prompt_tokens=getattr(resp_usage, "input_tokens", 0),
-                    completion_tokens=getattr(resp_usage, "output_tokens", 0),
-                    total_tokens=getattr(resp_usage, "total_tokens", 0),
+                    prompt_tokens=_item_get(resp_usage, "input_tokens", 0),
+                    completion_tokens=_item_get(resp_usage, "output_tokens", 0),
+                    total_tokens=_item_get(resp_usage, "total_tokens", 0),
                 )
         except Exception as exc:
             if timed_out.is_set():
@@ -4643,8 +4763,18 @@ def call_llm(
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
-        return _validate_llm_response(
+        _started_at = time.time()
+        _response = _validate_llm_response(
             client.chat.completions.create(**kwargs), task)
+        _log_auxiliary_llm_call(
+            task=task,
+            provider=resolved_provider,
+            model=final_model,
+            base_url=_client_base or resolved_base_url,
+            response=_response,
+            started_at=_started_at,
+        )
+        return _response
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -4654,8 +4784,18 @@ def call_llm(
                 task or "call",
             )
             try:
-                return _validate_llm_response(
+                _started_at = time.time()
+                _response = _validate_llm_response(
                     client.chat.completions.create(**retry_kwargs), task)
+                _log_auxiliary_llm_call(
+                    task=task,
+                    provider=resolved_provider,
+                    model=final_model,
+                    base_url=_client_base or resolved_base_url,
+                    response=_response,
+                    started_at=_started_at,
+                )
+                return _response
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 # If retry still fails, fall through to the max_tokens /
@@ -5022,8 +5162,18 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
-        return _validate_llm_response(
+        _started_at = time.time()
+        _response = _validate_llm_response(
             await client.chat.completions.create(**kwargs), task)
+        _log_auxiliary_llm_call(
+            task=task,
+            provider=resolved_provider,
+            model=final_model,
+            base_url=_client_base or resolved_base_url,
+            response=_response,
+            started_at=_started_at,
+        )
+        return _response
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -5033,8 +5183,18 @@ async def async_call_llm(
                 task or "call",
             )
             try:
-                return _validate_llm_response(
+                _started_at = time.time()
+                _response = _validate_llm_response(
                     await client.chat.completions.create(**retry_kwargs), task)
+                _log_auxiliary_llm_call(
+                    task=task,
+                    provider=resolved_provider,
+                    model=final_model,
+                    base_url=_client_base or resolved_base_url,
+                    response=_response,
+                    started_at=_started_at,
+                )
+                return _response
             except Exception as retry_err:
                 retry_err_str = str(retry_err)
                 if not (

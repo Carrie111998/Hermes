@@ -37,22 +37,153 @@ job_briefs:
     instructions:
     - Extract source, sender, timestamp, commitments, blockers, and requested actions.
     - Preserve original wording for material facts that may need audit.
-    - Before changing an existing case, use pa_business_read with operation tgg_case_lookup
-      when a job number is present.
-    - For clearly new case reports with zone, address, problem, and WhatsApp source,
-      call pa_business_write with operation tgg_case_create before any state update. Include
-      jobNo when present; otherwise let PS generate a WA job number. If address, problem,
-      source, or confidence is unclear, do not create; surface the missing facts for
-      clarification.
-    - If an inbound WhatsApp operations message contains photos, worker updates, or
-      case evidence, call pa_business_write with operation tgg_case_observation. Include
-      source, notes, confidence, and fields containing message_text, sender_name,
-      chat_name, observed_at, photo_count, media_refs, and extracted case facts.
-    - For case-state updates, call pa_business_write with operation tgg_case_update before
-      replying.
-    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
-      and report inability if the tool blocks it.
+    - >-
+      If a real job number is present (for example SK/JOB/2604/2376), use
+      tgg_case_lookup. Do not treat unit numbers such as #11-109 or 11-109
+      as job numbers.
+    - >-
+      A job number is hard identity and is never interchangeable with a different
+      job number, even at the same block, unit, or address. If a message carries
+      an explicit job number (HDB or iLinked) and the exact lookup for THAT job
+      number returns no match in the operator DB, do NOT attach the message to
+      any other existing case that merely shares the address, block, or unit.
+      Preserve the explicit job identity: create the case under THAT job
+      number (tgg_case_create with jobNo set exactly as written) OR ask via
+      tgg_clarification_request, listing any same-address cases as candidates
+      only -- never resolve to them. Same address + different job number = a
+      different case.
+    - >-
+      Before any case lookup or create, extract structured anchors from the
+      message: job number, block, street, unit, zone-text, sender, and
+      work/status text. Use the job number as hard identity when present
+      (exact match). Use block + unit + street as strong identity. Treat
+      zone-text as a soft hint only (per the zone rule). If only block + unit
+      are present and they match multiple streets, towns, or zones, treat it
+      as ambiguous and ask via tgg_clarification_request (naming the
+      candidates) rather than create.
+    - If address, unit, block/street, or work-type text is present without a
+      real job number, use tgg_case_search before deciding whether an existing
+      case matches.
+    - >-
+      tgg_case_search returns CANDIDATES, each with a match_basis naming why it
+      surfaced (unit_exact, unit_exact_block_mismatch, job_no,
+      block_street_fuzzy, text_like). The search is deliberately generous --
+      YOU judge which candidate (if any) is the same job, weighing unit/block
+      identity, street, work shape, and case state. A unit_exact candidate on
+      the same block is strong identity even when the street wording differs
+      (Cres vs Crescent, typo'd street). Candidates are evidence to judge, not
+      answers to accept.
+    - >-
+      Search once per distinct address first. If block/street/unit or address is
+      present, pass them as structured block/unit fields (plus address text as
+      the search) and keep workType/problem as your reasoning hint after
+      candidates return; do not mix work words such as "toilet door" or "main
+      gate" into the address search. Use workType/problem as fallback search
+      text only when no usable address or job number exists. Only run a second
+      search for the same cluster if the first result is empty, ambiguous, or
+      contradicts the message evidence.
+    - >-
+      Search economy: one search per case decision, then REUSE that result.
+      Never repeat an identical search (same tool, same block/unit/terms) you
+      already ran this turn -- the archive and the case DB do not change
+      between identical calls.
+    - >-
+      When searching for an existing case to match an inbound report, search by
+      job number, block, unit, and street/address text. Do NOT pass zone as a
+      search filter when the zone came from the WhatsApp message text -- zone
+      written in chat is a soft hint only. Only filter by zone when the zone is
+      sourced from the operator DB or iLinked. A "Zone: X" line in a chat must
+      never exclude an exact block/unit match that lives in a different zone.
+    - >-
+      When a worker report carries no job number, run message_history_search
+      by block + unit first (and by job number if one is visible in the
+      message). The real job number is often announced earlier in a DIFFERENT
+      chat, and street names in chat are sometimes typo'd (for example "Jalan
+      Kati" vs "Jalan Kayu"), so block + unit matching beats street strings.
+      If a prior announcement carries a real job number, use that number --
+      look it up / search cases for it and attach the report there.
+    - >-
+      We do not open new cases -- that is for HDB. Cases enter the ledger
+      ONLY from HDB job sheets (messages carrying an explicit job number).
+      Call tgg_case_create only when an explicit HDB job number is in the
+      evidence, passing it as jobNo exactly as written. A worker-reported
+      issue with no job sheet is NEVER a new case: when an existing case
+      matches, record it with tgg_case_observation against that case; when no
+      case matches, record it via tgg_clarification_request in the
+      propose-and-confirm shape ("no HDB job sheet found for this report --
+      holding it as pending; send the job number when issued"). Do not mint
+      placeholder WA/JOB numbers. When identity is ambiguous -- block + unit
+      match more than one street/town/zone, only partial anchors are present,
+      or confidence is low -- do NOT create a case and do NOT silently drop
+      the message: ask via tgg_clarification_request, naming the candidate
+      job numbers you found and what is missing. Clarify; do not guess.
+    - >-
+      When to clarify vs decide: if the candidate evidence is ambiguous --
+      multiple plausible candidate cases, a COMPLETED case matching new
+      same-shape work at the same unit (is this a recurrence/follow-up or the
+      old job?), or a report whose unit/job cannot be resolved -- ask via
+      tgg_clarification_request instead of guessing or minting a new case. The
+      clarification is recorded for the operator; no answer arrives this turn,
+      so proceed without assuming the answer and do NOT also create a
+      placeholder case for the same work (the clarification IS the record).
+      When the evidence is clear, do NOT clarify -- over-asking is noise. At
+      most one clarification per case decision.
+    - >-
+      Clarification shape -- propose and confirm, never ask open questions.
+      Every clarification states (1) your one-line read of the evidence, (2)
+      the action you will take by default, and (3) an invitation to correct.
+      Register: "we'll add it to the existing case, let me know if you want me
+      to record otherwise". Do not ask "should this attach to A or B?" -- pick
+      the better-supported read, name it, and let the operator redirect. The
+      proposed default action must NEVER be opening a new case -- cases enter
+      the ledger only from HDB job sheets, so the default for an unmatched
+      report is holding it as pending, not creating.
+    - >-
+      If an inbound WhatsApp operations message contains photos, worker updates,
+      or case evidence and a safe case match exists, call tgg_case_observation.
+      Include source, notes, confidence, observedAt, mediaRefs/sourceRefs, and
+      fields containing message_text, sender_name, sender_role, chat_name,
+      photo_count, and extracted case facts. When more than one existing case
+      plausibly matches an inbound report, record all candidate job numbers,
+      the one you chose (if any), and your confidence in the observation fields
+      -- never pick a single match silently when others are plausible.
+    - >-
+      Completion judgment -- judge like a human operator would. When a worker
+      report clearly covers what the case says the job IS (the case says pipe
+      leak, the report says "epoxy applied, done"), mark the case completed
+      with tgg_case_update_state, citing the report messages as
+      evidence_message_refs. When the report covers only part of the case's
+      scope, or the scope is unclear (the case names several items and the
+      report mentions one; the report is vague about what was done), do NOT
+      complete: record the evidence with tgg_case_observation and ask via
+      tgg_clarification_request ("is this completed?"). Never complete on
+      ambiguity.
+    - >-
+      Work one case at a time. Process each case decision fully -- search,
+      judge, act (observation / completion / clarification / create) -- before
+      moving to the next message or case. Keep each response short and
+      incremental: act on the case in front of you, do not plan or enumerate
+      many cases in one response.
+    - >-
+      For TGG case work in this ingest job, use only tgg_case_lookup,
+      tgg_case_search, message_history_search (tgg_message_history_search),
+      tgg_clarification_request (clarification_request), tgg_case_create,
+      tgg_case_observation, and tgg_case_update_state. Do not call generic
+      pa_business_read, pa_business_write, or agent config operations as a
+      workaround when a lookup/search is unclear. Ask for clarification when
+      the tgg_case_* result leaves the decision ambiguous; never create a
+      WhatsApp-only case.
     - Route management questions out of ops ingest instead of answering them inline.
+    - >-
+      State assertions restate THIS turn's tool result (v6.3, 1018/1092
+      receipt). Any claim about a case's state (open, completed, ready,
+      pending) in your summary or diary must restate the state returned by a
+      lookup/search/tool result from THIS turn -- never carried conversation
+      memory or a prior compaction summary. When carried conversation memory
+      conflicts with a fresh tool result, the tool result wins: report the
+      tool-returned state and flag the discrepancy explicitly ("earlier
+      context said completed; this turn's lookup returns open -- treating as
+      open") instead of repeating the remembered state.
     - >
       Recording what happened (observability): at the end of each turn, use the
       record_event tool to record the meaningful things you did — one event per
@@ -87,15 +218,33 @@ job_briefs:
       include_next_actions: true
       slash_commands: []
       max_output_tokens: 2048
+      # compaction_guidance (v6.3, WB f6845320): standing retention brief
+      # threaded into the NATIVE context-compressor summarizer prompt on
+      # auto-triggered compactions (composes with any per-call /compress
+      # focus). This REPLACES the former pa_compression_policy block
+      # (strategy: preserve-case-state, added 2f6e2f847) — that keyword
+      # keep/drop filter short-circuited the native pipeline entirely and on
+      # 100%-case-traffic zone chats kept ~98% of messages per pass, so
+      # context only grew (8 compactions in 13 turns, ctx 143k→201k, AMK
+      # day-30 receipt). The case ledger is the durable state store;
+      # conversation history only needs working state, so the native
+      # rolling-summary pipeline + this guidance now governs compaction.
+      # Wiring: gateway _apply_pa_compression_policy →
+      # ContextCompressor.set_pa_compaction_guidance.
       compression:
-        strategy: preserve-case-state
-        window_size: 24
-        preserve_fields:
-        - block
-        - unit
-        - worker
-        - photo
-        - status
+        compaction_guidance: >-
+          Case-state retention rules for this summary. OPEN cases: keep
+          working state for each — jobNo, current state, the last action
+          taken, and anything pending or promised (follow-ups, awaited
+          confirmations, outstanding clarifications). CLOSED/completed
+          cases: collapse each to ONE line (jobNo + closed date); keep only
+          the most recent ~50 closed-case one-liners and drop older
+          closed-case lines entirely on subsequent compactions. Compress
+          evidence detail (photo descriptions, quoted worker messages,
+          observation bodies) aggressively — every observation is already
+          recorded in the case ledger and retrievable via
+          tgg_message_history_search and tgg_case_lookup, so the summary
+          only needs the fact that evidence was recorded, not its content.
   tgg_management:
     title: TGG Management Brief
     purpose: Prepare decision-oriented management summaries from known facts.
@@ -107,6 +256,16 @@ job_briefs:
       model: gemini-3.1-flash-lite
     instructions:
     - Separate facts from any interpretation; do not mix known data with a read.
+    - >-
+      State assertions restate THIS turn's tool result (v6.3, 1018/1092
+      receipt). Any claim about a case's state (open, completed, ready,
+      pending) in an answer must restate the state returned by a
+      lookup/search/tool result from THIS turn -- never carried conversation
+      memory or a prior compaction summary. When carried conversation memory
+      conflicts with a fresh tool result, the tool result wins: report the
+      tool-returned state and flag the discrepancy explicitly ("earlier
+      context said completed; this turn's lookup returns open -- treating as
+      open") instead of repeating the remembered state.
     - >
       Default management-chat answer shape: answer the operator's question with
       factual case data first. Do not include Recommendations or Open Questions
@@ -146,8 +305,8 @@ job_briefs:
       line items unless the operator asks for costing/scope/claim/WC details.
     - >
       For normal operator questions about outstanding/open/pending cases by block,
-      street, unit, zone, or address, use the operator DB only. Call
-      pa_business_read with operation tgg_case_search and payload search=<operator text>,
+      street, unit, or address, use the operator DB only. Call
+      pa_business_read with operation case_search and payload search=<operator text>,
       limit=20. Do not send a state filter for "outstanding" because the operator
       DB stores in-progress jobs under source-specific states such as hdb_confirmed.
       This is the default for Sky-style questions such as "223A got what outstanding?".
@@ -157,11 +316,11 @@ job_briefs:
       issue, status, received age. Do not mention WC refs in general lists
       unless the operator asks about costing/scope/claim/WC.
       For exact count questions ("how many", "count only", "maint vs sprucing"),
-      call pa_business_read with operation tgg_case_search using the same search,
-      state, zone, serviceLine, and sourceStatus filters you would normally use,
+      call pa_business_read with operation case_search using the same search,
+      state, serviceLine, and sourceStatus filters you would normally use,
       with a small limit such as 1. Answer counts from resultTotal,
       resultServiceLineSplit, and resultStateSplit on the returned rows. Do NOT
-      infer totals by counting returned rows; tgg_case_search is paginated and may
+      infer totals by counting returned rows; case_search is paginated and may
       be partial.
       Use serviceLine/serviceLineLabel from the tool when present. If a mixed
       result contains both Maintenance and Sprucing/EASE cases, you MUST group
@@ -172,10 +331,10 @@ job_briefs:
       "WhatsApp-only item", never write a WA-ONLY identifier. Describe it as
       "WhatsApp-only item" plus the unit/problem/source status.
       If the operator asks "maintenance only" or "sprucing only", pass
-      serviceLine=maintenance or serviceLine=sprucing in the tgg_case_search
+      serviceLine=maintenance or serviceLine=sprucing in the case_search
       payload.
       For oldest/long-outstanding or other broad mixed case lists, do not rely
-      on one mixed search. Run separate tgg_case_search calls for
+      on one mixed search. Run separate case_search calls for
       serviceLine=maintenance and serviceLine=sprucing, then answer under the
       two headings. Sort each section by receivedAgeDays descending before
       summarizing.
@@ -236,8 +395,6 @@ job_briefs:
       update questions, call pa_business_read with operation ilinked_status before
       summarizing and include source_system_requested=true in the payload.
       Include the result in Facts.
-    - If a TGG chat asks for a Mofex fact, call pa_business_read with operation mofex_lookup
-      and report inability if the tool blocks it.
     - >
       Honor shortness signals. If the operator says "short", "brief", "tldr",
       "quick", "just", "simple", "summary", "short answer", or similar,
