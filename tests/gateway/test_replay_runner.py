@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +58,7 @@ class FakeReplayAdapter(BasePlatformAdapter):
 
 @pytest.mark.asyncio
 async def test_gateway_runner_replay_uses_no_connect_build_and_captures_outbound(monkeypatch):
+    monkeypatch.delenv("WHATSAPP_HOME_CHANNEL", raising=False)
     runner = GatewayRunner(GatewayConfig(platforms={Platform.WHATSAPP: PlatformConfig(enabled=True, extra={})}))
     runner._session_db = None
     adapter = FakeReplayAdapter()
@@ -72,6 +74,7 @@ async def test_gateway_runner_replay_uses_no_connect_build_and_captures_outbound
         assert ctx is not None
         assert ctx.execution_mode == "replay"
         assert ctx.run_id == "run-1"
+        assert os.getenv("WHATSAPP_HOME_CHANNEL") == "eval-home@g.us"
         return "captured reply"
 
     monkeypatch.setattr(runner, "_build_adapter", fake_build)
@@ -81,7 +84,7 @@ async def test_gateway_runner_replay_uses_no_connect_build_and_captures_outbound
         platform="whatsapp",
         run_id="run-1",
         attempt_id="attempt-1",
-        messages=({"messageId": "m1", "body": "hello", "timestamp": 100},),
+        messages=({"messageId": "m1", "chatId": "eval-home@g.us", "body": "hello", "timestamp": 100},),
     ))
 
     assert build_calls == [(Platform.WHATSAPP, False)]
@@ -95,6 +98,7 @@ async def test_gateway_runner_replay_uses_no_connect_build_and_captures_outbound
     assert result.outbound[0]["headers"]["X-Replay-Attempt-Id"] == "attempt-1"
     assert result.attempt["run_id"] == "run-1"
     assert result.attempt["replay_namespace"] == "agent:replay:run-1"
+    assert "WHATSAPP_HOME_CHANNEL" not in os.environ
 
 
 @pytest.mark.asyncio

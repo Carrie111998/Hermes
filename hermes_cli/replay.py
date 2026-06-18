@@ -301,7 +301,7 @@ def add_replay_run_parser(subparsers) -> argparse.ArgumentParser:
     start.add_argument(
         "--allow-outbound-kind",
         action="append",
-        help="Captured outbound kind allowed by the gate; repeatable.",
+        help="Outbound kind allow-list metadata retained in gate reports; non-capture delivery modes still fail.",
     )
     start.add_argument(
         "--expected-turn-count", type=int, help="Exact PA turn count expected."
@@ -325,7 +325,11 @@ def add_replay_run_parser(subparsers) -> argparse.ArgumentParser:
         help="Hermes state.db path to derive PA turn/tool coverage from.",
     )
     verify.add_argument("--tool-error-budget", type=int, default=0)
-    verify.add_argument("--allow-outbound-kind", action="append")
+    verify.add_argument(
+        "--allow-outbound-kind",
+        action="append",
+        help="Outbound kind allow-list metadata retained in gate reports; non-capture delivery modes still fail.",
+    )
     verify.add_argument("--expected-turn-count", type=int)
     verify.add_argument("--min-turn-count", type=int)
     verify.add_argument("--no-provider-invariants", action="store_true")

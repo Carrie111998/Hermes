@@ -246,7 +246,7 @@ def test_orchestrator_prepare_run_verify_persists_manifest_and_gate(tmp_path):
 def test_verify_gate_marks_dirty_on_unexpected_outbound(tmp_path):
     runner = FakeRunner(
         tmp_path / "state.db",
-        outbound=[{"kind": "send", "kwargs": {"content": "leak"}}],
+        outbound=[{"kind": "send", "delivery_mode": "live", "kwargs": {"content": "leak"}}],
     )
     orch, provider = _prepared_orchestrator(tmp_path, runner_factory=lambda: runner)
     orch.run_agent_replay(_plan())
@@ -259,6 +259,59 @@ def test_verify_gate_marks_dirty_on_unexpected_outbound(tmp_path):
     assert provider.dirty_calls
     with pytest.raises(ReplayStateError, match="cannot promote"):
         orch.promote(prod_data_dir=str(tmp_path / "non-prod"))
+
+
+def test_verify_gate_reports_but_allows_captured_outbound(tmp_path):
+    runner = FakeRunner(
+        tmp_path / "state.db",
+        outbound=[
+            {
+                "kind": "send",
+                "delivery_mode": "capture",
+                "kwargs": {"content": "would-be reply"},
+            }
+        ],
+    )
+    orch, _provider = _prepared_orchestrator(tmp_path, runner_factory=lambda: runner)
+    orch.run_agent_replay(_plan())
+
+    report = orch.verify(VerifyGateConfig(expected_turn_count=1))
+
+    checks = {check["name"]: check for check in report["checks"]}
+    outbound_check = checks["zero-unexpected-outbound"]
+    assert outbound_check["ok"] is True
+    assert outbound_check["actual"]["captured_count"] == 1
+    assert outbound_check["actual"]["captured"][0]["kwargs"]["content"] == "would-be reply"
+    assert outbound_check["actual"]["escaped_count"] == 0
+    assert outbound_check["actual"]["unexpected_count"] == 0
+
+
+def test_verify_gate_hard_fails_escaped_outbound_even_when_kind_allowed(tmp_path):
+    runner = FakeRunner(
+        tmp_path / "state.db",
+        outbound=[
+            {
+                "kind": "send",
+                "delivery_mode": "live",
+                "kwargs": {"content": "escaped"},
+            }
+        ],
+    )
+    orch, _provider = _prepared_orchestrator(tmp_path, runner_factory=lambda: runner)
+    orch.run_agent_replay(_plan())
+
+    with pytest.raises(ReplayVerifyError, match="zero-unexpected-outbound"):
+        orch.verify(
+            VerifyGateConfig(expected_turn_count=1, allowed_outbound_kinds=("send",))
+        )
+
+    checks = {
+        check["name"]: check for check in orch.manifest.verify.get("checks", [])
+    }
+    outbound_check = checks["zero-unexpected-outbound"]
+    assert outbound_check["ok"] is False
+    assert outbound_check["actual"]["escaped_count"] == 1
+    assert outbound_check["actual"]["allowed_escaped_count"] == 1
 
 
 def test_verify_gate_enforces_tool_error_budget(tmp_path):

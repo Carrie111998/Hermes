@@ -720,20 +720,52 @@ class PAReplayOrchestrator:
             )
         )
 
-        unexpected_outbound = [
+        outbound_entries = [
             entry
             for entry in (result.get("outbound") or [])
-            if str(entry.get("kind") or "") not in set(gate.allowed_outbound_kinds)
+            if isinstance(entry, Mapping)
+        ]
+        captured_outbound = [
+            entry
+            for entry in outbound_entries
+            if str(entry.get("delivery_mode") or "").strip().lower() == "capture"
+        ]
+        escaped_outbound = [
+            entry
+            for entry in outbound_entries
+            if str(entry.get("delivery_mode") or "").strip().lower() != "capture"
+        ]
+        allowed_kinds = set(gate.allowed_outbound_kinds)
+        unexpected_outbound = [
+            entry
+            for entry in escaped_outbound
+            if str(entry.get("kind") or "") not in allowed_kinds
+        ]
+        allowed_escaped_outbound = [
+            entry
+            for entry in escaped_outbound
+            if str(entry.get("kind") or "") in allowed_kinds
         ]
         checks.append(
             CheckResult(
                 "zero-unexpected-outbound",
-                ok=len(unexpected_outbound) == 0,
+                ok=len(escaped_outbound) == 0,
                 actual={
+                    "captured_count": len(captured_outbound),
+                    "captured": captured_outbound[:5],
+                    "escaped_count": len(escaped_outbound),
+                    "escaped": escaped_outbound[:5],
                     "unexpected_count": len(unexpected_outbound),
                     "unexpected": unexpected_outbound[:5],
+                    "allowed_escaped_count": len(allowed_escaped_outbound),
+                    "allowed_escaped": allowed_escaped_outbound[:5],
                 },
-                expected={"unexpected_count": 0},
+                expected={"escaped_count": 0},
+                detail=(
+                    "Captured replay outbounds (delivery_mode=capture) are "
+                    "reported but non-failing. Any non-capture delivery mode "
+                    "is treated as escaped and hard-fails this gate."
+                ),
             )
         )
 

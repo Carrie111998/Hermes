@@ -6208,6 +6208,57 @@ class GatewayRunner:
             if hasattr(adapter, name):
                 setattr(adapter, name, _make_guard(name))
 
+    def _install_replay_home_channel_env(self, platform: Any, plan: Any) -> tuple[str, str | None] | None:
+        """Temporarily seed a replay-only home-channel env var.
+
+        The first-message onboarding notice checks ``<PLATFORM>_HOME_CHANNEL``
+        directly. Eval replay homes are disposable, so seed the env var from
+        configured home-channel data or the first replay chat id instead of
+        emitting a captured "[mailbox] no home channel" sideband into every
+        clean replay attempt.
+        """
+        platform_name = getattr(platform, "value", str(platform))
+        env_key = _home_target_env_var(platform_name)
+        if os.environ.get(env_key):
+            return None
+
+        chat_id = None
+        try:
+            home = self.config.get_home_channel(platform)
+            if home and home.chat_id:
+                chat_id = str(home.chat_id)
+        except Exception:
+            chat_id = None
+
+        if not chat_id:
+            for message in getattr(plan, "messages", ()) or ():
+                if not isinstance(message, Mapping):
+                    continue
+                value = (
+                    message.get("chatId")
+                    or message.get("chat_id")
+                    or message.get("chat")
+                )
+                if value:
+                    chat_id = str(value)
+                    break
+        if not chat_id:
+            return None
+
+        previous = os.environ.get(env_key)
+        os.environ[env_key] = chat_id
+        return env_key, previous
+
+    @staticmethod
+    def _restore_replay_home_channel_env(patch: tuple[str, str | None] | None) -> None:
+        if patch is None:
+            return
+        env_key, previous = patch
+        if previous is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = previous
+
     async def replay(self, plan: Any):
         """Replay bridge-message corpus through the native gateway path."""
         from gateway.config import Platform, PlatformConfig
@@ -6232,8 +6283,10 @@ class GatewayRunner:
         if session_db is not None and hasattr(session_db, "record_replay_attempt"):
             session_db.record_replay_attempt(**attempt.to_db_kwargs())
 
+        home_channel_patch = None
         try:
             with replay_context(plan) as ctx:
+                home_channel_patch = self._install_replay_home_channel_env(platform, plan)
                 adapter, _ = await self._build_adapter(platform, platform_config, connect=False)
                 if adapter is None:
                     raise RuntimeError(f"No adapter available for {platform.value}")
@@ -6290,6 +6343,8 @@ class GatewayRunner:
                 except Exception:
                     pass
             raise
+        finally:
+            self._restore_replay_home_channel_env(home_channel_patch)
 
     def _create_adapter(
         self, 

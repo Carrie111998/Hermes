@@ -60,7 +60,9 @@ Promote is refused unless all checks pass:
 - corpus parity: processed message count equals the deterministic corpus count.
 - processed-turn coverage: PA turn records exist and cover source message ids.
 - zero failed PA turns.
-- zero unexpected outbound sends unless explicitly allowed by kind.
+- zero escaped outbound sends: captured replay outbounds
+  (`delivery_mode=capture`) are reported for review but do not fail the gate;
+  any non-capture outbound remains a hard-fail capture-lock leak.
 - tool-error budget not exceeded.
 - provider descriptor/baseline digests match their manifests.
 - attempt/code/replay-policy digests match persisted manifests.
