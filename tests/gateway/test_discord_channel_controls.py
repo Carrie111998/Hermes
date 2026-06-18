@@ -61,6 +61,7 @@ class FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.send = AsyncMock()
 
 
 class FakeThread:
@@ -238,5 +239,4 @@ def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
 
     import os
     assert os.getenv("DISCORD_IGNORED_CHANNELS") == "111,222"
-
 

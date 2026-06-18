@@ -6579,6 +6579,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
+                # If another bot/client won the race and already created the
+                # thread from this starter message, reuse it instead of
+                # posting a fallback seed and creating a duplicate thread.
+                existing_thread = getattr(message, "thread", None)
+                if existing_thread is not None:
+                    return existing_thread
+                if self._client is not None:
+                    try:
+                        existing_thread = self._client.get_channel(int(message.id))
+                        if existing_thread is None:
+                            existing_thread = await self._client.fetch_channel(int(message.id))
+                        if existing_thread is not None:
+                            return existing_thread
+                    except Exception:
+                        logger.debug(
+                            "[%s] Could not resolve existing Discord thread for starter message %s",
+                            self.name,
+                            getattr(message, "id", "unknown"),
+                            exc_info=True,
+                        )
+
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
