@@ -12483,11 +12483,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 replacement = handoff if preserve_compaction_handoff else None
 
             cursor = conn.execute(
-                "SELECT id FROM messages "
-                "WHERE session_id = ? AND id >= ? AND active = 1",
+                "SELECT id, role, platform_message_id FROM messages "
+                "WHERE session_id = ? AND id >= ? AND active = 1 ORDER BY id",
                 (session_id, target_message_id),
             )
-            ids = [r[0] for r in cursor.fetchall()]
+            rewound_rows = [dict(row) for row in cursor.fetchall()]
+            ids = [row["id"] for row in rewound_rows]
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(
@@ -12518,7 +12519,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             new_head_id = (
                 head_row[0] if head_row and head_row[0] is not None else None
             )
-            return target_row, ids, new_head_id, replacement_message_id
+            return target_row, rewound_rows, new_head_id, replacement_message_id
 
         target_row, rewound, new_head_id, replacement_message_id = (
             self._execute_write(_do)
@@ -12535,6 +12536,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
         if preserve_compaction_handoff:
             result["replacement_message_id"] = replacement_message_id
+        result["rewound_messages"] = rewound
         return result
 
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
