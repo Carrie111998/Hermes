@@ -400,6 +400,11 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Inline LLM risk annotations for terminal tool calls.
+        #   risky  — confirm only explicit HIGH/UNKNOWN risk annotations
+        #   always — confirm each distinct terminal command
+        #   never  — bypass ordinary prompts; deterministic safety floors remain
+        "confirmation_policy": "risky",
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
