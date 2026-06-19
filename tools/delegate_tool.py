@@ -867,6 +867,13 @@ def _build_child_progress_callback(
             _relay("subagent.complete", preview=preview, **kwargs)
             return
 
+        # Streamed assistant text from the child (wired via child_stream_cb).
+        # Relayed verbatim with the subagent identity kwargs so observers can
+        # show the subagent's live response, attributed to the right subagent.
+        if event_type == "subagent.message":
+            _relay("subagent.message", preview=preview)
+            return
+
         # Normalise legacy strings, new-style "delegate.*" strings, and
         # DelegateEvent enum values all to a single DelegateEvent.  The
         # original implementation only accepted the five legacy strings;
@@ -893,6 +900,23 @@ def _build_child_progress_callback(
             return
 
         if event == DelegateEvent.TASK_TOOL_COMPLETED:
+            # Relay tool completion so observers can flip the subagent's tool
+            # from "running" to done/error and show its output. Carries the
+            # result text (truncated), error flag, and duration; identity kwargs
+            # are added by _relay. (Previously dropped — subagent tools appeared
+            # to run forever in the FlagOps UI.)
+            result_text = kwargs.get("result")
+            if not isinstance(result_text, str):
+                result_text = "" if result_text is None else str(result_text)
+            _relay(
+                "subagent.tool.completed",
+                tool_name,
+                preview,
+                None,
+                is_error=bool(kwargs.get("is_error", False)),
+                duration_seconds=kwargs.get("duration"),
+                output=result_text[:4000],
+            )
             return
 
         if event == DelegateEvent.TASK_PROGRESS:
@@ -1099,18 +1123,44 @@ def _build_child_agent(
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
-    child_thinking_cb = None
+    # Relay the child's GENUINE reasoning (model chain-of-thought) up to the
+    # parent via the reasoning channel. We deliberately do NOT wire the child's
+    # thinking_callback: in quiet mode Hermes pushes a cosmetic spinner string
+    # to thinking_callback — a random kawaii face + verb, e.g. "(⌐■_■) reasoning…"
+    # (see agent/conversation_loop.py + KawaiiSpinner) — which would surface as
+    # fake subagent "thinking". reasoning_callback carries the real CoT instead.
+    # Relayed as the same "_thinking" → subagent.thinking event so the gateway
+    # and UI mapping stay unchanged.
+    child_reasoning_cb = None
     if child_progress_cb:
 
-        def _child_thinking(text: str) -> None:
+        def _child_reasoning(text: str) -> None:
             if not text:
                 return
             try:
                 child_progress_cb("_thinking", text)
             except Exception as e:
-                logger.debug("Child thinking callback relay failed: %s", e)
+                logger.debug("Child reasoning callback relay failed: %s", e)
 
-        child_thinking_cb = _child_thinking
+        child_reasoning_cb = _child_reasoning
+
+    # Relay the child's streamed assistant text up to the parent so observers
+    # (e.g. the FlagOps Runs API SSE) can surface the subagent's response live,
+    # not just the final summary. Mirrors child_reasoning_cb but for the answer
+    # channel. Routed through the same progress callback as a "subagent.message"
+    # event so it inherits the subagent identity kwargs (subagent_id, depth, …).
+    child_stream_cb = None
+    if child_progress_cb:
+
+        def _child_stream(delta: str) -> None:
+            if not delta:
+                return
+            try:
+                child_progress_cb("subagent.message", preview=delta)
+            except Exception as e:
+                logger.debug("Child stream callback relay failed: %s", e)
+
+        child_stream_cb = _child_stream
 
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
@@ -1219,7 +1269,8 @@ def _build_child_agent(
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
-        thinking_callback=child_thinking_cb,
+        stream_delta_callback=child_stream_cb,
+        reasoning_callback=child_reasoning_cb,
         session_db=getattr(parent_agent, "_session_db", None),
         parent_session_id=getattr(parent_agent, "session_id", None),
         providers_allowed=child_providers_allowed,

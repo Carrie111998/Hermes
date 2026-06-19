@@ -3626,6 +3626,82 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "text": preview or "",
                 })
+            # ── Subagent (delegate_task) activity ────────────────────────────
+            # The parent's tool_progress_callback receives these relayed from
+            # each child via delegate_tool._build_child_progress_callback. We
+            # forward them as distinct SSE events carrying the subagent identity
+            # (subagent_id / task_index / depth / goal) so the client can show
+            # which agent produced each chunk and group them per subagent.
+            elif event_type == "subagent.start":
+                _push({
+                    "event": "subagent.started",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "subagent_id": kwargs.get("subagent_id"),
+                    "task_index": kwargs.get("task_index"),
+                    "depth": kwargs.get("depth"),
+                    "goal": kwargs.get("goal") or preview or "",
+                    "model": kwargs.get("model"),
+                })
+            elif event_type == "subagent.message":
+                _push({
+                    "event": "subagent.message.delta",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "subagent_id": kwargs.get("subagent_id"),
+                    "task_index": kwargs.get("task_index"),
+                    "depth": kwargs.get("depth"),
+                    "goal": kwargs.get("goal") or "",
+                    "delta": preview or "",
+                })
+            elif event_type == "subagent.thinking":
+                _push({
+                    "event": "subagent.reasoning.delta",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "subagent_id": kwargs.get("subagent_id"),
+                    "task_index": kwargs.get("task_index"),
+                    "depth": kwargs.get("depth"),
+                    "goal": kwargs.get("goal") or "",
+                    "delta": preview or "",
+                })
+            elif event_type == "subagent.tool":
+                _push({
+                    "event": "subagent.tool.started",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "subagent_id": kwargs.get("subagent_id"),
+                    "task_index": kwargs.get("task_index"),
+                    "depth": kwargs.get("depth"),
+                    "goal": kwargs.get("goal") or "",
+                    "tool": tool_name,
+                    "preview": preview,
+                })
+            elif event_type == "subagent.tool.completed":
+                _push({
+                    "event": "subagent.tool.completed",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "subagent_id": kwargs.get("subagent_id"),
+                    "task_index": kwargs.get("task_index"),
+                    "depth": kwargs.get("depth"),
+                    "goal": kwargs.get("goal") or "",
+                    "tool": tool_name,
+                    "output": kwargs.get("output") or "",
+                    "error": bool(kwargs.get("is_error", False)),
+                    "duration": kwargs.get("duration_seconds"),
+                })
+            elif event_type == "subagent.complete":
+                _push({
+                    "event": "subagent.completed",
+                    "run_id": run_id,
+                    "timestamp": ts,
+                    "subagent_id": kwargs.get("subagent_id"),
+                    "task_index": kwargs.get("task_index"),
+                    "depth": kwargs.get("depth"),
+                    "goal": kwargs.get("goal") or "",
+                    "status": kwargs.get("status") or "completed",
+                })
             # _thinking and subagent_progress are intentionally not forwarded
 
         return _callback
