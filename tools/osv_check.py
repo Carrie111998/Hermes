@@ -15,7 +15,7 @@ import logging
 import os
 import re
 import urllib.request
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def _query_osv(
     package: str, ecosystem: str, version: Optional[str] = None
 ) -> list:
     """Query the OSV API for MAL-* advisories. Returns list of malware vulns."""
-    payload = {"package": {"name": package, "ecosystem": ecosystem}}
+    payload: Dict[str, Any] = {"package": {"name": package, "ecosystem": ecosystem}}
     if version:
         payload["version"] = version
 

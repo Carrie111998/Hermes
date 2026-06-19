@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 V4A Patch Format Parser
 
@@ -31,8 +33,11 @@ Usage:
 import difflib
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any
+from typing import List, Optional, Tuple, Any, TYPE_CHECKING
 from enum import Enum
+
+if TYPE_CHECKING:
+    from tools.file_operations import PatchResult
 
 
 class OperationType(Enum):
@@ -329,7 +334,7 @@ def _validate_operations(
 
 
 def apply_v4a_operations(operations: List[PatchOperation],
-                          file_ops: Any) -> 'PatchResult':
+                          file_ops: Any) -> PatchResult:
     """Apply V4A patch operations using a file operations interface.
 
     Uses a two-phase validate-then-apply approach:
