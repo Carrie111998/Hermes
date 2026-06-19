@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from typing import Optional, Sequence
@@ -40,6 +41,7 @@ __all__ = [
     "windows_detach_flags",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "run_text_capture",
 ]
 
 
@@ -210,6 +212,99 @@ def windows_hide_flags() -> int:
     if not IS_WINDOWS:
         return 0
     return _CREATE_NO_WINDOW
+
+
+def run_text_capture(
+    argv: Sequence[str],
+    *,
+    timeout: float,
+) -> subprocess.CompletedProcess:
+    """``subprocess.run(argv, capture_output=True, text=True, timeout=timeout)``
+    that reliably honours ``timeout`` on Windows.
+
+    The stdlib hang this works around: when the spawned child itself spawns a
+    grandchild that inherits the capture (stdout/stderr) pipe handles, the
+    grandchild keeps the pipe's write end open. ``subprocess.run`` kills only
+    the *direct* child on timeout, then (on Windows) calls ``communicate()`` a
+    second time to drain the pipes — which blocks forever on the reader-thread
+    join because the pipe never reaches EOF. A wedged CLI therefore hangs the
+    caller indefinitely instead of timing out at ``timeout`` seconds.
+
+    The fix: launch the child in its own process group, and on timeout
+    tree-kill the whole group (``taskkill /T /F`` on Windows, ``killpg`` on
+    POSIX) so EVERY write end of the pipe closes before we drain. Returns a
+    :class:`subprocess.CompletedProcess`; raises
+    :class:`subprocess.TimeoutExpired` on timeout (same as ``subprocess.run``)
+    so existing ``except (OSError, subprocess.TimeoutExpired)`` handlers keep
+    working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
+    ``subprocess.run``.
+    """
+    if IS_WINDOWS:
+        popen_kwargs: dict = {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
+    else:
+        # Own session/process group so killpg() on timeout reaches grandchildren.
+        popen_kwargs = {"start_new_session": True}
+
+    with subprocess.Popen(
+        list(argv),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        **popen_kwargs,
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _tree_kill(proc)
+            # The whole tree is now dead, so every pipe write end is closed and
+            # this drain reaches EOF promptly instead of blocking. Bounded by a
+            # second timeout regardless, so a stubborn descendant can never make
+            # this hang — we drop the output and re-raise instead.
+            try:
+                stdout, stderr = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                stdout = stderr = None
+            raise subprocess.TimeoutExpired(
+                proc.args, timeout, output=stdout, stderr=stderr,
+            )
+        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+
+def _tree_kill(proc: subprocess.Popen) -> None:
+    """Kill ``proc`` and its entire descendant tree; never raises.
+
+    Windows: ``taskkill /PID <pid> /T /F`` — the documented primitive for a
+    tree-kill, mirroring ``tools.process_registry._terminate_host_pid``. We
+    can't use a softer signal: there is no Windows SIGTERM that cascades
+    through a process group, and ``/T`` without ``/F`` won't reach a windowless
+    child. POSIX: ``killpg(SIGKILL)`` reaches the grandchildren because the
+    child was started in its own session (``start_new_session=True``). Either
+    way the goal is to close EVERY write end of the capture pipe so a blocked
+    reader-thread drain can reach EOF.
+    """
+    if IS_WINDOWS:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                proc.kill()  # at least reap the direct child
+            except OSError:
+                pass
+        return
+
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def windows_detach_popen_kwargs() -> dict:

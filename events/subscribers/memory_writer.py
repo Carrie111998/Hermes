@@ -236,9 +236,14 @@ class MemoryWriter(BaseSubscriber):
             if not company:
                 logger.debug("MemoryWriter: no company in event, skipping GBrain write")
                 return
+            # Discard output via DEVNULL rather than capture_output=True: a
+            # capture pipe inherited by a grandchild of the gbrain CLI keeps the
+            # pipe's write end open and hangs subprocess.run's timeout on
+            # Windows. With no pipe there is nothing to inherit, so timeout=10
+            # reliably fires. (The result was already thrown away.)
             subprocess.run(
                 ["gbrain", "timeline", "add", company, content],
-                capture_output=True, timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
             )
             logger.info("MemoryWriter: wrote GBrain timeline entry for %s", company)
         except FileNotFoundError:

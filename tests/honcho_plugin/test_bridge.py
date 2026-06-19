@@ -147,25 +147,39 @@ def test_parse_compiled_facts_excludes_synthesis_markers():
     assert "Existing compiled fact one." in facts
 
 
+# GBrainAdapter shells out via run_text_capture (not subprocess.run directly):
+# that helper tree-kills a wedged gbrain on timeout so a grandchild holding the
+# capture pipe can't hang the bridge on Windows. Tests patch the helper.
 def test_gbrain_get_returns_stdout():
     gb = bridge.GBrainAdapter()
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="PAGE", stderr="")
-    with mock.patch("subprocess.run", return_value=completed) as run:
+    with mock.patch("plugins.memory.honcho.bridge.run_text_capture", return_value=completed) as run:
         assert gb.get_page("hindsight/diego") == "PAGE"
         run.assert_called_once()
         assert run.call_args.args[0] == ["gbrain", "get", "hindsight/diego"]
+        assert run.call_args.kwargs["timeout"] == bridge._GBRAIN_TIMEOUT
 
 
 def test_gbrain_get_missing_cli_returns_none():
     gb = bridge.GBrainAdapter()
-    with mock.patch("subprocess.run", side_effect=FileNotFoundError):
+    with mock.patch("plugins.memory.honcho.bridge.run_text_capture", side_effect=FileNotFoundError):
+        assert gb.get_page("hindsight/diego") is None
+
+
+def test_gbrain_get_timeout_returns_none():
+    # A wedged gbrain (backend down) must yield None, not propagate the timeout
+    # up into the bridge/gateway. run_text_capture raises TimeoutExpired after
+    # tree-killing; the adapter swallows it best-effort.
+    gb = bridge.GBrainAdapter()
+    timeout_exc = subprocess.TimeoutExpired(cmd=["gbrain", "get"], timeout=bridge._GBRAIN_TIMEOUT)
+    with mock.patch("plugins.memory.honcho.bridge.run_text_capture", side_effect=timeout_exc):
         assert gb.get_page("hindsight/diego") is None
 
 
 def test_gbrain_timeline_add_invokes_cli():
     gb = bridge.GBrainAdapter()
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-    with mock.patch("subprocess.run", return_value=completed) as run:
+    with mock.patch("plugins.memory.honcho.bridge.run_text_capture", return_value=completed) as run:
         assert gb.add_timeline("hindsight/diego", "2026-06-04", "[source:honcho] x") is True
         assert run.call_args.args[0] == [
             "gbrain", "timeline-add", "hindsight/diego", "2026-06-04", "[source:honcho] x",
@@ -177,7 +191,7 @@ def test_gbrain_put_passes_markdown_via_content_argv():
     # stdin by opening '/dev/stdin', which does not exist on Windows (ENOENT).
     gb = bridge.GBrainAdapter()
     completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-    with mock.patch("subprocess.run", return_value=completed) as run:
+    with mock.patch("plugins.memory.honcho.bridge.run_text_capture", return_value=completed) as run:
         assert gb.put_page("hindsight/diego", "# Diego\n") is True
         assert "input" not in run.call_args.kwargs  # never piped on stdin
         assert run.call_args.args[0] == [

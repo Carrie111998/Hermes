@@ -15,6 +15,8 @@ import subprocess
 from pathlib import Path
 from typing import Iterable
 
+from hermes_cli._subprocess_compat import run_text_capture
+
 logger = logging.getLogger(__name__)
 
 _TAG_RE = re.compile(r"^\s*\[source:(?P<src>[a-z0-9_-]+)\]\s*")
@@ -139,10 +141,7 @@ class GBrainAdapter:
         Note: an existing-but-empty page yields "" (falsy), not None.
         """
         try:
-            r = subprocess.run(
-                ["gbrain", "get", slug],
-                capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
-            )
+            r = run_text_capture(["gbrain", "get", slug], timeout=_GBRAIN_TIMEOUT)
             return r.stdout if r.returncode == 0 else None
         except (OSError, subprocess.TimeoutExpired) as e:
             logger.warning("gbrain get %s failed: %s", slug, e)
@@ -153,9 +152,9 @@ class GBrainAdapter:
             # Pass content via --content (argv), NOT piped stdin: `gbrain put`
             # reads stdin by opening '/dev/stdin', which does not exist on
             # Windows and fails with ENOENT. --content is cross-platform.
-            r = subprocess.run(
+            r = run_text_capture(
                 ["gbrain", "put", slug, "--content", markdown],
-                capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
+                timeout=_GBRAIN_TIMEOUT,
             )
             return r.returncode == 0
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -164,9 +163,9 @@ class GBrainAdapter:
 
     def add_timeline(self, slug: str, date: str, text: str) -> bool:
         try:
-            r = subprocess.run(
+            r = run_text_capture(
                 ["gbrain", "timeline-add", slug, date, text],
-                capture_output=True, text=True, timeout=_GBRAIN_TIMEOUT,
+                timeout=_GBRAIN_TIMEOUT,
             )
             return r.returncode == 0
         except (OSError, subprocess.TimeoutExpired) as e:

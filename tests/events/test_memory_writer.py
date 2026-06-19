@@ -1,5 +1,6 @@
 """Tests for events.subscribers.memory_writer -- routes events to memory layers."""
 
+import subprocess
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
@@ -47,6 +48,52 @@ class TestMemoryWriter:
         content = writer._build_content(event, "gbrain")
         assert "Acme" in content
         assert "VP Finance" in content
+
+
+class TestGBrainWrite:
+    """_write_gbrain shells out to the gbrain CLI but DISCARDS its output.
+
+    It must therefore NOT capture stdout/stderr: a capture pipe inherited by a
+    grandchild keeps the pipe's write end open and hangs subprocess.run's
+    timeout on Windows (the grandchild-pipe bug). With no pipe at all there is
+    nothing to inherit, so timeout=10 reliably fires. Best-effort throughout.
+    """
+
+    def test_write_gbrain_uses_devnull_not_capture_pipe(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        writer = MemoryWriter(bus)
+        event = Event.create(EventType.JOB_HIGH_SCORE, "scout", {"company": "Acme"})
+
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)) as run:
+            writer._write_gbrain(event, "timeline content")
+
+        run.assert_called_once()
+        kwargs = run.call_args.kwargs
+        assert kwargs.get("stdout") is subprocess.DEVNULL
+        assert kwargs.get("stderr") is subprocess.DEVNULL
+        assert "capture_output" not in kwargs  # capture pipe is what causes the hang
+        assert kwargs.get("timeout") == 10
+        assert run.call_args.args[0] == ["gbrain", "timeline", "add", "Acme", "timeline content"]
+
+    def test_write_gbrain_swallows_timeout(self, tmp_path):
+        # A wedged gbrain that times out must not propagate out of the
+        # best-effort writer (it runs inside the gateway event loop).
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        writer = MemoryWriter(bus)
+        event = Event.create(EventType.JOB_HIGH_SCORE, "scout", {"company": "Acme"})
+
+        with patch("subprocess.run",
+                   side_effect=subprocess.TimeoutExpired(cmd=["gbrain"], timeout=10)):
+            writer._write_gbrain(event, "content")  # must not raise
+
+    def test_write_gbrain_skips_when_no_company(self, tmp_path):
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        writer = MemoryWriter(bus)
+        event = Event.create(EventType.JOB_HIGH_SCORE, "scout", {})
+
+        with patch("subprocess.run") as run:
+            writer._write_gbrain(event, "content")
+        run.assert_not_called()
 
 
 class TestMemPalaceWrite:
