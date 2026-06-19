@@ -400,10 +400,13 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
-        # Inline LLM risk annotations for terminal tool calls.
-        #   risky  — confirm only explicit HIGH/UNKNOWN risk annotations
+        # Inline LLM risk annotations for terminal tool calls. These are
+        # advisory self-reports, not security scans: LOW/MEDIUM does not
+        # prove a command is safe, and deterministic guards still run.
+        #   risky  — confirm explicit HIGH/UNKNOWN advisory annotations
         #   always — confirm each distinct terminal command
-        #   never  — bypass ordinary prompts; deterministic safety floors remain
+        #   never  — ignore annotation prompts in trusted environments;
+        #             hardline/sudo-stdin floors still apply
         "confirmation_policy": "risky",
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
