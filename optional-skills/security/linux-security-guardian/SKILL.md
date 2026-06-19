@@ -296,9 +296,13 @@ After presenting the report, DO NOT apply fixes automatically. Instead:
    - Ask: *"Apply this fix? (y/N)"*
    - If yes, execute; if no, skip and explain the risk
 3. After each fix, re-run the affected check(s) to confirm.
-4. For **SSH config changes**: remind the user to open a second SSH session and verify
+4. For **SSH config changes**: After editing `sshd_config`, run `sshd -t` to validate
+   the config syntax BEFORE restarting sshd. Only proceed if `sshd -t` returns exit
+   code 0. If it fails, display the error output to the user and abort the fix — do not
+   restart sshd or continue applying this change.
+5. For **SSH config changes**: remind the user to open a second SSH session and verify
    login BEFORE closing the current one.
-5. **Never** modify `sshd_config` and then close the session in the same turn.
+6. **Never** modify `sshd_config` and then close the session in the same turn.
 
 ### Fix Commands Reference
 
