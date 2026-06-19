@@ -9,12 +9,17 @@ black" / dim gray) which does not exist on 8-color terminals.  The fix
 clamps with ``min(8, curses.COLORS - 1)``.
 """
 
-import curses
 import re
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 import pytest
+
+# ``_curses`` is unavailable on Windows stock Python.  Import-or-skip the whole
+# module so a missing curses is reported as a clean skip rather than raising
+# ModuleNotFoundError at collection time -- which would abort collection of the
+# entire ``tests/`` tree, not just this file.
+curses = pytest.importorskip("curses")
 
 
 # Path to the source files under test
