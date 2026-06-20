@@ -165,6 +165,7 @@ class CriticState(TypedDict, total=False):
     # Finalize
     retro_path: str
     run_id: str
+    changelog_appended: bool  # False when the run had empty input (no entry written)
 
     error: Optional[str]
 
@@ -1115,7 +1116,26 @@ def emit_proposals_node(state: CriticState) -> dict:
 
 
 def finalize_node(state: CriticState) -> dict:
-    """Append run summary to changelog.jsonl + write a retro markdown."""
+    """Append run summary to changelog.jsonl + write a retro markdown.
+
+    Empty-input guard (2026-06-20): when the run had NOTHING to analyze
+    (diff_reports_used == [] AND paired_jobs == []) it produced no clusters,
+    no proposals, and took no side-effectful action — so it must NOT append a
+    changelog entry. Two consumers depend on this:
+
+      * bin/critic_run.py:already_ran_today() keys idempotency off the last
+        REAL changelog entry. An empty entry dated today would make every
+        same-day Task Scheduler repetition (07:30->12:30 PT30M) no-op, stranding
+        same-day recovery once a fresh diff-report finally appears — the
+        multi-day-downtime case (laptop off 6/13-6/19).
+      * the laptop-monitor ">30h staleness alarm" watches changelog.jsonl's
+        MTIME. Skipping the write means an empty fire does NOT refresh that
+        mtime, so the alarm still trips when no real proposal generation has
+        landed — an empty run can never falsely satisfy it.
+
+    The retro markdown is still written (harmless, and documents "nothing to
+    do"); only the changelog append is gated.
+    """
     with _TRACER.start_as_current_span("critic.finalize") as span:
         run_id = state.get("run_id") or uuid.uuid4().hex[:12]
         clusters = state.get("clusters") or []
@@ -1123,21 +1143,28 @@ def finalize_node(state: CriticState) -> dict:
         emitted = state.get("emitted") or []
         applied = state.get("auto_applied") or []
 
-        CHANGELOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        log_entry = {
-            "run_id": run_id,
-            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "diff_reports_used": state.get("diff_reports_used") or [],
-            "paired_jobs": len(state.get("paired_jobs") or []),
-            "dataset_items": len(state.get("dataset_items") or []),
-            "clusters_found": len(clusters),
-            "proposals_generated": len(proposals),
-            "auto_applied_count": sum(1 for a in applied if a.get("executed")),
-            "auto_apply_deferred_count": sum(1 for a in applied if not a.get("executed")),
-            "propose_only_count": len(emitted),
-        }
-        with open(CHANGELOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry, default=str) + "\n")
+        diff_reports = state.get("diff_reports_used") or []
+        paired = state.get("paired_jobs") or []
+        empty_input = not diff_reports and not paired
+
+        if empty_input:
+            span.set_attribute("finalize.empty_input", True)
+        else:
+            CHANGELOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            log_entry = {
+                "run_id": run_id,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "diff_reports_used": diff_reports,
+                "paired_jobs": len(paired),
+                "dataset_items": len(state.get("dataset_items") or []),
+                "clusters_found": len(clusters),
+                "proposals_generated": len(proposals),
+                "auto_applied_count": sum(1 for a in applied if a.get("executed")),
+                "auto_apply_deferred_count": sum(1 for a in applied if not a.get("executed")),
+                "propose_only_count": len(emitted),
+            }
+            with open(CHANGELOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, default=str) + "\n")
 
         # Retro markdown
         RETROS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1206,9 +1233,13 @@ def finalize_node(state: CriticState) -> dict:
         ]
         retro_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-        span.set_attribute("finalize.changelog_appended", True)
+        span.set_attribute("finalize.changelog_appended", not empty_input)
         span.set_attribute("finalize.retro_path", str(retro_path))
-        return {"retro_path": str(retro_path), "run_id": run_id}
+        return {
+            "retro_path": str(retro_path),
+            "run_id": run_id,
+            "changelog_appended": not empty_input,
+        }
 
 
 # ---------------------------------------------------------------------------
