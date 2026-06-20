@@ -36,11 +36,11 @@ from typing import Dict, Any, List, Optional
 from utils import atomic_replace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
-msvcrt = None
+msvcrt: Any = None
 try:
     import fcntl
 except ImportError:
-    fcntl = None
+    fcntl: Any = None
     try:
         import msvcrt
     except ImportError:
@@ -161,8 +161,9 @@ class MemoryStore:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
             else:
+                from typing import cast
                 fd.seek(0)
-                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+                cast(Any, msvcrt).locking(fd.fileno(), cast(Any, msvcrt).LK_LOCK, 1)
             yield
         finally:
             if fcntl:
@@ -171,9 +172,10 @@ class MemoryStore:
                 except (OSError, IOError):
                     pass
             elif msvcrt:
+                from typing import cast
                 try:
                     fd.seek(0)
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+                    cast(Any, msvcrt).locking(fd.fileno(), cast(Any, msvcrt).LK_UNLCK, 1)
                 except (OSError, IOError):
                     pass
             fd.close()
@@ -373,7 +375,7 @@ class MemoryStore:
 
     # -- Internal helpers --
 
-    def _success_response(self, target: str, message: str = None) -> Dict[str, Any]:
+    def _success_response(self, target: str, message: Optional[str] = None) -> Dict[str, Any]:
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
@@ -465,8 +467,8 @@ class MemoryStore:
 def memory_tool(
     action: str,
     target: str = "memory",
-    content: str = None,
-    old_text: str = None,
+    content: Optional[str] = None,
+    old_text: Optional[str] = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """

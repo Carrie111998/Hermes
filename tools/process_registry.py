@@ -474,8 +474,8 @@ class ProcessRegistry:
         self,
         command: str,
         cwd: Optional[str] = None,
-        task_id: str = "",
-        session_key: str = "",
+        task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
         env_vars: Optional[dict] = None,
         use_pty: bool = False,
     ) -> ProcessSession:
@@ -492,8 +492,8 @@ class ProcessRegistry:
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
-            task_id=task_id,
-            session_key=session_key,
+            task_id=task_id or "",
+            session_key=session_key or "",
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -609,9 +609,9 @@ class ProcessRegistry:
         env: Any,
         command: str,
         cwd: Optional[str] = None,
-        task_id: str = "",
-        session_key: str = "",
-        timeout: int = 10,
+        task_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        timeout: Optional[int] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -627,8 +627,8 @@ class ProcessRegistry:
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
-            task_id=task_id,
-            session_key=session_key,
+            task_id=task_id or "",
+            session_key=session_key or "",
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -653,7 +653,7 @@ class ProcessRegistry:
         )
 
         try:
-            result = env.execute(bg_command, timeout=timeout)
+            result = env.execute(bg_command, timeout=timeout or 10)
             output = result.get("output", "").strip()
             # Try to extract the PID from the output
             for line in output.splitlines():

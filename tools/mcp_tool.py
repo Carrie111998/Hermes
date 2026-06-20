@@ -204,7 +204,7 @@ try:
     try:
         from mcp.client.sse import sse_client
     except ImportError:
-        sse_client = None
+        sse_client: Any = None
         logger.debug("mcp.client.sse.sse_client not available -- SSE transport disabled")
     # Sampling types -- separated so older SDK versions don't break MCP support
     try:
@@ -953,14 +953,15 @@ class SamplingHandler:
 
         # Offload sync LLM call to thread (non-blocking)
         def _sync_call():
+            from typing import cast
             return call_llm(
                 task="mcp",
-                model=resolved_model or None,
+                model=cast(str, resolved_model or None),
                 messages=messages,
-                temperature=call_temperature,
-                max_tokens=max_tokens,
-                tools=call_tools,
-                timeout=self.timeout,
+                temperature=cast(float, call_temperature),
+                max_tokens=cast(int, max_tokens),
+                tools=cast(list, call_tools),
+                timeout=cast(float, self.timeout),
             )
 
         try:
@@ -1144,6 +1145,7 @@ class MCPServerTask:
 
             # 1. Fetch current tool list from server
             async with self._rpc_lock:
+                assert self.session is not None
                 tools_result = await self.session.list_tools()
             new_mcp_tools = tools_result.tools if hasattr(tools_result, "tools") else []
 
@@ -2331,6 +2333,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
+                assert server.session is not None
                 result = await server.session.call_tool(tool_name, arguments=args)
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
@@ -2444,6 +2447,7 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
+                assert server.session is not None
                 result = await server.session.list_resources()
             resources = []
             for r in (result.resources if hasattr(result, "resources") else []):
@@ -2508,6 +2512,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
+                assert server.session is not None
                 result = await server.session.read_resource(uri)
             # read_resource returns ReadResourceResult with .contents list
             parts: List[str] = []
@@ -2562,6 +2567,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
+                assert server.session is not None
                 result = await server.session.list_prompts()
             prompts = []
             for p in (result.prompts if hasattr(result, "prompts") else []):
@@ -2632,6 +2638,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
+                assert server.session is not None
                 result = await server.session.get_prompt(name, arguments=arguments)
             # GetPromptResult has .messages list
             messages = []
