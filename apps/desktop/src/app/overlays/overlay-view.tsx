@@ -89,6 +89,7 @@ export function OverlayView({
       // leak into the hidden composer (and the overlay's own bare-key shortcuts,
       // e.g. star map's Space, keep working).
       data-overlay-surface=""
+      data-overlay-view=""
       onClick={event => {
         if (event.target === event.currentTarget) {
           closeOverlay()
