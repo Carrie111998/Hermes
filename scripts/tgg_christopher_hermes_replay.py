@@ -347,7 +347,7 @@ def _mint_local_christopher_token(ps_data_dir: Path) -> str | None:
     return token
 
 
-def _prepare_env(hermes_home: Path, *, secrets: Path) -> None:
+def _prepare_env(hermes_home: Path, *, secrets: Path, live_business_writes: bool = False) -> None:
     _load_secrets(secrets)
     os.environ.setdefault("PS_DATA_DIR", str(Path(DEFAULT_DB).parent.parent))
     # Christopher's deploy config expects this name. Studio secrets currently
@@ -368,8 +368,12 @@ def _prepare_env(hermes_home: Path, *, secrets: Path) -> None:
         # shared alias. Mirror it in-process so replay uses the live config shape.
         os.environ["GEMINI_API_KEY_PCL_PA_SHARED"] = os.environ["GEMINI_API_KEY"]
     os.environ["HERMES_HOME"] = str(hermes_home)
-    os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "1"
-    os.environ["HERMES_PA_AGENT_ACTION_DRY_RUN"] = "1"
+    if live_business_writes:
+        os.environ.pop("HERMES_PA_BUSINESS_DRY_RUN", None)
+        os.environ.pop("HERMES_PA_AGENT_ACTION_DRY_RUN", None)
+    else:
+        os.environ["HERMES_PA_BUSINESS_DRY_RUN"] = "1"
+        os.environ["HERMES_PA_AGENT_ACTION_DRY_RUN"] = "1"
     os.environ.setdefault("HERMES_OPENAI_CAPTURE_DIR", str(hermes_home / "openai-captures"))
     os.environ.setdefault("HERMES_LLM_CALL_LOG", str(hermes_home / "llm-call-ledger.jsonl"))
     os.environ["HERMES_TIMEZONE"] = "Asia/Singapore"
@@ -401,11 +405,21 @@ def _validate_replay_args(args: argparse.Namespace) -> None:
             "--vision-model looks like Gemini but --vision-provider points elsewhere. "
             "Refusing to route a Gemini model name through the main provider."
         )
-    if args.business_base_url and not profile.allow_prod_url and not str(args.business_base_url).startswith(LOCAL_BUSINESS_PREFIXES):
+    external_business_url = bool(
+        args.business_base_url
+        and not str(args.business_base_url).startswith(LOCAL_BUSINESS_PREFIXES)
+    )
+    if external_business_url and not profile.allow_prod_url and not args.prod_pilot_run_id:
         raise SystemExit(
             "--business-base-url must be localhost/127.0.0.1 for replay. "
-            "Use the local copied-DB backend; do not point replay at production."
+            "Use the local copied-DB backend, or pass --prod-pilot-run-id to "
+            "enter the bounded production pilot write path."
         )
+    if args.prod_pilot_run_id:
+        if not args.no_local_operator_backend or not args.business_base_url:
+            raise SystemExit("--prod-pilot-run-id requires --no-local-operator-backend and --business-base-url")
+        if not args.live_business_writes:
+            raise SystemExit("--prod-pilot-run-id requires --live-business-writes")
     if not Path(args.db).exists():
         raise SystemExit(f"Replay DB does not exist: {args.db}")
     sidecars = [Path(str(args.db) + suffix) for suffix in ("-wal", "-shm")]
@@ -938,6 +952,7 @@ def _prepare_hermes_home(
     chat_id: str,
     profile: ReplayProfile,
     business_base_url: str | None,
+    prod_pilot_run_id: str | None = None,
     session_reset_mode: str | None = None,
 ) -> None:
     config = _load_yaml(TGG_CONFIG)
@@ -1018,6 +1033,10 @@ def _prepare_hermes_home(
                 url = str(operation.get("url") or "")
                 if url.startswith("https://systems.papercut-labs.com"):
                     operation["url"] = url.replace("https://systems.papercut-labs.com", base, 1)
+                if prod_pilot_run_id:
+                    headers = operation.setdefault("headers", {})
+                    if isinstance(headers, dict):
+                        headers["X-Replay-Run-Id"] = prod_pilot_run_id
 
     platform = config.setdefault("platforms", {}).setdefault("whatsapp", {})
     platform["enabled"] = True
@@ -1082,21 +1101,35 @@ def _load_records(
     until_sgt: str | None,
     limit: int | None,
     skip_messages: int = 0,
+    source_table: str = "bridge_message_log",
 ) -> list[ReplayRecord]:
+    if source_table not in {"bridge_message_log", "message_ledger"}:
+        raise ValueError("source_table must be bridge_message_log or message_ledger")
     clauses = ["chat_jid = ?", "sgt >= ?"]
     params: list[Any] = [chat_id, since_sgt]
     if until_sgt:
         clauses.append("sgt < ?")
         params.append(until_sgt)
 
-    sql = f"""
-        SELECT source_ref, chat_jid, chat_name, sender_id, ts, sgt, text,
-               message_kind, has_media, media_refs, quoted_text,
-               reply_to_source_ref, raw_json
-        FROM bridge_message_log
-        WHERE {' AND '.join(clauses)}
-        ORDER BY ts, source_ref
-    """
+    if source_table == "message_ledger":
+        clauses.append("in_scope = 1")
+        sql = f"""
+            SELECT source_ref, chat_jid, chat_name, sender_id, ts, sgt, text,
+                   message_kind, has_media, media_refs, quoted_text,
+                   reply_to_source_ref, raw_json
+            FROM message_ledger
+            WHERE {' AND '.join(clauses)}
+            ORDER BY ts, source_ref
+        """
+    else:
+        sql = f"""
+            SELECT source_ref, chat_jid, chat_name, sender_id, ts, sgt, text,
+                   message_kind, has_media, media_refs, quoted_text,
+                   reply_to_source_ref, raw_json
+            FROM bridge_message_log
+            WHERE {' AND '.join(clauses)}
+            ORDER BY ts, source_ref
+        """
     if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
@@ -2533,7 +2566,11 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"[continue-session] {continue_plan['reason']}", file=sys.stderr)
     output_path = Path(args.output) if args.output else DOCS_DIR / f"{run_label}.html"
 
-    _prepare_env(hermes_home, secrets=Path(args.secrets))
+    _prepare_env(
+        hermes_home,
+        secrets=Path(args.secrets),
+        live_business_writes=bool(args.live_business_writes),
+    )
     _replay_run_row = _stamp_replay_run(
         hermes_home,
         run_label=run_label,
@@ -2564,6 +2601,7 @@ async def _run(args: argparse.Namespace) -> int:
         chat_id=args.chat_id,
         profile=profile,
         business_base_url=business_base_url,
+        prod_pilot_run_id=args.prod_pilot_run_id,
         session_reset_mode=continue_plan["session_reset_mode"],
     )
 
@@ -2590,9 +2628,10 @@ async def _run(args: argparse.Namespace) -> int:
         until_sgt=args.until_sgt,
         limit=args.limit_messages,
         skip_messages=args.skip_messages,
+        source_table=args.source_table,
     )
     if not records:
-        raise RuntimeError("No bridge_message_log rows matched replay criteria")
+        raise RuntimeError(f"No {args.source_table} rows matched replay criteria")
 
     config = load_gateway_config()
     runner = GatewayRunner(config)
@@ -2798,6 +2837,7 @@ async def _run(args: argparse.Namespace) -> int:
     summary = {
         "run_label": run_label,
         "chat_id": args.chat_id,
+        "source_table": args.source_table,
         "since_sgt": args.since_sgt,
         "until_sgt": args.until_sgt,
         "messages": len(records),
@@ -2816,6 +2856,8 @@ async def _run(args: argparse.Namespace) -> int:
         "session_count": len(session_ids),
         "hermes_home": str(hermes_home),
         "business_base_url": business_base_url,
+        "prod_pilot_run_id": args.prod_pilot_run_id,
+        "live_business_writes": bool(args.live_business_writes),
         "local_operator_backend": bool(local_backend),
         "openai_capture_dir": os.environ.get("HERMES_OPENAI_CAPTURE_DIR"),
         "html": str(output_path),
@@ -2845,6 +2887,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="tgg-eval-gpt54-mini", choices=_replay_profile_names())
     parser.add_argument("--db", default=str(DEFAULT_DB))
+    parser.add_argument(
+        "--source-table",
+        default="bridge_message_log",
+        choices=["bridge_message_log", "message_ledger"],
+        help="Source table for replay rows. PG prod pilot uses message_ledger.",
+    )
     parser.add_argument("--chat-id", default=DEFAULT_CHAT)
     parser.add_argument("--since-sgt", default=DEFAULT_SINCE)
     parser.add_argument("--until-sgt")
@@ -2861,6 +2909,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hermes-home")
     parser.add_argument("--business-base-url")
     parser.add_argument("--no-local-operator-backend", action="store_true")
+    parser.add_argument(
+        "--prod-pilot-run-id",
+        help=(
+            "Explicit bounded-prod pilot mode. Adds X-Replay-Run-Id to business "
+            "bridge writes and permits a non-local business URL only with "
+            "--live-business-writes."
+        ),
+    )
+    parser.add_argument(
+        "--live-business-writes",
+        action="store_true",
+        help=(
+            "Disable HERMES_PA_BUSINESS_DRY_RUN. Intended only with "
+            "--prod-pilot-run-id and the systems prod replay gate."
+        ),
+    )
     parser.add_argument("--publish-review-run")
     parser.add_argument("--publish-review-db")
     parser.add_argument("--render-review-run", help="Render a previously published tgg_christopher_* run without replaying")

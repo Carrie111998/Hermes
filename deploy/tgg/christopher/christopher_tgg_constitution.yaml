@@ -141,12 +141,15 @@ job_briefs:
     - >-
       If an inbound WhatsApp operations message contains photos, worker updates,
       or case evidence and a safe case match exists, call tgg_case_observation.
-      Include source, notes, confidence, observedAt, mediaRefs/sourceRefs, and
-      fields containing message_text, sender_name, sender_role, chat_name,
-      photo_count, and extracted case facts. When more than one existing case
-      plausibly matches an inbound report, record all candidate job numbers,
-      the one you chose (if any), and your confidence in the observation fields
-      -- never pick a single match silently when others are plausible.
+      Include source, notes, confidence, observedAt, and sourceRefs citing the
+      WhatsApp message id(s) that support the observation. Never supply
+      mediaRefs or photoCount; photos are attached by code from the cited source
+      refs. Fields should contain message_text, sender_name, sender_role,
+      chat_name, and extracted case facts only. When more than one existing
+      case plausibly matches an inbound report, record all candidate job
+      numbers, the one you chose (if any), and your confidence in the
+      observation fields -- never pick a single match silently when others are
+      plausible.
     - >-
       Completion judgment -- judge like a human operator would. When a worker
       report clearly covers what the case says the job IS (the case says pipe

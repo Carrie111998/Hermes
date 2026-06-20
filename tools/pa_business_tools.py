@@ -1171,14 +1171,27 @@ def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str
     for source_key, field_key in (
         ("observedAt", "observed_at"),
         ("sourceRefs", "source_refs"),
-        ("mediaRefs", "media_refs"),
         ("messageText", "message_text"),
         ("senderName", "sender_name"),
         ("chatName", "chat_name"),
-        ("photoCount", "photo_count"),
     ):
         if raw.get(source_key) is not None and field_key not in fields:
             fields[field_key] = raw.get(source_key)
+    source_refs = _string_list(fields.get("source_refs") or raw.get("sourceRefs"))
+    if not source_refs:
+        return tool_error(
+            "tgg_case_observation requires non-empty sourceRefs. Cite the "
+            "WhatsApp message id(s) that support this observation; photos are "
+            "attached server-side from those source refs."
+        )
+    fields["source_refs"] = source_refs
+    # Media attachment is mechanical. Christopher cites source messages; the
+    # systems API derives media_refs/photo_count from message_ledger. Strip any
+    # model-supplied raw media/photo fields so the LLM cannot silently create
+    # broken gallery refs.
+    for key in ("mediaRefs", "media_refs", "photoCount", "photo_count"):
+        raw.pop(key, None)
+        fields.pop(key, None)
     payload = {
         "jobNo": raw.get("jobNo"),
         "source": raw.get("source") or "whatsapp",
@@ -1590,12 +1603,19 @@ TGG_CASE_OBSERVATION_SCHEMA = {
             "messageText": {"type": "string", "description": "Original message text or bundled message summary."},
             "senderName": {"type": "string", "description": "WhatsApp sender name/id."},
             "chatName": {"type": "string", "description": "WhatsApp group/chat name."},
-            "photoCount": {"type": "integer", "description": "Number of attached photos."},
-            "sourceRefs": {"type": "array", "items": {"type": "string"}, "description": "Source WhatsApp message IDs/refs."},
-            "mediaRefs": {"type": "array", "items": {"type": "string"}, "description": "Attached media paths/refs."},
+            "sourceRefs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": (
+                    "Required source WhatsApp message IDs/refs. Cite the "
+                    "message(s) that support this observation; do not supply "
+                    "media refs or photo counts."
+                ),
+            },
         },
-        "required": ["jobNo", "source", "observedAt", "notes", "confidence"],
-        "additionalProperties": True,
+        "required": ["jobNo", "source", "observedAt", "notes", "confidence", "sourceRefs"],
+        "additionalProperties": False,
     },
 }
 

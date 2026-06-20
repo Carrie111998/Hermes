@@ -138,7 +138,11 @@ def test_observation_result_echoes_last_known_state(monkeypatch):
     )
     pbt._handle_tgg_case_lookup({"jobNo": "AM/JOB/2601/1018"})
     raw = pbt._handle_tgg_case_observation(
-        {"jobNo": "AM/JOB/2601/1018", "notes": "worker photos"}
+        {
+            "jobNo": "AM/JOB/2601/1018",
+            "notes": "worker photos",
+            "sourceRefs": ["wa-msg-1"],
+        }
     )
     data = json.loads(raw)
     assert data["ok"] is True
@@ -157,7 +161,9 @@ def test_observation_without_known_state_is_unchanged(monkeypatch):
             }
         },
     )
-    raw = pbt._handle_tgg_case_observation({"jobNo": "AM/JOB/2601/9999"})
+    raw = pbt._handle_tgg_case_observation(
+        {"jobNo": "AM/JOB/2601/9999", "sourceRefs": ["wa-msg-2"]}
+    )
     data = json.loads(raw)
     assert "caseState" not in data
     assert "caseStateNote" not in data
@@ -169,7 +175,9 @@ def test_observation_error_result_not_annotated(monkeypatch):
         monkeypatch,
         {"tgg_case_observation": RuntimeError("backend down")},
     )
-    raw = pbt._handle_tgg_case_observation({"jobNo": "AM/JOB/2601/1018"})
+    raw = pbt._handle_tgg_case_observation(
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["wa-msg-3"]}
+    )
     data = json.loads(raw)
     assert "error" in data
     assert "caseState" not in data
@@ -190,8 +198,64 @@ def test_observation_does_not_override_backend_provided_state(monkeypatch):
             }
         },
     )
-    raw = pbt._handle_tgg_case_observation({"jobNo": "AM/JOB/2601/1018"})
+    raw = pbt._handle_tgg_case_observation(
+        {"jobNo": "AM/JOB/2601/1018", "sourceRefs": ["wa-msg-4"]}
+    )
     assert json.loads(raw)["caseState"] == "completed"
+
+
+def test_observation_requires_source_refs_before_backend_write(monkeypatch):
+    calls = _patch_backend(
+        monkeypatch,
+        {
+            "tgg_case_observation": {
+                "ok": True,
+                "data": {"observationId": 99},
+                "status_code": 200,
+            }
+        },
+    )
+    raw = pbt._handle_tgg_case_observation({"jobNo": "AM/JOB/2601/1018"})
+    data = json.loads(raw)
+    assert data["error"]
+    assert "sourceRefs" in data["error"]
+    assert calls == []
+
+
+def test_observation_strips_model_supplied_media_and_photo_fields(monkeypatch):
+    calls = _patch_backend(
+        monkeypatch,
+        {
+            "tgg_case_observation": {
+                "ok": True,
+                "data": {"observationId": 100},
+                "status_code": 200,
+            }
+        },
+    )
+    raw = pbt._handle_tgg_case_observation(
+        {
+            "jobNo": "AM/JOB/2601/1018",
+            "source": "whatsapp",
+            "observedAt": "2026-06-20 10:00:00",
+            "notes": "worker sent completion photos",
+            "confidence": "observed",
+            "sourceRefs": ["wa-msg-5"],
+            "mediaRefs": ["bad-model-ref"],
+            "photoCount": 9,
+            "fields": {
+                "message_text": "done",
+                "media_refs": ["bad-nested-ref"],
+                "photo_count": 9,
+            },
+        }
+    )
+    assert json.loads(raw)["ok"] is True
+    assert calls[0][0] == "tgg_case_observation"
+    payload = calls[0][1]
+    assert payload["fields"]["source_refs"] == ["wa-msg-5"]
+    assert "media_refs" not in payload["fields"]
+    assert "photo_count" not in payload["fields"]
 
 
 def test_state_cache_is_bounded():
