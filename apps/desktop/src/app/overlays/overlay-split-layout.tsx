@@ -44,6 +44,7 @@ interface OverlayNavItemProps {
 export function OverlaySplitLayout({ children, className }: OverlaySplitLayoutProps) {
   return (
     <div
+      data-overlay-split
       className={cn(
         // Narrow: one column, and pin rows to [nav-bar auto | main 1fr] — without
         // an explicit template the grid's default align-content:stretch splits the
@@ -60,6 +61,7 @@ export function OverlaySplitLayout({ children, className }: OverlaySplitLayoutPr
 export function OverlaySidebar({ children, className }: OverlaySidebarProps) {
   return (
     <aside
+      data-overlay-sidebar
       className={cn(
         // The left links sit beside (not under) the floating close button, so
         // they ride up via the shorter shared OVERLAY_TOP_CLEARANCE (same line
@@ -82,6 +84,7 @@ export function OverlaySidebar({ children, className }: OverlaySidebarProps) {
 export function OverlayMain({ children, className }: OverlayMainProps) {
   return (
     <main
+      data-overlay-main
       className={cn(
         // Main sits UNDER the floating close button (top-right), so it keeps the
         // taller top pad to clear the X — unlike the sidebar / Panel header,
@@ -111,6 +114,7 @@ export const OverlayNavItem = memo(function OverlayNavItem({
 }: OverlayNavItemProps) {
   return (
     <button
+      data-overlay-nav-item
       className={cn(
         'flex h-7 w-full items-center justify-start gap-2 rounded-md border px-2 text-left text-[length:var(--conversation-text-font-size)] font-normal transition-colors',
         nested
