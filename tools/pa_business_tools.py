@@ -1208,7 +1208,7 @@ def _handle_tgg_case_observation(args: Mapping[str, Any], **_kwargs: Any) -> str
     )
 
 
-_JOB_NO_TOKEN_RE = re.compile(r"\b[A-Z]{2}/JOB/\d{4}/\d{1,4}\b")
+_JOB_NO_RE = re.compile(r"\b[A-Z]{2}/JOB/\d{4}/\d{1,4}\b")
 
 _CREATE_JOB_NO_ALIASES = ("reportedJobNo", "reported_job_no", "job_no", "jobno", "jobNumber")
 
@@ -1222,7 +1222,7 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
     if not str(payload.get("jobNo") or "").strip():
         for alias in _CREATE_JOB_NO_ALIASES:
             value = str(payload.get(alias) or "").strip()
-            if value and _JOB_NO_TOKEN_RE.search(value.upper()):
+            if value and _JOB_NO_RE.search(value.upper()):
                 payload["jobNo"] = value.upper()
                 break
     for alias in _CREATE_JOB_NO_ALIASES:
@@ -1235,7 +1235,7 @@ def _handle_tgg_case_create(args: Mapping[str, Any], **_kwargs: Any) -> str:
     # explicit-operator-instruction escape hatch.
     if not str(payload.get("jobNo") or "").strip() and not payload.get("confirmNoJobNo"):
         evidence_blob = json.dumps(payload.get("evidence") or {}, ensure_ascii=False)
-        found = sorted(set(_JOB_NO_TOKEN_RE.findall(evidence_blob.upper())))
+        found = sorted(set(_JOB_NO_RE.findall(evidence_blob.upper())))
         if found:
             return tool_error(
                 "JOB_NO_OMITTED: the evidence text contains job number(s) "
