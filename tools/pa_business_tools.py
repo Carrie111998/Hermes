@@ -1105,7 +1105,7 @@ def _coerce_observed_at_epoch(value: Any) -> Any:
     """Coerce an observed_at value to epoch SECONDS (int) when possible.
 
     The tgg_case_update_state backend expects epoch seconds; agents naturally
-    produce ISO-8601 strings (sk-day26-v6: christopher sent
+    produce ISO-8601 strings (SK day-26 v6: Christopher sent
     '2026-05-26T11:02:58+08:00', got rejected, and burned a retry call with
     epoch). Accept both shapes at the tool boundary:
 
