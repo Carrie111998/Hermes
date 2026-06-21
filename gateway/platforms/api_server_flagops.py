@@ -19,6 +19,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- POST /v1/runs/{run_id}/force-stop  — hard-stop a run (interrupt + kill background processes)
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1016,6 +1017,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         reasoning_callback=None,
+        step_callback=None,
         gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
@@ -1065,6 +1067,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
             reasoning_callback=reasoning_callback,
+            step_callback=step_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -1163,6 +1166,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
                 "run_status": True,
                 "run_events_sse": True,
                 "run_stop": True,
+                "run_force_stop": True,
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
@@ -1191,6 +1195,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "run_force_stop": {"method": "POST", "path": "/v1/runs/{run_id}/force-stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -3828,6 +3833,24 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Per-iteration progress. agent.step_callback fires at the top of each
+        # agent-loop turn (conversation_loop) with the running api_call_count;
+        # we surface it as a lightweight "iteration" event so external UIs can
+        # show "iteration N / max". max_iterations mirrors _create_agent's cap.
+        run_max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+
+        def _step_cb(api_call_count: int, prev_tools=None) -> None:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "iteration",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "iteration": api_call_count,
+                    "max_iterations": run_max_iterations,
+                })
+            except Exception:
+                pass
+
         self._set_run_status(
             run_id,
             "queued",
@@ -3845,6 +3868,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     reasoning_callback=_reasoning_cb,
+                    step_callback=_step_cb,
                     gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent
@@ -4213,6 +4237,75 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_force_stop_run(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runs/{run_id}/force-stop — hard-stop a running agent.
+
+        Strictly stronger than /stop. In addition to interrupting the agent
+        loop and cancelling the asyncio wrapper (what /stop does), this also
+        terminates the run's background processes via process_registry.kill_all
+        so a long-lived ``terminal(background=true)`` shell (brute-force script,
+        watcher, etc.) cannot survive the stop and keep emitting work. The
+        worker thread itself cannot be force-killed in Python, but
+        agent.interrupt() already breaks foreground commands (which poll the
+        per-thread interrupt flag) and propagates to worker threads + subagents.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        run_id = request.match_info["run_id"]
+        agent = self._active_run_agents.get(run_id)
+        task = self._active_run_tasks.get(run_id)
+
+        if agent is None and task is None:
+            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+
+        self._set_run_status(run_id, "stopping", last_event="run.stopping")
+
+        if agent is not None:
+            try:
+                agent.interrupt("Force-stop requested via API")
+            except Exception:
+                pass
+
+            # Kill any background processes this run spawned. They are keyed by
+            # task_id, which the run derives as ``session_id or run_id`` (see
+            # _run_sync). Unlike agent.interrupt(), nothing else tears these
+            # down on stop, so this is the step that makes force-stop actually
+            # forceful for the common "agent left a bg shell running" case.
+            try:
+                from tools.process_registry import process_registry
+
+                task_id = getattr(agent, "session_id", None) or run_id
+                killed = process_registry.kill_all(task_id=task_id)
+                if killed:
+                    logger.info(
+                        "[api_server] force-stop run %s killed %d background process(es)",
+                        run_id, killed,
+                    )
+            except Exception:
+                logger.debug("[api_server] force-stop kill_all failed for run %s", run_id, exc_info=True)
+
+        if task is not None and not task.done():
+            task.cancel()
+            # Bounded wait: run_conversation() executes in the default executor
+            # thread which task.cancel() cannot preempt — we rely on the
+            # interrupt + kill_all above to break it. Cap the wait so a slow
+            # interrupt can't hang this handler. Shorter than /stop's 5s since
+            # the caller (FlagOps) also cancels its own stream locally.
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[api_server] force-stop for run %s timed out after 2s; "
+                    "agent may still be finishing the current step",
+                    run_id,
+                )
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        return web.json_response({"run_id": run_id, "status": "stopping"})
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -4298,6 +4391,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            self._app.router.add_post("/v1/runs/{run_id}/force-stop", self._handle_force_stop_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
