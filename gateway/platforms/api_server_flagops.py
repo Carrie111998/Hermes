@@ -1017,6 +1017,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         reasoning_callback=None,
+        step_callback=None,
         gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
@@ -1066,6 +1067,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
             reasoning_callback=reasoning_callback,
+            step_callback=step_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
@@ -3831,6 +3833,24 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Per-iteration progress. agent.step_callback fires at the top of each
+        # agent-loop turn (conversation_loop) with the running api_call_count;
+        # we surface it as a lightweight "iteration" event so external UIs can
+        # show "iteration N / max". max_iterations mirrors _create_agent's cap.
+        run_max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+
+        def _step_cb(api_call_count: int, prev_tools=None) -> None:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, {
+                    "event": "iteration",
+                    "run_id": run_id,
+                    "timestamp": time.time(),
+                    "iteration": api_call_count,
+                    "max_iterations": run_max_iterations,
+                })
+            except Exception:
+                pass
+
         self._set_run_status(
             run_id,
             "queued",
@@ -3848,6 +3868,7 @@ class APIServerFlagOpsAdapter(BasePlatformAdapter):
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
                     reasoning_callback=_reasoning_cb,
+                    step_callback=_step_cb,
                     gateway_session_key=gateway_session_key,
                 )
                 self._active_run_agents[run_id] = agent
