@@ -659,6 +659,28 @@ class TestResetBundledSkill:
             assert "google-workspace" not in _read_manifest()
             assert "user-edited" in (dest / "SKILL.md").read_text()
 
+    def test_reset_no_bundled_source_reports_no_bundled_action(self, tmp_path):
+        """A source-less tracked skill needs an honest, non-restore action."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "orphan-skill"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text(
+            "---\nname: orphan-skill\n---\n# Orphan\n"
+        )
+        manifest_file.write_text("orphan-skill:OLDHASH00000000000000000000000000\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = reset_bundled_skill("orphan-skill", restore=False)
+
+            assert result["ok"] is True
+            assert result["action"] == "manifest_cleared_no_bundled"
+            assert "no bundled source" in result["message"]
+            assert "reset --restore" not in result["message"]
+            assert "orphan-skill" not in _read_manifest()
+            assert "Orphan" in (dest / "SKILL.md").read_text()
+
     def test_reset_restore_succeeds_on_readonly_nix_tree(self, tmp_path):
         """#34972: --restore must succeed even when the user copy is a fully
         read-only tree (r-xr-xr-x dirs + files), as produced by copying a
