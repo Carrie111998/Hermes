@@ -27527,6 +27527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
+        from gateway.recall_scope import is_recall_gateway_platform
         from gateway.session_context import set_session_vars
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
@@ -27541,6 +27542,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
+            parent_chat_id=str(
+                getattr(context.source, "parent_chat_id", "") or ""
+            ),
+            prospective_thread_id=str(
+                getattr(context.source, "prospective_thread_id", "") or ""
+            ),
             chat_type=(
                 str(context.source.chat_type) if context.source.chat_type else ""
             ),
@@ -27551,10 +27558,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
+            gateway_context=is_recall_gateway_platform(context.source.platform),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -30823,7 +30832,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         When ``GATEWAY_PROXY_URL`` (or ``gateway.proxy_url`` in config.yaml)
         is set, the gateway becomes a thin relay: it handles platform I/O
         (encryption, threading, media) and delegates all agent work to the
-        remote server via ``POST /v1/chat/completions`` with SSE streaming.
+        remote server via the dedicated internal gateway-proxy route with SSE
+        streaming. Non-gateway/programmatic sources retain the ordinary
+        OpenAI endpoint and never acquire live gateway recall capability.
 
         This lets a Docker container handle Matrix E2EE while the actual
         agent runs on the host with full access to local files, memory,
@@ -30861,6 +30872,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             proxy_key = os.getenv("GATEWAY_PROXY_KEY", "").strip()
 
+        if not proxy_key:
+            return {
+                "final_response": (
+                    "⚠️ Gateway proxy mode requires GATEWAY_PROXY_KEY so the "
+                    "remote API can authenticate and preserve chat scope."
+                ),
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
+        try:
+            from gateway.recall_scope import (
+                GATEWAY_PROXY_CHAT_COMPLETIONS_PATH,
+                GATEWAY_PROXY_MARKER_HEADER,
+                GATEWAY_PROXY_ORIGIN_HEADER,
+                GATEWAY_PROXY_SESSION_KEY_HEADER,
+                encode_gateway_proxy_origin,
+                encode_gateway_proxy_session_key,
+                is_recall_gateway_platform,
+            )
+
+            is_native_gateway_source = is_recall_gateway_platform(source.platform)
+            if is_native_gateway_source and not session_id:
+                raise ValueError("gateway proxy session id is missing")
+            proxy_origin = None
+            proxy_session_key = None
+            proxy_path = "/v1/chat/completions"
+            if is_native_gateway_source:
+                proxy_origin = encode_gateway_proxy_origin(source.to_dict())
+                proxy_session_key = encode_gateway_proxy_session_key(session_key)
+                proxy_path = GATEWAY_PROXY_CHAT_COMPLETIONS_PATH
+        except (TypeError, ValueError) as exc:
+            return {
+                "final_response": f"⚠️ Gateway proxy context rejected: {exc}",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+            }
+
         def _run_still_current() -> bool:
             if run_generation is None or not session_key:
                 return True
@@ -30892,8 +30943,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # HTTP headers ---------------------------------------------------
         headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if proxy_key:
-            headers["Authorization"] = f"Bearer {proxy_key}"
+        headers["Authorization"] = f"Bearer {proxy_key}"
+        if proxy_origin is not None:
+            headers[GATEWAY_PROXY_MARKER_HEADER] = "1"
+            headers[GATEWAY_PROXY_ORIGIN_HEADER] = proxy_origin
+            headers[GATEWAY_PROXY_SESSION_KEY_HEADER] = proxy_session_key
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
 
@@ -30968,7 +31022,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _timeout = ClientTimeout(total=0, sock_read=1800)
             async with _AioClientSession(timeout=_timeout) as session:
                 async with session.post(
-                    f"{proxy_url}/v1/chat/completions",
+                    f"{proxy_url}{proxy_path}",
                     json=body,
                     headers=headers,
                 ) as resp:

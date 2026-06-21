@@ -74,6 +74,12 @@ def session_context_engaged() -> bool:
 _SESSION_PLATFORM: ContextVar = ContextVar("HERMES_SESSION_PLATFORM", default=_UNSET)
 _SESSION_SOURCE: ContextVar = ContextVar("HERMES_SESSION_SOURCE", default=_UNSET)
 _SESSION_CHAT_ID: ContextVar = ContextVar("HERMES_SESSION_CHAT_ID", default=_UNSET)
+_SESSION_PARENT_CHAT_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_PARENT_CHAT_ID", default=_UNSET
+)
+_SESSION_PROSPECTIVE_THREAD_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_PROSPECTIVE_THREAD_ID", default=_UNSET
+)
 _SESSION_CHAT_TYPE: ContextVar = ContextVar("HERMES_SESSION_CHAT_TYPE", default=_UNSET)
 _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=_UNSET)
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
@@ -135,6 +141,15 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Hidden, request-local trust marker for a live messaging-gateway turn.  This
+# is deliberately NOT inferred from ``agent.platform`` or a persisted session
+# source: a TUI/Desktop can resume a Telegram row without becoming Telegram,
+# while an authenticated gateway proxy executes through an api_server agent
+# but must retain its upstream chat recall boundary.
+_SESSION_GATEWAY_CONTEXT: ContextVar = ContextVar(
+    "HERMES_SESSION_GATEWAY_CONTEXT", default=_UNSET
+)
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -145,6 +160,8 @@ _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
     "HERMES_SESSION_CHAT_ID": _SESSION_CHAT_ID,
+    "HERMES_SESSION_PARENT_CHAT_ID": _SESSION_PARENT_CHAT_ID,
+    "HERMES_SESSION_PROSPECTIVE_THREAD_ID": _SESSION_PROSPECTIVE_THREAD_ID,
     "HERMES_SESSION_CHAT_TYPE": _SESSION_CHAT_TYPE,
     "HERMES_SESSION_CHAT_NAME": _SESSION_CHAT_NAME,
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
@@ -242,6 +259,9 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    parent_chat_id: str = "",
+    prospective_thread_id: str = "",
+    gateway_context: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -271,6 +291,8 @@ def set_session_vars(
         _SESSION_PLATFORM.set(platform),
         _SESSION_SOURCE.set(source),
         _SESSION_CHAT_ID.set(chat_id),
+        _SESSION_PARENT_CHAT_ID.set(parent_chat_id),
+        _SESSION_PROSPECTIVE_THREAD_ID.set(prospective_thread_id),
         _SESSION_CHAT_TYPE.set(chat_type),
         _SESSION_CHAT_NAME.set(chat_name),
         _SESSION_THREAD_ID.set(thread_id),
@@ -287,6 +309,7 @@ def set_session_vars(
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_GATEWAY_CONTEXT.set(bool(gateway_context)),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -312,6 +335,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_PLATFORM,
         _SESSION_SOURCE,
         _SESSION_CHAT_ID,
+        _SESSION_PARENT_CHAT_ID,
+        _SESSION_PROSPECTIVE_THREAD_ID,
         _SESSION_CHAT_TYPE,
         _SESSION_CHAT_NAME,
         _SESSION_THREAD_ID,
@@ -334,6 +359,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_GATEWAY_CONTEXT.set(False)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -382,6 +408,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_GATEWAY_CONTEXT.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -414,6 +441,67 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_bound_session_origin() -> dict[str, str] | None:
+    """Return the current task's bound routing origin without env fallback.
+
+    Gateway recall must distinguish "this task has no bound chat" from a
+    process-global ``HERMES_SESSION_*`` value left by another surface.  Reading
+    the ContextVars directly preserves that distinction: an unbound or cleared
+    task returns ``None``; a bound task returns only stable routing identifiers
+    (never names, topics, or message content).
+    """
+    platform = _SESSION_PLATFORM.get()
+    if platform is _UNSET or not str(platform or "").strip():
+        return None
+
+    def _value(var: ContextVar) -> str:
+        value = var.get()
+        if value is _UNSET or value is None:
+            return ""
+        return str(value)
+
+    return {
+        "platform": str(platform),
+        "chat_id": _value(_SESSION_CHAT_ID),
+        "parent_chat_id": _value(_SESSION_PARENT_CHAT_ID),
+        "prospective_thread_id": _value(_SESSION_PROSPECTIVE_THREAD_ID),
+        "chat_type": _value(_SESSION_CHAT_TYPE),
+        "thread_id": _value(_SESSION_THREAD_ID),
+        "user_id": _value(_SESSION_USER_ID),
+        "user_id_alt": _value(_SESSION_USER_ID_ALT),
+        "scope_id": _value(_SESSION_SCOPE_ID),
+        "profile": _value(_SESSION_PROFILE),
+    }
+
+
+def gateway_context_active() -> bool:
+    """Return whether this task is bound to a live messaging-gateway turn."""
+    return _SESSION_GATEWAY_CONTEXT.get() is True
+
+
+@contextmanager
+def scoped_gateway_context(active: bool) -> Iterator[None]:
+    """Temporarily set the live-gateway capability and restore it exactly.
+
+    Delegated children inherit the parent's ContextVars through
+    ``copy_context()`` but are historical non-gateway/global surfaces.  They
+    use this boundary before child construction/session binding so a copied
+    marker can never stay true beside the child's unrelated session id.
+    """
+    token = _SESSION_GATEWAY_CONTEXT.set(bool(active))
+    try:
+        yield
+    finally:
+        _SESSION_GATEWAY_CONTEXT.reset(token)
+
+
+def get_bound_gateway_origin() -> dict[str, str] | None:
+    """Return live gateway routing metadata only for a trusted gateway turn."""
+    if not gateway_context_active():
+        return None
+    return get_bound_session_origin()
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform

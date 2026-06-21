@@ -3,6 +3,7 @@ OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
+- POST /internal/gateway-proxy/v1/chat/completions — authenticated native gateway proxy ingress (mandatory origin + exact session key)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
@@ -59,7 +60,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -1969,6 +1970,208 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
+    def _single_gateway_proxy_header(
+        request: "web.Request", name: str
+    ) -> Optional[str]:
+        """Return one exact header value; reject missing or duplicate fields."""
+        headers = request.headers
+        getall = getattr(headers, "getall", None)
+        if callable(getall):
+            values = list(getall(name, []))
+        elif name in headers:
+            values = [headers.get(name)]
+        else:
+            values = []
+        if len(values) != 1 or not isinstance(values[0], str):
+            return None
+        return values[0]
+
+    def _parse_gateway_proxy_context(
+        self, request: "web.Request"
+    ) -> tuple[
+        Optional[dict[str, str]], Optional[str], Optional["web.Response"]
+    ]:
+        """Parse the mandatory context on the dedicated gateway-proxy route.
+
+        This parser is never called by the ordinary OpenAI route.  Route
+        dispatch therefore supplies the non-downgradeable caller identity:
+        missing or stripped proxy headers cannot turn a proxy request into a
+        profile-global API request.
+        """
+        from gateway.recall_scope import (
+            GATEWAY_PROXY_MARKER_HEADER,
+            GATEWAY_PROXY_ORIGIN_HEADER,
+            GATEWAY_PROXY_SESSION_KEY_HEADER,
+            canonical_recall_identity,
+            decode_gateway_proxy_origin,
+            decode_gateway_proxy_session_key,
+        )
+
+        marker = self._single_gateway_proxy_header(
+            request, GATEWAY_PROXY_MARKER_HEADER
+        )
+        encoded_origin = self._single_gateway_proxy_header(
+            request, GATEWAY_PROXY_ORIGIN_HEADER
+        )
+        encoded_session_key = self._single_gateway_proxy_header(
+            request, GATEWAY_PROXY_SESSION_KEY_HEADER
+        )
+        if marker != "1" or not encoded_origin or not encoded_session_key:
+            return None, None, web.json_response(
+                _openai_error(
+                    "Gateway proxy context is missing or malformed",
+                    code="gateway_proxy_context_invalid",
+                ),
+                status=400,
+            )
+        # _admit_api_agent_request already authenticated this request.  This
+        # additional key-presence guard keeps direct/manual handler wiring from
+        # treating the historical no-key test mode as an authenticated proxy.
+        if not self._expected_api_key():
+            return None, None, web.json_response(
+                _openai_error(
+                    "Gateway proxy context requires API key authentication",
+                    err_type="gateway_auth_error",
+                    code="gateway_proxy_auth_required",
+                ),
+                status=403,
+            )
+        try:
+            origin = decode_gateway_proxy_origin(encoded_origin)
+            session_key = decode_gateway_proxy_session_key(encoded_session_key)
+        except ValueError as exc:
+            return None, None, web.json_response(
+                _openai_error(str(exc), code="gateway_proxy_context_invalid"),
+                status=400,
+            )
+
+        identity = canonical_recall_identity(origin)
+        request_profile = (_api_request_profile.get() or "default").strip().lower()
+        if identity is None or identity.profile != request_profile:
+            return None, None, web.json_response(
+                _openai_error(
+                    "Gateway proxy context does not match the requested profile",
+                    code="gateway_proxy_profile_mismatch",
+                ),
+                status=409,
+            )
+        return origin, session_key, None
+
+    async def _verify_gateway_proxy_session_context(
+        self,
+        *,
+        session_id: str,
+        origin: Mapping[str, str],
+        session_key: str,
+    ) -> Optional["web.Response"]:
+        """Create or verify the durable proxy origin and exact session key."""
+        from gateway.recall_scope import canonical_recall_identity
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy scope could not open state.db",
+                    err_type="server_error",
+                    code="gateway_proxy_state_unavailable",
+                ),
+                status=503,
+            )
+
+        try:
+            existing = await asyncio.to_thread(db.get_session, session_id)
+            if not existing:
+                encoded = json.dumps(
+                    dict(origin), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                )
+
+                def _insert_if_absent(conn):
+                    cursor = conn.execute(
+                        """INSERT INTO sessions (
+                               id, source, user_id, session_key, chat_id,
+                               chat_type, thread_id, profile_name, origin_json,
+                               started_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(id) DO NOTHING""",
+                        (
+                            session_id,
+                            str(origin.get("platform") or ""),
+                            origin.get("user_id") or None,
+                            session_key,
+                            origin.get("chat_id") or None,
+                            origin.get("chat_type") or None,
+                            origin.get("thread_id") or None,
+                            origin.get("profile") or None,
+                            encoded,
+                            time.time(),
+                        ),
+                    )
+                    return cursor.rowcount == 1
+
+                # Atomic create-only semantics are load-bearing. A concurrent
+                # ordinary API request may claim the same id after the read
+                # above; COALESCE-upserting our origin onto that row would turn
+                # an ambiguous collision into a trusted gateway session.
+                if not hasattr(db, "_execute_write"):
+                    raise RuntimeError("SessionDB lacks atomic insert support")
+                await asyncio.to_thread(db._execute_write, _insert_if_absent)
+                existing = await asyncio.to_thread(db.get_session, session_id)
+        except Exception:
+            logger.exception(
+                "Gateway proxy could not establish durable origin for %s", session_id
+            )
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy scope could not be persisted",
+                    err_type="server_error",
+                    code="gateway_proxy_scope_persist_failed",
+                ),
+                status=503,
+            )
+
+        raw_durable = (existing or {}).get("origin_json")
+        try:
+            durable_origin = json.loads(raw_durable) if raw_durable else None
+        except (TypeError, ValueError):
+            durable_origin = None
+        live_identity = canonical_recall_identity(origin)
+        durable_identity = canonical_recall_identity(durable_origin)
+        if live_identity is None or durable_identity is None:
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy session has no unambiguous durable origin",
+                    code="gateway_proxy_scope_unavailable",
+                ),
+                status=409,
+            )
+        durable_session_key = (existing or {}).get("session_key")
+        if not isinstance(durable_session_key, str) or not durable_session_key:
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy session has no durable session key",
+                    code="gateway_proxy_session_key_unavailable",
+                ),
+                status=409,
+            )
+        if durable_session_key != session_key:
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy session key does not match the durable session",
+                    code="gateway_proxy_session_key_mismatch",
+                ),
+                status=409,
+            )
+        if live_identity != durable_identity:
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy context does not match the durable session origin",
+                    code="gateway_proxy_scope_mismatch",
+                ),
+                status=409,
+            )
+        return None
+
+    @staticmethod
     def _normalize_callback_platform(value: str) -> str:
         normalized = (value or "").strip().lower().replace("-", "_")
         if not re.fullmatch(r"[a-z0-9_]+", normalized):
@@ -2213,6 +2416,8 @@ class APIServerAdapter(BasePlatformAdapter):
         Kept as a method so multiplex tests can assert the /p/<profile>/
         mirrors without starting a real aiohttp listener.
         """
+        from gateway.recall_scope import GATEWAY_PROXY_CHAT_COMPLETIONS_PATH
+
         routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
@@ -2244,6 +2449,11 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            (
+                "POST",
+                GATEWAY_PROXY_CHAT_COMPLETIONS_PATH,
+                self._handle_gateway_proxy_chat_completions,
+            ),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -5166,10 +5376,41 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        return await self._handle_chat_completions_impl(
+            request, gateway_proxy_route=False
+        )
+
+    @_admit_api_agent_request
+    async def _handle_gateway_proxy_chat_completions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Dedicated authenticated ingress for native gateway proxy turns."""
+        return await self._handle_chat_completions_impl(
+            request, gateway_proxy_route=True
+        )
+
+    async def _handle_chat_completions_impl(
+        self,
+        request: "web.Request",
+        *,
+        gateway_proxy_route: bool,
+    ) -> "web.Response":
+        """Shared OpenAI payload handling after route identity is fixed."""
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
             return limited
+
+        gateway_proxy_origin: Optional[dict[str, str]] = None
+        gateway_proxy_session_key: Optional[str] = None
+        if gateway_proxy_route:
+            (
+                gateway_proxy_origin,
+                gateway_proxy_session_key,
+                proxy_context_err,
+            ) = self._parse_gateway_proxy_context(request)
+            if proxy_context_err is not None:
+                return proxy_context_err
 
         # Parse request body
         try:
@@ -5226,9 +5467,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # is independent of X-Hermes-Session-Id: the key persists across
         # transcripts while the id rotates when the caller starts a new
         # transcript (i.e. /new semantics).  See _parse_session_key_header.
-        gateway_session_key, key_err = self._parse_session_key_header(request)
-        if key_err is not None:
-            return key_err
+        if gateway_proxy_route:
+            # The dedicated protocol's encoded key is mandatory and exact.
+            # Never let the ordinary optional memory-scope header replace it.
+            gateway_session_key = gateway_proxy_session_key
+        else:
+            gateway_session_key, key_err = self._parse_session_key_header(request)
+            if key_err is not None:
+                return key_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
@@ -5238,6 +5484,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+        if gateway_proxy_route and not provided_session_id:
+            return web.json_response(
+                _openai_error(
+                    "Gateway proxy context requires X-Hermes-Session-Id",
+                    code="gateway_proxy_session_required",
+                ),
+                status=400,
+            )
         if provided_session_id:
             if not self._api_key:
                 logger.warning(
@@ -5269,6 +5523,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
+            if gateway_proxy_route:
+                assert gateway_proxy_origin is not None
+                assert gateway_session_key is not None
+                proxy_scope_err = await self._verify_gateway_proxy_session_context(
+                    session_id=session_id,
+                    origin=gateway_proxy_origin,
+                    session_key=gateway_session_key,
+                )
+                if proxy_scope_err is not None:
+                    return proxy_scope_err
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
@@ -5395,6 +5659,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                gateway_origin=gateway_proxy_origin,
                 **agent_overrides,
                 route=route,
             ))
@@ -5416,14 +5681,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                gateway_origin=gateway_proxy_origin,
                 **agent_overrides,
                 route=route,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
+            fingerprint_body = dict(body)
+            if gateway_proxy_origin is not None:
+                fingerprint_body["_hermes_gateway_origin"] = gateway_proxy_origin
             fp = _make_request_fingerprint(
-                body,
+                fingerprint_body,
                 keys=[
                     "model",
                     "provider",
@@ -5432,6 +5701,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tools",
                     "tool_choice",
                     "stream",
+                    "_hermes_gateway_origin",
                 ],
             )
             try:
@@ -7353,16 +7623,17 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
+        gateway_origin: Optional[Mapping[str, str]] = None,
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
         This is the SINGLE structural chokepoint every API-server agent-entry
-        path must use to seed session context — it hardwires
-        ``platform="api_server"`` and ``async_delivery=False`` so a new route
-        physically cannot reintroduce the silent-no-op bug (#10760) by
-        forgetting to mark the channel as non-delivering. There is no
-        ``async_delivery`` parameter to get wrong; the stateless HTTP path can
-        never wake the agent after the turn ends, on ANY route.
+        path must use to seed session context. Ordinary requests bind
+        ``platform="api_server"`` with no gateway marker. An authenticated
+        proxy request binds its verified upstream origin and hidden gateway
+        marker. Both hardwire ``async_delivery=False`` so a new route cannot
+        reintroduce the silent-no-op bug (#10760): the remote HTTP executor
+        itself can never wake the upstream gateway after the turn ends.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -7371,15 +7642,29 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         from gateway.session_context import set_session_vars
 
+        origin = dict(gateway_origin or {})
         return set_session_vars(
-            platform="api_server",
-            chat_id=chat_id,
+            platform=str(origin.get("platform") or "api_server"),
+            chat_id=str(origin.get("chat_id") or chat_id),
+            parent_chat_id=str(origin.get("parent_chat_id") or ""),
+            prospective_thread_id=str(
+                origin.get("prospective_thread_id") or ""
+            ),
+            chat_type=str(origin.get("chat_type") or ""),
+            thread_id=str(origin.get("thread_id") or ""),
+            user_id=str(origin.get("user_id") or ""),
+            user_id_alt=str(origin.get("user_id_alt") or ""),
+            scope_id=str(
+                origin.get("scope_id") or origin.get("guild_id") or ""
+            ),
+            profile=str(origin.get("profile") or ""),
             session_key=session_key,
             session_id=session_id,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
             cron_session="",
+            gateway_context=bool(origin),
         )
 
     async def _run_agent(
@@ -7404,6 +7689,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
         bind_declared_conversation: bool = False,
+        gateway_origin: Optional[Mapping[str, str]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7445,6 +7731,7 @@ class APIServerAdapter(BasePlatformAdapter):
         request_browser_control_transport_family = (
             _api_request_browser_control_transport_family.get()
         )
+        request_gateway_origin = dict(gateway_origin or {})
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -7458,6 +7745,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     browser_control_transport_family=(
                         request_browser_control_transport_family
                     ),
+                    gateway_origin=request_gateway_origin or None,
                 )
                 agent = None
                 try:

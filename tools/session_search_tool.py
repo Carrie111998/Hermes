@@ -37,6 +37,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
+from gateway.recall_scope import RecallIdentity, canonical_recall_identity
 from hermes_state_common import _RESET_END_REASONS
 
 # Sources that are excluded from session browsing/searching by default.
@@ -72,6 +73,102 @@ _DISCOVER_SEARCH_FIELDS = (
     "model",
     "session_started",
 )
+
+
+def _current_recall_scope(
+    *,
+    db,
+    current_session_id: Optional[str],
+) -> RecallIdentity:
+    """Resolve and verify the current gateway chat scope, or fail closed."""
+    try:
+        from gateway.session_context import get_bound_gateway_origin
+
+        bound_origin = get_bound_gateway_origin()
+    except Exception:
+        bound_origin = None
+
+    if not current_session_id:
+        raise ValueError("current chat scope is unavailable: no current session id")
+
+    live_scope = canonical_recall_identity(bound_origin)
+    if live_scope is None:
+        raise ValueError("current chat scope is unavailable or malformed")
+
+    try:
+        current_meta = db.get_session(current_session_id) or {}
+    except Exception as exc:
+        raise ValueError(
+            "current chat scope could not be resolved from state.db"
+        ) from exc
+    raw_origin = current_meta.get("origin_json")
+    if not isinstance(raw_origin, str) or not raw_origin.strip():
+        raise ValueError("current chat scope is unavailable in state.db")
+    try:
+        durable_origin = json.loads(raw_origin)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("current chat scope is malformed in state.db") from exc
+    durable_scope = canonical_recall_identity(durable_origin)
+    if durable_scope is None:
+        raise ValueError("current chat scope is incomplete in state.db")
+    if durable_scope != live_scope:
+        raise ValueError("current chat scope does not match the active session")
+    return durable_scope
+
+
+def _scope_for_call(
+    *,
+    scope: Optional[str],
+    db,
+    current_session_id: Optional[str],
+) -> Optional[RecallIdentity]:
+    """Resolve model-visible scope into an internal SQL recall filter."""
+    scope_value = str(scope).strip().lower() if isinstance(scope, str) else ""
+    if scope_value not in {"", "current", "all"}:
+        raise ValueError("scope must be one of: current, all")
+    if scope_value == "all":
+        return None
+    try:
+        from gateway.session_context import gateway_context_active
+
+        is_gateway_context = gateway_context_active()
+    except Exception:
+        is_gateway_context = False
+    if not is_gateway_context:
+        if scope_value == "current":
+            raise ValueError(
+                "scope='current' is unavailable outside a live messaging gateway"
+            )
+        return None
+    return _current_recall_scope(
+        db=db,
+        current_session_id=current_session_id,
+    )
+
+
+def _scope_label(recall_scope: Optional[RecallIdentity]) -> str:
+    return "current" if recall_scope else "all"
+
+
+def _scope_error(session_id: str) -> str:
+    return (
+        f"session_id {session_id} is outside the current chat scope. "
+        "Pass scope='all' only when the user explicitly wants profile-wide history."
+    )
+
+
+def _session_matches_scope(
+    db,
+    session_id: str,
+    recall_scope: Optional[RecallIdentity],
+) -> bool:
+    if not recall_scope:
+        return True
+    try:
+        return bool(db.session_matches_recall_scope(session_id, recall_scope))
+    except Exception:
+        return False
+
 
 # Prefixes that identify generated context-compaction handoff summaries.
 # These are inserted by agent/context_compressor.py as normal user/assistant
@@ -366,6 +463,72 @@ def _resolve_profile_db(profile: str):
     return SessionDB(db_path=profiles_mod.get_profile_dir(canon) / "state.db", read_only=True)
 
 
+def _active_profile_home(db):
+    """Return the home proven by the active SessionDB, or the bound home."""
+    from pathlib import Path
+
+    db_path = getattr(db, "db_path", None)
+    if db_path:
+        try:
+            return Path(db_path).expanduser().resolve(strict=False).parent
+        except Exception:
+            pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home().expanduser().resolve(strict=False)
+    except Exception as exc:
+        raise ValueError("active profile home is unavailable") from exc
+
+
+def _profile_targets_active_db(
+    profile: str,
+    *,
+    db,
+    current_session_id: Optional[str],
+) -> bool:
+    """Prove whether a target profile is the DB already bound to this call.
+
+    On a live gateway, both the live/durable recall identity and the physical
+    profile home must agree.  A failure to prove that relationship is an
+    error, never an implicit cross-profile transition.
+    """
+    from hermes_cli import profiles as profiles_mod
+
+    active_home = _active_profile_home(db)
+    target_home = profiles_mod.get_profile_dir(profile).expanduser().resolve(
+        strict=False
+    )
+    try:
+        from gateway.session_context import gateway_context_active
+
+        is_gateway_context = gateway_context_active()
+    except Exception:
+        is_gateway_context = False
+
+    if not is_gateway_context:
+        return active_home == target_home
+
+    active_scope = _current_recall_scope(
+        db=db,
+        current_session_id=current_session_id,
+    )
+    active_profile_home = profiles_mod.get_profile_dir(
+        active_scope.profile
+    ).expanduser().resolve(strict=False)
+    if active_profile_home != active_home:
+        raise ValueError(
+            "active profile does not match the verified gateway session home"
+        )
+    target_matches_home = target_home == active_home
+    target_matches_origin = profile == active_scope.profile
+    if target_matches_home != target_matches_origin:
+        raise ValueError(
+            "target profile does not match the verified gateway session profile"
+        )
+    return target_matches_home
+
+
 def _session_link(session_id: str, profile: str = None) -> str:
     """The reference the agent writes to point the user at a session.
 
@@ -432,7 +595,14 @@ def _locate_session_db(session_id: str):
     return None, None
 
 
-def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_profile: str = None) -> str:
+def _read_session(
+    db,
+    session_id: str,
+    head: int = 20,
+    tail: int = 10,
+    link_profile: str = None,
+    recall_scope: Optional[RecallIdentity] = None,
+) -> str:
     """Read shape: dump a whole session by id (head + tail when large).
 
     Serves the linked-session case — the user dropped an @session reference and
@@ -447,6 +617,8 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
         meta = {}
     if not meta:
         return tool_error(f"session_id not found: {session_id}", success=False)
+    if not _session_matches_scope(db, session_id, recall_scope):
+        return tool_error(_scope_error(session_id), success=False)
 
     try:
         rows = db.get_messages(session_id)
@@ -462,6 +634,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     response = {
         "success": True,
         "mode": "read",
+        "scope": _scope_label(recall_scope),
         "session_id": session_id,
         "link": _session_link(session_id, link_profile),
         "session_meta": {
@@ -482,7 +655,13 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
     return json.dumps(response, ensure_ascii=False)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_profile: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    link_profile: str = None,
+    recall_scope: Optional[RecallIdentity] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls, no FTS5)."""
     try:
         # list_sessions_rich (include_children=False) already applies the
@@ -496,6 +675,7 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             limit=limit + 15,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             order_by_last_active=True,
+            recall_scope=recall_scope,
         )  # fetch extra so we can skip current / compression roots
 
         current_root, has_compression_hop = (
@@ -527,13 +707,21 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None, link_p
             if len(results) >= limit:
                 break
 
-        return json.dumps({
-            "success": True,
-            "mode": "browse",
-            "results": results,
-            "count": len(results),
-            "message": f"Showing {len(results)} most recent sessions. Pass a query= to search, or session_id+around_message_id to scroll.",
-        }, ensure_ascii=False)
+        return json.dumps(
+            {
+                "success": True,
+                "mode": "browse",
+                "scope": _scope_label(recall_scope),
+                "results": results,
+                "count": len(results),
+                "message": (
+                    f"Showing {len(results)} most recent sessions"
+                    + (" in the current chat scope" if recall_scope else "")
+                    + ". Pass a query= to search, or session_id+around_message_id to scroll."
+                ),
+            },
+            ensure_ascii=False,
+        )
     except Exception as e:
         logging.error("Error listing recent sessions: %s", e, exc_info=True)
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
@@ -545,6 +733,7 @@ def _scroll(
     around_message_id: int,
     window: int = 5,
     current_session_id: str = None,
+    recall_scope: Optional[RecallIdentity] = None,
 ) -> str:
     """Scroll shape: return a window of messages centered on an anchor.
 
@@ -569,6 +758,9 @@ def _scroll(
             window = 5
     window = max(1, min(window, 20))
 
+    if not _session_matches_scope(db, session_id, recall_scope):
+        return tool_error(_scope_error(session_id), success=False)
+
     # Locate the anchor before applying the current-lineage guard. Discovery
     # intentionally surfaces same-lineage history that is no longer in live
     # context: in-place compacted rows, compression-ended parents, and
@@ -578,6 +770,10 @@ def _scroll(
     owning_session_id = (
         anchor_state.get("session_id") if anchor_state is not None else None
     )
+    if owning_session_id and not _session_matches_scope(
+        db, owning_session_id, recall_scope
+    ):
+        return tool_error(_scope_error(owning_session_id), success=False)
 
     if current_session_id:
         anchor_session_id = owning_session_id or session_id
@@ -658,6 +854,7 @@ def _scroll(
     response = {
         "success": True,
         "mode": "scroll",
+        "scope": _scope_label(recall_scope),
         "session_id": session_id,
         "around_message_id": around_message_id,
         "session_meta": {
@@ -691,6 +888,7 @@ def _title_match_result(
     db,
     query: str,
     current_lineage_root: Optional[str],
+    recall_scope: Optional[RecallIdentity] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a discovery-shaped result when the query matches a session title."""
     title_query = _normalize_title_query(query)
@@ -704,8 +902,16 @@ def _title_match_result(
         return None
     if not session_id:
         return None
+    if not _session_matches_scope(db, session_id, recall_scope):
+        return None
 
     lineage_root = _resolve_lineage(db, session_id)
+    if (
+        recall_scope
+        and lineage_root != session_id
+        and not _session_matches_scope(db, lineage_root, recall_scope)
+    ):
+        return None
     if current_lineage_root and lineage_root == current_lineage_root:
         # Same-lineage title hits are in-context only when the session is
         # still live. /new-reset and compression-ended parents are not.
@@ -767,11 +973,17 @@ def _discover(
     detail: str,
     current_session_id: str = None,
     link_profile: str = None,
+    recall_scope: Optional[RecallIdentity] = None,
 ) -> str:
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
-    title_result = _title_match_result(db, query, current_lineage_root)
+    title_result = _title_match_result(
+        db,
+        query,
+        current_lineage_root,
+        recall_scope=recall_scope,
+    )
 
     try:
         raw_results = db.search_messages(
@@ -784,6 +996,7 @@ def _discover(
             offset=0,
             sort=sort,
             fields=_DISCOVER_SEARCH_FIELDS,
+            recall_scope=recall_scope,
         )
     except Exception as e:
         logging.error("FTS5 search failed: %s", e, exc_info=True)
@@ -799,6 +1012,7 @@ def _discover(
         _empty_payload = {
             "success": True,
             "mode": "discover",
+            "scope": _scope_label(recall_scope),
             "query": query,
             "detail": detail,
             "results": [],
@@ -829,6 +1043,14 @@ def _discover(
             break
         raw_sid = r["session_id"]
         resolved_sid, _ = _resolve_to_parent(db, raw_sid)
+        if (
+            recall_scope
+            and resolved_sid != raw_sid
+            and not _session_matches_scope(db, resolved_sid, recall_scope)
+        ):
+            # Never borrow title/model/bookend metadata from a lineage root
+            # whose durable origin cannot prove it belongs to this chat.
+            continue
         # Skip the current session lineage — UNLESS the hit's transcript has
         # left live context. Three sub-cases:
         #
@@ -933,6 +1155,7 @@ def _discover(
     _final_payload = {
         "success": True,
         "mode": "discover",
+        "scope": _scope_label(recall_scope),
         "query": query,
         "detail": detail,
         "results": results,
@@ -966,6 +1189,8 @@ def _session_search_impl(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    # Gateway recall scope (public opt-out + hidden runtime identity)
+    scope: str = None,
     *,
     _owned_dbs: Optional[List[Any]] = None,
 ) -> str:
@@ -976,9 +1201,10 @@ def _session_search_impl(
     Read:      pass ``session_id`` (no anchor) — dumps the whole session.
     Browse:    pass nothing.
 
-    Pass ``profile`` to read another profile's sessions (e.g. resolving an
-    ``@session:<profile>/<id>`` link). Scroll wins over read/discovery when an
-    anchor is set — the agent has asked for a specific slice.
+    Pass ``profile`` with an exact ``session_id`` to resolve another profile's
+    linked session. Cross-profile query/browse additionally requires explicit
+    ``scope="all"``. Scroll wins over read/discovery when an anchor is set —
+    the agent has asked for a specific slice.
     """
     # Normalise a raw `@session:<profile>/<id>` link value passed as session_id.
     # Session ids never contain "/", so a slash unambiguously means profile/id —
@@ -992,19 +1218,82 @@ def _session_search_impl(
             if emb_profile and (profile is None or not str(profile).strip()):
                 profile = emb_profile
 
-    # Cross-profile read: swap in the named profile's DB (read-only) for every
-    # shape below. The current-session-lineage guards no longer apply across
-    # profiles, but they key off ids that won't collide, so they stay inert.
-    if profile is not None and str(profile).strip():
+    has_exact_target = isinstance(session_id, str) and bool(session_id.strip())
+    profile_name = str(profile).strip() if profile is not None else ""
+    if profile_name:
         try:
-            profile_db = _resolve_profile_db(profile)
-        except Exception as e:
-            return tool_error(f"profile '{profile}': {e}", success=False)
+            from hermes_cli import profiles as profiles_mod
+
+            profile_name = profiles_mod.normalize_profile_name(profile_name)
+            profiles_mod.validate_profile_name(profile_name)
+        except Exception as exc:
+            return tool_error(f"profile '{profile_name}': {exc}", success=False)
+        profile = profile_name
+    scope_value = str(scope).strip().lower() if isinstance(scope, str) else ""
+    if scope_value not in {"", "current", "all"}:
+        return tool_error("scope must be one of: current, all", success=False)
+    if profile_name and not has_exact_target and scope_value == "current":
+        return tool_error(
+            "scope='current' cannot be combined with profile; use an exact "
+            "session_id without current scope, or scope='all' for profile-wide search",
+            success=False,
+        )
+    if profile_name and not has_exact_target and scope_value != "all":
+        return tool_error(
+            "profile query/browse requires explicit scope='all'",
+            success=False,
+        )
+
+    cross_profile_exact = False
+    open_target_profile = bool(profile_name)
+    if profile_name and has_exact_target:
+        try:
+            target_is_active = _profile_targets_active_db(
+                profile_name,
+                db=db,
+                current_session_id=current_session_id,
+            )
+        except ValueError as exc:
+            return tool_error(str(exc), success=False)
+        if target_is_active:
+            open_target_profile = False
+        else:
+            cross_profile_exact = True
+            if scope_value == "current":
+                return tool_error(
+                    "scope='current' cannot cross profiles",
+                    success=False,
+                )
+
+    # Actually different exact targets retain the linked-session transition.
+    # Query/browse with explicit all may also select a named DB.  A same-profile
+    # exact target stays on the already-bound DB so current scope remains live.
+    if open_target_profile:
+        try:
+            profile_db = _resolve_profile_db(profile_name)
+        except Exception as exc:
+            return tool_error(f"profile '{profile_name}': {exc}", success=False)
         if profile_db is not None:
             db = profile_db
             if _owned_dbs is not None:
                 _owned_dbs.append(profile_db)
             current_session_id = None
+
+    if cross_profile_exact:
+        # An exact linked-session target is the only implicit cross-profile
+        # transition.  Query/browse required explicit all above, and explicit
+        # current was rejected.  Do not try to compare the active chat's
+        # durable origin against another profile's state.db.
+        recall_scope = None
+    else:
+        try:
+            recall_scope = _scope_for_call(
+                scope=scope,
+                db=db,
+                current_session_id=current_session_id,
+            )
+        except ValueError as exc:
+            return tool_error(str(exc), success=False)
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -1014,19 +1303,27 @@ def _session_search_impl(
             around_message_id=around_message_id,
             window=window,
             current_session_id=current_session_id,
+            recall_scope=recall_scope,
         )
 
     # Read shape: a session_id with no anchor → dump the whole session.
     if isinstance(session_id, str) and session_id.strip():
         sid = session_id.strip()
-        result = _read_session(db, sid, link_profile=profile)
+        result = _read_session(
+            db,
+            sid,
+            link_profile=profile,
+            recall_scope=recall_scope,
+        )
         if json.loads(result).get("success"):
             return result
 
         # Miss in the target profile — the model may have dropped the owning
         # profile from the link. Scan every profile and read it from wherever
         # it lives, tagging the profile it was found in.
-        located, owner = _locate_session_db(sid)
+        located, owner = (None, None)
+        if recall_scope is None:
+            located, owner = _locate_session_db(sid)
         if located is not None:
             try:
                 found = json.loads(_read_session(located, sid, link_profile=owner))
@@ -1047,7 +1344,13 @@ def _session_search_impl(
 
     # Browse shape: no query → recent sessions.
     if not query or not isinstance(query, str) or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id, link_profile=profile)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            link_profile=profile,
+            recall_scope=recall_scope,
+        )
 
     # Parse role_filter
     role_list: Optional[List[str]] = None
@@ -1076,6 +1379,7 @@ def _session_search_impl(
         detail=detail_norm,
         current_session_id=current_session_id,
         link_profile=profile,
+        recall_scope=recall_scope,
     )
 
 
@@ -1095,6 +1399,8 @@ def session_search(
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    # Gateway defaults to current chat; explicit all opts out.
+    scope: str = None,
 ) -> str:
     """Run session search and close databases opened by this invocation."""
     owned_dbs: List[Any] = []
@@ -1123,6 +1429,7 @@ def session_search(
             sort=sort,
             profile=profile,
             detail=detail,
+            scope=scope,
             _owned_dbs=owned_dbs,
         )
     finally:
@@ -1156,8 +1463,10 @@ SESSION_SEARCH_SCHEMA = {
         "Searches conversation history ONLY — when the user gave a direct "
         "source (URL, file, contact, live system), inspect that first; never "
         "conclude 'not found' from history alone. Use for questions about past "
-        "conversations: 'what did we do about X', 'where did we leave Y'. When "
-        "referring the user to a session, write its `link` value verbatim "
+        "conversations: 'what did we do about X', 'where did we leave Y'. In "
+        "messaging gateways, omitted scope searches only the current chat or "
+        "thread; use `scope='all'` only for an explicit global-history request. "
+        "When referring the user to a session, write its `link` value verbatim "
         "inline (it renders as a titled link)."
     ),
     "parameters": {
@@ -1234,13 +1543,26 @@ SESSION_SEARCH_SCHEMA = {
                     "behaviour) or 'tool' to search tool output only."
                 ),
             },
+            "scope": {
+                "type": "string",
+                "enum": ["current", "all"],
+                "description": (
+                    "Optional. Messaging gateways default to the current chat/thread. "
+                    "Set to 'all' only when the user explicitly requests profile-wide "
+                    "or global history. CLI, TUI, desktop, and API sessions retain "
+                    "their global default."
+                ),
+            },
             "profile": {
                 "type": "string",
                 "description": (
-                    "Optional. Read sessions from another Hermes profile's database "
-                    "(read-only). Use when resolving an `@session:<profile>/<id>` link: "
-                    "pass the profile segment here with session_id as the id segment. "
-                    "Omit to use the current profile."
+                    "Optional. Read/scroll an exact session in another Hermes profile's "
+                    "database (read-only). Use when resolving an "
+                    "`@session:<profile>/<id>` link: pass the profile segment here with "
+                    "session_id as the id segment. Cross-profile query/browse requires "
+                    "explicit scope='all'. An exact target may use current scope only "
+                    "when profile names the already active profile; a different profile "
+                    "is a cross-profile read. Omit to use the current profile."
                 ),
             },
         },
@@ -1265,6 +1587,7 @@ registry.register(
         window=args.get("window", 5),
         sort=args.get("sort"),
         detail=args.get("detail", "adaptive"),
+        scope=args.get("scope"),
         profile=args.get("profile"),
         db=kw.get("db"),
         current_session_id=kw.get("current_session_id"),

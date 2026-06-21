@@ -130,7 +130,12 @@ class SessionPortabilityMixin:
             runs.append(s)
         return runs
 
-    def _get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> Optional[Dict[str, Any]]:
+    def _get_session_rich_row(
+        self,
+        session_id: str,
+        compact_rows: bool = False,
+        recall_scope: object = None,
+    ) -> Optional[Dict[str, Any]]:
         """Fetch a single session with the same enriched columns as
         ``list_sessions_rich`` (preview + last_active). Returns None if the
         session doesn't exist.
@@ -142,11 +147,16 @@ class SessionPortabilityMixin:
         SELECT lives in exactly one place.
         """
         return self._get_session_rich_rows_batch(
-            [session_id], compact_rows=compact_rows
+            [session_id],
+            compact_rows=compact_rows,
+            recall_scope=recall_scope,
         ).get(session_id)
 
     def _get_session_rich_rows_batch(
-        self, session_ids, compact_rows: bool = False
+        self,
+        session_ids,
+        compact_rows: bool = False,
+        recall_scope: object = None,
     ) -> Dict[str, Dict[str, Any]]:
         """Fetch multiple sessions with the same enriched columns as
         ``_get_session_rich_row``, in a single query.
@@ -171,7 +181,9 @@ class SessionPortabilityMixin:
             for start in range(0, len(ids), _CHUNK):
                 result.update(
                     self._get_session_rich_rows_batch(
-                        ids[start:start + _CHUNK], compact_rows=compact_rows
+                        ids[start:start + _CHUNK],
+                        compact_rows=compact_rows,
+                        recall_scope=recall_scope,
                     )
                 )
             return result
@@ -179,6 +191,8 @@ class SessionPortabilityMixin:
         self.flush_token_counts()
         _sel = self._compact_session_cols() if compact_rows else "s.*"
         placeholders = ",".join("?" for _ in ids)
+        scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+        scope_clause = f" AND {scope_sql}" if scope_sql else ""
         prompt_select = (
             "" if compact_rows
             else ", COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved"
@@ -200,10 +214,10 @@ class SessionPortabilityMixin:
                 {_sql_session_last_active("s")} AS last_active
             FROM sessions s
             {prompt_join}
-            WHERE s.id IN ({placeholders})
+            WHERE s.id IN ({placeholders}){scope_clause}
         """
         with self._lock:
-            cursor = self._conn.execute(query, ids)
+            cursor = self._conn.execute(query, [*ids, *scope_params])
             rows = cursor.fetchall()
         result: Dict[str, Dict[str, Any]] = {}
         for row in rows:
@@ -212,14 +226,23 @@ class SessionPortabilityMixin:
             result[s["id"]] = s
         return result
 
-    def get_session_rich_row(self, session_id: str, compact_rows: bool = False) -> Optional[Dict[str, Any]]:
+    def get_session_rich_row(
+        self,
+        session_id: str,
+        compact_rows: bool = False,
+        recall_scope: object = None,
+    ) -> Optional[Dict[str, Any]]:
         """Public wrapper for :meth:`_get_session_rich_row`.
 
         Exposes the single-session enriched row (same columns as
         ``list_sessions_rich``: preview + last_active) for callers outside
         this module, e.g. the web server's session-search hydration.
         """
-        return self._get_session_rich_row(session_id, compact_rows=compact_rows)
+        return self._get_session_rich_row(
+            session_id,
+            compact_rows=compact_rows,
+            recall_scope=recall_scope,
+        )
 
     def list_skill_scaffolded_sessions(self, limit: int = 200) -> List[Dict[str, Any]]:
         """Titled sessions whose first user turn was a ``/skill`` invocation.

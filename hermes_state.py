@@ -11801,7 +11801,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_chain(self, session_id: str) -> List[str]:
+    def get_compression_chain(
+        self,
+        session_id: str,
+        recall_scope: object = None,
+    ) -> List[str]:
         """Walk the compression-continuation chain forward and return every id.
 
         Root-first order, ending at the tip; ``[session_id]`` when no
@@ -11827,6 +11831,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Returns the latest continuation tip, or the input id when no
         continuation exists.
         """
+        if recall_scope and not self.session_matches_recall_scope(
+            session_id, recall_scope
+        ):
+            return []
+        child_scope_sql, child_scope_params = self._recall_scope_sql(
+            "child", recall_scope
+        )
+        child_scope_clause = (
+            f" AND {child_scope_sql}" if child_scope_sql else ""
+        )
         current = session_id
         chain = [current] if current else []
         seen = {current} if current else set()
@@ -11844,6 +11858,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {child_scope_clause}
                     ORDER BY
                       CASE
                         WHEN child.end_reason = 'compression' THEN 0
@@ -11855,7 +11870,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       child.id DESC
                     LIMIT 1
                     """,
-                    (current,),
+                    (current, *child_scope_params),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -11868,12 +11883,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             chain.append(child_id)
         return chain
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self,
+        session_id: str,
+        recall_scope: object = None,
+    ) -> Optional[str]:
         """The live tip of a compression-continuation chain (see
         ``get_compression_chain`` for the walk's semantics). Returns the input
-        id when no continuation exists."""
-        chain = self.get_compression_chain(session_id)
-        return chain[-1] if chain else session_id
+        id when no continuation exists, or ``None`` when ``recall_scope`` does
+        not cover ``session_id`` (fail closed for scoped callers)."""
+        chain = self.get_compression_chain(session_id, recall_scope=recall_scope)
+        if not chain:
+            return None
+        return chain[-1]
 
     # Columns excluded from compact_rows projections: only the payload-heavy
     # blob no list consumer renders. Everything else — including gateway
@@ -11935,6 +11957,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_pinned: bool = False,
         session_key: str = None,
         include_hidden: bool = False,
+        recall_scope: object = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -11989,6 +12012,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Pass ``session_key`` to restrict results to one stable gateway
         conversation scope (DM, group, channel, or thread, including the
         configured per-user isolation policy).
+
+        Pass ``recall_scope`` to restrict results to the current logical
+        gateway chat/thread across per-user session keys.  Rows without valid
+        durable ``origin_json`` are excluded rather than guessed into scope.
         """
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
@@ -12022,6 +12049,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if session_key:
             where_clauses.append("s.session_key = ?")
             params.append(session_key)
+        scope_sql, scope_params = self._recall_scope_sql("s", recall_scope)
+        if scope_sql:
+            where_clauses.append(scope_sql)
+            params.extend(scope_params)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
@@ -12078,6 +12109,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # ended_at is written, while stale websocket siblings may satisfy
             # the timestamp test and hijack resume/list projection.
             outer_where = where_sql
+            chain_child_scope_sql, chain_child_scope_params = (
+                self._recall_scope_sql("child", recall_scope)
+            )
+            chain_child_scope_clause = (
+                f" AND {chain_child_scope_sql}"
+                if chain_child_scope_sql
+                else ""
+            )
             id_params: List[Any] = []
             filter_clauses: List[str] = []
 
@@ -12137,6 +12176,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
                       AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
                       AND COALESCE(child.source, '') != 'tool'
+                      {chain_child_scope_clause}
                 ),
                 chain_max AS (
                     SELECT
@@ -12165,7 +12205,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             """
             # WHERE params apply twice (CTE seed + outer select); the id filter
             # only applies to the outer select.
-            params = params + params + id_params + [limit, offset]
+            params = (
+                params
+                + chain_child_scope_params
+                + params
+                + id_params
+                + [limit, offset]
+            )
         else:
             _sel = self._compact_session_cols() if compact_rows else "s.*"
             query = f"""
@@ -12255,15 +12301,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             for s in sessions:
                 if s.get("end_reason") != "compression":
                     continue
-                chain = self.get_compression_chain(s["id"])
-                tip_id = chain[-1] if chain else s["id"]
+                chain = self.get_compression_chain(
+                    s["id"], recall_scope=recall_scope
+                )
+                if not chain:
+                    # Root is outside the recall scope — a scoped listing must
+                    # not see or leak its continuation tip.
+                    continue
+                tip_id = chain[-1]
                 if tip_id != s["id"]:
                     tip_ids_by_root[s["id"]] = tip_id
                     chain_by_root[s["id"]] = chain
 
             tip_rows = (
                 self._get_session_rich_rows_batch(
-                    set(tip_ids_by_root.values()), compact_rows=compact_rows
+                    set(tip_ids_by_root.values()),
+                    compact_rows=compact_rows,
+                    recall_scope=recall_scope,
                 )
                 if tip_ids_by_root
                 else {}
