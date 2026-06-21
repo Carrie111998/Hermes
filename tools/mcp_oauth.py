@@ -377,8 +377,8 @@ def _make_callback_handler() -> tuple[type, dict]:
             self.end_headers()
             self.wfile.write(body.encode())
 
-        def log_message(self, fmt: str, *args: Any) -> None:
-            logger.debug("OAuth callback: %s", fmt % args)
+        def log_message(self, format: str, *args: Any) -> None:
+            logger.debug("OAuth callback: %s", format % args)
 
     return _Handler, result
 

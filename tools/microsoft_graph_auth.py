@@ -126,6 +126,7 @@ class MicrosoftGraphTokenProvider:
         **kwargs: Any,
     ) -> "MicrosoftGraphTokenProvider":
         credentials = GraphCredentials.from_env(environ)
+        assert credentials is not None
         return cls(credentials, **kwargs)
 
     def clear_cache(self) -> None:

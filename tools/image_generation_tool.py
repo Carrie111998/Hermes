@@ -440,6 +440,7 @@ class _ManagedFalSyncClient:
         self._raise_for_status(response)
 
         data = response.json()
+        assert self._request_handle_class is not None
         return self._request_handle_class(
             request_id=data["request_id"],
             response_url=data["response_url"],
@@ -476,6 +477,7 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
+        assert fal_client is not None
         return fal_client.submit(model, arguments=arguments, headers=request_headers)
 
     managed_client = _get_managed_fal_client(managed_gateway)
@@ -901,7 +903,7 @@ if __name__ == "__main__":
     print("✅ FAL.ai API key found")
 
     try:
-        import fal_client  # noqa: F401
+        import fal_client  # type: ignore[import-unresolved] # noqa: F401
         print("✅ fal_client library available")
     except ImportError:
         print("❌ fal_client library not found — pip install fal-client")

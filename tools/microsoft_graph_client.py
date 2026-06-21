@@ -67,6 +67,7 @@ class MicrosoftGraphClient:
     @classmethod
     def from_env(cls, **kwargs: Any) -> "MicrosoftGraphClient":
         credentials = GraphCredentials.from_env()
+        assert credentials is not None
         provider = MicrosoftGraphTokenProvider(credentials)
         return cls(provider, **kwargs)
 
