@@ -409,6 +409,7 @@ export const en: Translations = {
       checkNow: 'Check now',
       checking: 'Checking…',
       seeWhatsNew: "See what's new",
+      updateNow: 'Update now',
       releaseNotes: 'Release notes',
       onLatest: "You're on the latest version.",
       installing: 'An update is currently installing.',
