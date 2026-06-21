@@ -7177,8 +7177,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     messages=list(self.conversation_history or []),
                     config_context_length=getattr(self.agent, "_config_context_length", None),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
 
         old_model = self.model
         self.model = result.new_model
@@ -7456,8 +7456,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     messages=list(self.conversation_history or []),
                     config_context_length=getattr(self.agent, "_config_context_length", None),
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
 
         if not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
