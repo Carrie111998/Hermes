@@ -81,8 +81,8 @@ platforms:
   # WeChat personal account via Tencent iLink Bot API.
   # Run the QR wizard once to bind the bot to your WeChat account:
   #   docker compose -f docker-compose.upstream.yml run --rm hermes-gateway \
-  #       hermes gateway setup weixin
-  # Credentials are saved to ~/.hermes/weixin_accounts/<account_id>.json by the
+  #       hermes gateway setup
+  # Credentials are saved to ~/.hermes/weixin/accounts/<account_id>.json by the
   # wizard — no further config needed here. Set dm_policy / group_policy below
   # to restrict who can talk to the bot.
   weixin:

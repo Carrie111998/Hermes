@@ -99,7 +99,7 @@ Focus on:
 - config bootstrap problems or entrypoint drift when startup behavior is under discussion;
 - missing env vars or permission errors;
 - port binding conflicts;
-- WeChat gateway stuck on first poll — verify `data/weixin_accounts/` exists and contains a JSON credential file. If empty, run the wizard (the `setup` subcommand opens a menu — select `Weixin / WeChat`, item 13):
+- WeChat gateway stuck on first poll — verify `data/weixin/accounts/` exists and contains a JSON credential file. If empty, run the wizard (the `setup` subcommand opens a menu — select `Weixin / WeChat`, item 13):
   ```bash
   docker compose -f docker-compose.upstream.yml run --rm hermes-gateway \
       hermes gateway setup
@@ -118,7 +118,7 @@ Validate these expectations:
 
 The weixin adapter uses outbound long-poll to Tencent iLink — there is no host port to `curl`. Use this four-level sequence instead, cheapest first.
 
-**Level 1 — Container healthcheck (5s).** The compose healthcheck probes for `data/weixin_accounts/` directory existence. If `healthy`, the wizard has run at least once.
+**Level 1 — Container healthcheck (5s).** The compose healthcheck probes for `data/weixin/accounts/` directory existence. If `healthy`, the wizard has run at least once.
 
 ```bash
 docker compose -f docker-compose.upstream.yml ps
@@ -196,7 +196,7 @@ docker compose -f docker-compose.upstream.yml exec hermes-web ls -la /opt/data/s
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| Container `Exit 1` immediately | `data/weixin_accounts/` doesn't exist | Run the wizard |
+| Container `Exit 1` immediately | `data/weixin/accounts/` doesn't exist | Run the wizard |
 | Container `Up` but not `healthy` | Wizard hasn't run yet | Run the wizard |
 | `Connected` then `Disconnected` | Token lock conflict (another profile using same bot) | Stop other profile, restart |
 | `getUpdates failed ret=-14` | iLink session expired | Re-run wizard |

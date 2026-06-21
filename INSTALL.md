@@ -84,7 +84,7 @@ docker compose -f docker-compose.upstream.yml run --rm hermes-gateway \
 
 When prompted `Select [1-27] (27):`, type `13` and press Enter.
 
-The wizard prints an ASCII QR code in the terminal. Scan it with the WeChat app on your phone (Settings → Plugins → search "iLink Bot" if not visible), confirm in WeChat, and the wizard saves credentials to `data/weixin_accounts/<account_id>.json` automatically.
+The wizard prints an ASCII QR code in the terminal. Scan it with the WeChat app on your phone (Settings → Plugins → search "iLink Bot" if not visible), confirm in WeChat, and the wizard saves credentials to `data/weixin/accounts/<account_id>.json` automatically.
 
 Then bring the gateway up:
 
@@ -134,7 +134,7 @@ The web UI healthcheck on `:9119` is the primary smoke signal. The WeChat gatewa
 | `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` | Slack gateway | Optional |
 | `EXA_API_KEY` | AI-native web search | Optional |
 
-WeChat personal accounts (`weixin`) do not use tokens — credentials are obtained via the QR wizard and saved to `data/weixin_accounts/`.
+WeChat personal accounts (`weixin`) do not use tokens — credentials are obtained via the QR wizard and saved to `data/weixin/accounts/`.
 
 ### `data/config.yaml` — runtime settings
 
@@ -225,7 +225,7 @@ Webhook platform is no longer pre-published in this stack. To enable inbound web
 
 ```bash
 docker compose down -v   # removes named volumes (including postgres_data — all DB rows gone)
-rm -rf data/             # removes persisted data (config, sessions, memories, weixin_accounts)
+rm -rf data/             # removes persisted data (config, sessions, memories, weixin/accounts)
 docker compose -f docker-compose.upstream.yml up -d --pull always --force-recreate --remove-orphans
 ```
 

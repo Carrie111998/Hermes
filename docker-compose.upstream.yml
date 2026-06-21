@@ -50,7 +50,7 @@ services:
       # does not lock the shared gateway log path used by hermes-gateway.
       - hermes_web_gateway_default_log:/opt/data/logs/gateways/default
     ports:
-      - "9119:9119"
+      - "127.0.0.1:9119:9119"
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:9119/api/status'); sys.exit(0 if r.status==200 else 1)"]
       interval: 30s
@@ -71,7 +71,7 @@ services:
       hermes-web:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import os,sys; sys.exit(0 if os.path.exists(\"/opt/data/weixin_accounts\") else 1)'"]
+      test: ["CMD-SHELL", "python3 -c 'import os,sys; sys.exit(0 if os.path.exists(\"/opt/data/weixin/accounts\") else 1)'"]
       interval: 30s
       timeout: 5s
       retries: 3

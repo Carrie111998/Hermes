@@ -11,7 +11,6 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $ComposePath = Join-Path $RepoRoot $ComposeFile
 $EnvPath = Join-Path $RepoRoot "data/.env"
-$DefaultApiServerKey = "28765d337208aa3c0b6671cb1969e8cad9c22d7b7967b216"
 
 function Write-Step {
     param([string]$Message)
@@ -111,7 +110,8 @@ if (-not $ApiServerKey) {
 }
 
 if (-not $ApiServerKey) {
-    $ApiServerKey = $DefaultApiServerKey
+    Write-Warning "API_SERVER_KEY is not set in $EnvPath. API health probe will be skipped."
+    Write-Warning "Set API_SERVER_KEY in data/.env to enable the :8789 health probe."
 }
 
 Push-Location $RepoRoot

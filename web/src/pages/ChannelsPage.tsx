@@ -1631,7 +1631,11 @@ function WeixinOnboardingPanel({
       }
       await onChanged();
     } catch (applyError) {
-      setPhase("waiting");
+      // Don't go back to "waiting" — that would trigger the polling effect
+      // to auto-call apply() again on the next "confirmed" status, creating
+      // a retry loop with repeated writes/restarts. Reset to idle so the
+      // user can manually retry by clicking "Set up with QR" again.
+      resetSetup();
       setError(String(applyError));
     }
   };

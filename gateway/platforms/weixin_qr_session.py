@@ -134,6 +134,7 @@ class WeixinQRSessionManager:
             if session.expires_at_ts <= now and session.state not in {
                 "confirmed",
                 "failed",
+                "expired",
                 "cancelled",
             }
         ]
