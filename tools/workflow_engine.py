@@ -1243,6 +1243,39 @@ class WorkflowEngine:
                     f"but has no dependents — LOOP detection will find no revision node"
                 )
 
+        # incomplete_branch rule (adapted from itechmeat/hermes-workflows).
+        # Catches non-terminal nodes that rely on the implicit default
+        # ``fallback_on_timeout="skip"`` — which silently cascades skip to
+        # all downstream nodes. Authors should be intentional about how a
+        # node handles timeout / failure when other nodes depend on it.
+        # Non-fatal: surfaces as an issue for the caller to act on, but
+        # doesn't flip ``valid`` (existing fleet workflows commonly omit
+        # the explicit declaration — warn, don't break).
+        try:
+            yaml_path = self.workflows_dir / f"{workflow_name}.yaml"
+            raw_yaml = yaml.safe_load(yaml_path.read_text()) if yaml_path.exists() else None
+            nodes_raw = (raw_yaml or {}).get("nodes", {}) if raw_yaml else {}
+        except Exception:
+            nodes_raw = {}
+        for nid, node in workflow.nodes.items():
+            if node.synthetic:
+                continue
+            # Terminal = no downstream consumers; skip the check.
+            has_downstream = any(
+                nid in other.depends_on
+                for other_id, other in workflow.nodes.items()
+                if other_id != nid
+            )
+            if not has_downstream:
+                continue
+            raw_node = nodes_raw.get(nid, {})
+            if "fallback_on_timeout" not in raw_node:
+                result["issues"].append(
+                    f"Node '{nid}' has downstream consumers but no explicit "
+                    f"fallback_on_timeout in YAML. Add one of: skip | degraded "
+                    f"| retry to make failure routing intentional, not implicit."
+                )
+
         return result
 
     # ── Execution ──────────────────────────────────────────────

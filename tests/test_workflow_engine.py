@@ -1823,3 +1823,80 @@ def test_apply_silent_marker_strips_marker_in_middle():
     assert state.silent is True
     assert "[SILENT]" not in state.result
     assert "Fleet heartbeat clean" in state.result
+
+
+# ── incomplete_branch validation tests ─────────────────────────────
+
+
+def test_validate_flags_non_terminal_without_fallback(tmp_path):
+    """Non-terminal node relying on default fallback_on_timeout surfaces an issue."""
+    import yaml as _yaml
+    wf_path = tmp_path / "wf.yaml"
+    # a depends on b — b is non-terminal. b does NOT declare fallback_on_timeout.
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "wf",
+        "nodes": {
+            "a": {"agent": "sherlock", "task": "do a", "depends_on": ["b"]},
+            "b": {"agent": "nikola", "task": "do b"},
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    result = engine.validate("wf")
+    assert result["valid"] is True  # non-fatal
+    issues_text = " ".join(result["issues"])
+    assert "b" in issues_text
+    assert "fallback_on_timeout" in issues_text
+
+
+def test_validate_does_not_flag_terminal_nodes(tmp_path):
+    """Terminal nodes (no downstream) don't need explicit fallback_on_timeout."""
+    import yaml as _yaml
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "wf",
+        "nodes": {
+            "leaf": {"agent": "sherlock", "task": "final node"},  # terminal
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    result = engine.validate("wf")
+    fallback_issues = [i for i in result["issues"] if "fallback_on_timeout" in i]
+    assert fallback_issues == []
+
+
+def test_validate_does_not_flag_when_explicit(tmp_path):
+    """Non-terminal node with explicit fallback_on_timeout is clean."""
+    import yaml as _yaml
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "wf",
+        "nodes": {
+            "a": {"agent": "sherlock", "task": "do a", "depends_on": ["b"]},
+            "b": {
+                "agent": "nikola",
+                "task": "do b",
+                "fallback_on_timeout": "degraded",
+            },
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    result = engine.validate("wf")
+    fallback_issues = [i for i in result["issues"] if "fallback_on_timeout" in i]
+    assert fallback_issues == []
+
+
+def test_validate_skips_synthetic_nodes(tmp_path):
+    """Synthetic gates don't need fallback_on_timeout even if downstream."""
+    import yaml as _yaml
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "wf",
+        "nodes": {
+            "a": {"agent": "sherlock", "task": "do a", "depends_on": ["gate"]},
+            "gate": {"synthetic": True},  # auto-completed, no fallback needed
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    result = engine.validate("wf")
+    fallback_issues = [i for i in result["issues"] if "fallback_on_timeout" in i]
+    assert fallback_issues == []
