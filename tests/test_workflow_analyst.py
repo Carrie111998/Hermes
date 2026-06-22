@@ -11,7 +11,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from tools.workflow_engine_llm_utils import extract_json_blob
+from tools.workflow_llm_utils import extract_json_blob
 from tools.workflow_analyst import (
     AnalystOutcome,
     analyze_escalation,
