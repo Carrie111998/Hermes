@@ -6331,6 +6331,23 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Inert resolved-row button (ccc:noop) ---
+        if data == "ccc:noop":
+            await query.answer()
+            return
+
+        # --- CCC callbacks (decision / follow-up / meeting action items) ---
+        if data.startswith(("ccc:decision:", "ccc:followup:", "ai:")):
+            await self._handle_ccc_script_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -6824,6 +6841,126 @@ class TelegramAdapter(BasePlatformAdapter):
         if size <= max_bytes:
             return True, None
         return False, self._telegram_media_too_large_note(label, size, max_bytes)
+
+    # CCC callback action → (success label, keep_keyboard) mapping.
+    _CCC_ACTION_LABELS = {
+        "approve": ("✅ Approved", False),
+        "reject": ("❌ Rejected", False),
+        "defer": ("⏭ Deferred", False),
+        "view": ("🔗 Opening…", True),
+        "done": ("✅ Done", False),
+        "dismiss": ("🗑 Dismissed", False),
+        "snooze1h": ("⏰ Snoozed 1h", False),
+        "snooze4h": ("⏰ Snoozed 4h", False),
+        "snooze1d": ("⏰ Snoozed 1d", False),
+        "snooze1w": ("⏰ Snoozed 1w", False),
+        "snooze3d": ("⏰ Snoozed 3d", False),
+    }
+
+    async def _handle_ccc_script_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Dispatch a CCC inline-button callback by shelling out to the
+        ccc-decision-callback.sh handler.
+
+        Handles three prefixes:
+          - ccc:decision:<approve|reject|defer|view>:<id>
+          - ccc:followup:<dismiss|done|snooze*>:<id>
+          - ai:<done|snooze3d|dismiss>:<meetingId>:<index>
+        """
+        # Parse the action verb for labelling. The action sits in a different
+        # field depending on prefix:
+        #   ccc:decision:<action>:<id>   → parts[2]
+        #   ccc:followup:<action>:<id>   → parts[2]
+        #   ai:<action>:<meetingId>:<idx> → parts[1]
+        parts = data.split(":")
+        if data.startswith("ai:"):
+            action = parts[1] if len(parts) >= 2 else ""
+        else:
+            action = parts[2] if len(parts) >= 3 else ""
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ Not authorized.")
+            return
+
+        script_path = _Path.home() / "workspace" / "scripts" / "ccc-decision-callback.sh"
+        if not script_path.exists():
+            await query.answer(text="❌ Callback handler missing")
+            logger.error("[%s] CCC callback script missing: %s", self.name, script_path)
+            return
+
+        success_label, keep_keyboard = self._CCC_ACTION_LABELS.get(
+            action, (f"✓ {action}", False)
+        )
+        success = False
+        label = success_label
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(script_path),
+                data,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=30,
+            )
+            if proc.returncode == 0:
+                success = True
+                logger.info("[%s] CCC callback ok: %s", self.name, data)
+            else:
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+                # Surface the API's error message (e.g. "already approved") to the user.
+                detail = stderr_text.splitlines()[-1] if stderr_text else f"exit {proc.returncode}"
+                if "already" in detail.lower():
+                    label = "⚠️ Already resolved"
+                    success = True  # treat as resolved — strip buttons
+                else:
+                    label = f"❌ {action} failed: {detail[:80]}"
+                logger.error(
+                    "[%s] CCC callback failed: %s rc=%s stderr=%s",
+                    self.name, data, proc.returncode, stderr_text,
+                )
+        except asyncio.TimeoutError:
+            label = f"❌ {action} timed out"
+            logger.error("[%s] CCC callback timed out: %s", self.name, data)
+        except Exception as exc:
+            label = f"❌ {action} error: {exc}"
+            logger.error(
+                "[%s] CCC callback exception: %s err=%s",
+                self.name, data, exc, exc_info=True,
+            )
+
+        await query.answer(text=label)
+        if not success or keep_keyboard:
+            return
+
+        # Terminal action succeeded — append outcome and strip the keyboard so
+        # it can't fire twice. Preserve HTML (producers send parse_mode=HTML).
+        user_display = getattr(query.from_user, "first_name", "User")
+        original_html = (query.message.text_html or "") if query.message else ""
+        appended = f"{original_html}\n\n— <i>{_html.escape(label)} by {_html.escape(str(user_display))}</i>"
+        try:
+            await query.edit_message_text(
+                text=appended,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
     async def send_voice(
         self,
