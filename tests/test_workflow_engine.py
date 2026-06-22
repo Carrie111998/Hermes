@@ -1768,3 +1768,58 @@ def test_load_workflow_scope_defaults_to_project(tmp_path):
     engine = WorkflowEngine(workflows_dir=tmp_path)
     wf = engine.load_workflow("normal")
     assert wf.scope == "project"
+
+
+# ── [SILENT] suppression tests ─────────────────────────────────────
+
+
+def test_node_state_silent_defaults_to_false():
+    """NodeState.silent starts False — delivery is the default."""
+    state = NodeState(node_id="x")
+    assert state.silent is False
+
+
+def test_silent_marker_constant_value():
+    """The marker literal is exactly [SILENT] — case-sensitive, no whitespace."""
+    assert WorkflowEngine.SILENT_MARKER == "[SILENT]"
+
+
+def test_apply_silent_marker_sets_flag_and_strips_literal():
+    """When result contains the marker, state.silent=True and literal removed."""
+    engine = WorkflowEngine()
+    state = NodeState(node_id="hb", result="Heartbeat OK [SILENT]")
+    engine._apply_silent_marker(state)
+    assert state.silent is True
+    assert "[SILENT]" not in state.result
+    assert state.result == "Heartbeat OK"
+
+
+def test_apply_silent_marker_no_op_when_marker_absent():
+    """Marker absent → silent stays False, result unchanged."""
+    engine = WorkflowEngine()
+    state = NodeState(node_id="hb", result="Found 3 issues, see details")
+    engine._apply_silent_marker(state)
+    assert state.silent is False
+    assert state.result == "Found 3 issues, see details"
+
+
+def test_apply_silent_marker_handles_none_result():
+    """get_card_body can return None — must not crash the helper."""
+    engine = WorkflowEngine()
+    state = NodeState(node_id="hb", result=None)
+    engine._apply_silent_marker(state)
+    assert state.silent is False
+    assert state.result is None
+
+
+def test_apply_silent_marker_strips_marker_in_middle():
+    """Marker can appear anywhere in the body, not just at the end."""
+    engine = WorkflowEngine()
+    state = NodeState(
+        node_id="hb",
+        result="[SILENT]\n\nFleet heartbeat clean\nAll agents responsive.",
+    )
+    engine._apply_silent_marker(state)
+    assert state.silent is True
+    assert "[SILENT]" not in state.result
+    assert "Fleet heartbeat clean" in state.result
