@@ -110,6 +110,24 @@ def handle_workflow_start(
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
 
+    # Single-flight opt-in check: if the workflow declares
+    # ``single_flight: true`` in YAML, refuse to start when another
+    # run is already in progress. Prevents duplicate parallel runs
+    # from webhook storms or repeated dispatch signals.
+    # Skipped for dry-run and resume — those are explicitly about
+    # inspecting / continuing an existing run, not starting fresh.
+    if not dry_run and not resume:
+        try:
+            wf_def = engine.load_workflow(workflow)
+        except Exception:
+            wf_def = None
+        if wf_def is not None and getattr(wf_def, "single_flight", False):
+            if engine._has_active_run(workflow):
+                return _err(
+                    f"single_flight: another run of '{workflow}' is in progress",
+                    hint="wait for the current run to finish, or call workflow_status to inspect",
+                )
+
     try:
         result = engine.execute(
             workflow_name=workflow,

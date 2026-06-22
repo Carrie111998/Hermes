@@ -155,6 +155,12 @@ class Workflow:
                                     # "global" — in-process only, no cards created.
                                     # Used for maintenance / notification / heartbeat
                                     # workflows that should not pollute project boards.
+    single_flight: bool = False     # When True, refuse to start a new run if any
+                                    # run for this workflow is already in progress.
+                                    # Used to prevent duplicate parallel runs from
+                                    # webhook storms or repeated dispatch signals.
+                                    # Default False preserves the existing "multiple
+                                    # parallel runs allowed" behavior.
 
 @dataclass
 class NodeState:
@@ -261,6 +267,7 @@ class WorkflowEngine:
             trigger_events=raw.get("trigger_events", []),
             kanban_board=raw.get("kanban_board", ""),
             scope=raw.get("scope", "project"),
+            single_flight=bool(raw.get("single_flight", False)),
         )
 
         for node_id, node_data in raw.get("nodes", {}).items():
@@ -562,6 +569,50 @@ class WorkflowEngine:
             state.result = state.result.replace(
                 self.SILENT_MARKER, ""
             ).strip()
+
+    # State files older than this are considered stale — the engine
+    # crashed or was killed mid-run and the state is no longer accurate.
+    # Single-flight checks ignore stale state files so a single bad
+    # crash doesn't permanently block a workflow from running again.
+    ACTIVE_RUN_STALE_SECONDS = 3600
+
+    def _has_active_run(self, workflow_name: str) -> bool:
+        """Return True if any in-progress run exists for ``workflow_name``.
+
+        Used to enforce single-flight semantics: workflows with
+        ``single_flight: true`` refuse to start a new run when another
+        run is already in progress. A run is considered active when its
+        state file was updated within ``ACTIVE_RUN_STALE_SECONDS`` and
+        contains at least one node in ``running``, ``pending``, or
+        ``blocked`` status.
+
+        Returns False if no state file exists, all state files are stale,
+        or all nodes in the active state file are in terminal status.
+        """
+        for path in sorted(self.STATE_DIR.glob(f"{workflow_name}_*_state.json")):
+            try:
+                with open(path) as f:
+                    state = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            updated_at = state.get("updated_at")
+            if updated_at:
+                try:
+                    age = (
+                        datetime.now(timezone.utc)
+                        - datetime.fromisoformat(updated_at)
+                    ).total_seconds()
+                    if age > self.ACTIVE_RUN_STALE_SECONDS:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            states = state.get("states", {})
+            if any(
+                s.get("status") in ("running", "pending", "blocked")
+                for s in states.values()
+            ):
+                return True
+        return False
 
     def get_card_status(self, card_id: str) -> dict:
         """Query a kanban card's current state.

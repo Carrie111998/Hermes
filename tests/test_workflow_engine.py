@@ -10,6 +10,7 @@ import pytest
 import tempfile
 import json
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Import the engine module (must be run from hermes-agent repo root)
 from tools.workflow_engine import (
@@ -1900,3 +1901,98 @@ def test_validate_skips_synthetic_nodes(tmp_path):
     result = engine.validate("wf")
     fallback_issues = [i for i in result["issues"] if "fallback_on_timeout" in i]
     assert fallback_issues == []
+
+
+# ── single_flight tests ────────────────────────────────────────────
+
+
+def test_workflow_single_flight_default_false():
+    """Workflows default to single_flight=False — multiple parallel runs allowed."""
+    wf = Workflow(name="x")
+    assert wf.single_flight is False
+
+
+def test_load_workflow_parses_single_flight_field(tmp_path):
+    """YAML single_flight: true is loaded into Workflow.single_flight."""
+    import yaml as _yaml
+    wf_path = tmp_path / "wf.yaml"
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "wf",
+        "single_flight": True,
+        "nodes": {
+            "x": {"agent": "sherlock", "task": "do x"},
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    wf = engine.load_workflow("wf")
+    assert wf.single_flight is True
+
+
+def test_has_active_run_returns_false_when_no_state_files(tmp_path):
+    """No state files for workflow → not active."""
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    assert engine._has_active_run("nonexistent") is False
+
+
+def test_has_active_run_returns_false_when_all_nodes_terminal(tmp_path):
+    """State file exists but all nodes are done → not active."""
+    import json as _json
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    state_file = state_dir / "wf_abc123_state.json"
+    state_file.write_text(_json.dumps({
+        "workflow_name": "wf",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "states": {
+            "x": {"status": "done"},
+            "y": {"status": "failed"},
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    assert engine._has_active_run("wf") is False
+
+
+def test_has_active_run_returns_true_when_node_running(tmp_path):
+    """State file with a running node → active."""
+    import json as _json
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    state_file = state_dir / "wf_xyz_state.json"
+    state_file.write_text(_json.dumps({
+        "workflow_name": "wf",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "states": {
+            "x": {"status": "done"},
+            "y": {"status": "running"},
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    assert engine._has_active_run("wf") is True
+
+
+def test_has_active_run_ignores_stale_state_files(tmp_path):
+    """State files older than ACTIVE_RUN_STALE_SECONDS are ignored."""
+    import json as _json
+    from datetime import timedelta as _td
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    state_file = state_dir / "wf_old_state.json"
+    # 2 hours old — past the 1-hour staleness threshold
+    old_time = (
+        datetime.now(timezone.utc) - _td(seconds=2 * 3600)
+    ).isoformat()
+    state_file.write_text(_json.dumps({
+        "workflow_name": "wf",
+        "updated_at": old_time,
+        "states": {
+            "y": {"status": "running"},  # would be active if not stale
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    assert engine._has_active_run("wf") is False
