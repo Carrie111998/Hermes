@@ -55,6 +55,27 @@ LAZY_REFRESH_REPAIR_PACKAGES: dict[str, str] = {
     "jwt": "PyJWT",
 }
 
+TOP_LEVEL_VALUE_FLAGS = frozenset({
+    "-p", "--profile", "-z", "--oneshot", "-m", "--model",
+    "--provider", "-t", "--toolsets", "-r", "--resume",
+    "-s", "--skills", "--usage-file", "-c", "--continue",
+})
+
+
+def early_cli_subcommand(argv: list[str]) -> str:
+    """Find the top-level command without importing the full CLI parser."""
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in TOP_LEVEL_VALUE_FLAGS:
+            index += 2
+            continue
+        if argument.startswith("--profile=") or argument.startswith("-"):
+            index += 1
+            continue
+        return argument
+    return ""
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -188,6 +209,9 @@ def recover_if_needed(
     """
     try:
         args = sys.argv[1:] if argv is None else argv
+        # Health must report interrupted recovery, not mutate the venv with pip.
+        if early_cli_subcommand(args) == "health":
+            return
         # Same deliberately-loose match as main(): the real update flow writes
         # and clears its own markers — a recovery install must not race it.
         if "update" in args:

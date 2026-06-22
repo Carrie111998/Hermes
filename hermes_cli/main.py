@@ -18,6 +18,7 @@ Usage:
     hermes cron list           # List cron jobs
     hermes cron status         # Check if cron scheduler is running
     hermes doctor              # Check configuration and dependencies
+    hermes health              # Offline health checks for automation
     hermes honcho setup                    # Configure Honcho AI memory integration
     hermes honcho status                   # Show Honcho config and connection status
     hermes honcho sessions                 # List directory → session name mappings
@@ -447,6 +448,7 @@ from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
+from hermes_cli.subcommands.health import build_health_parser
 from hermes_cli.subcommands.security import build_security_parser
 from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
@@ -682,12 +684,27 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+# Parser-lite command detection must run before dotenv/secret-source loading so
+# the public read-only/offline health command can bypass mutating or remote
+# startup initialization. Keep this value-option grammar shared with the later
+# plugin-discovery fast path.
+_TOP_LEVEL_VALUE_FLAGS = _early_recovery_mod.TOP_LEVEL_VALUE_FLAGS
+
+
+def _early_cli_subcommand(argv: list[str]) -> str:
+    """Find the top-level command without running the full argument parser."""
+    return _early_recovery_mod.early_cli_subcommand(argv)
+
+
+_EARLY_CLI_COMMAND = _early_cli_subcommand(sys.argv[1:])
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+if _EARLY_CLI_COMMAND != "health":
+    load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -733,21 +750,21 @@ try:
 except Exception:
     pass  # best-effort — redaction stays at default (enabled) on config errors
 
-# Initialize centralized file logging early — all `hermes` subcommands
-# (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
+# Initialize centralized file logging early — all `hermes` subcommands except
+# the explicitly read-only `health` command write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
 try:
     from hermes_logging import setup_logging as _setup_logging
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+    if _EARLY_CLI_COMMAND != "health":
+        _setup_logging(
+            mode=(
+                "gui"
+                if _EARLY_CLI_COMMAND in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
 except Exception:
     pass  # best-effort — don't crash the CLI if logging setup fails
 
@@ -4603,6 +4620,13 @@ def cmd_doctor(args):
     from hermes_cli.doctor import run_doctor
 
     run_doctor(args)
+
+
+def cmd_health(args):
+    """Run automation-friendly offline health checks."""
+    from hermes_cli.health import run_health
+
+    sys.exit(run_health(args))
 
 
 def cmd_security(args):
@@ -10225,7 +10249,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
-        "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
+        "dump", "egress", "fallback", "gateway", "health", "hooks", "import", "import-agent", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
         "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
@@ -10250,22 +10274,8 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 # Correctness-safe either way: missing an entry here only makes the
 # fast-path bail out too eagerly (we run plugin discovery when we didn't
 # need to); extra entries would make us skip a real positional.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
-    {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
-        # value-taking: if the next token is a subcommand-looking word
-        # the user almost certainly meant it as the session name, and
-        # either interpretation keeps us on the safe side.
-        "-c", "--continue",
-    }
-)
+# Defined near early logging setup so the read-only health fast path and the
+# plugin-discovery fast path share one parser-lite value-option grammar.
 
 
 def _first_positional_argv() -> str | None:
@@ -10808,16 +10818,18 @@ def main():
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
-    try:
-        _cleanup_quarantined_exes()
-    except Exception:
-        pass
+    if _EARLY_CLI_COMMAND != "health":
+        try:
+            _cleanup_quarantined_exes()
+        except Exception:
+            pass
 
     # If the checkout changed since the last launch (hermes update, manual
     # git pull, old-updater update that predates newer clears), sweep stale
     # __pycache__ once so no process — this one's lazy imports included —
     # resolves fresh source against old bytecode. Never raises.
-    _sweep_stale_bytecode_if_checkout_changed()
+    if _EARLY_CLI_COMMAND != "health":
+        _sweep_stale_bytecode_if_checkout_changed()
 
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
@@ -10829,11 +10841,12 @@ def main():
     # ``hermes skills install update``) merely defers recovery one launch;
     # under-matching (missing ``hermes -p work update``) would race a recovery
     # install against the real one. Loose wins.
-    try:
-        if "update" not in sys.argv[1:]:
-            _recover_from_interrupted_install()
-    except Exception:
-        pass
+    if _EARLY_CLI_COMMAND != "health":
+        try:
+            if "update" not in sys.argv[1:]:
+                _recover_from_interrupted_install()
+        except Exception:
+            pass
 
     if _try_termux_fast_tui_launch():
         return
@@ -11135,6 +11148,11 @@ def main():
     # doctor command  (parser built in hermes_cli/subcommands/doctor.py)
     # =========================================================================
     build_doctor_parser(subparsers, cmd_doctor=cmd_doctor)
+
+    # =========================================================================
+    # health command  (parser built in hermes_cli/subcommands/health.py)
+    # =========================================================================
+    build_health_parser(subparsers, cmd_health=cmd_health)
 
     # =========================================================================
     # security command — on-demand supply-chain audit
