@@ -237,6 +237,10 @@ SEND_MESSAGE_SCHEMA = {
                 "type": "string",
                 "description": "The message text to send. To send an image or file, include MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — the platform will deliver it as a native media attachment."
             },
+            "subject": {
+                "type": "string",
+                "description": "Optional email subject. Honored for target='email:...' and ignored by chat-style platforms."
+            },
             "emoji": {
                 "type": "string",
                 "description": "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, ❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji reactions."
@@ -487,6 +491,8 @@ def _handle_send(args):
                 return json.dumps(_resolve_err)
             chat_id = _resolved
 
+    subject = args.get("subject") if platform_name == "email" else None
+
     try:
         from model_tools import _run_async
         send_kwargs = {
@@ -498,6 +504,8 @@ def _handle_send(args):
         # the complete typed request.
         if entry is not None and entry.send_message_handler is not None:
             send_kwargs["args"] = args
+        if subject:
+            send_kwargs["subject"] = subject>>>>>>> 8c78165ab7 (Fix hermes send email subjects)
         result = _run_async(
             _send_to_platform(
                 platform,
