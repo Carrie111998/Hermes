@@ -22,7 +22,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from hermes_cli.llm_utils import extract_json_blob
+from tools.workflow_engine_llm_utils import extract_json_blob
 
 logger = logging.getLogger(__name__)
 

@@ -1223,7 +1223,7 @@ class WorkflowEngine:
         """Try LLM analysis of a deadlocked revision loop. Best-effort —
         failure is silent; the engine continues with mechanical escalation."""
         try:
-            from hermes_cli.workflow_analyst import analyze_escalation
+            from tools.workflow_analyst import analyze_escalation
         except Exception:
             return  # Auxiliary module not available
 
@@ -1268,7 +1268,7 @@ class WorkflowEngine:
         if node.synthetic:
             return
         try:
-            from hermes_cli.workflow_analyst import analyze_failure
+            from tools.workflow_analyst import analyze_failure
         except Exception:
             return
 
@@ -1298,7 +1298,7 @@ class WorkflowEngine:
                              saved_state: dict) -> Optional[str]:
         """Try LLM summary of pipeline state. Returns summary text or None."""
         try:
-            from hermes_cli.workflow_analyst import analyze_status
+            from tools.workflow_analyst import analyze_status
         except Exception:
             return None
 

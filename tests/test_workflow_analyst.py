@@ -4,12 +4,15 @@ Run: python3 -m pytest tests/test_workflow_analyst.py -v
 """
 
 import json
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from hermes_cli.llm_utils import extract_json_blob
-from hermes_cli.workflow_analyst import (
+from tools.workflow_engine_llm_utils import extract_json_blob
+from tools.workflow_analyst import (
     AnalystOutcome,
     analyze_escalation,
     analyze_status,
@@ -94,7 +97,7 @@ def test_outcome_failure():
 
 def test_analyze_escalation_builds_prompt():
     """Escalation prompt includes project, gate, and history."""
-    with patch("hermes_cli.workflow_analyst._invoke") as mock_invoke:
+    with patch("tools.workflow_analyst._invoke") as mock_invoke:
         mock_invoke.return_value = AnalystOutcome(mode="escalation", success=True)
         result = analyze_escalation(
             project="goms", gate="ada-security",
@@ -110,7 +113,7 @@ def test_analyze_escalation_builds_prompt():
 
 
 def test_analyze_status_builds_prompt():
-    with patch("hermes_cli.workflow_analyst._invoke") as mock_invoke:
+    with patch("tools.workflow_analyst._invoke") as mock_invoke:
         mock_invoke.return_value = AnalystOutcome(mode="status", success=True)
         result = analyze_status(pipeline_name="ideation", state_json='{"x":1}')
         assert result.success is True
@@ -121,7 +124,7 @@ def test_analyze_status_builds_prompt():
 
 
 def test_analyze_failure_builds_prompt():
-    with patch("hermes_cli.workflow_analyst._invoke") as mock_invoke:
+    with patch("tools.workflow_analyst._invoke") as mock_invoke:
         mock_invoke.return_value = AnalystOutcome(mode="failure", success=True)
         result = analyze_failure(
             node_id="newton-build", agent="newton",
@@ -165,7 +168,7 @@ def verify_state_with_history():
 def test_escalation_with_full_history(engine, verify_state_with_history):
     """Analyst receives full loop_history, not just last error."""
     wf = Workflow(name="test")
-    with patch("hermes_cli.workflow_analyst.analyze_escalation") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_escalation") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="escalation", success=True,
             result={
@@ -194,7 +197,7 @@ def test_escalation_no_history_fallback(engine):
     wf = Workflow(name="test")
     state = NodeState(node_id="test")
     state.error = "Some error"
-    with patch("hermes_cli.workflow_analyst.analyze_escalation") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_escalation") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="escalation", success=True, result={"summary": "ok"}
         )
@@ -208,7 +211,7 @@ def test_escalation_recommends_randy(engine, capsys):
     wf = Workflow(name="test")
     state = NodeState(node_id="test")
     state.error = "Blocked"
-    with patch("hermes_cli.workflow_analyst.analyze_escalation") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_escalation") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="escalation", success=True,
             result={
@@ -228,7 +231,7 @@ def test_escalation_analyst_unavailable(engine, capsys):
     wf = Workflow(name="test")
     state = NodeState(node_id="test")
     state.error = "Blocked"
-    with patch("hermes_cli.workflow_analyst.analyze_escalation") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_escalation") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="escalation", success=False, error="API error"
         )
@@ -242,7 +245,7 @@ def test_failure_suggests_retry(engine, capsys):
     node = WorkflowNode(id="newton-build", agent="newton", task="Build")
     state = NodeState(node_id="newton-build")
     state.error = "timeout"
-    with patch("hermes_cli.workflow_analyst.analyze_failure") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_failure") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="failure", success=True,
             result={
@@ -265,7 +268,7 @@ def test_failure_analyst_unavailable(engine, capsys):
     node = WorkflowNode(id="test", agent="test", task="Task")
     state = NodeState(node_id="test")
     state.error = "timeout"
-    with patch("hermes_cli.workflow_analyst.analyze_failure") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_failure") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="failure", success=False, error="API error"
         )
@@ -276,7 +279,7 @@ def test_failure_analyst_unavailable(engine, capsys):
 
 def test_status_with_alerts(engine):
     """Happy path — returns formatted summary with alerts."""
-    with patch("hermes_cli.workflow_analyst.analyze_status") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_status") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="status", success=True,
             result={
@@ -293,7 +296,7 @@ def test_status_with_alerts(engine):
 
 def test_status_analyst_fails(engine):
     """When analyst returns failure, returns None."""
-    with patch("hermes_cli.workflow_analyst.analyze_status") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_status") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="status", success=False, error="API error"
         )
@@ -303,7 +306,7 @@ def test_status_analyst_fails(engine):
 
 def test_status_analyst_no_alerts(engine):
     """When everything is running, no attention_needed."""
-    with patch("hermes_cli.workflow_analyst.analyze_status") as mock_analyze:
+    with patch("tools.workflow_analyst.analyze_status") as mock_analyze:
         mock_analyze.return_value = AnalystOutcome(
             mode="status", success=True,
             result={
