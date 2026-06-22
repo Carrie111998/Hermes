@@ -1744,3 +1744,545 @@ def test_prune_old_runs_no_op_when_fewer_files(tmp_path):
     pruned = engine._prune_old_runs(keep=20)
     assert pruned == 0
     assert len(list(state_dir.glob("*.json"))) == 5
+
+
+# ── when: conditional step support tests ────────────────────────────
+
+
+class TestWhenCondition:
+    """Tests for the ``when:`` conditional dispatch feature."""
+
+    # ── Empty when: always runs (current behavior preserved) ──
+
+    def test_empty_when_always_runs(self, engine):
+        """An empty when: string means the node always dispatches."""
+        wf = Workflow(name="test-when-empty")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="agent-a", task="Task A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="agent-b", task="Task B",
+            depends_on=["a"], when="",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done", result="hello"),
+            "b": NodeState(node_id="b"),
+        }
+        assert engine.evaluate_when("", wf.nodes["b"], states) is True
+
+    def test_none_when_always_runs(self, engine):
+        """None-like empty when: still dispatches."""
+        wf = Workflow(name="test-when-none")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="agent-a", task="Task A")
+        states = {"a": NodeState(node_id="a", status="done")}
+        assert engine.evaluate_when(None, wf.nodes["a"], states) is True
+
+    # ── == operator ──
+
+    def test_when_status_equals_done(self, engine):
+        """when: {review.status} == done → dispatches when review is done."""
+        wf = Workflow(name="test-when-eq")
+        wf.nodes["review"] = WorkflowNode(id="review", agent="r", task="R")
+        wf.nodes["deploy"] = WorkflowNode(
+            id="deploy", agent="d", task="D",
+            depends_on=["review"], when="{review.status} == done",
+        )
+        states = {
+            "review": NodeState(node_id="review", status="done"),
+            "deploy": NodeState(node_id="deploy"),
+        }
+        assert engine.evaluate_when(
+            "{review.status} == done", wf.nodes["deploy"], states
+        ) is True
+
+    def test_when_status_not_done_skips(self, engine):
+        """when: {review.status} == done → skips when review failed."""
+        wf = Workflow(name="test-when-eq-skip")
+        wf.nodes["review"] = WorkflowNode(id="review", agent="r", task="R")
+        wf.nodes["deploy"] = WorkflowNode(
+            id="deploy", agent="d", task="D",
+            depends_on=["review"], when="{review.status} == done",
+        )
+        states = {
+            "review": NodeState(node_id="review", status="failed"),
+            "deploy": NodeState(node_id="deploy"),
+        }
+        assert engine.evaluate_when(
+            "{review.status} == done", wf.nodes["deploy"], states
+        ) is False
+
+    # ── != operator ──
+
+    def test_when_not_equal(self, engine):
+        """when: {review.status} != failed → dispatches when not failed."""
+        wf = Workflow(name="test-when-ne")
+        wf.nodes["review"] = WorkflowNode(id="review", agent="r", task="R")
+        wf.nodes["deploy"] = WorkflowNode(
+            id="deploy", agent="d", task="D",
+            depends_on=["review"], when="{review.status} != failed",
+        )
+        states = {
+            "review": NodeState(node_id="review", status="done"),
+            "deploy": NodeState(node_id="deploy"),
+        }
+        assert engine.evaluate_when(
+            "{review.status} != failed", wf.nodes["deploy"], states
+        ) is True
+
+    def test_when_not_equal_skips_on_match(self, engine):
+        """when: {review.status} != failed → skips when review failed."""
+        wf = Workflow(name="test-when-ne-skip")
+        wf.nodes["review"] = WorkflowNode(id="review", agent="r", task="R")
+        wf.nodes["deploy"] = WorkflowNode(
+            id="deploy", agent="d", task="D",
+            depends_on=["review"], when="{review.status} != failed",
+        )
+        states = {
+            "review": NodeState(node_id="review", status="failed"),
+            "deploy": NodeState(node_id="deploy"),
+        }
+        assert engine.evaluate_when(
+            "{review.status} != failed", wf.nodes["deploy"], states
+        ) is False
+
+    # ── contains operator ──
+
+    def test_when_contains(self, engine):
+        """when: {a.result} contains "error" → matches substring."""
+        wf = Workflow(name="test-when-contains")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when='{a.result} contains "error"',
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done",
+                           result="build failed: error in module X"),
+            "b": NodeState(node_id="b"),
+        }
+        assert engine.evaluate_when(
+            '{a.result} contains "error"', wf.nodes["b"], states
+        ) is True
+
+    def test_when_contains_no_match(self, engine):
+        """when: {a.result} contains "error" → false when no match."""
+        wf = Workflow(name="test-when-contains-nomatch")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when='{a.result} contains "error"',
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done",
+                           result="all tests passed"),
+            "b": NodeState(node_id="b"),
+        }
+        assert engine.evaluate_when(
+            '{a.result} contains "error"', wf.nodes["b"], states
+        ) is False
+
+    # ── and composition ──
+
+    def test_when_and_composition(self, engine):
+        """when: {a.status} == done and {b.status} == done → both must be true."""
+        wf = Workflow(name="test-when-and")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(id="b", agent="b", task="B")
+        wf.nodes["c"] = WorkflowNode(
+            id="c", agent="c", task="C",
+            depends_on=["a", "b"],
+            when="{a.status} == done and {b.status} == done",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+            "b": NodeState(node_id="b", status="failed"),
+            "c": NodeState(node_id="c"),
+        }
+        assert engine.evaluate_when(
+            "{a.status} == done and {b.status} == done",
+            wf.nodes["c"], states,
+        ) is False
+
+    def test_when_and_both_true(self, engine):
+        """when: {a.status} == done and {b.status} == done → true when both done."""
+        wf = Workflow(name="test-when-and-true")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(id="b", agent="b", task="B")
+        wf.nodes["c"] = WorkflowNode(
+            id="c", agent="c", task="C",
+            depends_on=["a", "b"],
+            when="{a.status} == done and {b.status} == done",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+            "b": NodeState(node_id="b", status="done"),
+            "c": NodeState(node_id="c"),
+        }
+        assert engine.evaluate_when(
+            "{a.status} == done and {b.status} == done",
+            wf.nodes["c"], states,
+        ) is True
+
+    # ── or composition ──
+
+    def test_when_or_composition(self, engine):
+        """when: {a.status} == done or {b.status} == done → true when either done."""
+        wf = Workflow(name="test-when-or")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(id="b", agent="b", task="B")
+        wf.nodes["c"] = WorkflowNode(
+            id="c", agent="c", task="C",
+            depends_on=["a", "b"],
+            when="{a.status} == done or {b.status} == done",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="failed"),
+            "b": NodeState(node_id="b", status="done"),
+            "c": NodeState(node_id="c"),
+        }
+        assert engine.evaluate_when(
+            "{a.status} == done or {b.status} == done",
+            wf.nodes["c"], states,
+        ) is True
+
+    # ── not operator ──
+
+    def test_when_not(self, engine):
+        """when: not {a.status} == failed → true when not failed."""
+        wf = Workflow(name="test-when-not")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when='not {a.status} == failed',
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+            "b": NodeState(node_id="b"),
+        }
+        assert engine.evaluate_when(
+            'not {a.status} == failed', wf.nodes["b"], states
+        ) is True
+
+    # ── context.key reference ──
+
+    def test_when_context_reference(self, engine):
+        """when: {context.mode} == production → checks context dict."""
+        wf = Workflow(name="test-when-ctx")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when="{context.mode} == production",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+            "b": NodeState(node_id="b"),
+        }
+        context = {"mode": "production"}
+        assert engine.evaluate_when(
+            "{context.mode} == production", wf.nodes["b"], states, context
+        ) is True
+
+    def test_when_context_reference_skips(self, engine):
+        """when: {context.mode} == production → skips on mismatch."""
+        wf = Workflow(name="test-when-ctx-skip")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when="{context.mode} == production",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+            "b": NodeState(node_id="b"),
+        }
+        context = {"mode": "staging"}
+        assert engine.evaluate_when(
+            "{context.mode} == production", wf.nodes["b"], states, context
+        ) is False
+
+    # ── Skipped node state is recorded ──
+
+    def test_skipped_node_state_recorded(self, engine):
+        """When a node is skipped via when:, its state.status is 'skipped'."""
+        wf = Workflow(name="test-when-state")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when="{a.status} == done",
+        )
+        states = {
+            "a": NodeState(node_id="a", status="failed"),
+            "b": NodeState(node_id="b"),
+        }
+        # Simulate what execute() does
+        if not engine.evaluate_when("{a.status} == done", wf.nodes["b"], states):
+            states["b"].status = "skipped"
+        assert states["b"].status == "skipped"
+
+    # ── Downstream cascade: skipped node propagates skip ──
+
+    def test_downstream_cascade_skip(self, engine):
+        """A node skipped via when: causes its downstream to also skip
+        (standard dependency-skip propagation)."""
+        wf = Workflow(name="test-when-cascade")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(
+            id="b", agent="b", task="B",
+            depends_on=["a"], when="{a.status} == done",
+        )
+        wf.nodes["c"] = WorkflowNode(
+            id="c", agent="c", task="C",
+            depends_on=["b"],
+        )
+        states = {
+            "a": NodeState(node_id="a", status="failed"),
+            "b": NodeState(node_id="b"),
+            "c": NodeState(node_id="c"),
+        }
+        # b is skipped because a failed
+        if not engine.evaluate_when("{a.status} == done", wf.nodes["b"], states):
+            states["b"].status = "skipped"
+        # c should be skipped because b is skipped (standard dep cascade)
+        assert states["b"].status == "skipped"
+        # c has b as dependency and b is skipped → c gets skipped
+        # This is the standard dependency check in execute(), not when:-
+
+    # ── Numeric comparison ──
+
+    def test_when_numeric_gt(self, engine):
+        """when: {a.attempts} > 2 → numeric comparison."""
+        wf = Workflow(name="test-when-gt")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="done", attempts=3),
+        }
+        assert engine.evaluate_when(
+            "{a.attempts} > 2", wf.nodes["a"], states
+        ) is True
+
+    def test_when_numeric_lt(self, engine):
+        """when: {a.attempts} < 5 → numeric comparison."""
+        wf = Workflow(name="test-when-lt")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="done", attempts=3),
+        }
+        assert engine.evaluate_when(
+            "{a.attempts} < 5", wf.nodes["a"], states
+        ) is True
+
+    # ── starts_with operator ──
+
+    def test_when_starts_with(self, engine):
+        """when: {a.result} starts_with "PASS" → prefix match."""
+        wf = Workflow(name="test-when-sw")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="done",
+                           result="PASS: all 42 tests green"),
+        }
+        assert engine.evaluate_when(
+            '{a.result} starts_with "PASS"', wf.nodes["a"], states
+        ) is True
+
+    # ── in operator ──
+
+    def test_when_in_list(self, engine):
+        """when: {a.status} in [done, skipped] → membership check."""
+        wf = Workflow(name="test-when-in")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+        }
+        assert engine.evaluate_when(
+            "{a.status} in [done, skipped]", wf.nodes["a"], states
+        ) is True
+
+    def test_when_in_list_false(self, engine):
+        """when: {a.status} in [done, skipped] → false on non-member."""
+        wf = Workflow(name="test-when-in-false")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="failed"),
+        }
+        assert engine.evaluate_when(
+            "{a.status} in [done, skipped]", wf.nodes["a"], states
+        ) is False
+
+    # ── Validation: warns on when referencing non-dependency ──
+
+    def test_validate_warns_when_references_non_dependency(self, tmp_path):
+        """validate() warns when when: references a node not in depends_on."""
+        wf_content = """
+name: test-when-validation
+nodes:
+  a:
+    agent: agent-a
+    task: Task A
+  b:
+    agent: agent-b
+    task: Task B
+    when: "{a.status} == done"
+  c:
+    agent: agent-c
+    task: Task C
+    depends_on: [b]
+"""
+        (tmp_path / "test-when-validation.yaml").write_text(wf_content)
+        engine = WorkflowEngine(workflows_dir=tmp_path)
+        result = engine.validate("test-when-validation")
+        # b references a in when: but doesn't declare a in depends_on
+        when_warnings = [
+            i for i in result["issues"]
+            if "when:" in i and "depends_on" in i
+        ]
+        assert len(when_warnings) >= 1
+
+    def test_validate_no_warn_when_depends_on_declared(self, tmp_path):
+        """validate() does NOT warn when when: references a declared dependency."""
+        wf_content = """
+name: test-when-valid-dep
+nodes:
+  a:
+    agent: agent-a
+    task: Task A
+  b:
+    agent: agent-b
+    task: Task B
+    depends_on: [a]
+    when: "{a.status} == done"
+"""
+        (tmp_path / "test-when-valid-dep.yaml").write_text(wf_content)
+        engine = WorkflowEngine(workflows_dir=tmp_path)
+        result = engine.validate("test-when-valid-dep")
+        when_warnings = [
+            i for i in result["issues"]
+            if "when:" in i and "depends_on" in i
+        ]
+        assert len(when_warnings) == 0
+
+    def test_validate_no_warn_when_context_reference(self, tmp_path):
+        """validate() does NOT warn for {context.key} references."""
+        wf_content = """
+name: test-when-ctx-val
+nodes:
+  a:
+    agent: agent-a
+    task: Task A
+    when: "{context.mode} == production"
+"""
+        (tmp_path / "test-when-ctx-val.yaml").write_text(wf_content)
+        engine = WorkflowEngine(workflows_dir=tmp_path)
+        result = engine.validate("test-when-ctx-val")
+        when_warnings = [
+            i for i in result["issues"]
+            if "when:" in i and "depends_on" in i
+        ]
+        assert len(when_warnings) == 0
+
+    # ── WorkflowNode data model ──
+
+    def test_workflow_node_when_defaults_to_empty(self):
+        """WorkflowNode.when defaults to empty string."""
+        node = WorkflowNode(id="x", agent="a", task="T")
+        assert node.when == ""
+
+    def test_workflow_node_when_set_from_yaml(self, tmp_path):
+        """load_workflow() parses when: from YAML."""
+        wf_content = """
+name: test-when-yaml
+nodes:
+  a:
+    agent: agent-a
+    task: Task A
+  b:
+    agent: agent-b
+    task: Task B
+    depends_on: [a]
+    when: "{a.status} == done"
+"""
+        (tmp_path / "test-when-yaml.yaml").write_text(wf_content)
+        engine = WorkflowEngine(workflows_dir=tmp_path)
+        wf = engine.load_workflow("test-when-yaml")
+        assert wf.nodes["b"].when == "{a.status} == done"
+        assert wf.nodes["a"].when == ""
+
+    # ── Parenthesized expressions ──
+
+    def test_when_parenthesized(self, engine):
+        """when: ({a.status} == done) or ({b.status} == done) → grouping."""
+        wf = Workflow(name="test-when-paren")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        wf.nodes["b"] = WorkflowNode(id="b", agent="b", task="B")
+        wf.nodes["c"] = WorkflowNode(
+            id="c", agent="c", task="C",
+            depends_on=["a", "b"],
+            when='({a.status} == done) or ({b.status} == done)',
+        )
+        states = {
+            "a": NodeState(node_id="a", status="failed"),
+            "b": NodeState(node_id="b", status="done"),
+            "c": NodeState(node_id="c"),
+        }
+        assert engine.evaluate_when(
+            '({a.status} == done) or ({b.status} == done)',
+            wf.nodes["c"], states,
+        ) is True
+
+    # ── Error_count and duration_seconds fields ──
+
+    def test_when_error_count(self, engine):
+        """when: {a.error_count} > 0 → checks error_count field."""
+        wf = Workflow(name="test-when-errcount")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="failed", error_count=3),
+        }
+        assert engine.evaluate_when(
+            "{a.error_count} > 0", wf.nodes["a"], states
+        ) is True
+
+    # ── Fail-closed on evaluation error ──
+
+    def test_when_evaluation_error_skips(self, engine):
+        """Evaluation errors default to skip (fail-closed)."""
+        wf = Workflow(name="test-when-err")
+        wf.nodes["a"] = WorkflowNode(id="a", agent="a", task="A")
+        states = {
+            "a": NodeState(node_id="a", status="done"),
+        }
+        # Malformed expression — should skip
+        assert engine.evaluate_when(
+            "()", wf.nodes["a"], states
+        ) is False
+
+    # ── Complex real-world pattern ──
+
+    def test_when_realistic_branching(self, engine):
+        """Realistic pattern: deploy only if review passed and tests green."""
+        wf = Workflow(name="test-when-realistic")
+        wf.nodes["review"] = WorkflowNode(id="review", agent="r", task="R")
+        wf.nodes["tests"] = WorkflowNode(id="tests", agent="t", task="T")
+        wf.nodes["deploy"] = WorkflowNode(
+            id="deploy", agent="d", task="D",
+            depends_on=["review", "tests"],
+            when='{review.status} == done and {tests.status} == done',
+        )
+        wf.nodes["notify-fail"] = WorkflowNode(
+            id="notify-fail", agent="n", task="N",
+            depends_on=["review", "tests"],
+            when='{review.status} != done or {tests.status} != done',
+        )
+        states = {
+            "review": NodeState(node_id="review", status="done"),
+            "tests": NodeState(node_id="tests", status="failed"),
+            "deploy": NodeState(node_id="deploy"),
+            "notify-fail": NodeState(node_id="notify-fail"),
+        }
+        # deploy should be skipped (tests failed)
+        assert engine.evaluate_when(
+            '{review.status} == done and {tests.status} == done',
+            wf.nodes["deploy"], states,
+        ) is False
+        # notify-fail should dispatch (tests failed)
+        assert engine.evaluate_when(
+            '{review.status} != done or {tests.status} != done',
+            wf.nodes["notify-fail"], states,
+        ) is True

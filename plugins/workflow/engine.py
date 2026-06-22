@@ -141,6 +141,22 @@ class WorkflowNode:
        keeps its depends_on relationships and promotes to 'ready'
        when all children complete.
     """
+    when: str = ""
+    """Conditional expression controlling whether this node dispatches.
+
+    Empty string (default) means always run — preserving the existing
+    behavior for all workflows.  Non-empty strings are evaluated against
+    the workflow state + context at dispatch time; a truthy result means
+    the node runs, falsy means it is skipped.
+
+    Supported references inside the expression:
+      {node-id}.status, {node-id}.result, {node-id}.error,
+      {node-id}.attempts, {node-id}.duration_seconds, {node-id}.error_count
+      {context.key}
+
+    Supported operators:
+      ==, !=, >, <, >=, <=, contains, starts_with, in, and, or, not
+    """
 
 @dataclass
 class Workflow:
@@ -338,6 +354,7 @@ class WorkflowEngine:
                 privacy_gate=bool(node_data.get("privacy_gate", False)),
                 goal_max_turns=node_data.get("goal_max_turns"),
                 triage=bool(node_data.get("triage", False)),
+                when=node_data.get("when", ""),
             )
 
         return workflow
@@ -1408,7 +1425,312 @@ class WorkflowEngine:
                     f"| retry to make failure routing intentional, not implicit."
                 )
 
+        # ── when: dependency validation (non-fatal) ──
+        # Warn if a when: expression references a node that is not in
+        # the current node's depends_on list.  This catches missing
+        # dependency declarations — the engine would still skip nodes
+        # with failed deps, but the when: condition might silently
+        # evaluate to a stale value instead of being properly gated.
+        for nid, node in workflow.nodes.items():
+            if not node.when:
+                continue
+            # Extract all {node-id.field} references from the when expr
+            refs = re.findall(
+                r"\{([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z0-9_\-]+\}",
+                node.when,
+            )
+            for ref_nid in set(refs):
+                if ref_nid == "context":
+                    continue  # context is always available
+                if ref_nid not in workflow.nodes:
+                    continue  # unknown node — separate issue
+                if ref_nid not in node.depends_on and ref_nid != nid:
+                    result["issues"].append(
+                        f"Node '{nid}' has when: referencing '{ref_nid}' "
+                        f"but does not declare it in depends_on. Add "
+                        f"'{ref_nid}' to depends_on or use a context "
+                        f"variable instead."
+                    )
+
         return result
+
+    # ── When-condition evaluation ──────────────────────────────
+
+    # Operator tokens recognised in when: expressions
+    _WHEN_OPS = frozenset({"==", "!=", ">", "<", ">=", "<=", "contains", "starts_with"})
+    _WHEN_KEYWORDS = frozenset({"and", "or", "not", "in", "True", "False", "None"})
+
+    def _resolve_when_references(self, when_expr: str, states: dict,
+                                  context: Optional[dict] = None) -> str:
+        """Resolve ``{node-id.field}`` and ``{context.key}`` in a
+        ``when:`` expression, replacing them with their literal values
+        (quoted strings, raw numbers).
+
+        Unresolved references are left as literal text — the evaluator
+        will treat unknown identifiers as string values.
+        """
+        # Build a lookup of node state fields
+        when_lookup: dict = {}
+        for nid, st in states.items():
+            when_lookup[nid] = {
+                "status": st.status,
+                "result": st.result or "",
+                "error": st.error or "",
+                "attempts": st.attempts,
+                "duration_seconds": st.duration_seconds,
+                "error_count": st.error_count,
+            }
+        when_lookup["context"] = dict(context or {})
+
+        def _replace(match: re.Match) -> str:
+            if match.group("ns") is not None:
+                ns, field = match.group("ns"), match.group("field")
+                ns_val = when_lookup.get(ns)
+                if isinstance(ns_val, dict) and field in ns_val:
+                    val = ns_val[field]
+                    if isinstance(val, str):
+                        return f'"{val}"'
+                    if val is None:
+                        return "None"
+                    return str(val)
+                return match.group(0)  # Leave unresolved
+            bare = match.group("bare")
+            ctx = when_lookup.get("context")
+            if isinstance(ctx, dict) and bare in ctx:
+                val = ctx[bare]
+                if isinstance(val, str):
+                    return f'"{val}"'
+                if val is None:
+                    return "None"
+                return str(val)
+            if bare in when_lookup:
+                val = when_lookup[bare]
+                if isinstance(val, str):
+                    return f'"{val}"'
+                if val is None:
+                    return "None"
+                return str(val)
+            return match.group(0)
+
+        return self._TEMPLATE_RE.sub(_replace, when_expr)
+
+    def _tokenize_when(self, expr: str) -> list:
+        """Tokenize a resolved when: expression into a flat list of
+        (type, value) tuples.  Unquoted identifiers that are not
+        reserved keywords are treated as string literals.
+        """
+        tokens = []
+        i = 0
+        n = len(expr)
+        while i < n:
+            # Whitespace — skip
+            if expr[i].isspace():
+                i += 1
+                continue
+            # Quoted string
+            if expr[i] == '"':
+                j = i + 1
+                while j < n and expr[j] != '"':
+                    if expr[j] == '\\':
+                        j += 1
+                    j += 1
+                tokens.append(("STRING", expr[i + 1:j]))
+                i = j + 1
+                continue
+            # Number (possibly negative)
+            if expr[i].isdigit() or (
+                expr[i] == '-' and i + 1 < n and expr[i + 1].isdigit()
+                and (not tokens or tokens[-1][0] in ("OP", "KEYWORD", "BRACKET", "COMMA"))
+            ):
+                j = i
+                if expr[j] == '-':
+                    j += 1
+                while j < n and (expr[j].isdigit() or expr[j] == '.'):
+                    j += 1
+                num_str = expr[i:j]
+                tokens.append(
+                    ("NUMBER", float(num_str) if '.' in num_str else int(num_str))
+                )
+                i = j
+                continue
+            # Brackets
+            if expr[i] in '[]()':
+                tokens.append(("BRACKET", expr[i]))
+                i += 1
+                continue
+            # Comma
+            if expr[i] == ',':
+                tokens.append(("COMMA", ","))
+                i += 1
+                continue
+            # Multi-char operators (>=, <=, !=, ==) — check before single-char
+            if i + 1 < n and expr[i:i+2] in ("==", "!=", ">=", "<="):
+                tokens.append(("OP", expr[i:i+2]))
+                i += 2
+                continue
+            # Single-char operators
+            if expr[i] in "><":
+                tokens.append(("OP", expr[i]))
+                i += 1
+                continue
+            # Word (identifier / keyword / operator-name)
+            j = i
+            while j < n and not expr[j].isspace() and expr[j] not in '[],();':
+                j += 1
+            word = expr[i:j]
+            if word in self._WHEN_OPS:
+                tokens.append(("OP", word))
+            elif word in self._WHEN_KEYWORDS:
+                tokens.append(("KEYWORD", word))
+            else:
+                # Unknown identifier → string literal
+                tokens.append(("STRING", word))
+            i = j
+        return tokens
+
+    def _eval_when_tokens(self, tokens: list) -> bool:
+        """Evaluate a tokenized when: expression via recursive descent.
+
+        Grammar (precedence low → high):
+            or_expr  → and_expr ('or' and_expr)*
+            and_expr → not_expr ('and' not_expr)*
+            not_expr → 'not' not_expr | in_expr
+            in_expr  → comparison ('in' '[' list ']')?
+            comparison → atom (op atom)?
+            atom      → STRING | NUMBER | 'True' | 'False' | 'None'
+                        | '(' or_expr ')'
+        """
+        pos = [0]
+
+        def _peek():
+            return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+        def _consume():
+            t = tokens[pos[0]]
+            pos[0] += 1
+            return t
+
+        def _to_num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _parse_or():
+            left = _parse_and()
+            while _peek() == ("KEYWORD", "or"):
+                _consume()
+                right = _parse_and()
+                left = left or right
+            return left
+
+        def _parse_and():
+            left = _parse_not()
+            while _peek() == ("KEYWORD", "and"):
+                _consume()
+                right = _parse_not()
+                left = left and right
+            return left
+
+        def _parse_not():
+            if _peek() == ("KEYWORD", "not"):
+                _consume()
+                return not _parse_not()
+            return _parse_in()
+
+        def _parse_in():
+            left = _parse_comparison()
+            if _peek() == ("KEYWORD", "in"):
+                _consume()
+                # Expect '['
+                assert _peek() == ("BRACKET", "["), "Expected '[' after 'in'"
+                _consume()
+                items = []
+                while _peek() and _peek() != ("BRACKET", "]"):
+                    items.append(_parse_atom())
+                    if _peek() == ("COMMA", ","):
+                        _consume()
+                assert _peek() == ("BRACKET", "]"), "Expected ']' to close list"
+                _consume()
+                return left in items
+            return left
+
+        def _parse_comparison():
+            left = _parse_atom()
+            pk = _peek()
+            if pk and pk[0] == "OP" and pk[1] in self._WHEN_OPS:
+                op = _consume()[1]
+                right = _parse_atom()
+                if op == "==":
+                    return left == right
+                elif op == "!=":
+                    return left != right
+                elif op == ">":
+                    return _to_num(left) > _to_num(right)
+                elif op == "<":
+                    return _to_num(left) < _to_num(right)
+                elif op == ">=":
+                    return _to_num(left) >= _to_num(right)
+                elif op == "<=":
+                    return _to_num(left) <= _to_num(right)
+                elif op == "contains":
+                    return str(right) in str(left)
+                elif op == "starts_with":
+                    return str(left).startswith(str(right))
+            return left
+
+        def _parse_atom():
+            pk = _peek()
+            if pk is None:
+                raise ValueError("Unexpected end of when: expression")
+            if pk[0] == "NUMBER":
+                return _consume()[1]
+            if pk[0] == "STRING":
+                return _consume()[1]
+            if pk[0] == "KEYWORD" and pk[1] in ("True", "False", "None"):
+                val = _consume()[1]
+                return {"True": True, "False": False, "None": None}[val]
+            if pk[0] == "BRACKET" and pk[1] == "(":
+                _consume()
+                val = _parse_or()
+                assert _peek() == ("BRACKET", ")"), "Expected ')' in when: expression"
+                _consume()
+                return val
+            raise ValueError(f"Unexpected token in when: expression: {pk}")
+
+        return bool(_parse_or())
+
+    def evaluate_when(self, when_expr: str, node: "WorkflowNode",
+                      states: dict, context: Optional[dict] = None,
+                      layers: list = None,
+                      workflow: "Workflow" = None) -> bool:
+        """Evaluate a node's ``when:`` condition against the current
+        workflow state.
+
+        Returns True when the node should dispatch (truthy expression
+        or empty ``when``), False when it should be skipped.
+        """
+        if not when_expr or not when_expr.strip():
+            return True  # Empty = always run
+
+        try:
+            resolved = self._resolve_when_references(
+                when_expr, states, context
+            )
+            tokens = self._tokenize_when(resolved)
+            if not tokens:
+                return True  # Empty after resolution = always run
+            return self._eval_when_tokens(tokens)
+        except Exception as exc:
+            # Fail open — evaluation error defaults to skip to avoid
+            # dispatching a node whose condition couldn't be checked.
+            import sys as _sys
+            print(
+                f"   ⚠  when: evaluation error for "
+                f"'{when_expr}': {exc} — skipping node",
+                file=_sys.stderr,
+            )
+            return False
 
     # ── Execution ──────────────────────────────────────────────
 
@@ -1535,6 +1857,14 @@ class WorkflowEngine:
                     if deps_failed:
                         print(f"   [SKIP] {nid} — {'; '.join(deps_failed)}")
                         continue
+                    # dry-run when: check
+                    if node.when:
+                        if not self.evaluate_when(
+                            node.when, node, states, context,
+                            layers=layers, workflow=workflow,
+                        ):
+                            print(f"   [SKIP] {nid} — when: {node.when}")
+                            continue
                     if node.synthetic:
                         # Synthetic gates auto-complete — there is no
                         # card to create, so dry-run should still
@@ -1585,6 +1915,21 @@ class WorkflowEngine:
                     results[nid] = "blocked"
                     print(f"   🚧 {nid} — WAITING ({', '.join(deps_blocked)} blocked)")
                     continue
+
+                # ── when: conditional dispatch ──
+                # Evaluate the node's when: expression against the
+                # current workflow state.  Empty when: = always run
+                # (preserves existing behavior for all workflows).
+                if node.when:
+                    if not self.evaluate_when(
+                        node.when, node, states, context,
+                        layers=layers, workflow=workflow,
+                    ):
+                        state.status = "skipped"
+                        state.error = f"Skipped: when condition not met ({node.when})"
+                        results[nid] = "skipped"
+                        print(f"   ⏭ {nid} — SKIPPED (when: {node.when})")
+                        continue
 
                 # Synthetic gate nodes: auto-complete here. By the time
                 # we reach this layer, all depends_on are done (the
