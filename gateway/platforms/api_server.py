@@ -2489,6 +2489,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2497,6 +2498,13 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
+
+        If *model_override* is provided (e.g. from the request body's
+        ``model`` field), it takes precedence over the gateway default.
+        When the override contains a provider prefix (e.g.
+        ``openrouter/openai/gpt-5.5``), the provider and base_url are
+        resolved from config.yaml so the agent routes to the correct
+        backend.
 
         ``gateway_session_key`` is a stable per-channel identifier supplied
         by the client (via ``X-Hermes-Session-Key``).  Unlike ``session_id``
@@ -2767,6 +2775,91 @@ class APIServerAdapter(BasePlatformAdapter):
             if confirmed_runtime_lock
             else GatewayRunner._load_fallback_model()
         )
+
+        # Apply model override from request body if provided.
+        # This allows API consumers (CCC, external UIs) to select a model
+        # per-request rather than always using the gateway default.
+        # Runs AFTER the selection block above so a provider-prefixed
+        # override (e.g. ``litellm-dev/dev-gpt54``, ``openai-codex/gpt-5.5``)
+        # wins for this request. A confirmed Browser runtime lock is an
+        # execution contract and is never overridden.
+        if model_override and not confirmed_runtime_lock:
+            model = model_override
+            _override_lower = model_override.lower()
+            providers_cfg = user_config.get("providers", {})
+            if _override_lower.startswith("openrouter/"):
+                or_cfg = providers_cfg.get("openrouter", {})
+                runtime_kwargs["provider"] = "openrouter"
+                if or_cfg.get("api_key"):
+                    runtime_kwargs["api_key"] = or_cfg["api_key"]
+                if or_cfg.get("base_url"):
+                    runtime_kwargs["base_url"] = or_cfg["base_url"]
+                elif not runtime_kwargs.get("base_url"):
+                    runtime_kwargs["base_url"] = "https://openrouter.ai/api/v1"
+            elif _override_lower.startswith("litellm-") or _override_lower.startswith("litellm/"):
+                runtime_kwargs["provider"] = "custom"
+                runtime_kwargs["base_url"] = "http://localhost:4000"
+            elif "/" in model_override:
+                # General provider-prefix routing. When the override is
+                # ``<provider>/<model>`` and ``<provider>`` is a registered
+                # Hermes provider (e.g. ``openai-codex/gpt-5.5``,
+                # ``anthropic/claude-sonnet-4-6``), pin that provider and strip
+                # the prefix so the bare model reaches it.
+                #
+                # Setting ``provider`` alone is NOT enough: AIAgent keeps the
+                # gateway's default base_url/api_key when only a provider name
+                # is passed, so an OAuth-gated provider would still hit the
+                # default endpoint (e.g. openai-codex/gpt-5.5 -> api.anthropic.com
+                # -> 404). We therefore run the same canonical resolver the CLI
+                # uses (``resolve_runtime_provider``) to fetch the provider's
+                # base_url, api_key/OAuth token, api_mode, and credential pool,
+                # and merge them into runtime_kwargs. This routes OAuth-gated
+                # providers like openai-codex (ChatGPT subscription) directly,
+                # without per-model special-casing.
+                #
+                # Aggregator-namespaced models (``openai/gpt-4o``) and litellm
+                # aliases are unaffected because their prefixes don't resolve to
+                # a registered provider profile.
+                _prefix = model_override.split("/", 1)[0].strip().lower()
+                try:
+                    from providers import get_provider_profile as _gpf_override
+                    _prefix_profile = _gpf_override(_prefix)
+                except Exception:
+                    _prefix_profile = None
+                if _prefix_profile is not None:
+                    _bare_model = model_override.split("/", 1)[1]
+                    try:
+                        from hermes_cli.runtime_provider import (
+                            resolve_runtime_provider as _rrp_override,
+                        )
+                        _binding = _rrp_override(
+                            requested=_prefix_profile.name,
+                            target_model=_bare_model,
+                        )
+                    except Exception:
+                        _binding = None
+                    if _binding:
+                        # Provider resolved with full runtime binding. Honor
+                        # only the fields the resolver actually produced so we
+                        # never clobber runtime_kwargs with empty values.
+                        runtime_kwargs["provider"] = (
+                            _binding.get("provider") or _prefix_profile.name
+                        )
+                        if _binding.get("base_url"):
+                            runtime_kwargs["base_url"] = _binding["base_url"]
+                        if _binding.get("api_key"):
+                            runtime_kwargs["api_key"] = _binding["api_key"]
+                        if _binding.get("api_mode"):
+                            runtime_kwargs["api_mode"] = _binding["api_mode"]
+                        if _binding.get("credential_pool") is not None:
+                            runtime_kwargs["credential_pool"] = _binding[
+                                "credential_pool"
+                            ]
+                    else:
+                        # Resolver unavailable/failed — fall back to pinning the
+                        # provider name only (base_url/key resolve downstream).
+                        runtime_kwargs["provider"] = _prefix_profile.name
+                    model = _bare_model
 
         agent_kwargs = {
             "model": model,
@@ -3983,6 +4076,13 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
+        # Derive model override: use body.model if it differs from the
+        # gateway's advertised model name (which is just an alias).
+        # Unlike agent_overrides (gated on direct_model_requests), this
+        # carry always honors provider-prefixed overrides from CCC.
+        _chat_model_override = body.get("model") or None
+        if _chat_model_override == self._model_name:
+            _chat_model_override = None
 
         if stream:
             import queue as _q
@@ -4068,6 +4168,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                model_override=_chat_model_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4089,6 +4190,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                model_override=_chat_model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5115,6 +5217,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # groups the entire conversation under one session entry.
         session_id = stored_session_id or str(uuid.uuid4())
 
+        # Derive model override for responses API (carry: always honors
+        # provider-prefixed overrides regardless of direct_model_requests).
+        _resp_model_override = body.get("model") or None
+        if _resp_model_override == self._model_name:
+            _resp_model_override = None
+
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(
@@ -5185,6 +5293,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                model_override=_resp_model_override,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5220,6 +5329,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                model_override=_resp_model_override,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5932,6 +6042,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        model_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5989,6 +6100,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        model_override=model_override,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -6378,6 +6490,12 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+        # Extract requested model from body (may be None/empty → use gateway default)
+        requested_model = body.get("model") or None
+        # Don't treat self._model_name as an override — it's the gateway default alias
+        if requested_model == self._model_name:
+            requested_model = None
+
         self._set_run_status(
             run_id,
             "queued",
@@ -6416,6 +6534,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         requested_provider=agent_overrides.get("requested_provider"),
                         model_options=agent_overrides.get("model_options"),
                         route=route,
+                        model_override=requested_model,
                     )
                 self._active_run_agents[run_id] = agent
 
