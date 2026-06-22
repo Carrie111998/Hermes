@@ -179,17 +179,6 @@ class NodeState:
                                   # "revision_needed". Available to
                                   # downstream nodes via {phaseN.X} or
                                   # {node-id} template substitution.
-                                  # If the body contained the SILENT
-                                  # marker, the literal is stripped here
-                                  # and `silent` is set to True so the
-                                  # caller knows to skip delivery.
-    silent: bool = False          # True when the captured result contained
-                                  # the [SILENT] marker. Caller (the
-                                  # workflow-result handler) should skip
-                                  # Discord / notification delivery for
-                                  # silent nodes — they're cron-style
-                                  # health checks that found nothing to
-                                  # report.
     duration_seconds: Optional[float] = None
     """Wall-clock duration from started_at → completed_at.
 
@@ -224,17 +213,7 @@ class WorkflowEngine:
     MAX_REVISION_LOOPS = 3
     POLL_INTERVAL = 15  # seconds between kanban status checks
     STATE_DIR = None     # Set after init for state persistence
-    SILENT_MARKER = "[SILENT]"
-    """Marker agents include in their card body to suppress delivery.
 
-    When a node's captured body contains this literal, the engine sets
-    ``state.silent = True`` and strips the marker from ``state.result``
-    so it doesn't leak into downstream template substitution. The
-    workflow-result handler (the agent that called ``workflow_start``)
-    should check ``state.silent`` and skip Discord / notification
-    delivery when it's True. Used for cron-style health checks that
-    should stay quiet when nothing's wrong.
-    """
 
     def __init__(self, workflows_dir: str = None):
         if workflows_dir is None:
@@ -565,25 +544,7 @@ class WorkflowEngine:
             workflow=workflow, states=states, layers=layers,
         )
 
-    def _apply_silent_marker(self, state: NodeState) -> None:
-        """Check the captured result for the [SILENT] marker.
 
-        If present, sets ``state.silent = True`` and strips the marker
-        literal from ``state.result`` so it doesn't leak into downstream
-        ``{node-id}`` template substitution. The caller (workflow-result
-        handler) checks ``state.silent`` and skips Discord / notification
-        delivery for silent nodes — used by cron-style health checks
-        that should stay quiet when nothing's wrong.
-
-        Safe to call on a state with ``result = None``.
-        """
-        if not state.result:
-            return
-        if self.SILENT_MARKER in state.result:
-            state.silent = True
-            state.result = state.result.replace(
-                self.SILENT_MARKER, ""
-            ).strip()
 
     # Terminal statuses for which we record telemetry. Anything else
     # (running, pending, blocked, revision_needed, degraded) is mid-flight.
@@ -1099,7 +1060,6 @@ class WorkflowEngine:
                 # bottleneck analysis.
                 "duration_seconds": s.duration_seconds,
                 "error_count": s.error_count,
-                "silent": s.silent,
             } for nid, s in states.items()},
             "results": results,
             "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -1947,15 +1907,6 @@ class WorkflowEngine:
                             state.result = self.get_card_body(
                                 state.kanban_card_id
                             )
-                            # [SILENT] suppression: when an agent's
-                            # captured body contains the marker, mark
-                            # the node silent, strip the literal so it
-                            # doesn't leak into downstream {node-id}
-                            # template substitution, and let the caller
-                            # skip notification delivery. Used by
-                            # cron-style health checks that should
-                            # stay quiet when nothing's wrong.
-                            self._apply_silent_marker(state)
                         except Exception as e:
                             print(f"   ⚠  {nid} done but result "
                                   f"capture failed: {e}")
