@@ -4,7 +4,7 @@ Users configure the analyst under ``auxiliary.workflow_analyst`` in config.yaml.
 The engine invokes it via ``get_text_auxiliary_client("workflow_analyst")``
 for three analysis modes: escalation, status summary, and failure diagnosis.
 
-See ``plugins/workflow-engine/analyst.py`` for the auxiliary module.
+See ``plugins/workflow/analyst.py`` for the auxiliary module.
 """
 
 from __future__ import annotations

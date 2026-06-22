@@ -1,4 +1,4 @@
-"""Agent-facing tools for the workflow-engine plugin.
+"""Agent-facing tools for the workflow plugin.
 
 These wrap the in-process ``WorkflowEngine`` class so an agent (e.g. Sherlock)
 can drive pipeline execution through its normal tool calls without having
