@@ -45,7 +45,7 @@ def check_workflow_requirements() -> bool:
     against local kanban + filesystem state.
     """
     try:
-        from tools.workflow_engine import WorkflowEngine  # noqa: F401
+        from plugins.workflow.engine import WorkflowEngine  # noqa: F401
     except ImportError as exc:
         logger.debug("workflow_engine import failed: %s", exc)
         return False
@@ -54,7 +54,7 @@ def check_workflow_requirements() -> bool:
     # the gate reflects whatever directory the engine itself would use.
     try:
         from pathlib import Path
-        engine_mod = __import__("tools.workflow_engine", fromlist=["WorkflowEngine"])
+        engine_mod = __import__("plugins.workflow.engine", fromlist=["WorkflowEngine"])
         workflows_dir = Path(engine_mod.__file__).resolve().parent.parent / "docs" / "fleet-pipelines"
         if not workflows_dir.is_dir():
             return False
@@ -72,7 +72,7 @@ def _engine():
     plugin still loads in test contexts where ``tools.workflow_engine`` may
     not be importable (the check_fn already gates on this, but defense in
     depth is cheap)."""
-    from tools.workflow_engine import WorkflowEngine
+    from plugins.workflow.engine import WorkflowEngine
     return WorkflowEngine()
 
 

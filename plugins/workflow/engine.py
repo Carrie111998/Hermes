@@ -6,9 +6,9 @@ for ready nodes, monitors completion, and advances the graph. Supports revision
 loops via the LOOP:<target> convention in block reasons.
 
 Usage:
-    python -m tools.workflow_engine start ideation --context pr=123
-    python -m tools.workflow_engine validate ideation
-    python -m tools.workflow_engine list
+    python -m plugins.workflow.engine start ideation --context pr=123
+    python -m plugins.workflow.engine validate ideation
+    python -m plugins.workflow.engine list
 
 Architecture:
     Trigger (Discord/webhook) → Classify (Sherlock) → Engine (this) → Kanban → Agents
@@ -66,7 +66,7 @@ def _hermes_binary() -> str:
         return str(candidate)
     # ``sys.prefix`` is set to the venv root by the activated
     # environment, regardless of which python binary executed this
-    # module.  This catches ``python3 -m tools.workflow_engine``
+    # module.  This catches ``python3 -m plugins.workflow.engine``
     # invocations where ``sys.executable`` is the system python.
     venv_candidate = Path(sys.prefix) / "bin" / "hermes"
     if venv_candidate.is_file():
@@ -1223,7 +1223,7 @@ class WorkflowEngine:
         """Try LLM analysis of a deadlocked revision loop. Best-effort —
         failure is silent; the engine continues with mechanical escalation."""
         try:
-            from tools.workflow_analyst import analyze_escalation
+            from plugins.workflow.analyst import analyze_escalation
         except Exception:
             return  # Auxiliary module not available
 
@@ -1268,7 +1268,7 @@ class WorkflowEngine:
         if node.synthetic:
             return
         try:
-            from tools.workflow_analyst import analyze_failure
+            from plugins.workflow.analyst import analyze_failure
         except Exception:
             return
 
@@ -1298,7 +1298,7 @@ class WorkflowEngine:
                              saved_state: dict) -> Optional[str]:
         """Try LLM summary of pipeline state. Returns summary text or None."""
         try:
-            from tools.workflow_analyst import analyze_status
+            from plugins.workflow.analyst import analyze_status
         except Exception:
             return None
 

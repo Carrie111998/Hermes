@@ -22,7 +22,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from tools.workflow_llm_utils import extract_json_blob
+from plugins.workflow.llm_utils import extract_json_blob
 
 logger = logging.getLogger(__name__)
 

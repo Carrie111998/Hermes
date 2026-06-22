@@ -13,7 +13,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # Import the engine module (must be run from hermes-agent repo root)
-from tools.workflow_engine import (
+from plugins.workflow.engine import (
     WorkflowEngine, Workflow, WorkflowNode, NodeState,
     CycleDetectedError,
 )
