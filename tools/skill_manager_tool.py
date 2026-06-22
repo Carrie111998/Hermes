@@ -814,7 +814,43 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if unsafe:
         return {"success": False, "error": unsafe}
 
-    shutil.rmtree(skill_dir)
+    # During the curator consolidation pass, a verified consolidation must be
+    # RECOVERABLE: archival into ~/.hermes/skills/.archive/ is documented as
+    # the maximum destructive action the curator may take, and
+    # `hermes curator restore` promises the skill can be brought back. Route
+    # through the recoverable archive primitive instead of permanent rmtree so
+    # a misjudged consolidation can be undone (#29912). Foreground,
+    # user-directed deletes keep their existing hard-delete semantics.
+    try:
+        from tools.skill_provenance import is_background_review
+        curator_pass = is_background_review()
+    except Exception:
+        curator_pass = False
+
+    if curator_pass:
+        try:
+            from tools.skill_usage import archive_skill
+            ok, archive_msg = archive_skill(name)
+        except Exception as e:
+            return {"success": False, "error": f"failed to archive '{name}': {e}"}
+        if not ok:
+            return {"success": False, "error": archive_msg}
+        message = f"Skill '{name}' archived ({archive_msg})."
+        if is_consolidation:
+            message += f" Content absorbed into '{absorbed_target}'."
+        return {"success": True, "message": message, "_archived": True}
+
+    try:
+        shutil.rmtree(skill_dir)
+    except PermissionError:
+        return {
+            "success": False,
+            "error": (
+                f"Cannot delete skill '{name}': permission denied. "
+                "This is likely a bundled read-only skill installed as part of the base image. "
+                "It cannot be removed."
+            ),
+        }
 
     # Clean up empty category directories (don't remove the skills root itself)
     parent = skill_dir.parent
