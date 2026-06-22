@@ -190,6 +190,21 @@ class NodeState:
                                   # silent nodes — they're cron-style
                                   # health checks that found nothing to
                                   # report.
+    duration_seconds: Optional[float] = None
+    """Wall-clock duration from started_at → completed_at.
+
+    Populated when the node enters a terminal status (done / failed /
+    timed_out / blocked / revision_needed). Computed from started_at
+    and completed_at; agents don't need to set it manually. Exposed
+    via workflow_status for cost / bottleneck analysis.
+    """
+    error_count: int = 0
+    """Cumulative count of failed / timed_out transitions for this node.
+
+    Incremented each time the node enters a failure state. Multiple
+    retries on a flaky node will increment this counter — useful for
+    spotting nodes that keep failing across runs.
+    """
     validation_warnings: list[str] = field(default_factory=list)
 
 # ── Engine core ──────────────────────────────────────────────────
@@ -570,11 +585,102 @@ class WorkflowEngine:
                 self.SILENT_MARKER, ""
             ).strip()
 
+    # Terminal statuses for which we record telemetry. Anything else
+    # (running, pending, blocked, revision_needed, degraded) is mid-flight.
+    _TELEMETRY_TERMINAL_STATUSES = frozenset({
+        "done", "failed", "timed_out",
+    })
+    """Statuses that mark a node as finished for telemetry purposes.
+
+    "blocked" and "revision_needed" are mid-flight (the engine may
+    rerun the node), so we don't count them as terminal for duration
+    tracking. "degraded" is also mid-flight (downstream proceeds).
+    """
+
+    # Tracks which (state-id, status) pairs have already had telemetry
+    # recorded, so repeated _save_state calls don't double-count
+    # error_count or recompute duration. Reset per engine instance.
+    _telemetry_recorded: "set[tuple[int, str]]" = None  # lazy-init in __init__
+
+    def _record_node_completion(self, state: NodeState) -> None:
+        """Capture telemetry when a node enters a terminal status.
+
+        Computes ``duration_seconds`` from ``started_at`` and
+        ``completed_at``, and increments ``error_count`` for failure
+        outcomes. Idempotent — safe to call multiple times via
+        ``_save_state`` without double-counting, using a per-node-id
+        dedup set.
+        """
+        if state.status not in self._TELEMETRY_TERMINAL_STATUSES:
+            return
+        if self._telemetry_recorded is None:
+            self._telemetry_recorded = set()
+        dedup_key = (id(state), state.status)
+        if dedup_key in self._telemetry_recorded:
+            return
+        self._telemetry_recorded.add(dedup_key)
+        if state.duration_seconds is None and state.started_at and state.completed_at:
+            try:
+                start = datetime.fromisoformat(state.started_at)
+                end = datetime.fromisoformat(state.completed_at)
+                state.duration_seconds = (end - start).total_seconds()
+            except (ValueError, TypeError):
+                pass
+        if state.status in ("failed", "timed_out"):
+            state.error_count += 1
+
     # State files older than this are considered stale — the engine
     # crashed or was killed mid-run and the state is no longer accurate.
     # Single-flight checks ignore stale state files so a single bad
     # crash doesn't permanently block a workflow from running again.
     ACTIVE_RUN_STALE_SECONDS = 3600
+
+    # How many historical state files to retain per workflow. Older
+    # state files are pruned at the end of each save so disk usage
+    # doesn't grow unbounded with long-running fleet usage. Set to
+    # a low default to keep telemetry disk-cheap; raise via
+    # ``STATE_RETENTION_PER_WORKFLOW`` env var if more history needed.
+    STATE_RETENTION_PER_WORKFLOW = 20
+
+    def _prune_old_runs(self, keep: int = None) -> int:
+        """Delete oldest state files beyond ``keep`` per workflow.
+
+        Walks the state directory, groups files by workflow name,
+        sorts each group by mtime, and unlinks everything past the
+        ``keep`` threshold. Returns the number of files pruned.
+
+        Called automatically at the end of ``_save_state`` so retention
+        is enforced without callers needing to remember. Safe to call
+        when STATE_DIR doesn't exist yet (returns 0).
+        """
+        if self.STATE_DIR is None or not self.STATE_DIR.exists():
+            return 0
+        if keep is None:
+            keep = self.STATE_RETENTION_PER_WORKFLOW
+        # Group state files by workflow name (strip "_<run_id>_state.json"
+        # or "_state.json" suffix).
+        groups: dict[str, list[Path]] = defaultdict(list)
+        for path in self.STATE_DIR.glob("*_state.json"):
+            stem = path.stem  # e.g. "council_20260101T120000_state"
+            # Strip "_state" suffix and split off the trailing timestamp.
+            if stem.endswith("_state"):
+                stem = stem[:-len("_state")]
+            # If the stem still has an underscore-separated timestamp suffix
+            # (looks like YYYYMMDDTHHMMSS), strip it for grouping.
+            parts = stem.rsplit("_", 1)
+            workflow_name = parts[0] if len(parts) > 1 else stem
+            groups[workflow_name].append(path)
+        pruned = 0
+        for wf_name, paths in groups.items():
+            # Sort by mtime ascending; prune the oldest.
+            paths.sort(key=lambda p: p.stat().st_mtime)
+            for old in paths[:-keep] if keep > 0 else paths:
+                try:
+                    old.unlink()
+                    pruned += 1
+                except OSError:
+                    pass
+        return pruned
 
     def _has_active_run(self, workflow_name: str) -> bool:
         """Return True if any in-progress run exists for ``workflow_name``.
@@ -965,6 +1071,12 @@ class WorkflowEngine:
                     current_layer: int, layers: list[list[str]],
                     run_id: str = None):
         """Persist engine state for crash recovery."""
+        # Telemetry: capture duration_seconds + error_count for any node
+        # that has reached a terminal status but hasn't been recorded yet.
+        # Idempotent — running _record_node_completion on already-recorded
+        # states is a no-op (duration_seconds check guards).
+        for node_state in states.values():
+            self._record_node_completion(node_state)
         state = {
             "workflow_name": workflow_name,
             "current_layer": current_layer,
@@ -982,12 +1094,21 @@ class WorkflowEngine:
                 # substitute {phaseN.X} / {node-id} references for
                 # downstream nodes that haven't been dispatched yet.
                 "result": s.result,
+                # Telemetry: populated by _record_node_completion before
+                # this save runs. Surface to workflow_status for cost /
+                # bottleneck analysis.
+                "duration_seconds": s.duration_seconds,
+                "error_count": s.error_count,
+                "silent": s.silent,
             } for nid, s in states.items()},
             "results": results,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         with open(self._state_path(workflow_name, run_id), "w") as f:
             json.dump(state, f, indent=2)
+        # Retention: prune state files beyond STATE_RETENTION_PER_WORKFLOW
+        # so disk usage stays bounded. No-op if nothing to prune.
+        self._prune_old_runs()
 
     def _load_state(self, workflow_name: str, run_id: str = None) -> Optional[dict]:
         """Load persisted state if it exists."""

@@ -1996,3 +1996,143 @@ def test_has_active_run_ignores_stale_state_files(tmp_path):
     engine = WorkflowEngine(workflows_dir=tmp_path)
     engine.STATE_DIR = state_dir
     assert engine._has_active_run("wf") is False
+
+
+# ── per-node telemetry tests ──────────────────────────────────────
+
+
+def test_node_state_duration_defaults_to_none():
+    """NodeState.duration_seconds starts None — populated on completion."""
+    state = NodeState(node_id="x")
+    assert state.duration_seconds is None
+
+
+def test_node_state_error_count_defaults_to_zero():
+    """NodeState.error_count starts at 0 — incremented on failure."""
+    state = NodeState(node_id="x")
+    assert state.error_count == 0
+
+
+def test_record_node_completion_computes_duration_on_done():
+    """When status='done' and started/completed_at set, duration_seconds is computed."""
+    engine = WorkflowEngine()
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 1, 12, 1, 30, tzinfo=timezone.utc)  # 90 seconds later
+    state = NodeState(
+        node_id="x",
+        status="done",
+        started_at=start.isoformat(),
+        completed_at=end.isoformat(),
+    )
+    engine._record_node_completion(state)
+    assert state.duration_seconds == 90.0
+    # Done is not a failure — error_count stays at 0.
+    assert state.error_count == 0
+
+
+def test_record_node_completion_increments_error_count_on_failure():
+    """Failed status increments error_count; duration computed if timestamps present."""
+    engine = WorkflowEngine()
+    start = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 1, 1, 12, 0, 30, tzinfo=timezone.utc)
+    state = NodeState(
+        node_id="x",
+        status="failed",
+        started_at=start.isoformat(),
+        completed_at=end.isoformat(),
+    )
+    engine._record_node_completion(state)
+    assert state.duration_seconds == 30.0
+    assert state.error_count == 1
+
+
+def test_record_node_completion_is_idempotent():
+    """Calling twice doesn't double-count error_count or recompute duration."""
+    engine = WorkflowEngine()
+    state = NodeState(
+        node_id="x",
+        status="failed",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    engine._record_node_completion(state)
+    first_duration = state.duration_seconds
+    engine._record_node_completion(state)
+    assert state.duration_seconds == first_duration
+    assert state.error_count == 1  # only incremented once
+
+
+def test_record_node_completion_no_op_for_running_status():
+    """Running nodes don't get telemetry — not terminal yet."""
+    engine = WorkflowEngine()
+    state = NodeState(
+        node_id="x",
+        status="running",
+        started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    engine._record_node_completion(state)
+    assert state.duration_seconds is None
+    assert state.error_count == 0
+
+
+def test_record_node_completion_handles_missing_timestamps():
+    """Defensive: don't crash if started_at or completed_at missing."""
+    engine = WorkflowEngine()
+    state = NodeState(node_id="x", status="done")
+    engine._record_node_completion(state)
+    assert state.duration_seconds is None
+    assert state.error_count == 0
+
+
+def test_prune_old_runs_keeps_most_recent(tmp_path):
+    """Retention deletes oldest files beyond `keep` per workflow."""
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    # Create 25 state files for "wf", spaced 1 second apart in mtime.
+    import time as _time
+    paths = []
+    for i in range(25):
+        p = state_dir / f"wf_run{i:03d}_state.json"
+        p.write_text("{}")
+        # Force mtime difference
+        import os as _os
+        _os.utime(p, (1000 + i, 1000 + i))
+        paths.append(p)
+    pruned = engine._prune_old_runs(keep=20)
+    assert pruned == 5
+    remaining = sorted(p.name for p in state_dir.glob("wf_*_state.json"))
+    assert len(remaining) == 20
+
+
+def test_prune_old_runs_groups_by_workflow(tmp_path):
+    """Pruning keeps the per-workflow limit, not a global limit."""
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    import os as _os
+    # 15 files for "wf_a" and 15 for "wf_b"
+    for wf_name in ("wf_a", "wf_b"):
+        for i in range(15):
+            p = state_dir / f"{wf_name}_run{i:03d}_state.json"
+            p.write_text("{}")
+            _os.utime(p, (1000 + i, 1000 + i))
+    pruned = engine._prune_old_runs(keep=10)
+    assert pruned == 10  # 5 from each workflow
+    assert len(list(state_dir.glob("wf_a_*"))) == 10
+    assert len(list(state_dir.glob("wf_b_*"))) == 10
+
+
+def test_prune_old_runs_no_op_when_fewer_files(tmp_path):
+    """No pruning when count is below threshold."""
+    state_dir = tmp_path / ".engine-state"
+    state_dir.mkdir()
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    engine.STATE_DIR = state_dir
+    for i in range(5):
+        (state_dir / f"wf_run{i:03d}_state.json").write_text("{}")
+    pruned = engine._prune_old_runs(keep=20)
+    assert pruned == 0
+    assert len(list(state_dir.glob("*.json"))) == 5
