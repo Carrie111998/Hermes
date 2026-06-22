@@ -59,7 +59,7 @@ def _load_fal_client() -> Any:
         pass
     except Exception as e:
         raise ImportError(str(e))
-    import fal_client as _fal_client  # noqa: F811 — module-global rebind
+    import fal_client as _fal_client  # type: ignore # noqa: F811 — module-global rebind
     fal_client = _fal_client
     return fal_client
 

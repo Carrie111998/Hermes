@@ -97,7 +97,7 @@ def _resolve_modal_image(image_spec: Any) -> Any:
     Includes add_python support for ubuntu/debian images (absorbed from PR 4511).
     """
     _ensure_modal_sdk()
-    import modal as _modal
+    import modal as _modal # type: ignore
 
     if not isinstance(image_spec, str):
         return image_spec
@@ -201,7 +201,7 @@ class ModalEnvironment(BaseEnvironment):
                 logger.info("Modal: restoring from snapshot %s", restored_snapshot_id[:20])
 
         _ensure_modal_sdk()
-        import modal as _modal
+        import modal as _modal # type: ignore
 
         cred_mounts = []
         try:

@@ -58,7 +58,7 @@ class DaytonaEnvironment(BaseEnvironment):
             pass
         except Exception as e:
             raise ImportError(str(e))
-        from daytona import (
+        from daytona import ( # type: ignore
             Daytona,
             CreateSandboxFromImageParams,
             DaytonaError,
@@ -164,7 +164,7 @@ class DaytonaEnvironment(BaseEnvironment):
         multipart POST, avoiding per-file TLS/HTTP overhead (~580 files
         goes from ~5 min to <2 s).
         """
-        from daytona.common.filesystem import FileUpload
+        from daytona.common.filesystem import FileUpload # type: ignore
 
         if not files:
             return

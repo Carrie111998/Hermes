@@ -29,6 +29,7 @@ import os
 import re
 import threading
 import time
+import typing
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -229,7 +230,7 @@ def sanitize_tool_call_arguments(
     messages: list,
     *,
     logger=None,
-    session_id: str = None,
+    session_id: Optional[str] = None,
 ) -> int:
     """Repair corrupted assistant tool-call argument JSON in-place."""
     log = logger or logging.getLogger(__name__)
@@ -708,8 +709,8 @@ def try_recover_primary_transport(
             agent._anthropic_api_key = rt["anthropic_api_key"]
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                rt["anthropic_api_key"], typing.cast(str, rt["anthropic_base_url"]),
+                timeout=typing.cast(float, get_provider_request_timeout(agent.provider, agent.model)),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -872,8 +873,8 @@ def restore_primary_runtime(agent) -> bool:
             agent._anthropic_api_key = rt["anthropic_api_key"]
             agent._anthropic_base_url = rt["anthropic_base_url"]
             agent._anthropic_client = build_anthropic_client(
-                rt["anthropic_api_key"], rt["anthropic_base_url"],
-                timeout=get_provider_request_timeout(agent.provider, agent.model),
+                rt["anthropic_api_key"], typing.cast(str, rt["anthropic_base_url"]),
+                timeout=typing.cast(float, get_provider_request_timeout(agent.provider, agent.model)),
             )
             agent._is_anthropic_oauth = rt["is_anthropic_oauth"]
             agent.client = None
@@ -1201,7 +1202,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # the same class of bug.
     client_kwargs = dict(client_kwargs)
     _validate_proxy_env_urls()
-    _validate_base_url(client_kwargs.get("base_url"))
+    _validate_base_url(typing.cast(str, client_kwargs.get("base_url")))
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
@@ -1357,8 +1358,8 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         agent._anthropic_api_key = effective_key
         agent._anthropic_base_url = base_url or getattr(agent, "_anthropic_base_url", None)
         agent._anthropic_client = build_anthropic_client(
-            effective_key, agent._anthropic_base_url,
-            timeout=get_provider_request_timeout(agent.provider, agent.model),
+            effective_key, typing.cast(str, agent._anthropic_base_url),
+            timeout=typing.cast(float, get_provider_request_timeout(agent.provider, agent.model)),
         )
         agent._is_anthropic_oauth = _is_oauth_token(effective_key) if _is_native_anthropic else False
         agent.client = None
@@ -1486,7 +1487,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
-                 tool_call_id: Optional[str] = None, messages: list = None,
+                 tool_call_id: Optional[str] = None, messages: Optional[list] = None,
                  pre_tool_block_checked: bool = False) -> str:
     """Invoke a single tool and return the result string. No display logic.
 
@@ -1535,7 +1536,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         target = function_args.get("target", "memory")
         from tools.memory_tool import memory_tool as _memory_tool
         result = _memory_tool(
-            action=function_args.get("action"),
+            action=typing.cast(str, function_args.get("action")),
             target=target,
             content=function_args.get("content"),
             old_text=function_args.get("old_text"),

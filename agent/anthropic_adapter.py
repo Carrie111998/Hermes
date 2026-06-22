@@ -45,7 +45,7 @@ def _get_anthropic_sdk():
             # FeatureUnavailable — fall through to ImportError handling below
             pass
         try:
-            import anthropic as _sdk
+            import anthropic as _sdk  # type: ignore
             _anthropic_sdk = _sdk
         except ImportError:
             _anthropic_sdk = None
@@ -566,8 +566,8 @@ def _common_betas_for_base_url(
 
 def _build_anthropic_client_with_bearer_hook(
     token_provider,
-    base_url: str = None,
-    timeout: float = None,
+    base_url: Optional[str] = None,
+    timeout: Optional[float] = None,
     *,
     drop_context_1m_beta: bool = False,
 ):
@@ -639,8 +639,8 @@ def _build_anthropic_client_with_bearer_hook(
 
 def build_anthropic_client(
     api_key,
-    base_url: str = None,
-    timeout: float = None,
+    base_url: Optional[str] = None,
+    timeout: Optional[float] = None,
     *,
     drop_context_1m_beta: bool = False,
 ):
@@ -692,7 +692,7 @@ def build_anthropic_client(
 
     normalized_base_url = _normalize_base_url_text(base_url)
     _read_timeout = timeout if (isinstance(timeout, (int, float)) and timeout > 0) else 900.0
-    kwargs = {
+    kwargs: Dict[str, Any] = {
         "timeout": Timeout(timeout=float(_read_timeout), connect=10.0),
     }
     if normalized_base_url:
