@@ -1,0 +1,281 @@
+---
+name: workflow-engine-fleet
+description: 'Fleet-specific extensions to the workflow-engine skill — our pipelines (council, brainstorm, ideation, feature-dev, deployment-verify, deployment-revert, error-response, new-agent-onboarding), kanban-specific patterns, and fleet agent assignments. Load alongside workflow-engine for fleet operator use.'
+version: 1.0.0
+author: Sherlock (fleet orchestrator)
+license: MIT
+metadata:
+  hermes:
+    tags: [workflow, fleet, pipelines, council, ideation, kanban]
+    related_skills: [workflow-engine, kanban-orchestrator, fleet-pipeline-governance]
+---
+
+# Workflow Engine — Fleet Overlay
+
+## Overview
+
+This skill extends `workflow-engine` with fleet-specific content: the pipelines we ship, our kanban-specific patterns (human validation gate, todo card flow), and our operator conventions.
+
+Load `workflow-engine` first for the generic engine reference. This overlay adds fleet-specific context on top.
+
+## When to Reach for a Pipeline
+
+**Rule of thumb for strategic/fleet-level questions:** if the question involves multiple stakeholders, trade-offs, risk assessment, or competing priorities — use a pipeline. Do NOT write a solo analysis.
+
+**Council vs Brainstorm — which pipeline?**
+
+| Situation | Pipeline | Why |
+|-----------|----------|-----|
+| Adversarial debate needed (tough trade-offs, competing priorities) | **Council** | Agents challenge each other's positions |
+| Collaborative assessment (fleet audit, strategy, role mapping) | **Brainstorm** | Agents build on each other's ideas, cooperative framing |
+| "Should we build X or Y?" | **Council** | Disagreement is the point |
+| "What's the risk of Z?" | **Council** | Multiple risk lenses |
+| "How do I deploy this?" | Solo answer (single-domain) | No pipeline needed |
+
+**Exception:** if the question is purely technical (how-to, config, debug a specific error), solo analysis is correct. Pipelines are for questions where reasonable agents can disagree or where multiple perspectives produce better decisions.
+
+### Council Limitations
+
+The council pipeline has known failure modes:
+
+- **Parallel execution fragility.** The council's parallel phases (position, reflect, probe) are the most failure-prone. Cards spawned before dependencies complete, timeout cascades through skip chains, stale heartbeats on pending cards.
+- **Debate format vs structured deliverable.** The council produces debate artifacts (shared concerns, genuine disagreement, confidence dispersion) — NOT structured reports with overlap maps, gap matrices, or recommendation tables.
+
+**When to NOT use the council:**
+- The user wants a specific document format (overlap map, gap analysis, recommendations table)
+- The question requires reading all agent files and producing a comprehensive audit
+- The user explicitly says the council isn't the right shape
+- The topic is too broad for a single council question — break it into smaller, focused questions
+
+## Fleet Pipelines
+
+### Pipeline Catalog
+
+| Pipeline | Purpose | Nodes | Layers | Key context keys |
+|----------|---------|-------|--------|------------------|
+| `council` | Structured multi-agent debate | 13 | 8 | `{question}` |
+| `ideation` | Research → spec → security → decomposition | 14 | 12 | project context |
+| `brainstorm` | Collaborative multi-agent ideation | 14 | 6 | topic, goals |
+| `feature-dev` | Build → CI → review → merge → post-merge | 10 | 5 | `{pr_link}` |
+| `deployment-verify` | Post-deploy adversarial probe | 4 | 3 | `{env}`, `{project}` |
+| `deployment-revert` | Auto-rollback on deploy failure | 4 | 3 | `{env}`, `{project}` |
+| `error-response` | Sentry alert triage and dispatch | 5 | 4 | `{project}`, `{env}` |
+| `new-agent-onboarding` | 7-phase DAG for commissioning a new agent profile | multi | 7 | agent name, role |
+
+### Intent → Pipeline Mapping
+
+| User intent | Pipeline |
+|-------------|----------|
+| "run a council on X" | `council` |
+| "start ideation for Y" | `ideation` |
+| "brainstorm this topic" | `brainstorm` |
+| "build this feature" | `feature-dev` |
+| "verify the deployment" | `deployment-verify` |
+| "revert the deployment" | `deployment-revert` |
+| "respond to this error" | `error-response` |
+| "onboard a new agent" | `new-agent-onboarding` |
+| "what pipelines exist" | `workflow_list()` |
+
+### Pipeline-Specific Notes
+
+**Council (`council`)**
+- Requires: `question` in context (the question for the council to deliberate on)
+- Board: `council` (declared in YAML)
+- Duration: ~15-20 minutes (13 nodes, 8 layers)
+- Output: artifact at `docs/fleet-research-kb/council/<date>/<run_id>/artifact.md`
+- Delivery: delivery node produces voice summary
+
+**Ideation (`ideation`)**
+- Requires: project context (description, goals, constraints)
+- Board: auto-created `wf_ideation`
+- Duration: ~10-15 minutes
+- Output: spec document at project spec directory
+
+**Feature-dev (`feature-dev`)**
+- Requires: `pr_link` or feature description in inputs
+- Board: auto-created `wf_feature-dev`
+- Duration: ~5-10 minutes
+- Output: implemented code + PR
+
+**New Agent Onboarding (`new-agent-onboarding`)**
+- 7-phase DAG: intent capture → 3-agent parallel evaluation → human gate → profile creation + SOUL/AGENTS authoring + model chain → resource provisioning → domain education → operational confirmation
+- **This is the canonical workflow for adding a new agent to the fleet** — don't hand-roll a setup script, fire this.
+
+### Council Pipeline DAG
+
+```
+L0: premortem-researcher           (Researcher: failure imagination — PRIVATE)
+L1: council-ready                  (synthetic gate — premortem privacy)
+L2: position-strategist/implementer/researcher  (parallel: architecture/execution/skepticism)
+L3: probe-orchestrator/tester      (parallel: systemic cost / boundary analysis)
+L4: reflect-strategist/implementer/researcher   (parallel: concede, update positions)
+L5: assumption-map-strategist      (solo: map assumptions per position)
+L6: synthesize-researcher          (solo: confidence dispersion, artifact, git push)
+L7: orchestrator-deliver           (solo: TTS voice summary via DM)
+```
+
+## Fleet-Specific Patterns
+
+### Human Validation Gate (Todo Card Pattern)
+
+For workflows that need human approval between phases (e.g. ideation → execution), use `todo` cards as approval gates. **The dispatcher only picks up `ready` cards.** Cards in `todo` sit until manually promoted.
+
+**How It Works**
+
+1. Ideation node finishes → creates a `todo` card with the research document attached
+2. Card sits in `todo` — orchestrator watchdog ignores it
+3. Human reviews the document at their pace
+4. Human approves by moving card to `ready` (or adding an "approved" comment)
+5. Next node picks it up automatically via `recompute_ready()`
+
+**Implementation**
+
+```yaml
+approval-gate:
+  description: "Human reviews ideation output before execution"
+  agent: orchestrator
+  task: >
+    Review the ideation output. Create a todo card with the research document
+    attached. Wait for human approval before proceeding.
+  outputs:
+    - approved_document
+```
+
+The engine creates this card as `todo` (not `ready`). The `recompute_ready()` function only promotes `todo` → `ready` when ALL parent dependencies are met. Since this card has no parents (it IS the gate), it stays in `todo` until the human acts.
+
+**Re-ideate Loop**
+
+When the human is not satisfied with the ideation output:
+1. Human tells the orchestrator: "re-ideate" / "researcher missed X" / "this doesn't match what I meant"
+2. Orchestrator dispatches researcher to produce new artifacts
+3. New `todo` card is created with updated documents
+4. Human reviews again
+5. When satisfied → move to `ready` → execution starts automatically
+
+**Key:** the loop is human-driven. The engine doesn't loop — it creates a new `todo` card each time. The human controls iteration count and exit condition.
+
+**Card Ownership:** Assign the approval card to the agent who acts on it, not the orchestrator. The system cannot assign cards to humans — only to agents. The human triggers by manually moving the card from `todo` to `ready`.
+
+**Approval Mechanisms:**
+- **Kanban CLI:** `hermes kanban update <card-id> --status ready`
+- **Comment trigger:** Human adds "approved" comment, engine watches for this
+
+**Why This Works Without Schema Changes:** The kanban status flow is `triage → todo → ready → running → done`. `todo` = waiting (dispatcher ignores). `ready` = all deps met, dispatcher claims. No new statuses needed.
+
+**Delivery Notifications:** When a human gate is reached, the pipeline should notify the originating channel BEFORE the todo card is created. Add a `notify-*` node between evaluation and the human gate.
+
+### Workflow Ownership Model
+
+**Workflows are org resources, not agent responsibilities.** Only the workflow operator needs to understand the full pipeline. Individual agents don't need to own, teach, or even know about workflows — they get dispatched via kanban, execute their part, and report back.
+
+- **Workflows** = coordination infrastructure. Multi-agent pipelines with phases. The operator defines, runs, and maintains them.
+- **Agents** = role-based workers. They receive dispatch context and acceptance criteria. They don't need to know the workflow exists.
+- **Individual agents** run their own processes for role-based work. Those aren't workflows — they're just job execution.
+
+**Fleet operator convention:** Sherlock operates workflows; agents don't need to know they exist.
+
+### Fleet-Pipelines YAML Standard
+
+All workflows in `fleet-pipelines/` should follow these conventions:
+
+**Required fields per node:**
+```yaml
+node-name:
+  agent: <agent>
+  task: >
+    Instruction text...
+  timeout_minutes: 30
+  fallback_on_timeout: degraded
+  channel: orchestration
+```
+
+**`fallback_on_timeout` convention (MANDATORY on all nodes):**
+- Use `degraded` on research/analysis nodes (timeout = partial results, continue)
+- Use `skip` on setup/CI/monitoring nodes (timeout = not critical, skip)
+- Omit only on critical path nodes where timeout = pipeline failure (merge, security gate)
+
+**`outputs` convention (MANDATORY on terminal and referenced nodes):**
+- Declare on terminal nodes (final reports, artifacts pushed to docs repo)
+- Declare on nodes whose output is referenced by downstream nodes
+- Format: `outputs: [raw-context]`
+- Template variables in output paths: `{date}` and `{run_id}` resolve correctly. Use `docs/{project}/brainstorm/{date}/{run_id}/artifact.md`.
+
+**Channel convention:**
+- All nodes use `channel: orchestration` unless they need to post to a project channel
+- The delivery node uses the originating channel for voice DM delivery
+
+**Validation after changes:**
+```bash
+cd ~/.hermes/hermes-agent
+.venv/bin/python3 -m tools.workflow_engine validate <workflow-name>
+```
+
+### Agent Selection Guide
+
+| Agent | Use for |
+|-------|---------|
+| `orchestrator` | Setup, orchestration, delivery, git operations |
+| `implementer` | Implementation, code changes, feature building |
+| `strategist` | Design, spec writing, architecture decisions |
+| `researcher` | Research, analysis, documentation |
+| `tester` | Testing, QA, verification |
+| `security` | Security review, compliance auditing |
+| `writer` | Writing, content, copywriting |
+| `tuner` | Behavioral tuning of agents — prompt patterns, performance measurement |
+| `operator` | Operations, infrastructure maintenance |
+
+## Fleet Recovery Patterns
+
+### Stalled Pipeline Nodes
+
+When `workflow_status` returns "no saved state" and the engine process is dead, the pipeline may have stalled at layer 0. Query the kanban board for the run's cards:
+
+```bash
+sqlite3 ~/.hermes/kanban/boards/fleet-workflow/kanban.db \
+  "SELECT id, title, status, assignee, datetime(created_at,'unixepoch') as dt \
+   FROM tasks ORDER BY created_at DESC LIMIT 5;"
+```
+
+Look for the layer-0 card (e.g. `premortem-researcher`) in `blocked` status.
+
+### `workflow_start(node=...)` Creates Duplicate Runs
+
+Each call to `workflow_start` with `node: "ci-green"` creates a NEW `run_id`, new kanban cards, and fresh state — it does NOT advance the existing workflow run.
+
+**Correct pattern for advancing an existing run:**
+1. Check if a workflow run is already in progress: `workflow_status()`
+2. If yes, the run is monitoring kanban cards — CI green is detected by the engine's polling loop, NOT by calling `workflow_start` again
+3. Only call `workflow_start(node=...)` when NO existing run covers this work
+4. When you must re-dispatch, use `resume=True` to reuse saved state: `workflow_start(workflow="feature-dev", resume=True, node="ci-green")`
+
+### Template Substitution Failure
+
+Common blocked reason: `Template substitution failure: {question} was not resolved`. This means the context dict passed to `workflow_start` didn't carry through.
+
+**Fix:** inject the variable and reset the card:
+```sql
+UPDATE tasks SET
+  body = replace(body, '{question}', '<the full question text>'),
+  status = 'ready',
+  claim_lock = NULL,
+  claim_expires = NULL,
+  current_run_id = NULL,
+  worker_pid = NULL
+WHERE id = '<card-id>';
+```
+
+**Prevention:** when calling `workflow_start`, ensure ALL template variables referenced in the pipeline YAML are present in the context dict.
+
+### Per-pipeline Kanban Board Routing
+
+`hermes kanban create` has **no `--board` flag**. Board resolves via `HERMES_KANBAN_BOARD` env var. Three-part fix:
+
+1. YAML: `kanban_board: council`
+2. Engine: read in `load_workflow()`, override in `execute()`
+3. Subprocess: inject `HERMES_KANBAN_BOARD` env var in `create_kanban_card`
+
+**CRITICAL:** the polling side (`get_card_status`) must ALSO inject the env var.
+
+### Loop Convention
+
+When a pipeline node needs to iterate, use the convention: `"LOOP:<target> | <instruction>"` in the task body. The agent executing the node recognizes this prefix and loops until the target condition is met or `goal_max_turns` is exhausted.
