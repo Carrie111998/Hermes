@@ -1675,3 +1675,96 @@ class TestDeadlockDetection:
         child_ids = {r["child_id"] for r in links}
         assert b in child_ids
         assert c in child_ids
+
+
+# ── scope: global / dispatch_node tests ────────────────────────────
+
+
+def test_workflow_scope_default_is_project():
+    """Workflows default to scope: project — current behavior preserved."""
+    wf = Workflow(name="x")
+    assert wf.scope == "project"
+
+
+def test_dispatch_node_scope_global_returns_none_and_marks_done():
+    """scope: global nodes are dispatched in-process; no card created."""
+    engine = WorkflowEngine()
+    wf = Workflow(name="heartbeat", scope="global")
+    state = NodeState(node_id="hb")
+    node = WorkflowNode(
+        id="hb",
+        agent="sherlock",
+        task="Check fleet heartbeat",
+    )
+    layers = [[node]]
+    states = {"hb": state}
+
+    # No subprocess should be invoked — the helper sets state.done directly.
+    card_id = engine.dispatch_node(
+        state, node, context={},
+        workflow=wf, states=states, layers=layers,
+    )
+    assert card_id is None
+    assert state.status == "done"
+    assert state.completed_at is not None
+    assert state.result == "[in-process, scope: global]"
+
+
+def test_dispatch_node_scope_project_delegates_to_create_kanban_card(
+        engine, council_pipeline, monkeypatch):
+    """scope: project (default) routes through create_kanban_card as before."""
+
+    class FakeResult:
+        returncode = 0
+        stdout = '{"id": "t_project_card"}'
+        stderr = ""
+
+    monkeypatch.setattr("subprocess.run", lambda *a, **kw: FakeResult())
+
+    node = council_pipeline.nodes["position-edison"]
+    state = NodeState(node_id=node.id)
+    layers = engine.topological_sort(council_pipeline)
+    states = {nid: NodeState(node_id=nid) for nid in council_pipeline.nodes}
+
+    card_id = engine.dispatch_node(
+        state, node, context={},
+        workflow=council_pipeline,  # scope defaults to "project"
+        states=states, layers=layers,
+    )
+    assert card_id == "t_project_card"
+    assert state.status != "done"  # dispatcher left it "running" for monitoring
+
+
+def test_load_workflow_parses_scope_field(tmp_path):
+    """YAML scope: global is loaded into Workflow.scope."""
+    import yaml as _yaml
+    wf_path = tmp_path / "heartbeat.yaml"
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "heartbeat",
+        "scope": "global",
+        "nodes": {
+            "check": {
+                "agent": "sherlock",
+                "task": "Heartbeat check.",
+            },
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    wf = engine.load_workflow("heartbeat")
+    assert wf.scope == "global"
+    assert "check" in wf.nodes
+
+
+def test_load_workflow_scope_defaults_to_project(tmp_path):
+    """Workflows without explicit scope default to 'project'."""
+    import yaml as _yaml
+    wf_path = tmp_path / "normal.yaml"
+    wf_path.write_text(_yaml.safe_dump({
+        "name": "normal",
+        "nodes": {
+            "x": {"agent": "sherlock", "task": "do x"},
+        },
+    }))
+    engine = WorkflowEngine(workflows_dir=tmp_path)
+    wf = engine.load_workflow("normal")
+    assert wf.scope == "project"

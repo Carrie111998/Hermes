@@ -151,6 +151,10 @@ class Workflow:
     nodes: dict[str, WorkflowNode] = field(default_factory=dict)
     run_id: str = ""              # Generated at execute() time
     kanban_board: str = ""         # Per-pipeline board override (empty = engine default)
+    scope: str = "project"         # "project" (default) — creates kanban cards per node.
+                                    # "global" — in-process only, no cards created.
+                                    # Used for maintenance / notification / heartbeat
+                                    # workflows that should not pollute project boards.
 
 @dataclass
 class NodeState:
@@ -234,6 +238,7 @@ class WorkflowEngine:
             description=raw.get("description", ""),
             trigger_events=raw.get("trigger_events", []),
             kanban_board=raw.get("kanban_board", ""),
+            scope=raw.get("scope", "project"),
         )
 
         for node_id, node_data in raw.get("nodes", {}).items():
@@ -492,6 +497,29 @@ class WorkflowEngine:
         # Fallback: try last token (fragile but works for legacy output)
         card_id = out.split()[-1] if out else ""
         return card_id
+
+    def dispatch_node(self, state: NodeState, node: WorkflowNode, context: dict,
+                       workflow: "Workflow", states: dict, layers: list) -> Optional[str]:
+        """Dispatch a node to kanban, or mark it done in-process.
+
+        For ``scope: global`` workflows (maintenance, notifications, heartbeat)
+        no kanban card is created — the node is marked ``done`` with a
+        sentinel ``result`` and ``None`` is returned. Callers should treat
+        ``None`` as "in-process, no card to monitor" and skip heartbeat /
+        monitoring for this node.
+
+        For ``scope: project`` (default), this delegates straight to
+        :meth:`create_kanban_card` and returns the card ID.
+        """
+        if workflow is not None and getattr(workflow, "scope", "project") == "global":
+            state.status = "done"
+            state.completed_at = datetime.now(timezone.utc).isoformat()
+            state.result = "[in-process, scope: global]"
+            return None
+        return self.create_kanban_card(
+            node, context,
+            workflow=workflow, states=states, layers=layers,
+        )
 
     def get_card_status(self, card_id: str) -> dict:
         """Query a kanban card's current state.
@@ -1369,10 +1397,15 @@ class WorkflowEngine:
                 state.attempts += 1
 
                 try:
-                    card_id = self.create_kanban_card(
-                        node, context,
+                    card_id = self.dispatch_node(
+                        state, node, context,
                         workflow=workflow, states=states, layers=layers,
                     )
+                    if card_id is None:
+                        # scope: global — in-process, no card to monitor
+                        results[nid] = "done"
+                        print(f"   ⊙ {nid} → in-process (scope: global)")
+                        continue
                     state.kanban_card_id = card_id
                     # Initialize heartbeat so the sweep doesn't auto-block
                     # the card before the worker picks it up.
@@ -1429,10 +1462,14 @@ class WorkflowEngine:
                     state.started_at = datetime.now(timezone.utc).isoformat()
                     state.attempts += 1
                     try:
-                        card_id = self.create_kanban_card(
-                            node, context,
+                        card_id = self.dispatch_node(
+                            state, node, context,
                             workflow=workflow, states=states, layers=layers,
                         )
+                        if card_id is None:
+                            results[nid] = "done"
+                            print(f"   ⊙ {nid} → in-process (scope: global)")
+                            continue
                         state.kanban_card_id = card_id
                         print(f"   ✓ {nid} → card {card_id} (unblocked)")
                         running_nodes.append(nid)
@@ -1482,10 +1519,14 @@ class WorkflowEngine:
                     rev_state.started_at = datetime.now(timezone.utc).isoformat()
                     rev_state.attempts += 1
                     try:
-                        card_id = self.create_kanban_card(
-                            rev_node, context,
+                        card_id = self.dispatch_node(
+                            rev_state, rev_node, context,
                             workflow=workflow, states=states, layers=layers,
                         )
+                        if card_id is None:
+                            results[revision_nid] = "done"
+                            print(f"   ⊙ {revision_nid} → in-process (scope: global)")
+                            continue
                         rev_state.kanban_card_id = card_id
                         print(f"   ✓ {revision_nid} → card {card_id}")
                     except Exception as e:
@@ -1606,10 +1647,14 @@ class WorkflowEngine:
                               f"(attempt {state.attempts}/3)")
                         # Re-create the card
                         try:
-                            card_id = self.create_kanban_card(
-                                node, context,
+                            card_id = self.dispatch_node(
+                                state, node, context,
                                 workflow=workflow, states=states, layers=layers,
                             )
+                            if card_id is None:
+                                results[nid] = "done"
+                                print(f"   ⊙ {nid} → in-process (scope: global)")
+                                continue
                             state.kanban_card_id = card_id
                         except Exception as e:
                             state.status = "failed"
