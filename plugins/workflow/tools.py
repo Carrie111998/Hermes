@@ -359,3 +359,172 @@ WORKFLOW_SHOW_SCHEMA: Dict[str, Any] = {
         "required": ["workflow"],
     },
 }
+
+# ---------------------------------------------------------------------------
+# Dynamic workflow tools — model-authored DAGs
+# ---------------------------------------------------------------------------
+
+def check_dynamic_workflow_requirements() -> bool:
+    """Return True when the dynamic workflow engine can be invoked.
+
+    Gates on the ``dynamic`` and ``dynamic_bridge`` modules being
+    importable.  No external API keys or subprocess runners needed.
+    """
+    try:
+        from plugins.workflow.dynamic import handle_workflow_dynamic  # noqa: F401
+        from plugins.workflow.dynamic_bridge import run_dynamic_workflow  # noqa: F401
+    except ImportError as exc:
+        logger.debug("dynamic workflow import failed: %s", exc)
+        return False
+    return True
+
+
+def handle_workflow_dynamic_start(
+    workflow: str = "",
+    context: Optional[Dict[str, Any]] = None,
+    scope: str = "project",
+    single_flight: bool = False,
+    delivery_target: str = "",
+    dry_run: bool = False,
+    **kwargs: Any,
+) -> str:
+    """Start a dynamic (model-authored) workflow.
+
+    Unlike ``handle_workflow_start`` which reads pre-defined YAML pipeline
+    definitions, this handler creates an ad-hoc DAG at runtime.  The
+    ``workflow`` parameter is the workflow_id to create (or reuse), and
+    ``context`` carries the objective and nodes from the calling agent.
+
+    Scope controls fleet integration:
+      - ``project`` (default): creates kanban cards for worker nodes
+      - ``global``: no kanban, in-memory only
+      - ``durable``: persists state to disk
+    """
+    from plugins.workflow.dynamic_bridge import (
+        run_dynamic_workflow,
+    )
+
+    if not workflow or not isinstance(workflow, str):
+        return _err("workflow (workflow_id) must be a non-empty string")
+
+    # Extract objective and nodes from context or kwargs
+    ctx = context or {}
+    objective = ctx.get("objective", "")
+    nodes = ctx.get("nodes", [])
+    wf_context = ctx.get("context", "")
+
+    # Allow overriding via kwargs (for future flexibility)
+    if not objective and "objective" in kwargs:
+        objective = kwargs["objective"]
+    if not nodes and "nodes" in kwargs:
+        nodes = kwargs["nodes"]
+    if not wf_context and "wf_context" in kwargs:
+        wf_context = kwargs["wf_context"]
+
+    if not objective:
+        return _err("objective is required (pass in context.objective)")
+    if not isinstance(nodes, list) or not nodes:
+        return _err("nodes must be a non-empty list (pass in context.nodes)")
+    if scope not in ("project", "global", "durable"):
+        return _err(f"invalid scope: {scope!r}; must be project, global, or durable")
+
+    if dry_run:
+        return _ok({
+            "dry_run": True,
+            "workflow_id": workflow,
+            "objective": objective,
+            "node_count": len(nodes),
+            "scope": scope,
+            "single_flight": single_flight,
+            "delivery_target": delivery_target,
+        })
+
+    try:
+        result = run_dynamic_workflow(
+            workflow_id=workflow,
+            objective=objective,
+            nodes=nodes,
+            context=wf_context,
+            scope=scope,
+            single_flight=single_flight,
+            dispatch_ready=True,
+            delivery_target=delivery_target,
+        )
+    except Exception as exc:
+        logger.exception("dynamic_workflow_start failed for %s", workflow)
+        return _err(f"dynamic workflow failed: {exc}")
+
+    return _ok(result)
+
+
+DYNAMIC_WORKFLOW_SCHEMA: Dict[str, Any] = {
+    "name": "workflow_dynamic_start",
+    "description": (
+        "Start a dynamic (model-authored) workflow — create an ad-hoc DAG at "
+        "runtime instead of reading pre-defined YAML pipelines.  Pass the "
+        "workflow_id, objective, and node list.  Nodes define worker goals "
+        "and dependencies; the engine dispatches ready nodes as background "
+        "delegations and advances the graph as results arrive.\n\n"
+        "Scope controls fleet integration:\n"
+        "  - project (default): creates kanban cards on the dynamic-workflows board\n"
+        "  - global: in-memory only, no kanban\n"
+        "  - durable: persists node state to ~/.hermes/workflow-logs/\n\n"
+        "Use workflow_status to query progress, or pass delivery_target to "
+        "route the final summary to Discord/Telegram."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow": {
+                "type": "string",
+                "description": (
+                    "Workflow ID (unique identifier).  If empty, the engine "
+                    "generates one.  Must match ^[A-Za-z0-9_.\\-]{1,96}$."
+                ),
+            },
+            "context": {
+                "type": "object",
+                "description": (
+                    "Workflow configuration object with keys: "
+                    "'objective' (required, string — the high-level goal), "
+                    "'nodes' (required, array — each with 'node_id', 'goal', "
+                    "and optional 'depends_on'), 'context' (optional string "
+                    "shared context for all nodes)."
+                ),
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["project", "global", "durable"],
+                "description": (
+                    "Fleet integration scope. 'project' creates kanban cards, "
+                    "'durable' persists state, 'global' is in-memory only."
+                ),
+                "default": "project",
+            },
+            "single_flight": {
+                "type": "boolean",
+                "description": (
+                    "If True, refuse to create a new workflow when a run "
+                    "with the same workflow_id is already in progress."
+                ),
+                "default": False,
+            },
+            "delivery_target": {
+                "type": "string",
+                "description": (
+                    "Optional delivery target (e.g. 'discord:CHANNEL_ID'). "
+                    "When set, the workflow summary is posted on completion."
+                ),
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": (
+                    "Print the execution plan without creating kanban cards "
+                    "or dispatching nodes."
+                ),
+                "default": False,
+            },
+        },
+        "required": ["workflow", "context"],
+    },
+}
