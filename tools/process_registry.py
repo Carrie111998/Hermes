@@ -96,7 +96,8 @@ class ProcessSession:
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
-    env_ref: Any = None                         # Reference to the environment object
+    env_ref: Any = None                         # Reference to the backend object
+    environment_lease: Any = None              # Lease held while backend process is running
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
@@ -842,6 +843,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        environment_lease: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -862,6 +864,7 @@ class ProcessRegistry:
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
+            environment_lease=environment_lease,
             pid_scope="sandbox",
         )
 
@@ -922,7 +925,28 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
+            try:
+                reader.start()
+            except Exception as exc:
+                # The remote process is already running, but it has not been
+                # published to the registry yet. Roll it back before releasing
+                # the backend lease so replacement/cleanup cannot tear down a
+                # backend with an untracked process still alive inside it.
+                if session.pid is not None:
+                    try:
+                        env.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                    except Exception:
+                        logger.debug(
+                            "Could not terminate remote process after poller start failure",
+                            exc_info=True,
+                        )
+                session.exited = True
+                session.exit_code = -1
+                session.completion_reason = "failed_start"
+                session.termination_source = "failed_start"
+                session.output_buffer = f"Failed to start poller: {exc}"
+                self._release_environment_lease(session)
+                raise
 
         with self._lock:
             self._prune_if_needed()
@@ -931,6 +955,8 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
+        else:
+            self._release_environment_lease(session)
 
         return session
 
@@ -1139,6 +1165,21 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    @staticmethod
+    def _release_environment_lease_object(lease: Any) -> None:
+        if lease is None:
+            return
+        try:
+            lease.release()
+        except Exception as exc:
+            logger.debug("Terminal backend lease release failed: %s", exc, exc_info=True)
+
+    def _release_environment_lease(self, session: ProcessSession) -> None:
+        with self._lock:
+            lease = getattr(session, "environment_lease", None)
+            session.environment_lease = None
+        self._release_environment_lease_object(lease)
+
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
 
@@ -1149,7 +1190,11 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+            lease = session.environment_lease if was_running else None
+            if was_running:
+                session.environment_lease = None
         session._completion_event.set()
+        self._release_environment_lease_object(lease)
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without

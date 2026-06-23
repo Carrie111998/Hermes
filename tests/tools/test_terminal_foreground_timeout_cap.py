@@ -27,6 +27,14 @@ def _make_env_config(**overrides):
     return config
 
 
+def _mark_compatible(env, config, task_id="default"):
+    from tools import terminal_tool
+
+    runtime = terminal_tool.resolve_terminal_runtime_identity(config, raw_task_id=task_id)
+    setattr(env, terminal_tool._ENV_SIGNATURE_ATTR, runtime["signature"])
+    return env
+
+
 class TestForegroundTimeoutCap:
     """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
 
@@ -84,6 +92,7 @@ class TestForegroundTimeoutCap:
 
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "usage", "returncode": 0}
+            _mark_compatible(mock_env, _make_env_config())
 
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
@@ -103,6 +112,7 @@ class TestForegroundTimeoutCap:
 
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
+            _mark_compatible(mock_env, _make_env_config())
 
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
@@ -131,6 +141,8 @@ class TestForegroundTimeoutCap:
 
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
+            _mark_compatible(mock_env, _make_env_config())
+            _mark_compatible(mock_env, _make_env_config(timeout=900))
 
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
@@ -151,6 +163,7 @@ class TestForegroundTimeoutCap:
 
             mock_env = MagicMock()
             mock_env.env = {}
+            _mark_compatible(mock_env, _make_env_config())
             mock_proc_session = MagicMock()
             mock_proc_session.id = "test-123"
             mock_proc_session.pid = 1234
@@ -184,6 +197,7 @@ class TestForegroundTimeoutCap:
 
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
+            _mark_compatible(mock_env, _make_env_config())
 
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
@@ -203,6 +217,7 @@ class TestForegroundTimeoutCap:
 
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
+            _mark_compatible(mock_env, _make_env_config())
 
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \

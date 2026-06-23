@@ -151,20 +151,41 @@ class _DummyDockerEnvironment:
 
 
 def test_container_path_detection_uses_live_docker_environment(monkeypatch):
-    """A live DockerEnvironment-shaped env should beat config fallback."""
+    """A signature-compatible live Docker environment should select container paths."""
+    config = {"env_type": "docker", "cwd": "/workspace"}
+    env = _DummyDockerEnvironment()
+    runtime = terminal_tool.resolve_terminal_runtime_identity(config, raw_task_id="default")
+    setattr(env, terminal_tool._ENV_SIGNATURE_ATTR, runtime["signature"])
     monkeypatch.setattr(
         terminal_tool,
         "_active_environments",
-        {"default": _DummyDockerEnvironment()},
+        {"default": env},
     )
-    monkeypatch.setattr(
-        terminal_tool,
-        "_get_env_config",
-        lambda: (_ for _ in ()).throw(AssertionError("should not read config")),
-    )
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
     monkeypatch.delenv("TERMINAL_ENV", raising=False)
 
     assert ft._uses_container_paths("default") is True
+
+
+def test_container_path_detection_ignores_stale_docker_environment(monkeypatch):
+    """Current runtime config, not a stale cached backend, controls path semantics."""
+    old_config = {"env_type": "docker", "cwd": "/workspace"}
+    current_config = {"env_type": "local", "cwd": "/host/project"}
+    backend = _DummyDockerEnvironment()
+    old_runtime = terminal_tool.resolve_terminal_runtime_identity(
+        old_config,
+        raw_task_id="default",
+    )
+    setattr(backend, terminal_tool._ENV_SIGNATURE_ATTR, old_runtime["signature"])
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": backend},
+    )
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: current_config)
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+
+    assert ft._uses_container_paths("default") is False
 
 
 def test_resolution_base_always_absolute_no_terminal_cwd(_isolated_cwd, monkeypatch):

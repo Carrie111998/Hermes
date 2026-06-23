@@ -32,6 +32,7 @@ Usage:
 """
 
 import importlib.util
+import hashlib
 import json
 import logging
 import os
@@ -982,6 +983,55 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
+_RETIRED_CLEANUP_WORKER_MAX_ATTEMPTS = 3
+
+
+class _EnvironmentLeaseState:
+    """Refcount state for one terminal backend object."""
+
+    def __init__(self, task_id: str, env: Any):
+        self.task_id = task_id
+        self.env = env
+        self.refcount = 0
+        self.retired = False
+        self.cleaned = False
+        self.cleaning = False
+        self.cleanup_failed = False
+        self.cleanup_attempts = 0
+        self.next_cleanup_retry_at = 0.0
+        self.force_remove = False
+
+
+class _EnvironmentLease:
+    """A held reference that keeps a backend object alive until released."""
+
+    def __init__(self, state: _EnvironmentLeaseState):
+        self._state = state
+        self.env = state.env
+        self._released = False
+
+    def release(self) -> None:
+        cleanup_item = None
+        with _env_lock:
+            if self._released:
+                return
+            self._released = True
+            state = self._state
+            if state.refcount > 0:
+                state.refcount -= 1
+            if state.retired and state.refcount == 0 and not state.cleaned:
+                cleanup_item = _mark_environment_state_cleaning_locked(state)
+        if cleanup_item is not None:
+            _cleanup_environment_item(cleanup_item)
+
+    def __enter__(self):
+        return self.env
+
+    def __exit__(self, exc_type, exc, tb):
+        self.release()
+
+
+_environment_lease_states: Dict[int, _EnvironmentLeaseState] = {}
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
@@ -1078,11 +1128,9 @@ _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 # wrong-worktree bug class (env.cwd_owner stamping, _last_known_cwd, and the
 # ownership ladder in file_tools are all patches over that misplacement).
 #
-# Step 1 (this change): dual-write only. Every site that learns a session's
-# live cwd (post-command tracking, cwd-override registration) also records it
-# here. Readers still use the legacy env.cwd ladder. Later steps flip
-# file_tools and _resolve_command_cwd to read this store, then delete the
-# env-side tracking + ownership guards.
+# Every site that learns a session's live cwd records it here. Terminal cwd
+# resolution and file-tool relative operations read this raw session record so
+# a collapsed shared backend cannot leak one session's cwd into another.
 _session_cwd: Dict[str, str] = {}
 _session_cwd_lock = threading.Lock()
 
@@ -1225,6 +1273,530 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
         or _task_env_overrides.get(_resolve_container_task_id(raw))
         or {}
     )
+
+
+# Attribute stored on live execution environments so a config/profile/backend
+# change cannot accidentally reuse a sandbox/SSH shell created for a different
+# runtime. The cache key remains the session/task id; the signature is the
+# compatibility guard for the cached value behind that key.
+_ENV_SIGNATURE_ATTR = "_hermes_terminal_env_signature"
+
+
+def _normalize_signature_value(value: Any) -> str:
+    """Return a stable string for runtime signature values."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple, dict)):
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        except TypeError:
+            return str(value)
+    return str(value)
+
+
+def _fingerprint_for_signature(value: Any) -> str:
+    """Return a stable one-way fingerprint for sensitive signature fields."""
+    normalized = _normalize_signature_value(value)
+    if not normalized:
+        return ""
+    return hashlib.sha256(normalized.encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _ssh_key_fingerprint(key: Any) -> str:
+    """Fingerprint SSH key configuration without storing the raw path/material.
+
+    When *key* points at a readable file, include both normalized path identity
+    and file content so replacing a key at the same path invalidates the cached
+    SSH connection. If it is not a readable file, hash the configured value
+    itself; that preserves compatibility invalidation without exposing it.
+    """
+    if not isinstance(key, str) or not key.strip():
+        return ""
+    expanded = os.path.expanduser(key)
+    path = Path(expanded)
+    try:
+        resolved = str(path.resolve(strict=False))
+    except OSError:
+        resolved = expanded
+    digest = hashlib.sha256()
+    digest.update(resolved.encode("utf-8", "surrogateescape"))
+    try:
+        st = path.stat()
+        digest.update(f":{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:".encode("ascii"))
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        digest.update(b":unreadable:")
+        digest.update(key.encode("utf-8", "surrogateescape"))
+    return digest.hexdigest()
+
+
+def _runtime_image_for_config(config: Dict[str, Any], overrides: Optional[Dict[str, Any]] = None) -> str:
+    """Return the selected backend image for the current config/overrides."""
+    overrides = overrides or {}
+    env_type = config.get("env_type") or "local"
+    if env_type == "docker":
+        return overrides.get("docker_image") or config.get("docker_image") or ""
+    if env_type == "singularity":
+        return overrides.get("singularity_image") or config.get("singularity_image") or ""
+    if env_type == "modal":
+        return overrides.get("modal_image") or config.get("modal_image") or ""
+    if env_type == "daytona":
+        return overrides.get("daytona_image") or config.get("daytona_image") or ""
+    return ""
+
+
+def _container_config_for_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the complete container config passed to environment creation."""
+    return {
+        "container_cpu": config.get("container_cpu", 1),
+        "container_memory": config.get("container_memory", 5120),
+        "container_disk": config.get("container_disk", 51200),
+        "container_persistent": config.get("container_persistent", True),
+        "modal_mode": config.get("modal_mode", "auto"),
+        "docker_volumes": config.get("docker_volumes", []),
+        "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+        "docker_forward_env": config.get("docker_forward_env", []),
+        "docker_env": config.get("docker_env", {}),
+        "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+        "docker_extra_args": config.get("docker_extra_args", []),
+        "docker_network": config.get("docker_network", True),
+        "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+        "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+    }
+
+
+def _ssh_config_for_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return SSH config passed to environment creation."""
+    return {
+        "host": config.get("ssh_host", ""),
+        "user": config.get("ssh_user", ""),
+        "port": config.get("ssh_port", 22),
+        "key": config.get("ssh_key", ""),
+        "persistent": config.get("ssh_persistent", False),
+    }
+
+
+def _local_config_for_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return local backend config passed to environment creation."""
+    return {
+        "persistent": config.get("local_persistent", False),
+    }
+
+
+def _terminal_env_signature(
+    config: Dict[str, Any],
+    *,
+    task_id: str = "default",
+    overrides: Optional[Dict[str, Any]] = None,
+    image: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> Dict[str, str]:
+    """Build the runtime signature for a cached terminal environment."""
+    overrides = overrides or {}
+    env_type = config.get("env_type") or "local"
+    if image is None:
+        image = _runtime_image_for_config(config, overrides)
+    if cwd is None:
+        cwd = overrides.get("cwd") or config.get("cwd") or ""
+    fields = {
+        "task_id": task_id or "default",
+        "hermes_home": os.getenv("HERMES_HOME", ""),
+        "hermes_config_path": os.getenv("HERMES_CONFIG_PATH", ""),
+        "session_profile": os.getenv("HERMES_SESSION_PROFILE", ""),
+        "env_type": env_type,
+        "cwd": cwd,
+        "host_cwd": config.get("host_cwd"),
+        "image": image,
+        "modal_mode": config.get("modal_mode"),
+        "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace"),
+        "docker_volumes": config.get("docker_volumes"),
+        "docker_forward_env": config.get("docker_forward_env"),
+        "docker_env": config.get("docker_env"),
+        "docker_run_as_host_user": config.get("docker_run_as_host_user"),
+        "docker_network": config.get("docker_network"),
+        "docker_extra_args": config.get("docker_extra_args"),
+        "docker_persist_across_processes": config.get("docker_persist_across_processes"),
+        "docker_orphan_reaper": config.get("docker_orphan_reaper"),
+        "container_cpu": config.get("container_cpu"),
+        "container_memory": config.get("container_memory"),
+        "container_disk": config.get("container_disk"),
+        "container_persistent": config.get("container_persistent"),
+        "ssh_host": config.get("ssh_host"),
+        "ssh_user": config.get("ssh_user"),
+        "ssh_port": config.get("ssh_port"),
+        # Do not include raw key path/material in logs or signatures.
+        # Fingerprint distinguishes key-backed SSH identities and key rotation.
+        "ssh_key_present": bool(config.get("ssh_key")),
+        "ssh_key_fingerprint": _ssh_key_fingerprint(config.get("ssh_key")),
+        "ssh_persistent": config.get("ssh_persistent"),
+        "local_persistent": config.get("local_persistent"),
+        "timeout": config.get("timeout"),
+    }
+    return {key: _normalize_signature_value(value) for key, value in fields.items()}
+
+
+def resolve_terminal_runtime_identity(
+    config: Dict[str, Any],
+    *,
+    raw_task_id: Optional[str] = "default",
+    cwd_fallback: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve current runtime identity and creation inputs for terminal envs."""
+    raw_task_id = raw_task_id or "default"
+    effective_task_id = _resolve_container_task_id(raw_task_id)
+    overrides = resolve_task_overrides(raw_task_id)
+    env_type = config["env_type"]
+    image = _runtime_image_for_config(config, overrides)
+    cwd_only_shared_override = (
+        effective_task_id != raw_task_id
+        and set(overrides.keys()) == {"cwd"}
+    )
+    signature_cwd = (
+        config["cwd"]
+        if cwd_only_shared_override
+        else (overrides.get("cwd") or config["cwd"])
+    )
+    session_cwd = get_session_cwd(raw_task_id)
+    cwd = (
+        session_cwd
+        or overrides.get("cwd")
+        or cwd_fallback
+        or config["cwd"]
+    )
+
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != config["cwd"]:
+            logger.info(
+                "Ignoring host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd, env_type, config["cwd"],
+            )
+        cwd = config["cwd"]
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(signature_cwd):
+        signature_cwd = config["cwd"]
+
+    container_config = (
+        _container_config_for_runtime(config)
+        if env_type in _CONTAINER_BACKENDS
+        else None
+    )
+    ssh_config = _ssh_config_for_runtime(config) if env_type == "ssh" else None
+    local_config = _local_config_for_runtime(config) if env_type == "local" else None
+    signature = _terminal_env_signature(
+        config,
+        task_id=effective_task_id,
+        overrides=overrides,
+        image=image,
+        cwd=signature_cwd,
+    )
+
+    return {
+        "raw_task_id": raw_task_id,
+        "effective_task_id": effective_task_id,
+        "overrides": overrides,
+        "env_type": env_type,
+        "image": image,
+        "cwd": cwd,
+        "container_config": container_config,
+        "ssh_config": ssh_config,
+        "local_config": local_config,
+        "signature": signature,
+    }
+
+
+def _safe_signature_for_log(signature: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Return a compact redacted signature suitable for warning logs."""
+    if not signature:
+        return {}
+    sensitive_fingerprint_keys = {
+        "image",
+        "docker_extra_args",
+        "docker_env",
+        "docker_forward_env",
+    }
+    safe_keys = (
+        "hermes_home",
+        "session_profile",
+        "env_type",
+        "cwd",
+        "host_cwd",
+        "image",
+        "docker_network",
+        "docker_forward_env",
+        "docker_env",
+        "docker_extra_args",
+        "docker_persist_across_processes",
+        "docker_orphan_reaper",
+        "ssh_host",
+        "ssh_user",
+        "ssh_port",
+        "ssh_key_present",
+        "local_persistent",
+        "ssh_persistent",
+    )
+    safe: Dict[str, str] = {}
+    for key in safe_keys:
+        value = signature.get(key, "")
+        if not value:
+            continue
+        if key in sensitive_fingerprint_keys:
+            safe[f"{key}_fingerprint"] = _fingerprint_for_signature(value)[:16]
+        else:
+            safe[key] = value
+    return safe
+
+
+def _signature_changed_fields_for_log(
+    old: Optional[Dict[str, str]],
+    new: Optional[Dict[str, str]],
+) -> list[str]:
+    """Return changed signature field names without logging sensitive values."""
+    old = old or {}
+    new = new or {}
+    return sorted(key for key in set(old) | set(new) if old.get(key) != new.get(key))
+
+
+def _clear_file_ops_cache_for_task(task_id: str) -> None:
+    """Best-effort invalidation for file_tools' wrapper around terminal envs."""
+    try:
+        from tools.file_tools import clear_file_ops_cache
+
+        clear_file_ops_cache(task_id)
+    except Exception:
+        logger.debug("Could not clear file ops cache for task %s", task_id, exc_info=True)
+
+
+def _cleanup_environment_object(task_id: str, env: Any, force_remove: bool = False) -> bool:
+    """Clean one backend object outside the lifecycle lock."""
+    try:
+        if hasattr(env, 'cleanup'):
+            if force_remove:
+                import inspect
+                sig = inspect.signature(env.cleanup)
+                if "force_remove" in sig.parameters:
+                    env.cleanup(force_remove=True)
+                else:
+                    env.cleanup()
+            else:
+                env.cleanup()
+        elif hasattr(env, 'stop'):
+            env.stop()
+        elif hasattr(env, 'terminate'):
+            env.terminate()
+        return True
+    except Exception as exc:
+        error_str = str(exc)
+        if "404" in error_str or "not found" in error_str.lower():
+            logger.info("Terminal backend for task %s already cleaned up", task_id)
+            return True
+        logger.warning("Error cleaning terminal backend for task %s: %s", task_id, exc)
+        return False
+
+
+def _environment_state_key(env: Any) -> int:
+    return id(env)
+
+
+def _environment_state_for_locked(task_id: str, env: Any) -> _EnvironmentLeaseState:
+    key = _environment_state_key(env)
+    state = _environment_lease_states.get(key)
+    if state is None:
+        state = _EnvironmentLeaseState(task_id, env)
+        _environment_lease_states[key] = state
+    else:
+        state.task_id = task_id
+    return state
+
+
+def _mark_environment_state_cleaning_locked(state: _EnvironmentLeaseState) -> tuple[str, Any, bool]:
+    state.cleaning = True
+    state.cleanup_failed = False
+    state.cleanup_attempts += 1
+    return state.task_id, state.env, state.force_remove
+
+
+def _finish_environment_state_cleanup(task_id: str, env: Any, success: bool) -> None:
+    with _env_lock:
+        state = _environment_lease_states.get(_environment_state_key(env))
+        if state is None:
+            return
+        state.cleaning = False
+        if success:
+            state.cleaned = True
+            state.cleanup_failed = False
+            state.next_cleanup_retry_at = 0.0
+            _environment_lease_states.pop(_environment_state_key(env), None)
+            return
+        state.task_id = task_id
+        state.cleanup_failed = True
+        delay = min(300.0, 30.0 * (2 ** max(0, state.cleanup_attempts - 1)))
+        state.next_cleanup_retry_at = time.time() + delay
+
+
+def _cleanup_environment_item(item: tuple[str, Any, bool]) -> bool:
+    task_id, env, force_remove = item
+    success = _cleanup_environment_object(task_id, env, force_remove)
+    _finish_environment_state_cleanup(task_id, env, success)
+    return success
+
+
+def _retire_environment_locked(task_id: str, env: Any, *, force_remove: bool = False) -> tuple[str, Any, bool] | None:
+    state = _environment_state_for_locked(task_id, env)
+    state.retired = True
+    state.force_remove = state.force_remove or force_remove
+    if state.refcount == 0 and not state.cleaned:
+        if state.cleaning:
+            return None
+        return _mark_environment_state_cleaning_locked(state)
+    return None
+
+
+def _retire_replaced_environment(task_id: str, env: Any) -> None:
+    """Retire an active-cache replacement and clean it after current leases."""
+    cleanup_item = None
+    with _env_lock:
+        cleanup_item = _retire_environment_locked(task_id, env)
+    if cleanup_item is not None:
+        _cleanup_environment_item(cleanup_item)
+
+
+def _acquire_environment_lease_locked(task_id: str, env: Any) -> _EnvironmentLease:
+    state = _environment_state_for_locked(task_id, env)
+    if state.retired or state.cleaned:
+        raise RuntimeError("Cannot acquire a retired terminal backend")
+    state.refcount += 1
+    return _EnvironmentLease(state)
+
+
+def _get_active_environment_if_compatible(
+    effective_task_id: str,
+    signature: Dict[str, str],
+    *,
+    raw_task_id: Optional[str] = None,
+) -> Any | None:
+    """Return a compatible active backend without holding a long-lived lease.
+
+    New execution paths should use ``_acquire_active_environment_if_compatible``
+    so the backend cannot be cleaned while in use. This compatibility wrapper is
+    kept for older tests and read-only helpers that only inspect the object.
+    """
+    lease = _acquire_active_environment_if_compatible(
+        effective_task_id,
+        signature,
+        raw_task_id=raw_task_id,
+    )
+    if lease is None:
+        return None
+    env = lease.env
+    lease.release()
+    return env
+
+
+def _acquire_active_environment_if_compatible(
+    effective_task_id: str,
+    signature: Dict[str, str],
+    *,
+    raw_task_id: Optional[str] = None,
+) -> _EnvironmentLease | None:
+    """Lease cached backend only when its runtime signature matches."""
+    lease = None
+    stale_records: list[tuple[str, Optional[Dict[str, str]], tuple[str, Any, bool] | None]] = []
+    with _env_lock:
+        candidate_keys = [effective_task_id]
+        if raw_task_id and raw_task_id != effective_task_id:
+            candidate_keys.append(raw_task_id)
+
+        for existing_key in candidate_keys:
+            env = _active_environments.get(existing_key)
+            if env is None:
+                continue
+
+            existing_signature = getattr(env, _ENV_SIGNATURE_ATTR, None)
+            if existing_signature == signature:
+                _last_activity[existing_key] = time.time()
+                lease = _acquire_environment_lease_locked(existing_key, env)
+                break
+
+            stale = _active_environments.pop(existing_key, None)
+            _last_activity.pop(existing_key, None)
+            stale_cleanup = None
+            if stale is not None:
+                stale_cleanup = _retire_environment_locked(existing_key, stale)
+            stale_records.append((
+                existing_key,
+                existing_signature if isinstance(existing_signature, dict) else None,
+                stale_cleanup,
+            ))
+
+    for stale_key, stale_signature, stale_cleanup in stale_records:
+        for key in {stale_key, effective_task_id, raw_task_id or ""}:
+            if key:
+                _clear_file_ops_cache_for_task(key)
+        logger.warning(
+            "Discarding cached terminal backend for task %s because runtime signature changed: changed_fields=%s old=%s new=%s",
+            stale_key[:8],
+            _signature_changed_fields_for_log(stale_signature, signature),
+            _safe_signature_for_log(stale_signature),
+            _safe_signature_for_log(signature),
+        )
+        if stale_cleanup is not None:
+            _cleanup_environment_item(stale_cleanup)
+    return lease
+
+
+def _store_active_environment(task_id: str, env: Any, signature: Dict[str, str], *, lease: bool = False) -> _EnvironmentLease | None:
+    """Store backend in the active cache with its runtime signature."""
+    try:
+        setattr(env, _ENV_SIGNATURE_ATTR, dict(signature))
+    except Exception:
+        logger.debug("Could not attach terminal backend signature for task %s", task_id, exc_info=True)
+    cleanup_items = []
+    acquired_lease = None
+    with _env_lock:
+        existing = _active_environments.get(task_id)
+        if existing is not None and existing is not env:
+            existing_signature = getattr(existing, _ENV_SIGNATURE_ATTR, None)
+            if existing_signature == signature:
+                _last_activity[task_id] = time.time()
+                cleanup_item = _retire_environment_locked(task_id, env)
+                if cleanup_item is not None:
+                    cleanup_items.append(cleanup_item)
+                if lease:
+                    acquired_lease = _acquire_environment_lease_locked(task_id, existing)
+            else:
+                cleanup_item = _retire_environment_locked(task_id, existing)
+                if cleanup_item is not None:
+                    cleanup_items.append(cleanup_item)
+                _active_environments[task_id] = env
+                _last_activity[task_id] = time.time()
+                state = _environment_state_for_locked(task_id, env)
+                state.retired = False
+                state.cleaned = False
+                state.cleanup_failed = False
+                state.next_cleanup_retry_at = 0.0
+                state.force_remove = False
+                if lease:
+                    state.refcount += 1
+                    acquired_lease = _EnvironmentLease(state)
+        else:
+            _active_environments[task_id] = env
+            _last_activity[task_id] = time.time()
+            state = _environment_state_for_locked(task_id, env)
+            state.retired = False
+            state.cleaned = False
+            state.cleanup_failed = False
+            state.next_cleanup_retry_at = 0.0
+            state.force_remove = False
+            if lease:
+                state.refcount += 1
+                acquired_lease = _EnvironmentLease(state)
+    for item in cleanup_items:
+        _cleanup_environment_item(item)
+    return acquired_lease
 
 
 # Configuration from environment variables
@@ -1634,24 +2206,19 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
-    """Clean up environments that have been inactive for longer than lifetime_seconds."""
+    """Retire environments that have been inactive longer than lifetime_seconds."""
     current_time = time.time()
 
-    # Check the process registry -- skip cleanup for sandboxes with active
-    # background processes (their _last_activity gets refreshed to keep them alive).
     try:
         from tools.process_registry import process_registry
         for task_id in list(_last_activity.keys()):
             if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time  # Keep sandbox alive
+                _last_activity[task_id] = current_time
     except ImportError:
         pass
 
-    # Phase 1: collect stale entries and remove them from tracking dicts while
-    # holding the lock.  Do NOT call env.cleanup() inside the lock -- Modal and
-    # Docker teardown can block for 10-15s, which would stall every concurrent
-    # terminal/file tool call waiting on _env_lock.
-    envs_to_stop = []  # list of (task_id, env) pairs
+    cleanup_items = []
+    retired_tasks = []
 
     with _env_lock:
         for task_id, last_time in list(_last_activity.items()):
@@ -1659,40 +2226,26 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
                 if env is not None:
-                    envs_to_stop.append((task_id, env))
+                    retired_tasks.append(task_id)
+                    item = _retire_environment_locked(task_id, env)
+                    if item is not None:
+                        cleanup_items.append(item)
 
-        # Also purge per-task creation locks for cleaned-up tasks
         with _creation_locks_lock:
-            for task_id, _ in envs_to_stop:
+            for task_id in retired_tasks:
                 _creation_locks.pop(task_id, None)
 
-    # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
-    # are not blocked while Modal/Docker sandboxes shut down.
-    for task_id, env in envs_to_stop:
-        # Invalidate stale file_ops cache entry (Bug fix: prevents
-        # ShellFileOperations from referencing a dead sandbox)
+    for task_id in retired_tasks:
         try:
             from tools.file_tools import clear_file_ops_cache
             clear_file_ops_cache(task_id)
         except ImportError:
             pass
 
-        try:
-            if hasattr(env, 'cleanup'):
-                env.cleanup()
-            elif hasattr(env, 'stop'):
-                env.stop()
-            elif hasattr(env, 'terminate'):
-                env.terminate()
-
+    for item in cleanup_items:
+        task_id = item[0]
+        if _cleanup_environment_item(item):
             logger.info("Cleaned up inactive environment for task: %s", task_id)
-
-        except Exception as e:
-            error_str = str(e)
-            if "404" in error_str or "not found" in error_str.lower():
-                logger.info("Environment for task %s already cleaned up", task_id)
-            else:
-                logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
 def _cleanup_thread_worker():
@@ -1701,6 +2254,9 @@ def _cleanup_thread_worker():
         try:
             config = _get_env_config()
             _cleanup_inactive_envs(config["lifetime_seconds"])
+            _cleanup_retired_environments(
+                max_attempts=_RETIRED_CLEANUP_WORKER_MAX_ATTEMPTS
+            )
         except Exception as e:
             logger.warning("Error in cleanup thread: %s", e, exc_info=True)
 
@@ -1758,7 +2314,7 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 
-def cleanup_all_environments():
+def cleanup_all_environments(*, force_retired: bool = False):
     """Clean up ALL active environments. Use with caution."""
     task_ids = list(_active_environments.keys())
     cleaned = 0
@@ -1769,6 +2325,8 @@ def cleanup_all_environments():
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
+
+    cleaned += len(_cleanup_retired_environments(force=force_retired))
     
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
@@ -1785,85 +2343,86 @@ def cleanup_all_environments():
     return cleaned
 
 
+def _cleanup_retired_environments(
+    *,
+    force: bool = False,
+    max_attempts: int | None = None,
+) -> list[Any]:
+    """Drain retired backends whose final operation lease has been released."""
+    cleanup_items = []
+    now = time.time()
+    with _env_lock:
+        for state in list(_environment_lease_states.values()):
+            if (
+                state.retired
+                and (force or state.refcount == 0)
+                and not state.cleaned
+                and not state.cleaning
+                and (
+                    force
+                    or max_attempts is None
+                    or state.cleanup_attempts < max_attempts
+                )
+                and (force or state.next_cleanup_retry_at <= now)
+            ):
+                if force:
+                    state.force_remove = True
+                cleanup_items.append(_mark_environment_state_cleaning_locked(state))
+
+    cleaned_envs = []
+    for item in cleanup_items:
+        task_id, env, _force_remove = item
+        if _cleanup_environment_item(item):
+            cleaned_envs.append(env)
+            logger.info("Cleaned up retired environment for task: %s", task_id)
+    return cleaned_envs
+
+
 def cleanup_vm(task_id: str, *, force_remove: bool = False):
-    """Manually clean up a specific environment by task_id.
+    """Retire a specific environment by task_id.
 
-    *force_remove* (default False) is forwarded to backends that accept it
-    — currently only ``DockerEnvironment``. The default of False matches
-    session-lifecycle semantics: this function is called from
-    ``AIAgent.close()`` (TUI session close, gateway session teardown) and the
-    per-turn cleanup branch for non-persistent envs, both of which should
-    honor the user's persist-mode preference. Stopping the container here
-    would defeat the "ONE long-lived container shared across sessions"
-    contract — exactly the bug Ben reported when the container was killed
-    on every TUI session close.
-
-    Pass ``force_remove=True`` for actual user-initiated teardown
-    (e.g. ``/reset``-style flows that haven't been wired yet, or future
-    "destroy my sandbox" commands).
-
-    The idle reaper passes the env through ``env.cleanup()`` directly (not
-    via this function), so persist-mode idle envs are similarly no-op'd —
-    only the orphan reaper at next startup reclaims them.
+    Cleanup runs immediately when no operation holds a lease; otherwise the
+    final lease release performs it.
     """
-    # Remove from tracking dicts while holding the lock, but defer the
-    # actual (potentially slow) env.cleanup() call to outside the lock
-    # so other tool calls aren't blocked.
-    env = None
+    cleanup_item = None
     with _env_lock:
         env = _active_environments.pop(task_id, None)
         _last_activity.pop(task_id, None)
+        if env is not None:
+            cleanup_item = _retire_environment_locked(
+                task_id, env, force_remove=force_remove
+            )
 
-    # Clean up per-task creation lock
     with _creation_locks_lock:
         _creation_locks.pop(task_id, None)
 
-    # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
         clear_file_ops_cache(task_id)
     except ImportError:
         pass
 
-    if env is None:
+    if cleanup_item is None:
         return
 
-    try:
-        if hasattr(env, 'cleanup'):
-            # Pass force_remove only if the env's cleanup() accepts it
-            # (DockerEnvironment after issue #20561; other backends don't).
-            import inspect
-            sig = inspect.signature(env.cleanup)
-            if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
-            else:
-                env.cleanup()
-        elif hasattr(env, 'stop'):
-            env.stop()
-        elif hasattr(env, 'terminate'):
-            env.terminate()
-
+    if _cleanup_environment_item(cleanup_item):
         logger.info("Manually cleaned up environment for task: %s", task_id)
-
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
-        else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
 def _atexit_cleanup():
     """Stop cleanup thread and shut down all remaining sandboxes on exit."""
     _stop_cleanup_thread()
-    if _active_environments:
+    with _env_lock:
         count = len(_active_environments)
+        envs_to_wait = list(_active_environments.values()) + [
+            state.env for state in _environment_lease_states.values()
+        ]
+    if count or envs_to_wait:
         logger.info("Shutting down %d remaining sandbox(es)...", count)
         # Snapshot the env objects BEFORE cleanup_all_environments empties
         # the dict; we need them to wait on docker cleanup threads after the
         # registry has been cleared.
-        envs_to_wait = list(_active_environments.values())
-        cleanup_all_environments()
+        cleanup_all_environments(force_retired=True)
         # Block briefly so docker stop/rm actually completes before the
         # interpreter exits. Issue #20561 — without this join, the daemon
         # cleanup threads were getting torn down mid-`docker stop`, leaving
@@ -2140,6 +2699,7 @@ def terminal_tool(
         # Force run after user confirmation
         # Note: force parameter is internal only, not exposed to model API
     """
+    env_lease = None
     try:
         if not isinstance(command, str):
             logger.warning(
@@ -2157,52 +2717,11 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # Use task_id for environment isolation. By default all subagent
-        # task_ids collapse back to "default" so the top-level agent and
-        # every delegate_task child share one container; only task_ids with
-        # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
-
-        # Check per-task overrides (set by environments like TerminalBench2Env)
-        # before falling back to global env var config. ``resolve_task_overrides``
-        # reads the raw task id first then the collapsed container id, so a
-        # CWD-only override (which collapses ``effective_task_id`` to
-        # ``"default"``) is still found under its originating session id while
-        # isolation-keyed RL/benchmark overrides keep resolving as before.
-        overrides = resolve_task_overrides(task_id)
-        
-        # Select image based on env type, with per-task override support
-        if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
-        else:
-            image = ""
-
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
+        runtime = resolve_terminal_runtime_identity(config, raw_task_id=task_id)
+        effective_task_id = runtime["effective_task_id"]
+        image = runtime["image"]
+        cwd = runtime["cwd"]
+        env_signature = runtime["signature"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -2236,91 +2755,74 @@ def terminal_tool(
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
-        env = None
-        with _env_lock:
-            # Prefer the collapsed container id, but fall back to an env cached
-            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
-            # with a CWD-only override collapse to "default" for container
-            # sharing, yet an env may already be cached under the originating
-            # task_id; honor it instead of spawning a duplicate.
-            _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
-            )
-            if _existing_key is not None:
-                _last_activity[_existing_key] = time.time()
-                env = _active_environments[_existing_key]
-                needs_creation = False
-            else:
-                needs_creation = True
+        env_lease = _acquire_active_environment_if_compatible(
+            effective_task_id,
+            env_signature,
+            raw_task_id=task_id,
+        )
+        env = env_lease.env if env_lease is not None else None
+        needs_creation = env_lease is None
 
-        if needs_creation:
-            # Per-task lock: only one thread creates the sandbox, others wait
+        while needs_creation:
+            # Per-task lock: only one thread creates the sandbox for the
+            # effective cache key. Runtime identity can change while we wait,
+            # so switch locks before touching the cache or publishing.
+            lock_task_id = effective_task_id
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if lock_task_id not in _creation_locks:
+                    _creation_locks[lock_task_id] = threading.Lock()
+                task_lock = _creation_locks[lock_task_id]
 
             with task_lock:
-                # Double-check after acquiring the per-task lock
-                with _env_lock:
-                    _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
-                    )
-                    if _existing_key is not None:
-                        _last_activity[_existing_key] = time.time()
-                        env = _active_environments[_existing_key]
-                        needs_creation = False
+                # Config/runtime may have changed while this thread waited.
+                # Recompute before compatibility checks or publishing a new
+                # backend so a stale waiter cannot retire a freshly-created
+                # backend with the current signature.
+                config = _get_env_config()
+                runtime = resolve_terminal_runtime_identity(config, raw_task_id=task_id)
+                effective_task_id = runtime["effective_task_id"]
+                image = runtime["image"]
+                cwd = runtime["cwd"]
+                env_signature = runtime["signature"]
+                env_type = runtime["env_type"]
+                default_timeout = config["timeout"]
+                effective_timeout = timeout or default_timeout
+
+                if effective_task_id != lock_task_id:
+                    continue
+
+                if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+                    return json.dumps({
+                        "error": (
+                            f"Foreground timeout {timeout}s exceeds the maximum of "
+                            f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
+                            f"notify_on_complete=true for long-running commands."
+                        ),
+                    }, ensure_ascii=False)
+
+                # Double-check after acquiring the per-task lock with the
+                # freshly recomputed signature.
+                env_lease = _acquire_active_environment_if_compatible(
+                    effective_task_id,
+                    env_signature,
+                    raw_task_id=task_id,
+                )
+                env = env_lease.env if env_lease is not None else None
+                needs_creation = env_lease is None
 
                 if needs_creation:
                     if env_type == "singularity":
                         _check_disk_usage_warning()
                     logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
                     try:
-                        ssh_config = None
-                        if env_type == "ssh":
-                            ssh_config = {
-                                "host": config.get("ssh_host", ""),
-                                "user": config.get("ssh_user", ""),
-                                "port": config.get("ssh_port", 22),
-                                "key": config.get("ssh_key", ""),
-                                "persistent": config.get("ssh_persistent", False),
-                            }
-
-                        container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona"}:
-                            container_config = {
-                                "container_cpu": config.get("container_cpu", 1),
-                                "container_memory": config.get("container_memory", 5120),
-                                "container_disk": config.get("container_disk", 51200),
-                                "container_persistent": config.get("container_persistent", True),
-                                "modal_mode": config.get("modal_mode", "auto"),
-                                "docker_volumes": config.get("docker_volumes", []),
-                                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                                "docker_forward_env": config.get("docker_forward_env", []),
-                                "docker_env": config.get("docker_env", {}),
-                                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                                "docker_extra_args": config.get("docker_extra_args", []),
-                                "docker_network": config.get("docker_network", True),
-                                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
-                                "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                            }
-
-                        local_config = None
-                        if env_type == "local":
-                            local_config = {
-                                "persistent": config.get("local_persistent", False),
-                            }
-
                         new_env = _create_environment(
                             env_type=env_type,
                             image=image,
                             cwd=cwd,
                             timeout=effective_timeout,
-                            ssh_config=ssh_config,
-                            container_config=container_config,
-                            local_config=local_config,
+                            ssh_config=runtime["ssh_config"],
+                            container_config=runtime["container_config"],
+                            local_config=runtime["local_config"],
                             task_id=effective_task_id,
                             host_cwd=config.get("host_cwd"),
                         )
@@ -2332,10 +2834,11 @@ def terminal_tool(
                             "status": "disabled"
                         }, ensure_ascii=False)
 
-                    with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
-                        env = new_env
+                    env_lease = _store_active_environment(
+                        effective_task_id, new_env, env_signature, lease=True
+                    )
+                    env = env_lease.env if env_lease is not None else new_env
+                    needs_creation = False
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
         if env is None:
@@ -2481,7 +2984,9 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        environment_lease=env_lease,
                     )
+                    env_lease = None
 
                 result_data = {
                     "output": "Background process started",
@@ -2764,13 +3269,11 @@ def terminal_tool(
                 # Got a result
                 break
 
-            # Dual-write (cwd rearch step 1): the env's post-command tracking
-            # (marker parse / local sync) has just updated env.cwd with the
-            # directory this command finished in. That cwd belongs to THIS
-            # session — record it under the session key so the durable record
-            # never depends on the shared env surviving or on who drives the
-            # env next.
-            record_session_cwd(session_key, getattr(env, "cwd", None))
+            # The execution result carries the cwd observed by THIS command's
+            # wrapper. Do not read the shared backend cwd here: another session
+            # can drive the same collapsed environment before we persist ours.
+            result_cwd = result.get("cwd") if isinstance(result, dict) else None
+            record_session_cwd(session_key, result_cwd)
 
             # Extract output
             output = result.get("output", "")
@@ -2906,6 +3409,9 @@ def terminal_tool(
             "traceback": tb_str,
             "status": "error"
         }, ensure_ascii=False)
+    finally:
+        if env_lease is not None:
+            env_lease.release()
 
 
 def check_terminal_requirements() -> bool:

@@ -1527,17 +1527,22 @@ class LocalEnvironment(BaseEnvironment):
         ``result["output"]`` so output formatting is identical.
         """
         # Snapshot pre-existing cwd, defer to base for parsing + marker
-        # stripping, then validate / normalize whatever it assigned.
+        # stripping, then validate / normalize the cwd parsed for this exact
+        # command result. Do not reread self.cwd after base parsing: another
+        # shared-backend command can update that mutable field concurrently.
         prev_cwd = self.cwd
         super()._extract_cwd_from_output(result)
-        if self.cwd != prev_cwd:
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+        parsed_cwd = result.get("cwd")
+        if isinstance(parsed_cwd, str) and parsed_cwd and parsed_cwd != prev_cwd:
+            normalized = _msys_to_windows_path(parsed_cwd) if _IS_WINDOWS else parsed_cwd
             if normalized and os.path.isdir(normalized):
                 self.cwd = normalized
+                result["cwd"] = normalized
             else:
                 # Stale / non-existent path — keep previous cwd; _run_bash
                 # will resolve a safe fallback on the next call if needed.
                 self.cwd = prev_cwd
+                result["cwd"] = prev_cwd
 
     def cleanup(self):
         """Clean up temp files."""

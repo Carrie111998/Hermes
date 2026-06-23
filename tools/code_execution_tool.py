@@ -704,7 +704,7 @@ def _rpc_server_loop(
 # Remote execution support (file-based RPC via terminal backend)
 # ---------------------------------------------------------------------------
 
-def _get_or_create_env(task_id: str):
+def _get_or_create_env_lease(task_id: str):
     """Get or create the terminal environment for *task_id*.
 
     Reuses the same environment (container/sandbox/SSH session) that the
@@ -712,99 +712,91 @@ def _get_or_create_env(task_id: str):
     Returns ``(env, env_type)`` tuple.
     """
     from tools.terminal_tool import (
-        _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id,
+        _create_environment,
+        _get_env_config,
+        _start_cleanup_thread,
+        _creation_locks,
+        _creation_locks_lock,
+        _acquire_active_environment_if_compatible,
+        _store_active_environment,
+        resolve_terminal_runtime_identity,
     )
 
-    effective_task_id = _resolve_container_task_id(task_id)
+    config = _get_env_config()
+    runtime = resolve_terminal_runtime_identity(
+        config,
+        raw_task_id=task_id,
+    )
+    effective_task_id = runtime["effective_task_id"]
+    env_signature = runtime["signature"]
 
-    # Fast path: environment already exists
-    with _env_lock:
-        if effective_task_id in _active_environments:
-            _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
+    # Fast path: environment already exists and still matches current runtime.
+    env_lease = _acquire_active_environment_if_compatible(
+        effective_task_id,
+        env_signature,
+        raw_task_id=task_id,
+    )
+    if env_lease is not None:
+        return getattr(env_lease, "env"), runtime["env_type"], env_lease
 
     # Slow path: create environment (same pattern as file_tools._get_file_ops)
-    with _creation_locks_lock:
-        if effective_task_id not in _creation_locks:
-            _creation_locks[effective_task_id] = threading.Lock()
-        task_lock = _creation_locks[effective_task_id]
+    while True:
+        with _creation_locks_lock:
+            if effective_task_id not in _creation_locks:
+                _creation_locks[effective_task_id] = threading.Lock()
+            task_lock = _creation_locks[effective_task_id]
 
-    with task_lock:
-        with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
+        with task_lock:
+            config = _get_env_config()
+            runtime = resolve_terminal_runtime_identity(
+                config,
+                raw_task_id=task_id,
+            )
+            if runtime["effective_task_id"] != effective_task_id:
+                effective_task_id = runtime["effective_task_id"]
+                env_signature = runtime["signature"]
+                continue
+            env_signature = runtime["signature"]
 
-        config = _get_env_config()
-        env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+            env_lease = _acquire_active_environment_if_compatible(
+                effective_task_id,
+                env_signature,
+                raw_task_id=task_id,
+            )
+            if env_lease is not None:
+                return getattr(env_lease, "env"), runtime["env_type"], env_lease
 
-        if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
-        else:
-            image = ""
+            env_type = runtime["env_type"]
 
-        cwd = overrides.get("cwd") or config["cwd"]
+            logger.info("Creating new %s environment for execute_code task %s...",
+                         env_type, effective_task_id[:8])
+            env = _create_environment(
+                env_type=env_type,
+                image=runtime["image"],
+                cwd=runtime["cwd"],
+                timeout=config["timeout"],
+                ssh_config=runtime["ssh_config"],
+                container_config=runtime["container_config"],
+                local_config=runtime["local_config"],
+                task_id=effective_task_id,
+                host_cwd=config.get("host_cwd"),
+            )
 
-        container_config = None
-        if env_type in {"docker", "singularity", "modal", "daytona"}:
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_network": config.get("docker_network", True),
-            }
+            env_lease = _store_active_environment(
+                effective_task_id, env, env_signature, lease=True
+            )
+            env = getattr(env_lease, "env") if env_lease is not None else env
 
-        ssh_config = None
-        if env_type == "ssh":
-            ssh_config = {
-                "host": config.get("ssh_host", ""),
-                "user": config.get("ssh_user", ""),
-                "port": config.get("ssh_port", 22),
-                "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
-            }
+            _start_cleanup_thread()
+            logger.info("%s environment ready for execute_code task %s",
+                         env_type, effective_task_id[:8])
+            return env, env_type, env_lease
 
-        local_config = None
-        if env_type == "local":
-            local_config = {
-                "persistent": config.get("local_persistent", False),
-            }
 
-        logger.info("Creating new %s environment for execute_code task %s...",
-                     env_type, effective_task_id[:8])
-        env = _create_environment(
-            env_type=env_type,
-            image=image,
-            cwd=cwd,
-            timeout=config["timeout"],
-            ssh_config=ssh_config,
-            container_config=container_config,
-            local_config=local_config,
-            task_id=effective_task_id,
-            host_cwd=config.get("host_cwd"),
-        )
-
-        with _env_lock:
-            _active_environments[effective_task_id] = env
-            _last_activity[effective_task_id] = time.time()
-
-        _start_cleanup_thread()
-        logger.info("%s environment ready for execute_code task %s",
-                     env_type, effective_task_id[:8])
-        return env, env_type
+def _get_or_create_env(task_id: str):
+    env, env_type, lease = _get_or_create_env_lease(task_id)
+    lease.release()
+    return env, env_type
 
 
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
@@ -1015,13 +1007,25 @@ def _execute_remote(
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     effective_task_id = task_id or "default"
-    env, env_type = _get_or_create_env(effective_task_id)
+    env, env_type, env_lease = _get_or_create_env_lease(effective_task_id)
+    lease_released = False
 
-    sandbox_id = uuid.uuid4().hex[:12]
-    temp_dir = _env_temp_dir(env)
-    sandbox_dir = f"{temp_dir}/hermes_exec_{sandbox_id}"
-    quoted_sandbox_dir = shlex.quote(sandbox_dir)
-    quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
+    def _release_env_lease_once() -> None:
+        nonlocal lease_released
+        if lease_released:
+            return
+        lease_released = True
+        env_lease.release()
+
+    try:
+        sandbox_id = uuid.uuid4().hex[:12]
+        temp_dir = _env_temp_dir(env)
+        sandbox_dir = f"{temp_dir}/hermes_exec_{sandbox_id}"
+        quoted_sandbox_dir = shlex.quote(sandbox_dir)
+        quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
+    except Exception:
+        _release_env_lease_once()
+        raise
 
     tool_call_log: list = []
     tool_call_counter = [0]
@@ -1130,6 +1134,8 @@ def _execute_remote(
             )
         except Exception:
             logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
+        finally:
+            _release_env_lease_once()
 
     duration = round(time.monotonic() - exec_start, 2)
 
@@ -1178,7 +1184,10 @@ def _execute_remote(
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
 
-    return json.dumps(result, ensure_ascii=False)
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        _release_env_lease_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1321,11 +1330,12 @@ def execute_code(
         # Two transports:
         #   POSIX: AF_UNIX stream socket on sock_path, chmod 0600 for
         #   owner-only access.  Filesystem permissions gate the socket.
-        #   Windows: AF_INET stream socket on 127.0.0.1 with an ephemeral
-        #   port.  No filesystem permission story, but loopback-only bind
-        #   means only the current user's processes (not remote) can
-        #   connect.  HERMES_RPC_SOCKET is set to ``tcp://127.0.0.1:<port>``
-        #   which the generated client parses to pick AF_INET.
+        #   Windows, or restricted POSIX sandboxes that reject AF_UNIX bind:
+        #   AF_INET stream socket on 127.0.0.1 with an ephemeral port.  No
+        #   filesystem permission story, but loopback-only bind plus the
+        #   per-run token keeps dispatch fail-closed. HERMES_RPC_SOCKET is set
+        #   to ``tcp://127.0.0.1:<port>`` which the generated client parses to
+        #   pick AF_INET.
         if _use_tcp_rpc:
             server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_sock.bind(("127.0.0.1", 0))  # ephemeral port
@@ -1333,8 +1343,15 @@ def execute_code(
             rpc_endpoint = f"tcp://{_host}:{_port}"
         else:
             server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            server_sock.bind(sock_path)
-            os.chmod(sock_path, 0o600)
+            try:
+                server_sock.bind(sock_path)
+                os.chmod(sock_path, 0o600)
+            except PermissionError:
+                server_sock.close()
+                server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_sock.bind(("127.0.0.1", 0))
+                _host, _port = server_sock.getsockname()[:2]
+                rpc_endpoint = f"tcp://{_host}:{_port}"
         server_sock.listen(1)
 
         # Wrapped so the thread inherits the turn's approval context + callbacks

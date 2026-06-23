@@ -773,6 +773,40 @@ class TestSpawnEnvSanitization:
         args, kwargs = env.commands[0]
         assert kwargs.get("rewrite_compound_background") is False
 
+    def test_spawn_via_env_kills_remote_process_when_poller_start_fails(self, registry):
+        events = []
+
+        class FakeEnv:
+            def __init__(self):
+                self.commands = []
+
+            def execute(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if "nohup bash" in command:
+                    events.append("launch")
+                    return {"output": "4321\n", "returncode": 0}
+                if command == "kill 4321 2>/dev/null":
+                    events.append("kill")
+                    return {"output": "", "returncode": 0}
+                raise AssertionError(f"unexpected command: {command}")
+
+        class FailingThread:
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        env = FakeEnv()
+        lease = MagicMock()
+        lease.release.side_effect = lambda: events.append("release")
+
+        with patch("tools.process_registry.threading.Thread", return_value=FailingThread()), \
+             patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="thread start failed"):
+                registry.spawn_via_env(env, "echo hello", environment_lease=lease)
+
+        assert events == ["launch", "kill", "release"]
+        assert registry._running == {}
+        lease.release.assert_called_once_with()
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False

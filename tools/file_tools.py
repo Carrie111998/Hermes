@@ -8,6 +8,7 @@ import os
 import posixpath
 import sys
 import threading
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from agent.file_safety import get_read_block_error
@@ -175,7 +176,17 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             _env_lock,
             _get_env_config,
             _resolve_container_task_id,
+            resolve_terminal_runtime_identity,
         )
+
+        cfg = _get_env_config()
+        try:
+            runtime = resolve_terminal_runtime_identity(cfg, raw_task_id=task_id)
+            env_type = str(runtime.get("env_type") or "").lower()
+            if env_type:
+                return env_type
+        except Exception:
+            logger.debug("Could not resolve current terminal runtime identity", exc_info=True)
 
         try:
             container_key = _resolve_container_task_id(task_id)
@@ -197,7 +208,6 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
                 return "modal"
             if "daytona" in name:
                 return "daytona"
-        cfg = _get_env_config()
         return str(cfg.get("env_type") or os.getenv("TERMINAL_ENV") or "local").lower()
     except Exception:
         return str(os.getenv("TERMINAL_ENV") or "local").lower()
@@ -925,7 +935,7 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
-def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
+def _get_file_ops_with_lease(task_id: str = "default") -> tuple[ShellFileOperations, object]:
     """Get or create ShellFileOperations for a terminal environment.
 
     Respects the TERMINAL_ENV setting -- if the task_id doesn't have an
@@ -941,160 +951,169 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     a registered env override keep their isolation.
     """
     from tools.terminal_tool import (
-        _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
+        _create_environment,
+        _ENV_SIGNATURE_ATTR,
+        _acquire_active_environment_if_compatible,
+        _get_env_config,
+        _start_cleanup_thread,
+        _store_active_environment,
         _creation_locks,
         _creation_locks_lock,
-        _resolve_container_task_id,
-        _is_unusable_container_cwd,
-        _CONTAINER_BACKENDS,
+        get_session_cwd,
+        resolve_terminal_runtime_identity,
     )
-    import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    config = _get_env_config()
+    runtime = resolve_terminal_runtime_identity(
+        config,
+        raw_task_id=raw_task_id,
+        cwd_fallback=get_session_cwd(raw_task_id),
+    )
+    task_id = runtime["effective_task_id"]
+    env_signature = runtime["signature"]
 
     # Fast path: check cache -- but also verify the underlying environment
-    # is still alive (it may have been killed by the cleanup thread).
+    # is still alive and still compatible with the current runtime.
     with _file_ops_lock:
         cached = _file_ops_cache.get(task_id)
     if cached is not None:
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                return cached
-            else:
-                # Environment was cleaned up -- preserve the old cwd in the
-                # session record before invalidating the stale cache entry
-                # (fixes #26211: silent file-creation failures in long-running
-                # conversations). Usually a no-op: every completed command
-                # already recorded its cwd.
-                old_cwd = getattr(cached, "cwd", None)
-                if old_cwd:
-                    try:
-                        from tools.terminal_tool import record_session_cwd
-                        record_session_cwd(raw_task_id, old_cwd)
-                    except Exception:
-                        pass
-                with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+        terminal_lease = _acquire_active_environment_if_compatible(
+            task_id,
+            env_signature,
+            raw_task_id=raw_task_id,
+        )
+        if terminal_lease is not None:
+            if getattr(cached, "env", None) is terminal_lease.env:
+                return cached, terminal_lease
+            terminal_lease.release()
+        # Environment was cleaned up or replaced -- preserve the old cwd before
+        # invalidating the stale cache entry only for idle cleanup where no
+        # raw session record exists (fixes #26211: silent file-creation
+        # failures in long-running conversations). Do not copy cwd out of a
+        # signature-replaced backend; that can restore an old SSH/container cwd
+        # over the current local/session cwd.
+        old_env = getattr(cached, "env", None)
+        old_cwd = getattr(old_env, "cwd", None) or getattr(cached, "cwd", None)
+        old_signature = getattr(old_env, _ENV_SIGNATURE_ATTR, None)
+        signature_replaced = (
+            isinstance(old_signature, dict)
+            and old_signature != env_signature
+        )
+        if old_cwd and not signature_replaced and get_session_cwd(raw_task_id) is None:
+            try:
+                from tools.terminal_tool import record_session_cwd
+                record_session_cwd(raw_task_id, old_cwd)
+            except Exception:
+                pass
+            runtime = resolve_terminal_runtime_identity(
+                config,
+                raw_task_id=raw_task_id,
+                cwd_fallback=old_cwd,
+            )
+            env_signature = runtime["signature"]
+        with _file_ops_lock:
+            _file_ops_cache.pop(task_id, None)
 
     # Need to ensure the environment exists before building file_ops.
     # Acquire per-task lock so only one thread creates the sandbox.
-    with _creation_locks_lock:
-        if task_id not in _creation_locks:
-            _creation_locks[task_id] = threading.Lock()
-        task_lock = _creation_locks[task_id]
+    while True:
+        with _creation_locks_lock:
+            if task_id not in _creation_locks:
+                _creation_locks[task_id] = threading.Lock()
+            task_lock = _creation_locks[task_id]
 
-    with task_lock:
-        # Double-check: another thread may have created it while we waited
-        with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                terminal_env = _active_environments[task_id]
-            else:
-                terminal_env = None
-
-        if terminal_env is None:
-            from tools.terminal_tool import resolve_task_overrides
-
+        with task_lock:
+            # Config/runtime may have changed while this thread waited. If the
+            # effective cache key changed, switch to that key's creation lock
+            # before touching the cache or publishing a backend.
             config = _get_env_config()
-            env_type = config["env_type"]
-            overrides = resolve_task_overrides(raw_task_id)
-
-            if env_type == "docker":
-                image = overrides.get("docker_image") or config["docker_image"]
-            elif env_type == "singularity":
-                image = overrides.get("singularity_image") or config["singularity_image"]
-            elif env_type == "modal":
-                image = overrides.get("modal_image") or config["modal_image"]
-            elif env_type == "daytona":
-                image = overrides.get("daytona_image") or config["daytona_image"]
-            else:
-                image = ""
-
-            try:
-                from tools.terminal_tool import get_session_cwd
-                recorded_cwd = get_session_cwd(raw_task_id)
-            except Exception:
-                recorded_cwd = None
-            cwd = overrides.get("cwd") or recorded_cwd or config["cwd"]
-            # Re-apply the container cwd guard that _get_env_config() already
-            # ran on config["cwd"] (see #50636).  A per-task cwd override
-            # registered by the gateway/TUI/ACP for workspace tracking is a
-            # raw host path (e.g. a Desktop session's /Users/<me>/workspace or
-            # C:\\Users\\<me>). On a container backend that reaches
-            # ``docker run -w <host-path>`` and the container starts in a
-            # directory that doesn't exist inside the sandbox, so search_files
-            # and friends silently return empty results (#54447).  Sanitize it
-            # back to the already-validated config["cwd"] so the override can't
-            # bypass the guard.  Valid in-container override paths (RL/benchmark
-            # sandboxes that set cwd to /workspace, /root, etc.) are absolute
-            # non-host paths and pass through untouched.
-            if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-                if cwd != config["cwd"]:
-                    logger.info(
-                        "Ignoring host/relative cwd override %r for %s backend "
-                        "(won't exist in sandbox). Using %r instead.",
-                        cwd, env_type, config["cwd"],
-                    )
-                cwd = config["cwd"]
-            logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
-
-            container_config = None
-            if env_type in {"docker", "singularity", "modal", "daytona"}:
-                container_config = {
-                    "container_cpu": config.get("container_cpu", 1),
-                    "container_memory": config.get("container_memory", 5120),
-                    "container_disk": config.get("container_disk", 51200),
-                    "container_persistent": config.get("container_persistent", True),
-                    "docker_volumes": config.get("docker_volumes", []),
-                    "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
-                    "docker_forward_env": config.get("docker_forward_env", []),
-                    "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                    "docker_network": config.get("docker_network", True),
-                }
-
-            ssh_config = None
-            if env_type == "ssh":
-                ssh_config = {
-                    "host": config.get("ssh_host", ""),
-                    "user": config.get("ssh_user", ""),
-                    "port": config.get("ssh_port", 22),
-                    "key": config.get("ssh_key", ""),
-                    "persistent": config.get("ssh_persistent", False),
-                }
-
-            local_config = None
-            if env_type == "local":
-                local_config = {
-                    "persistent": config.get("local_persistent", False),
-                }
-
-            terminal_env = _create_environment(
-                env_type=env_type,
-                image=image,
-                cwd=cwd,
-                timeout=config["timeout"],
-                ssh_config=ssh_config,
-                container_config=container_config,
-                local_config=local_config,
-                task_id=task_id,
-                host_cwd=config.get("host_cwd"),
+            runtime = resolve_terminal_runtime_identity(
+                config,
+                raw_task_id=raw_task_id,
+                cwd_fallback=get_session_cwd(raw_task_id),
             )
+            if runtime["effective_task_id"] != task_id:
+                task_id = runtime["effective_task_id"]
+                env_signature = runtime["signature"]
+                continue
+            env_signature = runtime["signature"]
 
-            with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
+            # Double-check: another thread may have created it while we waited
+            terminal_lease = _acquire_active_environment_if_compatible(
+                task_id,
+                env_signature,
+                raw_task_id=raw_task_id,
+            )
+            terminal_env = getattr(terminal_lease, "env") if terminal_lease is not None else None
 
-            _start_cleanup_thread()
-            logger.info("%s environment ready for task %s", env_type, task_id[:8])
+            if terminal_env is None:
+                env_type = runtime["env_type"]
+                logger.info("Creating new %s environment for task %s...", env_type, task_id[:8])
+
+                terminal_env = _create_environment(
+                    env_type=env_type,
+                    image=runtime["image"],
+                    cwd=runtime["cwd"],
+                    timeout=config["timeout"],
+                    ssh_config=runtime["ssh_config"],
+                    container_config=runtime["container_config"],
+                    local_config=runtime["local_config"],
+                    task_id=task_id,
+                    host_cwd=config.get("host_cwd"),
+                )
+
+                terminal_lease = _store_active_environment(
+                    task_id, terminal_env, env_signature, lease=True
+                )
+                terminal_env = getattr(terminal_lease, "env") if terminal_lease is not None else terminal_env
+
+                _start_cleanup_thread()
+                logger.info("%s environment ready for task %s", env_type, task_id[:8])
+            break
 
     # Build file_ops from the (guaranteed live) environment and cache it
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
+    return file_ops, terminal_lease
+
+
+def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
+    file_ops, lease = _get_file_ops_with_lease(task_id)
+    lease.release()
     return file_ops
+
+
+_REAL_GET_FILE_OPS = _get_file_ops
+
+
+def _bind_file_ops_to_task_cwd(
+    file_ops: ShellFileOperations,
+    task_id: str = "default",
+) -> ShellFileOperations:
+    operation_cwd = _authoritative_workspace_root(task_id)
+    if not operation_cwd or not isinstance(file_ops, ShellFileOperations):
+        return file_ops
+    bound = ShellFileOperations(
+        getattr(file_ops, "env"),
+        cwd=operation_cwd,
+        bind_cwd=True,
+    )
+    bound._command_cache = file_ops._command_cache
+    return bound
+
+
+@contextmanager
+def _leased_file_ops(task_id: str = "default"):
+    if _get_file_ops is not _REAL_GET_FILE_OPS:
+        yield _get_file_ops(task_id)
+        return
+    file_ops, lease = _get_file_ops_with_lease(task_id)
+    try:
+        yield _bind_file_ops_to_task_cwd(file_ops, task_id)
+    finally:
+        lease.release()
 
 
 def clear_file_ops_cache(task_id: str = None):
@@ -1136,13 +1155,14 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             except ExtractionError:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
                 page_text = "\n".join(lines[offset - 1:end_line])
+                with _leased_file_ops(task_id) as file_ops:
+                    numbered_content = file_ops._add_line_numbers(page_text, offset) if page_text else ""
                 result_dict = {
-                    "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
+                    "content": numbered_content,
                     "total_lines": total_lines,
                     "file_size": os.path.getsize(_resolved),
                     "truncated": total_lines > end_line,
@@ -1267,8 +1287,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        with _leased_file_ops(task_id) as file_ops:
+            result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -1604,8 +1624,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            with _leased_file_ops(task_id) as file_ops:
+                result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
@@ -1625,8 +1645,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
-            file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            with _leased_file_ops(task_id) as file_ops:
+                result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -1758,26 +1778,25 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
-            file_ops = _get_file_ops(task_id)
-
-            if mode == "replace":
-                if not path:
-                    return tool_error("path required")
-                if old_string is None or new_string is None:
-                    return tool_error("old_string and new_string required")
-                # Pass the resolved ABSOLUTE path to the shell layer so it
-                # operates on the exact file the tool layer resolved — the
-                # shell's own cwd may differ (worktree-cwd bug), and a relative
-                # path would let the two layers disagree about which file is
-                # being edited.
-                _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
-            elif mode == "patch":
-                if not patch:
-                    return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
-            else:
-                return tool_error(f"Unknown mode: {mode}")
+            with _leased_file_ops(task_id) as file_ops:
+                if mode == "replace":
+                    if not path:
+                        return tool_error("path required")
+                    if old_string is None or new_string is None:
+                        return tool_error("old_string and new_string required")
+                    # Pass the resolved ABSOLUTE path to the shell layer so it
+                    # operates on the exact file the tool layer resolved — the
+                    # shell's own cwd may differ (worktree-cwd bug), and a relative
+                    # path would let the two layers disagree about which file is
+                    # being edited.
+                    _replace_target = _path_to_resolved.get(path) or path
+                    result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                elif mode == "patch":
+                    if not patch:
+                        return tool_error("patch content required")
+                    result = file_ops.patch_v4a(patch)
+                else:
+                    return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
             if stale_warnings:
@@ -1896,11 +1915,11 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
 
-        file_ops = _get_file_ops(task_id)
-        result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
-        )
+        with _leased_file_ops(task_id) as file_ops:
+            result = file_ops.search(
+                pattern=pattern, path=path, target=target, file_glob=file_glob,
+                limit=limit, offset=offset, output_mode=output_mode, context=context
+            )
         omitted = _filter_read_blocked_search_results(result, task_id)
         if hasattr(result, 'matches'):
             for m in result.matches:
