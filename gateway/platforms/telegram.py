@@ -14,6 +14,8 @@ import os
 import tempfile
 import html as _html
 import re
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -84,6 +86,30 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from utils import atomic_replace
+
+
+def _first_present(mapping: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -4856,6 +4882,195 @@ class TelegramAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             timestamp=message.date,
         )
+
+
+    async def replay_bridge_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        bypass_require_mention: bool = True,
+    ) -> int:
+        """Replay Telegram-shaped records through the normalized MessageEvent path.
+
+        Native gateway replay builds adapters with ``connect=False`` and wraps
+        outbound sends, so this method must not touch Telegram network APIs. It
+        normalizes stored/test records into the same MessageEvent surface that
+        live Telegram updates produce, then hands them to BasePlatformAdapter's
+        replay-aware sequential dispatcher.
+        """
+        processed = 0
+        for msg_data in sorted((m for m in messages if isinstance(m, dict)), key=self._replay_sort_key):
+            event = self._build_replay_message_event(
+                msg_data,
+                bypass_require_mention=bypass_require_mention,
+            )
+            if event is None:
+                continue
+            await self.handle_message(event)
+            processed += 1
+        return processed
+
+    @staticmethod
+    def _replay_sort_key(message: Dict[str, Any]) -> tuple:
+        ts = TelegramAdapter._replay_timestamp_value(message)
+        message_id = _first_present(
+            message,
+            "messageId",
+            "message_id",
+            "id",
+            "telegramMessageId",
+            "telegram_message_id",
+        )
+        return (ts if ts is not None else 0, str(message_id or ""))
+
+    @staticmethod
+    def _replay_timestamp_value(message: Dict[str, Any]) -> Optional[int]:
+        raw = _first_present(message, "timestamp", "ts", "date")
+        if isinstance(raw, dict):
+            raw = _first_present(raw, "low", "value", "seconds")
+        if raw in (None, ""):
+            return None
+        if isinstance(raw, (int, float)):
+            return int(raw / 1000) if raw > 10_000_000_000 else int(raw)
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+            return int(value / 1000) if value > 10_000_000_000 else int(value)
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+
+    def _build_replay_message_event(
+        self,
+        data: Dict[str, Any],
+        *,
+        bypass_require_mention: bool = False,
+    ) -> Optional[MessageEvent]:
+        """Build a Telegram MessageEvent from JSON/JSONL replay data."""
+        text = str(_first_present(data, "body", "text", "message", "caption") or "")
+        chat_id = str(_first_present(data, "chatId", "chat_id", "chat", "chat_id_str") or "")
+        if not chat_id:
+            return None
+
+        user_id = _first_present(data, "senderId", "sender_id", "fromUserId", "from_user_id", "userId", "user_id")
+        chat_type = self._replay_chat_type(data, chat_id=chat_id)
+        thread_id = _first_present(data, "messageThreadId", "message_thread_id", "threadId", "thread_id")
+        thread_id_str = str(thread_id) if thread_id not in (None, "") else None
+
+        if not bypass_require_mention and not self._should_process_replay_message(
+            data,
+            text=text,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            user_id=str(user_id) if user_id not in (None, "") else None,
+            thread_id=thread_id_str,
+        ):
+            return None
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=_first_present(data, "chatName", "chat_name", "title"),
+            chat_type=chat_type,
+            user_id=str(user_id) if user_id not in (None, "") else (chat_id if chat_type == "dm" else None),
+            user_name=_first_present(data, "senderName", "sender_name", "fromUserName", "from_user_name", "userName", "user_name"),
+            thread_id=thread_id_str,
+            chat_topic=_first_present(data, "chatTopic", "chat_topic", "topic"),
+        )
+
+        # Match the live text handler's post-normalization surface: mentions
+        # that exist solely to wake the bot are removed before the agent sees
+        # the message.
+        cleaned_text = self._clean_bot_trigger_text(text)
+        msg_type = MessageType.COMMAND if str(cleaned_text or "").startswith("/") else MessageType.TEXT
+        timestamp = self._replay_datetime(data)
+        addressed = bool(
+            _truthy(_first_present(data, "addressed", "mentionsBot", "mentions_bot", "replyToBot", "reply_to_bot"))
+        )
+
+        return MessageEvent(
+            text=cleaned_text or "",
+            message_type=msg_type,
+            source=source,
+            raw_message=dict(data),
+            message_id=str(_first_present(data, "messageId", "message_id", "id", "telegramMessageId", "telegram_message_id") or ""),
+            platform_update_id=_optional_int(_first_present(data, "updateId", "update_id")),
+            reply_to_message_id=(
+                str(_first_present(data, "replyToMessageId", "reply_to_message_id", "quotedMessageId", "quoted_message_id"))
+                if _first_present(data, "replyToMessageId", "reply_to_message_id", "quotedMessageId", "quoted_message_id") not in (None, "")
+                else None
+            ),
+            reply_to_text=_first_present(data, "replyToText", "reply_to_text", "quotedText", "quoted_text"),
+            channel_prompt=data.get("_hermes_channel_prompt"),
+            pa_job_type=data.get("_hermes_pa_job_type"),
+            pa_context=data.get("_hermes_pa_context") if isinstance(data.get("_hermes_pa_context"), dict) else None,
+            addressed=addressed,
+            timestamp=timestamp,
+        )
+
+    @staticmethod
+    def _replay_chat_type(data: Dict[str, Any], *, chat_id: str) -> str:
+        raw = _first_present(data, "chatType", "chat_type", "type")
+        if raw is not None:
+            value = str(raw).split(".")[-1].lower()
+            if value in {"group", "supergroup", "forum"}:
+                return "group"
+            if value in {"private", "dm", "user"}:
+                return "dm"
+            if value == "channel":
+                return "channel"
+        if bool(data.get("isGroup")) or bool(data.get("is_group")) or str(chat_id).startswith("-"):
+            return "group"
+        return "dm"
+
+    def _should_process_replay_message(
+        self,
+        data: Dict[str, Any],
+        *,
+        text: str,
+        chat_id: str,
+        chat_type: str,
+        user_id: Optional[str],
+        thread_id: Optional[str],
+    ) -> bool:
+        """Apply the existing Telegram group gate to a replay record."""
+        fake_message = SimpleNamespace(
+            text=text,
+            caption=data.get("caption"),
+            entities=data.get("entities") or [],
+            caption_entities=data.get("caption_entities") or data.get("captionEntities") or [],
+            message_thread_id=thread_id,
+            chat=SimpleNamespace(
+                id=chat_id,
+                type="group" if chat_type == "group" else ("channel" if chat_type == "channel" else "private"),
+                title=_first_present(data, "chatName", "chat_name", "title"),
+                full_name=_first_present(data, "chatName", "chat_name", "title"),
+                is_forum=bool(data.get("isForum") or data.get("is_forum")),
+            ),
+            from_user=SimpleNamespace(id=user_id) if user_id is not None else None,
+            reply_to_message=self._replay_reply_to_message(data),
+        )
+        return self._should_process_message(fake_message, is_command=text.startswith("/"))
+
+    def _replay_reply_to_message(self, data: Dict[str, Any]) -> Any:
+        if not _truthy(_first_present(data, "replyToBot", "reply_to_bot")):
+            return None
+        bot_id = getattr(self._bot, "id", None) if self._bot is not None else None
+        return SimpleNamespace(from_user=SimpleNamespace(id=bot_id))
+
+    @staticmethod
+    def _replay_datetime(data: Dict[str, Any]) -> datetime:
+        ts = TelegramAdapter._replay_timestamp_value(data)
+        if ts is None:
+            return datetime.now(timezone.utc)
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
 
     # ── Message reactions (processing lifecycle) ──────────────────────────
 

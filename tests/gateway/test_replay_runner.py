@@ -811,3 +811,95 @@ def test_replay_context_sets_pa_history_cap():
         assert _history_before_ts_cap() == 111
         set_replay_turn_history_before_ts(222)
         assert _history_before_ts_cap() == 222
+
+
+@pytest.mark.asyncio
+async def test_telegram_replay_bridge_messages_dispatches_normalized_events():
+    from gateway.platforms.telegram import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(
+        enabled=True,
+        token="unused-for-replay",
+        extra={
+            "require_mention": False,
+            "group_sessions_per_user": False,
+            "thread_sessions_per_user": True,
+        },
+    ))
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+        return None
+
+    adapter.set_message_handler(fake_handle)
+
+    with replay_context(ReplayPlan(platform="telegram", run_id="tg-run", attempt_id="tg-attempt")):
+        processed = await adapter.replay_bridge_messages([
+            {
+                "messageId": "tg-2",
+                "chatId": "-100100200300",
+                "chatName": "Pip PA Replay",
+                "isGroup": True,
+                "senderId": "276672685",
+                "senderName": "Teren",
+                "body": "later",
+                "timestamp": 102,
+                "messageThreadId": 9,
+            },
+            {
+                "messageId": "tg-1",
+                "chatId": "-100100200300",
+                "chatName": "Pip PA Replay",
+                "isGroup": True,
+                "senderId": "276672685",
+                "senderName": "Teren",
+                "body": "status please",
+                "timestamp": 101,
+                "messageThreadId": 9,
+            },
+        ])
+
+    assert processed == 2
+    assert [event.message_id for event in handled] == ["tg-1", "tg-2"]
+    first = handled[0]
+    assert first.source.platform == Platform.TELEGRAM
+    assert first.source.chat_id == "-100100200300"
+    assert first.source.chat_type == "group"
+    assert first.source.user_id == "276672685"
+    assert first.source.thread_id == "9"
+    assert first.text == "status please"
+    assert first.raw_message["messageId"] == "tg-1"
+
+
+@pytest.mark.asyncio
+async def test_telegram_replay_honors_group_mention_gate_when_not_bypassed():
+    from gateway.platforms.telegram import TelegramAdapter
+
+    adapter = TelegramAdapter(PlatformConfig(
+        enabled=True,
+        token="unused-for-replay",
+        extra={"require_mention": True},
+    ))
+    handled = []
+
+    async def fake_handle(event):
+        handled.append(event)
+        return None
+
+    adapter.set_message_handler(fake_handle)
+
+    with replay_context(ReplayPlan(platform="telegram", run_id="tg-gate", attempt_id="tg-gate-attempt")):
+        processed = await adapter.replay_bridge_messages([
+            {
+                "messageId": "tg-drop",
+                "chatId": "-100100200300",
+                "isGroup": True,
+                "senderId": "276672685",
+                "body": "unaddressed group text",
+                "timestamp": 101,
+            }
+        ], bypass_require_mention=False)
+
+    assert processed == 0
+    assert handled == []
