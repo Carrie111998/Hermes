@@ -26,12 +26,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from plugins.workflow import get_config
+
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────
+# ── Constants (from plugin config) ──────────────────────────────────
 
-MAX_NODES_PER_WORKFLOW = 256
-MAX_DISPATCH_PER_CALL = 16
+def _max_nodes() -> int:
+    return get_config().get("max_nodes_per_workflow", 256)
+
+def _max_dispatch() -> int:
+    return get_config().get("max_dispatch_per_call", 16)
+
+def _default_scope() -> str:
+    return get_config().get("default_scope", "project")
+
+def _auto_approve(key: str) -> bool:
+    return bool(get_config().get(key, False))
+
+def _auto_discover() -> bool:
+    return bool(get_config().get("auto_discovery", True))
+
+def _auto_deliver() -> bool:
+    return bool(get_config().get("auto_deliver", True))
 
 VALID_SCOPES = frozenset({"project", "global", "durable"})
 
@@ -257,17 +274,17 @@ def _check_single_flight(workflow_id: str) -> str | None:
 
 def _validate_nodes_count(nodes: list) -> str | None:
     """Reject workflows exceeding the node cap.  Returns error or None."""
-    if len(nodes) > MAX_NODES_PER_WORKFLOW:
+    if len(nodes) > _max_nodes():
         return (
             f"too many nodes: {len(nodes)} exceeds cap of "
-            f"{MAX_NODES_PER_WORKFLOW}"
+            f"{_max_nodes()}"
         )
     return None
 
 
 def _validate_dispatch_count(count: int) -> int:
     """Clamp dispatch count to the per-call cap."""
-    return max(1, min(count, MAX_DISPATCH_PER_CALL))
+    return max(1, min(count, _max_dispatch()))
 
 
 # ── Active run tracking ───────────────────────────────────────────
@@ -327,7 +344,7 @@ def run_dynamic_workflow(
             return {"ok": False, "error": sf_err, "hint": "wait for the current run to finish"}
 
     # Clamp dispatch count
-    max_dispatch = _validate_dispatch_count(MAX_DISPATCH_PER_CALL)
+    max_dispatch = _validate_dispatch_count(_max_dispatch())
 
     # Build the engine args
     engine_args = {
@@ -447,7 +464,7 @@ def record_node(
 
 def dispatch_nodes(
     workflow_id: str,
-    max_dispatch: int = MAX_DISPATCH_PER_CALL,
+    max_dispatch: int = _max_dispatch(),
     scope: str = "project",
 ) -> dict:
     """Manually trigger dispatch of ready nodes.
