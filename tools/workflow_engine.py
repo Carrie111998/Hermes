@@ -6,9 +6,9 @@ for ready nodes, monitors completion, and advances the graph. Supports revision
 loops via the LOOP:<target> convention in block reasons.
 
 Usage:
-    python -m plugins.workflow.engine start ideation --context pr=123
-    python -m plugins.workflow.engine validate ideation
-    python -m plugins.workflow.engine list
+    python -m tools.workflow_engine start ideation --context pr=123
+    python -m tools.workflow_engine validate ideation
+    python -m tools.workflow_engine list
 
 Architecture:
     Trigger (Discord/webhook) → Classify (Sherlock) → Engine (this) → Kanban → Agents
@@ -66,7 +66,7 @@ def _hermes_binary() -> str:
         return str(candidate)
     # ``sys.prefix`` is set to the venv root by the activated
     # environment, regardless of which python binary executed this
-    # module.  This catches ``python3 -m plugins.workflow.engine``
+    # module.  This catches ``python3 -m tools.workflow_engine``
     # invocations where ``sys.executable`` is the system python.
     venv_candidate = Path(sys.prefix) / "bin" / "hermes"
     if venv_candidate.is_file():
@@ -141,22 +141,6 @@ class WorkflowNode:
        keeps its depends_on relationships and promotes to 'ready'
        when all children complete.
     """
-    when: str = ""
-    """Conditional expression controlling whether this node dispatches.
-
-    Empty string (default) means always run — preserving the existing
-    behavior for all workflows.  Non-empty strings are evaluated against
-    the workflow state + context at dispatch time; a truthy result means
-    the node runs, falsy means it is skipped.
-
-    Supported references inside the expression:
-      {node-id}.status, {node-id}.result, {node-id}.error,
-      {node-id}.attempts, {node-id}.duration_seconds, {node-id}.error_count
-      {context.key}
-
-    Supported operators:
-      ==, !=, >, <, >=, <=, contains, starts_with, in, and, or, not
-    """
 
 @dataclass
 class Workflow:
@@ -167,16 +151,6 @@ class Workflow:
     nodes: dict[str, WorkflowNode] = field(default_factory=dict)
     run_id: str = ""              # Generated at execute() time
     kanban_board: str = ""         # Per-pipeline board override (empty = engine default)
-    scope: str = "project"         # "project" (default) — creates kanban cards per node.
-                                    # "global" — in-process only, no cards created.
-                                    # Used for maintenance / notification / heartbeat
-                                    # workflows that should not pollute project boards.
-    single_flight: bool = False     # When True, refuse to start a new run if any
-                                    # run for this workflow is already in progress.
-                                    # Used to prevent duplicate parallel runs from
-                                    # webhook storms or repeated dispatch signals.
-                                    # Default False preserves the existing "multiple
-                                    # parallel runs allowed" behavior.
 
 @dataclass
 class NodeState:
@@ -195,21 +169,6 @@ class NodeState:
                                   # "revision_needed". Available to
                                   # downstream nodes via {phaseN.X} or
                                   # {node-id} template substitution.
-    duration_seconds: Optional[float] = None
-    """Wall-clock duration from started_at → completed_at.
-
-    Populated when the node enters a terminal status (done / failed /
-    timed_out / blocked / revision_needed). Computed from started_at
-    and completed_at; agents don't need to set it manually. Exposed
-    via workflow_status for cost / bottleneck analysis.
-    """
-    error_count: int = 0
-    """Cumulative count of failed / timed_out transitions for this node.
-
-    Incremented each time the node enters a failure state. Multiple
-    retries on a flaky node will increment this counter — useful for
-    spotting nodes that keep failing across runs.
-    """
     validation_warnings: list[str] = field(default_factory=list)
 
 # ── Engine core ──────────────────────────────────────────────────
@@ -229,7 +188,6 @@ class WorkflowEngine:
     MAX_REVISION_LOOPS = 3
     POLL_INTERVAL = 15  # seconds between kanban status checks
     STATE_DIR = None     # Set after init for state persistence
-
 
     def __init__(self, workflows_dir: str = None):
         if workflows_dir is None:
@@ -276,8 +234,6 @@ class WorkflowEngine:
             description=raw.get("description", ""),
             trigger_events=raw.get("trigger_events", []),
             kanban_board=raw.get("kanban_board", ""),
-            scope=raw.get("scope", "project"),
-            single_flight=bool(raw.get("single_flight", False)),
         )
 
         for node_id, node_data in raw.get("nodes", {}).items():
@@ -354,7 +310,6 @@ class WorkflowEngine:
                 privacy_gate=bool(node_data.get("privacy_gate", False)),
                 goal_max_turns=node_data.get("goal_max_turns"),
                 triage=bool(node_data.get("triage", False)),
-                when=node_data.get("when", ""),
             )
 
         return workflow
@@ -537,166 +492,6 @@ class WorkflowEngine:
         # Fallback: try last token (fragile but works for legacy output)
         card_id = out.split()[-1] if out else ""
         return card_id
-
-    def dispatch_node(self, state: NodeState, node: WorkflowNode, context: dict,
-                       workflow: "Workflow", states: dict, layers: list) -> Optional[str]:
-        """Dispatch a node to kanban, or mark it done in-process.
-
-        For ``scope: global`` workflows (maintenance, notifications, heartbeat)
-        no kanban card is created — the node is marked ``done`` with a
-        sentinel ``result`` and ``None`` is returned. Callers should treat
-        ``None`` as "in-process, no card to monitor" and skip heartbeat /
-        monitoring for this node.
-
-        For ``scope: project`` (default), this delegates straight to
-        :meth:`create_kanban_card` and returns the card ID.
-        """
-        if workflow is not None and getattr(workflow, "scope", "project") == "global":
-            state.status = "done"
-            state.completed_at = datetime.now(timezone.utc).isoformat()
-            state.result = "[in-process, scope: global]"
-            return None
-        return self.create_kanban_card(
-            node, context,
-            workflow=workflow, states=states, layers=layers,
-        )
-
-
-
-    # Terminal statuses for which we record telemetry. Anything else
-    # (running, pending, blocked, revision_needed, degraded) is mid-flight.
-    _TELEMETRY_TERMINAL_STATUSES = frozenset({
-        "done", "failed", "timed_out",
-    })
-    """Statuses that mark a node as finished for telemetry purposes.
-
-    "blocked" and "revision_needed" are mid-flight (the engine may
-    rerun the node), so we don't count them as terminal for duration
-    tracking. "degraded" is also mid-flight (downstream proceeds).
-    """
-
-    # Tracks which (state-id, status) pairs have already had telemetry
-    # recorded, so repeated _save_state calls don't double-count
-    # error_count or recompute duration. Reset per engine instance.
-    _telemetry_recorded: "set[tuple[int, str]]" = None  # lazy-init in __init__
-
-    def _record_node_completion(self, state: NodeState) -> None:
-        """Capture telemetry when a node enters a terminal status.
-
-        Computes ``duration_seconds`` from ``started_at`` and
-        ``completed_at``, and increments ``error_count`` for failure
-        outcomes. Idempotent — safe to call multiple times via
-        ``_save_state`` without double-counting, using a per-node-id
-        dedup set.
-        """
-        if state.status not in self._TELEMETRY_TERMINAL_STATUSES:
-            return
-        if self._telemetry_recorded is None:
-            self._telemetry_recorded = set()
-        dedup_key = (id(state), state.status)
-        if dedup_key in self._telemetry_recorded:
-            return
-        self._telemetry_recorded.add(dedup_key)
-        if state.duration_seconds is None and state.started_at and state.completed_at:
-            try:
-                start = datetime.fromisoformat(state.started_at)
-                end = datetime.fromisoformat(state.completed_at)
-                state.duration_seconds = (end - start).total_seconds()
-            except (ValueError, TypeError):
-                pass
-        if state.status in ("failed", "timed_out"):
-            state.error_count += 1
-
-    # State files older than this are considered stale — the engine
-    # crashed or was killed mid-run and the state is no longer accurate.
-    # Single-flight checks ignore stale state files so a single bad
-    # crash doesn't permanently block a workflow from running again.
-    ACTIVE_RUN_STALE_SECONDS = 3600
-
-    # How many historical state files to retain per workflow. Older
-    # state files are pruned at the end of each save so disk usage
-    # doesn't grow unbounded with long-running fleet usage. Set to
-    # a low default to keep telemetry disk-cheap; raise via
-    # ``STATE_RETENTION_PER_WORKFLOW`` env var if more history needed.
-    STATE_RETENTION_PER_WORKFLOW = 20
-
-    def _prune_old_runs(self, keep: int = None) -> int:
-        """Delete oldest state files beyond ``keep`` per workflow.
-
-        Walks the state directory, groups files by workflow name,
-        sorts each group by mtime, and unlinks everything past the
-        ``keep`` threshold. Returns the number of files pruned.
-
-        Called automatically at the end of ``_save_state`` so retention
-        is enforced without callers needing to remember. Safe to call
-        when STATE_DIR doesn't exist yet (returns 0).
-        """
-        if self.STATE_DIR is None or not self.STATE_DIR.exists():
-            return 0
-        if keep is None:
-            keep = self.STATE_RETENTION_PER_WORKFLOW
-        # Group state files by workflow name (strip "_<run_id>_state.json"
-        # or "_state.json" suffix).
-        groups: dict[str, list[Path]] = defaultdict(list)
-        for path in self.STATE_DIR.glob("*_state.json"):
-            stem = path.stem  # e.g. "council_20260101T120000_state"
-            # Strip "_state" suffix and split off the trailing timestamp.
-            if stem.endswith("_state"):
-                stem = stem[:-len("_state")]
-            # If the stem still has an underscore-separated timestamp suffix
-            # (looks like YYYYMMDDTHHMMSS), strip it for grouping.
-            parts = stem.rsplit("_", 1)
-            workflow_name = parts[0] if len(parts) > 1 else stem
-            groups[workflow_name].append(path)
-        pruned = 0
-        for wf_name, paths in groups.items():
-            # Sort by mtime ascending; prune the oldest.
-            paths.sort(key=lambda p: p.stat().st_mtime)
-            for old in paths[:-keep] if keep > 0 else paths:
-                try:
-                    old.unlink()
-                    pruned += 1
-                except OSError:
-                    pass
-        return pruned
-
-    def _has_active_run(self, workflow_name: str) -> bool:
-        """Return True if any in-progress run exists for ``workflow_name``.
-
-        Used to enforce single-flight semantics: workflows with
-        ``single_flight: true`` refuse to start a new run when another
-        run is already in progress. A run is considered active when its
-        state file was updated within ``ACTIVE_RUN_STALE_SECONDS`` and
-        contains at least one node in ``running``, ``pending``, or
-        ``blocked`` status.
-
-        Returns False if no state file exists, all state files are stale,
-        or all nodes in the active state file are in terminal status.
-        """
-        for path in sorted(self.STATE_DIR.glob(f"{workflow_name}_*_state.json")):
-            try:
-                with open(path) as f:
-                    state = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            updated_at = state.get("updated_at")
-            if updated_at:
-                try:
-                    age = (
-                        datetime.now(timezone.utc)
-                        - datetime.fromisoformat(updated_at)
-                    ).total_seconds()
-                    if age > self.ACTIVE_RUN_STALE_SECONDS:
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            states = state.get("states", {})
-            if any(
-                s.get("status") in ("running", "pending", "blocked")
-                for s in states.values()
-            ):
-                return True
-        return False
 
     def get_card_status(self, card_id: str) -> dict:
         """Query a kanban card's current state.
@@ -1049,12 +844,6 @@ class WorkflowEngine:
                     current_layer: int, layers: list[list[str]],
                     run_id: str = None):
         """Persist engine state for crash recovery."""
-        # Telemetry: capture duration_seconds + error_count for any node
-        # that has reached a terminal status but hasn't been recorded yet.
-        # Idempotent — running _record_node_completion on already-recorded
-        # states is a no-op (duration_seconds check guards).
-        for node_state in states.values():
-            self._record_node_completion(node_state)
         state = {
             "workflow_name": workflow_name,
             "current_layer": current_layer,
@@ -1072,20 +861,12 @@ class WorkflowEngine:
                 # substitute {phaseN.X} / {node-id} references for
                 # downstream nodes that haven't been dispatched yet.
                 "result": s.result,
-                # Telemetry: populated by _record_node_completion before
-                # this save runs. Surface to workflow_status for cost /
-                # bottleneck analysis.
-                "duration_seconds": s.duration_seconds,
-                "error_count": s.error_count,
             } for nid, s in states.items()},
             "results": results,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         with open(self._state_path(workflow_name, run_id), "w") as f:
             json.dump(state, f, indent=2)
-        # Retention: prune state files beyond STATE_RETENTION_PER_WORKFLOW
-        # so disk usage stays bounded. No-op if nothing to prune.
-        self._prune_old_runs()
 
     def _load_state(self, workflow_name: str, run_id: str = None) -> Optional[dict]:
         """Load persisted state if it exists."""
@@ -1200,7 +981,7 @@ class WorkflowEngine:
         """Try LLM analysis of a deadlocked revision loop. Best-effort —
         failure is silent; the engine continues with mechanical escalation."""
         try:
-            from plugins.workflow.analyst import analyze_escalation
+            from hermes_cli.workflow_analyst import analyze_escalation
         except Exception:
             return  # Auxiliary module not available
 
@@ -1245,7 +1026,7 @@ class WorkflowEngine:
         if node.synthetic:
             return
         try:
-            from plugins.workflow.analyst import analyze_failure
+            from hermes_cli.workflow_analyst import analyze_failure
         except Exception:
             return
 
@@ -1275,7 +1056,7 @@ class WorkflowEngine:
                              saved_state: dict) -> Optional[str]:
         """Try LLM summary of pipeline state. Returns summary text or None."""
         try:
-            from plugins.workflow.analyst import analyze_status
+            from hermes_cli.workflow_analyst import analyze_status
         except Exception:
             return None
 
@@ -1392,345 +1173,7 @@ class WorkflowEngine:
                     f"but has no dependents — LOOP detection will find no revision node"
                 )
 
-        # incomplete_branch rule (adapted from itechmeat/hermes-workflows).
-        # Catches non-terminal nodes that rely on the implicit default
-        # ``fallback_on_timeout="skip"`` — which silently cascades skip to
-        # all downstream nodes. Authors should be intentional about how a
-        # node handles timeout / failure when other nodes depend on it.
-        # Non-fatal: surfaces as an issue for the caller to act on, but
-        # doesn't flip ``valid`` (existing fleet workflows commonly omit
-        # the explicit declaration — warn, don't break).
-        try:
-            yaml_path = self.workflows_dir / f"{workflow_name}.yaml"
-            raw_yaml = yaml.safe_load(yaml_path.read_text()) if yaml_path.exists() else None
-            nodes_raw = (raw_yaml or {}).get("nodes", {}) if raw_yaml else {}
-        except Exception:
-            nodes_raw = {}
-        for nid, node in workflow.nodes.items():
-            if node.synthetic:
-                continue
-            # Terminal = no downstream consumers; skip the check.
-            has_downstream = any(
-                nid in other.depends_on
-                for other_id, other in workflow.nodes.items()
-                if other_id != nid
-            )
-            if not has_downstream:
-                continue
-            raw_node = nodes_raw.get(nid, {})
-            if "fallback_on_timeout" not in raw_node:
-                result["issues"].append(
-                    f"Node '{nid}' has downstream consumers but no explicit "
-                    f"fallback_on_timeout in YAML. Add one of: skip | degraded "
-                    f"| retry to make failure routing intentional, not implicit."
-                )
-
-        # ── when: dependency validation (non-fatal) ──
-        # Warn if a when: expression references a node that is not in
-        # the current node's depends_on list.  This catches missing
-        # dependency declarations — the engine would still skip nodes
-        # with failed deps, but the when: condition might silently
-        # evaluate to a stale value instead of being properly gated.
-        for nid, node in workflow.nodes.items():
-            if not node.when:
-                continue
-            # Extract all {node-id.field} references from the when expr
-            refs = re.findall(
-                r"\{([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z0-9_\-]+\}",
-                node.when,
-            )
-            for ref_nid in set(refs):
-                if ref_nid == "context":
-                    continue  # context is always available
-                if ref_nid not in workflow.nodes:
-                    continue  # unknown node — separate issue
-                if ref_nid not in node.depends_on and ref_nid != nid:
-                    result["issues"].append(
-                        f"Node '{nid}' has when: referencing '{ref_nid}' "
-                        f"but does not declare it in depends_on. Add "
-                        f"'{ref_nid}' to depends_on or use a context "
-                        f"variable instead."
-                    )
-
         return result
-
-    # ── When-condition evaluation ──────────────────────────────
-
-    # Operator tokens recognised in when: expressions
-    _WHEN_OPS = frozenset({"==", "!=", ">", "<", ">=", "<=", "contains", "starts_with"})
-    _WHEN_KEYWORDS = frozenset({"and", "or", "not", "in", "True", "False", "None"})
-
-    def _resolve_when_references(self, when_expr: str, states: dict,
-                                  context: Optional[dict] = None) -> str:
-        """Resolve ``{node-id.field}`` and ``{context.key}`` in a
-        ``when:`` expression, replacing them with their literal values
-        (quoted strings, raw numbers).
-
-        Unresolved references are left as literal text — the evaluator
-        will treat unknown identifiers as string values.
-        """
-        # Build a lookup of node state fields
-        when_lookup: dict = {}
-        for nid, st in states.items():
-            when_lookup[nid] = {
-                "status": st.status,
-                "result": st.result or "",
-                "error": st.error or "",
-                "attempts": st.attempts,
-                "duration_seconds": st.duration_seconds,
-                "error_count": st.error_count,
-            }
-        when_lookup["context"] = dict(context or {})
-
-        def _replace(match: re.Match) -> str:
-            if match.group("ns") is not None:
-                ns, field = match.group("ns"), match.group("field")
-                ns_val = when_lookup.get(ns)
-                if isinstance(ns_val, dict) and field in ns_val:
-                    val = ns_val[field]
-                    if isinstance(val, str):
-                        return f'"{val}"'
-                    if val is None:
-                        return "None"
-                    return str(val)
-                return match.group(0)  # Leave unresolved
-            bare = match.group("bare")
-            ctx = when_lookup.get("context")
-            if isinstance(ctx, dict) and bare in ctx:
-                val = ctx[bare]
-                if isinstance(val, str):
-                    return f'"{val}"'
-                if val is None:
-                    return "None"
-                return str(val)
-            if bare in when_lookup:
-                val = when_lookup[bare]
-                if isinstance(val, str):
-                    return f'"{val}"'
-                if val is None:
-                    return "None"
-                return str(val)
-            return match.group(0)
-
-        return self._TEMPLATE_RE.sub(_replace, when_expr)
-
-    def _tokenize_when(self, expr: str) -> list:
-        """Tokenize a resolved when: expression into a flat list of
-        (type, value) tuples.  Unquoted identifiers that are not
-        reserved keywords are treated as string literals.
-        """
-        tokens = []
-        i = 0
-        n = len(expr)
-        while i < n:
-            # Whitespace — skip
-            if expr[i].isspace():
-                i += 1
-                continue
-            # Quoted string
-            if expr[i] == '"':
-                j = i + 1
-                while j < n and expr[j] != '"':
-                    if expr[j] == '\\':
-                        j += 1
-                    j += 1
-                tokens.append(("STRING", expr[i + 1:j]))
-                i = j + 1
-                continue
-            # Number (possibly negative)
-            if expr[i].isdigit() or (
-                expr[i] == '-' and i + 1 < n and expr[i + 1].isdigit()
-                and (not tokens or tokens[-1][0] in ("OP", "KEYWORD", "BRACKET", "COMMA"))
-            ):
-                j = i
-                if expr[j] == '-':
-                    j += 1
-                while j < n and (expr[j].isdigit() or expr[j] == '.'):
-                    j += 1
-                num_str = expr[i:j]
-                tokens.append(
-                    ("NUMBER", float(num_str) if '.' in num_str else int(num_str))
-                )
-                i = j
-                continue
-            # Brackets
-            if expr[i] in '[]()':
-                tokens.append(("BRACKET", expr[i]))
-                i += 1
-                continue
-            # Comma
-            if expr[i] == ',':
-                tokens.append(("COMMA", ","))
-                i += 1
-                continue
-            # Multi-char operators (>=, <=, !=, ==) — check before single-char
-            if i + 1 < n and expr[i:i+2] in ("==", "!=", ">=", "<="):
-                tokens.append(("OP", expr[i:i+2]))
-                i += 2
-                continue
-            # Single-char operators
-            if expr[i] in "><":
-                tokens.append(("OP", expr[i]))
-                i += 1
-                continue
-            # Word (identifier / keyword / operator-name)
-            j = i
-            while j < n and not expr[j].isspace() and expr[j] not in '[],();':
-                j += 1
-            word = expr[i:j]
-            if word in self._WHEN_OPS:
-                tokens.append(("OP", word))
-            elif word in self._WHEN_KEYWORDS:
-                tokens.append(("KEYWORD", word))
-            else:
-                # Unknown identifier → string literal
-                tokens.append(("STRING", word))
-            i = j
-        return tokens
-
-    def _eval_when_tokens(self, tokens: list) -> bool:
-        """Evaluate a tokenized when: expression via recursive descent.
-
-        Grammar (precedence low → high):
-            or_expr  → and_expr ('or' and_expr)*
-            and_expr → not_expr ('and' not_expr)*
-            not_expr → 'not' not_expr | in_expr
-            in_expr  → comparison ('in' '[' list ']')?
-            comparison → atom (op atom)?
-            atom      → STRING | NUMBER | 'True' | 'False' | 'None'
-                        | '(' or_expr ')'
-        """
-        pos = [0]
-
-        def _peek():
-            return tokens[pos[0]] if pos[0] < len(tokens) else None
-
-        def _consume():
-            t = tokens[pos[0]]
-            pos[0] += 1
-            return t
-
-        def _to_num(v):
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return 0.0
-
-        def _parse_or():
-            left = _parse_and()
-            while _peek() == ("KEYWORD", "or"):
-                _consume()
-                right = _parse_and()
-                left = left or right
-            return left
-
-        def _parse_and():
-            left = _parse_not()
-            while _peek() == ("KEYWORD", "and"):
-                _consume()
-                right = _parse_not()
-                left = left and right
-            return left
-
-        def _parse_not():
-            if _peek() == ("KEYWORD", "not"):
-                _consume()
-                return not _parse_not()
-            return _parse_in()
-
-        def _parse_in():
-            left = _parse_comparison()
-            if _peek() == ("KEYWORD", "in"):
-                _consume()
-                # Expect '['
-                assert _peek() == ("BRACKET", "["), "Expected '[' after 'in'"
-                _consume()
-                items = []
-                while _peek() and _peek() != ("BRACKET", "]"):
-                    items.append(_parse_atom())
-                    if _peek() == ("COMMA", ","):
-                        _consume()
-                assert _peek() == ("BRACKET", "]"), "Expected ']' to close list"
-                _consume()
-                return left in items
-            return left
-
-        def _parse_comparison():
-            left = _parse_atom()
-            pk = _peek()
-            if pk and pk[0] == "OP" and pk[1] in self._WHEN_OPS:
-                op = _consume()[1]
-                right = _parse_atom()
-                if op == "==":
-                    return left == right
-                elif op == "!=":
-                    return left != right
-                elif op == ">":
-                    return _to_num(left) > _to_num(right)
-                elif op == "<":
-                    return _to_num(left) < _to_num(right)
-                elif op == ">=":
-                    return _to_num(left) >= _to_num(right)
-                elif op == "<=":
-                    return _to_num(left) <= _to_num(right)
-                elif op == "contains":
-                    return str(right) in str(left)
-                elif op == "starts_with":
-                    return str(left).startswith(str(right))
-            return left
-
-        def _parse_atom():
-            pk = _peek()
-            if pk is None:
-                raise ValueError("Unexpected end of when: expression")
-            if pk[0] == "NUMBER":
-                return _consume()[1]
-            if pk[0] == "STRING":
-                return _consume()[1]
-            if pk[0] == "KEYWORD" and pk[1] in ("True", "False", "None"):
-                val = _consume()[1]
-                return {"True": True, "False": False, "None": None}[val]
-            if pk[0] == "BRACKET" and pk[1] == "(":
-                _consume()
-                val = _parse_or()
-                assert _peek() == ("BRACKET", ")"), "Expected ')' in when: expression"
-                _consume()
-                return val
-            raise ValueError(f"Unexpected token in when: expression: {pk}")
-
-        return bool(_parse_or())
-
-    def evaluate_when(self, when_expr: str, node: "WorkflowNode",
-                      states: dict, context: Optional[dict] = None,
-                      layers: list = None,
-                      workflow: "Workflow" = None) -> bool:
-        """Evaluate a node's ``when:`` condition against the current
-        workflow state.
-
-        Returns True when the node should dispatch (truthy expression
-        or empty ``when``), False when it should be skipped.
-        """
-        if not when_expr or not when_expr.strip():
-            return True  # Empty = always run
-
-        try:
-            resolved = self._resolve_when_references(
-                when_expr, states, context
-            )
-            tokens = self._tokenize_when(resolved)
-            if not tokens:
-                return True  # Empty after resolution = always run
-            return self._eval_when_tokens(tokens)
-        except Exception as exc:
-            # Fail open — evaluation error defaults to skip to avoid
-            # dispatching a node whose condition couldn't be checked.
-            import sys as _sys
-            print(
-                f"   ⚠  when: evaluation error for "
-                f"'{when_expr}': {exc} — skipping node",
-                file=_sys.stderr,
-            )
-            return False
 
     # ── Execution ──────────────────────────────────────────────
 
@@ -1751,11 +1194,9 @@ class WorkflowEngine:
         ``{inputs.<key>}`` template substitutions across all nodes.
 
         ``delivery`` is an optional delivery target (e.g.
-        ``"discord:CHANNEL_ID"``). The delivery router ALWAYS activates
-        — it writes to a local log file unconditionally. If ``delivery``
-        is set to a platform target, it ALSO posts to that platform.
-        The engine still returns results to the caller (the router is
-        additive, not replacing the chat flow).
+        ``"discord:CHANNEL_ID"``). When set, the result is routed
+        through the delivery router after the DAG completes. When
+        ``None``, the normal return-to-caller flow is used.
 
         Returns execution summary: {node_id: final_status, ...}
         """
@@ -1864,14 +1305,6 @@ class WorkflowEngine:
                     if deps_failed:
                         print(f"   [SKIP] {nid} — {'; '.join(deps_failed)}")
                         continue
-                    # dry-run when: check
-                    if node.when:
-                        if not self.evaluate_when(
-                            node.when, node, states, context,
-                            layers=layers, workflow=workflow,
-                        ):
-                            print(f"   [SKIP] {nid} — when: {node.when}")
-                            continue
                     if node.synthetic:
                         # Synthetic gates auto-complete — there is no
                         # card to create, so dry-run should still
@@ -1923,21 +1356,6 @@ class WorkflowEngine:
                     print(f"   🚧 {nid} — WAITING ({', '.join(deps_blocked)} blocked)")
                     continue
 
-                # ── when: conditional dispatch ──
-                # Evaluate the node's when: expression against the
-                # current workflow state.  Empty when: = always run
-                # (preserves existing behavior for all workflows).
-                if node.when:
-                    if not self.evaluate_when(
-                        node.when, node, states, context,
-                        layers=layers, workflow=workflow,
-                    ):
-                        state.status = "skipped"
-                        state.error = f"Skipped: when condition not met ({node.when})"
-                        results[nid] = "skipped"
-                        print(f"   ⏭ {nid} — SKIPPED (when: {node.when})")
-                        continue
-
                 # Synthetic gate nodes: auto-complete here. By the time
                 # we reach this layer, all depends_on are done (the
                 # topological sort guarantees this), so the gate is
@@ -1956,15 +1374,10 @@ class WorkflowEngine:
                 state.attempts += 1
 
                 try:
-                    card_id = self.dispatch_node(
-                        state, node, context,
+                    card_id = self.create_kanban_card(
+                        node, context,
                         workflow=workflow, states=states, layers=layers,
                     )
-                    if card_id is None:
-                        # scope: global — in-process, no card to monitor
-                        results[nid] = "done"
-                        print(f"   ⊙ {nid} → in-process (scope: global)")
-                        continue
                     state.kanban_card_id = card_id
                     # Initialize heartbeat so the sweep doesn't auto-block
                     # the card before the worker picks it up.
@@ -2021,14 +1434,10 @@ class WorkflowEngine:
                     state.started_at = datetime.now(timezone.utc).isoformat()
                     state.attempts += 1
                     try:
-                        card_id = self.dispatch_node(
-                            state, node, context,
+                        card_id = self.create_kanban_card(
+                            node, context,
                             workflow=workflow, states=states, layers=layers,
                         )
-                        if card_id is None:
-                            results[nid] = "done"
-                            print(f"   ⊙ {nid} → in-process (scope: global)")
-                            continue
                         state.kanban_card_id = card_id
                         print(f"   ✓ {nid} → card {card_id} (unblocked)")
                         running_nodes.append(nid)
@@ -2078,14 +1487,10 @@ class WorkflowEngine:
                     rev_state.started_at = datetime.now(timezone.utc).isoformat()
                     rev_state.attempts += 1
                     try:
-                        card_id = self.dispatch_node(
-                            rev_state, rev_node, context,
+                        card_id = self.create_kanban_card(
+                            rev_node, context,
                             workflow=workflow, states=states, layers=layers,
                         )
-                        if card_id is None:
-                            results[revision_nid] = "done"
-                            print(f"   ⊙ {revision_nid} → in-process (scope: global)")
-                            continue
                         rev_state.kanban_card_id = card_id
                         print(f"   ✓ {revision_nid} → card {card_id}")
                     except Exception as e:
@@ -2140,16 +1545,9 @@ class WorkflowEngine:
         self._clear_state(workflow_name, run_id=workflow.run_id)
 
         # ── Delivery routing ──
-        # The delivery router ALWAYS activates — it persists output to a
-        # local log file unconditionally.  If a delivery target is set
-        # (e.g. "discord:123456789"), it ALSO posts to that platform.
-        # The engine still returns results to the caller — the router
-        # is additive, not replacing the chat flow.
-        from plugins.workflow.delivery_router import deliver
-        delivery_result = deliver(
-            results, delivery or "local", workflow.run_id, workflow.name,
-        )
-        results["delivery"] = delivery_result
+        if delivery:
+            from plugins.workflow.delivery_router import deliver
+            deliver(results, delivery, workflow.run_id, workflow.name)
 
         return results
 
@@ -2219,14 +1617,10 @@ class WorkflowEngine:
                               f"(attempt {state.attempts}/3)")
                         # Re-create the card
                         try:
-                            card_id = self.dispatch_node(
-                                state, node, context,
+                            card_id = self.create_kanban_card(
+                                node, context,
                                 workflow=workflow, states=states, layers=layers,
                             )
-                            if card_id is None:
-                                results[nid] = "done"
-                                print(f"   ⊙ {nid} → in-process (scope: global)")
-                                continue
                             state.kanban_card_id = card_id
                         except Exception as e:
                             state.status = "failed"
@@ -2401,6 +1795,7 @@ def main():
     start.add_argument("--dry-run", action="store_true", help="Print plan without executing")
     start.add_argument("--node", help="Start from a specific node (partial execution)")
     start.add_argument("--resume", action="store_true", help="Resume from saved state")
+    start.add_argument("--delivery", "-d", help="Delivery target (e.g. discord:CHANNEL_ID, telegram:CHAT_ID)")
 
     # validate
     validate = sub.add_parser("validate", help="Validate a workflow without executing")
@@ -2433,7 +1828,8 @@ def main():
                 inputs[k] = v
         engine.execute(args.workflow, context=context, start_node=args.node,
                       dry_run=args.dry_run, resume=args.resume,
-                      board=args.board, inputs=inputs or None)
+                      board=args.board, inputs=inputs or None,
+                      delivery=args.delivery)
 
     elif args.command == "validate":
         result = engine.validate(args.workflow)

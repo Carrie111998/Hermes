@@ -307,3 +307,29 @@ The engine supports single-flight enforcement: if a workflow is already running,
 - [ ] All nodes declare `fallback_on_timeout` or are terminal
 - [ ] `workflow_start` returns `ok: true` with a `run_id`
 - [ ] Status checkable via `workflow_status(workflow="name")`
+
+## Delivery Router
+
+By default, `workflow_start` returns results to the caller (the subagent that invoked it). For cron jobs that should route output to a specific destination, pass a `delivery` target:
+
+| Target | Behavior |
+|---|---|
+| `local` (default) | Writes to `~/.hermes/workflow-logs/{date}/{run_id}.log` — silent |
+| `discord:CHANNEL_ID` | Posts to Discord channel |
+| `discord:CHANNEL_ID:THREAD_ID` | Posts to Discord thread |
+| `telegram:CHAT_ID` | Posts to Telegram chat |
+| `telegram:CHAT_ID:THREAD_ID` | Posts to Telegram topic |
+
+Pass via `workflow_start`:
+
+```python
+workflow_start(workflow="fleet-health", context={...}, delivery="discord:123456789")
+```
+
+Or via CLI:
+
+```bash
+python -m tools.workflow_engine start fleet-health --delivery "discord:123456789"
+```
+
+The router activates only when `delivery` is explicitly set AND non-local. Manual invocations without `delivery` continue to use the normal return-to-caller flow.
