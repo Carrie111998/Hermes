@@ -77,6 +77,8 @@ const reasoningConfigPayload = (arg: string, sid: string) => {
   }
 }
 
+const opensSessionModelPicker = (arg: string) => arg.trim() === '--session'
+
 export const sessionCommands: SlashCommand[] = [
   {
     aliases: ['bg', 'btw'],
@@ -108,12 +110,12 @@ export const sessionCommands: SlashCommand[] = [
         return
       }
 
-      if (!arg.trim()) {
-        return patchOverlayState({ modelPicker: true })
+      if (!arg.trim() || opensSessionModelPicker(arg)) {
+        return patchOverlayState({ modelPicker: true, modelPickerSessionOnly: opensSessionModelPicker(arg) })
       }
 
       if (arg.trim() === '--refresh') {
-        return patchOverlayState({ modelPicker: { refresh: true } })
+        return patchOverlayState({ modelPicker: { refresh: true }, modelPickerSessionOnly: false })
       }
 
       const switchModel = (confirmExpensiveModel = false) =>

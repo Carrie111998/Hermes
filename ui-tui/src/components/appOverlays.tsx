@@ -4,7 +4,7 @@ import type { ReactNode } from 'react'
 
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppOverlaysProps } from '../app/interfaces.js'
-import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
+import { $overlayState, closeModelPicker, patchOverlayState } from '../app/overlayStore.js'
 import { $uiSessionId, $uiTheme } from '../app/uiStore.js'
 
 import { ActiveSessionSwitcher } from './activeSessionSwitcher.js'
@@ -248,10 +248,11 @@ export function FloatingOverlays({
       render: width => (
         <FloatBox color={theme.color.border}>
           <ModelPicker
+            allowPersistGlobal={!overlay.modelPickerSessionOnly}
             gw={gw}
             initialRefresh={initialRefresh}
             maxWidth={width}
-            onCancel={() => patchOverlayState({ modelPicker: false })}
+            onCancel={closeModelPicker}
             onSelect={onModelSelect}
             sessionId={sid}
             t={theme}
