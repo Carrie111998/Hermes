@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
+
+from run_agent import AIAgent
+from tools.gradeos_tools import set_gradeos_session_scope
+
+
+app = FastAPI(title="GradeOS Hermes Smoke Server")
+
+DEFAULT_DEV_TOKEN = "gradeos-local-dev-token"
+
+
+class TeacherInfo(BaseModel):
+    teacher_id: str = "local_teacher"
+    org_id: Optional[str] = None
+
+
+class TeacherAgentChatRequest(BaseModel):
+    request_id: str = "local-smoke"
+    session_id: str = "gradeos-smoke-session"
+    message: str
+    teacher: TeacherInfo = Field(default_factory=TeacherInfo)
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_policy: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "allow_writes": False,
+            "allow_external_web": False,
+            "disable_memory": True,
+            "disable_session_search": True,
+        }
+    )
+    gradeos_tools: Dict[str, Any] = Field(default_factory=dict)
+
+
+class TeacherAgentChatResponse(BaseModel):
+    request_id: str
+    session_id: str
+    session_key: str
+    content: str
+    model: Optional[str] = None
+    citations: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    action_proposals: List[Dict[str, Any]] = Field(default_factory=list)
+    usage: Dict[str, Any] = Field(default_factory=dict)
+
+
+@app.get("/healthz")
+def healthz() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "openrouter_key": bool(os.getenv("OPENROUTER_API_KEY")),
+        "provider": os.getenv("HERMES_INFERENCE_PROVIDER") or "openrouter",
+        "auth_configured": bool(os.getenv("HERMES_INTERNAL_KEY") or os.getenv("API_SERVER_KEY")),
+        "gradeos_internal_api": os.getenv("GRADEOS_INTERNAL_API_BASE_URL", "http://127.0.0.1:8001"),
+    }
+
+
+def _expected_token() -> str:
+    return os.getenv("HERMES_INTERNAL_KEY") or os.getenv("API_SERVER_KEY") or DEFAULT_DEV_TOKEN
+
+
+def _verify_internal_auth(authorization: Optional[str]) -> None:
+    expected = _expected_token()
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Hermes internal bearer token")
+    token = authorization.removeprefix("Bearer ").strip()
+    if token != expected:
+        raise HTTPException(status_code=403, detail="Invalid Hermes internal bearer token")
+
+
+def _validate_header_scope(value: str, header_name: str) -> str:
+    if len(value) > 256 or any(ch in value for ch in ("\r", "\n", "\x00")):
+        raise HTTPException(status_code=400, detail=f"Invalid {header_name}")
+    return value
+
+
+def _fallback_session_key(request: TeacherAgentChatRequest) -> str:
+    tenant_id = (
+        request.scope.get("tenant_id")
+        or request.scope.get("org_id")
+        or request.teacher.org_id
+        or "local"
+    )
+    user_id = request.scope.get("user_id") or request.teacher.teacher_id
+    return f"gradeos:tenant:{tenant_id}:teacher:{user_id}:conversation:{request.session_id}"
+
+
+def _build_agent(session_id: str, session_key: str) -> AIAgent:
+    return AIAgent(
+        provider=os.getenv("HERMES_INFERENCE_PROVIDER") or "openrouter",
+        model=os.getenv("HERMES_INFERENCE_MODEL") or "qwen/qwen3.7-plus",
+        platform="gradeos_teacher",
+        session_id=session_id,
+        user_id=session_key,
+        gateway_session_key=session_key,
+        enabled_toolsets=["skills", "gradeos_tools"],
+        disabled_toolsets=[
+            "memory",
+            "session_search",
+            "terminal",
+            "file",
+            "browser",
+            "computer",
+            "computer_use",
+            "code_execution",
+            "delegation",
+            "cronjob",
+            "web",
+            "image_gen",
+            "tts",
+        ],
+        skip_context_files=True,
+        quiet_mode=True,
+        max_iterations=8,
+    )
+
+
+def _compact_attachment(attachment: Dict[str, Any]) -> Dict[str, Any]:
+    text = attachment.get("text")
+    compact = {
+        "attachment_id": attachment.get("attachment_id"),
+        "kind": attachment.get("kind"),
+        "name": attachment.get("name"),
+        "mime_type": attachment.get("mime_type"),
+        "size_bytes": attachment.get("size_bytes"),
+        "url": attachment.get("url"),
+        "has_data_url": bool(attachment.get("data_url")),
+        "metadata": (
+            attachment.get("metadata") if isinstance(attachment.get("metadata"), dict) else {}
+        ),
+    }
+    if isinstance(text, str) and text:
+        compact["text_preview"] = text[:2400]
+    return compact
+
+
+def _json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        stripped = "\n".join(lines).strip()
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _list_field(data: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _usage_field(parsed: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
+    usage = parsed.get("usage")
+    return usage if isinstance(usage, dict) else fallback
+
+
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _agent_usage(agent: AIAgent, result: Any, model_name: str) -> Dict[str, Any]:
+    data = result if isinstance(result, dict) else {}
+    usage = {
+        "input_tokens": _safe_int(
+            data.get("input_tokens", getattr(agent, "session_input_tokens", 0))
+        ),
+        "output_tokens": _safe_int(
+            data.get("output_tokens", getattr(agent, "session_output_tokens", 0))
+        ),
+        "prompt_tokens": _safe_int(
+            data.get("prompt_tokens", getattr(agent, "session_prompt_tokens", 0))
+        ),
+        "completion_tokens": _safe_int(
+            data.get("completion_tokens", getattr(agent, "session_completion_tokens", 0))
+        ),
+        "total_tokens": _safe_int(
+            data.get("total_tokens", getattr(agent, "session_total_tokens", 0))
+        ),
+        "cache_read_input_tokens": _safe_int(
+            data.get("cache_read_tokens", getattr(agent, "session_cache_read_tokens", 0))
+        ),
+        "cache_creation_input_tokens": _safe_int(
+            data.get("cache_write_tokens", getattr(agent, "session_cache_write_tokens", 0))
+        ),
+        "reasoning_tokens": _safe_int(
+            data.get("reasoning_tokens", getattr(agent, "session_reasoning_tokens", 0))
+        ),
+        "api_calls": _safe_int(data.get("api_calls", getattr(agent, "session_api_calls", 0))),
+        "estimated_cost_usd": _safe_float(
+            data.get("estimated_cost_usd", getattr(agent, "session_estimated_cost_usd", 0.0))
+        ),
+        "cost_status": data.get("cost_status", getattr(agent, "session_cost_status", None)),
+        "cost_source": data.get("cost_source", getattr(agent, "session_cost_source", None)),
+        "provider": data.get("provider") or getattr(agent, "provider", None),
+        "model": data.get("model") or getattr(agent, "model", None) or model_name,
+    }
+    if not usage["total_tokens"]:
+        if usage["prompt_tokens"] or usage["completion_tokens"]:
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        else:
+            usage["total_tokens"] = (
+                usage["input_tokens"]
+                + usage["output_tokens"]
+                + usage["cache_read_input_tokens"]
+                + usage["cache_creation_input_tokens"]
+            )
+    return {key: value for key, value in usage.items() if value not in (None, "", 0, 0.0)}
+
+
+@app.post("/v1/gradeos/teacher-agent/chat", response_model=TeacherAgentChatResponse)
+async def teacher_agent_chat(
+    request: TeacherAgentChatRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_hermes_session_key: Optional[str] = Header(default=None, alias="X-Hermes-Session-Key"),
+    x_hermes_session_id: Optional[str] = Header(default=None, alias="X-Hermes-Session-Id"),
+) -> TeacherAgentChatResponse:
+    _verify_internal_auth(authorization)
+    if not os.getenv("OPENROUTER_API_KEY"):
+        raise HTTPException(status_code=503, detail="OPENROUTER_API_KEY is not configured")
+
+    session_id = _validate_header_scope(
+        x_hermes_session_id or request.session_id,
+        "X-Hermes-Session-Id",
+    )
+    session_key = _validate_header_scope(
+        x_hermes_session_key or _fallback_session_key(request),
+        "X-Hermes-Session-Key",
+    )
+
+    attachment_context = [_compact_attachment(item) for item in request.attachments]
+    model_name = os.getenv("HERMES_INFERENCE_MODEL") or "qwen/qwen3.7-plus"
+    response_contract = {
+        "content": "concise teacher-facing markdown",
+        "citations": [],
+        "artifacts": [],
+        "action_proposals": [],
+        "tool_calls": [],
+        "model": model_name,
+        "usage": {},
+    }
+    enriched_message = (
+        "Use $gradeos-teacher-assistant for this GradeOS request. "
+        "If the skill is available, load it with skill_view before answering.\n"
+        "Return exactly one JSON object with these frontend-facing fields: "
+        "content, citations, artifacts, action_proposals, tool_calls, model, usage. "
+        "Do not use answer as a separate output field.\n\n"
+        "<gradeos-context>\n"
+        f"teacher_id: {request.teacher.teacher_id}\n"
+        f"session_id: {session_id}\n"
+        f"session_key: {session_key}\n"
+        f"scope: {request.scope}\n"
+        f"context: {request.context}\n"
+        f"history: {request.history[-8:]}\n"
+        f"attachments: {attachment_context}\n"
+        f"tool_policy: {request.tool_policy}\n"
+        f"gradeos_tools: {request.gradeos_tools}\n"
+        f"response_contract: {response_contract}\n"
+        "security: GradeOS backend is the authority for user identity, tenant scope, "
+        "permissions, retrieval, and audit. Do not infer or request data outside the "
+        "provided scope. Do not use MEMORY.md, USER.md, or bare session_search as "
+        "GradeOS data sources.\n"
+        "</gradeos-context>\n\n"
+        f"Teacher question:\n{request.message}"
+    )
+    set_gradeos_session_scope(
+        session_id,
+        teacher_id=request.teacher.teacher_id,
+        scope=request.scope,
+    )
+    agent = _build_agent(session_id, session_key)
+    result = await asyncio.to_thread(agent.run_conversation, enriched_message)
+    content = ""
+    usage: Dict[str, Any] = {}
+    if isinstance(result, dict):
+        raw_content = result.get("final_response") or result.get("response") or ""
+        content = (
+            raw_content
+            if isinstance(raw_content, str)
+            else json.dumps(raw_content, ensure_ascii=False)
+        )
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    else:
+        content = str(result)
+    if not usage:
+        usage = _agent_usage(agent, result, model_name)
+    parsed = _json_from_text(content) or {}
+
+    return TeacherAgentChatResponse(
+        request_id=request.request_id,
+        session_id=session_id,
+        session_key=session_key,
+        content=str(parsed.get("content") or content),
+        model=str(parsed.get("model") or model_name),
+        citations=_list_field(parsed, "citations"),
+        tool_calls=_list_field(parsed, "tool_calls"),
+        artifacts=_list_field(parsed, "artifacts"),
+        action_proposals=_list_field(parsed, "action_proposals"),
+        usage=_usage_field(parsed, usage),
+    )
