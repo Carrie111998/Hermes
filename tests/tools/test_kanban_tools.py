@@ -161,6 +161,8 @@ def test_show_uses_live_worktree_snapshot(monkeypatch, tmp_path):
     assert d["task"]["workspace_kind"] == "worktree"
     assert d["task"]["workspace_path"] == str(worktree.resolve())
     assert d["task"]["branch_name"] == "wt/live"
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
