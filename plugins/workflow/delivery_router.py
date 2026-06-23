@@ -1,20 +1,39 @@
 """Delivery router for workflow outputs.
 
-Routes workflow results to the configured delivery target. Default is
-'local' (writes to log file, silent). Cron jobs can specify a platform:
-channel target (e.g., 'discord:123456789') to route results elsewhere.
+The router persists workflow output to a local log file, the same way
+cron jobs persist their output. This is the default behavior — every
+workflow run writes to ``~/.hermes/workflow-logs/{date}/{run_id}.log``.
 
-The router ONLY activates when a ``delivery`` parameter is explicitly
-passed via the workflow context (e.g. ``delivery='discord:123456789'``).
-Manual invocations without a delivery target continue to use the normal
-return-to-caller flow.
+Additionally, if a cron was set up with a ``delivery`` target, the router
+ALSO posts to that platform. This is an opt-in additional layer — only
+cron workflows explicitly configured with ``delivery="discord:..."`` (or
+similar) trigger platform posting.
 
-Delivery formats:
-  - ``"local"``: write to log file, return log path (silent)
-  - ``"discord:CHANNEL_ID"``: post to Discord channel + log file
-  - ``"discord:CHANNEL_ID:THREAD_ID"``: post to Discord thread + log file
-  - ``"telegram:CHAT_ID"``: post to Telegram chat + log file
-  - ``"telegram:CHAT_ID:THREAD_ID"``: post to Telegram topic + log file
+Activation:
+  - ALWAYS: writes to local log file (cron-style persistence)
+  - IF delivery is set to a platform target: ALSO posts to that platform
+  - IF delivery is empty/missing: just the log file
+
+Delivery formats (the optional additional layer):
+  - empty / not set / ``"local"``: log file only
+  - ``"discord:CHANNEL_ID"``: log file + post to Discord channel
+  - ``"discord:CHANNEL_ID:THREAD_ID"``: log file + post to Discord thread
+  - ``"telegram:CHAT_ID"``: log file + post to Telegram chat
+  - ``"telegram:CHAT_ID:THREAD_ID"``: log file + post to Telegram topic
+
+Example cron setup with additional delivery:
+  ```python
+  cronjob(
+      action="create",
+      schedule="0 */4 * * *",
+      prompt="Run workflow_start(workflow='fleet-health', context={...}, "
+             "delivery='discord:123456789'). Report back only if issues.",
+      name="fleet-health-cron"
+  )
+  ```
+
+Without ``delivery``, the workflow just writes to the log file (same as
+cron jobs do by default).
 """
 
 from __future__ import annotations
