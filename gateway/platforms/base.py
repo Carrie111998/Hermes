@@ -1249,6 +1249,24 @@ _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
     "Library/Keychains",  # macOS
 )
 
+# Single-file credential stores that live directly at $HOME (not inside one of
+# the credential directories above). These mirror the canonical write guard
+# ``build_write_denied_paths`` in ``agent/file_safety.py`` — which already
+# forbids the agent from writing them — so the delivery (read/exfil) side can't
+# trail the write side: a credential the agent may not write must also never be
+# auto-attached to a chat reply. In default (non-strict) media-delivery mode any
+# file not under a denied path is otherwise deliverable, so a prompt-injected or
+# buggy agent could surface a plaintext ``~/.git-credentials`` (Git remote
+# tokens), ``~/.netrc`` (FTP/HTTP logins), ``~/.pgpass`` (Postgres passwords),
+# or ``~/.npmrc`` / ``~/.pypirc`` (package-registry tokens).
+_MEDIA_DELIVERY_DENIED_HOME_FILES = (
+    ".netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+)
+
 
 # Canonical cache subdirectories that hold deliverable artifacts. Used both
 # for the top-level safe roots above and to enumerate per-profile cache roots
@@ -1365,6 +1383,11 @@ def _media_delivery_denied_paths() -> List[Path]:
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
+    # Per-file home-root credential stores (e.g. ~/.netrc, ~/.git-credentials).
+    # Matched by exact path in _path_under_denied_prefix, mirroring the write
+    # guard build_write_denied_paths so delivery can't trail the write side.
+    for cred_file in _MEDIA_DELIVERY_DENIED_HOME_FILES:
+        denied.append(home / cred_file)
     # The active Hermes profile and shared Hermes root both contain control
     # files and credentials. Only cache subdirectories under them are
     # explicitly allowlisted above (matched BEFORE this denylist in
@@ -1442,13 +1465,48 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
             resolved_denied = denied.expanduser().resolve(strict=False)
         except (OSError, RuntimeError, ValueError):
             continue
-        if not (_path_is_within(resolved, resolved_denied) or resolved == resolved_denied):
+        same_path = resolved == resolved_denied
+        if not same_path:
+            # ``Path.resolve`` preserves caller-provided casing on common
+            # case-insensitive filesystems. Compare the existing path and each
+            # ancestor by filesystem identity so aliases such as ``~/.NETRC``
+            # and ``~/.SSH/id_rsa`` cannot bypass lowercase deny entries.
+            for candidate in (resolved, *resolved.parents):
+                try:
+                    if os.path.samefile(candidate, resolved_denied):
+                        same_path = True
+                        break
+                except (FileNotFoundError, OSError, ValueError):
+                    continue
+        if not (_path_is_within(resolved, resolved_denied) or same_path):
             continue
         # Allow the running user's own home tree; its credential sub-dirs are
         # caught by their own (more-specific) denylist entries above.
         if home is not None and resolved_denied == home:
             continue
         return True
+    return False
+
+
+def _matches_denied_home_credential_file(resolved: Path) -> bool:
+    """Return True when ``resolved`` is one of the exact home credentials.
+
+    This identity check runs before cache/operator allow roots so a hard link
+    cannot turn an exact credential store into an implicitly trusted cache file.
+    """
+    try:
+        home = Path(os.path.expanduser("~")).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for name in _MEDIA_DELIVERY_DENIED_HOME_FILES:
+        denied = (home / name).resolve(strict=False)
+        if resolved == denied:
+            return True
+        try:
+            if os.path.samefile(resolved, denied):
+                return True
+        except (FileNotFoundError, OSError, ValueError):
+            continue
     return False
 
 
@@ -1812,6 +1870,13 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
             return None
 
     if not resolved.is_file():
+        return None
+
+    # Exact home-root credential stores outrank every implicit cache allowlist.
+    # Otherwise a hard link under a cache could inherit trust before the normal
+    # denylist runs. Explicit operator-root semantics remain unchanged for all
+    # other files.
+    if _matches_denied_home_credential_file(resolved):
         return None
 
     # Cache / operator allowlist is always honored — these are unconditionally

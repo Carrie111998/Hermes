@@ -634,6 +634,97 @@ class TestMediaDeliveryDefaultMode:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
+    def test_denylist_blocks_home_root_credential_files(self, tmp_path, monkeypatch):
+        """Home-root credential stores must never be deliverable by default."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        for name in (".netrc", ".pgpass", ".npmrc", ".pypirc", ".git-credentials"):
+            cred = fake_home / name
+            cred.write_text("secret-token")
+            assert BasePlatformAdapter.validate_media_delivery_path(str(cred)) is None, name
+
+    def test_non_credential_home_file_still_delivers(self, tmp_path, monkeypatch):
+        """The home-file denylist is exact and must not block ordinary files."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        report = fake_home / "report.md"
+        report.write_text("# notes\n")
+        assert BasePlatformAdapter.validate_media_delivery_path(str(report)) == str(report.resolve())
+
+    def test_home_credential_case_alias_blocked_on_case_insensitive_fs(
+        self, tmp_path, monkeypatch
+    ):
+        """A case alias to the same credential inode must remain denied."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir(parents=True)
+        credential = fake_home / ".netrc"
+        credential.write_text("machine example.test password secret")
+        alias = fake_home / ".NETRC"
+        if not alias.exists() or not os.path.samefile(alias, credential):
+            pytest.skip("requires a case-insensitive filesystem")
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(alias)) is None
+
+    def test_home_credential_hard_link_alias_blocked(self, tmp_path, monkeypatch):
+        """An alternate filename for the same credential inode stays denied."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        fake_home.mkdir(parents=True)
+        credential = fake_home / ".netrc"
+        credential.write_text("machine example.test password secret")
+        alias = fake_home / "credentials-copy"
+        os.link(credential, alias)
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(alias)) is None
+
+    def test_home_credential_hard_link_in_cache_still_blocked(
+        self, tmp_path, monkeypatch
+    ):
+        """Implicit cache trust must not outrank an exact credential inode."""
+        fake_home = tmp_path / "home"
+        cache = fake_home / "cache"
+        cache.mkdir(parents=True)
+        credential = fake_home / ".netrc"
+        credential.write_text("machine example.test password secret")
+        alias = cache / "report.txt"
+        os.link(credential, alias)
+        monkeypatch.setenv("HOME", str(fake_home))
+        self._patch_roots(monkeypatch, cache)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(alias)) is None
+
+    def test_credential_directory_case_alias_blocked_on_case_insensitive_fs(
+        self, tmp_path, monkeypatch
+    ):
+        """A case alias beneath a denied credential directory stays denied."""
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        ssh_dir = fake_home / ".ssh"
+        ssh_dir.mkdir(parents=True)
+        credential = ssh_dir / "id_rsa"
+        credential.write_text("secret")
+        alias_dir = fake_home / ".SSH"
+        alias = alias_dir / "id_rsa"
+        if not alias.exists() or not os.path.samefile(alias_dir, ssh_dir):
+            pytest.skip("requires a case-insensitive filesystem")
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(alias)) is None
+
 
     def test_denylist_blocks_google_token_default_mode(self, tmp_path, monkeypatch):
         """Integration credentials at the HERMES_HOME root (google_token.json)
