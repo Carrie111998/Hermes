@@ -1,12 +1,12 @@
 ---
 name: workflow-engine-fleet
-description: 'Fleet-specific extensions to the workflow-engine skill — our pipelines (council, brainstorm, ideation, feature-dev, deployment-verify, deployment-revert, error-response, new-agent-onboarding), kanban-specific patterns, and fleet agent assignments. Load alongside workflow-engine for fleet operator use.'
+description: 'Use when you need to run, reference, or extend fleet workflows — pre-defined pipelines (council, brainstorm, ideation, feature-dev, deployment-verify, deployment-revert, error-response, new-agent-onboarding) or dynamic model-authored workflows for open-ended investigation.'
 version: 1.0.0
 author: Sherlock (fleet orchestrator)
 license: MIT
 metadata:
   hermes:
-    tags: [workflow, fleet, pipelines, council, ideation, kanban]
+    tags: [workflow, fleet, pipelines, council, ideation, kanban, dynamic]
     related_skills: [workflow-engine, kanban-orchestrator, fleet-pipeline-governance]
 ---
 
@@ -33,6 +33,77 @@ Load `workflow-engine` first for the generic engine reference. This overlay adds
 | "How do I deploy this?" | Solo answer (single-domain) | No pipeline needed |
 
 **Exception:** if the question is purely technical (how-to, config, debug a specific error), solo analysis is correct. Pipelines are for questions where reasonable agents can disagree or where multiple perspectives produce better decisions.
+
+### Pre-defined vs Dynamic — which mode?
+
+| Signal | Pre-defined (`workflow_start`) | Dynamic (`workflow_dynamic_start`) |
+|--------|-------------------------------|-----------------------------------|
+| Pipeline shape is known upfront | ✅ | ❌ |
+| Repeatable across runs | ✅ | ❌ |
+| Cost must be predictable | ✅ | ❌ |
+| Problem is open-ended / exploratory | ❌ | ✅ |
+| Shape emerges from worker findings | ❌ | ✅ |
+| One-off investigation, debug, research | ❌ | ✅ |
+
+**Rule:** if you can draw the DAG before any worker runs, use `workflow_start`. If you can't, use `workflow_dynamic_start` and let the model author the graph as findings arrive.
+
+## Dynamic Workflows
+
+Dynamic workflows create ad-hoc DAGs at runtime instead of reading pre-defined YAML pipelines. The model authors the graph: start with initial nodes, then extend the DAG based on what workers report back.
+
+**Tool:** `workflow_dynamic_start` — create a workflow with initial nodes.
+**Tool:** `workflow_dynamic` — extend, record, dispatch, status, cancel (action enum).
+
+### Workflow Lifecycle
+
+```
+1. workflow_dynamic_start(
+     workflow="investigate-checkout-failure",
+     context={
+       "objective": "Investigate and fix the checkout flow failure on iOS Safari",
+       "nodes": [{"node_id": "read-logs", "goal": "Read production error logs, summarize hypotheses"}]
+     },
+     scope="project"
+   )
+
+2. [Worker returns: "94% Safari iOS 17, started after deploy X on June 10. Points to polyfill regression."]
+
+3. workflow_dynamic(action="extend", workflow_id="investigate-checkout-failure", nodes=[
+     {"node_id": "diff-deploy", "goal": "Diff deploy X vs prior, flag polyfill changes", "depends_on": ["read-logs"]},
+     {"node_id": "reproduce", "goal": "Reproduce on iOS 17 Safari", "depends_on": ["read-logs"]},
+     {"node_id": "synthesize", "goal": "Combine findings into a fix proposal", "depends_on": ["diff-deploy", "reproduce"]}
+   ])
+
+4. workflow_dynamic(action="dispatch", workflow_id="investigate-checkout-failure")
+
+5. [Workers complete. synthesize reports back.]
+```
+
+### Scope Modes
+
+| Scope | Kanban | Persistence | Use for |
+|-------|--------|-------------|---------|
+| `project` (default) | Cards on `dynamic-workflows` board | No | Visible fleet investigations |
+| `global` | No cards | No | Quick one-shot investigations |
+| `durable` | No cards | `~/.hermes/workflow-logs/<id>/state.json` | Cron-driven workflows, restart-safe |
+
+### Constraints
+
+- Max 256 nodes per workflow
+- Max 16 workers per dispatch call
+- `max_iterations: 150` per worker (from delegation config)
+- `max_concurrent_children: 3` (from delegation config)
+- `max_spawn_depth: 1` (from delegation config)
+
+### Worker Output
+
+- Workers return summaries. The orchestrator reads them and decides next steps.
+- `exit_reason: "max_iterations"` = worker ran out of turns with a partial result. Read the partial, extend with a follow-up node or accept and move on.
+- No polling needed — reconciliation happens automatically on every `status` and `dispatch` call.
+
+### Cancellation
+
+`workflow_dynamic(action="cancel")` marks all pending nodes as cancelled and interrupts dispatched workers. Cancel when the objective is met or the cost budget is exhausted.
 
 ### Council Limitations
 
