@@ -67,27 +67,39 @@ _DESCRIPTIONS: Dict[str, str] = {
 # Path resolution
 # ---------------------------------------------------------------------------
 
-def _fleet_pipelines_dir() -> Optional[Path]:
-    """Resolve ``docs/fleet-pipelines/`` relative to the repo root.
+def _fleet_pipelines_dirs() -> list[Path]:
+    """Resolve all ``docs/fleet-pipelines/`` directories.
 
-    Tries several known locations in order:
-      1. ``HERMES_HOME/hermes-agent/docs/fleet-pipelines/``
-      2. ``~/.hermes/hermes-agent/docs/fleet-pipelines/``
-      3. ``<this-module-repo>/docs/fleet-pipelines/``
+    Uses ``HERMES_FLEET_PIPELINES`` env var if set, then falls back to
+    scanning profile workspaces for docs repos.
     """
+    dirs: list[Path] = []
+
+    # Primary: HERMES_FLEET_PIPELINES env var
+    env_path = os.environ.get("HERMES_FLEET_PIPELINES", "")
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_dir():
+            dirs.append(p)
+
+    # Fallback: scan profile workspaces for docs repos
     hermes_home = Path(os.environ.get("HERMES_HOME", "")).expanduser()
     if not hermes_home or not hermes_home.is_dir():
         hermes_home = Path.home() / ".hermes"
 
-    candidates = [
-        hermes_home / "hermes-agent" / "docs" / "fleet-pipelines",
-        Path.home() / ".hermes" / "hermes-agent" / "docs" / "fleet-pipelines",
-        Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines",
-    ]
-    for c in candidates:
-        if c.is_dir():
-            return c
-    return None
+    profiles_dir = hermes_home / "profiles"
+    if profiles_dir.is_dir():
+        for profile in profiles_dir.iterdir():
+            if not profile.is_dir():
+                continue
+            for candidate in [
+                profile / "workspace" / "docs" / "fleet-pipelines",
+                profile / "workspace" / "projects" / "docs" / "fleet-pipelines",
+            ]:
+                if candidate.is_dir() and candidate not in dirs:
+                    dirs.append(candidate)
+
+    return dirs
 
 
 def _user_workflows_dir() -> Optional[Path]:
@@ -161,8 +173,7 @@ def list_workflows() -> List[Dict[str, Any]]:
     workflows: List[Dict[str, Any]] = []
 
     # --- Pre-defined pipelines from docs/fleet-pipelines/ ---
-    fp_dir = _fleet_pipelines_dir()
-    if fp_dir is not None:
+    for fp_dir in _fleet_pipelines_dirs():
         for yml in sorted(fp_dir.glob("*.yaml")):
             meta = _extract_yaml_metadata(yml)
             stem = yml.stem
