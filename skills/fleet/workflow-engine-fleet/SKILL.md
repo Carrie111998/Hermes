@@ -118,6 +118,55 @@ The council pipeline has known failure modes:
 - The user explicitly says the council isn't the right shape
 - The topic is too broad for a single council question — break it into smaller, focused questions
 
+## Auto-Discovery (Workflows as Skills)
+
+When a user message matches a workflow trigger, the agent should offer to run that workflow — just like skills. The workflow registry scans two locations:
+
+1. **Pre-defined pipelines** from `docs/fleet-pipelines/` (shipped with the repo)
+2. **User-saved templates** from `~/.hermes/workflows/` (dynamic mode)
+
+### Trigger Matching
+
+Matching is keyword-based and case-insensitive. Each workflow declares a trigger string (pipe-separated keywords). The engine splits the trigger on `|` and checks if any keyword appears in the user message.
+
+**Workflow trigger keywords (built-in):**
+
+| Pipeline | Trigger keywords |
+|----------|-----------------|
+| `council` | `council`, `debate`, `trade-off`, `competing priorities`, `adversarial`, `perspective` |
+| `ideation` | `ideation`, `spec`, `research`, `decompose`, `architecture` |
+| `brainstorm` | `brainstorm`, `collaborative`, `ideation session`, `group ideation` |
+| `feature-dev` | `feature`, `build`, `develop`, `implement`, `coding`, `ci`, `review`, `merge`, `pull request` |
+| `deployment-verify` | `verify deploy`, `post-deploy`, `deployment check`, `smoke test` |
+| `deployment-revert` | `revert`, `rollback`, `undo deploy`, `deploy failure`, `auto-rollback` |
+| `error-response` | `sentry`, `error alert`, `incident`, `triage`, `fatal error`, `bug`, `crash` |
+| `new-agent-onboarding` | `onboard`, `new agent`, `commission agent`, `agent setup`, `create agent` |
+| `report-back` | `report back`, `deliver results`, `summary report`, `deliver summary` |
+
+**Matching algorithm:**
+1. Lowercase both the trigger keywords and the user message.
+2. For each workflow, count how many of its trigger keywords appear as substrings.
+3. Return the workflow with the most hits. If no workflow matches, return None.
+
+### Using `workflow_list()`
+
+`workflow_list()` returns all registered workflows with full metadata:
+- `name`: workflow identifier (pass to `workflow_start` or `workflow_dynamic_start`)
+- `description`: human-readable "Use when ..." string
+- `trigger`: pipe-separated keywords for matching
+- `mode`: `predefined` (fleet pipeline) or `dynamic` (user template)
+- `category`: `fleet`, `dynamic`, or `project-specific`
+- `path`: filesystem path to the YAML definition
+
+**Filter by trigger:** `workflow_list(trigger="deploy rollback")` returns only workflows whose triggers match.
+
+### Auto-Discovery Flow
+
+1. User sends a message.
+2. Agent calls `match_workflow_trigger(user_message)` or `workflow_list(trigger=user_message)`.
+3. If a match is found, agent offers: *"I found a matching workflow: `{name}` — {description}. Want me to run it?"*
+4. User confirms → agent calls `workflow_start(workflow="{name}", context={...})`.
+
 ## Fleet Pipelines
 
 ### Pipeline Catalog

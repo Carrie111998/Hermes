@@ -185,17 +185,41 @@ def handle_workflow_status(workflow: Optional[str] = None, **kwargs: Any) -> str
     return _ok(result)
 
 
-def handle_workflow_list(**kwargs: Any) -> str:
-    """List available pipeline definitions in ``docs/fleet-pipelines/``."""
-    try:
-        engine = _engine()
-    except Exception as exc:
-        return _err(f"engine import failed: {exc}")
+def handle_workflow_list(
+    trigger: Optional[str] = None,
+    **kwargs: Any,
+) -> str:
+    """List available workflow definitions from both the fleet pipelines
+    directory (pre-defined) and ``~/.hermes/workflows/`` (dynamic).
 
-    files = sorted(engine.workflows_dir.glob("*.yaml"))
+    When *trigger* is provided the list is filtered to workflows whose
+    trigger keywords appear in the given string (case-insensitive).
+    Without *trigger* every registered workflow is returned.
+    """
+    from plugins.workflow.registry import list_workflows, match_workflow_trigger
+
+    try:
+        workflows = list_workflows()
+    except Exception as exc:
+        return _err(f"registry scan failed: {exc}")
+
+    # Optional trigger-based filter
+    if trigger:
+        matched = match_workflow_trigger(trigger)
+        if matched is not None:
+            workflows = [w for w in workflows if w["name"] == matched["name"]]
+        else:
+            workflows = []
+
+    # Partition for a clearer response
+    predefined = [w for w in workflows if w["mode"] == "predefined"]
+    dynamic = [w for w in workflows if w["mode"] == "dynamic"]
+
     return _ok({
-        "pipelines": [f.stem for f in files],
-        "dir": str(engine.workflows_dir),
+        "workflows": workflows,
+        "predefined_count": len(predefined),
+        "dynamic_count": len(dynamic),
+        "total": len(workflows),
     })
 
 
@@ -331,13 +355,24 @@ WORKFLOW_STATUS_SCHEMA: Dict[str, Any] = {
 WORKFLOW_LIST_SCHEMA: Dict[str, Any] = {
     "name": "workflow_list",
     "description": (
-        "List available pipeline definitions in docs/fleet-pipelines/. "
-        "Returns the pipeline names that can be passed to workflow_start, "
-        "workflow_validate, workflow_status, or workflow_show."
+        "List available workflow definitions from both fleet pipelines "
+        "(pre-defined) and user-saved templates (~/.hermes/workflows/). "
+        "Returns workflows with metadata: name, description, trigger "
+        "keywords, mode (predefined/dynamic), category, and path. "
+        "Pass trigger to filter by keyword match."
     ),
     "parameters": {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "trigger": {
+                "type": "string",
+                "description": (
+                    "Optional trigger string to filter workflows by keyword "
+                    "match (case-insensitive). When provided, only workflows "
+                    "whose trigger keywords appear in this string are returned."
+                ),
+            },
+        },
     },
 }
 
