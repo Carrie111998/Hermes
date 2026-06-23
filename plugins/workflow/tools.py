@@ -7,8 +7,9 @@ agent can read directly.
 
 Tools
 -----
-- ``workflow_start``    — kick off a pipeline; creates kanban cards and
-                         monitors them layer-by-layer
+- ``workflow_start``    — kick off a pipeline (predefined or dynamic mode);
+                         creates kanban cards and monitors them layer-by-layer
+- ``workflow_view``     — load a workflow template for inspection
 - ``workflow_validate`` — structural check: DAG, cycles, missing nodes
 - ``workflow_status``   — current state of a running (or last-run) pipeline
 - ``workflow_list``     — available pipeline definitions
@@ -28,7 +29,6 @@ import os
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Runtime gate
@@ -66,7 +66,6 @@ def check_workflow_requirements() -> bool:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
-
 def _engine():
     """Lazy import + instantiate the engine. Kept inside a function so the
     plugin still loads in test contexts where ``tools.workflow_engine`` may
@@ -89,26 +88,70 @@ def _err(message: str, **extra: Any) -> str:
 def handle_workflow_start(
     workflow: str,
     context: Optional[Dict[str, Any]] = None,
+    mode: str = "predefined",
     node: Optional[str] = None,
     dry_run: bool = False,
     resume: bool = False,
+    scope: str = "project",
+    single_flight: bool = False,
+    delivery_target: str = "",
     **kwargs: Any,
 ) -> str:
-    """Start a pipeline. Creates kanban cards for layer-0 nodes, monitors
-    them, and advances the DAG as cards complete. Returns a final summary
-    keyed by node_id.
+    """Start a pipeline in the given mode.
 
-    See ``docs/fleet-pipelines/`` for available pipelines. The current
-    canon: ``ideation`` (13 nodes, spec→security→validate→decompose) and
-    ``feature-dev`` (9 nodes, build→CI→review→merge→post-merge).
+    Mode ``"predefined"`` (default):
+        Reads a YAML pipeline definition from ``docs/fleet-pipelines/``,
+        validates it, and dispatches via the kanban engine.  Creates
+        kanban cards for layer-0 nodes, monitors them, and advances the
+        DAG as cards complete.  Returns a final summary keyed by node_id.
+
+    Mode ``"dynamic"``:
+        Delegates to ``dynamic_bridge.run_dynamic_workflow()`` which
+        creates an ad-hoc DAG at runtime from the objective and node
+        list passed in *context*.
+
+    See ``workflow_list`` for available pipelines, ``workflow_show`` to
+    inspect structure, and ``workflow_status`` to check a running run.
     """
+    if not workflow or not isinstance(workflow, str):
+        return _err("workflow must be a non-empty string")
+
+    if mode == "dynamic":
+        return _handle_workflow_start_dynamic(
+            workflow=workflow,
+            context=context,
+            scope=scope,
+            single_flight=single_flight,
+            delivery_target=delivery_target,
+            dry_run=dry_run,
+            **kwargs,
+        )
+
+    # Default: predefined mode
+    return _handle_workflow_start_predefined(
+        workflow=workflow,
+        context=context,
+        node=node,
+        dry_run=dry_run,
+        resume=resume,
+        single_flight=single_flight,
+    )
+
+
+def _handle_workflow_start_predefined(
+    workflow: str,
+    context: Optional[Dict[str, Any]] = None,
+    node: Optional[str] = None,
+    dry_run: bool = False,
+    resume: bool = False,
+    single_flight: bool = False,
+) -> str:
+    """Predefined mode: look up YAML in docs/fleet-pipelines/, validate,
+    dispatch via engine."""
     try:
         engine = _engine()
     except Exception as exc:
         return _err(f"engine import failed: {exc}")
-
-    if not workflow or not isinstance(workflow, str):
-        return _err("workflow must be a non-empty string")
 
     # Single-flight opt-in check: if the workflow declares
     # ``single_flight: true`` in YAML, refuse to start when another
@@ -116,7 +159,7 @@ def handle_workflow_start(
     # from webhook storms or repeated dispatch signals.
     # Skipped for dry-run and resume — those are explicitly about
     # inspecting / continuing an existing run, not starting fresh.
-    if not dry_run and not resume:
+    if not dry_run and not resume and single_flight:
         try:
             wf_def = engine.load_workflow(workflow)
         except Exception:
@@ -143,6 +186,114 @@ def handle_workflow_start(
         return _err(f"execution failed: {exc}")
 
     return _ok(result)
+
+
+def _handle_workflow_start_dynamic(
+    workflow: str,
+    context: Optional[Dict[str, Any]] = None,
+    scope: str = "project",
+    single_flight: bool = False,
+    delivery_target: str = "",
+    dry_run: bool = False,
+    **kwargs: Any,
+) -> str:
+    """Dynamic mode: delegate to dynamic_bridge.run_dynamic_workflow().
+
+    Unlike predefined mode which reads pre-defined YAML pipeline
+    definitions, this creates an ad-hoc DAG at runtime.  The
+    ``workflow`` parameter is the workflow_id to create (or reuse), and
+    ``context`` carries the objective and nodes from the calling agent.
+
+    Scope controls fleet integration:
+      - ``project`` (default): creates kanban cards for worker nodes
+      - ``global``: no kanban, in-memory only
+      - ``durable``: persists state to disk
+    """
+    from plugins.workflow.dynamic_bridge import (
+        run_dynamic_workflow,
+    )
+
+    # Extract objective and nodes from context or kwargs
+    ctx = context or {}
+    objective = ctx.get("objective", "")
+    nodes = ctx.get("nodes", [])
+    wf_context = ctx.get("context", "")
+
+    # Allow overriding via kwargs (for future flexibility)
+    if not objective and "objective" in kwargs:
+        objective = kwargs["objective"]
+    if not nodes and "nodes" in kwargs:
+        nodes = kwargs["nodes"]
+    if not wf_context and "wf_context" in kwargs:
+        wf_context = kwargs["wf_context"]
+
+    if not objective:
+        return _err("objective is required (pass in context.objective)")
+    if not isinstance(nodes, list) or not nodes:
+        return _err("nodes must be a non-empty list (pass in context.nodes)")
+    if scope not in ("project", "global", "durable"):
+        return _err(f"invalid scope: {scope!r}; must be project, global, or durable")
+
+    if dry_run:
+        return _ok({
+            "dry_run": True,
+            "workflow_id": workflow,
+            "objective": objective,
+            "node_count": len(nodes),
+            "scope": scope,
+            "single_flight": single_flight,
+            "delivery_target": delivery_target,
+        })
+
+    try:
+        result = run_dynamic_workflow(
+            workflow_id=workflow,
+            objective=objective,
+            nodes=nodes,
+            context=wf_context,
+            scope=scope,
+            single_flight=single_flight,
+            dispatch_ready=True,
+            delivery_target=delivery_target,
+        )
+    except Exception as exc:
+        logger.exception("dynamic_workflow_start failed for %s", workflow)
+        return _err(f"dynamic workflow failed: {exc}")
+
+    return _ok(result)
+
+
+def handle_workflow_view(workflow: str = "", **kwargs: Any) -> str:
+    """Load a workflow template (predefined YAML or dynamic starter) for inspection."""
+    from plugins.workflow.registry import _fleet_pipelines_dirs, _user_workflows_dir
+
+    if not workflow or not isinstance(workflow, str):
+        return _err("workflow must be a non-empty string")
+
+    # Check if it's a predefined pipeline
+    for fp_dir in _fleet_pipelines_dirs():
+        path = fp_dir / f"{workflow}.yaml"
+        if path.is_file():
+            return _ok({
+                "name": workflow,
+                "mode": "predefined",
+                "path": str(path),
+                "yaml": path.read_text(),
+            })
+
+    # Check if it's a dynamic template
+    uw_dir = _user_workflows_dir()
+    if uw_dir:
+        path = uw_dir / f"{workflow}.yaml"
+        if path.is_file():
+            return _ok({
+                "name": workflow,
+                "mode": "dynamic",
+                "path": str(path),
+                "yaml": path.read_text(),
+            })
+
+    return _err(f"workflow template not found: {workflow}")
 
 
 def handle_workflow_validate(workflow: str, **kwargs: Any) -> str:
@@ -263,20 +414,54 @@ def handle_workflow_show(workflow: str, **kwargs: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deprecated alias — prefer handle_workflow_start(mode="dynamic") instead
+# ---------------------------------------------------------------------------
+
+def handle_workflow_dynamic_start(
+    workflow: str = "",
+    context: Optional[Dict[str, Any]] = None,
+    scope: str = "project",
+    single_flight: bool = False,
+    delivery_target: str = "",
+    dry_run: bool = False,
+    **kwargs: Any,
+) -> str:
+    """Deprecated: use ``handle_workflow_start`` with ``mode="dynamic"`` instead.
+
+    This thin wrapper maintains backward compatibility for callers that
+    still reference the old entry point.
+    """
+    return handle_workflow_start(
+        workflow=workflow,
+        context=context,
+        mode="dynamic",
+        scope=scope,
+        single_flight=single_flight,
+        delivery_target=delivery_target,
+        dry_run=dry_run,
+        **kwargs,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tool schemas — fed to PluginContext.register_tool() in __init__.py
 # ---------------------------------------------------------------------------
 
 WORKFLOW_START_SCHEMA: Dict[str, Any] = {
     "name": "workflow_start",
     "description": (
-        "Start a pipeline by name. Creates kanban cards for layer-0 nodes, "
+        "Start a pipeline by name in the given mode. "
+        "Mode 'predefined' (default): reads a YAML pipeline from "
+        "docs/fleet-pipelines/, creates kanban cards for layer-0 nodes, "
         "monitors them layer-by-layer, advances the DAG as cards complete. "
         "Supports revision loops via the LOOP:<target> convention: if a "
         "reviewer blocks a card with a reason starting with 'LOOP:<node-id> |', "
-        "the engine reruns the targeted node automatically. Returns a final "
-        "summary dict keyed by node_id with the terminal status of each node. "
-        "Use workflow_list to see available pipelines, workflow_show to "
-        "inspect structure, and workflow_status to check a running pipeline."
+        "the engine reruns the targeted node automatically. "
+        "Mode 'dynamic': creates an ad-hoc DAG at runtime from the objective "
+        "and node list in context; delegates to the dynamic bridge. "
+        "Returns a final summary dict. Use workflow_list to see available "
+        "pipelines, workflow_show to inspect structure, and workflow_status "
+        "to check a running pipeline."
     ),
     "parameters": {
         "type": "object",
@@ -284,21 +469,37 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
             "workflow": {
                 "type": "string",
                 "description": (
-                    "Pipeline name (without .yaml). Current canon: "
-                    "'ideation' (spec→security→validate→decompose), "
-                    "'feature-dev' (build→CI→review→merge→post-merge)."
+                    "Pipeline name (without .yaml). For predefined mode, "
+                    "current canon: 'ideation' (spec→security→validate→decompose), "
+                    "'feature-dev' (build→CI→review→merge→post-merge). "
+                    "For dynamic mode, this is the workflow_id to create or reuse."
                 ),
             },
             "context": {
                 "type": "object",
                 "description": (
                     "Optional key=value context pairs (e.g. {'project': 'foo'}). "
-                    "Available as substitutions in the pipeline YAML."
+                    "Available as substitutions in the pipeline YAML. "
+                    "For dynamic mode, must contain 'objective' (string) and "
+                    "'nodes' (array of node dicts with node_id, goal, depends_on)."
+                ),
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["predefined", "dynamic"],
+                "default": "predefined",
+                "description": (
+                    "Workflow mode. 'predefined' uses YAML pipeline from "
+                    "docs/fleet-pipelines/. 'dynamic' creates a model-authored "
+                    "DAG from a template."
                 ),
             },
             "node": {
                 "type": "string",
-                "description": "Start from a specific node id (partial execution).",
+                "description": (
+                    "Start from a specific node id (partial execution). "
+                    "Only used in predefined mode."
+                ),
             },
             "dry_run": {
                 "type": "boolean",
@@ -309,6 +510,53 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                 "type": "boolean",
                 "description": "Resume from saved state if a previous run was interrupted.",
                 "default": False,
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["project", "global", "durable"],
+                "description": (
+                    "Fleet integration scope (dynamic mode only). "
+                    "'project' creates kanban cards, 'durable' persists state, "
+                    "'global' is in-memory only."
+                ),
+                "default": "project",
+            },
+            "single_flight": {
+                "type": "boolean",
+                "description": (
+                    "If True, refuse to create a new workflow when a run "
+                    "with the same workflow_id is already in progress. "
+                    "In predefined mode, also checks the YAML single_flight flag."
+                ),
+                "default": False,
+            },
+            "delivery_target": {
+                "type": "string",
+                "description": (
+                    "Optional delivery target (e.g. 'discord:CHANNEL_ID'). "
+                    "When set, the workflow summary is posted on completion. "
+                    "Dynamic mode only."
+                ),
+            },
+        },
+        "required": ["workflow"],
+    },
+}
+
+WORKFLOW_VIEW_SCHEMA: Dict[str, Any] = {
+    "name": "workflow_view",
+    "description": (
+        "Load a workflow template for inspection. Checks predefined YAML "
+        "pipelines from docs/fleet-pipelines/ first, then user-saved dynamic "
+        "templates from ~/.hermes/workflows/. Returns the template name, "
+        "mode (predefined/dynamic), filesystem path, and raw YAML content."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "workflow": {
+                "type": "string",
+                "description": "Workflow name to load (without .yaml).",
             },
         },
         "required": ["workflow"],
@@ -396,7 +644,7 @@ WORKFLOW_SHOW_SCHEMA: Dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
-# Dynamic workflow tools — model-authored DAGs
+# Dynamic workflow tools — model-authored DAGs (deprecated entry point)
 # ---------------------------------------------------------------------------
 
 def check_dynamic_workflow_requirements() -> bool:
@@ -414,87 +662,10 @@ def check_dynamic_workflow_requirements() -> bool:
     return True
 
 
-def handle_workflow_dynamic_start(
-    workflow: str = "",
-    context: Optional[Dict[str, Any]] = None,
-    scope: str = "project",
-    single_flight: bool = False,
-    delivery_target: str = "",
-    dry_run: bool = False,
-    **kwargs: Any,
-) -> str:
-    """Start a dynamic (model-authored) workflow.
-
-    Unlike ``handle_workflow_start`` which reads pre-defined YAML pipeline
-    definitions, this handler creates an ad-hoc DAG at runtime.  The
-    ``workflow`` parameter is the workflow_id to create (or reuse), and
-    ``context`` carries the objective and nodes from the calling agent.
-
-    Scope controls fleet integration:
-      - ``project`` (default): creates kanban cards for worker nodes
-      - ``global``: no kanban, in-memory only
-      - ``durable``: persists state to disk
-    """
-    from plugins.workflow.dynamic_bridge import (
-        run_dynamic_workflow,
-    )
-
-    if not workflow or not isinstance(workflow, str):
-        return _err("workflow (workflow_id) must be a non-empty string")
-
-    # Extract objective and nodes from context or kwargs
-    ctx = context or {}
-    objective = ctx.get("objective", "")
-    nodes = ctx.get("nodes", [])
-    wf_context = ctx.get("context", "")
-
-    # Allow overriding via kwargs (for future flexibility)
-    if not objective and "objective" in kwargs:
-        objective = kwargs["objective"]
-    if not nodes and "nodes" in kwargs:
-        nodes = kwargs["nodes"]
-    if not wf_context and "wf_context" in kwargs:
-        wf_context = kwargs["wf_context"]
-
-    if not objective:
-        return _err("objective is required (pass in context.objective)")
-    if not isinstance(nodes, list) or not nodes:
-        return _err("nodes must be a non-empty list (pass in context.nodes)")
-    if scope not in ("project", "global", "durable"):
-        return _err(f"invalid scope: {scope!r}; must be project, global, or durable")
-
-    if dry_run:
-        return _ok({
-            "dry_run": True,
-            "workflow_id": workflow,
-            "objective": objective,
-            "node_count": len(nodes),
-            "scope": scope,
-            "single_flight": single_flight,
-            "delivery_target": delivery_target,
-        })
-
-    try:
-        result = run_dynamic_workflow(
-            workflow_id=workflow,
-            objective=objective,
-            nodes=nodes,
-            context=wf_context,
-            scope=scope,
-            single_flight=single_flight,
-            dispatch_ready=True,
-            delivery_target=delivery_target,
-        )
-    except Exception as exc:
-        logger.exception("dynamic_workflow_start failed for %s", workflow)
-        return _err(f"dynamic workflow failed: {exc}")
-
-    return _ok(result)
-
-
 DYNAMIC_WORKFLOW_SCHEMA: Dict[str, Any] = {
     "name": "workflow_dynamic_start",
     "description": (
+        "Deprecated: use workflow_start with mode='dynamic' instead. "
         "Start a dynamic (model-authored) workflow — create an ad-hoc DAG at "
         "runtime instead of reading pre-defined YAML pipelines.  Pass the "
         "workflow_id, objective, and node list.  Nodes define worker goals "
