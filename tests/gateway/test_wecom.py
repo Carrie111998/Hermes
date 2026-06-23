@@ -1519,3 +1519,78 @@ class TestFinalFrameAckTimeoutSemantics:
                 {"msgtype": "stream", "stream": {"id": "stream_x", "content": "x", "finish": True}},
                 is_final=True,
             )
+
+
+class TestWeComOutboundMediaPathGuard:
+    """Fail-closed path-traversal guard on outbound media (#32717, #45734)."""
+
+    @pytest.mark.asyncio
+    async def test_load_outbound_media_serves_in_cwd_file(self, tmp_path, monkeypatch):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        monkeypatch.chdir(tmp_path)
+        media = tmp_path / "hello.txt"
+        media.write_bytes(b"hello world")
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        data, _content_type, resolved_name = await adapter._load_outbound_media(
+            str(media)
+        )
+
+        assert data == b"hello world"
+        assert resolved_name == "hello.txt"
+
+    @pytest.mark.asyncio
+    async def test_load_outbound_media_rejects_traversal(self, tmp_path, monkeypatch):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        monkeypatch.chdir(workdir)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        secret = tmp_path / "secret.txt"
+        secret.write_bytes(b"top secret")
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        with pytest.raises(ValueError, match="outside the allowed directory"):
+            await adapter._load_outbound_media("../secret.txt")
+
+    @pytest.mark.asyncio
+    async def test_load_outbound_media_fail_closed_on_resolve_error(
+        self, tmp_path, monkeypatch
+    ):
+        """If path resolution raises, the guard must refuse rather than bypass."""
+        import plugins.platforms.wecom.adapter as wecom_module
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        monkeypatch.chdir(tmp_path)
+        media = tmp_path / "hello.txt"
+        media.write_bytes(b"hello world")
+
+        original_resolve = Path.resolve
+
+        def exploding_resolve(self, *args, **kwargs):
+            if self.name == "hello.txt":
+                raise OSError("simulated resolve failure")
+            return original_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(wecom_module.Path, "resolve", exploding_resolve)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        with pytest.raises(ValueError, match="unable to resolve path safely"):
+            await adapter._load_outbound_media(str(media))
+
+    @pytest.mark.asyncio
+    async def test_load_outbound_media_rejects_allowed_root_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """The allowed root directory itself is not a servable media file."""
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        with pytest.raises(ValueError, match="outside the allowed directory"):
+            await adapter._load_outbound_media(str(tmp_path))
