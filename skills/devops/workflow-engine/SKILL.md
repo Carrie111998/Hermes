@@ -31,6 +31,44 @@ The engine resolves pipeline YAMLs from the first directory that exists:
 
 **Don't use for:** single one-off tool calls, workflows that need real-time user interaction (use `delegate_task` for async), or simple sequential tasks better handled by a single agent session.
 
+## Triggers
+
+### Trigger types
+
+| Type | How to fire | Use case |
+|------|-------------|----------|
+| manual | `workflow_start(workflow="...")` or `delegate_task` wrapper | Interactive, on-demand |
+| cron | Hermes cron job calls `workflow_start` | Scheduled health checks, monitoring, recurring tasks |
+| webhook | HTTP endpoint fires the workflow | External CI/CD, GitHub events |
+| github | GitHub webhook (PR, push, issue) | Auto-trigger on repo events |
+| api | Generic API call | External integrations |
+
+### Scheduling a workflow via cron
+
+Use Hermes cron to trigger a workflow on a schedule:
+
+```python
+cronjob(
+    action="create",
+    schedule="0 */4 * * *",  # every 4 hours
+    prompt="Run the fleet health check pipeline: workflow_start(workflow='fleet-health', context={'check': 'all'})",
+    name="fleet-health-cron"
+)
+```
+
+### Trigger events in YAML
+
+The `trigger_events` field in workflow YAML declares which trigger types the workflow supports:
+
+```yaml
+name: fleet-health
+trigger_events:
+  - cron
+  - manual
+```
+
+This is metadata — the engine doesn't enforce trigger types. Use it for documentation and tooling to understand when a workflow is designed to run.
+
 ## Making Workflows (YAML Authoring)
 
 ### YAML Structure
