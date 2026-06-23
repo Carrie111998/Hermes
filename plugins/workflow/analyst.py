@@ -18,7 +18,9 @@ Design notes
 
 from __future__ import annotations
 
+import json as _json
 import logging
+import re as _re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -153,6 +155,45 @@ Error: {error}
 """
 
 
+# ── Mode: extension suggestion ─────────────────────────────────────
+
+_EXTENSION_SYSTEM = """You are the workflow extension analyst for the Hermes Agent fleet.
+
+A worker node in a dynamic workflow has completed. You analyze the completion
+summary and the workflow objective to suggest follow-up nodes that would
+continue progress toward the objective.
+
+Output a JSON array of objects:
+
+  [
+    {
+      "node_id": "<suggested_node_id>",
+      "goal": "<concise actionable goal for the worker>",
+      "depends_on": ["<node_id this depends on>"]
+    },
+    ...
+  ]
+
+Rules:
+- Suggest 0-3 follow-up nodes. If the objective appears fully met, return [].
+- Each node_id must be unique and not already in the existing_nodes list.
+- Goals should be concise and actionable (one sentence).
+- depends_on should list node_ids from the existing graph (typically the node that just completed).
+- Do not create circular dependencies.
+- No preamble, no code fences. Output only the JSON array."""
+
+
+_EXTENSION_USER = """Workflow objective: {objective}
+
+Worker completion summary: {summary}
+
+Existing nodes: {existing_nodes}
+
+Based on the summary, suggest 0-3 follow-up nodes to continue working toward the objective.
+If the objective appears to be met, return an empty array.
+Only suggest nodes that are NOT already in the existing_nodes list."""
+
+
 # ── Outcome dataclass ──────────────────────────────────────────────
 
 @dataclass
@@ -236,6 +277,49 @@ def analyze_failure(
     )
 
 
+def analyze_extension(
+    *,
+    summary: str = "",
+    objective: str = "",
+    existing_nodes: list[str] | None = None,
+    timeout: Optional[int] = None,
+) -> list[dict]:
+    """Suggest follow-up nodes after a worker completes.
+
+    Calls the workflow_analyst auxiliary with the extension prompt.
+    Returns a list of suggestion dicts (node_id, goal, depends_on)
+    or an empty list if the analyst is unavailable / returns nothing useful.
+    """
+    if existing_nodes is None:
+        existing_nodes = []
+    user_msg = _EXTENSION_USER.format(
+        summary=summary,
+        objective=objective,
+        existing_nodes=", ".join(existing_nodes) if existing_nodes else "(none)",
+    )
+    outcome = _invoke(
+        mode="extension",
+        system_prompt=_EXTENSION_SYSTEM,
+        user_message=user_msg,
+        timeout=timeout,
+    )
+
+    # Try parsing from result dict first (LLM might wrap array in object)
+    if outcome.success and isinstance(outcome.result, dict):
+        for key in ("nodes", "suggestions", "extensions"):
+            val = outcome.result.get(key)
+            if isinstance(val, list):
+                return _validate_suggestions(val)
+
+    # Fall back to parsing raw response as JSON array
+    raw = outcome.raw_response or ""
+    nodes = _extract_json_list(raw)
+    if nodes is not None:
+        return _validate_suggestions(nodes)
+
+    return []
+
+
 # ── Internal ───────────────────────────────────────────────────────
 
 def _invoke(
@@ -294,3 +378,52 @@ def _invoke(
         )
 
     return AnalystOutcome(mode=mode, success=True, result=parsed, raw_response=raw)
+
+
+# ── Extension helpers ──────────────────────────────────────────────
+
+_FENCE_RE = _re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", _re.IGNORECASE)
+
+
+def _extract_json_list(raw: str) -> list | None:
+    """Lenient extraction of a JSON array from an LLM response.
+
+    Mirrors extract_json_blob but handles ``[...]`` arrays.
+    Returns the parsed list, or ``None`` if extraction fails.
+    """
+    if not raw:
+        return None
+    stripped = _FENCE_RE.sub("", raw.strip())
+    first = stripped.find("[")
+    last = stripped.rfind("]")
+    if first == -1 or last == -1 or last <= first:
+        return None
+    candidate = stripped[first:last + 1]
+    try:
+        val = _json.loads(candidate)
+    except (ValueError, _json.JSONDecodeError):
+        return None
+    if not isinstance(val, list):
+        return None
+    return val
+
+
+def _validate_suggestions(items: list) -> list[dict]:
+    """Validate and normalise extension suggestions from the analyst."""
+    validated: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        nid = str(item.get("node_id") or "").strip()
+        goal = str(item.get("goal") or "").strip()
+        if not nid or not goal:
+            continue
+        depends_on = item.get("depends_on")
+        if not isinstance(depends_on, list):
+            depends_on = []
+        validated.append({
+            "node_id": nid,
+            "goal": goal,
+            "depends_on": [str(d).strip() for d in depends_on if str(d).strip()],
+        })
+    return validated

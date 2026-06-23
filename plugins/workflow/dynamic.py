@@ -906,7 +906,45 @@ def _action_record(
         _sync_delegation_state(workflow)
         _dispatch_ready_nodes(workflow, parent_agent)
 
-        return _ok({"workflow": workflow.public_view()})
+        # Auto-extension: suggest follow-up nodes on completion
+        ext_payload: dict[str, Any] = {}
+        if status == COMPLETED and node.summary:
+            from plugins.workflow import get_config
+            from plugins.workflow.analyst import analyze_extension
+
+            existing_ids = list(workflow.nodes.keys())
+            suggestions = analyze_extension(
+                summary=node.summary,
+                objective=workflow.objective,
+                existing_nodes=existing_ids,
+            )
+            if suggestions:
+                auto_approve = get_config().get(
+                    "auto_approve_extensions", False
+                )
+                if auto_approve:
+                    ext_args = {
+                        "workflow_id": wf_id,
+                        "nodes": suggestions,
+                        "dispatch_ready": True,
+                    }
+                    ext_result = _action_extend(ext_args, parent_agent)
+                    ext_payload["auto_extended"] = True
+                    ext_payload["extension_result"] = (
+                        _json.loads(ext_result)
+                        if isinstance(ext_result, str)
+                        else ext_result
+                    )
+                else:
+                    workflow._pending_extensions = suggestions
+                    ext_payload["pending_extensions"] = suggestions
+                    ext_payload["extension_note"] = (
+                        "suggestions stored for user review"
+                    )
+            else:
+                ext_payload["extension_note"] = "no follow-up nodes suggested"
+
+        return _ok({"workflow": workflow.public_view(), **ext_payload})
 
 
 def _action_dispatch(
