@@ -33,6 +33,7 @@ _DEFAULTS: Dict[str, Any] = {
     "max_nodes_per_extension": 3,
     "default_scope": "project",
     "default_delivery_target": "",
+    "default_assignee": "",
     "persist_dir": "~/.hermes/workflow-logs",
 }
 

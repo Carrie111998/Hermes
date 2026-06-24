@@ -100,15 +100,17 @@ def _kanban_create_card(node: dict, workflow_id: str, context: str = "") -> str 
     if context:
         body += f"\n\nContext: {context}"
 
+    _default_assignee = get_config().get("default_assignee", "")
     cmd = [
         _hermes_binary(), "kanban", "create",
         title,
         "--tenant", KANBAN_BOARD,
         "--body", body,
-        "--assignee", "sherlock",
         "--goal",
         "--priority", "2",
     ]
+    if _default_assignee:
+        cmd.extend(["--assignee", _default_assignee])
     run_env = dict(os.environ)
     run_env["HERMES_KANBAN_BOARD"] = KANBAN_BOARD
     try:
