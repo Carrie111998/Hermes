@@ -1027,14 +1027,14 @@ def _action_dispatch(
     Reconciles async state first, then dispatches up to ``max_dispatch``
     ready nodes as background delegations.
     """
-    _evict_completed()
-
     wf_id = str(args.get("workflow_id") or "").strip()
     fmt_err = _validate_id_format(wf_id, "workflow_id")
     if fmt_err:
         return _err(fmt_err)
 
     with _workflows_lock:
+        _evict_completed()
+
         scope_key = _resolve_scope(parent_agent)
         workflow = _lookup_workflow(wf_id, scope_key)
         if workflow is None:
@@ -1055,9 +1055,9 @@ def _action_status(
 
     Reconciles async delegation state before reporting.
     """
-    _evict_completed()
-
     with _workflows_lock:
+        _evict_completed()
+
         wf_id = str(args.get("workflow_id") or "").strip()
         scope_key = _resolve_scope(parent_agent)
 
