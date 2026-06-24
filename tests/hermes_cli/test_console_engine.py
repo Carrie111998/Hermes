@@ -429,11 +429,18 @@ def test_sessions_export_zero_limit_disables_guard(
     assert output.exists()
 
 
-def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
+def test_cron_pause_resume_and_run_require_confirmation(
+    _isolate_hermes_home, monkeypatch
+):
     from cron.jobs import create_job, get_job
 
     job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
     engine = HermesConsoleEngine()
+    warnings = []
+    monkeypatch.setattr(
+        "hermes_cli.cron._warn_if_gateway_not_running",
+        lambda: warnings.append(True),
+    )
 
     pending = engine.execute(f"cron pause {job['id']}")
     assert pending.status == "confirm_required"
@@ -452,6 +459,7 @@ def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
     stored = get_job(job["id"])
     assert stored is not None
     assert stored["state"] == "scheduled"
+    assert warnings == [True]
 
     triggered = engine.execute("cron run alpha", confirmed=True)
     assert triggered.status == "ok"

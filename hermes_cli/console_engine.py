@@ -1617,6 +1617,7 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if ns.at and ns.run_now:
         raise ConsoleCommandError("Use exactly one of --at or --run-now.")
     from cron.jobs import AmbiguousJobReference, _hermes_now, rearm_oneshot, resume_job
+    from hermes_cli.cron import _warn_if_gateway_not_running
 
     try:
         if ns.at or ns.run_now:
@@ -1629,6 +1630,7 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
         raise ConsoleCommandError(str(exc)) from exc
     if not job:
         raise ConsoleCommandError(f"Job not found: {ns.job}")
+    _warn_if_gateway_not_running()
     return _format_job(job, "Resumed")
 
 
