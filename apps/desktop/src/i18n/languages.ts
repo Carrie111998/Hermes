@@ -30,10 +30,17 @@ export const LOCALE_OPTIONS = [
     configValue: 'ja'
   },
   {
+<<<<<<< HEAD
     id: 'ar',
     name: 'العربية',
     englishName: 'Arabic',
     configValue: 'ar'
+=======
+    id: 'de',
+    name: 'Deutsch',
+    englishName: 'German',
+    configValue: 'de'
+>>>>>>> ce55225b9 (feat(desktop): add German (de) locale)
   }
 ] as const satisfies readonly { configValue: string; englishName: string; id: Locale; name: string }[]
 
@@ -71,6 +78,7 @@ const LOCALE_ALIASES: Record<string, Locale> = {
   ja: 'ja',
   'ja-jp': 'ja',
   ja_jp: 'ja',
+<<<<<<< HEAD
   ar: 'ar',
   'ar-sa': 'ar',
   ar_sa: 'ar',
@@ -80,6 +88,19 @@ const LOCALE_ALIASES: Record<string, Locale> = {
   ar_eg: 'ar',
   arabic: 'ar',
   العربية: 'ar'
+=======
+  de: 'de',
+  'de-de': 'de',
+  de_de: 'de',
+  'de-at': 'de',
+  de_at: 'de',
+  'de-ch': 'de',
+  de_ch: 'de',
+  'de-li': 'de',
+  de_li: 'de',
+  'de-lu': 'de',
+  de_lu: 'de'
+>>>>>>> ce55225b9 (feat(desktop): add German (de) locale)
 }
 
 export function isLocale(value: unknown): value is Locale {
