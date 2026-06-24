@@ -1157,7 +1157,8 @@ def _restore_durable_workflows() -> None:
             from plugins.workflow.dynamic_bridge import _recover_workflow
             recovered = _recover_workflow(workflow_id)
             if recovered:
-                _workflows[(workflow_id, workflow_id)] = recovered
+                with _workflows_lock:
+                    _workflows[(workflow_id, workflow_id)] = recovered
         except Exception as exc:
             logger.warning("failed to recover workflow %s: %s", workflow_id, exc)
 
