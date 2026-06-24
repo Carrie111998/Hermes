@@ -7174,6 +7174,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
+        limit: int | None = None,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -7192,6 +7193,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         mutates only the per-request list, never the stored transcript.
         Inspection/export consumers keep the default and see the transcript
         verbatim.
+
+        When ``limit`` is set, only the last ``limit`` messages are returned
+        (ordered by insertion id). This is used by ``--recent N`` to
+        load a partial transcript for quick session check-ins without
+        paying the full token cost of a long conversation.
         """
         session_ids = [session_id]
         if include_ancestors:
@@ -7214,6 +7220,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"{active_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
+
+        # Apply limit: keep only the last N rows (most recent by insertion
+        # order). Note: when include_ancestors=True, the limit applies across
+        # the entire merged lineage, not per-session. This is intentional —
+        # the caller wants the last N messages of the conversation, regardless
+        # of which session in the compression chain they belong to.
+        if limit is not None and limit > 0 and len(rows) > limit:
+            rows = rows[-limit:]
 
         return self._rows_to_conversation(
             rows,
@@ -7367,7 +7381,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return messages
 
     def get_resume_conversations(
-        self, session_id: str
+        self, session_id: str, limit: int | None = None
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
 
@@ -7384,6 +7398,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         rows are part of the lineage), so serving both from one lineage SELECT
         halves the resume's DB work versus two separate calls, with byte-identical
         output (see test_get_resume_conversations_matches_separate_reads).
+
+        When ``limit`` is set, only the last ``limit`` messages of the tip
+        session are loaded into ``model_history`` (ordered by insertion id).
+        This is used by ``--recent N`` to load a partial transcript for quick
+        session check-ins without paying the full token cost of a long
+        conversation. ``display_history`` is always returned in full so the
+        timeline still renders correctly. The slice never begins on a ``tool``
+        response whose owning assistant ``tool_calls`` row was cut off (see
+        ``get_messages_as_conversation``).
         """
         session_ids = self._session_lineage_root_to_tip(session_id)
         with self._read_ctx() as conn:
@@ -7401,6 +7424,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # with session_ids=[session_id]); filtering the lineage fetch preserves
         # their relative id order.
         tip_rows = [r for r in rows if r["session_id"] == session_id]
+        # ``--recent N``: keep only the last ``limit`` tip rows. Never begin the
+        # window on a ``tool`` response whose owning assistant ``tool_calls``
+        # row was sliced off (replay would orphan the call → HTTP 400), so back
+        # the start up over any leading tool rows. The result may exceed
+        # ``limit`` by at most one tool-call group.
+        if limit is not None and limit > 0 and len(tip_rows) > limit:
+            start = len(tip_rows) - limit
+            while start > 0 and tip_rows[start]["role"] == "tool":
+                start -= 1
+            tip_rows = tip_rows[start:]
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,

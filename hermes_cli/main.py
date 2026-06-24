@@ -575,6 +575,7 @@ def _apply_profile_override() -> None:
         "--provider",
         "-t", "--toolsets",
         "-r", "--resume",
+        "--recent",
         "-s", "--skills",
         "--usage-file",
     }
@@ -2720,6 +2721,7 @@ def cmd_chat(args):
         "query": args.query,
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
+        "recent": getattr(args, "recent", None),
         "worktree": getattr(args, "worktree", False),
         "checkpoints": getattr(args, "checkpoints", False),
         "pass_session_id": getattr(args, "pass_session_id", False),
@@ -9196,7 +9198,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "completion",
         "logs",
     }
-    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume"}
+    _SESSION_FLAGS = {"-c", "--continue", "-r", "--resume", "--recent"}
 
     result = []
     i = 0
@@ -10613,6 +10615,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "--provider",
         "-t", "--toolsets",
         "-r", "--resume",
+        "--recent",
         "-s", "--skills",
         "--usage-file",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as

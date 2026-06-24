@@ -405,7 +405,9 @@ class CLIAgentSetupMixin:
                 if resolved_meta:
                     session_meta = resolved_meta
             restored = self._session_db.get_messages_as_conversation(
-                self.session_id, repair_alternation=True
+                self.session_id,
+                repair_alternation=True,
+                limit=getattr(self, "_recent_limit", None),
             )
             if restored:
                 restored = [m for m in restored if m.get("role") != "session_meta"]
@@ -615,7 +617,9 @@ class CLIAgentSetupMixin:
             if resolved_meta:
                 session_meta = resolved_meta
 
-        model_history, display_history = self._session_db.get_resume_conversations(self.session_id)
+        model_history, display_history = self._session_db.get_resume_conversations(
+            self.session_id, limit=getattr(self, "_recent_limit", None)
+        )
         restored = model_history
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]
@@ -634,11 +638,15 @@ class CLIAgentSetupMixin:
             if session_meta.get("title"):
                 title_part = f' "{session_meta["title"]}"'
             accent_color = _accent_hex()
+            recent_note = ""
+            _rl = getattr(self, "_recent_limit", None)
+            if _rl and _rl > 0 and len(restored) < _rl:
+                recent_note = f" (last {len(restored)} of {_rl} requested)"
             self._console_print(
                 f"[{accent_color}]↻ Resumed session [bold]{self.session_id}[/bold]"
                 f"{title_part} "
                 f"({msg_count} user message{'s' if msg_count != 1 else ''}, "
-                f"{len(restored)} total messages)[/]"
+                f"{len(restored)} total messages){recent_note}[/]"
             )
             self._restore_session_cwd(session_meta)
             self._restore_session_yolo(session_meta)

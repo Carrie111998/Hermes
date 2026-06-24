@@ -4222,6 +4222,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         verbose: Optional[bool] = None,
         compact: bool = False,
         resume: str = None,
+        recent: int = None,
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
@@ -4620,6 +4621,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+
+        # --recent N: load only the last N messages on resume
+        self._recent_limit: Optional[int] = recent
         
         # History file for persistent input recall across sessions
         self._history_file = _hermes_home / ".hermes_history"
@@ -17972,6 +17976,7 @@ def main(
     list_toolsets: bool = False,
     gateway: bool = False,
     resume: str = None,
+    recent: int = None,
     worktree: bool = False,
     w: bool = False,
     checkpoints: bool = False,
@@ -18112,6 +18117,7 @@ def main(
         verbose=verbose,
         compact=compact,
         resume=resume,
+        recent=recent,
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
