@@ -4801,6 +4801,8 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> Any:
         effective_reply_to = reply_to
+        if not effective_reply_to and metadata and metadata.get("thread_id"):
+            effective_reply_to = metadata.get("reply_to_message_id")
         reply_in_thread = bool((metadata or {}).get("thread_id"))
         if effective_reply_to:
             body = self._build_reply_message_body(
@@ -5007,6 +5009,8 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id,
                         )
                         active_reply_to = None
+                        if metadata:
+                            metadata.pop("reply_to_message_id", None)
                         response = await self._send_raw_message(
                             chat_id=chat_id,
                             msg_type=msg_type,
@@ -5048,6 +5052,8 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id,
                         )
                         active_reply_to = None
+                        if metadata:
+                            metadata.pop("reply_to_message_id", None)
                         continue  # retry this attempt without reply_to
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
