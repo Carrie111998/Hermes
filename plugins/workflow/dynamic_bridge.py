@@ -203,10 +203,12 @@ def _save_state(workflow_id: str, wf_view: dict) -> None:
         logger.warning("failed to save durable state for %s: %s", workflow_id, exc)
 
 
-def _recover_workflow(workflow_id: str) -> dict | None:
+def _recover_workflow(workflow_id: str) -> "DynamicWorkflow | None":
     """Recover a workflow from its saved state and kanban card statuses.
 
-    Returns the reconstructed workflow view, or None if no state found.
+    Returns a ``DynamicWorkflow`` instance (not a dict), or None if no
+    state found.  Callers that store the result in ``_workflows`` expect
+    a live object with methods like ``.status``, not a plain dict.
     """
     state = _load_state(workflow_id)
     if not state:
@@ -238,7 +240,7 @@ def _recover_workflow(workflow_id: str) -> dict | None:
         wf.nodes[node_id] = node
         wf.node_order.append(node_id)
 
-    return wf.public_view()
+    return wf
 
 
 def _get_kanban_card_status(card_id: str) -> str:
@@ -605,6 +607,30 @@ def dispatch_nodes(
 
 
 # ── Internal helpers ──────────────────────────────────────────────
+
+
+def _append_extension_artifact(workflow_id: str, node_id: str, node_summary: str, suggestions: list, auto_approved: bool) -> None:
+    """Append extension suggestions to the workflow's audit artifact.
+
+    Called every time analyze_extension returns suggestions, regardless of
+    whether auto_approve_extensions is true. Provides permanent audit trail.
+    """
+    artifact_dir = Path.home() / ".hermes" / "workflow-logs" / workflow_id
+    try:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_file = artifact_dir / "extensions.jsonl"
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "workflow_id": workflow_id,
+            "node_id": node_id,
+            "node_summary": node_summary,
+            "suggestions": suggestions,
+            "auto_approved": auto_approved,
+        }
+        with open(artifact_file, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception as exc:
+        logger.warning("failed to write extension artifact for %s: %s", workflow_id, exc)
 
 
 def _all_nodes_terminal(wf_view: dict) -> bool:

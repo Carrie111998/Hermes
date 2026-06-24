@@ -1008,11 +1008,26 @@ def _action_record(
                             else ext_result
                         )
                     else:
-                        workflow._pending_extensions = suggestions
-                        ext_payload["pending_extensions"] = suggestions
+                        existing = getattr(workflow, "_pending_extensions", None) or []
+                        if not isinstance(existing, list):
+                            existing = [existing]
+                        combined = existing + suggestions
+                        workflow._pending_extensions = combined
+                        ext_payload["pending_extensions"] = combined
                         ext_payload["extension_note"] = (
                             "suggestions stored for user review"
                         )
+                    # Always write extension artifact for audit trail
+                    from plugins.workflow.dynamic_bridge import (
+                        _append_extension_artifact,
+                    )
+                    _append_extension_artifact(
+                        workflow_id=wf_id,
+                        node_id=nid,
+                        node_summary=node.summary or "",
+                        suggestions=suggestions,
+                        auto_approved=auto_approve,
+                    )
                 else:
                     ext_payload["extension_note"] = "no follow-up nodes suggested"
 
@@ -1150,15 +1165,21 @@ def _restore_durable_workflows() -> None:
         return
 
     for state_file in persist_dir.glob("*/state.json"):
+        try:
+            state = json.loads(state_file.read_text())
+        except Exception:
+            continue
+        scope_key = state.get("scope", "project")
         workflow_id = state_file.parent.name
-        if (workflow_id, workflow_id) in _workflows:  # already loaded
+        registry_key = (scope_key, workflow_id)
+        if registry_key in _workflows:  # already loaded
             continue
         try:
             from plugins.workflow.dynamic_bridge import _recover_workflow
             recovered = _recover_workflow(workflow_id)
             if recovered:
                 with _workflows_lock:
-                    _workflows[(workflow_id, workflow_id)] = recovered
+                    _workflows[registry_key] = recovered
         except Exception as exc:
             logger.warning("failed to recover workflow %s: %s", workflow_id, exc)
 
@@ -1171,6 +1192,14 @@ _ACTIONS = {
     "status": _action_status,
     "cancel": _action_cancel,
 }
+
+# ── Durable scope recovery (module load) ──────────────────────────
+# Restore previously persisted workflows at import time so the durable
+# scope is available before any tool call or workflow mutation.
+try:
+    _restore_durable_workflows()
+except Exception as exc:
+    logger.warning("durable recovery at module load failed: %s", exc)
 
 
 def handle_workflow_dynamic(args: dict[str, Any], parent_agent: Any = None) -> str:
@@ -1187,8 +1216,6 @@ def handle_workflow_dynamic(args: dict[str, Any], parent_agent: Any = None) -> s
         status   — query workflow state (single or all in scope)
         cancel   — cancel a workflow and optionally interrupt delegations
     """
-    _restore_durable_workflows()
-
     if not isinstance(args, dict):
         return _err("dynamic_workflow arguments must be an object")
 
