@@ -173,15 +173,53 @@ def _err(message: str, **extra: Any) -> str:
 
 # Keyed by (scope_key, workflow_id)
 _workflows: dict[tuple[str, str], DynamicWorkflow] = {}
+# Completed workflows awaiting eviction: key → (workflow, completed_timestamp)
+_completed_workflows: dict[tuple[str, str], tuple[DynamicWorkflow, float]] = {}
 _workflows_lock = threading.RLock()
+
+# How long to retain completed workflows before full eviction (seconds)
+_COMPLETED_RETENTION_SECONDS = 3600
 
 
 # ── Internal helpers ──────────────────────────────────────────────
+
+# Workflow-level statuses that are terminal (no further state changes expected)
+_WORKFLOW_TERMINAL_STATUSES: set[str] = {WF_COMPLETED, WF_FAILED, WF_CANCELLED}
 
 
 def _now() -> float:
     """Current wall-clock timestamp."""
     return time.time()
+
+
+def _is_workflow_terminal(workflow: DynamicWorkflow) -> bool:
+    """Return True if the workflow has reached a terminal status."""
+    return _derive_status(workflow) in _WORKFLOW_TERMINAL_STATUSES
+
+
+def _evict_completed() -> None:
+    """Promote terminal workflows to the completed cache and purge stale entries.
+
+    This is called on every ``_action_status`` and ``_action_dispatch``
+    invocation so that finished workflows don't leak memory indefinitely.
+    """
+    now = _now()
+    # 1) Promote terminal workflows out of the active dict
+    terminal_keys: list[tuple[str, str]] = []
+    for key, wf in _workflows.items():
+        if _is_workflow_terminal(wf):
+            terminal_keys.append(key)
+    for key in terminal_keys:
+        _completed_workflows[key] = (_workflows.pop(key), now)
+
+    # 2) Evict completed entries older than the retention window
+    expired = [
+        key
+        for key, (_, ts) in _completed_workflows.items()
+        if now - ts > _COMPLETED_RETENTION_SECONDS
+    ]
+    for key in expired:
+        del _completed_workflows[key]
 
 
 def _new_workflow_id() -> str:
@@ -907,6 +945,12 @@ def _action_record(
         _sync_delegation_state(workflow)
         _dispatch_ready_nodes(workflow, parent_agent)
 
+        # Move workflow to _completed_workflows if it reached terminal state
+        if _is_workflow_terminal(workflow):
+            key = (scope_key, wf_id)
+            _workflows.pop(key, None)
+            _completed_workflows[key] = (workflow, now)
+
         # Auto-extension: suggest follow-up nodes on completion
         ext_payload: dict[str, Any] = {}
         if status == COMPLETED and node.summary:
@@ -983,6 +1027,8 @@ def _action_dispatch(
     Reconciles async state first, then dispatches up to ``max_dispatch``
     ready nodes as background delegations.
     """
+    _evict_completed()
+
     wf_id = str(args.get("workflow_id") or "").strip()
     fmt_err = _validate_id_format(wf_id, "workflow_id")
     if fmt_err:
@@ -1009,6 +1055,8 @@ def _action_status(
 
     Reconciles async delegation state before reporting.
     """
+    _evict_completed()
+
     with _workflows_lock:
         wf_id = str(args.get("workflow_id") or "").strip()
         scope_key = _resolve_scope(parent_agent)
@@ -1077,6 +1125,11 @@ def _action_cancel(
                         interrupted_ids.append(node.delegation_id)
                 node.updated_at = now
 
+        # Move cancelled workflow to _completed_workflows
+        key = (scope_key, wf_id)
+        _workflows.pop(key, None)
+        _completed_workflows[key] = (workflow, now)
+
         return _ok({
             "workflow": workflow.public_view(),
             "interrupted_delegation_ids": interrupted_ids,
@@ -1133,3 +1186,4 @@ def _reset_for_tests() -> None:
     """Clear all in-memory workflow state.  Test-only."""
     with _workflows_lock:
         _workflows.clear()
+        _completed_workflows.clear()
