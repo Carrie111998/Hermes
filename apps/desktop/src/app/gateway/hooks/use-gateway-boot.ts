@@ -25,6 +25,7 @@ import {
   touchSecondaryGateways
 } from '@/store/gateway'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
+import { watchVisibleModels } from '@/store/model-visibility'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
 import {
@@ -461,6 +462,11 @@ export function useGatewayBoot({
     const offAttention = $attentionSessionIds.subscribe(() => recomputeKeptGateways())
     const offActiveProfile = $activeGatewayProfile.subscribe(() => recomputeKeptGateways())
 
+    // Model visibility watcher, registered once the gateway is reachable (see
+    // boot()). Subscribes to profile switches so one profile's visibility
+    // preferences never bleed into another.
+    let offVisibleModels: (() => void) | undefined
+
     const offWindowState = desktop.onWindowStateChanged?.(payload => {
       const current = $connection.get()
 
@@ -543,6 +549,13 @@ export function useGatewayBoot({
           return
         }
 
+        // Sync model visibility once the backend is reachable (the RPC needs a
+        // live gateway + resolved profile), and keep it in sync across profile
+        // switches so one profile's preferences never bleed into another.
+        // Best-effort: a missing or failed backend read just leaves the curated
+        // defaults in place.
+        offVisibleModels?.()
+        offVisibleModels = watchVisibleModels()
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
@@ -600,6 +613,7 @@ export function useGatewayBoot({
       offWorking()
       offAttention()
       offActiveProfile()
+      offVisibleModels?.()
       window.removeEventListener('online', onOnline)
       document.removeEventListener('visibilitychange', onVisible)
       offPowerResume?.()

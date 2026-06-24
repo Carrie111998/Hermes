@@ -8282,6 +8282,99 @@ def _pet_cancel_release(token: str) -> None:
         _pet_cancelled.discard(token)
 
 
+# ── Methods: model_visibility ────────────────────────────────────────────
+# Profile-scoped persistence for the desktop app's model visibility
+# preferences (which models to show/hide per provider).  Stored as a simple
+# JSON file under the profile's home so it survives cache clears, origin
+# changes, and Electron userData resets.
+#
+# ``customized`` is an explicit marker returned *alongside* the key list so the
+# client can distinguish "never customized" (curated defaults apply) from "the
+# user hid everything" (an explicit empty selection). A missing file means
+# never customized; an empty list alone must NOT be conflated with an empty
+# selection.
+
+_MODEL_VISIBILITY_FILENAME = "desktop-model-visibility.json"
+
+
+def _model_visibility_path(profile_home: Path | None = None) -> Path:
+    """Resolve the model visibility JSON file path for the active profile.
+
+    Resolves via :func:`get_hermes_home` at call time so the profile-scoped
+    override installed by ``_profile_scoped`` (from ``params.profile``) is
+    honoured — the module-level ``_hermes_home`` constant is captured at import
+    and would route to the launch profile instead.
+    """
+    home = profile_home or get_hermes_home()
+    return Path(home) / _MODEL_VISIBILITY_FILENAME
+
+
+def _read_model_visibility(profile_home: Path | None = None) -> tuple[list[str], bool]:
+    """Read the stored model visibility keys.
+
+    Returns ``(keys, customized)`` where ``customized`` is False when no file
+    exists yet (curated defaults apply) and True once the user has persisted an
+    explicit selection — including an empty selection meaning "hide everything".
+    A corrupted file is treated as customized with no keys (the client falls
+    back to curated defaults rather than hiding everything).
+    """
+    p = _model_visibility_path(profile_home)
+    if not p.exists():
+        return [], False
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, list) and all(isinstance(x, str) for x in data):
+            return data, True
+        return [], True
+    except (json.JSONDecodeError, OSError):
+        return [], True
+
+
+def _write_model_visibility(keys: list[str], profile_home: Path | None = None) -> None:
+    """Write model visibility keys to the profile-scoped JSON file."""
+    p = _model_visibility_path(profile_home)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(keys, ensure_ascii=False), encoding="utf-8")
+
+
+@method("model_visibility.get")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Return the stored model visibility keys for the active profile.
+
+    Returns ``{"keys": [...], "customized": bool}``. ``customized`` is False
+    when the profile has never persisted a selection, so the client knows to
+    keep its curated defaults rather than treating an empty array as "the user
+    hid everything".
+    """
+    try:
+        keys, customized = _read_model_visibility()
+        return _ok(rid, {"keys": keys, "customized": customized})
+    except Exception as exc:
+        logger.debug("model_visibility.get failed: %s", exc)
+        return _ok(rid, {"keys": [], "customized": False})
+
+
+@method("model_visibility.set")
+@_profile_scoped
+def _(rid, params: dict) -> dict:
+    """Persist model visibility keys for the active profile.
+
+    Params: ``{"keys": ["provider::model", ...]}``.
+    Returns ``{"ok": true}`` on success.
+    """
+    try:
+        raw = params.get("keys")
+        if not isinstance(raw, list):
+            return _err(rid, 4002, "keys must be a list of strings")
+        keys = [str(k) for k in raw if isinstance(k, str)]
+        _write_model_visibility(keys)
+        return _ok(rid, {"ok": True})
+    except Exception as exc:
+        logger.debug("model_visibility.set failed: %s", exc)
+        return _err(rid, 5001, f"model_visibility.set failed: {exc}")
+
+
 # ===========================================================================
 # Phase 2b Remote Spending RPC methods
 # ===========================================================================

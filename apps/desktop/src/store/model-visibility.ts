@@ -2,6 +2,8 @@ import { atom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 import type { ModelOptionProvider } from '@/types/hermes'
+import { $gateway } from './gateway'
+import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 
 const STORAGE_KEY = 'hermes.desktop.visible-models'
 
@@ -68,6 +70,130 @@ export function collapseModelFamilies(models: readonly string[]): ModelFamily[] 
   return families
 }
 
+// ── Backend persistence ──────────────────────────────────────────────
+// Model visibility preferences are persisted on the backend so they survive
+// cache clears, origin changes, and Electron userData resets.
+//
+// Profile scoping: model visibility is per-profile, so every RPC carries the
+// active gateway profile (the gateway no-ops it for the launch profile) — one
+// chokepoint so a call site can't forget it, mirroring the pet store's petRpc.
+
+/** Profile the active window backend is scoped to (normalized). */
+function visibilityProfile(): string {
+  return normalizeProfileKey($activeGatewayProfile.get())
+}
+
+/** Serialize every backend write. Each save snapshots the atom at call time so
+ *  two rapid toggles can't complete out of order and persist a stale selection
+ *  (the server's last write wins only for the *latest* intent). */
+let saveChain: Promise<void> = Promise.resolve()
+
+function enqueueBackendSave(keys: Set<string>): void {
+  const gateway = $gateway.get()
+  if (!gateway) return
+  const snapshot = [...keys]
+  saveChain = saveChain.then(async () => {
+    try {
+      await gateway.request('model_visibility.set', {
+        keys: snapshot,
+        profile: visibilityProfile()
+      })
+    } catch {
+      // Best-effort; localStorage remains the offline fallback.
+    }
+  })
+}
+
+/** Try to load visibility keys from the backend.
+ *
+ *  Returns:
+ *   - ``{ kind: 'customized', keys }`` when the profile has persisted a
+ *     selection (including an explicit empty selection — "hide everything"),
+ *   - ``{ kind: 'unset' }`` when the profile has never customized (curated
+ *     defaults apply),
+ *   - ``null`` when the backend is unreachable (caller should fall back).
+ */
+type BackendVisibility =
+  | { kind: 'customized'; keys: Set<string> }
+  | { kind: 'unset' }
+
+async function loadVisibleFromBackend(): Promise<BackendVisibility | null> {
+  const gateway = $gateway.get()
+  if (!gateway) return null
+  try {
+    const result = await gateway.request<{ keys: string[]; customized?: boolean }>(
+      'model_visibility.get',
+      { profile: visibilityProfile() }
+    )
+    if (result && Array.isArray(result.keys)) {
+      const keys = new Set(result.keys.filter((x): x is string => typeof x === 'string'))
+      // A missing file is reported as `customized: false`; treat that as unset
+      // so an empty array is NOT conflated with the user hiding everything.
+      return result.customized === false ? { kind: 'unset' } : { kind: 'customized', keys }
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** Migrate existing localStorage data to the backend. Returns the migrated
+ *  set, or null if there was nothing to migrate. */
+function migrateFromLocalStorage(): Set<string> | null {
+  const raw = storedString(STORAGE_KEY)
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? new Set(parsed.filter((x): x is string => typeof x === 'string')) : null
+  } catch {
+    return null
+  }
+}
+
+/** Load visibility preferences for the *given* profile and store them in the
+ *  atom. Guards against a stale response overwriting a newer profile's state:
+ *  the profile is snapshotted before the await, and the write is dropped if the
+ *  active profile changed in the meantime. */
+export async function syncVisibleModelsForProfile(profile: string): Promise<void> {
+  const backend = await loadVisibleFromBackend()
+  if (backend !== null) {
+    // A profile switch landed while we were in flight — don't clobber the new
+    // profile's freshly-loaded (or user-edited) state.
+    if (normalizeProfileKey($activeGatewayProfile.get()) !== normalizeProfileKey(profile)) {
+      return
+    }
+    if (backend.kind === 'customized') {
+      $visibleModels.set(backend.keys)
+      persistString(STORAGE_KEY, JSON.stringify([...backend.keys]))
+    } else {
+      // Never customized for this profile → curated defaults apply.
+      $visibleModels.set(null)
+      persistString(STORAGE_KEY, '')
+    }
+    return
+  }
+
+  const local = migrateFromLocalStorage()
+  if (local !== null) {
+    // Migrate localStorage data to backend (fire-and-forget, serialized)
+    enqueueBackendSave(local)
+    $visibleModels.set(local)
+    return
+  }
+
+  // Backend unreachable and nothing local — keep the null sentinel.
+}
+
+/** Call once after gateway boot to sync visibility preferences for the active
+ *  profile, and re-sync whenever the active gateway profile switches so one
+ *  profile's preferences never bleed into another. Returns an unsubscribe fn. */
+export function watchVisibleModels(): () => void {
+  void syncVisibleModelsForProfile($activeGatewayProfile.get())
+  return $activeGatewayProfile.subscribe(profile => {
+    void syncVisibleModelsForProfile(profile)
+  })
+}
+
 function loadVisible(): Set<string> | null {
   const raw = storedString(STORAGE_KEY)
 
@@ -93,6 +219,8 @@ export const $modelVisibilityOpen = atom(false)
 export function setVisibleModels(keys: Set<string>): void {
   $visibleModels.set(new Set(keys))
   persistString(STORAGE_KEY, JSON.stringify([...keys]))
+  // Serialized backend persist so a rapid toggle can't persist out of order.
+  enqueueBackendSave(keys)
 }
 
 export function setModelVisibilityOpen(open: boolean): void {

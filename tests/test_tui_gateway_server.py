@@ -16184,3 +16184,162 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert cleanup_order == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)
+
+
+# ---------------------------------------------------------------------------
+# model_visibility — profile-scoped RPC persistence
+# ---------------------------------------------------------------------------
+
+def _mv_home(tmp_path):
+    """Set up a temp HERMES_HOME override and return the reset token."""
+    token = set_hermes_home_override(tmp_path)
+    return token
+
+
+def test_model_visibility_get_unset_returns_not_customized(tmp_path, monkeypatch):
+    """model_visibility.get marks a missing file as not customized."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        result = server._methods["model_visibility.get"]("r1", {})
+        assert result["result"]["keys"] == []
+        assert result["result"]["customized"] is False
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_set_and_get_round_trip(tmp_path, monkeypatch):
+    """model_visibility.set persists keys that model_visibility.get returns."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        keys = ["openai::gpt-4o", "openai::gpt-4o-mini", "anthropic::claude-sonnet-4"]
+        set_result = server._methods["model_visibility.set"]("r1", {"keys": keys})
+        assert set_result["result"]["ok"] is True
+
+        get_result = server._methods["model_visibility.get"]("r2", {})
+        assert get_result["result"]["keys"] == keys
+        assert get_result["result"]["customized"] is True
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_empty_selection_is_customized(tmp_path, monkeypatch):
+    """An explicit empty selection is customized (hide-everything), not unset."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        set_result = server._methods["model_visibility.set"]("r1", {"keys": []})
+        assert set_result["result"]["ok"] is True
+
+        get_result = server._methods["model_visibility.get"]("r2", {})
+        assert get_result["result"]["keys"] == []
+        assert get_result["result"]["customized"] is True
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_set_rejects_non_list(tmp_path, monkeypatch):
+    """model_visibility.set returns an error when keys is not a list."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        result = server._methods["model_visibility.set"]("r1", {"keys": "not-a-list"})
+        assert "error" in result
+        assert result["error"]["code"] == 4002
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_set_filters_non_strings(tmp_path, monkeypatch):
+    """model_visibility.set silently drops non-string entries from the keys list."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        keys = ["valid::key", 42, None, "another::valid"]
+        set_result = server._methods["model_visibility.set"]("r1", {"keys": keys})
+        assert set_result["result"]["ok"] is True
+
+        get_result = server._methods["model_visibility.get"]("r2", {})
+        assert get_result["result"]["keys"] == ["valid::key", "another::valid"]
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_overwrites_previous_data(tmp_path, monkeypatch):
+    """model_visibility.set overwrites any previously stored keys."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        server._methods["model_visibility.set"]("r1", {"keys": ["old::key"]})
+        server._methods["model_visibility.set"]("r2", {"keys": ["new::key"]})
+
+        get_result = server._methods["model_visibility.get"]("r3", {})
+        assert get_result["result"]["keys"] == ["new::key"]
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_get_handles_corrupted_file(tmp_path, monkeypatch):
+    """model_visibility.get returns [] + customized when the JSON is corrupted."""
+    token = _mv_home(tmp_path)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        p = tmp_path / "desktop-model-visibility.json"
+        p.write_text("not valid json", encoding="utf-8")
+
+        result = server._methods["model_visibility.get"]("r1", {})
+        assert result["result"]["keys"] == []
+        assert result["result"]["customized"] is True
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_model_visibility_is_profile_scoped(tmp_path, monkeypatch):
+    """model_visibility.get resolves the active profile's home, not the launch one."""
+    profile_home = tmp_path / "profiles" / "work"
+    launch_home = tmp_path / "launch"
+    profile_home.mkdir(parents=True)
+    launch_home.mkdir()
+
+    # Different keys in each profile home.
+    (profile_home / "desktop-model-visibility.json").write_text(
+        json.dumps(["work::model"]), encoding="utf-8"
+    )
+    (launch_home / "desktop-model-visibility.json").write_text(
+        json.dumps(["launch::model"]), encoding="utf-8"
+    )
+
+    # Launch-home override; profile param routes to the work profile.
+    token = set_hermes_home_override(launch_home)
+    server._cfg_cache = None
+    server._cfg_mtime = None
+    server._cfg_path = None
+    try:
+        monkeypatch.setattr(
+            server,
+            "_profile_home",
+            lambda name: Path(profile_home) if name == "work" else None,
+        )
+        result = server._methods["model_visibility.get"]("r1", {"profile": "work"})
+        assert result["result"]["keys"] == ["work::model"]
+
+        # No profile param → launch home.
+        launch_result = server._methods["model_visibility.get"]("r2", {})
+        assert launch_result["result"]["keys"] == ["launch::model"]
+    finally:
+        reset_hermes_home_override(token)
