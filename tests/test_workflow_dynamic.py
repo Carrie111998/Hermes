@@ -914,9 +914,10 @@ class TestRecoverWorkflow:
                     result = _recover_workflow("wf-recovery-1")
 
             assert result is not None
-            assert result["workflow_id"] == "wf-recovery-1"
-            assert result["objective"] == "Recovery test"
-            nodes = {n["node_id"]: n for n in result["nodes"]}
+            view = result.public_view()
+            assert view["workflow_id"] == "wf-recovery-1"
+            assert view["objective"] == "Recovery test"
+            nodes = {n["node_id"]: n for n in view["nodes"]}
             assert nodes["n1"]["status"] == "completed"  # card done → completed
             assert nodes["n2"]["status"] == "pending"    # card ready → pending
 
@@ -956,7 +957,8 @@ class TestRecoverWorkflow:
                     result = _recover_workflow("wf-mixed-1")
 
             assert result is not None
-            nodes = {n["node_id"]: n for n in result["nodes"]}
+            view = result.public_view()
+            nodes = {n["node_id"]: n for n in view["nodes"]}
             assert nodes["n1"]["status"] == "completed"
             assert nodes["n2"]["status"] == "running"
             assert nodes["n3"]["status"] == "pending"
@@ -993,7 +995,8 @@ class TestRecoverWorkflow:
                     result = _recover_workflow("wf-notfound-1")
 
             assert result is not None
-            nodes = {n["node_id"]: n for n in result["nodes"]}
+            view = result.public_view()
+            nodes = {n["node_id"]: n for n in view["nodes"]}
             # "unknown" maps to "pending"
             assert nodes["n1"]["status"] == "pending"
 
@@ -1074,8 +1077,7 @@ class TestRecoverWorkflow:
                     result = _recover_workflow("wf-blocked-1")
 
             assert result is not None
-            # On feat branch _recover_workflow still returns a dict (type fix on operational only)
-            view = result if isinstance(result, dict) else result.public_view()
+            view = result.public_view()
             nodes = {n["node_id"]: n for n in view["nodes"]}
             # "blocked" must map to "failed" — not "pending" (which would redispatch)
             assert nodes["n1"]["status"] == "failed"
@@ -1118,9 +1120,189 @@ class TestRecoverWorkflow:
                     result = _recover_workflow("wf-resume-1")
 
             assert result is not None
+            view = result.public_view()
             # n1 has no deps and is pending → should be in ready_node_ids
-            assert "n1" in result["ready_node_ids"]
+            assert "n1" in view["ready_node_ids"]
             # n2 depends on n1 (which is pending, not completed) → not ready
-            assert "n2" not in result["ready_node_ids"]
+            assert "n2" not in view["ready_node_ids"]
             # Workflow status should be ready (has pending ready nodes)
-            assert result["status"] == WF_READY
+            assert view["status"] == WF_READY
+
+
+# ── pending extensions accumulation ────────────────────────────────────────
+
+
+class TestPendingExtensionsAccumulate:
+    """Tests that pending_extensions accumulate across multiple record calls."""
+
+    def test_pending_extensions_accumulate(self):
+        """Two record calls accumulate pending extensions rather than overwriting."""
+        agent = _make_agent()
+        # Create workflow with two nodes: n2 depends on n1
+        r1 = _parse(
+            handle_workflow_dynamic(
+                {
+                    "action": "create",
+                    "objective": "Accumulate test",
+                    "nodes": _make_nodes(
+                        ("n1", "Step 1", []),
+                        ("n2", "Step 2", ["n1"]),
+                    ),
+                    "workflow_id": "wf-accum-1",
+                },
+                agent,
+            )
+        )
+        assert r1["ok"] is True
+
+        suggestions_a = [{"node_id": "ext-a", "goal": "Ext A", "depends_on": []}]
+        suggestions_b = [{"node_id": "ext-b", "goal": "Ext B", "depends_on": []}]
+
+        key = ("session_id:test-session", "wf-accum-1")
+
+        # Record n1 completion — n2 becomes ready and gets dispatched
+        mock_dispatch = json.dumps(
+            {"status": "dispatched", "delegation_id": "del-n2"}
+        )
+        with patch("tools.delegate_tool.delegate_task", return_value=mock_dispatch):
+            with patch("plugins.workflow.get_config", return_value={
+                "max_nodes_per_workflow": 256,
+                "max_extensions_per_workflow": 10,
+                "max_nodes_per_extension": 3,
+                "auto_approve_extensions": False,
+            }):
+                with patch("plugins.workflow.analyst.analyze_extension", return_value=suggestions_a):
+                    with patch("plugins.workflow.dynamic_bridge._append_extension_artifact"):
+                        r2 = _parse(
+                            handle_workflow_dynamic(
+                                {
+                                    "action": "record",
+                                    "workflow_id": "wf-accum-1",
+                                    "node_id": "n1",
+                                    "status": "completed",
+                                    "summary": "N1 done",
+                                },
+                                agent,
+                            )
+                        )
+        assert r2["ok"] is True
+        wf = _workflows.get(key)
+        assert wf is not None, "workflow should still be in _workflows"
+        assert hasattr(wf, "_pending_extensions")
+        assert len(wf._pending_extensions) == 1
+        assert wf._pending_extensions[0]["node_id"] == "ext-a"
+
+        # Record n2 completion — mock analyze_extension to return suggestions_b
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps(
+            {"error": "no-op"}
+        )):
+            with patch("plugins.workflow.get_config", return_value={
+                "max_nodes_per_workflow": 256,
+                "max_extensions_per_workflow": 10,
+                "max_nodes_per_extension": 3,
+                "auto_approve_extensions": False,
+            }):
+                with patch("plugins.workflow.analyst.analyze_extension", return_value=suggestions_b):
+                    with patch("plugins.workflow.dynamic_bridge._append_extension_artifact"):
+                        r3 = _parse(
+                            handle_workflow_dynamic(
+                                {
+                                    "action": "record",
+                                    "workflow_id": "wf-accum-1",
+                                    "node_id": "n2",
+                                    "status": "completed",
+                                    "summary": "N2 done",
+                                },
+                                agent,
+                            )
+                        )
+        assert r3["ok"] is True
+        # Both suggestions should be accumulated
+        # Workflow may have been evicted to _completed_workflows
+        wf_now = _workflows.get(key) or _completed_workflows.get(key, (None,))[0]
+        assert wf_now is not None
+        assert hasattr(wf_now, "_pending_extensions")
+        assert len(wf_now._pending_extensions) == 2
+        node_ids = [s["node_id"] for s in wf_now._pending_extensions]
+        assert "ext-a" in node_ids
+        assert "ext-b" in node_ids
+
+
+# ── extension artifact writing ─────────────────────────────────────────────
+
+
+class TestExtensionArtifactWritten:
+    """Tests for extensions.jsonl audit trail."""
+
+    def test_extension_artifact_written(self):
+        """extensions.jsonl is created with expected entries when auto_approve=False."""
+        import tempfile
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _append_extension_artifact
+
+        wf_id = "wf-artifact-1"
+        suggestions = [{"node_id": "ext1", "goal": "Ext step", "depends_on": []}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Patch Path.home() inside the bridge module to return tmpdir
+            with patch("plugins.workflow.dynamic_bridge.Path") as MockPath:
+                MockPath.home.return_value = Path(tmpdir)
+                # Make division operator work for building sub-paths
+                MockPath.__truediv__ = Path.__truediv__
+
+                _append_extension_artifact(
+                    workflow_id=wf_id,
+                    node_id="n1",
+                    node_summary="Step completed",
+                    suggestions=suggestions,
+                    auto_approved=False,
+                )
+
+            # The artifact lives at tmpdir/.hermes/workflow-logs/<wf_id>/extensions.jsonl
+            artifact_file = (
+                Path(tmpdir) / ".hermes" / "workflow-logs" / wf_id / "extensions.jsonl"
+            )
+            assert artifact_file.exists(), "extensions.jsonl should be created"
+            lines = artifact_file.read_text().strip().splitlines()
+            assert len(lines) == 1
+            entry = json.loads(lines[0])
+            assert entry["workflow_id"] == wf_id
+            assert entry["node_id"] == "n1"
+            assert entry["node_summary"] == "Step completed"
+            assert entry["suggestions"] == suggestions
+            assert entry["auto_approved"] is False
+            assert "timestamp" in entry
+
+    def test_extension_artifact_written_for_auto_approved(self):
+        """extensions.jsonl is created even when auto_approve_extensions is true."""
+        import tempfile
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _append_extension_artifact
+
+        wf_id = "wf-artifact-auto-1"
+        suggestions = [{"node_id": "ext2", "goal": "Auto step", "depends_on": []}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("plugins.workflow.dynamic_bridge.Path") as MockPath:
+                MockPath.home.return_value = Path(tmpdir)
+                MockPath.__truediv__ = Path.__truediv__
+
+                _append_extension_artifact(
+                    workflow_id=wf_id,
+                    node_id="n1",
+                    node_summary="Auto step done",
+                    suggestions=suggestions,
+                    auto_approved=True,
+                )
+
+            artifact_file = (
+                Path(tmpdir) / ".hermes" / "workflow-logs" / wf_id / "extensions.jsonl"
+            )
+            assert artifact_file.exists(), "extensions.jsonl should be created"
+            lines = artifact_file.read_text().strip().splitlines()
+            assert len(lines) == 1
+            entry = json.loads(lines[0])
+            assert entry["workflow_id"] == wf_id
+            assert entry["node_id"] == "n1"
+            assert entry["suggestions"] == suggestions
+            assert entry["auto_approved"] is True
