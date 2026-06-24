@@ -59,12 +59,13 @@ def _make_card_action_data(
     chat_id: str = "oc_12345",
     open_id: str = "ou_user1",
     token: str = "tok_abc",
+    open_message_id: str = "",
 ) -> SimpleNamespace:
     """Create a mock Feishu card action callback data object."""
     return SimpleNamespace(
         event=SimpleNamespace(
             token=token,
-            context=SimpleNamespace(open_chat_id=chat_id),
+            context=SimpleNamespace(open_chat_id=chat_id, open_message_id=open_message_id),
             operator=SimpleNamespace(open_id=open_id),
             action=SimpleNamespace(
                 tag="button",
@@ -436,6 +437,59 @@ class TestNonApprovalCardAction:
         mock_handle.assert_called_once()
         event = mock_handle.call_args[0][0]
         assert "/card button" in event.text
+
+    @pytest.mark.asyncio
+    async def test_uses_open_message_id_when_available(self):
+        """When open_message_id is present in the callback context, it should
+        be used as the synthetic event's message_id so downstream reply
+        anchors resolve to a valid Feishu message (om_xxx), not the card
+        action token (c-xxx)."""
+        adapter = _make_adapter()
+
+        data = _make_card_action_data(
+            action_value={"custom_action": "recognize"},
+            token="c-deadbeef",
+            open_message_id="om_card_message_123",
+        )
+
+        with (
+            patch.object(
+                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
+                return_value={"user_id": "ou_u", "user_name": "Dave", "user_id_alt": None},
+            ),
+            patch.object(adapter, "get_chat_info", new_callable=AsyncMock, return_value={"name": "Test Chat"}),
+            patch.object(adapter, "_handle_message_with_guards", new_callable=AsyncMock) as mock_handle,
+        ):
+            await adapter._handle_card_action_event(data)
+
+        event = mock_handle.call_args[0][0]
+        assert event.message_id == "om_card_message_123"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_token_when_open_message_id_absent(self):
+        """When open_message_id is absent from the callback context (e.g.
+        older Feishu SDK or edge-case payload), message_id should fall back
+        to the card action token for deduplication purposes."""
+        adapter = _make_adapter()
+
+        data = _make_card_action_data(
+            action_value={"custom_action": "recognize"},
+            token="c-fallback-token",
+            open_message_id="",  # absent
+        )
+
+        with (
+            patch.object(
+                adapter, "_resolve_sender_profile", new_callable=AsyncMock,
+                return_value={"user_id": "ou_u", "user_name": "Dave", "user_id_alt": None},
+            ),
+            patch.object(adapter, "get_chat_info", new_callable=AsyncMock, return_value={"name": "Test Chat"}),
+            patch.object(adapter, "_handle_message_with_guards", new_callable=AsyncMock) as mock_handle,
+        ):
+            await adapter._handle_card_action_event(data)
+
+        event = mock_handle.call_args[0][0]
+        assert event.message_id == "c-fallback-token"
 
 
 # ===========================================================================
