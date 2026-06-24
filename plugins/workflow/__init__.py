@@ -29,6 +29,8 @@ _DEFAULTS: Dict[str, Any] = {
     "auto_deliver": True,
     "max_nodes_per_workflow": 256,
     "max_dispatch_per_call": 16,
+    "max_extensions_per_workflow": 10,
+    "max_nodes_per_extension": 3,
     "default_scope": "project",
     "default_delivery_target": "",
     "persist_dir": "~/.hermes/workflow-logs",

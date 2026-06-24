@@ -133,6 +133,7 @@ class DynamicWorkflow:
     updated_at: float = 0.0
     cancelled_at: float | None = None
     scope_key: str = "global"
+    extension_count: int = 0
 
     def public_view(self) -> dict[str, Any]:
         """Snapshot for the result envelope."""
@@ -912,37 +913,64 @@ def _action_record(
             from plugins.workflow import get_config
             from plugins.workflow.analyst import analyze_extension
 
-            existing_ids = list(workflow.nodes.keys())
-            suggestions = analyze_extension(
-                summary=node.summary,
-                objective=workflow.objective,
-                existing_nodes=existing_ids,
-            )
-            if suggestions:
-                auto_approve = get_config().get(
-                    "auto_approve_extensions", False
+            cfg = get_config()
+            max_nodes = cfg.get("max_nodes_per_workflow", 256)
+            max_ext = cfg.get("max_extensions_per_workflow", 10)
+            max_per_ext = cfg.get("max_nodes_per_extension", 3)
+
+            # Guard: skip if workflow is already at the node cap
+            if len(workflow.nodes) >= max_nodes:
+                ext_payload["extension_note"] = (
+                    f"skipped: workflow at node limit ({max_nodes})"
                 )
-                if auto_approve:
-                    ext_args = {
-                        "workflow_id": wf_id,
-                        "nodes": suggestions,
-                        "dispatch_ready": True,
-                    }
-                    ext_result = _action_extend(ext_args, parent_agent)
-                    ext_payload["auto_extended"] = True
-                    ext_payload["extension_result"] = (
-                        _json.loads(ext_result)
-                        if isinstance(ext_result, str)
-                        else ext_result
-                    )
-                else:
-                    workflow._pending_extensions = suggestions
-                    ext_payload["pending_extensions"] = suggestions
-                    ext_payload["extension_note"] = (
-                        "suggestions stored for user review"
-                    )
+            # Guard: skip if extension count reached the cap
+            elif workflow.extension_count >= max_ext:
+                ext_payload["extension_note"] = (
+                    f"skipped: extension limit reached ({max_ext})"
+                )
             else:
-                ext_payload["extension_note"] = "no follow-up nodes suggested"
+                existing_ids = set(workflow.nodes.keys())
+                suggestions = analyze_extension(
+                    summary=node.summary,
+                    objective=workflow.objective,
+                    existing_nodes=list(existing_ids),
+                )
+                if suggestions:
+                    # Dedup: filter out suggestions whose node_id already exists
+                    suggestions = [
+                        s for s in suggestions
+                        if s.get("node_id") not in existing_ids
+                    ]
+                    # Truncate to max_nodes_per_extension
+                    if len(suggestions) > max_per_ext:
+                        suggestions = suggestions[:max_per_ext]
+
+                if suggestions:
+                    auto_approve = cfg.get(
+                        "auto_approve_extensions", False
+                    )
+                    if auto_approve:
+                        ext_args = {
+                            "workflow_id": wf_id,
+                            "nodes": suggestions,
+                            "dispatch_ready": True,
+                        }
+                        ext_result = _action_extend(ext_args, parent_agent)
+                        workflow.extension_count += 1
+                        ext_payload["auto_extended"] = True
+                        ext_payload["extension_result"] = (
+                            _json.loads(ext_result)
+                            if isinstance(ext_result, str)
+                            else ext_result
+                        )
+                    else:
+                        workflow._pending_extensions = suggestions
+                        ext_payload["pending_extensions"] = suggestions
+                        ext_payload["extension_note"] = (
+                            "suggestions stored for user review"
+                        )
+                else:
+                    ext_payload["extension_note"] = "no follow-up nodes suggested"
 
         return _ok({"workflow": workflow.public_view(), **ext_payload})
 
