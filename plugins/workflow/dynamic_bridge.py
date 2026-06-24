@@ -175,16 +175,25 @@ def _state_path(workflow_id: str) -> Path:
 def _save_state(workflow_id: str, wf_view: dict) -> None:
     """Persist workflow node state to disk (durable scope only)."""
     nodes = wf_view.get("nodes", [])
+    cards_map = wf_view.get("cards", {})  # {node_id: card_id}
     state = {
         "workflow_id": workflow_id,
+        "objective": wf_view.get("objective", ""),
+        "context": wf_view.get("context", ""),
+        "scope": wf_view.get("scope", "project"),
+        "cards": cards_map,
         "nodes": {},
+        "created_at": wf_view.get("created_at", datetime.now(timezone.utc).isoformat()),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     for n in nodes:
         state["nodes"][n["node_id"]] = {
+            "goal": n.get("goal", ""),
+            "depends_on": n.get("depends_on", []),
             "status": n.get("status", "pending"),
             "summary": n.get("summary"),
             "error": n.get("error"),
+            "delegation_id": n.get("delegation_id"),
         }
     path = _state_path(workflow_id)
     try:
@@ -192,6 +201,74 @@ def _save_state(workflow_id: str, wf_view: dict) -> None:
             json.dump(state, f, indent=2, default=str)
     except Exception as exc:
         logger.warning("failed to save durable state for %s: %s", workflow_id, exc)
+
+
+def _recover_workflow(workflow_id: str) -> dict | None:
+    """Recover a workflow from its saved state and kanban card statuses.
+
+    Returns the reconstructed workflow view, or None if no state found.
+    """
+    state = _load_state(workflow_id)
+    if not state:
+        return None
+
+    from plugins.workflow.dynamic import DynamicWorkflow, DynamicNode
+
+    wf = DynamicWorkflow(
+        workflow_id=workflow_id,
+        objective=state.get("objective", ""),
+        context=state.get("context", ""),
+        scope_key=state.get("scope", "project"),
+    )
+
+    cards_map = state.get("cards", {})
+    for node_id, card_id in cards_map.items():
+        # Look up the card's current status from the kanban DB
+        card_status = _get_kanban_card_status(card_id)
+        node_state = state.get("nodes", {}).get(node_id, {})
+        node = DynamicNode(
+            node_id=node_id,
+            goal=node_state.get("goal", ""),
+            depends_on=node_state.get("depends_on", []),
+            status=_map_card_status(card_status),
+            summary=node_state.get("summary"),
+            error=node_state.get("error"),
+            delegation_id=node_state.get("delegation_id"),
+        )
+        wf.nodes[node_id] = node
+        wf.node_order.append(node_id)
+
+    return wf.public_view()
+
+
+def _get_kanban_card_status(card_id: str) -> str:
+    """Look up a kanban card's current status. Returns 'unknown' if card not found."""
+    try:
+        result = subprocess.run(
+            [_hermes_binary(), "kanban", "show", card_id, "--json"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            return data.get("status", "unknown")
+    except Exception:
+        pass
+    return "unknown"
+
+
+_STATUS_MAP = {
+    "ready": "pending",
+    "in_progress": "running",
+    "done": "completed",
+    "failed": "failed",
+    "blocked": "pending",
+    "skipped": "skipped",
+    "unknown": "pending",
+}
+
+def _map_card_status(card_status: str) -> str:
+    """Map kanban card status to workflow node status."""
+    return _STATUS_MAP.get(card_status, "pending")
 
 
 def _load_state(workflow_id: str) -> dict | None:

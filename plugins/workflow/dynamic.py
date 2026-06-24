@@ -1138,6 +1138,30 @@ def _action_cancel(
 
 # ── Public entry point ────────────────────────────────────────────
 
+# ── Durable recovery ─────────────────────────────────────────────
+
+
+def _restore_durable_workflows() -> None:
+    """Scan persist_dir for state files and restore workflows to memory."""
+    from pathlib import Path as _Path
+    from plugins.workflow import get_config as _get_config
+    persist_dir = _Path(_get_config().get("persist_dir", "~/.hermes/workflow-logs")).expanduser()
+    if not persist_dir.is_dir():
+        return
+
+    for state_file in persist_dir.glob("*/state.json"):
+        workflow_id = state_file.parent.name
+        if (workflow_id, workflow_id) in _workflows:  # already loaded
+            continue
+        try:
+            from plugins.workflow.dynamic_bridge import _recover_workflow
+            recovered = _recover_workflow(workflow_id)
+            if recovered:
+                _workflows[(workflow_id, workflow_id)] = recovered
+        except Exception as exc:
+            logger.warning("failed to recover workflow %s: %s", workflow_id, exc)
+
+
 _ACTIONS = {
     "create": _action_create,
     "extend": _action_extend,
@@ -1162,6 +1186,8 @@ def handle_workflow_dynamic(args: dict[str, Any], parent_agent: Any = None) -> s
         status   — query workflow state (single or all in scope)
         cancel   — cancel a workflow and optionally interrupt delegations
     """
+    _restore_durable_workflows()
+
     if not isinstance(args, dict):
         return _err("dynamic_workflow arguments must be an object")
 

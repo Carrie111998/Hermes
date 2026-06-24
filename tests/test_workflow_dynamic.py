@@ -865,3 +865,224 @@ class TestCreateWithDispatch:
         assert result["ok"] is True
         assert len(result["dispatched"]) == 1
         assert result["dispatched"][0]["delegation_id"] == "del-create-001"
+        assert result["dispatched"][0]["delegation_id"] == "del-create-001"
+
+
+# ── Kanban-based recovery tests ───────────────────────────────────────
+
+
+class TestRecoverWorkflow:
+    """Tests for kanban-based workflow recovery via _recover_workflow."""
+
+    def test_recover_workflow_from_kanban_cards(self):
+        """Create state file with card manifest, mock kanban show, verify reconstruction."""
+        import tempfile
+        import os
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _recover_workflow, _save_state
+
+        wf_view = {
+            "workflow_id": "wf-recovery-1",
+            "objective": "Recovery test",
+            "context": "test context",
+            "scope": "durable",
+            "cards": {"n1": "card-abc", "n2": "card-def"},
+            "nodes": [
+                {"node_id": "n1", "goal": "Step 1", "depends_on": [],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+                {"node_id": "n2", "goal": "Step 2", "depends_on": ["n1"],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+            ],
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+        # Patch _state_path to use a temp dir
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "wf-recovery-1"
+            state_dir.mkdir()
+
+            with patch("plugins.workflow.dynamic_bridge._state_path",
+                       return_value=state_dir / "state.json"):
+                _save_state("wf-recovery-1", wf_view)
+
+                # Mock kanban show to return "done" for card-abc and "ready" for card-def
+                def mock_kanban(card_id):
+                    return {"card-abc": "done", "card-def": "ready"}.get(card_id, "unknown")
+
+                with patch("plugins.workflow.dynamic_bridge._get_kanban_card_status",
+                           side_effect=mock_kanban):
+                    result = _recover_workflow("wf-recovery-1")
+
+            assert result is not None
+            assert result["workflow_id"] == "wf-recovery-1"
+            assert result["objective"] == "Recovery test"
+            nodes = {n["node_id"]: n for n in result["nodes"]}
+            assert nodes["n1"]["status"] == "completed"  # card done → completed
+            assert nodes["n2"]["status"] == "pending"    # card ready → pending
+
+    def test_recover_workflow_with_mixed_card_statuses(self):
+        """Some done, some in_progress, some pending."""
+        import tempfile
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _recover_workflow, _save_state
+
+        wf_view = {
+            "workflow_id": "wf-mixed-1",
+            "objective": "Mixed statuses",
+            "context": "",
+            "scope": "durable",
+            "cards": {"n1": "card-1", "n2": "card-2", "n3": "card-3"},
+            "nodes": [
+                {"node_id": "n1", "goal": "A", "depends_on": [],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+                {"node_id": "n2", "goal": "B", "depends_on": ["n1"],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+                {"node_id": "n3", "goal": "C", "depends_on": ["n1"],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "wf-mixed-1"
+            state_dir.mkdir()
+
+            with patch("plugins.workflow.dynamic_bridge._state_path",
+                       return_value=state_dir / "state.json"):
+                _save_state("wf-mixed-1", wf_view)
+
+                status_map = {"card-1": "done", "card-2": "in_progress", "card-3": "ready"}
+                with patch("plugins.workflow.dynamic_bridge._get_kanban_card_status",
+                           side_effect=lambda cid: status_map.get(cid, "unknown")):
+                    result = _recover_workflow("wf-mixed-1")
+
+            assert result is not None
+            nodes = {n["node_id"]: n for n in result["nodes"]}
+            assert nodes["n1"]["status"] == "completed"
+            assert nodes["n2"]["status"] == "running"
+            assert nodes["n3"]["status"] == "pending"
+
+    def test_recover_workflow_card_not_found(self):
+        """Card deleted, fall back to pending."""
+        import tempfile
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _recover_workflow, _save_state
+
+        wf_view = {
+            "workflow_id": "wf-notfound-1",
+            "objective": "Card not found",
+            "context": "",
+            "scope": "durable",
+            "cards": {"n1": "card-deleted"},
+            "nodes": [
+                {"node_id": "n1", "goal": "X", "depends_on": [],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "wf-notfound-1"
+            state_dir.mkdir()
+
+            with patch("plugins.workflow.dynamic_bridge._state_path",
+                       return_value=state_dir / "state.json"):
+                _save_state("wf-notfound-1", wf_view)
+
+                # Kanban show returns "unknown" (card not found)
+                with patch("plugins.workflow.dynamic_bridge._get_kanban_card_status",
+                           return_value="unknown"):
+                    result = _recover_workflow("wf-notfound-1")
+
+            assert result is not None
+            nodes = {n["node_id"]: n for n in result["nodes"]}
+            # "unknown" maps to "pending"
+            assert nodes["n1"]["status"] == "pending"
+
+    def test_save_state_includes_card_manifest(self):
+        """Verify the cards field is in the state file."""
+        import tempfile
+        import json
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _save_state
+
+        wf_view = {
+            "workflow_id": "wf-manifest-1",
+            "objective": "Manifest test",
+            "context": "ctx",
+            "scope": "durable",
+            "cards": {"n1": "card-x", "n2": "card-y"},
+            "nodes": [
+                {"node_id": "n1", "goal": "A", "depends_on": [],
+                 "status": "completed", "summary": "done", "error": None, "delegation_id": "del-1"},
+                {"node_id": "n2", "goal": "B", "depends_on": ["n1"],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+            ],
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "wf-manifest-1"
+            state_dir.mkdir()
+
+            with patch("plugins.workflow.dynamic_bridge._state_path",
+                       return_value=state_dir / "state.json"):
+                _save_state("wf-manifest-1", wf_view)
+
+                with open(state_dir / "state.json") as f:
+                    state = json.load(f)
+
+            assert "cards" in state
+            assert state["cards"] == {"n1": "card-x", "n2": "card-y"}
+            assert state["objective"] == "Manifest test"
+            assert state["context"] == "ctx"
+            assert state["scope"] == "durable"
+            # Verify node details include goal, depends_on, delegation_id
+            assert state["nodes"]["n1"]["goal"] == "A"
+            assert state["nodes"]["n1"]["depends_on"] == []
+            assert state["nodes"]["n1"]["delegation_id"] == "del-1"
+            assert state["nodes"]["n2"]["goal"] == "B"
+            assert state["nodes"]["n2"]["depends_on"] == ["n1"]
+
+    def test_recover_workflow_resumes_ready_nodes(self):
+        """Recovered workflow with ready nodes gets dispatched."""
+        import tempfile
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _recover_workflow, _save_state
+        from plugins.workflow.dynamic import (
+            _workflows, _workflows_lock, _reset_for_tests, _derive_status,
+            WF_READY,
+        )
+
+        wf_view = {
+            "workflow_id": "wf-resume-1",
+            "objective": "Resume test",
+            "context": "",
+            "scope": "durable",
+            "cards": {"n1": "card-r1", "n2": "card-r2"},
+            "nodes": [
+                {"node_id": "n1", "goal": "Step 1", "depends_on": [],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+                {"node_id": "n2", "goal": "Step 2", "depends_on": ["n1"],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "wf-resume-1"
+            state_dir.mkdir()
+
+            with patch("plugins.workflow.dynamic_bridge._state_path",
+                       return_value=state_dir / "state.json"):
+                _save_state("wf-resume-1", wf_view)
+
+                # Both cards are "ready" → nodes become "pending"
+                with patch("plugins.workflow.dynamic_bridge._get_kanban_card_status",
+                           return_value="ready"):
+                    result = _recover_workflow("wf-resume-1")
+
+            assert result is not None
+            # n1 has no deps and is pending → should be in ready_node_ids
+            assert "n1" in result["ready_node_ids"]
+            # n2 depends on n1 (which is pending, not completed) → not ready
+            assert "n2" not in result["ready_node_ids"]
+            # Workflow status should be ready (has pending ready nodes)
+            assert result["status"] == WF_READY
