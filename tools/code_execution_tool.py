@@ -770,17 +770,17 @@ def _resolve_sandbox_tools(
 def _sandbox_dispatch_kwargs(
     tool_name: str,
     task_id: str,
+    session_id: str,
     enabled_toolsets: Optional[List[str]],
     disabled_toolsets: Optional[List[str]],
 ) -> Dict[str, Any]:
-    """Build nested dispatch context without changing legacy direct-tool calls.
+    """Build the parent context for a nested sandbox tool dispatch.
 
-    Only Tool Search bridge calls need the session's toolset scope. Keeping the
-    extra kwargs off ordinary file/web/terminal calls preserves their existing
-    dispatch contract while preventing a bridge from seeing another session's
-    deferred catalog.
+    Every nested call keeps the parent session identity. Tool Search bridge
+    calls additionally receive the session's toolset scope so they cannot see
+    another session's deferred catalog.
     """
-    kwargs: Dict[str, Any] = {"task_id": task_id}
+    kwargs: Dict[str, Any] = {"task_id": task_id, "session_id": session_id}
     from tools.tool_search import BRIDGE_TOOL_NAMES
 
     if tool_name in BRIDGE_TOOL_NAMES:
@@ -810,6 +810,7 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    session_id: str = "",
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     dispatch=None,
@@ -824,6 +825,13 @@ def _rpc_server_loop(
     pass a dispatcher that rebinds each call to the CURRENT cell's
     authority — the serving thread outlives many cells there and must not
     freeze the first cell's context.
+
+    ``session_id`` is forwarded to ``handle_function_call`` so nested tool
+    calls (e.g. ``read_file`` invoked by ``execute_code``) receive the
+    same session context as the parent — without it, plugin hooks
+    ``on_pre_tool_call`` / ``on_post_tool_call`` see an empty session_id
+    and cannot correlate the nested call with the originating turn
+    (#51931).
     """
     from model_tools import handle_function_call
 
@@ -835,6 +843,7 @@ def _rpc_server_loop(
                 **_sandbox_dispatch_kwargs(
                     tool_name,
                     task_id,
+                    session_id,
                     enabled_toolsets,
                     disabled_toolsets,
                 ),
@@ -1103,6 +1112,7 @@ def _rpc_poll_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    session_id: str = "",
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
 ):
@@ -1111,6 +1121,9 @@ def _rpc_poll_loop(
     Runs in a background thread.  Each ``env.execute()`` spawns an
     independent process, so these calls run safely concurrent with the
     script-execution thread.
+
+    ``session_id`` is forwarded to ``handle_function_call`` so nested tool
+    calls receive the same session context as the parent (#51931).
     """
     from model_tools import handle_function_call
 
@@ -1203,6 +1216,7 @@ def _rpc_poll_loop(
                                 **_sandbox_dispatch_kwargs(
                                     tool_name,
                                     task_id,
+                                    session_id,
                                     enabled_toolsets,
                                     disabled_toolsets,
                                 ),
@@ -1309,10 +1323,22 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
     return json.dumps(result, ensure_ascii=False)
 
 
+def _resolve_rpc_session_id(session_id: Optional[str]) -> str:
+    """Return the explicit session id, falling back to legacy session context."""
+    if session_id is not None:
+        return session_id
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        return ""
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
+    session_id: Optional[str] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     reset: bool = False,
@@ -1423,12 +1449,14 @@ def _execute_remote(
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else sandbox RPC tool calls lose approval
         # routing (#33057).
+        # Resolve on the parent thread for explicit forwarding (#51931).
+        _rpc_session_id = _resolve_rpc_session_id(session_id)
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop),
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event, rpc_token,
+                sandbox_tools, stop_event, rpc_token, _rpc_session_id,
                 enabled_toolsets, disabled_toolsets,
             ),
             daemon=True,
@@ -1628,6 +1656,7 @@ def execute_code(
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     reset: bool = False,
+    session_id: Optional[str] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     allow_deferred_bridges: bool = False,
@@ -1653,6 +1682,7 @@ def execute_code(
         reset:         Session-kernel mode only: kill the existing kernel and
                        start fresh before running this code. Ignored in
                        per-call mode, where every call is already fresh.
+        session_id: Parent session ID forwarded to nested sandbox tool calls.
         enabled_toolsets: Session toolsets forwarded to deferred-tool bridge calls.
         disabled_toolsets: Session toolset exclusions forwarded to bridge calls.
         allow_deferred_bridges: Whether the caller supplied an explicit final
@@ -1730,8 +1760,9 @@ def execute_code(
             code,
             task_id,
             enabled_tools,
-            enabled_toolsets,
-            disabled_toolsets,
+            session_id=session_id,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
             reset=bool(reset),
         )
 
@@ -1842,12 +1873,20 @@ def execute_code(
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (see tools.thread_context) — else gateway sandbox tool calls silently
         # auto-approve dangerous commands (#33057, #30882).
+        # Resolve the session_id here (on the parent thread) so it can be
+        # passed explicitly to the RPC thread —
+        # propagate_context_to_thread copies ContextVars, but
+        # handle_function_call reads session_id as a parameter, not from a
+        # ContextVar, so without explicit forwarding nested tool hooks
+        # (on_pre_tool_call / on_post_tool_call) see an empty session_id
+        # (#51931).
+        _rpc_session_id = _resolve_rpc_session_id(session_id)
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_server_loop),
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools,
-                stop_event, rpc_token, enabled_toolsets, disabled_toolsets,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                rpc_token, _rpc_session_id, enabled_toolsets, disabled_toolsets,
             ),
             daemon=True,
         )
@@ -2616,6 +2655,7 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
         task_id=kwargs.get("task_id"),
         enabled_tools=kwargs.get("enabled_tools"),
         reset=bool(args.get("reset", False)),
+        session_id=kwargs.get("session_id"),
         enabled_toolsets=kwargs.get("enabled_toolsets"),
         disabled_toolsets=kwargs.get("disabled_toolsets"),
         allow_deferred_bridges=kwargs.get("allow_deferred_bridges", False),
