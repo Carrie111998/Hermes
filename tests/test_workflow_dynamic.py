@@ -1074,7 +1074,8 @@ class TestRecoverWorkflow:
                     result = _recover_workflow("wf-blocked-1")
 
             assert result is not None
-            view = result.public_view()
+            # On feat branch _recover_workflow still returns a dict (type fix on operational only)
+            view = result if isinstance(result, dict) else result.public_view()
             nodes = {n["node_id"]: n for n in view["nodes"]}
             # "blocked" must map to "failed" — not "pending" (which would redispatch)
             assert nodes["n1"]["status"] == "failed"
