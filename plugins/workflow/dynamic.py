@@ -1003,7 +1003,7 @@ def _action_record(
                         workflow.extension_count += 1
                         ext_payload["auto_extended"] = True
                         ext_payload["extension_result"] = (
-                            _json.loads(ext_result)
+                            json.loads(ext_result)
                             if isinstance(ext_result, str)
                             else ext_result
                         )
