@@ -256,12 +256,14 @@ def _get_kanban_card_status(card_id: str) -> str:
     return "unknown"
 
 
+# "blocked" → "failed" because blocked cards wait on upstream failures
+# or manual intervention. Treating them as pending causes infinite redispatch.
 _STATUS_MAP = {
     "ready": "pending",
     "in_progress": "running",
     "done": "completed",
     "failed": "failed",
-    "blocked": "pending",
+    "blocked": "failed",  # blocked cards are not redispatched
     "skipped": "skipped",
     "unknown": "pending",
 }

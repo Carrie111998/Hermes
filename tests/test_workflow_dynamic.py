@@ -1042,6 +1042,43 @@ class TestRecoverWorkflow:
             assert state["nodes"]["n2"]["goal"] == "B"
             assert state["nodes"]["n2"]["depends_on"] == ["n1"]
 
+    def test_blocked_card_maps_to_failed(self):
+        """Blocked kanban card maps to 'failed' node status in recovery."""
+        import tempfile
+        from pathlib import Path
+        from plugins.workflow.dynamic_bridge import _recover_workflow, _save_state
+
+        wf_view = {
+            "workflow_id": "wf-blocked-1",
+            "objective": "Blocked card test",
+            "context": "",
+            "scope": "durable",
+            "cards": {"n1": "card-blocked"},
+            "nodes": [
+                {"node_id": "n1", "goal": "Blocked step", "depends_on": [],
+                 "status": "pending", "summary": None, "error": None, "delegation_id": None},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / "wf-blocked-1"
+            state_dir.mkdir()
+
+            with patch("plugins.workflow.dynamic_bridge._state_path",
+                       return_value=state_dir / "state.json"):
+                _save_state("wf-blocked-1", wf_view)
+
+                # Kanban show returns "blocked" for the card
+                with patch("plugins.workflow.dynamic_bridge._get_kanban_card_status",
+                           return_value="blocked"):
+                    result = _recover_workflow("wf-blocked-1")
+
+            assert result is not None
+            view = result.public_view()
+            nodes = {n["node_id"]: n for n in view["nodes"]}
+            # "blocked" must map to "failed" — not "pending" (which would redispatch)
+            assert nodes["n1"]["status"] == "failed"
+
     def test_recover_workflow_resumes_ready_nodes(self):
         """Recovered workflow with ready nodes gets dispatched."""
         import tempfile
