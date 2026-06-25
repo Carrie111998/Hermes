@@ -3,6 +3,7 @@ import concurrent.futures
 import contextlib
 import contextvars
 import copy
+import errno
 import hashlib
 import inspect
 import json
@@ -10496,7 +10497,9 @@ def _desktop_attachment_dir(session: dict) -> Path:
     try:
         root.mkdir(parents=True, exist_ok=True)
         return root
-    except PermissionError:
+    except OSError as exc:
+        if not _should_fallback_attachment_path(exc):
+            raise
         fallback = _desktop_attachment_fallback_dir(session, workspace=workspace)
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback
@@ -10507,6 +10510,16 @@ def _desktop_attachment_fallback_dir(session: dict, *, workspace: Path | None = 
     profile_home = Path(str(session.get("profile_home") or _hermes_home)).resolve()
     digest = hashlib.sha256(str(workspace).encode("utf-8")).hexdigest()[:12]
     return profile_home / "desktop-attachments" / f"{workspace.name or 'workspace'}-{digest}"
+
+
+def _should_fallback_attachment_path(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or exc.errno in {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EROFS,
+        errno.ENOTDIR,
+        errno.EEXIST,
+    }
 
 
 def _sanitize_attachment_name(name: str) -> str:
@@ -10584,10 +10597,10 @@ def _stage_session_file_attachment(
       1. The path resolves to a file already INSIDE the session workspace — use
          it as-is (no copy, ``uploaded=False``).
       2. The path resolves to a gateway-visible file OUTSIDE the workspace — copy
-         it into ``.hermes/desktop-attachments/`` so the ``@file:`` ref resolves.
+         it into session attachment storage so the ``@file:`` ref resolves.
       3. The path doesn't exist on the gateway (the common remote case: it's a
          path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
-         write them into ``.hermes/desktop-attachments/``.
+         write them into session attachment storage.
 
     Returns ``(stored_path, uploaded)``.
     """
@@ -10606,9 +10619,21 @@ def _stage_session_file_attachment(
         payload = _decode_attachment_data_url(data_url)
         filename = _sanitize_attachment_name(name or Path(str(raw_path or "")).name)
 
+    filename = _sanitize_attachment_name(filename)
     upload_dir = _desktop_attachment_dir(session)
-    target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
-    target.write_bytes(payload)
+    target = _unique_attachment_path(upload_dir, filename)
+    try:
+        target.write_bytes(payload)
+    except OSError as exc:
+        fallback_dir = _desktop_attachment_fallback_dir(session, workspace=workspace)
+        if (
+            upload_dir.resolve() == fallback_dir.resolve()
+            or not _should_fallback_attachment_path(exc)
+        ):
+            raise
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+        target = _unique_attachment_path(fallback_dir, filename)
+        target.write_bytes(payload)
     return target.resolve(), True
 
 
