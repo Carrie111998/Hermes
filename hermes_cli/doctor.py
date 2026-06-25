@@ -17,6 +17,7 @@ from hermes_constants import display_hermes_home
 PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
 _DHH = display_hermes_home()  # user-facing display path (e.g. ~/.hermes or ~/.hermes/profiles/coder)
+_DOCTOR_WARNING_COUNT = 0
 
 # Load environment variables from ~/.hermes/.env so API key checks work
 _env_path = get_env_path()
@@ -156,7 +157,16 @@ def _filter_doctor_disabled_toolsets(unavailable: list[dict], disabled_toolsets:
     disabled = disabled_toolsets if disabled_toolsets is not None else _doctor_disabled_toolsets()
     if not disabled:
         return list(unavailable)
-    return [item for item in unavailable if item.get("name") not in disabled]
+    def _is_disabled(item: dict) -> bool:
+        name = str(item.get("name") or "")
+        if name in disabled:
+            return True
+        # Some packaged toolsets use a namespaced implementation id while the
+        # user-facing config uses the platform id (e.g. hermes-yuanbao vs
+        # yuanbao). Treat the platform id as authoritative so doctor doesn't
+        # ask for intentionally disabled optional integrations.
+        return name.startswith("hermes-") and name.removeprefix("hermes-") in disabled
+    return [item for item in unavailable if not _is_disabled(item)]
 
 
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
@@ -211,6 +221,8 @@ def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
 def check_warn(text: str, detail: str = ""):
+    global _DOCTOR_WARNING_COUNT
+    _DOCTOR_WARNING_COUNT += 1
     print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
 def check_fail(text: str, detail: str = ""):
@@ -218,6 +230,44 @@ def check_fail(text: str, detail: str = ""):
 
 def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
+
+
+def _print_doctor_summary(
+    *,
+    should_fix: bool,
+    fixed_count: int,
+    remaining_issues: list[str],
+    warning_count: int,
+) -> None:
+    """Print the final doctor summary without calling warnings a clean pass."""
+    if should_fix and fixed_count > 0:
+        print(color("─" * 60, Colors.GREEN))
+        print(color(f"  Fixed {fixed_count} issue(s).", Colors.GREEN, Colors.BOLD), end="")
+        if remaining_issues:
+            print(color(f" {len(remaining_issues)} issue(s) require manual intervention.", Colors.YELLOW, Colors.BOLD))
+        else:
+            print()
+        print()
+        if remaining_issues:
+            for i, issue in enumerate(remaining_issues, 1):
+                print(f"  {i}. {issue}")
+            print()
+    elif remaining_issues:
+        print(color("─" * 60, Colors.YELLOW))
+        print(color(f"  Found {len(remaining_issues)} issue(s) to address:", Colors.YELLOW, Colors.BOLD))
+        print()
+        for i, issue in enumerate(remaining_issues, 1):
+            print(f"  {i}. {issue}")
+        print()
+        if not should_fix:
+            print(color("  Tip: run 'hermes doctor --fix' to auto-fix what's possible.", Colors.DIM))
+    elif warning_count > 0:
+        print(color("─" * 60, Colors.YELLOW))
+        print(color(f"  Checks completed with {warning_count} warning(s).", Colors.YELLOW, Colors.BOLD))
+        print(color("  No blocking issues found; review warning rows above.", Colors.DIM))
+    else:
+        print(color("─" * 60, Colors.GREEN))
+        print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))
 
 
 def _section(title: str) -> None:
@@ -517,6 +567,8 @@ def managed_scope_check() -> None:
 
 def run_doctor(args):
     """Run diagnostic checks."""
+    global _DOCTOR_WARNING_COUNT
+    _DOCTOR_WARNING_COUNT = 0
     should_fix = getattr(args, 'fix', False)
     ack_target = getattr(args, 'ack', None)
 
@@ -692,7 +744,7 @@ def run_doctor(args):
             __import__(module)
             check_ok(name, "(optional)")
         except ImportError:
-            check_warn(name, "(optional, not installed)")
+            check_info(f"{name} optional package not installed")
     
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
@@ -1152,7 +1204,7 @@ def run_doctor(args):
             region = minimax_status.get("region", "global")
             check_ok("MiniMax OAuth", f"(logged in, region={region})")
         else:
-            check_warn("MiniMax OAuth", "(not logged in)")
+            check_info("MiniMax OAuth not logged in (optional unless MiniMax is selected)")
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
@@ -1720,6 +1772,26 @@ def run_doctor(args):
     )
     _probes: list = []  # list of (label, callable) submitted in display order
 
+    def _demote_nonblocking_oauth_fallback_result(_r):
+        """Show direct API-key probe failures as healthy when OAuth is usable."""
+        if not _has_healthy_oauth_fallback_for_apikey_provider(_r.label):
+            return _r
+        lines = []
+        changed = False
+        for _glyph, _label, _detail in _r.lines:
+            if "⚠" in str(_glyph) or "✗" in str(_glyph):
+                changed = True
+                lines.append((
+                    color("✓", Colors.GREEN),
+                    _label,
+                    color("(OAuth fallback healthy; direct API-key probe non-blocking)", Colors.DIM),
+                ))
+            else:
+                lines.append((_glyph, _label, _detail))
+        if not changed:
+            return _r
+        return _ConnectivityResult(_r.label, lines, [])
+
     def _probe_openrouter() -> _ConnectivityResult:
         key = os.getenv("OPENROUTER_API_KEY")
         if not key:
@@ -2118,8 +2190,11 @@ def run_doctor(args):
 
     # Clear the "Running …" line and print all results in submission order.
     print("\r" + " " * 70 + "\r", end="")
-    for _r in _results:
+    for _raw_r in _results:
+        _r = _demote_nonblocking_oauth_fallback_result(_raw_r)
         for _glyph, _label, _detail in _r.lines:
+            if "⚠" in str(_glyph):
+                _DOCTOR_WARNING_COUNT += 1
             if _detail:
                 print(f"  {_glyph} {_label} {_detail}")
             else:
@@ -2345,31 +2420,13 @@ def run_doctor(args):
     except Exception:
         pass
 
-    print()
     remaining_issues = issues + manual_issues
-    if should_fix and fixed_count > 0:
-        print(color("─" * 60, Colors.GREEN))
-        print(color(f"  Fixed {fixed_count} issue(s).", Colors.GREEN, Colors.BOLD), end="")
-        if remaining_issues:
-            print(color(f" {len(remaining_issues)} issue(s) require manual intervention.", Colors.YELLOW, Colors.BOLD))
-        else:
-            print()
-        print()
-        if remaining_issues:
-            for i, issue in enumerate(remaining_issues, 1):
-                print(f"  {i}. {issue}")
-            print()
-    elif remaining_issues:
-        print(color("─" * 60, Colors.YELLOW))
-        print(color(f"  Found {len(remaining_issues)} issue(s) to address:", Colors.YELLOW, Colors.BOLD))
-        print()
-        for i, issue in enumerate(remaining_issues, 1):
-            print(f"  {i}. {issue}")
-        print()
-        if not should_fix:
-            print(color("  Tip: run 'hermes doctor --fix' to auto-fix what's possible.", Colors.DIM))
-    else:
-        print(color("─" * 60, Colors.GREEN))
-        print(color("  All checks passed! 🎉", Colors.GREEN, Colors.BOLD))
+    print()
+    _print_doctor_summary(
+        should_fix=should_fix,
+        fixed_count=fixed_count,
+        remaining_issues=remaining_issues,
+        warning_count=_DOCTOR_WARNING_COUNT,
+    )
     
     print()
