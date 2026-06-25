@@ -2197,6 +2197,9 @@ def _transcribe_groq(
                 # Only send the prompt when set so the no-hook, no-config
                 # request stays byte-identical to today's.
                 create_kwargs["prompt"] = prompt
+            hotwords = _get_hotwords(_load_stt_config())
+            if hotwords and not prompt:
+                create_kwargs["prompt"] = "Key terms: " + ", ".join(hotwords)
             with open(file_path, "rb") as audio_file:
                 transcription = client.audio.transcriptions.create(
                     file=audio_file,
@@ -2300,6 +2303,9 @@ def _transcribe_openai(
                     # Only send the prompt when set so the no-hook, no-config
                     # request stays byte-identical to today's.
                     create_kwargs["prompt"] = prompt
+                hotwords = _get_hotwords(_load_stt_config())
+                if hotwords and not prompt:
+                    create_kwargs["prompt"] = "Key terms: " + ", ".join(hotwords)
                 return client.audio.transcriptions.create(**create_kwargs)
 
         try:
