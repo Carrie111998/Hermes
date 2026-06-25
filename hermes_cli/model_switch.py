@@ -1344,6 +1344,7 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    pdef: Optional[ProviderDef] = None
 
     # =================================================================
     # PATH A: Explicit --provider given
@@ -1355,7 +1356,7 @@ def switch_model(
             user_providers,
             custom_providers,
         )
-        if pdef is None and explicit_provider.strip().lower() == "custom":
+        if explicit_provider.strip().lower() == "custom" and (pdef is None or not pdef.base_url):
             pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
             _switch_err = (
@@ -1670,7 +1671,11 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    provider_label = (
+        pdef.name
+        if pdef is not None and target_provider == pdef.id
+        else get_label(target_provider)
+    )
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
