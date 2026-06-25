@@ -2373,6 +2373,10 @@ def _transcribe_mistral(
     if not api_key:
         return {"success": False, "transcript": "", "error": "MISTRAL_API_KEY not set"}
 
+    hotwords = _get_hotwords(_load_stt_config())
+    if hotwords:
+        logger.debug("hotwords not supported by Mistral; skipping")
+
     try:
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
@@ -2460,6 +2464,10 @@ def _transcribe_xai(
             "transcript": "",
             "error": "No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY",
         }
+
+    hotwords = _get_hotwords(_load_stt_config())
+    if hotwords:
+        logger.debug("hotwords not supported by xAI Grok STT; skipping")
 
     stt_config = _load_stt_config()
     xai_config = stt_config.get("xai") or {}
@@ -2604,6 +2612,10 @@ def _transcribe_elevenlabs(
     api_key = _resolve_provider_key("ELEVENLABS_API_KEY", "elevenlabs")
     if not api_key:
         return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
+
+    hotwords = _get_hotwords(_load_stt_config())
+    if hotwords:
+        logger.debug("hotwords not supported by ElevenLabs Scribe; skipping")
 
     stt_config = _load_stt_config()
     elevenlabs_config = stt_config.get("elevenlabs") or {}
