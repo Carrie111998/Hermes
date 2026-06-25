@@ -8,7 +8,7 @@
     "aiohttp>=3.9.0",
     "websockets>=12.0"
   ],
-  "version": "0.15.1",
+  "version": "0.17.0",
   "issue_tracker": "https://github.com/thcuba/HAOS-hermes-agent/issues",
   "config_flow": true,
   "integration_type": "service"
