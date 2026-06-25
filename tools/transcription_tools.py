@@ -170,6 +170,12 @@ def _load_stt_config() -> dict:
         return {}
 
 
+def _get_hotwords(stt_config: dict) -> list:
+    """Return cleaned hotwords list from stt config."""
+    raw = stt_config.get("hotwords", [])
+    return [w.strip() for w in raw if isinstance(w, str) and w.strip()]
+
+
 def is_stt_enabled(stt_config: Optional[dict] = None) -> bool:
     """Return whether STT is enabled in config."""
     if stt_config is None:
@@ -1837,6 +1843,10 @@ def build_local_transcribe_kwargs(stt_config: Optional[Dict[str, Any]] = None) -
     initial_prompt = local_cfg.get("initial_prompt")
     if isinstance(initial_prompt, str) and initial_prompt.strip():
         kwargs["initial_prompt"] = initial_prompt
+
+    hotwords = _get_hotwords(stt_config)
+    if hotwords:
+        kwargs["hotwords"] = ", ".join(hotwords)
 
     return kwargs
 
