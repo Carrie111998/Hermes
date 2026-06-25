@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import json
 
-from gateway.session_acl import has_principal_scope
+from gateway.session_acl import has_principal_scope, scope_fields
 from gateway.api_server_audit import log_api_decision, request_id_headers
 from gateway.session_scope_store import (
     bind_session_scope,
     can_access_session,
+    ensure_scope_schema,
     filter_sessions_for_scope,
     inherit_or_bind_session_scope,
 )
@@ -142,26 +143,38 @@ class APIServerSessionsMixin:
         include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
         has_more = False
         if has_principal_scope(principal_scope):
-            scoped_sessions: List[Dict[str, Any]] = []
-            scan_offset = 0
-            scan_limit = 200
-            target = offset + limit + 1
-            while len(scoped_sessions) < target:
-                batch = db.list_sessions_rich(
+            # 用 api_session_scopes 的 scope 索引直接查该 principal 的 session_ids
+            # （按 updated_at DESC 分页），再精确取富数据——替代全表循环扫描 +
+            # 逐条 scope 过滤（N+1，大 session 表会超时）。
+            ensure_scope_schema(db)
+            fields = scope_fields(principal_scope)
+            with db._lock:
+                scope_rows = db._conn.execute(
+                    "SELECT session_id FROM api_session_scopes "
+                    "WHERE tenant_id = ? AND workspace_id = ? AND project_id = ? AND user_id = ? "
+                    "ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (
+                        fields["tenant_id"],
+                        fields["workspace_id"],
+                        fields["project_id"],
+                        fields["user_id"],
+                        limit + 1,
+                        offset,
+                    ),
+                ).fetchall()
+            scoped_ids = [row["session_id"] for row in scope_rows]
+            has_more = len(scoped_ids) > limit
+            page_ids = scoped_ids[:limit]
+            sessions = (
+                db.list_sessions_rich(
                     source=source,
-                    limit=scan_limit,
-                    offset=scan_offset,
+                    session_ids=page_ids,
                     include_children=include_children,
                     order_by_last_active=True,
                 )
-                if not batch:
-                    break
-                scoped_sessions.extend(filter_sessions_for_scope(db, batch, principal_scope))
-                scan_offset += len(batch)
-                if len(batch) < scan_limit or scan_offset >= 10_000:
-                    break
-            has_more = len(scoped_sessions) > offset + limit
-            sessions = scoped_sessions[offset:offset + limit]
+                if page_ids
+                else []
+            )
         else:
             sessions = db.list_sessions_rich(
                 source=source,
@@ -486,6 +499,7 @@ class APIServerSessionsMixin:
         approval_session_key = gateway_session_key or f"api-session:{session_id}:{run_id}"
         prompt_session_key = f"api-session-prompts:{session_id}:{run_id}"
         seq = 0
+        tool_completion_meta: Dict[str, List[Dict[str, Any]]] = {}
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             nonlocal seq
@@ -514,6 +528,26 @@ class APIServerSessionsMixin:
             if delta:
                 _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
 
+        def _tool_preview(tool_name: str, args: Any) -> str:
+            try:
+                from agent.display import build_tool_preview
+
+                return build_tool_preview(tool_name, args) or tool_name
+            except Exception:
+                return tool_name
+
+        def _remember_tool_completion(tool_name: str, payload: Dict[str, Any]) -> None:
+            tool_completion_meta.setdefault(tool_name or "tool", []).append(payload)
+
+        def _pop_tool_completion(tool_name: str) -> Dict[str, Any]:
+            queue = tool_completion_meta.get(tool_name or "tool") or []
+            if not queue:
+                return {}
+            item = queue.pop(0)
+            if not queue:
+                tool_completion_meta.pop(tool_name or "tool", None)
+            return item
+
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
@@ -531,15 +565,46 @@ class APIServerSessionsMixin:
                         reason = str(parsed.get("reason") or parsed.get("error_type") or "")
                         message = str(parsed.get("error") or "")
                         error_text = ": ".join(part for part in (message, reason) if part) or error_text
-                event_name = "tool.failed" if is_error else event_type
-                payload = {
-                    "message_id": message_id,
-                    "tool_name": tool_name,
-                    "preview": error_text or preview,
-                    "args": args,
+                if event_type == "tool.started":
+                    return
+                _remember_tool_completion(tool_name or "tool", {
+                    "duration": kwargs.get("duration"),
+                    "event_name": "tool.failed" if is_error else "tool.completed",
                     "is_error": is_error,
-                }
-                _enqueue(event_name, payload)
+                    "preview": error_text or preview,
+                    "result": result,
+                })
+
+        def _tool_start(tool_call_id: str, function_name: str, function_args: Any) -> None:
+            if not tool_call_id or str(function_name or "").startswith("_"):
+                return
+            _enqueue("tool.started", {
+                "message_id": message_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": function_name,
+                "preview": _tool_preview(function_name, function_args),
+                "args": function_args,
+            })
+
+        def _tool_complete(tool_call_id: str, function_name: str, function_args: Any, function_result: Any) -> None:
+            if not tool_call_id or str(function_name or "").startswith("_"):
+                return
+            meta = _pop_tool_completion(function_name or "tool")
+            duration = meta.get("duration")
+            payload = {
+                "message_id": message_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": function_name,
+                "preview": meta.get("preview") or "",
+                "args": function_args,
+                "is_error": bool(meta.get("is_error")),
+                "result": meta.get("result", function_result),
+            }
+            if isinstance(duration, (int, float)):
+                payload["duration"] = duration
+                payload["duration_ms"] = int(float(duration) * 1000)
+            _enqueue(str(meta.get("event_name") or "tool.completed"), payload)
+
 
         def _approval_notify(approval_data: Dict[str, Any]) -> None:
             payload = dict(approval_data or {})
@@ -574,6 +639,8 @@ class APIServerSessionsMixin:
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    tool_start_callback=_tool_start,
+                    tool_complete_callback=_tool_complete,
                     agent_ref=agent_ref,
                     gateway_session_key=gateway_session_key,
                     approval_session_key=approval_session_key,

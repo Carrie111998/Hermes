@@ -1,6 +1,5 @@
 // Legacy React chat page retained for feature migration.
-// It is not referenced by web/src/App.tsx; the active product entrypoint is
-// standalone-chat-panel/src/apiPanel.ts.
+// It is not referenced by web/src/App.tsx.
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { AlertCircle, Bot, RefreshCw, Square } from "lucide-react";

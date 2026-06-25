@@ -1885,6 +1885,7 @@ class SessionDB:
         include_archived: bool = False,
         archived_only: bool = False,
         id_query: str = None,
+        session_ids: List[str] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1954,6 +1955,13 @@ class SessionDB:
             where_clauses.append("s.archived = 1")
         elif not include_archived:
             where_clauses.append("s.archived = 0")
+
+        if session_ids is not None:
+            if not session_ids:
+                return []
+            placeholders = ",".join("?" for _ in session_ids)
+            where_clauses.append(f"s.id IN ({placeholders})")
+            params.extend(session_ids)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 

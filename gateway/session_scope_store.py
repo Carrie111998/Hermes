@@ -154,13 +154,33 @@ def filter_sessions_for_scope(
     sessions: Iterable[Mapping[str, Any]],
     scope: Mapping[str, Any] | None,
 ) -> list[Mapping[str, Any]]:
-    """Filter SessionDB rows to sessions owned by the request scope."""
+    """Filter SessionDB rows to sessions owned by the request scope.
+
+    Batch-loads the scope rows for the whole page in one ``IN (...)`` query
+    instead of one ``get_session_scope`` per session (N+1, which made scoped
+    session.list time out on large session tables). The access decision is
+    identical to ``can_access_session``: ``scope_matches_record(scope, record)``,
+    where a missing record still evaluates to ``False`` for scoped principals.
+    """
     if not has_principal_scope(scope):
         return list(sessions)
+    sessions_list = list(sessions)
+    ids = [str(session.get("id") or "") for session in sessions_list if session.get("id")]
+    if not ids:
+        return []
+    ensure_scope_schema(db)
+    placeholders = ",".join("?" for _ in ids)
+    with db._lock:
+        rows = db._conn.execute(
+            f"SELECT session_id, tenant_id, workspace_id, project_id, user_id "
+            f"FROM api_session_scopes WHERE session_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    scope_map = {row["session_id"]: dict(row) for row in rows}
     return [
         session
-        for session in sessions
-        if can_access_session(db, str(session.get("id") or ""), scope)
+        for session in sessions_list
+        if scope_matches_record(scope, scope_map.get(str(session.get("id") or "")))
     ]
 
 
