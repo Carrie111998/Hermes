@@ -312,7 +312,7 @@ class TestHotwordsLocalProvider:
         stt_config = {
             "enabled": True,
             "provider": "local",
-            "hotwords": ["Hermes", "OpenCode"],
+            "hotwords": ["Hermes", "Nous"],
             "local": {"model": "base", "language": ""},
         }
 
@@ -328,7 +328,7 @@ class TestHotwordsLocalProvider:
             kwargs = mock_model.transcribe.call_args.kwargs
             assert "hotwords" in kwargs
             assert "Hermes" in kwargs["hotwords"]
-            assert "OpenCode" in kwargs["hotwords"]
+            assert "Nous" in kwargs["hotwords"]
 
     def test_empty_hotwords_skips_kwarg(self, tmp_path):
         audio_file = tmp_path / "test.ogg"
@@ -385,7 +385,7 @@ class TestHotwordsLocalProvider:
             assert result["success"] is True
             kwargs = mock_model.transcribe.call_args.kwargs
             assert "hotwords" in kwargs
-            # Only "Hermes" and "OpenCode" survive filtering
+            # Only "Hermes" and "Nous" survive filtering
             assert kwargs["hotwords"] == "Hermes, OpenCode"
 
 
@@ -409,7 +409,7 @@ class TestHotwordsCloudProviders:
         stt_config = {
             "enabled": True,
             "provider": "openai",
-            "hotwords": ["Hermes", "OpenCode"],
+            "hotwords": ["Hermes", "Nous"],
             "openai": {"model": "whisper-1"},
         }
 
@@ -424,7 +424,7 @@ class TestHotwordsCloudProviders:
             call_kwargs = mock_client.audio.transcriptions.create.call_args.kwargs
             assert "prompt" in call_kwargs
             assert "Hermes" in call_kwargs["prompt"]
-            assert "OpenCode" in call_kwargs["prompt"]
+            assert "Nous" in call_kwargs["prompt"]
 
     def test_openai_empty_hotwords_no_prompt(self, tmp_path):
         audio_file = tmp_path / "test.ogg"
@@ -530,7 +530,7 @@ class TestHotwordsCommandProviders:
         stt_config = {
             "enabled": True,
             "provider": "local",
-            "hotwords": ["Hermes", "OpenCode"],
+            "hotwords": ["Hermes", "Nous"],
             "local": {"model": "base", "language": "en"},
         }
 
