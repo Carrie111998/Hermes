@@ -2653,6 +2653,18 @@ Respond with exactly one word: ALLOWED, DENIED, or ESCALATE"""
         else:
             prompt = f"""You are a security reviewer for an AI coding agent. A terminal command was flagged by pattern matching as potentially dangerous.
 
+Command: {sanitized_command}
+Flagged reason: {description}
+
+Assess the ACTUAL risk of this command. Many flagged commands are false positives — for example, `python -c "print('hello')"` is flagged as "script execution via -c flag" but is completely harmless.
+
+Rules:
+- APPROVE if the command is clearly safe (benign script execution, safe file operations, development tools, package installs, git operations, etc.)
+- DENY if the command could genuinely damage the system (recursive delete of important paths, overwriting system files, fork bombs, wiping disks, dropping databases, etc.)
+- ESCALATE if you're uncertain
+
+Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
+
         system_prompt = (
             "You are a security reviewer for an AI coding agent. "
             "You assess whether shell commands are safe to execute.\n\n"
@@ -2699,7 +2711,6 @@ Respond with exactly one word: ALLOWED, DENIED, or ESCALATE"""
 
         answer = (response.choices[0].message.content or "").strip().upper()
 
-        if answer == "APPROVE":
         if "ALLOWED" in answer or "APPROVE" in answer:
             return "approve"
         elif answer == "DENY":
@@ -3136,7 +3147,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway") -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
-    elapses — firing pre/post approval hooks and cleaning up the queue entry.
+    elapses -- firing pre/post approval hooks and cleaning up the queue entry.
 
     Shared by the terminal command guard (``check_all_command_guards``) and
     the execute_code guard (``check_execute_code_guard``) so the fiddly
