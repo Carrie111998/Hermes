@@ -5411,7 +5411,12 @@ async def apply_weixin_onboarding(
         with _profile_scope(effective_profile):
             save_env_value("WEIXIN_ACCOUNT_ID", credentials["account_id"])
             save_env_value("WEIXIN_TOKEN", credentials["token"])
-            save_env_value("WEIXIN_BASE_URL", credentials["base_url"])
+            # Defensive: ensure the base URL is always the canonical iLink
+            # endpoint, even if the QR session somehow captured a stale one.
+            base_url = credentials["base_url"]
+            if "ilinkai.weixin.qq.com" not in base_url:
+                base_url = "https://ilinkai.weixin.qq.com"
+            save_env_value("WEIXIN_BASE_URL", base_url)
             _write_platform_enabled("weixin", True)
     except HTTPException:
         raise
