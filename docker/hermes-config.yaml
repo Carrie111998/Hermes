@@ -85,6 +85,8 @@ dashboard:
   basic_auth:
     username: admin
     password_hash: "scrypt$16384$8$1$QJMs7wfRIelUP6tXKnzgTg==$d4nrKch8xCpKe5pV5hGK5S+CnJrLLF8idO56e58Tlhw="
+    secret: "28765d337208aa3c0b6671cb1969e8cad9c22d7b7967b21628765d337208aa3c"
+    session_ttl_seconds: 86400
 
 # =============================================================================
 # Gateway Platforms

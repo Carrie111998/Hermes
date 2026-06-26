@@ -11,6 +11,8 @@ Or copy into the container and run:
 import yaml
 
 HASH = "scrypt$16384$8$1$QJMs7wfRIelUP6tXKnzgTg==$d4nrKch8xCpKe5pV5hGK5S+CnJrLLF8idO56e58Tlhw="
+# 32-byte hex secret for session token signing (required by BasicAuthProvider)
+SECRET = "28765d337208aa3c0b6671cb1969e8cad9c22d7b7967b21628765d337208aa3c"
 
 with open("/opt/data/config.yaml") as f:
     c = yaml.safe_load(f)
@@ -19,6 +21,8 @@ c.setdefault("dashboard", {})
 c["dashboard"]["basic_auth"] = {
     "username": "admin",
     "password_hash": HASH,
+    "secret": SECRET,
+    "session_ttl_seconds": 86400,
 }
 
 with open("/opt/data/config.yaml", "w") as f:
