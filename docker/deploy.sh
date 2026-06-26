@@ -72,6 +72,30 @@ else
     log "data/.env already exists — skipping template copy."
 fi
 
+# ── Pin weixin base_url in data/config.yaml ─────────────────────────────────
+# A stale WEIXIN_BASE_URL in data/.env (e.g. https://ilinkai.wechat.com instead
+# of https://ilinkai.weixin.qq.com) causes silent "Session expired" errors.
+# The adapter resolution order is: extra.base_url → WEIXIN_BASE_URL env → constant.
+# Pinning it in config.yaml wins over any stale env var.
+if [ -f "data/config.yaml" ]; then
+    if ! grep -q "ilinkai.weixin.qq.com" data/config.yaml 2>/dev/null; then
+        log "Pinning weixin base_url in data/config.yaml ..."
+        docker compose -f docker-compose.upstream.yml run --rm --no-deps \
+            --entrypoint "" hermes-gateway python3 -c "
+import yaml
+with open('/opt/data/config.yaml') as f:
+    cfg = yaml.safe_load(f)
+wx = cfg.setdefault('platforms', {}).setdefault('weixin', {})
+wx.setdefault('extra', {})['base_url'] = 'https://ilinkai.weixin.qq.com'
+with open('/opt/data/config.yaml', 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+print('weixin base_url pinned')
+"
+    else
+        log "weixin base_url already pinned in data/config.yaml — skipping."
+    fi
+fi
+
 # ── Pull + recreate ───────────────────────────────────────────────────────────
 log "Refreshing the fork's GHCR-published Hermes image and recreating services..."
 docker compose -f docker-compose.upstream.yml up -d --pull always --force-recreate --remove-orphans

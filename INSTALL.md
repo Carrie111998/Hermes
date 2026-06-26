@@ -138,6 +138,21 @@ The web UI healthcheck on `:9119` is the primary smoke signal. The WeChat gatewa
 
 WeChat personal accounts (`weixin`) do not use tokens — credentials are obtained via the QR wizard and saved to `data/weixin/accounts/`.
 
+> **Weixin "Session expired" fix:** If the gateway logs `Session expired; pausing for 10 minutes`, check `data/.env` for a wrong `WEIXIN_BASE_URL=https://ilinkai.wechat.com` (missing `.qq.com`). The correct URL is `https://ilinkai.weixin.qq.com`. To pin it permanently in `data/config.yaml` (wins over any stale env var):
+> ```bash
+> docker compose -f docker-compose.upstream.yml run --rm --no-deps --entrypoint "" hermes-gateway python3 -c "
+> import yaml
+> with open('/opt/data/config.yaml') as f:
+>     cfg = yaml.safe_load(f)
+> wx = cfg.setdefault('platforms', {}).setdefault('weixin', {})
+> wx.setdefault('extra', {})['base_url'] = 'https://ilinkai.weixin.qq.com'
+> with open('/opt/data/config.yaml', 'w') as f:
+>     yaml.dump(cfg, f, default_flow_style=False, allow_unicode=True)
+> print('weixin base_url pinned')
+> "
+> docker restart hermes-gateway
+> ```
+
 ### `data/config.yaml` — runtime settings
 
 Auto-created from `docker/hermes-config.yaml` on first start.  
