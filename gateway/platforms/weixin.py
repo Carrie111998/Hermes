@@ -1093,7 +1093,15 @@ async def qr_login(
             elif status == "scaned_but_redirect":
                 redirect_host = str(status_resp.get("redirect_host") or "")
                 if redirect_host:
-                    current_base_url = f"https://{redirect_host}"
+                    # iLink sometimes returns a redirect_host with the wrong
+                    # domain (e.g. ilinkai.wechat.com instead of
+                    # ilinkai.weixin.qq.com). Always normalise to the canonical
+                    # endpoint to avoid silent session failures.
+                    candidate = f"https://{redirect_host}"
+                    if "ilinkai.weixin.qq.com" in candidate:
+                        current_base_url = candidate
+                    else:
+                        current_base_url = ILINK_BASE_URL
             elif status == "expired":
                 refresh_count += 1
                 if refresh_count > 3:
@@ -1126,7 +1134,13 @@ async def qr_login(
             elif status == "confirmed":
                 account_id = str(status_resp.get("ilink_bot_id") or "")
                 token = str(status_resp.get("bot_token") or "")
-                base_url = str(status_resp.get("baseurl") or ILINK_BASE_URL)
+                # iLink sometimes returns a stale/wrong baseurl (e.g.
+                # ilinkai.wechat.com without the .qq.com suffix) in the QR
+                # confirmation response. Always normalise to the canonical
+                # ILINK_BASE_URL to avoid silent session failures caused by
+                # the wrong domain being saved to .env.
+                raw_base_url = str(status_resp.get("baseurl") or ILINK_BASE_URL)
+                base_url = ILINK_BASE_URL if "ilinkai.weixin.qq.com" not in raw_base_url else raw_base_url
                 user_id = str(status_resp.get("ilink_user_id") or "")
                 if not account_id or not token:
                     logger.error("weixin: QR confirmed but credential payload was incomplete")
