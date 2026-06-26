@@ -2065,6 +2065,10 @@ LEGACY_AUTHOR_MAP = {
     "1torhan@protonmail.com": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
     "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
+    "hermes-tmw@github.com": "hermes-tmw",  # Hermes AI agent account
+    "mail@tomwhipple.com": "tomwhipple",  # Tom Whipple (repo owner)
+    "hermes@tomwhipple.com": "hermes-tmw",  # Hermes AI agent account (alternate)
+    "claw@localhost": "claw",  # local dev user; appears in PR history
 }
 
 
