@@ -74,6 +74,7 @@ import os
 import re
 from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import parse_qs
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
@@ -96,6 +97,9 @@ SKILLS_DIR = HERMES_HOME / "skills"
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+MAX_LINKED_FILES_IN_SKILL_VIEW = 60
+MAX_DIRECTORY_FILES_IN_SKILL_VIEW = 200
+_LINKED_FILE_GROUPS = ("references", "templates", "assets", "scripts")
 
 # Platform identifiers for the 'platforms' frontmatter field.
 # Maps user-friendly names to sys.platform prefixes.
@@ -109,6 +113,84 @@ _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona"}
 )
 _secret_capture_callback = None
+
+
+def _coerce_non_negative_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(parsed, 0)
+
+
+def _split_file_path_options(file_path: str) -> tuple[str, int, int]:
+    """Parse optional directory-list pagination from skill_view(file_path=...)."""
+    path, _, query = file_path.partition("?")
+    params = parse_qs(query, keep_blank_values=False)
+    offset = _coerce_non_negative_int(
+        (params.get("offset") or [None])[0],
+        0,
+    )
+    limit = _coerce_non_negative_int(
+        (params.get("limit") or [None])[0],
+        MAX_DIRECTORY_FILES_IN_SKILL_VIEW,
+    )
+    if limit == 0 or limit > MAX_DIRECTORY_FILES_IN_SKILL_VIEW:
+        limit = MAX_DIRECTORY_FILES_IN_SKILL_VIEW
+    return path.rstrip("/") or ".", offset, limit
+
+
+def _compact_file_catalog(
+    files_by_group: dict[str, list[str]],
+    *,
+    max_entries: int,
+) -> tuple[dict[str, list[str]] | None, dict[str, Any]]:
+    """Return a bounded, grouped preview plus metadata for a file catalog."""
+    ordered = {
+        group: sorted(files)
+        for group, files in files_by_group.items()
+        if files
+    }
+    counts = {group: len(files) for group, files in ordered.items()}
+    total = sum(counts.values())
+    if total == 0:
+        return None, {
+            "total_count": 0,
+            "shown_count": 0,
+            "omitted_count": 0,
+            "counts": {},
+            "omitted_by_group": {},
+            "truncated": False,
+            "limit": max_entries,
+        }
+
+    remaining = max(max_entries, 0)
+    compact: dict[str, list[str]] = {}
+    omitted_by_group: dict[str, int] = {}
+    for group in _LINKED_FILE_GROUPS + tuple(
+        g for g in ordered.keys() if g not in _LINKED_FILE_GROUPS
+    ):
+        files = ordered.get(group, [])
+        shown = files[:remaining] if remaining else []
+        if shown:
+            compact[group] = shown
+        omitted = len(files) - len(shown)
+        if omitted:
+            omitted_by_group[group] = omitted
+        remaining -= len(shown)
+
+    shown_count = sum(len(files) for files in compact.values())
+    return compact or None, {
+        "total_count": total,
+        "shown_count": shown_count,
+        "omitted_count": total - shown_count,
+        "counts": counts,
+        "omitted_by_group": omitted_by_group,
+        "truncated": shown_count < total,
+        "limit": max_entries,
+    }
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -1193,8 +1275,12 @@ def skill_view(
         if file_path and skill_dir:
             from tools.path_security import validate_within_dir, has_traversal_component
 
+            requested_file_path, list_offset, list_limit = _split_file_path_options(
+                file_path
+            )
+
             # Security: Prevent path traversal attacks
-            if has_traversal_component(file_path):
+            if has_traversal_component(requested_file_path):
                 return json.dumps(
                     {
                         "success": False,
@@ -1204,7 +1290,7 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-            target_file = skill_dir / file_path
+            target_file = skill_dir / requested_file_path
 
             # Security: Verify resolved path is still within skill directory
             traversal_error = validate_within_dir(target_file, skill_dir)
@@ -1217,6 +1303,33 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
+            if target_file.exists() and target_file.is_dir():
+                files = sorted(
+                    str(f.relative_to(skill_dir))
+                    for f in target_file.rglob("*")
+                    if f.is_file() and f.name != "SKILL.md"
+                )
+                page = files[list_offset : list_offset + list_limit]
+                return json.dumps(
+                    {
+                        "success": True,
+                        "name": name,
+                        "directory": requested_file_path,
+                        "files": page,
+                        "total_count": len(files),
+                        "shown_count": len(page),
+                        "offset": list_offset,
+                        "limit": list_limit,
+                        "has_more": list_offset + len(page) < len(files),
+                        "next_file_path": (
+                            f"{requested_file_path}?offset={list_offset + len(page)}&limit={list_limit}"
+                            if list_offset + len(page) < len(files)
+                            else None
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+
             if not target_file.exists():
                 # List available files in the skill directory, organized by type
                 available_files = {
@@ -1250,15 +1363,18 @@ def skill_view(
                         }:
                             available_files["other"].append(rel)
 
-                # Remove empty categories
-                available_files = {k: v for k, v in available_files.items() if v}
+                compact_files, catalog_meta = _compact_file_catalog(
+                    available_files,
+                    max_entries=MAX_DIRECTORY_FILES_IN_SKILL_VIEW,
+                )
 
                 return json.dumps(
                     {
                         "success": False,
                         "error": f"File '{file_path}' not found in skill '{name}'.",
-                        "available_files": available_files,
-                        "hint": "Use one of the available file paths listed above",
+                        "available_files": compact_files,
+                        "available_files_summary": catalog_meta,
+                        "hint": "Use one of the available file paths listed above, or pass a directory path like 'references/?offset=0&limit=100' to page through a large catalog.",
                     },
                     ensure_ascii=False,
                 )
@@ -1272,7 +1388,7 @@ def skill_view(
                     {
                         "success": True,
                         "name": name,
-                        "file": file_path,
+                        "file": requested_file_path,
                         "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
                         "is_binary": True,
                     },
@@ -1283,7 +1399,7 @@ def skill_view(
                 {
                     "success": True,
                     "name": name,
-                    "file": file_path,
+                    "file": requested_file_path,
                     "content": content,
                     "file_type": target_file.suffix,
                 },
@@ -1350,16 +1466,23 @@ def skill_view(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
 
-        # Build linked files structure for clear discovery
-        linked_files = {}
+        # Build a bounded linked-file preview for progressive disclosure. Large
+        # router skills can have hundreds of references; listing every filename
+        # in the default skill_view response bloats agent context while every
+        # file remains loadable on demand through file_path.
+        linked_files_full = {}
         if reference_files:
-            linked_files["references"] = reference_files
+            linked_files_full["references"] = reference_files
         if template_files:
-            linked_files["templates"] = template_files
+            linked_files_full["templates"] = template_files
         if asset_files:
-            linked_files["assets"] = asset_files
+            linked_files_full["assets"] = asset_files
         if script_files:
-            linked_files["scripts"] = script_files
+            linked_files_full["scripts"] = script_files
+        linked_files, linked_files_summary = _compact_file_catalog(
+            linked_files_full,
+            max_entries=MAX_LINKED_FILES_IN_SKILL_VIEW,
+        )
 
         try:
             rel_path = str(skill_md.relative_to(SKILLS_DIR))
@@ -1459,8 +1582,12 @@ def skill_view(
             "content": rendered_content,
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
-            "linked_files": linked_files if linked_files else None,
-            "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
+            "linked_files": linked_files,
+            "linked_files_summary": linked_files_summary if linked_files else None,
+            "usage_hint": (
+                "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'. "
+                "If the catalog is truncated, page through a directory with file_path like 'references/?offset=60&limit=60'."
+            )
             if linked_files
             else None,
             "required_environment_variables": required_env_vars,
@@ -1576,7 +1703,7 @@ SKILLS_LIST_SCHEMA = {
 
 SKILL_VIEW_SCHEMA = {
     "name": "skill_view",
-    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a 'linked_files' dict showing available references/templates/scripts. To access those, call again with file_path parameter.",
+    "description": "Skills allow for loading information about specific tasks and workflows, as well as scripts and templates. Load a skill's full content or access its linked files (references, templates, scripts). First call returns SKILL.md content plus a capped, grouped 'linked_files' preview and summary counts. To access files, call again with file_path; for large catalogs, pass a directory with pagination, e.g. file_path='references/?offset=60&limit=60'.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -494,6 +494,56 @@ class TestSkillView:
         result = json.loads(raw)
         assert result["linked_files"] is not None
         assert "references" in result["linked_files"]
+        assert result["linked_files_summary"]["counts"] == {"references": 1}
+
+    def test_view_caps_large_linked_file_catalog(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "router-skill")
+            refs_dir = skill_dir / "references"
+            refs_dir.mkdir()
+            total = skills_tool_module.MAX_LINKED_FILES_IN_SKILL_VIEW + 5
+            for idx in range(total):
+                (refs_dir / f"ref-{idx:03d}.md").write_text(f"reference {idx}")
+            raw = skill_view("router-skill")
+
+        result = json.loads(raw)
+
+        assert result["success"] is True
+        assert len(result["linked_files"]["references"]) == skills_tool_module.MAX_LINKED_FILES_IN_SKILL_VIEW
+        assert result["linked_files_summary"] == {
+            "total_count": total,
+            "shown_count": skills_tool_module.MAX_LINKED_FILES_IN_SKILL_VIEW,
+            "omitted_count": 5,
+            "counts": {"references": total},
+            "omitted_by_group": {"references": 5},
+            "truncated": True,
+            "limit": skills_tool_module.MAX_LINKED_FILES_IN_SKILL_VIEW,
+        }
+        assert "references/ref-064.md" not in result["linked_files"]["references"]
+
+    def test_directory_file_path_lists_linked_files_with_pagination(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "router-skill")
+            refs_dir = skill_dir / "references"
+            refs_dir.mkdir()
+            for idx in range(5):
+                (refs_dir / f"ref-{idx:03d}.md").write_text(f"reference {idx}")
+            raw = skill_view("router-skill", file_path="references/?offset=2&limit=2")
+
+        result = json.loads(raw)
+
+        assert result == {
+            "success": True,
+            "name": "router-skill",
+            "directory": "references",
+            "files": ["references/ref-002.md", "references/ref-003.md"],
+            "total_count": 5,
+            "shown_count": 2,
+            "offset": 2,
+            "limit": 2,
+            "has_more": True,
+            "next_file_path": "references?offset=4&limit=2",
+        }
 
     def test_view_tags_from_metadata(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
