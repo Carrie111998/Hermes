@@ -1921,6 +1921,10 @@ AUTHOR_MAP = {
     "kiljadn@gmail.com": "designnotdrum",  # PR #56480 salvage (toolset static-inference fix)
     "lavya@loom.local": "LavyaTandel",  # PR #57893 salvage local git identity (envelope-layout cache markers on tool/empty-assistant messages; #57845)
     "601709253@qq.com": "SquabbyZ",  # PR #59682 salvage (in-container dashboard WS loopback host; #58993)
+    "hermes-tmw@github.com": "hermes-tmw",  # Hermes AI agent account
+    "mail@tomwhipple.com": "tomwhipple",  # Tom Whipple (repo owner)
+    "hermes@tomwhipple.com": "hermes-tmw",  # Hermes AI agent account (alternate)
+    "claw@localhost": "claw",  # local dev user; appears in PR history
 }
 
 
