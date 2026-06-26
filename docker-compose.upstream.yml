@@ -41,7 +41,11 @@ services:
   hermes-web:
     <<: *hermes-common
     container_name: hermes-web
-    command: ["dashboard", "--host", "127.0.0.1", "--port", "9119", "--no-open"]
+    # Bind 0.0.0.0 inside the container so Docker port forwarding works.
+    # Host-side binding is 127.0.0.1 (see ports below) so it's not LAN-exposed.
+    # Upstream 0.17+ requires auth for non-loopback binds — basic_auth is
+    # configured in data/config.yaml (username=admin, password=hermes).
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
     environment:
       - GATEWAY_HEALTH_URL=http://hermes-gateway:8789
     volumes:
