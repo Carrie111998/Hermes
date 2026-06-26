@@ -288,6 +288,12 @@ class WeixinQRSessionManager:
                     elif status == "scaned_but_redirect":
                         redirect_host = str(status_resp.get("redirect_host") or "")
                         if redirect_host:
+                            # Normalise: iLink sometimes redirects to
+                            # ilinkai.wechat.com (missing .qq.com).  Always
+                            # force the canonical domain so the token is
+                            # issued against the correct endpoint.
+                            if "ilinkai.weixin.qq.com" not in redirect_host:
+                                redirect_host = "ilinkai.weixin.qq.com"
                             session._current_base_url = f"https://{redirect_host}"
                         # Stay in scanned state until confirmed.
                     elif status == "expired":
