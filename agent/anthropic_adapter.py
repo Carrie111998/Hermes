@@ -610,7 +610,7 @@ def _build_anthropic_client_with_bearer_hook(
 
     http_client = build_bearer_http_client(token_provider, timeout=timeout_obj)
 
-    kwargs = {
+    kwargs: Dict[str, Any] = {
         "timeout": timeout_obj,
         "http_client": http_client,
         # The SDK requires *something* for api_key/auth_token. Our

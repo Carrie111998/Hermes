@@ -56,7 +56,8 @@ jobs:
         run: |
           # Use the latest tag from the repo as the baseline
           LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.15.1")
-          .venv/bin/python scripts/contributor_audit.py \
+          source .venv/bin/activate
+          python scripts/contributor_audit.py \
             --since-tag "$LATEST_TAG" \
             --diff-base "origin/${{ github.base_ref }}" \
             --strict

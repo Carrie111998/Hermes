@@ -1533,13 +1533,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             current_session_id=agent.session_id,
         )
     elif function_name == "memory":
-        target = function_args.get("target", "memory")
+        target = str(function_args.get("target", "memory"))
         from tools.memory_tool import memory_tool as _memory_tool
         result = _memory_tool(
             action=typing.cast(str, function_args.get("action")),
             target=target,
-            content=function_args.get("content"),
-            old_text=function_args.get("old_text"),
+            content=typing.cast(Optional[str], function_args.get("content")),
+            old_text=typing.cast(Optional[str], function_args.get("old_text")),
             store=agent._memory_store,
         )
         # Bridge: notify external memory provider of built-in memory writes

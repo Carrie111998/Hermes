@@ -1187,29 +1187,29 @@ def _rebuild_ref_chain(store: Path, working_dir: str, ref: str, keep_shas: List[
     new_parent: typing.Any = None
     for sha in keep_shas:
         # Use local variables and explicit str casts to break type cycles in 'ty'
-        sha_str = str(sha)
-        res_tree = _run_git(["rev-parse", sha_str + "^{tree}"], store, working_dir)
-        if not res_tree[0]:
+        sha_str: str = str(sha)
+        ok_tree, stdout_tree, _ = _run_git(["rev-parse", sha_str + "^{tree}"], store, working_dir)
+        if not ok_tree:
             return False
-        tree_sha = str(res_tree[1])
+        tree_sha: str = str(stdout_tree)
 
-        res_msg = _run_git(["log", "--format=%s", "-1", sha_str], store, working_dir)
-        commit_msg = str(res_msg[1]) if (res_msg[0] and res_msg[1]) else "checkpoint"
+        ok_msg, stdout_msg, _ = _run_git(["log", "--format=%s", "-1", sha_str], store, working_dir)
+        commit_msg: str = str(stdout_msg) if (ok_msg and stdout_msg) else "checkpoint"
 
-        args = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
+        args: List[str] = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
         if new_parent is not None:
             args = ["commit-tree", tree_sha, "-p", str(new_parent), "-m", commit_msg, "--no-gpg-sign"]
 
-        res_commit = _run_git(args, store, working_dir)
-        if not res_commit[0] or not res_commit[1]:
+        ok_commit, stdout_commit, _ = _run_git(args, store, working_dir)
+        if not ok_commit or not stdout_commit:
             return False
-        new_parent = str(res_commit[1])
+        new_parent = str(stdout_commit)
 
     if new_parent is None:
         return False
 
-    res_update = _run_git(["update-ref", ref, str(new_parent)], store, working_dir)
-    return bool(res_update[0])
+    ok_update, _, _ = _run_git(["update-ref", ref, str(new_parent)], store, working_dir)
+    return bool(ok_update)
 
 
 def prune_checkpoints(
