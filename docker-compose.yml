@@ -68,6 +68,8 @@ services:
     container_name: hermes-web
     # Bind to 127.0.0.1 — upstream 0.17+ refuses 0.0.0.0 without auth configured.
     command: ["dashboard", "--host", "127.0.0.1", "--port", "9119", "--no-open"]
+    environment:
+      - GATEWAY_HEALTH_URL=http://hermes-gateway:8789
     volumes:
       - ./data:/opt/data
       - ./docker/hermes-config.yaml:/opt/hermes/cli-config.yaml.example:ro
@@ -90,6 +92,13 @@ services:
     # per docker/hermes-config.yaml. weixin uses outbound long-poll to
     # ilinkai.weixin.qq.com — no inbound host port needed.
     command: ["gateway", "run"]
+    environment:
+      - API_SERVER_KEY=${API_SERVER_KEY:-28765d337208aa3c0b6671cb1969e8cad9c22d7b7967b216}
+      - API_SERVER_CORS_ORIGINS=http://localhost:8788,http://host.docker.internal:8788
+      - GATEWAY_ALLOW_ALL_USERS=true
+    ports:
+      - "8789:8789"
+      - "8644:8644"
     # Wait for hermes-web's healthcheck so config bootstrap is complete before gateway reads it
     depends_on:
       postgres:
@@ -97,9 +106,9 @@ services:
       hermes-web:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c 'import os,sys; sys.exit(0 if os.path.exists(\"/opt/data/weixin/accounts\") else 1)'"]
+      test: ["CMD", "python3", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8789/health'); sys.exit(0 if r.status==200 else 1)"]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
       start_period: 60s
 
