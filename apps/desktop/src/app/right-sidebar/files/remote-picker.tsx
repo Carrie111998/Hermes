@@ -5,28 +5,11 @@ import { Codicon } from '@/components/ui/codicon'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { useI18n } from '@/i18n'
 import { readDesktopDir, setDesktopFsRemotePicker } from '@/lib/desktop-fs'
-import { displayPath, pathLeaf } from '@/lib/display-path'
+import { displayPath } from '@/lib/display-path'
 import { cn } from '@/lib/utils'
 
-function clean(path: string) {
-  return path.replace(/\/+$/, '') || '/'
-}
+import { cleanRemotePath, parentRemotePath, remotePathCrumbs, remotePathLeaf } from './remote-picker-paths'
 
-function parentDir(path: string) {
-  const value = clean(path)
-
-  if (value === '/') {
-    return '/'
-  }
-
-  const parent = value.slice(0, value.lastIndexOf('/'))
-
-  return parent || '/'
-}
-
-function pathName(path: string) {
-  return pathLeaf(path) || path
-}
 
 interface PendingSelection {
   defaultPath: string
@@ -47,7 +30,7 @@ export function RemoteFolderPicker() {
     setDesktopFsRemotePicker({
       selectPaths: options =>
         new Promise(resolve => {
-          const defaultPath = clean(options?.defaultPath || '/')
+          const defaultPath = cleanRemotePath(options?.defaultPath || '/')
           setCurrentPath(defaultPath)
           setPending({ defaultPath, resolve, title: options?.title || r.remotePickerTitle })
         })
@@ -99,18 +82,7 @@ export function RemoteFolderPicker() {
     }
   }, [currentPath, pending])
 
-  const crumbs = useMemo(() => {
-    const parts = clean(currentPath).split('/').filter(Boolean)
-    const out = [{ label: '/', path: '/' }]
-    let acc = ''
-
-    for (const part of parts) {
-      acc += `/${part}`
-      out.push({ label: part, path: acc })
-    }
-
-    return out
-  }, [currentPath])
+  const crumbs = useMemo(() => remotePathCrumbs(currentPath), [currentPath])
 
   const close = (paths: string[] = []) => {
     pending?.resolve(paths)
@@ -149,9 +121,9 @@ export function RemoteFolderPicker() {
 
           <div className="min-h-0 flex-1 overflow-y-auto p-2">
             <FolderRow
-              disabled={currentPath === '/'}
+              disabled={parentRemotePath(currentPath) === cleanRemotePath(currentPath)}
               name=".."
-              onClick={() => setCurrentPath(parentDir(currentPath))}
+              onClick={() => setCurrentPath(parentRemotePath(currentPath))}
             />
             {loading ? (
               <div className="flex items-center gap-2 px-2 py-3 text-xs text-muted-foreground">
@@ -164,7 +136,7 @@ export function RemoteFolderPicker() {
               <div className="px-2 py-3 text-xs text-muted-foreground">{r.emptyBody}</div>
             ) : (
               entries.map(entry => (
-                <FolderRow key={entry.path} name={pathName(entry.path)} onClick={() => setCurrentPath(entry.path)} />
+                <FolderRow key={entry.path} name={remotePathLeaf(entry.path)} onClick={() => setCurrentPath(entry.path)} />
               ))
             )}
           </div>
