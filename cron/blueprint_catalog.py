@@ -95,6 +95,7 @@ class AutomationBlueprint:
     prompt_template: str
     slots: List[BlueprintSlot] = field(default_factory=list)
     deliver_default: str = "origin"
+    allow_silent: Optional[bool] = None
     skills: tuple = ()        # skills the job loads before running
     tags: tuple = ()
 
@@ -136,6 +137,7 @@ CATALOG: List[AutomationBlueprint] = [
         ),
         slots=[_TIME("08:00"), _DELIVER],
         skills=("google-workspace",),
+        allow_silent=False,
         tags=("daily", "briefing"),
     ),
     AutomationBlueprint(
@@ -194,6 +196,7 @@ CATALOG: List[AutomationBlueprint] = [
             _DELIVER,
         ],
         skills=("weekly-review-planning",),
+        allow_silent=False,
         tags=("weekly", "review"),
     ),
     AutomationBlueprint(
@@ -208,6 +211,7 @@ CATALOG: List[AutomationBlueprint] = [
             "recent context and any task tools. Encouraging, short, one message."
         ),
         slots=[_TIME("09:00"), _DELIVER],
+        allow_silent=False,
         tags=("daily", "focus"),
     ),
     AutomationBlueprint(
@@ -794,6 +798,8 @@ def fill_blueprint(
     }
     if blueprint.skills:
         spec["skills"] = list(blueprint.skills)
+    if blueprint.allow_silent is not None:
+        spec["allow_silent"] = blueprint.allow_silent
     if origin is not None:
         spec["origin"] = origin
     return spec
