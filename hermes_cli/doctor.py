@@ -57,7 +57,6 @@ _PROVIDER_ENV_HINTS = (
 
 
 from hermes_constants import is_termux as _is_termux
-from hermes_cli import _subprocess_compat
 
 
 def _python_install_cmd() -> str:
@@ -1517,7 +1516,7 @@ def run_doctor(args):
         if _safe_which("docker"):
             # Check if docker daemon is running
             try:
-                result = _subprocess_compat.run(["docker", "info"], capture_output=True, timeout=10)
+                result = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
             except subprocess.TimeoutExpired:
                 result = None
             if result is not None and result.returncode == 0:
@@ -2298,7 +2297,7 @@ def run_doctor(args):
     def _gh_authenticated() -> bool:
         """Check if gh CLI is authenticated via token file or device flow."""
         try:
-            result = _subprocess_compat.run(
+            result = subprocess.run(
                 ["gh", "auth", "status", "--json", "authenticated"],
                 capture_output=True, timeout=10,
             )
