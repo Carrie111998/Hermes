@@ -1016,7 +1016,7 @@ class TestMatrixMediaLiveAdapterReuse:
             "gateway.run._gateway_runner_ref",
             return_value=fake_runner,
         ), patch.dict(
-            sys.modules, {"gateway.platforms.matrix": SimpleNamespace()}
+            sys.modules, {"plugins.platforms.matrix.adapter": SimpleNamespace()}
         ):
             result = asyncio.run(
                 _send_matrix_via_adapter(
@@ -1066,7 +1066,7 @@ class TestMatrixMediaLiveAdapterReuse:
 
         with patch(
             "gateway.run._gateway_runner_ref", return_value=None
-        ), patch.dict(sys.modules, {"gateway.platforms.matrix": fake_module}):
+        ), patch.dict(sys.modules, {"plugins.platforms.matrix.adapter": fake_module}):
             result = asyncio.run(
                 _send_matrix_via_adapter(
                     SimpleNamespace(enabled=True, token="tok", extra={}),
@@ -1111,7 +1111,7 @@ class TestMatrixMediaLiveAdapterReuse:
         with patch(
             "gateway.run._gateway_runner_ref",
             return_value=fake_runner,
-        ), patch.dict(sys.modules, {"gateway.platforms.matrix": fake_module}):
+        ), patch.dict(sys.modules, {"plugins.platforms.matrix.adapter": fake_module}):
             result = asyncio.run(
                 _send_matrix_via_adapter(
                     SimpleNamespace(enabled=True, token="tok", extra={}),
