@@ -36,7 +36,7 @@ from tui_gateway.transport import (
     current_transport,
     reset_transport,
 )
-from tui_gateway.wiki_api import wiki_scan, wiki_page, resolve_wiki, wiki_list, wiki_taxonomy, wiki_flatten_taxonomy, wiki_expand_links
+from tui_gateway.wiki_api import wiki_scan, wiki_page, resolve_wiki, wiki_list, wiki_taxonomy, wiki_flatten_taxonomy, wiki_expand_links, wiki_changesets
 import tui_gateway.wiki_api as wiki_api
 
 logger = logging.getLogger(__name__)
@@ -15727,6 +15727,29 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("wiki.expand_links failed")
         return _err(rid, 5054, str(e))
+
+
+@method("wiki.changesets")
+def _(rid, params: dict) -> dict:
+    """Return paginated wiki changesets (timeline view)."""
+    try:
+        wiki_name = params.get("wiki")
+        wiki_path = resolve_wiki(wiki_name)
+        result = wiki_changesets(
+            wiki_path=wiki_path,
+            page=params.get("page"),
+            action=params.get("action"),
+            trigger=params.get("trigger"),
+            limit=params.get("limit", 50),
+            offset=params.get("offset", 0),
+            since=params.get("since"),
+            until=params.get("until"),
+        )
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("wiki.changesets failed")
+        return _err(rid, 5055, str(e))
+
 
 @method("feed.get")
 def _(rid, params: dict) -> dict:
