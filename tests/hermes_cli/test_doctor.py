@@ -1018,7 +1018,7 @@ def test_run_doctor_ignores_invalid_direct_keys_when_oauth_fallback_is_healthy(
         xai_oauth_status=xai_oauth_status,
     )
 
-    assert "invalid API key" in out
+    assert "OAuth fallback healthy; direct API-key probe non-blocking" in out
     assert unexpected_issue not in out
 
 
