@@ -1929,17 +1929,6 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             except Exception as e:
                 logger.debug("unknown platform name %r: %s", entry.name, e)
                 continue
-            platform = Platform(entry.name)
-            if (
-                platform in config.platforms
-                and config.platforms[platform].enabled is False
-            ):
-                # Respect explicit YAML/profile disables.  Dependency checks for
-                # plugin platforms answer "can this adapter run?", not "should
-                # this profile claim the shared listener?"  Non-default Hermes
-                # profiles intentionally set shared messaging adapters false so
-                # Kanban/subtask workers do not collide with the default gateway.
-                continue
             existing_cfg = config.platforms.get(platform)
             # Respect an explicit ``enabled: false`` (YAML / gateway.json /
             # dashboard PUT).  ``_enabled_explicit`` is set in

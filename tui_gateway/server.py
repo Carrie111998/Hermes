@@ -190,6 +190,7 @@ _LONG_HANDLERS = frozenset(
         # responsive; completion is read-only and write_json is lock-guarded.
         "complete.path",
         "complete.slash",
+        "llm.oneshot",
         # Pet RPCs hit the network (manifest fetch / spritesheet download) or do
         # per-frame PNG decode/encode (pet.cells): inline they serialize on the
         # reader thread, so picker previews trickle in one at a time and the
@@ -202,7 +203,6 @@ _LONG_HANDLERS = frozenset(
         "pet.hatch",
         "pet.select",
         "pet.thumb",
-        "llm.oneshot",
         "plugins.manage",
         "projects.discover_repos",
         "projects.record_repos",
@@ -278,6 +278,8 @@ class _SlashWorker:
             argv += ["--model", model]
 
         self._closed = False
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE,
@@ -289,6 +291,7 @@ class _SlashWorker:
             # slash_worker runs the Hermes agent → needs provider credentials.
             # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
             env=hermes_subprocess_env(inherit_credentials=True),
+            creationflags=windows_hide_flags(),
         )
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -11701,6 +11704,9 @@ def _list_repo_files(root: str) -> list[str]:
             return cached[1]
 
     files: list[str] = []
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    _creationflags = windows_hide_flags()
     try:
         top_result = subprocess.run(
             ["git", "-C", root, "rev-parse", "--show-toplevel"],
@@ -11708,6 +11714,7 @@ def _list_repo_files(root: str) -> list[str]:
             timeout=2.0,
             check=False,
             stdin=subprocess.DEVNULL,
+            creationflags=_creationflags,
         )
         if top_result.returncode == 0:
             top = top_result.stdout.decode("utf-8", "replace").strip()
@@ -11726,6 +11733,7 @@ def _list_repo_files(root: str) -> list[str]:
                 timeout=2.0,
                 check=False,
                 stdin=subprocess.DEVNULL,
+                creationflags=_creationflags,
             )
             if list_result.returncode == 0:
                 for p in list_result.stdout.decode("utf-8", "replace").split("\0"):
