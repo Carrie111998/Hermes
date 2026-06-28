@@ -843,13 +843,23 @@ def _is_profile_home(candidate: str | None, profile_home: str | None) -> bool:
 
 
 def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
-    """Return likely OS-user home candidates in trust order."""
-    env = env or {}
+    """Return likely OS-user home candidates in trust order.
+
+    When *env* is provided, values are read from that dict only (no fallback
+    to ``os.environ``). This allows callers to compute real-home for a
+    subprocess env dict without inheriting stale values from the parent.
+    """
+
+    def _get(key: str) -> str:
+        if env is not None:
+            return str(env.get(key) or "").strip()
+        return os.getenv(key, "").strip()
+
     candidates: list[str] = []
-    explicit = str(env.get("HERMES_REAL_HOME") or os.getenv("HERMES_REAL_HOME", "")).strip()
+    explicit = _get("HERMES_REAL_HOME")
     if explicit:
         candidates.append(explicit)
-    home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
+    home = _get("HOME")
     if home:
         candidates.append(home)
     try:
@@ -860,11 +870,11 @@ def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
             candidates.append(pw_home)
     except Exception:
         pass
-    userprofile = str(env.get("USERPROFILE") or os.getenv("USERPROFILE", "")).strip()
+    userprofile = _get("USERPROFILE")
     if userprofile:
         candidates.append(userprofile)
-    drive = str(env.get("HOMEDRIVE") or os.getenv("HOMEDRIVE", "")).strip()
-    path = str(env.get("HOMEPATH") or os.getenv("HOMEPATH", "")).strip()
+    drive = _get("HOMEDRIVE")
+    path = _get("HOMEPATH")
     if drive and path:
         candidates.append(f"{drive}{path}" if path.startswith(("\\", "/")) else os.path.join(drive, path))
     expanded = os.path.expanduser("~")
