@@ -1132,11 +1132,15 @@ class CuaDriverBackend(ComputerUseBackend):
             #     DISCARD the AX tree/elements, returning only the PNG. Vision
             #     mode's whole contract is "just the pixels, no element noise",
             #     so we drop everything but the image.
-            # Current cua-driver builds removed the standalone screenshot tool.
-            # Only use it when capability discovery positively says it exists;
-            # otherwise route vision capture through get_window_state with the
-            # explicit vision capture mode.
-            use_screenshot = self._session._has_tool("screenshot") is True
+            # When capability discovery hasn't run (empty map), we don't trust
+            # a negative `_has_tool` answer — we still try `screenshot` first
+            # and fall back if the driver rejects it, so the path self-heals on
+            # any driver version. Current drivers that do advertise capabilities
+            # and omit `screenshot` route vision capture through get_window_state.
+            use_screenshot = (
+                self._session._has_tool("screenshot")
+                or not self._session.capabilities_discovered
+            )
             sc_out: Optional[Dict[str, Any]] = None
             if use_screenshot:
                 sc_out = self._session.call_tool(
