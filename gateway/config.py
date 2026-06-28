@@ -1823,6 +1823,13 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 logger.debug("check_fn for %s raised: %s", entry.name, e)
                 continue
             platform = Platform(entry.name)
+            # Respect an explicit user opt-out: if config.yaml already declared
+            # this platform with ``enabled: false``, don't let registry
+            # auto-detection (check_fn) re-enable it.  check_fn answers "are the
+            # deps/env present?", which for shared-venv platforms like Discord
+            # is True even on profiles that never configured a token.
+            if platform in config.platforms and not config.platforms[platform].enabled:
+                continue
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()
             config.platforms[platform].enabled = True
