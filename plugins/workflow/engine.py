@@ -1776,11 +1776,17 @@ class WorkflowEngine:
             self.kanban_board = _normalize_board_slug(auto_slug)
 
         # Merge inputs into context — inputs are available as
-        # {inputs.<key>} in template substitution
+        # {inputs.<key>} in template substitution. Input keys are also
+        # promoted to top-level context for backward compatibility with
+        # YAML templates that use bare {key} references (e.g. {question}).
+        # If context already has a key, the explicit context value wins.
         if inputs:
             if context is None:
                 context = {}
             context["inputs"] = inputs
+            for k, v in inputs.items():
+                if k not in context:
+                    context[k] = v
 
         # Generate a run ID for this invocation. Available as {run_id}
         # in template substitution so YAML authors can create unique
