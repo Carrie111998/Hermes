@@ -1585,7 +1585,11 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     # Keep the provider override explicit and configurable instead of letting
     # auxiliary.vision.provider:auto route video to the image-only main model.
     provider = os.getenv("AUXILIARY_VIDEO_PROVIDER", "").strip() or "nous"
-    model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or None
+    model = (
+        os.getenv("AUXILIARY_VIDEO_MODEL", "").strip()
+        or os.getenv("AUXILIARY_VISION_MODEL", "").strip()
+        or None
+    )
     return video_analyze_tool(video_url, full_prompt, model, provider=provider)
 
 

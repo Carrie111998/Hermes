@@ -966,7 +966,7 @@ def load_gateway_config() -> GatewayConfig:
                 # ``_merge_platform_map`` already merged it with the correct
                 # precedence, so re-applying it here would overwrite that.
                 if not _cfg_toplevel:
-                    for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                    for _src in (yaml_cfg.get("platforms"), gateway_platforms):
                         if isinstance(_src, dict):
                             _candidate = _src.get(plat.value)
                             if isinstance(_candidate, dict):
@@ -1064,7 +1064,7 @@ def load_gateway_config() -> GatewayConfig:
                     # (e.g. ``platforms.discord.extra.allow_from``) and not via a
                     # top-level ``discord:`` block.
                     if not isinstance(platform_cfg, dict):
-                        for _src in (gateway_platforms, yaml_cfg.get("platforms")):
+                        for _src in (yaml_cfg.get("platforms"), gateway_platforms):
                             if isinstance(_src, dict):
                                 _candidate = _src.get(entry.name)
                                 if isinstance(_candidate, dict):

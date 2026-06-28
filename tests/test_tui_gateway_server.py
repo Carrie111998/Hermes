@@ -4573,7 +4573,9 @@ def test_leftover_session_steer_runs_as_next_turn(monkeypatch):
     try:
         server._run_prompt_submit("rid", "sid", session, "initial prompt")
         deadline = time.time() + 3
-        while time.time() < deadline and len(prompts) < 2:
+        while time.time() < deadline and (
+            len(prompts) < 2 or session.get("running")
+        ):
             time.sleep(0.01)
     finally:
         server._sessions.pop("sid", None)
