@@ -16,6 +16,34 @@ from agent.oneshot import (
 class TestRenderTemplate:
 
 
+    def test_branch_name_template_is_registered(self):
+        render_template("branch_name", {"description": "add oneshot branch name template"})
+        assert "branch_name" in PROMPT_TEMPLATES
+
+    def test_branch_name_user_input_contains_description(self):
+        _, user = render_template(
+            "branch_name",
+            {"description": "add a reusable one-shot branch name template"},
+        )
+        assert "add a reusable one-shot branch name template" in user
+
+    def test_branch_name_avoid_appended(self):
+        _, user = render_template(
+            "branch_name",
+            {
+                "description": "add a reusable one-shot branch name template",
+                "avoid": "feat-oneshot, add-branch-name",
+            },
+        )
+        assert "Avoid: feat-oneshot, add-branch-name" in user
+
+    def test_branch_name_no_avoid(self):
+        _, user = render_template(
+            "branch_name",
+            {"description": "add a reusable one-shot branch name template"},
+        )
+        assert "Avoid" not in user
+
     def test_commit_message_includes_diff_and_recent(self):
         instructions, user = render_template(
             "commit_message",

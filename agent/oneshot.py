@@ -84,9 +84,34 @@ def _commit_message_template(variables: Dict[str, Any]) -> Tuple[str, str]:
     return _COMMIT_INSTRUCTIONS, "\n\n".join(parts)
 
 
+_BRANCH_NAME_INSTRUCTIONS = (
+    "You write git branch names. Given a short description of the work, output "
+    "ONE concise kebab-case git branch name.\n"
+    "Rules:\n"
+    "- Use lower-case words separated by hyphens.\n"
+    "- Do not include a prefix, quotes, markdown, explanation, or multiple options.\n"
+    "- Return ONLY the branch name on one line."
+)
+
+
+def _branch_name_template(variables: Dict[str, Any]) -> Tuple[str, str]:
+    description = str(variables.get("description") or "").strip()
+    if not description:
+        raise ValueError("branch_name template requires description")
+
+    avoid = str(variables.get("avoid") or "").strip()
+
+    parts = ["Description:\n" + description]
+    if avoid:
+        parts.append("Avoid: " + avoid)
+
+    return _BRANCH_NAME_INSTRUCTIONS, "\n\n".join(parts)
+
+
 # Registry of named templates. Add an entry here to give a new surface a
 # consistent, reusable prompt without teaching every caller the prompt text.
 PROMPT_TEMPLATES: Dict[str, PromptTemplate] = {
+    "branch_name": _branch_name_template,
     "commit_message": _commit_message_template,
 }
 
