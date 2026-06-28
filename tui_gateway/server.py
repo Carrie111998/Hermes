@@ -8341,6 +8341,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        steer_followup = None  # set when /steer arrives too late for a tool boundary
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -8571,6 +8572,16 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
+                # Desktop session.steer accepts input while a turn is running,
+                # but if the steer arrives after the last tool batch there is
+                # no tool-result boundary left for AIAgent to append it to.
+                # run_conversation returns that text in pending_steer; without
+                # this TUI/desktop bridge handling, the UI shows "steered" but
+                # the instruction is silently lost. Classic gateway/CLI already
+                # deliver leftover steers as the next turn; mirror that here.
+                pending_steer = result.get("pending_steer")
+                if isinstance(pending_steer, str) and pending_steer.strip():
+                    steer_followup = pending_steer.strip()
             else:
                 raw = str(result)
                 status = "complete"
@@ -8745,6 +8756,28 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
         if _drain_queued_prompt(rid, sid, session):
+            return
+
+        # Chain a leftover /steer turn if the steer arrived after the final
+        # tool boundary. Do this AFTER releasing session["running"], same as
+        # the goal loop below. The user's correction must not vanish just
+        # because it came in during the final model call.
+        if steer_followup:
+            with session["history_lock"]:
+                if session.get("running"):
+                    return
+                session["running"] = True
+            try:
+                _emit("message.start", sid)
+                _run_prompt_submit(rid, sid, session, steer_followup)
+            except Exception as _steer_exc:
+                print(
+                    f"[tui_gateway] leftover steer dispatch failed: "
+                    f"{type(_steer_exc).__name__}: {_steer_exc}",
+                    file=sys.stderr,
+                )
+                with session["history_lock"]:
+                    session["running"] = False
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -12925,11 +12958,16 @@ def _normalize_cdp_url(parsed) -> str:
 
 
 def _failure_messages(url: str, port: int, system: str) -> list[str]:
-    from hermes_cli.browser_connect import manual_chrome_debug_command
+    from hermes_cli.browser_connect import get_chrome_debug_candidates, manual_chrome_debug_command
 
     command = manual_chrome_debug_command(port, system)
+    has_detected_executable = bool(get_chrome_debug_candidates(system))
     hint = (
-        ["Start a Chromium-family browser with remote debugging, then retry /browser connect:", command]
+        [
+            *([] if has_detected_executable else ["No supported Chromium-family browser executable was found in this environment."]),
+            "Start a Chromium-family browser with remote debugging, then retry /browser connect:",
+            command,
+        ]
         if command
         else [
             "No supported Chromium-family browser executable was found in this environment.",

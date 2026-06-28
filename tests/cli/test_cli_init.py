@@ -815,6 +815,64 @@ class TestProviderResolution:
         cli = _make_cli()
         assert cli.api_key is None or isinstance(cli.api_key, str)
 
+
+class TestCliCwdConfigResolution:
+    """CLI config must honor explicit terminal.cwd for fresh sessions."""
+
+    def test_explicit_local_terminal_cwd_wins_over_launch_dir(self, tmp_path, monkeypatch):
+        import yaml
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        project = tmp_path / "project"
+        project.mkdir()
+        launcher = tmp_path / "launcher"
+        launcher.mkdir()
+
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
+            "terminal": {
+                "backend": "local",
+                "cwd": str(project),
+            },
+        }))
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.chdir(launcher)
+
+        import cli
+        monkeypatch.setattr(cli, "_hermes_home", hermes_home)
+        cfg = cli.load_cli_config()
+
+        assert cfg["terminal"]["cwd"] == str(project)
+        assert os.environ["TERMINAL_CWD"] == str(project)
+
+    def test_placeholder_local_terminal_cwd_uses_launch_dir(self, tmp_path, monkeypatch):
+        import yaml
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        launcher = tmp_path / "launcher"
+        launcher.mkdir()
+
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump({
+            "terminal": {
+                "backend": "local",
+                "cwd": ".",
+            },
+        }))
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.chdir(launcher)
+
+        import cli
+        monkeypatch.setattr(cli, "_hermes_home", hermes_home)
+        cfg = cli.load_cli_config()
+
+        assert cfg["terminal"]["cwd"] == str(launcher)
+        assert os.environ["TERMINAL_CWD"] == str(launcher)
+
     def test_base_url_is_string(self):
         cli = _make_cli()
         assert isinstance(cli.base_url, str)

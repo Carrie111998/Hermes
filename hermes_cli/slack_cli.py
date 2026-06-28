@@ -68,6 +68,7 @@ def _build_full_manifest(
         "channels:history",
         "channels:read",
         "chat:write",
+        "chat:write.customize",
         "commands",
         "files:read",
         "files:write",
@@ -76,7 +77,28 @@ def _build_full_manifest(
         "im:history",
         "im:read",
         "im:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
         "users:read",
+        "users:read.email",
+    ]
+
+    user_scopes = [
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "files:read",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
+        "users:read",
+        "users:read.email",
     ]
 
     bot_events = [
@@ -84,6 +106,14 @@ def _build_full_manifest(
         "message.channels",
         "message.groups",
         "message.im",
+        "message.mpim",
+    ]
+
+    user_events = [
+        "message.channels",
+        "message.groups",
+        "message.im",
+        "message.mpim",
     ]
 
     if include_assistant:
@@ -114,11 +144,17 @@ def _build_full_manifest(
         "oauth_config": {
             "scopes": {
                 "bot": bot_scopes,
+                # User scopes are for the optional first-class-account path:
+                # a Slack user can authorize the app and Hermes can receive
+                # user_events / reply with that user's token instead of only
+                # operating as the bot transport.
+                "user": user_scopes,
             },
         },
         "settings": {
             "event_subscriptions": {
                 "bot_events": bot_events,
+                "user_events": user_events,
             },
             "interactivity": {
                 "is_enabled": True,

@@ -6203,6 +6203,26 @@ def _external_process_can_use_base_url(provider_id: str, base_url: str) -> bool:
     return False
 
 
+def _resolve_external_process_command(provider_id: str, command: str) -> Optional[str]:
+    """Resolve a subprocess-backed provider command.
+
+    macOS launchd services and Electron-launched dashboard processes often run
+    with a minimal PATH that omits ~/.local/bin. The Antigravity CLI installer
+    puts `agy` there, so check that user-local path before declaring the
+    provider unavailable.
+    """
+    if not command:
+        return None
+    resolved = shutil.which(command)
+    if resolved:
+        return resolved
+    if provider_id == "google-antigravity-cli" and command == "agy":
+        user_local_agy = os.path.expanduser("~/.local/bin/agy")
+        if os.path.isfile(user_local_agy) and os.access(user_local_agy, os.X_OK):
+            return user_local_agy
+    return None
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
@@ -6214,7 +6234,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    resolved_command = shutil.which(command) if command else None
+    resolved_command = _resolve_external_process_command(provider_id, command)
     configured = bool(resolved_command or _external_process_can_use_base_url(provider_id, base_url))
     return {
         "configured": configured,
@@ -6399,7 +6419,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
         base_url = pconfig.inference_base_url
 
     command, args, api_key = _external_process_defaults(provider_id)
-    resolved_command = shutil.which(command) if command else None
+    resolved_command = _resolve_external_process_command(provider_id, command)
     if not resolved_command and not _external_process_can_use_base_url(provider_id, base_url):
         if provider_id == "google-antigravity-cli":
             raise AuthError(

@@ -4522,6 +4522,66 @@ def test_session_steer_errors_when_agent_has_no_steer_method():
     assert resp["error"]["code"] == 4010
 
 
+def test_leftover_session_steer_runs_as_next_turn(monkeypatch):
+    """A late desktop steer must not disappear after the final tool boundary.
+
+    AIAgent returns pending_steer when session.steer() arrived too late to be
+    appended to a tool result. The desktop/TUI bridge must replay it as the next
+    user turn; otherwise the UI truthfully says "steered" while the model never
+    sees the correction.
+    """
+    prompts = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        base_url = ""
+        api_key = ""
+        tools = []
+
+        def run_conversation(self, prompt, **_kwargs):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return {
+                    "final_response": "first response",
+                    "messages": [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": "first response"},
+                    ],
+                    "pending_steer": "late correction",
+                }
+            return {
+                "final_response": "second response",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "second response"},
+                ],
+            }
+
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda *args, **kwargs: {})
+    monkeypatch.setattr(server, "_session_info", lambda *args, **kwargs: {})
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+
+    session = _session(agent=_Agent(), running=True)
+    server._sessions["sid"] = session
+    try:
+        server._run_prompt_submit("rid", "sid", session, "initial prompt")
+        deadline = time.time() + 3
+        while time.time() < deadline and len(prompts) < 2:
+            time.sleep(0.01)
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert prompts == ["initial prompt", "late correction"]
+    assert session["running"] is False
+
+
 def test_session_info_includes_mcp_servers(monkeypatch):
     fake_status = [
         {"name": "github", "transport": "http", "tools": 12, "connected": True},

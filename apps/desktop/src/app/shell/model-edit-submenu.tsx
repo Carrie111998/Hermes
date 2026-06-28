@@ -152,8 +152,9 @@ export function ModelEditSubmenu({
     }
 
     if (fastControl.kind === 'param') {
-      setModelPreset(provider, model, { fast: enabled })
-
+      // Param-fast (OpenAI Priority Processing / Anthropic speed=fast) is a
+      // live-session choice, not a remembered model preset. Persisting it made
+      // GPT reopen in fast mode by default, which is expensive and surprising.
       if (!isActive) {
         return
       }
@@ -173,7 +174,6 @@ export function ModelEditSubmenu({
           })
         } catch (err) {
           setCurrentFastMode(!enabled)
-          setModelPreset(provider, model, { fast: !enabled })
           notifyError(err, copy.fastFailed)
         }
       })()

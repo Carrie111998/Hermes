@@ -5,7 +5,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { getSessionMessages } from '@/hermes'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
-import { $currentCwd, $messages, $resumeFailedSessionId, setMessages, setResumeFailedSessionId } from '@/store/session'
+import {
+  $currentCwd,
+  $currentFastMode,
+  $messages,
+  $resumeFailedSessionId,
+  setCurrentFastMode,
+  setMessages,
+  setResumeFailedSessionId
+} from '@/store/session'
 
 import type { ClientSessionState } from '../../types'
 
@@ -26,7 +34,7 @@ function Harness({
   onReady,
   requestGateway
 }: {
-  onReady: (create: (preview?: string | null) => Promise<string | null>) => void
+  onReady: (actions: ReturnType<typeof useSessionActions>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -49,8 +57,8 @@ function Harness({
   })
 
   useEffect(() => {
-    onReady(actions.createBackendSessionForSend)
-  }, [actions.createBackendSessionForSend, onReady])
+    onReady(actions)
+  }, [actions, onReady])
 
   return null
 }
@@ -71,8 +79,8 @@ async function createWith(profileSetup: () => void): Promise<Record<string, unkn
   $currentCwd.set('')
   profileSetup()
 
-  let create: ((preview?: string | null) => Promise<string | null>) | null = null
-  render(<Harness onReady={c => (create = c)} requestGateway={requestGateway} />)
+  let create: ReturnType<typeof useSessionActions>['createBackendSessionForSend'] | null = null
+  render(<Harness onReady={actions => (create = actions.createBackendSessionForSend)} requestGateway={requestGateway} />)
   await waitFor(() => expect(create).not.toBeNull())
   await create!()
 
@@ -84,6 +92,7 @@ describe('createBackendSessionForSend profile routing', () => {
     cleanup()
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
+    setCurrentFastMode(false)
     vi.restoreAllMocks()
   })
 
@@ -116,6 +125,34 @@ describe('createBackendSessionForSend profile routing', () => {
     })
 
     expect(params).toMatchObject({ profile: 'default' })
+  })
+
+  it('does not carry fast mode from a previous session into a fresh GPT draft', async () => {
+    let createParams: Record<string, unknown> | undefined
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: null } as never
+      }
+
+      return {} as never
+    })
+
+    setCurrentFastMode(true)
+    expect($currentFastMode.get()).toBe(true)
+
+    let actions: ReturnType<typeof useSessionActions> | null = null
+    render(<Harness onReady={next => (actions = next)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(actions).not.toBeNull())
+
+    actions!.startFreshSessionDraft()
+    expect($currentFastMode.get()).toBe(false)
+
+    await actions!.createBackendSessionForSend()
+
+    expect(createParams).toBeTruthy()
+    expect(createParams).not.toHaveProperty('fast')
   })
 })
 

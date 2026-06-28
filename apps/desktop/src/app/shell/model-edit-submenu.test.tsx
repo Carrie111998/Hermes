@@ -52,17 +52,17 @@ function renderSubmenu(opts: { fastControl: FastControl; reasoning: boolean; req
   )
 }
 
-// Regression: editing the active row before a live session exists must stay
-// preset-only — the gateway's config.set falls back to global config when no
-// session matches, so it must not be called. (Caught in the second review.)
+// Regression: editing the active row before a live session exists must never
+// call the gateway — config.set falls back to global config when no session
+// matches. Reasoning stays preset-only; param-fast is draft-only.
 describe('ModelEditSubmenu no-session guard', () => {
-  it('param fast: records the preset but skips the gateway without a session', () => {
+  it('param fast: is draft-only and skips the gateway without a session', () => {
     const requestGateway = vi.fn().mockResolvedValue({})
     renderSubmenu({ fastControl: { kind: 'param', on: false }, reasoning: false, requestGateway })
 
     fireEvent.click(screen.getByRole('switch'))
 
-    expect(getModelPreset('p1', 'm1').fast).toBe(true)
+    expect(getModelPreset('p1', 'm1').fast).toBeUndefined()
     expect(requestGateway).not.toHaveBeenCalled()
   })
 

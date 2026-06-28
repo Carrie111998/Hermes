@@ -446,13 +446,13 @@ export function useSessionActions({
       })
       setSessionStartedAt(null)
       setTurnStartedAt(null)
-      // The composer's model/effort/fast is sticky UI state (persisted in
+      // The composer's model/effort is sticky UI state (persisted in
       // localStorage) — a new chat FOLLOWS your last pick instead of snapping
-      // back to the profile default, so we deliberately don't reset it here. The
-      // profile default still owns first-run seeding and profile switches (see
-      // refreshCurrentModel). Only $currentServiceTier (a live-session mirror)
-      // is cleared.
+      // back to the profile default. Fast is different: it is a paid/priority
+      // tier toggle and must not silently become the default for future GPT
+      // chats just because the last focused session had it enabled.
       setCurrentServiceTier('')
+      setCurrentFastMode(false)
       setYoloActive(false)
       // In a project → the repo's default-branch (main worktree) checkout; not in
       // a project → detached. So cmd-n "knows" the project instead of inheriting

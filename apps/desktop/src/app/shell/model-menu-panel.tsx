@@ -174,7 +174,10 @@ export function ModelMenuPanel({ gateway, onSelectModel, requestGateway }: Model
     await applyModelPreset(
       {
         effort: (caps?.reasoning ?? true) ? (preset.effort ?? 'medium') : undefined,
-        fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
+        // Param-fast models (notably GPT/OpenAI Priority Processing) must not
+        // inherit a saved "fast" default. Fast is per-session only; variant-fast
+        // models are handled above by selecting the `-fast` sibling.
+        fast: (caps?.fast ?? false) ? false : undefined
       },
       { failMessage: t.shell.modelOptions.updateFailed, request: requestGateway, sessionId: activeSessionId }
     )

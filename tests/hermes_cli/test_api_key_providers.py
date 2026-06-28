@@ -522,8 +522,26 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["args"] == ["--sandbox"]
         assert creds["source"] == "process"
 
+    def test_resolve_antigravity_uses_user_local_path_when_not_on_path(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: None)
+        monkeypatch.setenv("HOME", "/Users/tester")
+        monkeypatch.setattr(
+            "hermes_cli.auth.os.path.isfile",
+            lambda path: path == "/Users/tester/.local/bin/agy",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.auth.os.access",
+            lambda path, mode: path == "/Users/tester/.local/bin/agy" and mode == os.X_OK,
+        )
+
+        creds = resolve_external_process_provider_credentials("google-antigravity-cli")
+
+        assert creds["provider"] == "google-antigravity-cli"
+        assert creds["command"] == "/Users/tester/.local/bin/agy"
+
     def test_resolve_antigravity_missing_cli_raises(self, monkeypatch):
         monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: None)
+        monkeypatch.setattr("hermes_cli.auth.os.path.isfile", lambda path: False)
 
         with pytest.raises(AuthError) as exc:
             resolve_external_process_provider_credentials("google-antigravity-cli")

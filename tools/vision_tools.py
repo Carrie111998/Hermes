@@ -1338,7 +1338,8 @@ async def _download_video(video_url: str, destination: Path, max_retries: int = 
 async def video_analyze_tool(
     video_url: str,
     user_prompt: str,
-    model: str = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> str:
     """Analyze a video via multimodal LLM. Returns JSON {success, analysis}."""
     if not isinstance(user_prompt, str):
@@ -1456,6 +1457,8 @@ async def video_analyze_tool(
             "max_tokens": 4000,
             "timeout": vision_timeout,
         }
+        if provider:
+            call_kwargs["provider"] = provider
         if model:
             call_kwargs["model"] = model
 
@@ -1576,8 +1579,14 @@ def _handle_video_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         "including visual content, motion, audio cues, text overlays, and scene "
         f"transitions. Then answer the following question:\n\n{question}"
     )
-    model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
-    return video_analyze_tool(video_url, full_prompt, model)
+    # Video analysis needs a backend that accepts video_url parts. Gary's local
+    # active main provider (openai-codex/gpt-5.5) handles image vision but not
+    # video_url payloads reliably, while the Nous Portal multimodal path does.
+    # Keep the provider override explicit and configurable instead of letting
+    # auxiliary.vision.provider:auto route video to the image-only main model.
+    provider = os.getenv("AUXILIARY_VIDEO_PROVIDER", "").strip() or "nous"
+    model = os.getenv("AUXILIARY_VIDEO_MODEL", "").strip() or None
+    return video_analyze_tool(video_url, full_prompt, model, provider=provider)
 
 
 registry.register(
