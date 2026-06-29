@@ -5229,6 +5229,17 @@ def _build_call_kwargs(
     merged_extra = dict(extra_body or {})
     if provider == "nous":
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
+    # OpenRouter usage accounting + cheapest-provider routing on aux calls too,
+    # in parity with the main path (transport + openrouter plugin). The usage
+    # flag is load-bearing for billing: it makes the response carry usage.cost,
+    # which _account_auxiliary_cost captures into actual_cost_usd. Without it the
+    # session row's actual cost would be main-loop-only, and the Omnia reader's
+    # per-row COALESCE(actual, estimated) would silently drop the aux cost.
+    if provider == "openrouter" or base_url_host_matches(str(base_url or ""), "openrouter.ai"):
+        merged_extra["usage"] = {"include": True}
+        _or_prefs = dict(merged_extra.get("provider") or {})
+        _or_prefs.setdefault("sort", "price")
+        merged_extra["provider"] = _or_prefs
     if merged_extra:
         kwargs["extra_body"] = merged_extra
 
@@ -5297,8 +5308,17 @@ def _account_auxiliary_cost(response: Any) -> None:
         if not model_name:
             return
 
-        from agent.usage_pricing import estimate_usage_cost, normalize_usage
+        from agent.usage_pricing import (
+            estimate_usage_cost,
+            extract_provider_cost_usd,
+            normalize_usage,
+        )
         canonical = normalize_usage(usage, provider=ctx_provider)
+        # Real provider-REPORTED cost (OpenRouter usage.cost), captured exactly
+        # like the main loop so the session row's actual_cost_usd is COMPLETE
+        # (main + aux) — otherwise the Omnia reader's per-row COALESCE(actual,
+        # estimated) would drop this aux cost once the main loop reports actual.
+        reported_cost_usd = extract_provider_cost_usd(usage)
         cost = estimate_usage_cost(
             model_name,
             canonical,
@@ -5306,12 +5326,23 @@ def _account_auxiliary_cost(response: Any) -> None:
             base_url=ctx_base_url,
             api_key=ctx_api_key,
         )
-        if cost.amount_usd is None or cost.amount_usd <= 0:
-            return  # unknown price or subscription-included ⇒ nothing to add
+        estimated = (
+            float(cost.amount_usd)
+            if cost.amount_usd is not None and cost.amount_usd > 0
+            else None
+        )
+        if reported_cost_usd is None and estimated is None:
+            return  # neither a real cost nor a usable estimate ⇒ nothing to add
 
         db = _get_aux_cost_session_db()
         if db is None:
             return
+        # Complete billable delta: provider-reported when present, else the
+        # estimate — so actual_cost_usd stays complete per row even when this
+        # aux call reports no cost, and the proxy's per-row COALESCE(actual,
+        # estimated) can't prefer a partial actual and drop it. cost_status
+        # stays honest ("actual" only when truly reported).
+        billable = reported_cost_usd if reported_cost_usd is not None else estimated
         # Delta-add to the session's totals, exactly like the main loop's per-call
         # write in conversation_loop (absolute=False ⇒ increment, never overwrite).
         db.update_token_counts(
@@ -5321,9 +5352,10 @@ def _account_auxiliary_cost(response: Any) -> None:
             cache_read_tokens=canonical.cache_read_tokens,
             cache_write_tokens=canonical.cache_write_tokens,
             reasoning_tokens=canonical.reasoning_tokens,
-            estimated_cost_usd=float(cost.amount_usd),
-            cost_status=cost.status,
-            cost_source=cost.source,
+            estimated_cost_usd=estimated,
+            actual_cost_usd=billable,
+            cost_status="actual" if reported_cost_usd is not None else cost.status,
+            cost_source="provider_cost_api" if reported_cost_usd is not None else cost.source,
             model=model_name,
             api_call_count=1,
         )
@@ -5813,12 +5845,21 @@ def call_llm(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
+                _fb_base = str(getattr(fb_client, "base_url", "") or "")
                 fb_kwargs = _build_call_kwargs(
                     fb_label, fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
-                    base_url=str(getattr(fb_client, "base_url", "") or ""))
+                    base_url=_fb_base)
+                # Re-point cost accounting at the FALLBACK identity — the ctx set
+                # before the primary call still names the FAILED provider, so
+                # without this _account_auxiliary_cost would price the successful
+                # fallback response against the wrong provider/model/base_url.
+                _AUX_COST_CTX.set((
+                    fb_label, fb_kwargs.get("model"), _fb_base,
+                    str(getattr(fb_client, "api_key", "") or ""),
+                ))
                 return _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — emit a single user-visible
@@ -6273,6 +6314,14 @@ async def async_call_llm(
                 )
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
+                # Re-point cost accounting at the FALLBACK identity — see the sync
+                # path; without this the successful fallback response is priced
+                # against the failed provider/model/base_url.
+                _AUX_COST_CTX.set((
+                    fb_label, fb_kwargs.get("model"),
+                    str(getattr(async_fb, "base_url", "") or ""),
+                    str(getattr(async_fb, "api_key", "") or ""),
+                ))
                 return _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
             # All fallback layers exhausted — warn before re-raising. (#26882)
