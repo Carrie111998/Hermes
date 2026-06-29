@@ -97,6 +97,7 @@ export default defineConfig({
     logo: '/assets/product-shell.svg',
     nav: [
       { text: '图谱', link: '/visual-guide' },
+      { text: '实现地图', link: '/implementation-map' },
       { text: '地图', link: '/site-map' },
       { text: '产品', link: '/product-specs/00-index' },
       { text: '组件', link: '/product-specs/components/README' },
@@ -112,6 +113,7 @@ export default defineConfig({
         items: [
           { text: '首页', link: '/' },
           { text: '设计主线', link: '/00-design-spine' },
+          { text: '当前实现地图', link: '/implementation-map' },
           { text: '权限边界', link: '/permission-boundary-design' },
           { text: '中文总入口', link: '/README' },
           { text: '文档网站地图', link: '/site-map' },
