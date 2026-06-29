@@ -30,26 +30,36 @@ def _resolve_api_server_toolsets(
     from hermes_cli.tools_config import _get_platform_tools
 
     config = user_config if isinstance(user_config, dict) else {}
-    enabled = set(
-        _get_platform_tools(
-            config,
-            "api_server",
-            include_default_mcp_servers=include_default_mcp_servers,
+    try:
+        enabled = set(
+            _get_platform_tools(
+                config,
+                "api_server",
+                include_default_mcp_servers=include_default_mcp_servers,
+            )
         )
-    )
+    except TypeError as exc:
+        if "include_default_mcp_servers" not in str(exc):
+            raise
+        enabled = set(_get_platform_tools(config, "api_server"))
     platform_toolsets = config.get("platform_toolsets") or {}
     api_server_explicit = (
         isinstance(platform_toolsets, dict)
         and "api_server" in platform_toolsets
     )
     if not api_server_explicit:
-        cli_enabled = set(
-            _get_platform_tools(
-                config,
-                "cli",
-                include_default_mcp_servers=include_default_mcp_servers,
+        try:
+            cli_enabled = set(
+                _get_platform_tools(
+                    config,
+                    "cli",
+                    include_default_mcp_servers=include_default_mcp_servers,
+                )
             )
-        )
+        except TypeError as exc:
+            if "include_default_mcp_servers" not in str(exc):
+                raise
+            cli_enabled = set(_get_platform_tools(config, "cli"))
         enabled.update(_API_SERVER_CLI_INHERITED_TOOLSETS & cli_enabled)
 
     return sorted(enabled)
@@ -93,6 +103,8 @@ class APIServerCoreMixin:
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        self._max_concurrent_runs: int = self._resolve_max_concurrent_runs()
+        self._inflight_agent_runs: int = 0
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -108,6 +120,25 @@ class APIServerCoreMixin:
             items = [str(value)]
 
         return tuple(str(item).strip() for item in items if str(item).strip())
+
+    @staticmethod
+    def _resolve_max_concurrent_runs() -> int:
+        """Read the concurrent-run cap from config.yaml; 0 disables it."""
+        default = 10
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            raw = cfg_get(
+                load_config(),
+                "gateway",
+                "api_server",
+                "max_concurrent_runs",
+                default=default,
+            )
+            value = int(raw)
+        except Exception:
+            return default
+        return max(0, value)
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -210,6 +241,52 @@ class APIServerCoreMixin:
         if ctx.get("user_agent"):
             origin["user_agent"] = ctx["user_agent"]
         return origin
+
+    @staticmethod
+    def _bind_api_server_session(
+        *,
+        chat_id: str = "",
+        session_key: str = "",
+        session_id: str = "",
+        principal_scope: Optional[Dict[str, Any]] = None,
+    ) -> list:
+        """Bind request-scoped contextvars for an API-server agent run."""
+        from gateway.session_context import set_session_vars
+
+        scope = principal_scope or {}
+        return set_session_vars(
+            platform="api_server",
+            chat_id=chat_id,
+            session_key=session_key,
+            session_id=session_id,
+            tenant_id=str(scope.get("tenant_id") or ""),
+            workspace_id=str(scope.get("workspace_id") or ""),
+            project_id=str(scope.get("project_id") or ""),
+            user_id=str(scope.get("user_id") or ""),
+            roles=scope.get("roles"),
+            sandbox_id=str(scope.get("sandbox_id") or ""),
+            sandbox_status=str(scope.get("sandbox_status") or "active"),
+            sandbox_expires_at=scope.get("sandbox_expires_at"),
+            async_delivery=False,
+        )
+
+    def _concurrency_limited_response(self) -> Optional["web.Response"]:
+        """Return 429 when the shared API-server agent cap is exhausted."""
+        limit = self._max_concurrent_runs
+        if limit <= 0:
+            return None
+        inflight = self._inflight_agent_runs + len(self._run_streams)
+        if inflight >= limit:
+            return web.json_response(
+                _openai_error(
+                    f"Too many concurrent runs (max {limit})",
+                    err_type="rate_limit_error",
+                    code="rate_limit_exceeded",
+                ),
+                status=429,
+                headers={"Retry-After": "1"},
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Auth helper
@@ -386,7 +463,13 @@ class APIServerCoreMixin:
         — matching the semantics of the native gateway's ``session_key``.
         """
         from run_agent import AIAgent
-        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
+        from gateway.run import (
+            _current_max_iterations,
+            _resolve_runtime_agent_kwargs,
+            _resolve_gateway_model,
+            _load_gateway_config,
+            GatewayRunner,
+        )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
@@ -395,7 +478,7 @@ class APIServerCoreMixin:
         user_config = _load_gateway_config()
         enabled_toolsets = _resolve_api_server_toolsets(user_config)
 
-        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        max_iterations = _current_max_iterations()
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -440,16 +523,32 @@ class APIServerCoreMixin:
         dashboard can display full status without needing a shared PID file or
         /proc access.  No authentication required.
         """
-        from gateway.status import read_runtime_status
+        from gateway.status import (
+            derive_gateway_busy,
+            derive_gateway_drainable,
+            parse_active_agents,
+            read_runtime_status,
+        )
 
         runtime = read_runtime_status() or {}
+        gw_state = runtime.get("gateway_state")
+        gw_active = parse_active_agents(runtime.get("active_agents", 0))
         return web.json_response({
             "status": "ok",
             "platform": "hermes-agent",
             "version": _hermes_version(),
-            "gateway_state": runtime.get("gateway_state"),
+            "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}),
-            "active_agents": runtime.get("active_agents", 0),
+            "active_agents": gw_active,
+            "gateway_busy": derive_gateway_busy(
+                gateway_running=True,
+                gateway_state=gw_state,
+                active_agents=gw_active,
+            ),
+            "gateway_drainable": derive_gateway_drainable(
+                gateway_running=True,
+                gateway_state=gw_state,
+            ),
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),

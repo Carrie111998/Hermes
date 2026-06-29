@@ -17,6 +17,10 @@ class APIServerChatMixin:
         if auth_err:
             return auth_err
 
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         # Parse request body
         try:
             body = await request.json()
@@ -276,7 +280,8 @@ class APIServerChatMixin:
         is_partial = bool(result.get("partial"))
         is_failed = bool(result.get("failed"))
         completed = bool(result.get("completed", True))
-        err_msg = result.get("error")
+        raw_err_msg = result.get("error")
+        err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
@@ -347,6 +352,6 @@ class APIServerChatMixin:
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg:
-                response_headers["X-Hermes-Error"] = err_msg[:200]
+                response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
 
         return web.json_response(response_data, headers=response_headers)

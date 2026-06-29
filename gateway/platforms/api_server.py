@@ -18,6 +18,38 @@ from gateway.api_server_runs import APIServerRunsMixin
 from gateway.api_server_lifecycle import APIServerLifecycleMixin
 
 
+def _approval_notify(
+    approval_data: Dict[str, Any],
+    *,
+    loop: "asyncio.AbstractEventLoop",
+    q: "asyncio.Queue[Optional[Dict[str, Any]]]",
+    run_id: str,
+    set_run_status,
+) -> None:
+    """Enqueue a redacted approval request for API/SSE clients."""
+    event = dict(approval_data or {})
+    if "command" in event:
+        from gateway.run import _redact_approval_command
+
+        command = _redact_approval_command(event.get("command"))
+        event["command"] = command
+    event.update({
+        "event": "approval.request",
+        "run_id": run_id,
+        "timestamp": time.time(),
+        "choices": ["once", "session", "always", "deny"],
+    })
+    set_run_status(
+        run_id,
+        "waiting_for_approval",
+        last_event="approval.request",
+    )
+    try:
+        loop.call_soon_threadsafe(q.put_nowait, event)
+    except Exception:
+        logger.debug("Failed to enqueue API approval notification", exc_info=True)
+
+
 class APIServerAdapter(
     APIServerCoreMixin,
     APIServerSessionsMixin,
@@ -31,6 +63,8 @@ class APIServerAdapter(
     BasePlatformAdapter,
 ):
     """OpenAI-compatible HTTP API server adapter."""
+
+    supports_async_delivery: bool = False
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

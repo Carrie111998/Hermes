@@ -64,7 +64,11 @@ class APIServerRunsMixin:
                 principal_scope=principal_scope,
             )
 
-        return await loop.run_in_executor(None, _run)
+        self._inflight_agent_runs += 1
+        try:
+            return await loop.run_in_executor(None, _run)
+        finally:
+            self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
@@ -149,12 +153,9 @@ class APIServerRunsMixin:
         if principal_err is not None:
             return principal_err
 
-        # Enforce concurrency limit
-        if len(self._run_streams) >= self._MAX_CONCURRENT_RUNS:
-            return web.json_response(
-                _openai_error(f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})", code="rate_limit_exceeded"),
-                status=429,
-            )
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         try:
             body = await request.json()
@@ -266,25 +267,18 @@ class APIServerRunsMixin:
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": ["once", "session", "always", "deny"],
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
+                    from gateway.platforms.api_server import _approval_notify as _api_approval_notify
+
+                    _api_approval_notify(
+                        approval_data,
+                        loop=loop,
+                        q=q,
+                        run_id=run_id,
+                        set_run_status=self._set_run_status,
                     )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
 
                 def _run_sync():
-                    from gateway.session_context import clear_session_vars, set_session_vars
+                    from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
                         reset_current_session_key,
@@ -301,17 +295,11 @@ class APIServerRunsMixin:
                         # environment state.
                         approval_token = set_current_session_key(approval_session_key)
                         scope = principal_scope or {}
-                        session_tokens = set_session_vars(
-                            platform="api_server",
+                        session_tokens = self._bind_api_server_session(
                             chat_id=session_id or "",
                             session_key=approval_session_key,
                             session_id=session_id or "",
-                            tenant_id=str(scope.get("tenant_id") or ""),
-                            workspace_id=str(scope.get("workspace_id") or ""),
-                            project_id=str(scope.get("project_id") or ""),
-                            user_id=str(scope.get("user_id") or ""),
-                            roles=scope.get("roles"),
-                            sandbox_id=str(scope.get("sandbox_id") or ""),
+                            principal_scope=scope,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(

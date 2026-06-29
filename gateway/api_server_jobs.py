@@ -242,6 +242,51 @@ class APIServerJobsMixin:
         except Exception as e:
             return web.json_response({"error": str(e)}, status=500)
 
+    async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
+        """POST /api/cron/fire — Chronos managed-cron fire webhook."""
+        from hermes_cli.config import cfg_get, load_config
+        from plugins.cron_providers.chronos.verify import get_fire_verifier
+
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+
+        cfg = load_config()
+        claims = get_fire_verifier()(
+            token=token,
+            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
+            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
+            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None,
+        )
+        if claims is None:
+            logger.warning(
+                "cron fire: rejected invalid token: %s",
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response({"error": "invalid fire token"}, status=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        job_id = (body or {}).get("job_id")
+        if not job_id:
+            return web.json_response({"error": "missing job_id"}, status=400)
+
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        provider = resolve_cron_scheduler()
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(
+            asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+        )
+        try:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except (TypeError, AttributeError):
+            logger.debug("Cron fire task was not tracked by background task set", exc_info=True)
+
+        return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+
     # ------------------------------------------------------------------
     # Output extraction helper
     # ------------------------------------------------------------------

@@ -579,11 +579,21 @@ else:
     cors_middleware = None  # type: ignore[assignment]
 
 
+def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
+    """Redact API-bound error text before it crosses the HTTP boundary."""
+    from agent.redact import redact_sensitive_text
+
+    redacted = redact_sensitive_text(str(value), force=True)
+    if limit is not None:
+        return redacted[:limit]
+    return redacted
+
+
 def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
     """OpenAI-style error envelope."""
     return {
         "error": {
-            "message": message,
+            "message": _redact_api_error_text(message),
             "type": err_type,
             "param": param,
             "code": code,

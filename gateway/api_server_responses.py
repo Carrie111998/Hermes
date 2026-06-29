@@ -21,6 +21,10 @@ class APIServerResponsesMixin:
         if auth_err:
             return auth_err
 
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
+
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
@@ -259,7 +263,8 @@ class APIServerResponsesMixin:
 
         final_response = result.get("final_response", "")
         if not final_response:
-            final_response = result.get("error", "(No response generated)")
+            error_text = result.get("error")
+            final_response = _redact_api_error_text(error_text) if error_text else "(No response generated)"
 
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
         created_at = int(time.time())
@@ -488,7 +493,8 @@ class APIServerResponsesMixin:
         # Final assistant message
         final = result.get("final_response", "")
         if not final:
-            final = result.get("error", "(No response generated)")
+            error_text = result.get("error")
+            final = _redact_api_error_text(error_text) if error_text else "(No response generated)"
 
         items.append({
             "type": "message",

@@ -49,20 +49,30 @@ def run_agent_sync(
             scope.setdefault("sandbox_status", lease["status"])
             scope.setdefault("sandbox_expires_at", lease["expires_at"])
 
-    tokens = set_session_vars(
-        platform="api_server",
-        chat_id=session_id or "",
-        session_key=gateway_session_key or session_id or "",
-        session_id=session_id or "",
-        tenant_id=str(scope.get("tenant_id") or ""),
-        workspace_id=str(scope.get("workspace_id") or ""),
-        project_id=str(scope.get("project_id") or ""),
-        user_id=str(scope.get("user_id") or ""),
-        roles=scope.get("roles"),
-        sandbox_id=str(scope.get("sandbox_id") or ""),
-        sandbox_status=str(scope.get("sandbox_status") or "active"),
-        sandbox_expires_at=scope.get("sandbox_expires_at"),
-    )
+    bind_api_session = getattr(adapter, "_bind_api_server_session", None)
+    if bind_api_session is not None:
+        tokens = bind_api_session(
+            chat_id=session_id or "",
+            session_key=gateway_session_key or session_id or "",
+            session_id=session_id or "",
+            principal_scope=scope,
+        )
+    else:
+        tokens = set_session_vars(
+            platform="api_server",
+            chat_id=session_id or "",
+            session_key=gateway_session_key or session_id or "",
+            session_id=session_id or "",
+            tenant_id=str(scope.get("tenant_id") or ""),
+            workspace_id=str(scope.get("workspace_id") or ""),
+            project_id=str(scope.get("project_id") or ""),
+            user_id=str(scope.get("user_id") or ""),
+            roles=scope.get("roles"),
+            sandbox_id=str(scope.get("sandbox_id") or ""),
+            sandbox_status=str(scope.get("sandbox_status") or "active"),
+            sandbox_expires_at=scope.get("sandbox_expires_at"),
+            async_delivery=False,
+        )
     approval_token = None
     prompt_callbacks_enabled = bool(prompt_session_key and prompt_notify_callback)
 
