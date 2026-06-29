@@ -1,4 +1,4 @@
-"""Helpers for narrowing Hermes to the Ultra Studio creative skill catalog."""
+"""Helpers for narrowing Hermes to the VideoAgent/Ultra Studio skill catalog."""
 
 from __future__ import annotations
 
@@ -7,12 +7,30 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 
-DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST: tuple[str, ...] = (
+VIDEO_AGENT_CORE_SKILL_ALLOWLIST: tuple[str, ...] = (
     "workflow-router",
-    "infographic-md-flow",
     "media-qa",
     "prompt-repair",
 )
+
+VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST: tuple[str, ...] = (
+    "infographic-md-flow",
+)
+
+VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST: tuple[str, ...] = (
+    "gpt-image-2-director",
+    "marketing-studio-director",
+    "higgsfield-content-factory",
+)
+
+DEFAULT_VIDEO_AGENT_SKILL_ALLOWLIST: tuple[str, ...] = (
+    *VIDEO_AGENT_CORE_SKILL_ALLOWLIST,
+    *VIDEO_AGENT_WORKFLOW_SKILL_ALLOWLIST,
+    *VIDEO_AGENT_MARKETING_SKILL_ALLOWLIST,
+)
+
+# Backward-compatible name used by existing Ultra Studio profile helpers/tests.
+DEFAULT_ULTRA_STUDIO_SKILL_ALLOWLIST = DEFAULT_VIDEO_AGENT_SKILL_ALLOWLIST
 
 
 def _coerce_skill_name(skill: str | Mapping[str, Any]) -> str:

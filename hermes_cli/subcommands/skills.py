@@ -8,6 +8,14 @@ from __future__ import annotations
 
 from typing import Callable
 
+from hermes_cli.platforms import get_all_platforms
+
+
+def _cmd_video_agent_skills(args) -> None:
+    from hermes_cli.skills_config import video_agent_skills_command
+
+    video_agent_skills_command(args)
+
 
 def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     """Attach the ``skills`` subcommand to ``subparsers``."""
@@ -266,4 +274,20 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
         "config",
         help="Interactive skill configuration — enable/disable individual skills",
     )
+    skills_video_agent = skills_subparsers.add_parser(
+        "video-agent",
+        help="Enable only the VideoAgent skill preset for the active profile",
+    )
+    skills_video_agent.add_argument(
+        "--core-only",
+        action="store_true",
+        help="Keep only workflow-router, media-qa, and prompt-repair",
+    )
+    skills_video_agent.add_argument(
+        "--platform",
+        default=None,
+        choices=["global", *get_all_platforms().keys()],
+        help="Write a platform-specific disabled list instead of the global list",
+    )
+    skills_video_agent.set_defaults(func=_cmd_video_agent_skills)
     skills_parser.set_defaults(func=cmd_skills)

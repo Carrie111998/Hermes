@@ -11,16 +11,20 @@ Config stored in ~/.hermes/config.yaml under:
       telegram: [skill-c]
       cli: []
 """
-from typing import List, Optional, Set
+from typing import Iterable, List, Optional, Set
 
 from hermes_cli.config import cfg_get, load_config, save_config
 from hermes_cli.colors import Colors, color
-from hermes_cli.platforms import PLATFORMS as _PLATFORMS
+from hermes_cli.platforms import PLATFORMS as _PLATFORMS, get_all_platforms
 
 # Backward-compatible view: {key: label_string} so existing code that
 # iterates ``PLATFORMS.items()`` or calls ``PLATFORMS.get(key)`` keeps
 # working without changes to every call site.
 PLATFORMS = {k: info.label for k, info in _PLATFORMS.items() if k != "api_server"}
+
+
+class SkillDiscoveryError(RuntimeError):
+    """Raised when installed skill discovery fails in a write path."""
 
 # ─── Config Helpers ───────────────────────────────────────────────────────────
 
@@ -49,13 +53,109 @@ def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[st
 
 # ─── Skill Discovery ─────────────────────────────────────────────────────────
 
-def _list_all_skills() -> List[dict]:
+def _list_all_skills(*, strict: bool = False) -> List[dict]:
     """Return all installed skills (ignoring disabled state)."""
     try:
         from tools.skills_tool import _find_all_skills
         return _find_all_skills(skip_disabled=True)
-    except Exception:
+    except Exception as exc:
+        if strict:
+            raise SkillDiscoveryError("Could not discover installed skills") from exc
         return []
+
+
+def _platform_labels_for_writes() -> dict:
+    return {key: info.label for key, info in get_all_platforms().items()}
+
+
+def _normalize_platform_for_write(platform: Optional[str]) -> Optional[str]:
+    if platform is None:
+        return None
+    value = platform.strip()
+    if not value or value == "global":
+        return None
+    labels = _platform_labels_for_writes()
+    if value not in labels:
+        valid = ", ".join(["global", *sorted(labels)])
+        raise ValueError(f"Unknown platform '{value}'. Expected one of: {valid}")
+    return value
+
+
+def _platform_scope_label(platform: Optional[str]) -> str:
+    if platform is None:
+        return "All platforms"
+    return _platform_labels_for_writes().get(platform, platform)
+
+
+def apply_skill_allowlist(
+    allowlist: Iterable[str],
+    *,
+    platform: Optional[str] = None,
+) -> dict:
+    """Disable every installed skill not present in ``allowlist``.
+
+    This is the non-interactive counterpart to ``hermes skills config`` for
+    product-specific profiles that need a tight visible skill catalog.
+    """
+
+    platform = _normalize_platform_for_write(platform)
+    config = load_config()
+    installed = {s["name"] for s in _list_all_skills(strict=True)}
+    allowed = {name.strip() for name in allowlist if name and name.strip()}
+    disabled = installed - allowed
+    save_disabled_skills(config, disabled, platform)
+    enabled = installed - disabled
+    missing = allowed - installed
+    return {
+        "disabled": sorted(disabled),
+        "enabled": sorted(enabled),
+        "missing": sorted(missing),
+        "platform": platform,
+    }
+
+
+def video_agent_skills_command(args=None):
+    """Apply the built-in VideoAgent skill preset to the active profile."""
+
+    from hermes_cli.ultra_studio_skills import (
+        DEFAULT_VIDEO_AGENT_SKILL_ALLOWLIST,
+        VIDEO_AGENT_CORE_SKILL_ALLOWLIST,
+    )
+
+    platform = getattr(args, "platform", None) or None
+    if platform == "global":
+        platform = None
+    allowlist = (
+        VIDEO_AGENT_CORE_SKILL_ALLOWLIST
+        if getattr(args, "core_only", False)
+        else DEFAULT_VIDEO_AGENT_SKILL_ALLOWLIST
+    )
+
+    from rich.console import Console
+
+    console = Console()
+    try:
+        result = apply_skill_allowlist(allowlist, platform=platform)
+    except (SkillDiscoveryError, ValueError) as exc:
+        console.print(color(f"✗ VideoAgent skills not saved: {exc}", Colors.RED))
+        raise SystemExit(1) from exc
+
+    scope = _platform_scope_label(result["platform"])
+    missing = result["missing"]
+    console.print(
+        color(
+            f"✓ VideoAgent skills saved: {len(result['enabled'])} enabled, "
+            f"{len(result['disabled'])} disabled ({scope}).",
+            Colors.GREEN,
+        )
+    )
+    if missing:
+        console.print(
+            color(
+                "  Allowlist entries not installed yet: " + ", ".join(missing),
+                Colors.DIM,
+            )
+        )
 
 
 def _get_categories(skills: List[dict]) -> List[str]:
