@@ -65,7 +65,13 @@ class AtlasImageGenProvider(ImageGenProvider):
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
         model_arg = kwargs.get("model") if isinstance(kwargs.get("model"), str) else None
-        model_id, atlas_model = resolve_model(model_arg)
+        reference_image_urls = _normalize_reference_images(
+            kwargs.get("reference_image_urls")
+            or kwargs.get("reference_images")
+            or kwargs.get("images")
+        )
+        seed = kwargs.get("seed") if isinstance(kwargs.get("seed"), int) else None
+        model_id, atlas_model = resolve_model(model_arg, edit=bool(reference_image_urls))
 
         if not prompt:
             return error_response(
@@ -87,11 +93,23 @@ class AtlasImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        payload = client.build_payload(
-            atlas_model=atlas_model,
-            prompt=prompt,
-            aspect_ratio=aspect_ratio,
-        )
+        try:
+            payload = client.build_payload(
+                atlas_model=atlas_model,
+                prompt=prompt,
+                aspect_ratio=aspect_ratio,
+                reference_image_urls=reference_image_urls,
+                seed=seed,
+            )
+        except ValueError as exc:
+            return error_response(
+                error=str(exc),
+                error_type="invalid_reference_image",
+                provider="atlas",
+                model=model_id,
+                prompt=prompt,
+                aspect_ratio=aspect,
+            )
 
         try:
             body = client.generate_image(payload, api_key=api_key, api_root=api_root)
@@ -171,8 +189,23 @@ class AtlasImageGenProvider(ImageGenProvider):
             extra={
                 "atlas_model": atlas_model,
                 "atlas_aspect_ratio": payload["aspect_ratio"],
+                "reference_image_count": len(reference_image_urls),
             },
         )
+
+
+def _normalize_reference_images(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
 
 
 def register(ctx: Any) -> None:

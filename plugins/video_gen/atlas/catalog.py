@@ -52,12 +52,14 @@ ATLAS_FAMILIES: Dict[str, Dict[str, Any]] = {
         "display": "Kling v3 Pro",
         "speed": "standard",
         "price": "Atlas paid",
-        "strengths": "Kling pro text-to-video and image-to-video.",
+        "strengths": "Kling v3 Pro image-to-video with negative prompt, native sound, and start-frame guidance.",
         "text_model": "kwaivgi/kling-v3.0-pro/text-to-video",
         "image_model": "kwaivgi/kling-v3.0-pro/image-to-video",
-        "durations": (5, 10),
-        "resolutions": ("720P", "1080P"),
-        "audio": False,
+        "durations": tuple(range(3, 16)),
+        "resolutions": ("1080P", "1440P-SR"),
+        "audio": True,
+        "audio_param": "sound",
+        "negative": True,
     },
     "veo3.1": {
         "display": "Veo 3.1",
@@ -177,8 +179,12 @@ def clamp_duration(family: Dict[str, Any], duration: Optional[int]) -> int:
 
 
 def normalize_resolution(family: Dict[str, Any], resolution: str) -> str:
-    requested = (resolution or DEFAULT_RESOLUTION).strip().upper()
-    atlas_resolution = requested if requested.endswith("P") else f"{requested}P"
+    requested = (resolution or DEFAULT_RESOLUTION).strip().upper().replace("_", "-")
+    atlas_resolution = (
+        requested
+        if requested.endswith(("P", "P-SR"))
+        else f"{requested}P"
+    )
     resolutions = family.get("resolutions") or ()
     if atlas_resolution in resolutions:
         return atlas_resolution

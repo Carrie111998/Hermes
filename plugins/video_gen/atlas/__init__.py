@@ -73,12 +73,12 @@ class AtlasVideoGenProvider(VideoGenProvider):
         return {
             "modalities": ["text", "image"],
             "aspect_ratios": list(VALID_ASPECT_RATIOS),
-            "resolutions": ["720p", "1080p"],
+            "resolutions": ["720p", "1080p", "1440p-sr"],
             "max_duration": 15,
-            "min_duration": 5,
+            "min_duration": 3,
             "supports_audio": True,
-            "supports_negative_prompt": False,
-            "max_reference_images": 0,
+            "supports_negative_prompt": True,
+            "max_reference_images": 4,
         }
 
     def generate(
@@ -96,7 +96,7 @@ class AtlasVideoGenProvider(VideoGenProvider):
         seed: Optional[int] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        del negative_prompt, kwargs
+        del kwargs
         try:
             loop = asyncio.new_event_loop()
             try:
@@ -111,6 +111,7 @@ class AtlasVideoGenProvider(VideoGenProvider):
                         resolution=resolution,
                         audio=audio,
                         seed=seed,
+                        negative_prompt=negative_prompt,
                     )
                 )
             finally:
@@ -138,6 +139,7 @@ class AtlasVideoGenProvider(VideoGenProvider):
         resolution: str,
         audio: Optional[bool],
         seed: Optional[int],
+        negative_prompt: Optional[str],
     ) -> Dict[str, Any]:
         api_key, api_root = client.resolve_credentials()
         if not api_key:
@@ -156,10 +158,10 @@ class AtlasVideoGenProvider(VideoGenProvider):
                 provider="atlas",
                 prompt=prompt,
             )
-        if reference_image_urls:
+        if reference_image_urls and len(reference_image_urls) > 4:
             return error_response(
-                error="Atlas video_generate does not support reference_image_urls yet.",
-                error_type="unsupported_parameter",
+                error="Atlas video_generate supports at most 4 reference_image_urls.",
+                error_type="too_many_references",
                 provider="atlas",
                 prompt=prompt,
             )
@@ -190,6 +192,8 @@ class AtlasVideoGenProvider(VideoGenProvider):
                 resolution=resolution,
                 audio=audio,
                 seed=seed,
+                negative_prompt=negative_prompt,
+                reference_image_urls=reference_image_urls,
             )
         except ValueError as exc:
             return error_response(

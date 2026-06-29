@@ -102,6 +102,108 @@ def test_build_payload_uses_atlas_top_level_fields():
     }
 
 
+def test_build_payload_uses_images_for_reference_inputs(tmp_path):
+    from plugins.image_gen.atlas.client import build_payload
+
+    image = tmp_path / "ref.png"
+    image.write_bytes(base64.b64decode("iVBORw0KGgo="))
+
+    payload = build_payload(
+        atlas_model="google/nano-banana/edit",
+        prompt="turn this into a broadcast still",
+        aspect_ratio="landscape",
+        reference_image_urls=[str(image), "https://cdn.example/other.png"],
+        seed=7,
+    )
+
+    assert payload["model"] == "google/nano-banana/edit"
+    assert payload["images"][0].startswith("data:image/png;base64,")
+    assert payload["images"][1] == "https://cdn.example/other.png"
+    assert payload["seed"] == 7
+
+
+def test_local_reference_image_rejects_non_image_file(tmp_path):
+    from plugins.image_gen.atlas.client import build_payload
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not an image")
+
+    with pytest.raises(ValueError, match="PNG, JPEG, WebP, or GIF"):
+        build_payload(
+            atlas_model="google/nano-banana/edit",
+            prompt="edit this",
+            aspect_ratio="square",
+            reference_image_urls=[str(secret)],
+        )
+
+
+def test_local_reference_image_rejects_oversized_file(tmp_path, monkeypatch):
+    from plugins.image_gen.atlas import client
+
+    image = tmp_path / "ref.png"
+    image.write_bytes(base64.b64decode("iVBORw0KGgo="))
+    monkeypatch.setattr(client, "MAX_LOCAL_IMAGE_BYTES", 1)
+
+    with pytest.raises(ValueError, match="too large"):
+        client.build_payload(
+            atlas_model="google/nano-banana/edit",
+            prompt="edit this",
+            aspect_ratio="square",
+            reference_image_urls=[str(image)],
+        )
+
+
+def test_reference_image_rejects_remote_file_uri():
+    from plugins.image_gen.atlas.client import build_payload
+
+    with pytest.raises(ValueError, match="file:// reference images"):
+        build_payload(
+            atlas_model="google/nano-banana/edit",
+            prompt="edit this",
+            aspect_ratio="square",
+            reference_image_urls=["file://remote-host/tmp/ref.png"],
+        )
+
+
+def test_reference_image_rejects_non_image_data_uri():
+    from plugins.image_gen.atlas.client import build_payload
+
+    with pytest.raises(ValueError, match="data URIs must be PNG"):
+        build_payload(
+            atlas_model="google/nano-banana/edit",
+            prompt="edit this",
+            aspect_ratio="square",
+            reference_image_urls=["data:text/plain;base64,aGk="],
+        )
+
+
+def test_reference_image_rejects_invalid_data_uri_base64():
+    from plugins.image_gen.atlas.client import build_payload
+
+    with pytest.raises(ValueError, match="valid base64"):
+        build_payload(
+            atlas_model="google/nano-banana/edit",
+            prompt="edit this",
+            aspect_ratio="square",
+            reference_image_urls=["data:image/png;base64,not valid"],
+        )
+
+
+def test_reference_image_rejects_oversized_data_uri(monkeypatch):
+    from plugins.image_gen.atlas import client
+
+    monkeypatch.setattr(client, "MAX_LOCAL_IMAGE_BYTES", 1)
+    data_uri = "data:image/png;base64," + base64.b64encode(b"xx").decode("ascii")
+
+    with pytest.raises(ValueError, match="too large"):
+        client.build_payload(
+            atlas_model="google/nano-banana/edit",
+            prompt="edit this",
+            aspect_ratio="square",
+            reference_image_urls=[data_uri],
+        )
+
+
 def test_resolve_model_accepts_full_atlas_model_id():
     from plugins.image_gen.atlas.catalog import resolve_model
 
@@ -109,6 +211,15 @@ def test_resolve_model_accepts_full_atlas_model_id():
 
     assert model_id == "nano-banana-pro"
     assert atlas_model == "google/nano-banana-pro/text-to-image"
+
+
+def test_resolve_model_uses_edit_route_for_references():
+    from plugins.image_gen.atlas.catalog import resolve_model
+
+    model_id, atlas_model = resolve_model("nano-banana-2", edit=True)
+
+    assert model_id == "nano-banana-edit"
+    assert atlas_model == "google/nano-banana/edit"
 
 
 def test_generate_success_with_outputs_url(monkeypatch):
@@ -139,6 +250,33 @@ def test_generate_success_with_outputs_url(monkeypatch):
     assert result["atlas_model"] == "google/nano-banana-2/text-to-image"
     assert captured["payload"]["aspect_ratio"] == "1:1"
     assert captured["api_key"] == "test-key"
+
+
+def test_generate_with_references_routes_to_edit_model(monkeypatch):
+    import plugins.image_gen.atlas as atlas
+    from plugins.image_gen.atlas import client
+
+    captured = {}
+
+    def fake_generate_image(payload, *, api_key, api_root):
+        captured["payload"] = payload
+        return {"data": {"outputs": ["https://cdn.example/still.png"]}}
+
+    monkeypatch.setenv("ATLAS_API_KEY", "test-key")
+    monkeypatch.setattr(client, "generate_image", fake_generate_image)
+
+    result = atlas.AtlasImageGenProvider().generate(
+        "make a broadcast still",
+        aspect_ratio="landscape",
+        model="nano-banana-2",
+        reference_image_urls=["https://cdn.example/person.png"],
+    )
+
+    assert result["success"] is True
+    assert result["model"] == "nano-banana-edit"
+    assert result["atlas_model"] == "google/nano-banana/edit"
+    assert result["reference_image_count"] == 1
+    assert captured["payload"]["images"] == ["https://cdn.example/person.png"]
 
 
 def test_generate_success_with_urls_dict(monkeypatch):

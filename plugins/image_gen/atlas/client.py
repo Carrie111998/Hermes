@@ -6,7 +6,9 @@ import base64
 import binascii
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 import httpx
 
@@ -14,6 +16,7 @@ from agent.image_gen_provider import save_b64_image
 
 DEFAULT_API_BASE = "https://api.atlascloud.ai/v1"
 DEFAULT_TIMEOUT_SECONDS = 120
+MAX_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024
 
 _ASPECT_RATIO_MAP = {
     "landscape": "16:9",
@@ -30,12 +33,23 @@ _ASPECT_RATIO_MAP = {
     "5:4": "5:4",
 }
 _DATA_URI_RE = re.compile(r"^data:(?P<mime>image/[a-zA-Z0-9.+-]+);base64,(?P<data>.+)$", re.S)
+_INPUT_DATA_URI_RE = re.compile(
+    r"^data:(?P<mime>image/(?:png|jpe?g|webp|gif));base64,(?P<data>.+)$",
+    re.I | re.S,
+)
 _EXT_BY_MIME = {
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
     "image/webp": "webp",
     "image/gif": "gif",
+}
+_SUPPORTED_LOCAL_IMAGE_MIMES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+    "image/gif",
 }
 
 
@@ -88,6 +102,86 @@ def normalize_aspect_ratio(value: str) -> str:
     return _ASPECT_RATIO_MAP.get((value or "").strip().lower(), "16:9")
 
 
+def _local_file_from_url(value: str) -> Optional[Path]:
+    parsed = urlparse(value)
+    if parsed.scheme != "file":
+        return None
+    if parsed.netloc and parsed.netloc != "localhost":
+        raise ValueError("file:// reference images must point to local files")
+    return Path(unquote(parsed.path)).expanduser()
+
+
+def _sniff_image_mime(path: Path) -> str:
+    with path.open("rb") as fh:
+        header = fh.read(16)
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return ""
+
+
+def _image_to_data_uri(path: Path) -> str:
+    size = path.stat().st_size
+    if size > MAX_LOCAL_IMAGE_BYTES:
+        raise ValueError(
+            f"local reference image is too large; max {MAX_LOCAL_IMAGE_BYTES} bytes"
+        )
+    mime = _sniff_image_mime(path)
+    if mime not in _SUPPORTED_LOCAL_IMAGE_MIMES:
+        raise ValueError(
+            "local reference images must be PNG, JPEG, WebP, or GIF files"
+        )
+    data = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{data}"
+
+
+def _validate_data_image_uri(value: str) -> str:
+    match = _INPUT_DATA_URI_RE.match(value)
+    if not match:
+        raise ValueError(
+            "reference image data URIs must be PNG, JPEG, WebP, or GIF base64 images"
+        )
+    try:
+        decoded = base64.b64decode(match.group("data"), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("reference image data URI must contain valid base64") from exc
+    if len(decoded) > MAX_LOCAL_IMAGE_BYTES:
+        raise ValueError(
+            f"reference image data URI is too large; max {MAX_LOCAL_IMAGE_BYTES} bytes"
+        )
+    return value
+
+
+def normalize_image_input(value: str) -> str:
+    raw = (value or "").strip()
+    if raw.startswith(("http://", "https://")):
+        return raw
+    if raw.startswith("data:"):
+        return _validate_data_image_uri(raw)
+
+    file_url_path = _local_file_from_url(raw)
+    path = file_url_path or Path(raw).expanduser()
+    if not path.is_file():
+        raise ValueError(
+            "reference_image_urls must contain HTTP(S) URLs, data image URIs, or readable local image paths"
+        )
+    return _image_to_data_uri(path)
+
+
+def normalize_reference_images(value: Optional[Iterable[str]]) -> list[str]:
+    refs: list[str] = []
+    for item in value or []:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        refs.append(normalize_image_input(item))
+    return refs
+
+
 def build_payload(
     *,
     atlas_model: str,
@@ -95,8 +189,10 @@ def build_payload(
     aspect_ratio: str,
     output_format: str = "png",
     num_images: int = 1,
+    reference_image_urls: Optional[Iterable[str]] = None,
+    seed: Optional[int] = None,
 ) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "model": atlas_model,
         "prompt": prompt,
         "aspect_ratio": normalize_aspect_ratio(aspect_ratio),
@@ -104,6 +200,12 @@ def build_payload(
         "enable_sync_mode": True,
         "num_images": num_images,
     }
+    refs = normalize_reference_images(reference_image_urls)
+    if refs:
+        payload["images"] = refs
+    if seed is not None:
+        payload["seed"] = seed
+    return payload
 
 
 def generate_image(

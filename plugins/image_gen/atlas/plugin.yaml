@@ -1,6 +1,6 @@
 name: atlas
 version: 1.0.0
-description: "AtlasCloud image generation backend. Routes Hermes image_generate to Atlas Nano Banana text-to-image models through the synchronous image API."
+description: "AtlasCloud image generation backend. Routes Hermes image generation to Atlas Nano Banana text-to-image and image-edit models through the synchronous image API."
 author: NousResearch
 kind: backend
 requires_env:
