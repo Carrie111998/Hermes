@@ -119,7 +119,11 @@ class APIServerSessionsMixin:
                 )
                 if not can_access_session(db, resolved_id, principal_scope):
                     return []
-            return db.get_messages_as_conversation(resolved_id)
+            history = db.get_messages_as_conversation(resolved_id)
+            return [
+                {key: value for key, value in message.items() if key != "timestamp"}
+                for message in history
+            ]
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
