@@ -1,12 +1,15 @@
 # 资产服务
 
-状态：spec-only（仅规格说明）—— 该服务、其实体及 API 均已完整设计，但仓库中尚不存在资产服务代码、数据表或端点；当前上传仅作为聊天附件落地，无资产记录。
-日期：2026-06-11
+状态：部分实现（partial）—— 完整 Asset Service 仍未实现；P0 本地 `assets` 表已随 `ultra_media_job_finalize` 落地，可记录生成输出、URI 和最小 lineage。上传入库、资产 API、ACL、集合、搜索、mention 和下载端点仍为规格。
+日期：2026-06-29
 
 来源：
 
 - 文档：`docs/hermes-asset-library-backend-design.md`（全文：§架构形状、§核心实体、§API 面、§搜索和索引、§生成链路、§实时事件、§错误策略、§P0 切片）、`docs/ultra-studio-product-specs/03-media-asset-contract.md`（§Asset Types、§Asset Lifecycle、§来源链路（Lineage）、§QA、§Acceptance）、`docs/hermes-soulid-element-asset-model.md`（§资产类型、§最小数据模型、§工具映射、§安全要求）、`02-agent-runtime-contract.md`（§Error Contract）、`06-delivery-plan.md`（P0 第 9 项、P1 第 6-7 项）
-- 代码：无 —— 在 `tools/`、`plugins/`、`gateway/` 上执行 `rg -li "asset"` 仅返回无关命中（UI 主题、检查点管理器）；本会话已验证。上传入口仅作为聊天附件路径存在（`web/src/components/chat/ChatComposer.tsx`）。
+- 代码：P0 本地生成输出注册位于 `agent/ultra_media_store.py`
+  （`assets` 表、`finalize_job`、最小 lineage）和
+  `tools/ultra_media_job_tool.py`（`ultra_media_job_finalize`）。
+  上传入口仍仅作为聊天附件路径存在（`web/src/components/chat/ChatComposer.tsx`）。
 
 ## 目的与范围
 
@@ -20,7 +23,8 @@
 
 | 状态 | 项目 | 引用 |
 |---|---|---|
-| 已规定，未构建（Specified, not built） | `assets` / `asset_lineage` / `generation_jobs` / `collections` / `smart_groups` / `asset_references` / `asset_acl` / `asset_audit_events` 实体 | `hermes-asset-library-backend-design.md` §核心实体 |
+| 部分实现（Partial） | P0 本地 `assets` 行，记录生成输出 URI、media_type、job_id、session_id、metadata 和 lineage | `agent/ultra_media_store.py` |
+| 已规定，未构建（Specified, not built） | 完整 `asset_lineage` / `generation_jobs` / `collections` / `smart_groups` / `asset_references` / `asset_acl` / `asset_audit_events` 实体 | `hermes-asset-library-backend-design.md` §核心实体 |
 | 已规定，未构建（Specified, not built） | 两阶段上传（`uploads/init` 签名 URL -> `uploads/complete` -> 异步缩略图/元数据/嵌入） | §上传入库 |
 | 已规定，未构建（Specified, not built） | 列表/详情/来源链路/操作记录读取 API | §资产列表和详情 |
 | 已规定，未构建（Specified, not built） | 集合 CRUD（静态成员） | §Collection |
@@ -48,9 +52,9 @@
 | 功能 | 状态 |
 |---|---|
 | 将上传注册为 `media_input`，带 mime/大小验证 | 已规划（Planned）（P0 切片 1） |
-| 将生成输出注册为 `image_job`/`video_job`/`audio_job` 资产 | 已规划（Planned）（`06-delivery-plan.md` P0 第 9 项） |
+| 将生成输出注册为 `image_job`/`video_job` 资产 | 部分实现（Partial）（`ultra_media_job_finalize` 写本地 `assets`；`audio_job` 未实现） |
 | 资产生命周期管理（`uploading -> processing -> ready -> archived`） | 已规划（Planned） |
-| 来源链路图（父级、源作业、提供商作业、模型、提示词哈希、种子、用户/会话/运行） | 已规划（Planned）（`03-media-asset-contract.md` §来源链路（Lineage）） |
+| 来源链路图（父级、源作业、提供商作业、模型、提示词哈希、种子、用户/会话/运行） | 部分实现（Partial）（记录 source job、session/run/tool、输入资产、prompt、provider/model；提示词哈希/完整图未实现） |
 | 元素/角色/灵魂 ID 引用，带提供商训练状态 | 已规划（Planned）（P0 切片 4：允许模拟提供商，禁止伪造 `ready`） |
 | 集合（手动）与智能组（动态查询） | 已规划（Planned）（P0 切片 2-3） |
 | Mention/选择器搜索，带 `context=` 变体 | 已规划（Planned）（P0 切片 5） |

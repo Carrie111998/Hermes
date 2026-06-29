@@ -1,7 +1,7 @@
 # 10 媒体任务服务（Media Job Service）
 
-状态：部分实现（partial）—— 同步图像/视频生成工具、提供商注册表及 Atlas 提交/轮询客户端已实现；持久的 MediaJob 信封、`ultra_media_job_*` 工具组、作业持久化和作业事件仍处于仅规格阶段（spec-only）。
-日期：2026-06-11
+状态：部分实现（partial）—— 同步图像/视频生成工具、提供商注册表及 Atlas 提交/轮询客户端已实现；P0 本地 `ultra_media_job_create/status/finalize`、SQLite `media_jobs` / `assets` / `media_events` 已实现；取消、重试、后台轮询、网关事件流和完整 Asset Service 仍未实现。
+日期：2026-06-29
 
 来源：
 
@@ -24,7 +24,9 @@
   `resolve_credentials`）、`plugins/video_gen/atlas/catalog.py`
   （`ATLAS_FAMILIES`）、`plugins/image_gen/atlas/`（`catalog.py`、
   `client.py`），以及 `plugins/image_gen/`、`plugins/video_gen/` 下的
-  `fal`/`xai`/`openai` 提供商插件
+  `fal`/`xai`/`openai` 提供商插件；P0 本地作业层：
+  `agent/ultra_media_store.py`、`tools/ultra_media_job_tool.py`、
+  `tests/tools/test_ultra_media_job_tool.py`
 
 ## 目的与范围
 
@@ -47,10 +49,10 @@ Media Job Service 将图像/视频/音频生成作为持久的、与提供商无
 | 已实现（Implemented） | 服务端凭证解析（提示/UI 中无密钥） | `plugins/video_gen/atlas/client.py`（`resolve_credentials`）；启动门控 "Atlas credential path is explicit"（`06-delivery-plan.md`） |
 | 已实现（Implemented） | 参考图像归一化（本地文件 → 数据 URI） | `plugins/video_gen/atlas/client.py`（`normalize_image_input`、`_image_to_data_uri`） |
 | 已实现（Implemented） | 将每模型约束展示到工具 schema 和注意事项中 | `tools/video_generation_tool.py`（`_build_dynamic_video_schema`、`_format_model_caveats`）、`plugins/video_gen/atlas/catalog.py`（`ATLAS_FAMILIES` 时长/分辨率/音频） |
-| 已规定，未构建（Specified, not built） | 持久的 MediaJob 记录（包含 `job_id`、`session_id`、`run_id`、`tool_call_id`、`tokenrouter_decision_id` 等的信封） | `03-media-asset-contract.md` §Media Job Envelope；当前工具调用为同步同轮次，无持久化作业行 |
-| 已规定，未构建（Specified, not built） | `ultra_media_job_create / status / cancel / retry / finalize` 工具组 | `03-media-asset-contract.md` §Required Job Tools；代码中零 `media_job` 命中（rg，本次会话） |
-| 已规定，未构建（Specified, not built） | `media_job.created` / `media_job.updated` 网关事件 | `02-agent-runtime-contract.md` §Event Stream |
-| 已规定，未构建（Specified, not built） | 将输出注册到 Asset Service（`finalize` → 资产、缩略图、来源链路） | `03-media-asset-contract.md`；`hermes-asset-library-backend-design.md` §生成链路 |
+| 已实现（Implemented） | P0 本地 MediaJob 记录（`job_id`、`session_id`、`run_id`、`tool_call_id`、provider/model、状态、错误、输出） | `agent/ultra_media_store.py` |
+| 部分实现（Partial） | `ultra_media_job_create / status / finalize` 工具组 | `tools/ultra_media_job_tool.py`；`cancel` / `retry` 未实现 |
+| 部分实现（Partial） | `media_job.created` / `media_job.updated` / `media_job.failed` / `asset.ready` 事件记录 | `agent/ultra_media_store.py` 的 `media_events` 表；尚未接入 gateway/UI event stream |
+| 部分实现（Partial） | 将生成输出注册为本地 asset（`finalize` → `assets` 行 + lineage metadata） | `agent/ultra_media_store.py`；这不是完整 Asset Service |
 | 已规定，未构建（Specified, not built） | 作业在工作进程/会话中断后存活 | `06-delivery-plan.md` P2 门控 |
 | 缺口（Gap） | 各提供商的取消/重试语义（哪些 Atlas 路由支持取消） | 未指定 |
 
@@ -75,11 +77,11 @@ Media Job Service 将图像/视频/音频生成作为持久的、与提供商无
 | 基于配置的提供商/模型选择及可用性检查 | 已实现（Implemented）（`check_video_generation_requirements`、`_resolve_active_provider`） |
 | 向智能体展示模型注意事项消息（时长、分辨率、音频） | 已实现（Implemented）（`_format_model_caveats`） |
 | 对提供商预测进行异步轮询 | 已实现（Implemented）（同轮次 `poll`）；跨轮次持久轮询计划中 |
-| 支持状态查询的持久作业记录 | 已规划（Planned） |
+| 支持状态查询的持久作业记录 | 已实现（Implemented）（本地 SQLite `media_jobs` + `ultra_media_job_status`） |
 | 取消队列中/运行中的作业 | 已规划（Planned）（`ultra_media_job_cancel`） |
 | 使用编译修复计划进行重试 | 已规划（Planned）（`ultra_media_job_retry`；与 `prompt-repair` 技能配对） |
-| 完成：将输出注册为带有来源链路和缩略图的资产 | 已规划（Planned）（`ultra_media_job_finalize`） |
-| 向 UI 发送作业事件 | 已规划（Planned） |
+| 完成：将输出注册为带有来源链路的资产 | 部分实现（Partial）（`ultra_media_job_finalize` 写本地 `assets`；缩略图/完整 Asset Service 未实现） |
+| 向 UI 发送作业事件 | 已规划（Planned）（当前只写本地 `media_events`） |
 | 信封中的种子捕获和可复现参数 | 已规划（Planned）（信封字段存在于规格中；并非所有提供商都返回种子） |
 | TokenRouter 决策关联（`tokenrouter_decision_id`） | 已规划（Planned）；依赖于 `17-tokenrouter.md` |
 
@@ -107,22 +109,24 @@ job.running -> job.timeout                       (maps to `job_timeout` error)
 
 ## API 与事件
 
-已实现（智能体工具层面）：`generate_video` / 图像生成工具
+已实现（智能体工具层面）：`ultra_media_job_create`、
+`ultra_media_job_status`、`ultra_media_job_finalize` 包装当前
+`image_generate` / `video_generate`，并写入本地 SQLite。底层
+`generate_video` / 图像生成工具
 通过工具注册表注册（`model_tools.py` 分发）；通过
 `plugins/*/atlas/client.py` `submit`/`poll` 对 Atlas API 进行提供商调用
 （`ATLAS_API_KEY` 通过 `resolve_credentials` 在服务端）。
 
-计划中工具组（原文，`03-media-asset-contract.md` §Required Job
-Tools）：
+工具组状态（来自 `03-media-asset-contract.md` §Required Job Tools）：
 
 | 工具 | 目的 |
 |---|---|
-| `ultra_media_job_create` | 使用结构化输入创建图像/视频/音频作业。 |
-| `ultra_media_job_status` | 返回持久作业状态和进度。 |
-| `ultra_media_job_cancel` | 如支持，则取消队列中/运行中的作业。 |
-| `ultra_media_job_retry` | 使用编译修复计划进行重试。 |
-| `ultra_media_job_finalize` | 将输出注册为资产、缩略图、来源链路。 |
-| `ultra_media_constraints_get` | 在提示编译前返回模型/提供商限制。 |
+| `ultra_media_job_create` | 已实现：创建本地 MediaJob，调用当前图像/视频 provider，可自动 finalize。 |
+| `ultra_media_job_status` | 已实现：返回持久作业、输出资产、错误和本地事件。 |
+| `ultra_media_job_cancel` | 未实现。 |
+| `ultra_media_job_retry` | 未实现。 |
+| `ultra_media_job_finalize` | 部分实现：将输出注册为本地资产和来源链路；缩略图/完整资产服务未实现。 |
+| `ultra_media_constraints_get` | 未实现。 |
 
 计划中事件：`media_job.created`、`media_job.updated`，然后是 `asset.ready`
 （`02-agent-runtime-contract.md` §Event Stream）。在持久作业落地前，

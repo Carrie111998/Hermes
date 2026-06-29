@@ -52,7 +52,7 @@ User Message
   -> Inspector / History / Reuse
 ```
 
-缺口主要在中后段：结构化 workflow intent、持久 MediaJob、资产注册、统一事件、审计/用量/lineage。
+缺口主要在中后段：结构化 workflow intent、产品 UI 事件流、完整资产服务、审计/用量/lineage。
 
 ## 实现地图
 
@@ -71,8 +71,8 @@ User Message
 | Prompt Compiler | spec-only | 未发现稳定 runtime 编译器 | [13 提示词编译器](product-specs/components/13-prompt-compiler) | 把 workflow handoff 编译为工具参数，禁止自然语言裸传资产 ID。 |
 | Atlas Image Provider | implemented provider | `plugins/image_gen/atlas/__init__.py`、`plugins/image_gen/atlas/client.py` | [10 媒体任务服务](product-specs/components/10-media-job-service) | 包进 MediaJob 信封，输出交给 Asset Service finalize。 |
 | Atlas Video Provider | implemented provider | `plugins/video_gen/atlas/__init__.py`、`plugins/video_gen/atlas/client.py` | [10 媒体任务服务](product-specs/components/10-media-job-service) | 保留真实轮询和错误；不要把 poll/status URL 当输出 URL。 |
-| Media Job Service | spec-only with provider pieces | provider submit/poll 已有；无 `ultra_media_job_*` 持久工具组 | [10 媒体任务服务](product-specs/components/10-media-job-service) | 下一步 P0 优先补 `create/status/finalize` 最小信封。 |
-| Asset Service | spec-only | 当前上传仅是聊天附件；无资产表、资产 API 或来源链路端点 | [09 资产服务](product-specs/components/09-asset-service) | 补最小 `assets`/`asset_lineage`/download path，使输出可 inspect/reuse。 |
+| Media Job Service | partial / P0 local | `agent/ultra_media_store.py`、`tools/ultra_media_job_tool.py` 已提供 `ultra_media_job_create/status/finalize`、本地 SQLite `media_jobs`、`media_events` | [10 媒体任务服务](product-specs/components/10-media-job-service) | 接入 workflow-router / UI，并补 cancel/retry/background polling。 |
+| Asset Service | partial local registry | `agent/ultra_media_store.py` 的 `assets` 表会在 `finalize` 时注册生成输出；上传仍只是聊天附件 | [09 资产服务](product-specs/components/09-asset-service) | 补上传入库、资产列表/详情/download API、ACL 和 mention/reuse。 |
 | Inspector / Live Panel | partial | `web/src/components/chat/ChatInspector.tsx`、`ToolCall.tsx`、`PendingPromptPanel.tsx` | [03 检查器 / 实时面板](product-specs/components/03-inspector-live-panel) | 显示 job_id、asset_id、provider/model、输入/输出和 typed errors。 |
 | Approval Gateway | partial | chat pending prompt / approval 机制存在 | [15 人工审批网关](product-specs/components/15-human-approval-gateway) | 给高风险或高成本媒体操作增加 durable decision record。 |
 | Audit / Provenance Ledger | spec-only | 有 API server audit 相邻代码，但未串起 session/run/tool/job/asset/usage | [16 观察与溯源账本](product-specs/components/16-observation-provenance-ledger) | P0 至少写入 run/tool/job/asset 关联字段。 |
@@ -85,24 +85,24 @@ User Message
 1. 入口边界：明确当前产品入口是 Hermes web `/chat` 的临时基座，还是外部 Ultra Studio BFF。旧 `standalone-chat-panel` 文档必须降级为迁移记录。
 2. 结构化路由：让 `workflow-router` 输出可测试的 intent/handoff，包含 media type、mode、input asset roles、缺字段和下一步工具。
 3. Prompt Compiler：把 handoff 编译成 provider-neutral 工具参数，资产引用必须是结构化字段。
-4. MediaJob 最小信封：增加 `job_id/session_id/run_id/tool_call_id/provider/model/status/error/output`，先支持 create/status/finalize。
-5. Asset 最小记录：上传和生成输出都要产生 `asset_id`、download path、mime、status、lineage。
-6. 事件统一：UI 不能只看到工具文本流；需要 `media_job.*` 和 `asset.*` 事件投影。
+4. Workflow runtime 接入：让 agent 优先调用 `ultra_media_job_create`，而不是直接调用底层 `image_generate` / `video_generate`。
+5. Upload -> Asset：当前生成输出已能注册 asset，但用户上传还没有变成 `media_input asset`。
+6. 事件统一：当前只写本地 `media_events`，UI 还不能看到 `media_job.*` 和 `asset.ready` 流式投影。
 7. Inspector 绑定：右侧面板按 `job_id/asset_id` 展示真实提供商、模型、输入、输出、错误、来源链路。
 8. 审计和用量 seam：P0 至少保留 `policy_decision_id/tokenrouter_decision_id/usage_event_id` 字段，完整服务留在 Ultra 控制面。
 
 ## 不要继续误判的点
 
 - `docs/ultra-studio-zh/README.md` 和 [设计主线](00-design-spine) 已经能解释目标链路，但它们不是当前实现验收表。
-- [10 媒体任务服务](product-specs/components/10-media-job-service) 已经诚实标出持久 MediaJob 和 `ultra_media_job_*` 是 spec-only。
-- [09 资产服务](product-specs/components/09-asset-service) 已经诚实标出资产服务是 spec-only。
+- [10 媒体任务服务](product-specs/components/10-media-job-service) 现在有本地 P0 `create/status/finalize`，但 cancel/retry/background worker 仍未实现。
+- [09 资产服务](product-specs/components/09-asset-service) 现在只有生成输出的本地 asset registry，不是完整 Asset Service。
 - `web/src/pages/UltraStudioChatPage.tsx` 是迁移遗留页，不是当前路由入口。
 - `standalone-chat-panel/` 在当前仓库不存在；引用它的文档需要更新为历史/外部边界。
 - TokenRouter、Asset Service、Media Job Service、worker/orchestration 不应该默认塞回 Hermes core。Hermes 是 runtime 基座，Ultra Studio 产品层和基础服务应独立。
 
 ## 推荐下一步
 
-第一步先补 P0 的最小持久状态，而不是继续扩写大架构：
+下一步先把 P0 的最小持久状态接进运行链路，而不是继续扩写大架构：
 
 ```text
 chat upload
@@ -117,8 +117,8 @@ chat upload
 
 建议拆成两个连续 PR：
 
-1. 文档和入口校准：更新 stale panel/legacy page 说明，保证文档站从本页能跳到每个实现证据。
-2. P0 runtime slice：实现最小 MediaJob + Asset Registry，把 Atlas 输出注册为可检查、可下载、可复用的资产。
+1. Runtime 接入：让 workflow-router / Ultra profile 优先使用 `ultra_media_job_create`，并把 job/asset 结果送到 Inspector。
+2. Upload 入库：把 `/api/chat/uploads` 返回值注册为 `media_input asset`，让 image-to-video 走结构化 asset ref。
 
 完成这两步后，再接 TokenRouter/usage/audit 才不会变成没有状态源的控制面。
 
