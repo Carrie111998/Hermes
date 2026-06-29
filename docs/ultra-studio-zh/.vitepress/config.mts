@@ -41,7 +41,8 @@ const infraItems = [
   { text: '执行面设计', link: '/infra-design/04-execution-plane-design' },
   { text: '数据面设计', link: '/infra-design/05-data-plane-design' },
   { text: '安全与运维设计', link: '/infra-design/06-security-ops-design' },
-  { text: '验证路线', link: '/infra-design/07-validation-roadmap' }
+  { text: '验证路线', link: '/infra-design/07-validation-roadmap' },
+  { text: 'Hermes Fork 隔离迁移', link: '/infra-design/08-hermes-fork-isolation-migration' }
 ]
 
 const researchItems = [
@@ -110,6 +111,8 @@ export default defineConfig({
         collapsed: false,
         items: [
           { text: '首页', link: '/' },
+          { text: '设计主线', link: '/00-design-spine' },
+          { text: '权限边界', link: '/permission-boundary-design' },
           { text: '中文总入口', link: '/README' },
           { text: '文档网站地图', link: '/site-map' },
           { text: '信息保留与上线', link: '/preservation-and-deploy' },

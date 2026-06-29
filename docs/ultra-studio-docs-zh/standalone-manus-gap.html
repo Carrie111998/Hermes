@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manus 差距调研 | Ultra Studio 中文文档站</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文文档站</a>
+        <a class="chip" href="standalone-skill-tool-prompt.html">上一页</a>
+        <a class="chip" href="standalone-real-chat-ui.html">下一页</a>
+      </nav>
+      <h1>Manus 差距调研</h1>
+      <p class="lede">比较 Ultra Studio/Hermes fork 与 Manus-style general agent 的差距。</p>
+      <div class="meta">
+        <span class="badge research">调研</span>
+        <a class="chip" href="../ultra-studio-zh/standalone/ultra-studio-agent-manus-gap-research.html">打开中文详细版</a>
+        <a class="chip" href="../ultra-studio-agent-manus-gap-research.md">打开原文</a>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="panel">
+      <div class="grid">
+        <article class="card">
+          <h2>这份文档解决什么</h2>
+          <p>Manus 的核心不是模型，而是任务计算机：sandbox、browser、filesystem、artifact、long-running lifecycle、skills、human takeover。</p>
+        </article>
+        <article class="card">
+          <h2>P0 相关结论</h2>
+          <ul>
+          <li>Ultra Studio 需要 stronger task-computer infra，但 P0 不必一次性实现全部。</li>
+          <li>优先补 artifact browser、task files、durable media jobs。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>阅读位置</h2>
+          <p>这是中文阅读层，原文仍然保留为审计来源。需要写代码或开 issue 时，先读本页，再回到原文看细节。</p>
+        </article>
+      </div>
+      <h2>相邻阅读</h2>
+      <nav class="crumbs">
+        <a class="chip" href="README.html">返回总入口</a>
+        <a class="chip" href="standalone-skill-tool-prompt.html">上一页</a>
+        <a class="chip" href="standalone-real-chat-ui.html">下一页</a>
+      </nav>
+      <p class="footer">中文页用于串联和快速理解，不替代英文原文的完整细节。</p>
+    </section>
+  </main>
+</body>
+</html>

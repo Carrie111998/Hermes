@@ -10,6 +10,8 @@
 这是把 Ultra Studio / Hermes Agent 相关产品、组件、调研和基建设计串起来的中文详细文档包。优先从这里阅读；需要核对英文原文时，再回到对应源文档。
 
 - [先看可视化导读](visual-guide)：四张图解释 P0 闭环、三栏界面、系统分层和阅读路线。
+- [设计主线](00-design-spine)：锁定产品边界、P0 闭环、当前状态、目标架构和 source of truth。
+- [权限边界与零信任执行设计](permission-boundary-design)：定义 Prompt、UI、Router、Policy、Asset、Worker 的授权边界。
 - [文档网站地图](site-map)：说明每个分区解决什么问题，以及推荐阅读顺序。
 - [完整建设图谱](architecture-blueprint)：完整系统总图、控制面、执行面、数据面、安全运维和路线图。
 - [完整长期参考](long-term-reference)：把 TokenRouter、CometAPI、Sandbox lifecycle、Asset Service、Memory、Marketplace、Ledger 和 Cloud tenant layer 放到同一张长期地图里。
@@ -23,6 +25,8 @@
 
 ## 站点入口
 
+- [设计主线](00-design-spine)
+- [权限边界与零信任执行设计](permission-boundary-design)
 - [文档网站地图](site-map)
 - [源文档归档总览](source-archive/README)
 - [完整源文档清单](source-archive/inventory)
@@ -82,6 +86,7 @@
 - [数据面设计](infra-design/05-data-plane-design)
 - [安全与运维设计](infra-design/06-security-ops-design)
 - [基础设施验证路线](infra-design/07-validation-roadmap)
+- [Hermes Fork 隔离与多租户控制面迁移](infra-design/08-hermes-fork-isolation-migration)
 
 ## 独立专题
 

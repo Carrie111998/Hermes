@@ -25,6 +25,8 @@ document without reading everything.
 | [05-memory-marketplace-files.md](05-memory-marketplace-files.md) | Memory, Marketplace, Files, task filesystem, skill/templates catalog. | Product + platform |
 | [06-delivery-plan.md](06-delivery-plan.md) | Milestones, P0/P1/P2, acceptance checks, launch gates. | Everyone |
 | [components/README.md](components/README.md) | Per-component complete functional specs (19 components). | Engineering |
+| [../ultra-studio-zh/visual-guide.html](../ultra-studio-zh/visual-guide.html) | 中文可视化导读：P0 闭环、三栏界面、系统分层和阅读路线。 | Everyone |
+| [../ultra-studio-docs-zh/README.html](../ultra-studio-docs-zh/README.html) | 中文串联文档站，连接产品规格、组件、调研、基建和架构附录。 | Product + engineering |
 | [components-zh/README.html](components-zh/README.html) | 中文可读版组件规格，按状态、缺口、P0 和验收点整理。 | Product + engineering |
 
 ## Source References

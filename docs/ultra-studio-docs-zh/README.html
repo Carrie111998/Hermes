@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ultra Studio 中文文档站</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="../ultra-studio-product-specs/00-index.md">Product Specs</a>
+        <a href="../ultra-studio-product-specs/components-zh/README.html">组件中文页</a>
+        <a href="../ultra-studio-infra-design/00-index.md">Infra Specs</a>
+        <a href="../ultra-studio-research-analysis/00-index.md">Research Pack</a>
+      </nav>
+      <h1>Ultra Studio 中文文档站</h1>
+      <p class="lede">把分散的产品规格、组件规格、调研分析、基建设计和架构附录串成一条可读路线。先读中文页建立地图，再点原文看完整细节。</p>
+      <div class="meta">
+        <span class="badge product">产品规格</span>
+        <span class="badge research">调研分析</span>
+        <span class="badge infra">基础设施</span>
+        <span class="chip">29 个串联页面</span>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="panel">
+      <div class="callout"><strong>先看图：</strong><a href="../ultra-studio-zh/visual-guide.html">打开可视化导读</a>。<strong>完整中文详细版：</strong><a href="../ultra-studio-zh/README.html">打开 Ultra Studio 中文详细文档总入口</a>。这里保留为快速阅读层。</div>
+    </section>
+    <section class="panel">
+      <h2>最快阅读路径</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>要开始实现 P0</h3>
+          <p>读产品 00-06，然后读组件 01、02、12、10、19、03。目标是跑通真实 Atlas 生成闭环。</p>
+        </article>
+        <article class="card">
+          <h3>要补基建视角</h3>
+          <p>读 research 05/06，再读 infra 00-07。重点是状态 owner、TokenRouter、CometAPI、sandbox、asset data plane。</p>
+        </article>
+        <article class="card">
+          <h3>要追溯为什么</h3>
+          <p>读 research 90、Manus gap、research appendix。它们保存调研证据、drift 修正和开放问题。</p>
+        </article>
+      </div>
+
+      <h2>完整串联目录</h2>
+      <table class="table">
+        <thead><tr><th>#</th><th>中文页</th><th>层级</th><th>内容</th><th>原文</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>01</td>
+            <td><a href="product-00-index.html">产品规格总览</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>说明为什么 Ultra Studio 不是一个 PRD，而是一组互相咬合的产品、运行时、媒体任务、资产库、记忆、市场和技能规格。</td>
+            <td><a href="../ultra-studio-product-specs/00-index.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>02</td>
+            <td><a href="product-01-product-surface.html">产品表面与用户工作台</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>定义 Ultra Studio 的主界面：左侧导航、中心创作会话、右侧 Inspector，以及用户主要工作。</td>
+            <td><a href="../ultra-studio-product-specs/01-product-surface.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>03</td>
+            <td><a href="product-02-agent-runtime-contract.html">Agent 运行时合同</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>定义 Web UI、Gateway、session、sandbox、agent runtime、tools、media jobs 之间怎么交互。</td>
+            <td><a href="../ultra-studio-product-specs/02-agent-runtime-contract.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>04</td>
+            <td><a href="product-03-media-asset-contract.html">媒体与资产合同</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>把上传、生成图、生成视频、角色、Element、task file 都定义成 typed product objects。</td>
+            <td><a href="../ultra-studio-product-specs/03-media-asset-contract.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>05</td>
+            <td><a href="product-04-skill-tool-prompt-contract.html">Skill / Tool / Prompt 合同</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>定义 Ultra Studio 如何避免暴露 87 个无关技能，改为 focused creative skill system。</td>
+            <td><a href="../ultra-studio-product-specs/04-skill-tool-prompt-contract.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>06</td>
+            <td><a href="product-05-memory-marketplace-files.html">Memory / Marketplace / Files</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>定义左侧导航里的 durable workspace surfaces：Marketplace、Files、Memory、Tasks。</td>
+            <td><a href="../ultra-studio-product-specs/05-memory-marketplace-files.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>07</td>
+            <td><a href="product-06-delivery-plan.html">交付计划</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>把系统拆成 P0 真实闭环、P1 生产创作工作流、P2 任务计算机三个阶段。</td>
+            <td><a href="../ultra-studio-product-specs/06-delivery-plan.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>08</td>
+            <td><a href="components.html">19 个组件规格入口</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>组件层中文阅读版，逐个说明左侧导航、聊天、Inspector、资产服务、TokenRouter、CometAPI 等状态。</td>
+            <td><a href="../ultra-studio-product-specs/components-zh/README.html">原文</a></td>
+          </tr>
+          <tr>
+            <td>09</td>
+            <td><a href="research-00-index.html">调研分析总览</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>最终调研分析包，把 P0 MVP、agent/tool/media 合同、安全边界、云基础设施、完整系统视角串起来。</td>
+            <td><a href="../ultra-studio-research-analysis/00-index.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>10</td>
+            <td><a href="research-01-p0-mvp-vertical-slice.html">P0 MVP 垂直切片</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>定义最小真实产品切片：React chat、upload、workflow-router、Atlas wrapper、media_jobs、media_assets、media cards。</td>
+            <td><a href="../ultra-studio-research-analysis/01-p0-mvp-vertical-slice.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>11</td>
+            <td><a href="research-02-p0-agent-skill-tool-media-contracts.html">P0 Agent / Skill / Tool / Media 合同</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>收敛 P0 需要的 router、skill、media job、asset、provider constraints 合同。</td>
+            <td><a href="../ultra-studio-research-analysis/02-p0-agent-skill-tool-media-contracts.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>12</td>
+            <td><a href="research-03-p0-security-credential-boundaries.html">P0 安全与凭证边界</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>说明 P0 如何先用服务端 env credential shim，同时保留 TokenRouter seam。</td>
+            <td><a href="../ultra-studio-research-analysis/03-p0-security-credential-boundaries.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>13</td>
+            <td><a href="research-04-later-cloud-infra-roadmap.html">后续云基础设施路线</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>列出 Keycloak、OPA、OpenBao、Temporal、NATS、Kata/E2B、Browserbase、CometAPI、GPU scheduling 等后续能力。</td>
+            <td><a href="../ultra-studio-research-analysis/04-later-cloud-infra-roadmap.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>14</td>
+            <td><a href="research-05-complete-system-perspective.html">完整系统视角</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>定义完整目标形态：Experience、Agent Runtime、Media Execution、Asset Data、Control Boundary、Expansion Layer。</td>
+            <td><a href="../ultra-studio-research-analysis/05-complete-system-perspective.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>15</td>
+            <td><a href="research-06-extension-seams-migration-plan.html">扩展接口与迁移计划</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>规定 P0 必须保留哪些 seam，未来如何从本地 P0 迁移到 worker、TokenRouter、object storage、CometAPI。</td>
+            <td><a href="../ultra-studio-research-analysis/06-extension-seams-migration-plan.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>16</td>
+            <td><a href="research-90-open-questions.html">研究附录与开放问题</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>记录线程调研、外部参考、代码证据、drift 修正和还没决定的问题。</td>
+            <td><a href="../ultra-studio-research-analysis/90-research-appendix-open-questions.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>17</td>
+            <td><a href="infra-00-index.html">基础设施设计总览</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>专门讲基建，不讲 UI 组件。覆盖 control plane、execution plane、data plane、安全和运维。</td>
+            <td><a href="../ultra-studio-infra-design/00-index.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>18</td>
+            <td><a href="infra-01-reference-research.html">基建参考调研</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>整理 Manus、E2B、Browserbase、OpenAI/Anthropic computer use、Temporal、LangGraph、媒体队列 API 和 Hermes 现状。</td>
+            <td><a href="../ultra-studio-infra-design/01-reference-research.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>19</td>
+            <td><a href="infra-02-boundary-map.html">基础设施边界图</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>按层列出 Edge/Gateway、Identity、Policy、Sandbox、Filesystem、Event Bus、GPU、Asset、Storage、Observability 等边界。</td>
+            <td><a href="../ultra-studio-infra-design/02-boundary-map.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>20</td>
+            <td><a href="infra-03-control-plane-design.html">控制面设计</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>覆盖 Edge Gateway、Identity、OPA、TokenRouter、quota、approval、Gateway/Session 合同。</td>
+            <td><a href="../ultra-studio-infra-design/03-control-plane-design.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>21</td>
+            <td><a href="infra-04-execution-plane-design.html">执行面设计</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>覆盖 sandbox、browser context、filesystem mount、durable jobs、event bus、GPU scheduling。</td>
+            <td><a href="../ultra-studio-infra-design/04-execution-plane-design.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>22</td>
+            <td><a href="infra-05-data-plane-design.html">数据面设计</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>覆盖 CometAPI、Asset Library、object storage、Postgres RLS、media lineage、memory/files/marketplace。</td>
+            <td><a href="../ultra-studio-infra-design/05-data-plane-design.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>23</td>
+            <td><a href="infra-06-security-ops-design.html">安全与运维设计</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>覆盖 zero-trust isolation、guardrails、egress、audit、observability、service mesh、GitOps、incident checks。</td>
+            <td><a href="../ultra-studio-infra-design/06-security-ops-design.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>24</td>
+            <td><a href="infra-07-validation-roadmap.html">基础设施验证路线</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>定义 P0/P1/P2 基建验证、失败测试和 launch gates。</td>
+            <td><a href="../ultra-studio-infra-design/07-validation-roadmap.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>25</td>
+            <td><a href="standalone-skill-tool-prompt.html">完整 Skill / Tool / Prompt 实施规格</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>把 fork 改造成 Atlas-first 视频创作 agent 的完整实施规格。</td>
+            <td><a href="../ultra-studio-agent-skill-tool-prompt-design.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>26</td>
+            <td><a href="standalone-manus-gap.html">Manus 差距调研</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>比较 Ultra Studio/Hermes fork 与 Manus-style general agent 的差距。</td>
+            <td><a href="../ultra-studio-agent-manus-gap-research.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>27</td>
+            <td><a href="standalone-real-chat-ui.html">真实聊天 Agent UI 合同</a></td>
+            <td><span class="badge product">产品 / 实施</span></td>
+            <td>定义网页聊天必须连接真实 Hermes，而不是 fake demo 或 hardcoded 视频结果。</td>
+            <td><a href="../hermes-real-chat-agent-ui.md">原文</a></td>
+          </tr>
+          <tr>
+            <td>28</td>
+            <td><a href="standalone-architecture.html">架构图</a></td>
+            <td><span class="badge infra">基建</span></td>
+            <td>现有 Ultra Studio agent architecture HTML 图。</td>
+            <td><a href="../ultra-studio-agent-architecture.html">原文</a></td>
+          </tr>
+          <tr>
+            <td>29</td>
+            <td><a href="standalone-research-appendix.html">完整研究附录</a></td>
+            <td><span class="badge research">调研</span></td>
+            <td>更大的研究附录和背景材料。</td>
+            <td><a href="../ultra-studio-agent-research-appendix.html">原文</a></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>组件规格</h2>
+      <div class="callout">19 个组件已在独立中文索引里展开。这里不复制一遍，避免两份中文内容漂移。</div>
+      <p><a class="chip" href="../ultra-studio-product-specs/components-zh/README.html">打开 19 个组件中文规格</a></p>
+
+      <h2>当前工作区草稿</h2>
+      <div class="callout">这些文件当前存在于本机工作区，但不一定都已经进入 git。它们适合本地串读；提交前要单独确认是否纳入版本库。</div>
+      <table class="table">
+        <thead><tr><th>文档</th><th>用途</th><th>状态</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><a href="../hermes-asset-library-backend-design.md">资产库后端设计</a></td>
+            <td>定义 Asset Service、Collection、Smart Group、Character 的后端方向。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+          <tr>
+            <td><a href="../hermes-tokenrouter-credential-flow.md">TokenRouter 凭证流</a></td>
+            <td>定义未来云模式下 provider key、quota、policy、vault 交换。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+          <tr>
+            <td><a href="../hermes-cometapi-media-gateway.md">CometAPI 媒体网关</a></td>
+            <td>定义长视频/外部媒体的数据面预处理。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+          <tr>
+            <td><a href="../hermes-tool-contracts-from-notion.md">Notion 工具合同落地</a></td>
+            <td>从 Notion 源文档抽出的工具合同。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+          <tr>
+            <td><a href="../hermes-soulid-element-asset-model.md">SoulID / Element / Asset 模型</a></td>
+            <td>角色一致性和可复用资产模型。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+          <tr>
+            <td><a href="../hermes-open-source-architecture-plan.md">开源架构计划</a></td>
+            <td>外部开源组件选型和集成计划。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+          <tr>
+            <td><a href="../higgsfield-supercomputer-dialogue-architecture-research.md">Higgsfield 对话架构调研</a></td>
+            <td>参考 Supercomputer 对话式创作体验。</td>
+            <td><span class="badge draft">当前工作区草稿</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p class="footer">这套中文页是阅读层。英文 Markdown/HTML 仍是详细审计来源。新增实现前优先使用原文中的代码路径和验收点。</p>
+    </section>
+  </main>
+</body>
+</html>

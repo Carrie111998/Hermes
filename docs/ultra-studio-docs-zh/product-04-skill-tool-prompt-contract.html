@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Skill / Tool / Prompt 合同 | Ultra Studio 中文文档站</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap">
+      <nav class="crumbs" aria-label="breadcrumb">
+        <a href="README.html">中文文档站</a>
+        <a class="chip" href="product-03-media-asset-contract.html">上一页</a>
+        <a class="chip" href="product-05-memory-marketplace-files.html">下一页</a>
+      </nav>
+      <h1>Skill / Tool / Prompt 合同</h1>
+      <p class="lede">定义 Ultra Studio 如何避免暴露 87 个无关技能，改为 focused creative skill system。</p>
+      <div class="meta">
+        <span class="badge product">产品 / 实施</span>
+        <a class="chip" href="../ultra-studio-zh/product-specs/04-skill-tool-prompt-contract.html">打开中文详细版</a>
+        <a class="chip" href="../ultra-studio-product-specs/04-skill-tool-prompt-contract.md">打开原文</a>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <section class="panel">
+      <div class="grid">
+        <article class="card">
+          <h2>这份文档解决什么</h2>
+          <p>用户说“我要做视频”时，agent 需要先路由、再加载对应 workflow、再编译 provider payload，而不是随机调用无关 skill。</p>
+        </article>
+        <article class="card">
+          <h2>P0 相关结论</h2>
+          <ul>
+          <li>workflow-router 输出 intent、execution_mode、workflow_skill、asset_roles、missing、handoff。</li>
+          <li>只在答案会改变时问澄清问题。</li>
+          <li>Atlas 生成工具和 provider constraints 要进入 prompt compiler。</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>阅读位置</h2>
+          <p>这是中文阅读层，原文仍然保留为审计来源。需要写代码或开 issue 时，先读本页，再回到原文看细节。</p>
+        </article>
+      </div>
+      <h2>相邻阅读</h2>
+      <nav class="crumbs">
+        <a class="chip" href="README.html">返回总入口</a>
+        <a class="chip" href="product-03-media-asset-contract.html">上一页</a>
+        <a class="chip" href="product-05-memory-marketplace-files.html">下一页</a>
+      </nav>
+      <p class="footer">中文页用于串联和快速理解，不替代英文原文的完整细节。</p>
+    </section>
+  </main>
+</body>
+</html>
