@@ -1276,6 +1276,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
+            # Track generic tool failures for the turn-end tool-verifier footer.
+            if is_error and not blocked:
+                try:
+                    agent._record_tool_failure(
+                        function_name, function_result,
+                    )
+                except Exception as _fail_err:
+                    logging.debug("tool failure tracking error: %s", _fail_err)
+
+            if not blocked and agent.tool_progress_callback:
+                try:
+                    agent.tool_progress_callback(
+                        "tool.completed", function_name, None, None,
+                        duration=tool_duration, is_error=is_error,
+                        result=function_result,
+                    )
+                except Exception as cb_err:
+                    logging.debug(f"Tool progress callback error: {cb_err}")
+
             if agent.verbose_logging:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
@@ -2011,6 +2030,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
+
+        # Track generic tool failures for the turn-end tool-verifier footer.
+        if _is_error_result and not _execution_blocked:
+            try:
+                agent._record_tool_failure(
+                    function_name, function_result,
+                )
+            except Exception as _fail_err:
+                logging.debug("tool failure tracking error: %s", _fail_err)
+
+        if not _execution_blocked and agent.tool_progress_callback:
+            try:
+                agent.tool_progress_callback(
+                    "tool.completed", function_name, None, None,
+                    duration=tool_duration, is_error=_is_error_result,
+                    result=function_result,
+                )
+            except Exception as cb_err:
+                logging.debug(f"Tool progress callback error: {cb_err}")
 
         agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""
