@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workspace Volume Mounter / POSIX Data Isolation - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Workspace Volume Mounter / POSIX Data Isolation</h1>
+<p>把 tenant/workspace/project/session 的文件、memory、outputs 以 POSIX 文件系统形式挂进 sandbox，同时让底层容量和生命周期走对象存储。</p>
+<div class="meta"><span class="pill">推荐：JuiceFS CSI backed by object storage</span><span class="pill">对应 spec：Sections 8, 15, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="04-sandbox-runtime-isolation.html">上一项</a><a href="06-tokenrouter-secrets-boundary.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>JuiceFS CSI backed by object storage 是该模块的主选型。Agent 和工具天然按文件系统工作，需要 POSIX 语义、目录遍历、临时输出和原子文件写入；直接 S3 API 会让工具改造成本高。</section>
+<section><h2>为什么选它</h2><ul><li>Agent 和工具天然按文件系统工作，需要 POSIX 语义、目录遍历、临时输出和原子文件写入；直接 S3 API 会让工具改造成本高。</li>
+<li>JuiceFS 把元数据和对象数据分离，适合用对象存储承载大规模媒体/文件，同时通过 CSI 给 sandbox pod 挂载。</li>
+<li>相比共享 NFS，JuiceFS 更适合弹性容量和云对象存储；相比直接 CephFS，后续迁移到云 S3/R2/GCS 更灵活。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>CephFS CSI</strong></td><td>强 POSIX，一体化存储，适合自建 Rook-Ceph</td><td>和底层 Ceph 强绑定；跨云对象存储迁移没有 JuiceFS 灵活</td></tr>
+<tr><td><strong>NFS/EFS</strong></td><td>成熟简单</td><td>租户隔离、审计、弹性缓存和大规模小文件/媒体混合负载要额外治理</td></tr>
+<tr><td><strong>direct object storage only</strong></td><td>权限边界清晰，成本低</td><td>不适配大部分 agent/tool 的文件工作流，需要大量工具重写</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>Volume Mounter 是控制面服务，不让 agent 直接指定挂载源；agent 只能请求抽象 path set：`.memories`、`files`、`outputs`、`AGENTS.md`、`project.md`。</li>
+<li>Mounter 调 OPA 判断 requested_paths，再创建/绑定 CSI volume 或 subPath，挂载到 `/workspace`。</li>
+<li>每个 project 有独立 namespace/prefix；session outputs 可以写，AGENTS.md/project.md 默认只读，skill internals 永不挂进 sandbox。</li>
+<li>对 bulk read/export 走 egress filter，不靠文件系统权限单独兜底。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：project 级 JuiceFS volume，session 输出目录隔离。</li>
+<li>第二阶段：per-session snapshot/restore，失败 job 输出自动归档。</li>
+<li>第三阶段：冷热缓存、文件 lineage、对象生命周期策略和租户加密上下文。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>请求未授权路径时 mount policy 返回 deny。</li>
+<li>Sandbox 内没有 skill `references/*` 和 provider credentials。</li>
+<li>Tenant A project volume 无法由 Tenant B session mount。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://juicefs.com/docs/csi/introduction/">JuiceFS CSI introduction</a></li>
+<li><a href="https://juicefs.com/docs/cloud/use_juicefs_in_kubernetes">Use JuiceFS in Kubernetes</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

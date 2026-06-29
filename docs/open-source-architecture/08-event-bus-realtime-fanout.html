@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Event Bus / Realtime Fanout - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Event Bus / Realtime Fanout</h1>
+<p>处理 session 事件、tool progress、job status、worker heartbeat、轻量控制消息和可回放的事件流。</p>
+<div class="meta"><span class="pill">推荐：NATS JetStream</span><span class="pill">对应 spec：Sections 5, 10, 13, 16</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="07-durable-session-job-orchestration.html">上一项</a><a href="09-gpu-render-scheduling.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>NATS JetStream 是该模块的主选型。Hermes 需要低延迟事件推送和短期持久化回放，而不是只要一个重型日志管道。NATS JetStream 同时提供 pub/sub、stream、durable consumer 和 at-least-once delivery。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 需要低延迟事件推送和短期持久化回放，而不是只要一个重型日志管道。NATS JetStream 同时提供 pub/sub、stream、durable consumer 和 at-least-once delivery。</li>
+<li>相比 Kafka，NATS 运维轻、延迟低，更适合 session fanout 和控制面事件；相比 Redis Streams，NATS 的 subject/ACL/cluster 模型更适合多服务消息总线。</li>
+<li>它和 Temporal 分工清楚：Temporal 负责 durable workflow truth，NATS 负责事件广播和可短期回放的用户体验流。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Kafka/Redpanda</strong></td><td>吞吐极高，生态强</td><td>对 session fanout 和控制消息偏重；运维与容量规划成本更高</td></tr>
+<tr><td><strong>RabbitMQ</strong></td><td>传统队列成熟</td><td>stream replay、subject routing 和轻量 request/reply 不如 NATS 贴合</td></tr>
+<tr><td><strong>Redis Streams/PubSub</strong></td><td>部署简单</td><td>多租户 ACL、持久化语义和大规模 stream 运维边界较弱</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>Subject 命名必须包含作用域：`tenant.&lt;tid&gt;.workspace.&lt;wid&gt;.session.&lt;sid&gt;.events`，内部服务使用 service account ACL。</li>
+<li>前端不能直接连接 NATS；Edge/Realtime Fanout Service 订阅授权 subject 后转 SSE/WebSocket。</li>
+<li>Job worker 发布 progress event，Job Manager/Temporal 仍负责最终状态写入。</li>
+<li>JetStream retention 按事件类型配置：session events 短保留，audit 不走 NATS 作为唯一存储。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：session events stream + fanout service。</li>
+<li>第二阶段：worker heartbeat、job progress、dead-letter stream。</li>
+<li>第三阶段：per-tenant event quotas、backpressure、consumer lag alerts。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>无授权 fanout 服务不能订阅跨 tenant wildcard。</li>
+<li>SSE reconnect 能从 last_event_id 后补短期事件。</li>
+<li>JetStream consumer lag 会触发告警而不是静默丢状态。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://docs.nats.io/nats-concepts/jetstream">NATS JetStream concepts</a></li>
+<li><a href="https://docs.nats.io/nats-concepts/jetstream/consumers">NATS JetStream consumers</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

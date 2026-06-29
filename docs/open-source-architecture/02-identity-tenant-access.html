@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Identity / Tenant Access - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Identity / Tenant Access</h1>
+<p>负责 OIDC/OAuth2 登录、企业 IdP federation、客户端注册、用户身份令牌和可审计的身份生命周期。</p>
+<div class="meta"><span class="pill">推荐：Keycloak</span><span class="pill">对应 spec：Sections 4, 6, 13, 14</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="01-edge-gateway-realtime-ingress.html">上一项</a><a href="03-policy-engine-authorization.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Keycloak 是该模块的主选型。Hermes 需要标准 OIDC/JWT、企业 SSO、服务端验证、client policies 和管理 API；Keycloak 的成熟度和生态最适合作为自托管身份层。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 需要标准 OIDC/JWT、企业 SSO、服务端验证、client policies 和管理 API；Keycloak 的成熟度和生态最适合作为自托管身份层。</li>
+<li>租户模型不能完全塞进身份系统。Keycloak 负责认证和高层 claim，workspace/project/membership 仍由 Hermes 控制面数据库负责。</li>
+<li>对大型企业客户可以采用 realm-per-enterprise；默认 SaaS 可以先单 realm + tenant claim，避免一开始承担 realm 爆炸的运维复杂度。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Zitadel</strong></td><td>现代化、多租户体验好</td><td>生态和企业自定义迁移案例相对 Keycloak 少</td></tr>
+<tr><td><strong>Ory Hydra/Kratos</strong></td><td>组件化、云原生</td><td>需要拼装多个服务；对快速落地的统一管理台不如 Keycloak</td></tr>
+<tr><td><strong>Authentik</strong></td><td>自托管体验好，管理界面友好</td><td>大规模企业 IdP federation 和复杂 client policy 的成熟度需要额外验证</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>建立 `hermes` realm，定义 Web App、CLI、TokenRouter service、internal control-plane service 四类 client。</li>
+<li>访问令牌只表示认证事实和粗粒度租户上下文；细粒度 RBAC 在 Session Service 查询 membership 后生成 session-scoped stream token。</li>
+<li>企业客户需要独立密码策略、MFA、IdP、审计导出时，迁移到 dedicated realm，并把 realm_id 映射到 tenant_id。</li>
+<li>Keycloak 不直接发放 tool scope；tool scope 由 Hermes Session Service 根据 plan、workspace、project 和 user role 生成 `HF_JWT_TOKEN`。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：单 realm，OIDC 登录，JWT 验证，membership 映射。</li>
+<li>企业阶段：IdP federation、realm template、组织级 MFA/client policy。</li>
+<li>审计阶段：Keycloak admin event 同步进 Hermes audit_events。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>注销或禁用用户后不能继续创建新 session。</li>
+<li>用户跨 tenant 切换必须重新解析 membership，不能只信前端 tenant_id。</li>
+<li>企业 IdP claim 变化不会自动授予 project 权限，必须经过 Hermes membership 映射。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://www.keycloak.org/docs/latest/server_admin/">Keycloak Server Administration Guide</a></li>
+<li><a href="https://www.keycloak.org/securing-apps/client-registration">Keycloak client registration</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

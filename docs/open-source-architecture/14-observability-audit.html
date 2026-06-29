@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Observability / Audit - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Observability / Audit</h1>
+<p>统一采集 traces、metrics、logs、events，把 run_id/tool_call_id/job_id/tenant_id 串起来；审计日志另做 append-only 存储。</p>
+<div class="meta"><span class="pill">推荐：OpenTelemetry + Grafana LGTM stack</span><span class="pill">对应 spec：Sections 16, 18, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="13-object-media-storage.html">上一项</a><a href="15-service-mesh-egress.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>OpenTelemetry + Grafana LGTM stack 是该模块的主选型。Hermes 的故障排查横跨 Edge、Session、Sandbox、TokenRouter、Temporal、NATS、GPU worker、object storage。OpenTelemetry 是跨语言、跨后端的最低耦合采集标准。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 的故障排查横跨 Edge、Session、Sandbox、TokenRouter、Temporal、NATS、GPU worker、object storage。OpenTelemetry 是跨语言、跨后端的最低耦合采集标准。</li>
+<li>Grafana LGTM 组合覆盖 metrics、logs、traces 和 dashboard，开源可自托管，适合早期先跑通。</li>
+<li>审计不能只依赖普通日志：普通日志可以采样/过期，audit_events 必须可查询、可保留、可导出。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>ELK/OpenSearch</strong></td><td>日志检索强</td><td>traces/metrics 一体化和 OTel-first 体验不如 LGTM 直观</td></tr>
+<tr><td><strong>Jaeger + Prometheus only</strong></td><td>轻量、CNCF 成熟</td><td>日志和全栈关联需要额外拼装</td></tr>
+<tr><td><strong>Datadog/New Relic</strong></td><td>托管体验好</td><td>不是开源优先，且租户/提示/文件相关数据要额外合规治理</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>所有服务 trace span 必须带 `tenant_id`、`workspace_id`、`project_id`、`session_id`、`run_id`、`tool_call_id` 或明确标记 global。</li>
+<li>日志默认结构化 JSON，敏感字段在 SDK 层 redaction；禁止把 prompt 原文、provider key、protected skill content 写进普通日志。</li>
+<li>审计事件写 Postgres/对象归档，不通过 Loki 作为唯一事实；Loki 只做运维日志。</li>
+<li>建立 dashboard：sandbox cold start、TokenRouter deny、job duration、GPU utilization、queue depth、per-tenant spend。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：OTel SDK + Collector + Prometheus/Grafana + structured logs。</li>
+<li>第二阶段：Tempo traces、Loki logs、exemplars linking、tenant cost dashboards。</li>
+<li>第三阶段：audit export、SLO burn alerts、redaction regression tests。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>任意 failed media job 可从 job_id 追到 TokenRouter decision 和 worker log。</li>
+<li>日志扫描不能发现 provider key 或 protected skill path 内容。</li>
+<li>每次 tool_call touching infrastructure 都有 audit_events 记录。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://opentelemetry.io/docs/what-is-opentelemetry/">OpenTelemetry overview</a></li>
+<li><a href="https://opentelemetry.io/docs/concepts/signals/">OpenTelemetry signals</a></li>
+<li><a href="https://grafana.com/about/grafana-stack/">Grafana Stack</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

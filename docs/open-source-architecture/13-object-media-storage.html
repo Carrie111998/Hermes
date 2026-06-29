@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Object / Media Storage - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Object / Media Storage</h1>
+<p>保存 uploads、generated media、job outputs、thumbnails、manifests、asset lineage 和长期归档。</p>
+<div class="meta"><span class="pill">推荐：Rook-Ceph RGW for production; MinIO only for dev/small private deployments</span><span class="pill">对应 spec：Sections 8, 10, 15, 16, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="12-relational-data-tenant-rls.html">上一项</a><a href="14-observability-audit.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Rook-Ceph RGW for production; MinIO only for dev/small private deployments 是该模块的主选型。生产级开源存储需要对象、块、文件多模式能力和 Kubernetes operator 治理；Rook-Ceph 同时提供 CephFS、RBD 和 RGW/S3，适合 Hermes 的 mixed storage plane。</section>
+<section><h2>为什么选它</h2><ul><li>生产级开源存储需要对象、块、文件多模式能力和 Kubernetes operator 治理；Rook-Ceph 同时提供 CephFS、RBD 和 RGW/S3，适合 Hermes 的 mixed storage plane。</li>
+<li>Ceph RGW 有 S3/Swift 接口、用户/桶/tenant 概念，和多租户媒体资产模型更贴近。</li>
+<li>MinIO 非常适合开发和简单私有云，但当前许可证与商业云产品的合规边界要谨慎；因此不作为默认生产基座。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>MinIO</strong></td><td>简单、高性能、S3 兼容，AI 场景常见</td><td>AGPL/商业许可边界需要法务确认；只做对象存储，不覆盖块/文件一体化</td></tr>
+<tr><td><strong>SeaweedFS</strong></td><td>轻量，文件/对象模型灵活</td><td>生产多租户、K8s operator 和生态成熟度不如 Ceph/Rook</td></tr>
+<tr><td><strong>云厂商 S3/GCS/R2</strong></td><td>托管、可靠、运维少</td><td>不是开源方案；可作为部署时的兼容 backend</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>对象 key 统一前缀：`tenant/&lt;tid&gt;/workspace/&lt;wid&gt;/project/&lt;pid&gt;/{uploads,generated,jobs,thumbnails,manifests}`。</li>
+<li>Job Manager 生成 output_prefix，worker 只拿 scoped write credential 或代理写入，不接受 worker 自报目标路径。</li>
+<li>Asset ID 是授权对象，object key 只是存储定位；任何下载/预览都要通过 Asset Service 签发短期 URL。</li>
+<li>Rook-Ceph 提供 RGW；JuiceFS 可把 RGW 或云对象存储作为数据 backend。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：dev 用 MinIO 或云 S3；接口按 S3-compatible 设计。</li>
+<li>生产自托管：部署 Rook-Ceph RGW，开启 bucket lifecycle、versioning/retention 策略。</li>
+<li>高级阶段：per-tenant encryption context、多区域复制、asset lineage manifest。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>Tenant A 的 scoped credential 不能列出 Tenant B prefix。</li>
+<li>Worker 传入任意 output_prefix 会被 Job Manager 覆盖或拒绝。</li>
+<li>删除 asset 不破坏审计 manifest 和 usage record。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://rook.github.io/docs/rook/latest/Getting-Started/storage-architecture/">Rook storage architecture</a></li>
+<li><a href="https://rook.github.io/docs/rook/latest/Storage-Configuration/Object-Storage-RGW/object-storage/">Rook Ceph object storage</a></li>
+<li><a href="https://docs.ceph.com/en/latest/radosgw/">Ceph Object Gateway</a></li>
+<li><a href="https://min.io/docs/minio/container/index.html">MinIO container docs</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

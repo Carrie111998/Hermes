@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session / Job Orchestration - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Session / Job Orchestration</h1>
+<p>承接 session lifecycle、sandbox attach、media job group、retry、timeout、compensation、human approval 和长任务状态恢复。</p>
+<div class="meta"><span class="pill">推荐：Temporal</span><span class="pill">对应 spec：Sections 5, 10, 18, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="06-tokenrouter-secrets-boundary.html">上一项</a><a href="08-event-bus-realtime-fanout.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Temporal 是该模块的主选型。Hermes 的媒体生成和 agent 任务不是普通队列任务：它们有长耗时、重试、超时、外部 side effect、状态流和失败恢复。Temporal 的 Durable Execution 正是这个问题域。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 的媒体生成和 agent 任务不是普通队列任务：它们有长耗时、重试、超时、外部 side effect、状态流和失败恢复。Temporal 的 Durable Execution 正是这个问题域。</li>
+<li>把工作流状态写在自研 DB + worker loop 容易产生重复执行、丢状态和重试不一致；Temporal 把这些故障语义变成平台能力。</li>
+<li>Temporal 的 task queue 模型可以把 sandbox attach、GPU job、thumbnail、asset registration 拆成不同 worker pool。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Celery/RQ</strong></td><td>简单，Python 生态成熟</td><td>只解决任务派发，不解决长工作流状态、补偿、定时器和 determinism</td></tr>
+<tr><td><strong>Argo Workflows</strong></td><td>K8s 原生，适合批处理流水线</td><td>交互式 session 和细粒度业务状态恢复不如 Temporal</td></tr>
+<tr><td><strong>Airflow</strong></td><td>适合数据调度</td><td>不是低延迟用户交互和 per-session agent job 的最佳模型</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>`SessionWorkflow`：create/resume session、sandbox schedule/attach、stream token、heartbeat、suspend。</li>
+<li>`MediaJobGroupWorkflow`：validate assets、reserve concurrency、publish work、wait worker result、register output、meter usage。</li>
+<li>所有外部 side effect 放 Activity：TokenRouter call、object write、DB mutation、NATS publish；Activity 必须有 idempotency key。</li>
+<li>业务 Postgres 存查询模型；Temporal history 存工作流真实执行历史，二者不能互相替代。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：media job group 和 sandbox attach 两条 workflow。</li>
+<li>第二阶段：跨 worker pool retries、compensation、manual intervention。</li>
+<li>第三阶段：workflow replay tests、versioning strategy、multi-region failover 设计。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>Worker crash 后 job 不丢失，并从上一个已提交 activity 后恢复。</li>
+<li>重复 delivery 不会重复计费或覆盖错误 output_prefix。</li>
+<li>超过 timeout 的 job 被标记失败并返回 sanitized error。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://docs.temporal.io/">Temporal documentation</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

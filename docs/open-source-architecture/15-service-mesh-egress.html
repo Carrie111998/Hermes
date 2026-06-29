@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service Mesh / Internal mTLS / Egress - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Service Mesh / Internal mTLS / Egress</h1>
+<p>在内部服务之间提供 mTLS、服务身份、授权策略和受控 egress gateway，支撑 TokenRouter/Job Manager/worker 的零信任通信。</p>
+<div class="meta"><span class="pill">推荐：Istio</span><span class="pill">对应 spec：Sections 7, 12, 17, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="14-observability-audit.html">上一项</a><a href="16-gitops-secrets-delivery.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Istio 是该模块的主选型。Hermes 需要明确区分服务身份、用户身份和 sandbox token。Istio 的 mTLS、AuthorizationPolicy、egress gateway 能把服务到服务通信也纳入策略边界。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 需要明确区分服务身份、用户身份和 sandbox token。Istio 的 mTLS、AuthorizationPolicy、egress gateway 能把服务到服务通信也纳入策略边界。</li>
+<li>Envoy Gateway 已经在入口使用 Envoy，Istio 数据面同样基于 Envoy，便于统一观测和策略思路。</li>
+<li>Linkerd 更轻，但复杂 egress、ext_authz 和细粒度授权场景不如 Istio 完整。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Linkerd</strong></td><td>简单、轻量、mTLS 易用</td><td>复杂 egress gateway、Envoy 过滤器生态和策略扩展性较弱</td></tr>
+<tr><td><strong>Cilium Service Mesh</strong></td><td>eBPF 网络能力强</td><td>团队需要承担 Cilium 网络模型学习成本；和 Envoy Gateway/Istio 生态重叠要取舍</td></tr>
+<tr><td><strong>no mesh / library mTLS</strong></td><td>少一层复杂度</td><td>服务身份、默认拒绝、egress 统一治理会散落在应用里</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>控制面 namespace 启用 strict mTLS；TokenRouter、Job Manager、Volume Mounter、Asset Service 只接受 mesh identity。</li>
+<li>所有外部 provider/API 流量必须经 egress gateway 或 TokenRouter；sandbox namespace 默认无直接 internet egress。</li>
+<li>AuthorizationPolicy 限制服务调用方向，例如 GPU worker 可以回调 Job Manager，但不能调用 OpenBao。</li>
+<li>Service mesh 不承载用户授权最终决策；用户/tenant/tool 决策仍由 OPA/TokenRouter 完成。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：仅控制面服务启用 Istio mTLS，不把 sandbox 先放进 mesh。</li>
+<li>第二阶段：egress gateway + allowlist + provider endpoint audit。</li>
+<li>第三阶段：namespace default-deny、workload identity policy、mesh chaos tests。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>未注入 mesh identity 的服务不能调用 TokenRouter。</li>
+<li>Worker 不能直接访问 OpenBao 或数据库。</li>
+<li>外部 egress 目标不在 allowlist 时被网格拒绝并记录。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://istio.io/latest/docs/tasks/security/authentication/authn-policy/">Istio authentication policy</a></li>
+<li><a href="https://istio.io/latest/docs/tasks/traffic-management/egress/egress-gateway-tls-origination/">Istio egress gateway with TLS origination</a></li>
+<li><a href="https://istio.io/latest/docs/ops/best-practices/security/">Istio security best practices</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

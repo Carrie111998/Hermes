@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Edge Gateway / Realtime Ingress - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Edge Gateway / Realtime Ingress</h1>
+<p>统一承接浏览器 SSE/WebSocket/HTTP 请求，完成 TLS、JWT 校验、限流、外部授权、带宽限制、路由和会话流转发。</p>
+<div class="meta"><span class="pill">推荐：Envoy Gateway + Envoy Proxy</span><span class="pill">对应 spec：Sections 4, 5, 13, 17</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="02-identity-tenant-access.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>Envoy Gateway + Envoy Proxy 是该模块的主选型。Hermes 的入口层需要同时处理普通 HTTP、SSE、WebSocket、长连接空闲超时、租户级限流和策略外调，Envoy 的过滤器模型和 Envoy Gateway 的 Gateway API 扩展正好覆盖这些边界。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 的入口层需要同时处理普通 HTTP、SSE、WebSocket、长连接空闲超时、租户级限流和策略外调，Envoy 的过滤器模型和 Envoy Gateway 的 Gateway API 扩展正好覆盖这些边界。</li>
+<li>Envoy Gateway 原生支持 SecurityPolicy、external authorization 和本地/全局限流，便于把 JWT claim、tenant_id、workspace_id 和 plan 转成统一的控制面决策输入。</li>
+<li>相比功能型 API 网关，Envoy 更适合做后续 service mesh、OPA ext_authz、TokenRouter、egress gateway 的共同代理基础。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>Kong Gateway</strong></td><td>插件生态强，API 管理成熟</td><td>社区/企业功能边界和许可证要仔细核对；和 K8s Gateway API、service mesh 策略统一性不如 Envoy 直接</td></tr>
+<tr><td><strong>Traefik</strong></td><td>上手快，Ingress/Gateway 使用简单</td><td>复杂 ext_authz、长连接细粒度策略、全局限流和多租户策略编排不如 Envoy 深</td></tr>
+<tr><td><strong>NGINX Gateway Fabric</strong></td><td>稳定，团队熟悉度高</td><td>动态 xDS、Envoy 生态策略集成和 AI/agent gateway 延展性较弱</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>部署两个入口 GatewayClass：`public-hermes` 处理用户流量，`internal-hermes` 处理控制面内部入口。</li>
+<li>所有用户请求先通过 JWT SecurityPolicy；JWT 的 `sub`、`tenant_id`、`workspace_id`、`plan` 通过受信 header 传给 Session Service，外部请求不得直接提交这些 header。</li>
+<li>对 `/sessions/:id/events` 使用 SSE 长连接配置，按 `session_id` 做一致性哈希或 sticky routing，避免事件流在扩缩容时抖动。</li>
+<li>把 `ext_authz` 指向 OPA/Policy Adapter，由它判断 session stream 订阅、workspace membership、plan rate limit 和工具入口权限。</li>
+<li>Edge 只做身份和路由，不读取用户文件，不持有 provider key，不直接创建 GPU job。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>先接入 JWT 校验、请求体大小限制、SSE idle timeout 和 `/healthz`。</li>
+<li>第二步启用 per-route local rate limit；接入 Redis-backed global rate limit。</li>
+<li>第三步启用 ext_authz，把 session subscribe、tool preflight 和 tenant plan 都统一到 OPA 决策。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>Tenant A 的 stream token 不能订阅 Tenant B 的 SSE。</li>
+<li>JWT 缺少 tenant/workspace claim 时返回 401/403。</li>
+<li>超过 plan 的请求被限流而不是进入后端队列。</li>
+<li>WebSocket/SSE 断线重连不会跨 session 泄露事件。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://gateway.envoyproxy.io/docs/concepts/rate-limiting/">Envoy Gateway rate limiting</a></li>
+<li><a href="https://gateway.envoyproxy.io/docs/tasks/security/ext-auth/">Envoy Gateway external authorization</a></li>
+<li><a href="https://www.envoyproxy.io/docs/envoy/latest/start/sandboxes/websocket.html">Envoy Proxy WebSocket example</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>

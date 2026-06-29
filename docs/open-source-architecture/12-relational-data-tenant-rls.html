@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Relational Data / Tenant Row Isolation - Hermes Open Source Architecture</title>
+<style>
+:root { color-scheme: light; --ink:#17212b; --muted:#5d6876; --line:#d9e1ea; --panel:#f7f9fb; --accent:#176a7a; --accent2:#7a3e1d; --good:#1d6b43; --warn:#8b5a12; --bg:#ffffff; }
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif; color:var(--ink); background:var(--bg); line-height:1.56; }
+header { border-bottom:1px solid var(--line); background:linear-gradient(180deg,#f8fbfc,#eef5f7); }
+.wrap { max-width:1120px; margin:0 auto; padding:28px 28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; line-height:1.25; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+a { color:#0b5f78; text-decoration:none; }
+a:hover { text-decoration:underline; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0dc; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+.reco { border-left:5px solid var(--accent); background:#f3f9fa; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--warn); background:#fff8e8; padding:12px 14px; border-radius:6px; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f7; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+footer { margin-top:40px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; }
+.nav { display:flex; flex-wrap:wrap; gap:8px; margin-top:18px; }
+.nav a { border:1px solid var(--line); border-radius:6px; padding:6px 9px; background:#fff; }
+.small { color:var(--muted); font-size:13px; }
+@media (max-width:720px){ .wrap{padding:22px 16px;} h1{font-size:28px;} table{font-size:13px;} th,td{padding:8px;} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+<div class="kicker">Hermes Supercomputer 开源架构选型</div>
+<h1>Relational Data / Tenant Row Isolation</h1>
+<p>保存 tenants、workspaces、projects、sessions、runs、tool_calls、jobs、assets、usage_events、audit_events 等强一致业务数据。</p>
+<div class="meta"><span class="pill">推荐：PostgreSQL with Row Level Security</span><span class="pill">对应 spec：Sections 6, 14, 16, 19</span><span class="pill">资料核对：2026-05-29</span></div>
+<div class="nav"><a href="00-index.html">总览</a><a href="11-guardrails-exfiltration-defense.html">上一项</a><a href="13-object-media-storage.html">下一项</a></div>
+</div></header>
+<main class="wrap">
+<section class="reco"><strong>结论</strong><br>PostgreSQL with Row Level Security 是该模块的主选型。Hermes 控制面是典型关系模型：租户、成员、项目、会话、工具调用、用量、审计都需要事务和约束。PostgreSQL 是最稳妥的开源选择。</section>
+<section><h2>为什么选它</h2><ul><li>Hermes 控制面是典型关系模型：租户、成员、项目、会话、工具调用、用量、审计都需要事务和约束。PostgreSQL 是最稳妥的开源选择。</li>
+<li>Row Level Security 可以把 tenant isolation 下沉到数据库层，作为应用层过滤之外的第二道防线。</li>
+<li>JSONB 可承载 payload/result/acl 等半结构化字段，但主授权字段必须结构化列化，便于索引和 RLS 策略。</li></ul></section>
+<section><h2>候选方案对比</h2><table><thead><tr><th>候选</th><th>优势</th><th>为什么不是主选</th></tr></thead><tbody><tr><td><strong>MySQL</strong></td><td>成熟，团队常见</td><td>缺少 PostgreSQL RLS 这种强内建租户隔离机制</td></tr>
+<tr><td><strong>CockroachDB</strong></td><td>分布式 SQL，多区域强</td><td>复杂度和成本更高；早期不应先承担分布式数据库语义</td></tr>
+<tr><td><strong>MongoDB/DynamoDB</strong></td><td>文档/高扩展方便</td><td>复杂事务、审计查询、RLS 类隔离需要更多应用层自研</td></tr></tbody></table></section>
+<section><h2>Hermes 落地设计</h2><ol><li>所有 tenant-scoped 表必须有 tenant_id；workspace/project/session 相关表还要有 workspace_id/project_id/session_id。</li>
+<li>每个请求进入 DB transaction 前设置 `app.current_tenant_id`、`app.current_workspace_id` 等 session variables；RLS policy 引用这些值。</li>
+<li>DB owner/superuser 连接只用于迁移；应用 runtime 使用受限 role，强制 RLS。</li>
+<li>Audit 表 append-only；删除用户数据走 tombstone/anonymization，不直接破坏审计链。</li></ol></section>
+<section><h2>实施规划</h2><ol><li>MVP：核心表 + tenant_id composite index + app-level filters。</li>
+<li>第二阶段：启用 RLS policy 和 CI isolation tests。</li>
+<li>第三阶段：审计归档分区、只读 replica、data residency 分库策略。</li></ol></section>
+<section><h2>验收标准</h2><ul><li>没有设置 tenant session variable 时查询返回 0 行或报错。</li>
+<li>Tenant A 的 DB role 无法 select Tenant B 行。</li>
+<li>所有新增表 CI 检查必须包含 tenant_id 或显式标记 global table。</li></ul></section>
+<section><h2>官方资料</h2><ul><li><a href="https://www.postgresql.org/docs/current/ddl-rowsecurity.html">PostgreSQL row security policies</a></li>
+<li><a href="https://www.postgresql.org/docs/current/sql-createpolicy.html">PostgreSQL CREATE POLICY</a></li></ul></section>
+</main>
+<footer><div class="wrap">Generated for Hermes multi-tenant supercomputer isolation planning. Source: <code>docs/hermes-supercomputer-isolation-spec.md</code>.</div></footer>
+</body>
+</html>
