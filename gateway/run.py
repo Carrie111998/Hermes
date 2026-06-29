@@ -15375,6 +15375,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+
+        # Per-tool progress filter: allows overriding the global mode for
+        # specific tools (e.g., show skill_manage even when global is "off").
+        # Check platform-level first, fall back to global display config.
+        _tool_progress_filter = (_platform_cfg.get("tool_progress_filter") if isinstance(_platform_cfg, dict) else None) or _display_cfg.get("tool_progress_filter") or {}
+        # If global is "off" but filter has entries that aren't "off", we still
+        # need the progress queue active so filtered tools can emit messages.
+        if not tool_progress_enabled and _tool_progress_filter and source.platform != Platform.WEBHOOK:
+            if any(v != "off" for v in _tool_progress_filter.values()):
+                tool_progress_enabled = True
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
         # in chat platforms while opting into concise mid-turn updates.
@@ -15563,8 +15573,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
+            # Per-tool filter: resolve effective mode for this tool.
+            # Filter entries override the global progress_mode per tool name.
+            _effective_mode = _tool_progress_filter.get(tool_name, progress_mode) if _tool_progress_filter else progress_mode
+            if _effective_mode == "off":
+                return
+
             # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
+            if _effective_mode == "new" and tool_name == last_tool[0]:
                 return
             last_tool[0] = tool_name
 
@@ -15620,7 +15636,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _code_block_short = f"{_block_header}```\n{_cmd_short}\n```"
 
             # Verbose mode: show detailed arguments, respects tool_preview_length
-            if progress_mode == "verbose":
+            if _effective_mode == "verbose":
                 if _code_block_full is not None:
                     last_was_terminal_block[0] = True
                     progress_queue.put(_code_block_full)
