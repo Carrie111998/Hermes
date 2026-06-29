@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hermes 资产库 Go 后端设计</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f4;
+      --paper: #ffffff;
+      --ink: #161817;
+      --muted: #66706b;
+      --line: #d8ded8;
+      --line-strong: #aeb8af;
+      --mint: #0f8a66;
+      --mint-soft: #e4f5ee;
+      --copper: #a14f20;
+      --copper-soft: #fff0e7;
+      --blue: #276a84;
+      --blue-soft: #e6f3f7;
+      --gold: #8b6d10;
+      --gold-soft: #fbf3d1;
+      --red: #a63832;
+      --red-soft: #fdeceb;
+      --shadow: 0 18px 54px rgba(27, 35, 31, .08);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(90deg, rgba(22,24,23,.045) 1px, transparent 1px),
+        linear-gradient(0deg, rgba(22,24,23,.04) 1px, transparent 1px),
+        var(--bg);
+      background-size: 42px 42px;
+      font-family: "Avenir Next", "Gill Sans", "Noto Sans SC", "PingFang SC", sans-serif;
+      line-height: 1.65;
+      letter-spacing: 0;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code, pre {
+      font-family: "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+      letter-spacing: 0;
+    }
+    .shell {
+      display: grid;
+      grid-template-columns: 280px minmax(0, 1fr);
+      gap: 24px;
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .sidebar {
+      position: sticky;
+      top: 24px;
+      align-self: start;
+      background: rgba(255,255,255,.92);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      font-weight: 800;
+    }
+    .mark {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      color: #fff;
+      background: var(--ink);
+      border-radius: 8px;
+      font-weight: 900;
+    }
+    .toc {
+      display: grid;
+      gap: 8px;
+      margin: 12px 0 0;
+      font-size: 14px;
+    }
+    .toc a {
+      color: var(--ink);
+      padding: 8px 10px;
+      border-radius: 7px;
+      border: 1px solid transparent;
+    }
+    .toc a:hover {
+      border-color: var(--line);
+      background: #f5f8f5;
+      text-decoration: none;
+    }
+    main {
+      min-width: 0;
+    }
+    .hero {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 34px;
+      margin-bottom: 18px;
+    }
+    .eyebrow {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 16px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 30px;
+      padding: 4px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+      white-space: nowrap;
+    }
+    h1 {
+      margin: 0 0 14px;
+      font-family: Georgia, "Songti SC", "Noto Serif SC", serif;
+      font-size: 44px;
+      line-height: 1.08;
+      letter-spacing: 0;
+    }
+    .lead {
+      max-width: 920px;
+      margin: 0;
+      color: #303834;
+      font-size: 18px;
+    }
+    .section {
+      background: rgba(255,255,255,.96);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 26px;
+      margin: 18px 0;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 25px;
+      line-height: 1.25;
+    }
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 18px;
+    }
+    p { margin: 8px 0; }
+    .grid-2, .grid-3, .grid-4 {
+      display: grid;
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .tile {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 15px;
+    }
+    .tile strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 15px;
+    }
+    .tile p, .tile li {
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .callout {
+      border-left: 5px solid var(--mint);
+      background: var(--mint-soft);
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 16px 0;
+    }
+    .warning {
+      border-left-color: var(--copper);
+      background: var(--copper-soft);
+    }
+    .diagram {
+      display: grid;
+      grid-template-columns: 1fr 54px 1fr 54px 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .node {
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+      min-height: 104px;
+    }
+    .node h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+    .arrow {
+      display: grid;
+      place-items: center;
+      color: var(--mint);
+      font-size: 30px;
+      font-weight: 800;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      counter-reset: flow;
+      margin: 16px 0;
+    }
+    .step {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 42px 12px 12px;
+      min-height: 122px;
+    }
+    .step::before {
+      counter-increment: flow;
+      content: counter(flow);
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      width: 24px;
+      height: 24px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--ink);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 800;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 14px 0;
+      background: #fff;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #edf3ef;
+      color: #26332e;
+    }
+    pre {
+      overflow: auto;
+      max-width: 100%;
+      background: #101614;
+      color: #edf6f1;
+      border-radius: 8px;
+      padding: 16px;
+      line-height: 1.55;
+      font-size: 13px;
+    }
+    code {
+      background: #eef2ef;
+      border: 1px solid #dfe6e0;
+      border-radius: 5px;
+      padding: 2px 5px;
+      font-size: .92em;
+    }
+    pre code {
+      background: transparent;
+      border: 0;
+      padding: 0;
+      color: inherit;
+    }
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .tag.mint { background: var(--mint-soft); color: var(--mint); border-color: #b8dfcf; }
+    .tag.blue { background: var(--blue-soft); color: var(--blue); border-color: #b9d8e3; }
+    .tag.gold { background: var(--gold-soft); color: var(--gold); border-color: #eadb91; }
+    .tag.red { background: var(--red-soft); color: var(--red); border-color: #edc0bd; }
+    ul { padding-left: 20px; margin: 8px 0; }
+    li { margin: 5px 0; }
+    .footer {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 18px 0 4px;
+    }
+    p, li, td, th, a, code, .pill, .tag { overflow-wrap: anywhere; }
+    @media (max-width: 1120px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { position: static; }
+      .toc { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .diagram, .flow, .grid-4 { grid-template-columns: 1fr 1fr; }
+      .arrow { display: none; }
+    }
+    @media (max-width: 720px) {
+      .shell { padding: 12px; }
+      .hero, .section, .sidebar { padding: 18px; }
+      h1 { font-size: 32px; }
+      .lead { font-size: 16px; }
+      .toc, .grid-2, .grid-3, .grid-4, .diagram, .flow { grid-template-columns: 1fr; }
+      table, thead, tbody, tr, th, td { display: block; width: 100%; }
+      thead { display: none; }
+      tr { border: 1px solid var(--line); margin-bottom: 10px; }
+      td { border: 0; border-bottom: 1px solid var(--line); }
+      td:last-child { border-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="页面导航">
+      <div class="brand"><span class="mark">Go</span><span>Hermes 资产库后端</span></div>
+      <div class="eyebrow">
+        <span class="pill">状态：设计稿</span>
+        <span class="pill">实现语言：Go</span>
+      </div>
+      <nav class="toc">
+        <a href="#overview">总览</a>
+        <a href="#shape">架构</a>
+        <a href="#packages">Go 包结构</a>
+        <a href="#domain">核心模型</a>
+        <a href="#database">数据库</a>
+        <a href="#apis">API</a>
+        <a href="#job">MediaJob</a>
+        <a href="#security">权限审计</a>
+        <a href="#roadmap">路线图</a>
+      </nav>
+    </aside>
+
+    <main>
+      <header class="hero" id="overview">
+        <div class="eyebrow">
+          <span class="pill">2026-06-12</span>
+          <span class="pill">P0: real ingestion</span>
+          <span class="pill">No fake jobs</span>
+        </div>
+        <h1>Hermes 资产库 Go 后端设计</h1>
+        <p class="lead">资产库后端是上传素材和生成结果的唯一状态源。上传、生成、复用、下载、加入合集、撤销删除都进入 Go 服务 <code>assetd</code>，并产出稳定 <code>asset_id</code>、对象存储、lineage、prompt 上下文、权限和审计记录。</p>
+        <div class="callout">
+          第一版目标不是图库，也不是前端静态状态；它要跑通真实链路：上传或生成请求进入 Go Asset Service，落 MySQL/GORM、Redis 和阿里云 OSS，形成可被 Chat 和 Asset Library 复用的 typed asset。
+        </div>
+      </header>
+
+      <section class="section" id="shape">
+        <h2>架构选择</h2>
+        <p>采用独立 Go 服务 <code>assetd</code>。登录、account、member、RBAC 以 KubeDL Console 后端为权威源；Dashboard/Gateway 通过签名身份桥代理资产 API 到 Go 服务。</p>
+        <div class="diagram" aria-label="架构流向">
+          <div class="node">
+            <h3>React Web</h3>
+            <p>Asset Library、Chat composer、上传、mention、job card。</p>
+          </div>
+          <div class="arrow">→</div>
+          <div class="node">
+            <h3>Dashboard / Gateway</h3>
+            <p>代理 <code>/api/assets/*</code>、<code>/api/media-jobs/*</code>，注入 KubeDL account/user 上下文。</p>
+          </div>
+          <div class="arrow">→</div>
+          <div class="node">
+            <h3>Go assetd</h3>
+            <p>Asset Service、MediaJob、Object Store、Search、ACL、Audit。</p>
+          </div>
+        </div>
+        <div class="grid-3">
+          <div class="tile"><strong>权限边界</strong><p>KubeDL 是身份源；assetd 是资产 read/use/delete/revoke 的资源权限源。</p></div>
+          <div class="tile"><strong>P0 存储</strong><p>MySQL/GORM + Redis + OSS media/result/temp buckets，直接对齐 aiproxy 的存储形态。</p></div>
+          <div class="tile"><strong>P2 迁移</strong><p>多库拆分、vector index、durable worker；P0 存储基线保持 MySQL/Redis/OSS。</p></div>
+        </div>
+      </section>
+
+      <section class="section" id="packages">
+        <h2>Go 项目结构</h2>
+        <pre><code>services/asset-library/
+  go.mod
+  cmd/assetd/main.go
+  internal/config/
+  internal/domain/
+  internal/httpapi/
+  internal/app/
+  internal/store/mysqlstore/
+  internal/redisstore/
+  internal/object/ossstore/
+  internal/provider/atlas/
+  internal/search/
+  internal/events/
+  internal/identitybridge/
+  internal/authz/
+  internal/audit/
+  internal/testkit/</code></pre>
+        <table>
+          <thead><tr><th>包</th><th>职责</th></tr></thead>
+          <tbody>
+            <tr><td><code>cmd/assetd</code></td><td>composition root：读配置、建 DB、建 HTTP server、启动 worker、优雅关闭。</td></tr>
+            <tr><td><code>internal/domain</code></td><td>Asset、MediaJob、Collection、SmartGroup、Reference、状态机、typed errors。无 DB/HTTP/provider。</td></tr>
+            <tr><td><code>internal/app</code></td><td>上传、资产查询、合集、智能分组、mention、media job、引用创建。拥有事务边界。</td></tr>
+            <tr><td><code>internal/httpapi</code></td><td>HTTP handler、JSON DTO、错误码映射。不能直接 SQL 或 provider。</td></tr>
+            <tr><td><code>internal/provider/atlas</code></td><td>Atlas 请求、轮询、输出解析。provider 字段不泄露到公开 API。</td></tr>
+            <tr><td><code>internal/events</code></td><td>outbox、SSE/代理事件、事件序列化。</td></tr>
+          </tbody>
+        </table>
+        <div class="warning callout">Go 规则：<code>context.Context</code> 只作为参数传递；handler 只做 transport 翻译；goroutine 必须有 owner、取消和 shutdown；接口定义在消费者侧。</div>
+      </section>
+
+      <section class="section" id="domain">
+        <h2>核心模型</h2>
+        <div class="grid-2">
+          <div class="tile">
+            <strong>Asset</strong>
+            <p><span class="tag mint">media_input</span><span class="tag mint">image_job</span><span class="tag mint">video_job</span><span class="tag blue">element</span><span class="tag blue">character</span></p>
+            <p>核心字段：<code>asset_id</code>、project、type、media_type、status、prompt、endpoint、model_route、object_key、thumbnail_key、owner、timestamps。</p>
+          </div>
+          <div class="tile">
+            <strong>MediaJob</strong>
+            <p><span class="tag gold">created</span><span class="tag gold">queued</span><span class="tag gold">running</span><span class="tag mint">succeeded</span><span class="tag red">failed</span></p>
+            <p>provider submit 前先落库；只有真实输出落 object store 且 output asset 已创建，才能进入 succeeded。</p>
+          </div>
+          <div class="tile">
+            <strong>Collection</strong>
+            <p>静态成员表：<code>collections</code> + <code>collection_members</code>。删除合集不删除资产。</p>
+          </div>
+          <div class="tile">
+            <strong>Smart Group</strong>
+            <p>保存 <code>query_json</code>，打开时动态评估，不物化成员。无 embedding 时返回 <code>semantic_pending</code>。</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="database">
+        <h2>数据库与对象存储</h2>
+        <pre><code>MySQL: asset_library primary DB, GORM
+Redis: cache / distributed lock / active job set
+OSS media bucket: upload source media
+OSS result bucket: generated outputs and thumbnails
+OSS temp bucket: transient provider transfer objects</code></pre>
+        <div class="grid-3">
+          <div class="tile"><strong>MySQL</strong><p>assets、media_jobs、collections、lineage、audit、outbox 等权威状态；GORM 管 migration 和事务。</p></div>
+          <div class="tile"><strong>Redis</strong><p>缓存、分布式锁、active job set，对 sweeper/poller 做单实例推进保护。</p></div>
+          <div class="tile"><strong>OSS</strong><p>media bucket 存上传，result bucket 存输出和缩略图，temp bucket 存 provider 中转。</p></div>
+        </div>
+      </section>
+
+      <section class="section" id="apis">
+        <h2>HTTP API</h2>
+        <table>
+          <thead><tr><th>领域</th><th>接口</th><th>关键规则</th></tr></thead>
+          <tbody>
+            <tr><td>上传</td><td><code>POST /api/assets/uploads</code></td><td>streaming 读取、校验 MIME/大小、写 object、返回 <code>asset_id</code>。</td></tr>
+            <tr><td>资产</td><td><code>GET /api/assets</code><br><code>GET /api/assets/{id}</code><br><code>GET /api/assets/{id}/preview</code></td><td>list/detail/preview/download 都检查 <code>read</code>。</td></tr>
+            <tr><td>Collection</td><td><code>/api/assets/collections</code></td><td>批量加成员返回部分成功和失败原因。</td></tr>
+            <tr><td>Smart Group</td><td><code>/api/assets/smart-groups/preview</code></td><td>保存前必须 preview，规则错误返回字段级错误。</td></tr>
+            <tr><td>Mention</td><td><code>GET /api/assets/mentions</code></td><td>后端不信纯文本 <code>@Luna</code>，只信 structured ref。</td></tr>
+            <tr><td>Media Job</td><td><code>POST /api/media-jobs</code></td><td>provider submit 前校验所有 input asset 的 <code>use</code> 权限和 ready 状态。</td></tr>
+          </tbody>
+        </table>
+        <h3>上传返回</h3>
+        <pre><code>{
+  "asset_id": "asset_01j...",
+  "name": "ref.png",
+  "mime_type": "image/png",
+  "size": 4200000,
+  "status": "processing",
+  "thumbnail_url": null,
+  "preview_url": "/api/assets/asset_01j/preview"
+}</code></pre>
+      </section>
+
+      <section class="section" id="job">
+        <h2>MediaJob 生成流程</h2>
+        <div class="flow">
+          <div class="step"><strong>Validate</strong><p>校验 input asset 的 <code>use</code> 权限和 ready 状态。</p></div>
+          <div class="step"><strong>Create</strong><p>插入 <code>media_jobs(status=created)</code>，记录 prompt、params、input refs。</p></div>
+          <div class="step"><strong>Submit</strong><p>Atlas adapter 提交请求，保存 provider job id。</p></div>
+          <div class="step"><strong>Poll</strong><p>worker 轮询状态；status/prediction URL 不能当输出。</p></div>
+          <div class="step"><strong>Finalize</strong><p>输出落 OSS result bucket，创建 output asset 和 lineage；只能由 worker 内部触发。</p></div>
+        </div>
+        <pre><code>{
+  "project_id": "proj_default",
+  "media_type": "video",
+  "mode": "image_to_video",
+  "provider": "atlas",
+  "endpoint": "atlas/kling-video",
+  "model_route": "kling-v2",
+  "prompt": "5 second rooftop product shot",
+  "input_assets": [{"asset_id": "asset_ref", "role": "image_reference"}],
+  "params": {"duration": 5, "resolution": "720p"}
+}</code></pre>
+      </section>
+
+      <section class="section">
+        <h2>Chat 结构化提交</h2>
+        <pre><code>{
+  "text": "用 @Luna 做一个天台夜景视频",
+  "mentions": [{
+    "span": [2, 7],
+    "display": "@Luna",
+    "entity_type": "character",
+    "entity_id": "char_luna",
+    "asset_ref_type": "character",
+    "operation": "use"
+  }],
+  "attachments": [
+    {"asset_id": "asset_img_123", "role": "image_reference"}
+  ]
+}</code></pre>
+        <p>任意 ref 不合法则整体失败；prompt text 只给模型理解，不作为权限凭证。</p>
+      </section>
+
+      <section class="section" id="security">
+        <h2>KubeDL 身份桥、权限、审计</h2>
+        <div class="grid-3">
+          <div class="tile">
+            <strong>身份桥</strong>
+            <p>KubeDL 校验 JWT/cookie、account member、RBAC 后，向 assetd 注入签名 account/user header。</p>
+          </div>
+          <div class="tile">
+            <strong>资产权限</strong>
+            <p><span class="tag mint">read</span><span class="tag mint">use</span><span class="tag blue">update</span><span class="tag red">delete</span><span class="tag red">revoke</span></p>
+          </div>
+          <div class="tile">
+            <strong>审计</strong>
+            <p>asset.uploaded、asset.used、asset.downloaded、asset.revoked、media_job.succeeded。生成动作再进入 aiproxy 计费链路。</p>
+          </div>
+        </div>
+        <div class="warning callout">不允许 warning 后继续生成。输入 ref 有任何错误，必须在 provider submit 前 fail closed。</div>
+      </section>
+
+      <section class="section" id="roadmap">
+        <h2>P0 / P1 / P2 路线</h2>
+        <table>
+          <thead><tr><th>优先级</th><th>工作</th><th>完成标准</th></tr></thead>
+          <tbody>
+            <tr><td>P0</td><td>Go module + <code>assetd</code> HTTP server</td><td>本地可启动，health check 可用。</td></tr>
+            <tr><td>P0</td><td>MySQL/GORM + Redis + OSS</td><td>资产、job、collection、上传和生成输出都有真实持久化。</td></tr>
+            <tr><td>P0</td><td>Upload / Asset / Collection / Mention API</td><td>上传返回 asset_id，Chat 可拿 structured ref。</td></tr>
+            <tr><td>P0</td><td>MediaJob + Atlas adapter</td><td>fake provider 成功创建 output asset。</td></tr>
+            <tr><td>P1</td><td>Smart Group、Element/Character、FTS keywords</td><td>preview/save/evaluate 一致，ready 状态只来自真实完成。</td></tr>
+            <tr><td>P2</td><td>多库拆分 / vector / durable worker</td><td>通过同一 contract tests，job 可跨重启恢复。</td></tr>
+          </tbody>
+        </table>
+        <h3>验证命令</h3>
+        <pre><code>cd services/asset-library
+go test ./...
+go test -race ./...</code></pre>
+      </section>
+
+      <section class="section">
+        <h2>未决问题</h2>
+        <ul>
+          <li>P1 是否新增 KubeDL <code>/internal/auth/introspect</code> 替代 P0 签名 header？</li>
+          <li>P0 是否固定默认 <code>workspace_id/project_id</code>，直到前端项目选择器完成？</li>
+          <li>Go 服务事件是先由 Dashboard 转发，还是直接提供 SSE？</li>
+          <li>Atlas adapter 是 Go 原生重写，还是 P0 临时调用内部 HTTP provider gateway？</li>
+          <li>删除采用 tombstone 还是硬删除？建议 P0 tombstone：<code>status=deleted</code>。</li>
+        </ul>
+      </section>
+
+      <p class="footer">来源：<a href="hermes-asset-library-backend-design.md">Go 后端设计 Markdown</a>、<a href="hermes-asset-library-product-prd.md">产品 PRD</a>。本页为中文 HTML 阅读版。</p>
+    </main>
+  </div>
+</body>
+</html>
