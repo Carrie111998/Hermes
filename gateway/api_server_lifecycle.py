@@ -94,17 +94,22 @@ class APIServerLifecycleMixin:
                 )
                 return False
 
-            # Refuse to start network-accessible with a placeholder key.
-            # Ported from openclaw/openclaw#64586.
+            # Refuse to start network-accessible with a placeholder or weak key.
+            # Ported from openclaw/openclaw#64586; entropy floor raised to 16 in
+            # the June 2026 hermes-0day hardening (an 8-char key dispatching
+            # terminal-capable agent work on a public bind is brute-forceable).
             if is_network_accessible(self._host) and self._api_key:
                 try:
                     from hermes_cli.auth import has_usable_secret
-                    if not has_usable_secret(self._api_key, min_length=8):
+                    if not has_usable_secret(self._api_key, min_length=16):
                         logger.error(
-                            "[%s] Refusing to start: API_SERVER_KEY is set to a "
-                            "placeholder value. Generate a real secret "
-                            "(e.g. `openssl rand -hex 32`) and set API_SERVER_KEY "
-                            "before exposing the API server on %s.",
+                            "[%s] Refusing to start: API_SERVER_KEY is a "
+                            "placeholder or too short (<16 chars) for a "
+                            "network-accessible bind. This endpoint dispatches "
+                            "terminal-capable agent work — a guessable key is "
+                            "remote code execution. Generate a strong secret "
+                            "(e.g. `openssl rand -hex 32`) and set "
+                            "API_SERVER_KEY before exposing it on %s.",
                             self.name, self._host,
                         )
                         return False
