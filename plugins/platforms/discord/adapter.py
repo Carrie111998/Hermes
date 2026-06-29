@@ -819,6 +819,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        # Per-message active reaction tracking for persona/tool emoji swapping.
+        # Key: message.id (int), Value: currently active reaction emoji (str).
+        self._active_tool_reactions: Dict[int, str] = {}
 
     def _handle_bot_task_done(self, task: asyncio.Task) -> None:
         """Surface post-startup discord.py task exits to the gateway supervisor.
@@ -1775,27 +1778,85 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _reactions_enabled(self) -> bool:
         """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"} \
+            and self.config.extra.get("reactions", True)
+
+    def _dynamic_reactions_enabled(self) -> bool:
+        """Check if per-tool reaction swapping is enabled.
+
+        Resolution order:
+        1. ``discord.dynamic_reactions`` in config.yaml (platform override)
+        2. ``dynamic_reactions`` at top-level in config.yaml (global default)
+        3. True (built-in default)
+        """
+        if not self._reactions_enabled():
+            return False
+        extra = self.config.extra
+        if "dynamic_reactions" in extra:
+            return bool(extra["dynamic_reactions"])
+        from hermes_cli.config import load_config
+        return bool(load_config().get("dynamic_reactions", True))
+
+    def _persona_emoji(self) -> str:
+        """Return the agent's persona emoji.
+
+        Resolution order:
+        1. ``discord.persona_emoji`` in config.yaml (platform override)
+        2. ``persona_emoji`` at top-level in config.yaml (global default)
+        3. 👀 (built-in fallback so existing deployments are unaffected)
+        """
+        if emoji := self.config.extra.get("persona_emoji"):
+            return emoji
+        from hermes_cli.config import load_config
+        return load_config().get("persona_emoji") or "👀"
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction for normal Discord message events."""
+        """Add the agent's persona emoji when processing begins."""
         if not self._reactions_enabled():
             return
         message = event.raw_message
         if hasattr(message, "add_reaction"):
-            await self._add_reaction(message, "👀")
+            emoji = self._persona_emoji()
+            await self._add_reaction(message, emoji)
+            self._active_tool_reactions[message.id] = emoji
+    async def on_tool_call_start(self, event: MessageEvent, tool_name: str) -> None:
+        """Swap the active reaction to the tool-specific emoji.
+
+        Called by the gateway's progress_callback on every ``tool.started``
+        event. Removes the previous reaction (persona or prior tool) and
+        adds the emoji that represents the current tool, so the message
+        always shows exactly one reaction reflecting what the agent is doing.
+        """
+        if not self._dynamic_reactions_enabled():
+            return
+        message = event.raw_message
+        if not hasattr(message, "add_reaction"):
+            return
+        from agent.display import get_tool_emoji
+        tool_emoji = get_tool_emoji(tool_name, default="⚙️")
+        current = self._active_tool_reactions.get(message.id)
+        if current and current != tool_emoji:
+            await self._remove_reaction(message, current)
+        await self._add_reaction(message, tool_emoji)
+        self._active_tool_reactions[message.id] = tool_emoji
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Replace the active reaction with ✅ (success) or ❌ (failure).
+
+        Persona emoji identifies the agent during work; the terminal
+        reaction is a status indicator independent of identity.
+        """
         if not self._reactions_enabled():
             return
         message = event.raw_message
         if hasattr(message, "add_reaction"):
-            await self._remove_reaction(message, "👀")
+            current = self._active_tool_reactions.pop(message.id, self._persona_emoji())
+            await self._remove_reaction(message, current)
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
+            # CANCELLED: remove active reaction, leave nothing
 
     async def send(
         self,
