@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermes Web MVP PRD</title>
+<style>
+:root {
+  color-scheme: light;
+  --ink:#17202a;
+  --muted:#5b6673;
+  --line:#d8e0e8;
+  --panel:#f6f8fa;
+  --accent:#146b62;
+  --accent2:#8a5a13;
+  --danger:#8d2f2f;
+  --bg:#ffffff;
+}
+* { box-sizing:border-box; }
+body {
+  margin:0;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+  color:var(--ink);
+  background:var(--bg);
+  line-height:1.58;
+}
+header {
+  border-bottom:1px solid var(--line);
+  background:#f5f8f9;
+}
+.wrap { max-width:1120px; margin:0 auto; padding:28px; }
+.kicker { color:var(--accent); font-size:13px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }
+h1 { margin:8px 0 10px; font-size:34px; line-height:1.16; letter-spacing:0; }
+h2 { margin:34px 0 12px; font-size:22px; border-bottom:1px solid var(--line); padding-bottom:8px; }
+h3 { margin:22px 0 8px; font-size:17px; }
+p { margin:8px 0; }
+ul,ol { padding-left:22px; }
+li { margin:6px 0; }
+.meta { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { border:1px solid #bfd0d9; background:#fff; border-radius:999px; padding:5px 10px; color:#314153; font-size:13px; }
+.notice { border-left:5px solid var(--accent); background:#eff8f6; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.warning { border-left:5px solid var(--danger); background:#fff4f4; padding:14px 16px; border-radius:6px; margin:18px 0; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:14px; }
+.card { border:1px solid var(--line); border-radius:8px; padding:14px; background:#fff; min-height:110px; }
+.card strong { display:block; margin-bottom:5px; }
+table { width:100%; border-collapse:collapse; margin:14px 0; font-size:14px; }
+th,td { border:1px solid var(--line); padding:10px 11px; vertical-align:top; text-align:left; }
+th { background:#eef4f6; }
+code { background:#eef3f6; padding:2px 4px; border-radius:4px; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+.small { color:var(--muted); font-size:13px; }
+footer { border-top:1px solid var(--line); margin-top:34px; color:var(--muted); font-size:13px; }
+@media (max-width:720px) {
+  .wrap{padding:22px 16px;}
+  h1{font-size:28px;}
+  table{font-size:13px;}
+  th,td{padding:8px;}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="kicker">Hermes Web MVP</div>
+    <h1>云端多租户 Agent 最小纵向闭环 PRD</h1>
+    <p>目标不是复刻 Higgsfield Supercomputer 全量能力，而是跑通真实 Web Agent、Skill、资产引用、异步媒体 job、TokenRouter 和多租户隔离的第一条闭环。</p>
+    <div class="meta">
+      <span class="pill">日期：2026-06-04</span>
+      <span class="pill">定位：MVP PRD</span>
+      <span class="pill">范围：云端多租户 supercomputer</span>
+    </div>
+  </div>
+</header>
+<main class="wrap">
+  <section class="notice">
+    <strong>一页结论</strong><br>
+    用户登录 -> workspace/project -> 真实 Agent chat -> 上传素材 -> Skill / 工具 -> 资产引用 -> 异步媒体 job -> TokenRouter 鉴权和凭证隔离 -> Worker 执行 -> UI 展示状态和结果 -> 输出资产复用。
+  </section>
+
+  <section>
+    <h2>必须证明的三件事</h2>
+    <div class="grid">
+      <article class="card"><strong>真实 Agent</strong><p>Web 端是真实 Hermes gateway 会话入口，不是 demo job runner。</p></article>
+      <article class="card"><strong>真实隔离</strong><p>身份、数据、文件、资产、凭证、worker、审计一起建，不能后补。</p></article>
+      <article class="card"><strong>真实异步 job</strong><p>媒体生成要有 job、状态、错误、输出资产和审计，不伪造结果。</p></article>
+    </div>
+  </section>
+
+  <section>
+    <h2>MVP 必做</h2>
+    <table>
+      <thead><tr><th>模块</th><th>能力</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>Web Chat</td><td>真实 Hermes gateway 会话</td><td>新建/恢复 session、发送 prompt、展示 message/status/tool events。</td></tr>
+        <tr><td>文件上传</td><td>小规模附件上传</td><td>上传到受控 storage，返回真实 attachment marker。</td></tr>
+        <tr><td>Skill Runtime</td><td><code>skills_list</code>、<code>skill_view</code></td><td>公开 metadata 和受保护 <code>references/</code> 精确加载。</td></tr>
+        <tr><td>资产模型</td><td>Element / Soul ID / media_input / job asset</td><td>create/list/get/status、ACL、lineage、not-ready 错误。</td></tr>
+        <tr><td>媒体 job</td><td><code>media_generate</code>、<code>media_job_status</code></td><td>异步 job、状态流、输出资产、错误可见。</td></tr>
+        <tr><td>TokenRouter</td><td>凭证与策略边界</td><td>JWT、OPA、quota、asset ACL、provider key blind-state、audit。</td></tr>
+        <tr><td>Sandbox</td><td>云端隔离执行</td><td>任意代码/terminal/tool execution 走 microVM/Kata 级隔离。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>模块级拆解</h2>
+    <table>
+      <thead><tr><th>模块</th><th>用户目标</th><th>接口 / 数据</th><th>权限与验收</th></tr></thead>
+      <tbody>
+        <tr>
+          <td>Web Chat</td>
+          <td>新建、恢复、继续真实 Agent 会话。</td>
+          <td><code>session.create</code>、<code>session.resume</code>、<code>prompt.submit</code>、<code>slash.exec</code>；记录 <code>sessions</code>、<code>runs</code>、<code>messages</code>、<code>tool_calls</code>。</td>
+          <td>session 绑定 tenant/workspace/project；刷新后可恢复；工具进度和错误可见。</td>
+        </tr>
+        <tr>
+          <td>Identity / Project</td>
+          <td>用户进入正确 workspace/project，不能串租户。</td>
+          <td>服务端生成 identity tuple：<code>sub</code>、<code>tenant_id</code>、<code>workspace_id</code>、<code>project_id</code>、<code>session_id</code>、<code>tool_scopes</code>、<code>budget</code>、<code>exp</code>。</td>
+          <td>不信任前端 tenant_id；改 URL 或 payload 不能进入别的 project。</td>
+        </tr>
+        <tr>
+          <td>Upload / Attachment</td>
+          <td>上传素材并让 Agent 安全引用。</td>
+          <td><code>POST /api/chat/uploads</code>；返回 <code>upload_asset_id</code>、<code>media_input</code>、attachment marker；对象 key 按 tenant/workspace/project 分区。</td>
+          <td>Agent 看到 marker，不看到任意本地路径；其他 tenant 无法读取。</td>
+        </tr>
+        <tr>
+          <td>Skill Registry</td>
+          <td>用户看公开 Skill；Agent 按需加载受保护 reference。</td>
+          <td><code>skills_list</code>、<code>skill_view</code>、<code>skill_reference_access_logs</code>。</td>
+          <td>禁止 <code>../</code>、symlink escape、bulk export；每次加载记录 allow/deny reason。</td>
+        </tr>
+        <tr>
+          <td>References 安全</td>
+          <td>区分 Skill 内部、用户上传、媒体资产三类引用。</td>
+          <td>Skill <code>references/</code>、upload references、<code>soul_id</code>/<code>element_id</code>/<code>media_input</code>/<code>job_id</code>。</td>
+          <td>Skill internals 默认不可导出；媒体资产 id 使用前查 ACL/status/revocation。</td>
+        </tr>
+        <tr>
+          <td>Structured Question</td>
+          <td>Agent 用结构化方式让用户补信息。</td>
+          <td><code>ask_user_question</code> 支持 <code>text</code>、<code>entity</code>、<code>files</code>。</td>
+          <td>不能让用户手抄 asset id；picker 只展示有权限资产；取消返回结构化 cancel。</td>
+        </tr>
+        <tr>
+          <td>Asset Service</td>
+          <td>创建并复用 Element、Soul ID、media_input、job asset。</td>
+          <td><code>asset_references</code>、<code>asset_reference_sources</code>、<code>identity_jobs</code>、<code>generation_jobs</code>、<code>asset_acl</code>。</td>
+          <td>not_ready/failed/revoked 不能用于生成；output asset 必须记录 lineage。</td>
+        </tr>
+        <tr>
+          <td>Media Job</td>
+          <td>异步执行生成，UI 可见状态和结果。</td>
+          <td>validate -> create -> queue -> run -> finalize -> reuse；状态为 created/queued/running/completed/failed/cancelled。</td>
+          <td>idempotency key 防重复提交；provider 未配置返回可见错误，不伪造结果。</td>
+        </tr>
+        <tr>
+          <td>TokenRouter</td>
+          <td>凭证、配额、策略、审计控制面。</td>
+          <td>verify token、extract claims、OPA decision、asset/quota check、OpenBao secret exchange、proxy/job create、audit。</td>
+          <td>token 过期、OPA bundle 缺失、quota 缺失、vault failure、关键 audit failure 都 fail closed。</td>
+        </tr>
+        <tr>
+          <td>Sandbox / Volume / Egress</td>
+          <td>隔离任意代码和工具执行。</td>
+          <td>Kata / microVM、授权 <code>/workspace</code> path set、cgroup、egress proxy。</td>
+          <td>无 provider key、无 hidden Skill references、无 metadata egress、不能直连 provider。</td>
+        </tr>
+        <tr>
+          <td>Worker / Job Manager</td>
+          <td>受控执行媒体 job。</td>
+          <td>Job Manager 校验 job 和生成 manifest；worker 只拿 lease/input manifest，只写 assigned output_prefix。</td>
+          <td>MVP 单 queue、单 GPU pool、one model worker；不做复杂 Kueue 策略。</td>
+        </tr>
+        <tr>
+          <td>Audit / Observability</td>
+          <td>失败和成本能追踪。</td>
+          <td>session event、tool call、token decision、asset access、job event、usage event。</td>
+          <td>failed job 可从 job_id 追到 run、tool_call、TokenRouter decision、worker log、usage event。</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="warning">
+    <strong>MVP 不做</strong><br>
+    不做完整 CometAPI、不做 fake job、不自动生成、不公开化 <code>default_api:*</code>、不承诺 Soul ID 底层训练、不做 Boost upsell、不做跨 region GPU 调度、不用普通 Docker 承载任意租户代码。
+  </section>
+
+  <section>
+    <h2>核心对象</h2>
+    <p><code>tenant</code>、<code>workspace</code>、<code>project</code>、<code>session/thread</code>、<code>run</code>、<code>tool_call</code>、<code>upload</code>、<code>asset_reference</code>、<code>identity_job</code>、<code>generation_job</code>、<code>usage_event</code>、<code>audit_event</code></p>
+  </section>
+
+  <section>
+    <h2>产品体验</h2>
+    <ul>
+      <li>中间是真实 Agent transcript，展示流式消息。</li>
+      <li>右侧是 tool progress、assets、job status、structured prompt 面板。</li>
+      <li>附件上传必须进入真实 attachment flow。</li>
+      <li><code>ask_user_question</code> 支持 text、entity、files。</li>
+      <li>资产面板展示 upload、Element、Soul ID、media job、生成结果。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>工具接口</h2>
+    <table>
+      <thead><tr><th>来源工具名</th><th>本地 MVP 接口</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><code>default_api:higgsfield_generate</code></td><td><code>media_generate</code></td><td>provider-neutral 异步媒体生成。</td></tr>
+        <tr><td><code>default_api:higgsfield_job_status</code></td><td><code>media_job_status</code></td><td>统一 job 状态查询。</td></tr>
+        <tr><td><code>default_api:higgsfield_soul_id</code></td><td><code>identity_reference_train/status/list</code></td><td>身份引用，不暴露 provider 专名。</td></tr>
+        <tr><td><code>default_api:higgsfield_element</code></td><td><code>asset_reference_create/list/get</code></td><td>角色、环境、道具等资产引用。</td></tr>
+        <tr><td><code>default_api:skill_view</code></td><td><code>skill_view</code></td><td>精确加载授权 Skill 文件。</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>技术里程碑</h2>
+    <ol>
+      <li>PRD 与设计冻结：确认范围和不做事项。</li>
+      <li>Identity + Session + Web Chat：真实会话、流式消息、工具事件。</li>
+      <li>Skill + References：registry、<code>skill_view</code>、protected references。</li>
+      <li>Upload + Asset Service：上传、Element、Soul ID pending/status、asset picker。</li>
+      <li>TokenRouter MVP：JWT、OPA、OpenBao、quota、asset ACL、audit。</li>
+      <li>Media Job MVP：异步 job、单 worker、状态流、输出资产、全链路追踪。</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>验收标准</h2>
+    <ul>
+      <li>用户能创建/恢复真实 Hermes 会话，并看到流式消息和工具进度。</li>
+      <li>上传文件返回真实 attachment marker，不硬编码路径。</li>
+      <li>普通用户不能导出 protected Skill <code>references/</code>。</li>
+      <li><code>media_generate</code> 返回 job id，UI 显示 queued/running/completed/failed。</li>
+      <li>未授权或未 ready 的资产不能被 job 使用。</li>
+      <li>sandbox 和 mounted files 中没有 provider key。</li>
+      <li>failed job 可从 <code>job_id</code> 追到 TokenRouter decision、worker log、usage event。</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Future Parking Lot</h2>
+    <p>完整 CometAPI、长视频 URL 解析、帧缓存、Boost concurrency、多 region GPU 调度、Soul ID 真实训练后端、Skill package signing、per-tenant encryption context、zero-upload reusable media cache、Scheduled publishing、Connectors OAuth 大规模接入。</p>
+  </section>
+</main>
+<footer>
+  <div class="wrap">本 HTML 是 <code>docs/hermes-web-mvp-prd.md</code> 的浏览器阅读版。</div>
+</footer>
+</body>
+</html>
