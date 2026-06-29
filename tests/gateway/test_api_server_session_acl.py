@@ -226,15 +226,23 @@ async def test_image_prompt_stream_routes_through_agent_inside_principal_scope(s
 
     async def fake_run_agent(**kwargs):
         assert kwargs["user_message"] == "帮我生成一个猫的图片"
-        kwargs["tool_progress_callback"](
-            "tool.started",
-            tool_name="image_generate",
-            preview="agent-routed image tool",
+        kwargs["tool_start_callback"](
+            "call-image-owned-by-a",
+            "image_generate",
+            {"prompt": "cat"},
         )
         kwargs["tool_progress_callback"](
             "tool.completed",
             tool_name="image_generate",
             preview="agent completed image tool",
+            duration=0.2,
+            result='{"success": true, "image": "https://static.atlascloud.ai/images/cat.png"}',
+        )
+        kwargs["tool_complete_callback"](
+            "call-image-owned-by-a",
+            "image_generate",
+            {"prompt": "cat"},
+            '{"success": true, "image": "https://static.atlascloud.ai/images/cat.png"}',
         )
         db = scoped_adapter._ensure_session_db()
         db.append_message("image-owned-by-a", "user", kwargs["user_message"])
@@ -300,10 +308,10 @@ async def test_session_chat_stream_emits_tool_lifecycle_events(scoped_adapter):
 
     async def fake_run_agent(**kwargs):
         kwargs["stream_delta_callback"]("hello ")
-        kwargs["tool_progress_callback"](
-            "tool.started",
-            tool_name="image_generate",
-            preview="Creating image",
+        kwargs["tool_start_callback"](
+            "call-stream-image",
+            "image_generate",
+            {"prompt": "cat"},
         )
         kwargs["tool_progress_callback"](
             "reasoning.available",
@@ -314,6 +322,14 @@ async def test_session_chat_stream_emits_tool_lifecycle_events(scoped_adapter):
             "tool.completed",
             tool_name="image_generate",
             preview="Created image",
+            duration=1.25,
+            result='{"success": true, "image": "https://static.atlascloud.ai/images/cat.png"}',
+        )
+        kwargs["tool_complete_callback"](
+            "call-stream-image",
+            "image_generate",
+            {"prompt": "cat"},
+            '{"success": true, "image": "https://static.atlascloud.ai/images/cat.png"}',
         )
         kwargs["prompt_notify_callback"]({
             "kind": "clarify",
@@ -347,6 +363,9 @@ async def test_session_chat_stream_emits_tool_lifecycle_events(scoped_adapter):
     assert "event: tool.started" in body
     assert "event: tool.progress" in body
     assert "event: tool.completed" in body
+    assert '"tool_call_id": "call-stream-image"' in body
+    assert '"duration_ms": 1250' in body
+    assert "https://static.atlascloud.ai/images/cat.png" in body
     assert "event: clarify.request" in body
     assert "hello done" in body
 
@@ -356,10 +375,10 @@ async def test_session_chat_stream_emits_failed_tool_when_result_is_error(scoped
     app = _app(scoped_adapter)
 
     async def fake_run_agent(**kwargs):
-        kwargs["tool_progress_callback"](
-            "tool.started",
-            tool_name="image_generate",
-            preview="Creating image",
+        kwargs["tool_start_callback"](
+            "call-failed-image",
+            "image_generate",
+            {"prompt": "cat"},
         )
         kwargs["tool_progress_callback"](
             "tool.completed",
@@ -370,6 +389,17 @@ async def test_session_chat_stream_emits_failed_tool_when_result_is_error(scoped
                 "reason": "insufficient_role",
             }),
             is_error=True,
+            duration=0.5,
+        )
+        kwargs["tool_complete_callback"](
+            "call-failed-image",
+            "image_generate",
+            {"prompt": "cat"},
+            json.dumps({
+                "success": False,
+                "error": "Tool blocked by policy",
+                "reason": "insufficient_role",
+            }),
         )
         return (
             {"final_response": "could not generate", "session_id": "failed-tool"},
@@ -395,6 +425,7 @@ async def test_session_chat_stream_emits_failed_tool_when_result_is_error(scoped
     assert stream.status == 200
     assert "event: tool.started" in body
     assert "event: tool.failed" in body
+    assert '"tool_call_id": "call-failed-image"' in body
     assert "Tool blocked by policy" in body
     assert "insufficient_role" in body
 

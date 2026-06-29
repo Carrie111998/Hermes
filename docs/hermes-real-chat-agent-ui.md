@@ -21,6 +21,13 @@ This document replaces the earlier MVP/plugin demo plan. The dashboard chat page
   - `image.attach` only when the path is an image path that needs explicit image attach handling
 - The eventual `prompt.submit` text includes the real attachment marker returned by the gateway.
 
+## References and Asset UI
+
+- User attachments are session-level attached references; they are not Skill internal `references/`.
+- Persistent media references such as `soul_id`, `element_id`, `media_input`, `image_job`, and `video_job` should render as project assets or side-panel entities, not as raw prompt text only.
+- Skill internal `references/` are protected operational content and must not be exposed through the dashboard file browser or export UI.
+- Entity prompts from `ask_user_question` need picker UI for `soul_id`, `element`, `voice`, and `language` once those tools are enabled.
+
 ## Non-Goals
 
 - Do not auto-start video generation when the user opens chat.
