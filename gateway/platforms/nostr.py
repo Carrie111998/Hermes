@@ -33,7 +33,7 @@ class NostrAdapter(BasePlatformAdapter):
             if not relays:
                 # Try to get from environment variables
                 import os
-                relays_str = os.getenv("NOSRT_RELAYS", "")
+                relays_str = os.getenv("NOSTR_RELAYS", "")
                 if relays_str:
                     relays = [r.strip() for r in relays_str.split(",") if r.strip()]
                 else:
@@ -106,8 +106,8 @@ class NostrAdapter(BasePlatformAdapter):
 
             try:
                 if message.type == MessageType.EVENT:
-                    event = event.as_json_dict()
-                    await self._process_event(event)
+                    event_dict = message.as_json_dict()
+                    await self._process_event(event_dict)
             except Exception as e:
                 logger.exception(f"Error processing Nostr event: {e}")
 
