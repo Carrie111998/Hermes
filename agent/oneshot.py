@@ -94,6 +94,16 @@ _BRANCH_NAME_INSTRUCTIONS = (
 )
 
 
+_PR_DESCRIPTION_INSTRUCTIONS = (
+    "You write pull request descriptions. Given a diff of changes, write a PR body.\n"
+    "Rules:\n"
+    "- Start with a one-line summary sentence (≤ 72 characters) describing what the PR does.\n"
+    "- Follow with a ## Changes section containing a bullet list of the main changes (≤ 8 bullets).\n"
+    "- Each bullet should be concise and describe what changed, not restate diff lines.\n"
+    "- Return ONLY the markdown PR body text — no code fences, no preamble, no greeting."
+)
+
+
 def _branch_name_template(variables: Dict[str, Any]) -> Tuple[str, str]:
     description = str(variables.get("description") or "").strip()
     if not description:
@@ -108,11 +118,38 @@ def _branch_name_template(variables: Dict[str, Any]) -> Tuple[str, str]:
     return _BRANCH_NAME_INSTRUCTIONS, "\n\n".join(parts)
 
 
+def _pr_description_template(variables: Dict[str, Any]) -> Tuple[str, str]:
+    diff = _truncate(str(variables.get("diff") or ""), 14000)
+    branch_name = str(variables.get("branch_name") or "").strip()
+    recent_commits = _truncate(str(variables.get("recent_commits") or ""), 1500)
+
+    parts = []
+    if branch_name:
+        parts.append(f"Branch: {branch_name}")
+    if recent_commits.strip():
+        parts.append(
+            "Recent commits on this branch:\n"
+            f"{recent_commits}"
+        )
+    parts.append("Diff to describe:\n" + (diff or "(no diff available)"))
+
+    avoid = _truncate(str(variables.get("avoid") or "").strip(), 1000)
+    if avoid:
+        parts.append(
+            "You already proposed the description below and the user wants a "
+            "different one. Write a NEW description with different wording — do not "
+            f"repeat it:\n{avoid}"
+        )
+
+    return _PR_DESCRIPTION_INSTRUCTIONS, "\n\n".join(parts)
+
+
 # Registry of named templates. Add an entry here to give a new surface a
 # consistent, reusable prompt without teaching every caller the prompt text.
 PROMPT_TEMPLATES: Dict[str, PromptTemplate] = {
     "branch_name": _branch_name_template,
     "commit_message": _commit_message_template,
+    "pr_description": _pr_description_template,
 }
 
 

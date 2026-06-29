@@ -98,6 +98,83 @@ class TestRunOneshot:
             assert run_oneshot(instructions="x", user_input="y") == "fix: bug"
 
 
+class TestPrDescriptionTemplate:
+    def test_diff_only(self):
+        """Minimal call with just diff — user_input contains diff text."""
+        instructions, user = render_template("pr_description", {"diff": "diff --git a/x b/x\n+new line"})
+        assert "diff --git a/x b/x" in user
+        assert "+new line" in user
+        assert "one-line summary" in instructions
+
+    def test_with_all_variables(self):
+        """branch_name + recent_commits appear in user_input."""
+        _, user = render_template(
+            "pr_description",
+            {
+                "diff": "diff --git a/x b/x",
+                "branch_name": "feat/add-pr-template",
+                "recent_commits": "feat: add pr template\nfix: typo",
+            },
+        )
+        assert "feat/add-pr-template" in user
+        assert "feat: add pr template" in user
+        assert "fix: typo" in user
+
+    def test_avoid_appended(self):
+        """avoid text appears in user_input when provided."""
+        _, user = render_template(
+            "pr_description",
+            {"diff": "d", "avoid": "This PR adds a new feature."},
+        )
+        assert "This PR adds a new feature." in user
+        assert "do not repeat" in user
+
+    def test_large_diff_truncated(self):
+        """diff > 14,000 chars is truncated; instructions text unchanged."""
+        large_diff = "x" * 20000
+        instructions, user = render_template("pr_description", {"diff": large_diff})
+        # Diff should be truncated
+        assert len(user) < 20000
+        assert "…(truncated)" in user
+        # Instructions should remain intact
+        assert "one-line summary" in instructions
+        assert "## Changes" in instructions
+
+    def test_missing_diff_handled(self):
+        """Empty diff yields fallback string, not exception."""
+        instructions, user = render_template("pr_description", {})
+        assert "(no diff available)" in user
+        assert instructions  # Instructions should still be present
+
+    def test_run_oneshot_pr_description_resolves(self):
+        """run_oneshot with template='pr_description' resolves without KeyError."""
+        with patch(
+            "agent.oneshot.call_llm",
+            return_value=MagicMock(
+                choices=[
+                    MagicMock(
+                        message=MagicMock(
+                            content="Add feature X.\n\n## Changes\n- Add X",
+                            reasoning=None,
+                            reasoning_content=None,
+                            reasoning_details=None,
+                        )
+                    )
+                ]
+            ),
+        ) as llm:
+            out = run_oneshot(
+                template="pr_description",
+                variables={"diff": "diff --git a/x b/x"},
+                main_runtime=None,
+            )
+
+        assert out == "Add feature X.\n\n## Changes\n- Add X"
+        messages = llm.call_args.kwargs["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[1]["role"] == "user"
+
+
 class TestHelpers:
     def test_truncate_under_limit_unchanged(self):
         assert _truncate("short", 100) == "short"
