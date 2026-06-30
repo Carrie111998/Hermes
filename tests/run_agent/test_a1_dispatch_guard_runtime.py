@@ -27,6 +27,10 @@ def _mock_response(content="ok", finish_reason="stop"):
     return SimpleNamespace(choices=[choice], model="frontier-fast", usage=None)
 
 
+def _mock_invalid_response():
+    return SimpleNamespace(choices=[], model="frontier-fast", usage=None)
+
+
 def _make_agent() -> AIAgent:
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
@@ -100,3 +104,75 @@ def test_a1_guard_records_allowed_dispatch_result(monkeypatch, tmp_path):
     ]
     assert events[-1]["provider_call_attempted"] is True
     assert events[-1]["provider_call_completed"] is True
+
+
+def test_a1_guard_wraps_streaming_dispatch_before_provider_call(monkeypatch, tmp_path):
+    sink = tmp_path / "a1-streaming.jsonl"
+    monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
+    monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
+    agent = _make_agent()
+    agent.stream_delta_callback = lambda _delta: None
+    streaming_call = MagicMock(return_value=_mock_response("streamed ok"))
+    non_streaming_call = MagicMock(return_value=_mock_response("wrong path"))
+    agent._interruptible_streaming_api_call = streaming_call
+    agent._interruptible_api_call = non_streaming_call
+
+    result = agent.run_conversation("CLASSIFICATION=C0_PUBLIC streaming hello")
+
+    streaming_call.assert_called_once()
+    non_streaming_call.assert_not_called()
+    assert result["completed"] is True
+    assert result["final_response"] == "streamed ok"
+    events = _read_jsonl(sink)
+    assert [event["event_type"] for event in events] == [
+        "resolver_decision",
+        "payload_capture",
+        "dispatch_result",
+    ]
+    assert events[-1]["provider_call_attempted"] is True
+    assert events[-1]["provider_call_completed"] is True
+
+
+def test_a1_guard_rechecks_runtime_after_fallback_provider_switch(monkeypatch, tmp_path):
+    sink = tmp_path / "a1-fallback.jsonl"
+    monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
+    monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
+    agent = _make_agent()
+    agent._fallback_chain = [{"provider": "local-ollama", "model": "qwen3.5:9b"}]
+    agent._fallback_index = 0
+    provider_call = MagicMock(
+        side_effect=[
+            _mock_invalid_response(),
+            _mock_response("fallback ok"),
+        ]
+    )
+    agent._interruptible_api_call = provider_call
+
+    def activate_fallback(*_args, **_kwargs):
+        agent.provider = "local-ollama"
+        agent.model = "qwen3.5:9b"
+        agent.base_url = "http://localhost:11434/v1"
+        agent._fallback_index = 1
+        agent._fallback_activated = True
+        return True
+
+    agent._try_activate_fallback = MagicMock(side_effect=activate_fallback)
+
+    result = agent.run_conversation("CLASSIFICATION=C0_PUBLIC fallback hello")
+
+    assert provider_call.call_count == 2
+    assert agent._try_activate_fallback.call_count == 1
+    assert result["completed"] is True
+    assert result["final_response"] == "fallback ok"
+    events = _read_jsonl(sink)
+    assert [event["event_type"] for event in events] == [
+        "resolver_decision",
+        "payload_capture",
+        "dispatch_result",
+        "resolver_decision",
+        "payload_capture",
+        "dispatch_result",
+    ]
+    assert events[0]["canonical_provider"] == "custom:headroom-openrouter-litellm"
+    assert events[3]["canonical_provider"] == "local-ollama"
+    assert events[3]["canonical_base_url_host"] == "localhost:11434"
