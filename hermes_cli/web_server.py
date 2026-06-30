@@ -19995,7 +19995,7 @@ def start_server(
                 "There is no unauthenticated public-bind option — to keep it "
                 "local, bind 127.0.0.1 and tunnel in (SSH / Tailscale)."
             )
-            # Hint when credentials exist but the bundled provider is blocked
+# Hint when credentials exist but the bundled provider is blocked
             # (#54489).
             try:
                 from hermes_cli.config import load_config as _load_cfg
