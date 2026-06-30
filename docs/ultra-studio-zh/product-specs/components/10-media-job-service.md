@@ -1,7 +1,7 @@
 # 10 媒体任务服务（Media Job Service）
 
-状态：部分实现（partial）—— 同步图像/视频生成工具、提供商注册表及 Atlas 提交/轮询客户端已实现；P0 本地 `ultra_media_job_create/status/finalize`、SQLite `media_jobs` / `assets` / `media_events` 已实现；取消、重试、后台轮询、网关事件流和完整 Asset Service 仍未实现。
-日期：2026-06-29
+状态：外部服务边界（external）—— Hermes 内只保留图像/视频 provider adapter 和工具注册基础；MediaJob 权威状态不在 Hermes runtime 内实现。当前 workspace 中的独立服务位于 `/Users/lifcc/Desktop/code/work/infra/ultrastudio-foundation/ultrastudio-media-job-service`，已提供 provider-neutral job envelope、状态读取、状态流转、TokenRouter 决策和队列发布；Asset Service finalize、后台 worker 轮询和产品 UI 事件流仍待接入。
+日期：2026-06-30
 
 来源：
 
@@ -24,9 +24,10 @@
   `resolve_credentials`）、`plugins/video_gen/atlas/catalog.py`
   （`ATLAS_FAMILIES`）、`plugins/image_gen/atlas/`（`catalog.py`、
   `client.py`），以及 `plugins/image_gen/`、`plugins/video_gen/` 下的
-  `fal`/`xai`/`openai` 提供商插件；P0 本地作业层：
-  `agent/ultra_media_store.py`、`tools/ultra_media_job_tool.py`、
-  `tests/tools/test_ultra_media_job_tool.py`
+  `fal`/`xai`/`openai` 提供商插件。
+- 外部服务（本次会话已验证）：`/Users/lifcc/Desktop/code/work/infra/ultrastudio-foundation/ultrastudio-media-job-service/main.go`、
+  `internal_response.go`、`main_test.go`，共享合约位于
+  `/Users/lifcc/Desktop/code/work/infra/ultrastudio-foundation/ultrastudio-contracts/contracts.go`。
 
 ## 目的与范围
 
@@ -37,6 +38,8 @@ Media Job Service 将图像/视频/音频生成作为持久的、与提供商无
 范围：作业创建/状态/取消/重试/完成、MediaJob 信封、提供商适配器、轮询、输出生成交付至 Asset Service，以及作业事件。模型/约束元数据见
 `19-model-catalog-provider-constraints.md`；提示负载构造见
 `13-prompt-compiler.md`；凭证策略见 `17-tokenrouter.md`。
+
+边界规则：MediaJob、Asset、TokenRouter、usage/audit 是 Ultra Studio 产品基础服务，不能再放入 Hermes core。Hermes、Codex 或其他 runtime 只能通过薄 adapter 调用这些服务。
 
 ## 实现状态
 
@@ -49,12 +52,14 @@ Media Job Service 将图像/视频/音频生成作为持久的、与提供商无
 | 已实现（Implemented） | 服务端凭证解析（提示/UI 中无密钥） | `plugins/video_gen/atlas/client.py`（`resolve_credentials`）；启动门控 "Atlas credential path is explicit"（`06-delivery-plan.md`） |
 | 已实现（Implemented） | 参考图像归一化（本地文件 → 数据 URI） | `plugins/video_gen/atlas/client.py`（`normalize_image_input`、`_image_to_data_uri`） |
 | 已实现（Implemented） | 将每模型约束展示到工具 schema 和注意事项中 | `tools/video_generation_tool.py`（`_build_dynamic_video_schema`、`_format_model_caveats`）、`plugins/video_gen/atlas/catalog.py`（`ATLAS_FAMILIES` 时长/分辨率/音频） |
-| 已实现（Implemented） | P0 本地 MediaJob 记录（`job_id`、`session_id`、`run_id`、`tool_call_id`、provider/model、状态、错误、输出） | `agent/ultra_media_store.py` |
-| 部分实现（Partial） | `ultra_media_job_create / status / finalize` 工具组 | `tools/ultra_media_job_tool.py`；`cancel` / `retry` 未实现 |
-| 部分实现（Partial） | `media_job.created` / `media_job.updated` / `media_job.failed` / `asset.ready` 事件记录 | `agent/ultra_media_store.py` 的 `media_events` 表；尚未接入 gateway/UI event stream |
-| 部分实现（Partial） | 将生成输出注册为本地 asset（`finalize` → `assets` 行 + lineage metadata） | `agent/ultra_media_store.py`；这不是完整 Asset Service |
-| 已规定，未构建（Specified, not built） | 作业在工作进程/会话中断后存活 | `06-delivery-plan.md` P2 门控 |
-| 缺口（Gap） | 各提供商的取消/重试语义（哪些 Atlas 路由支持取消） | 未指定 |
+| 外部已实现（External implemented） | provider-neutral MediaJob 记录（job/context/provider/model/status/input/output/tokenrouter 字段） | `ultrastudio-foundation/ultrastudio-media-job-service` + `ultrastudio-contracts` |
+| 外部已实现（External implemented） | `POST /v1/jobs`、`GET /v1/jobs`、`GET /v1/jobs/{id}`、`GET /v1/jobs/{id}/status` | `ultrastudio-media-job-service/main.go` |
+| 外部已实现（External implemented） | `running/complete/fail/block/cancel/retry` 状态流转端点 | `ultrastudio-media-job-service/main.go` |
+| 外部已实现（External implemented） | 创建时调用 TokenRouter `POST /v1/decisions`，保存 `tokenrouter_decision_id` 和 scoped token，默认响应擦除 scoped token | `decide`、`responseJob` |
+| 外部已实现（External implemented） | 提交成功后发布队列消息，供 Worker Orchestrator 消费 | `enqueueJob` |
+| Hermes 未实现（Not in Hermes） | `ultra_media_job_create/status/finalize` 不能在 Hermes core 中持久化作业；未来只允许薄 adapter 调外部服务 | 本次修正已移除 Hermes 本地实现 |
+| 已规定，未构建（Specified, not built） | 输出注册到完整 Asset Service（缩略图、lineage、ACL、audit） | `09-asset-service.md` |
+| 缺口（Gap） | 各提供商真实取消/重试语义（哪些 Atlas 路由支持 provider-side cancel） | 未指定 |
 
 ## 用户入口点
 
@@ -77,13 +82,13 @@ Media Job Service 将图像/视频/音频生成作为持久的、与提供商无
 | 基于配置的提供商/模型选择及可用性检查 | 已实现（Implemented）（`check_video_generation_requirements`、`_resolve_active_provider`） |
 | 向智能体展示模型注意事项消息（时长、分辨率、音频） | 已实现（Implemented）（`_format_model_caveats`） |
 | 对提供商预测进行异步轮询 | 已实现（Implemented）（同轮次 `poll`）；跨轮次持久轮询计划中 |
-| 支持状态查询的持久作业记录 | 已实现（Implemented）（本地 SQLite `media_jobs` + `ultra_media_job_status`） |
-| 取消队列中/运行中的作业 | 已规划（Planned）（`ultra_media_job_cancel`） |
-| 使用编译修复计划进行重试 | 已规划（Planned）（`ultra_media_job_retry`；与 `prompt-repair` 技能配对） |
-| 完成：将输出注册为带有来源链路的资产 | 部分实现（Partial）（`ultra_media_job_finalize` 写本地 `assets`；缩略图/完整 Asset Service 未实现） |
-| 向 UI 发送作业事件 | 已规划（Planned）（当前只写本地 `media_events`） |
+| 支持状态查询的持久作业记录 | 外部已实现（External implemented）（`ultrastudio-media-job-service` JSON store + API） |
+| 取消队列中/运行中的作业 | 外部状态端点已实现；provider-side cancel 能力矩阵仍待补 |
+| 使用编译修复计划进行重试 | 外部状态端点已实现；Prompt Compiler repair plan 接入仍待补 |
+| 完成：将输出注册为带有来源链路的资产 | 已规划（Planned）（必须由外部 Asset Service finalize，不在 Hermes 本地写 assets） |
+| 向 UI 发送作业事件 | 已规划（Planned）（由产品层订阅 MediaJob/Asset 服务事件） |
 | 信封中的种子捕获和可复现参数 | 已规划（Planned）（信封字段存在于规格中；并非所有提供商都返回种子） |
-| TokenRouter 决策关联（`tokenrouter_decision_id`） | 已规划（Planned）；依赖于 `17-tokenrouter.md` |
+| TokenRouter 决策关联（`tokenrouter_decision_id`） | 外部已实现（External implemented）；完整用量闭环仍依赖 `17-tokenrouter.md` |
 
 ## 状态机
 
@@ -109,61 +114,71 @@ job.running -> job.timeout                       (maps to `job_timeout` error)
 
 ## API 与事件
 
-已实现（智能体工具层面）：`ultra_media_job_create`、
-`ultra_media_job_status`、`ultra_media_job_finalize` 包装当前
-`image_generate` / `video_generate`，并写入本地 SQLite。底层
-`generate_video` / 图像生成工具
-通过工具注册表注册（`model_tools.py` 分发）；通过
+Hermes 内没有 `ultra_media_job_*` 权威工具实现。未来若 Hermes 作为
+runtime 使用，只允许提供薄 adapter：把工具调用转发给外部
+Media Job Service，并把服务返回的 job/asset/error 映射回 agent/UI。若
+runtime 换成 Codex，同一套外部服务 API 应保持不变。
+
+外部 Media Job Service 当前 API：
+
+```http
+POST /v1/jobs
+GET  /v1/jobs?status=&include_internal=
+GET  /v1/jobs/{id}
+GET  /v1/jobs/{id}/status
+POST /v1/jobs/{id}/running
+POST /v1/jobs/{id}/complete
+POST /v1/jobs/{id}/fail
+POST /v1/jobs/{id}/block
+POST /v1/jobs/{id}/cancel
+POST /v1/jobs/{id}/retry
+```
+
+底层 `generate_video` / 图像生成 provider adapter 仍通过 Hermes 工具注册表注册（`model_tools.py` 分发）；通过
 `plugins/*/atlas/client.py` `submit`/`poll` 对 Atlas API 进行提供商调用
-（`ATLAS_API_KEY` 通过 `resolve_credentials` 在服务端）。
+（`ATLAS_API_KEY` 通过 `resolve_credentials` 在服务端）。这些 provider adapter 不是 MediaJob 状态源。
 
 工具组状态（来自 `03-media-asset-contract.md` §Required Job Tools）：
 
 | 工具 | 目的 |
 |---|---|
-| `ultra_media_job_create` | 已实现：创建本地 MediaJob，调用当前图像/视频 provider，可自动 finalize。 |
-| `ultra_media_job_status` | 已实现：返回持久作业、输出资产、错误和本地事件。 |
-| `ultra_media_job_cancel` | 未实现。 |
-| `ultra_media_job_retry` | 未实现。 |
-| `ultra_media_job_finalize` | 部分实现：将输出注册为本地资产和来源链路；缩略图/完整资产服务未实现。 |
+| `ultra_media_job_create` | 外部服务 API 已有创建端点；Hermes adapter 未接入。 |
+| `ultra_media_job_status` | 外部服务 API 已有状态端点；Hermes adapter 未接入。 |
+| `ultra_media_job_cancel` | 外部服务 API 已有状态流转端点；provider-side cancel 能力矩阵未补。 |
+| `ultra_media_job_retry` | 外部服务 API 已有状态流转端点；Prompt Compiler repair plan 未接入。 |
+| `ultra_media_job_finalize` | 必须由外部 Asset Service 完成；Hermes 不写本地资产表。 |
 | `ultra_media_constraints_get` | 未实现。 |
 
 计划中事件：`media_job.created`、`media_job.updated`，然后是 `asset.ready`
-（`02-agent-runtime-contract.md` §Event Stream）。在持久作业落地前，
-作业进度通过 `tool.progress` 传递给 UI。
+（`02-agent-runtime-contract.md` §Event Stream）。事件源应来自外部服务或产品 BFF 投影，不来自 Hermes 本地账本。
 
 ## 数据模型
 
-已实现：无持久化 —— 作业状态在工具调用的内存流中
-仅存在于轮次持续期间。
-
-计划中：MediaJob 信封（原文字段，
-`03-media-asset-contract.md`）：
+外部合约已在 `ultrastudio-contracts` 定义，核心字段包括：
 
 ```yaml
 MediaJob:
   job_id:
-  session_id:
-  run_id:
-  tool_call_id:
+  route_id:
+  context:
   provider:
   model:
   media_type:
   mode:
   status:
-  input_assets:
+  input_asset_refs:
   prompt:
-  negative_prompt:
-  provider_constraints:
-  seed:
   tokenrouter_decision_id:
-  output_assets:
+  estimate_units:
+  output_refs:
   error:
+  created_at:
+  updated_at:
 ```
 
 边界说明：`hermes-asset-library-backend-design.md` 在 Asset Service 侧定义了
-`generation_jobs` 表；将此表与此信封（单一写入者 + 事件镜像）协调
-是与 `09-asset-service.md` 共享的开放问题。
+`generation_jobs` 表。当前决策是 Media Job Service 拥有 job 状态；
+Asset Service 可保存 output/lineage 和可重建镜像，避免双写权威状态。
 
 ## UI 行为
 
@@ -203,8 +218,8 @@ Atlas 轮询错误向智能体暴露，而非伪装成功。
 - 清晰的视频请求创建真实提供商作业，并返回真实输出或类型化阻断器
   （`04-skill-tool-prompt-contract.md` §Acceptance）。
 - 轮询 URL 绝不会被注册为输出（由 `first_output_url` 行为进行回归防护）。
-- 一旦持久作业落地：浏览器在作业中途刷新保留作业；
-  `ultra_media_job_status` 返回与 UI 展示的相同状态。
+- 一旦外部 Media Job Service 接入产品层：浏览器在作业中途刷新保留作业；
+  runtime adapter 的 `ultra_media_job_status` 返回与 UI 展示的相同状态。
 - `finalize` 生成带有来源链路的资产 ID，关联作业、输入、模型、
   提示哈希、种子（`03-media-asset-contract.md` §来源链路（Lineage））。
 - 失败作业保持可检查状态，提供商错误类别完整保留。
@@ -222,8 +237,8 @@ Atlas 轮询错误向智能体暴露，而非伪装成功。
 
 ## 待解决问题
 
-1. 持久化作业存储位置：网关侧数据库 vs Asset Service
-   `generation_jobs` —— 谁是单一写入者？
+1. Asset Service 是否保存 `generation_jobs` 可重建镜像，还是只保存
+   output asset lineage；Media Job Service 是 job 状态的单一写入者。
 2. 作业持久化后的轮询所有权：网关后台工作进程 vs
    每会话恢复轮询；工作进程重启时，进行中的轮询会发生什么？
 3. 各 Atlas 路由的取消支持矩阵（`ATLAS_FAMILIES` 中的 Wan/Seedance/Kling 家族）

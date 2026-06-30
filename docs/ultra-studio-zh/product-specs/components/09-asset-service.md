@@ -1,15 +1,12 @@
 # 资产服务
 
-状态：部分实现（partial）—— 完整 Asset Service 仍未实现；P0 本地 `assets` 表已随 `ultra_media_job_finalize` 落地，可记录生成输出、URI 和最小 lineage。上传入库、资产 API、ACL、集合、搜索、mention 和下载端点仍为规格。
-日期：2026-06-29
+状态：外部服务边界（external/spec-only in Hermes）—— 完整 Asset Service 仍未在 Hermes 内实现，也不应在 Hermes runtime 内实现。上传入库、资产 API、ACL、集合、搜索、mention、download、lineage 和 audit 都属于 Ultra Studio 产品基础服务。
+日期：2026-06-30
 
 来源：
 
 - 文档：`docs/hermes-asset-library-backend-design.md`（全文：§架构形状、§核心实体、§API 面、§搜索和索引、§生成链路、§实时事件、§错误策略、§P0 切片）、`docs/ultra-studio-product-specs/03-media-asset-contract.md`（§Asset Types、§Asset Lifecycle、§来源链路（Lineage）、§QA、§Acceptance）、`docs/hermes-soulid-element-asset-model.md`（§资产类型、§最小数据模型、§工具映射、§安全要求）、`02-agent-runtime-contract.md`（§Error Contract）、`06-delivery-plan.md`（P0 第 9 项、P1 第 6-7 项）
-- 代码：P0 本地生成输出注册位于 `agent/ultra_media_store.py`
-  （`assets` 表、`finalize_job`、最小 lineage）和
-  `tools/ultra_media_job_tool.py`（`ultra_media_job_finalize`）。
-  上传入口仍仅作为聊天附件路径存在（`web/src/components/chat/ChatComposer.tsx`）。
+- 代码：Hermes 仓库内没有 Asset Service 权威实现。上传入口仍仅作为聊天附件路径存在（`web/src/components/chat/ChatComposer.tsx`）。MediaJob 输出应由外部 Asset Service finalize，而不是由 Hermes 写本地资产表。
 
 ## 目的与范围
 
@@ -23,7 +20,7 @@
 
 | 状态 | 项目 | 引用 |
 |---|---|---|
-| 部分实现（Partial） | P0 本地 `assets` 行，记录生成输出 URI、media_type、job_id、session_id、metadata 和 lineage | `agent/ultra_media_store.py` |
+| Hermes 未实现（Not in Hermes） | 资产权威状态、生成输出注册、lineage、ACL、audit 均不在 Hermes runtime 内实现 | 本文边界规则 |
 | 已规定，未构建（Specified, not built） | 完整 `asset_lineage` / `generation_jobs` / `collections` / `smart_groups` / `asset_references` / `asset_acl` / `asset_audit_events` 实体 | `hermes-asset-library-backend-design.md` §核心实体 |
 | 已规定，未构建（Specified, not built） | 两阶段上传（`uploads/init` 签名 URL -> `uploads/complete` -> 异步缩略图/元数据/嵌入） | §上传入库 |
 | 已规定，未构建（Specified, not built） | 列表/详情/来源链路/操作记录读取 API | §资产列表和详情 |
@@ -44,7 +41,7 @@
 - 资产库 UI（画廊、详情、集合、mention 菜单）—— `08-asset-library-ui.md`。
 - 聊天编辑器结构化提交（mentions + 附件）。
 - 代理工具：资产工具组 `ultra_asset_upload / list / inspect / download / promote`（`04-skill-tool-prompt-contract.md` §Asset Tools；仅规格说明）及 `hermes-soulid-element-asset-model.md` §工具映射 中映射的引用工具。
-- 媒体作业服务输出注册（`ultra_media_job_finalize` 路径）。
+- 媒体作业服务输出注册（外部 Media Job Service -> 外部 Asset Service finalize 路径）。
 - 文件提升（`06-files-task-file-browser.md` 提升操作）。
 
 ## 功能列表
@@ -52,9 +49,9 @@
 | 功能 | 状态 |
 |---|---|
 | 将上传注册为 `media_input`，带 mime/大小验证 | 已规划（Planned）（P0 切片 1） |
-| 将生成输出注册为 `image_job`/`video_job` 资产 | 部分实现（Partial）（`ultra_media_job_finalize` 写本地 `assets`；`audio_job` 未实现） |
+| 将生成输出注册为 `image_job`/`video_job` 资产 | 已规划（Planned）（外部 Asset Service finalize；`audio_job` 未实现） |
 | 资产生命周期管理（`uploading -> processing -> ready -> archived`） | 已规划（Planned） |
-| 来源链路图（父级、源作业、提供商作业、模型、提示词哈希、种子、用户/会话/运行） | 部分实现（Partial）（记录 source job、session/run/tool、输入资产、prompt、provider/model；提示词哈希/完整图未实现） |
+| 来源链路图（父级、源作业、提供商作业、模型、提示词哈希、种子、用户/会话/运行） | 已规划（Planned）（必须由外部 Asset Service 记录，Media Job Service 可提供 job/output refs） |
 | 元素/角色/灵魂 ID 引用，带提供商训练状态 | 已规划（Planned）（P0 切片 4：允许模拟提供商，禁止伪造 `ready`） |
 | 集合（手动）与智能组（动态查询） | 已规划（Planned）（P0 切片 2-3） |
 | Mention/选择器搜索，带 `context=` 变体 | 已规划（Planned）（P0 切片 5） |
