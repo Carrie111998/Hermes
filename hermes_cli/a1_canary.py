@@ -25,6 +25,9 @@ GREEN_CANARY_CASE_IDS = (
     "A1.3-CANARY-006",
     "A1.3-CANARY-005",
     "A1.3-CANARY-004",
+    "A1.3-SURFACE-CLI-001",
+    "A1.3-SURFACE-GATEWAY-001",
+    "A1.3-SURFACE-CRON-001",
 )
 
 _RAW_PAYLOAD_FRAGMENTS = (
@@ -98,6 +101,20 @@ def run_green_canary_harness(*, output_path: str | Path) -> list[dict[str, Any]]
                 configure=_configure_fallback,
             )
         )
+        for case_id, surface in (
+            ("A1.3-SURFACE-CLI-001", "cli"),
+            ("A1.3-SURFACE-GATEWAY-001", "gateway"),
+            ("A1.3-SURFACE-CRON-001", "cron"),
+        ):
+            records.append(
+                _run_surface_config_case(
+                    case_id=case_id,
+                    surface=surface,
+                    prompt=f"CLASSIFICATION=C2_LOCAL_ONLY {surface} surface do not leave local",
+                    hermes_home=tmp / f"{surface}-home",
+                    evidence_sink=tmp / f"{surface}.jsonl",
+                )
+            )
 
     with output.open("w", encoding="utf-8") as handle:
         for record in records:
@@ -180,6 +197,79 @@ def _run_case(
         _restore_env("HERMES_A1_EVIDENCE_SINK", old_sink)
 
 
+def _run_surface_config_case(
+    *,
+    case_id: str,
+    surface: str,
+    prompt: str,
+    hermes_home: Path,
+    evidence_sink: Path,
+) -> dict[str, Any]:
+    """Run a C2 denial through a named Hermes surface with config-only guard enablement."""
+    old_home = os.environ.get("HERMES_HOME")
+    old_guard = os.environ.get("HERMES_A1_DISPATCH_GUARD")
+    old_sink = os.environ.get("HERMES_A1_EVIDENCE_SINK")
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "config.yaml").write_text(
+        f"""
+a1:
+  dispatch_guard:
+    enabled: true
+    evidence_sink: {evidence_sink}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    os.environ["HERMES_HOME"] = str(hermes_home)
+    os.environ.pop("HERMES_A1_DISPATCH_GUARD", None)
+    os.environ.pop("HERMES_A1_EVIDENCE_SINK", None)
+    try:
+        agent = _make_agent(platform=surface)
+        setattr(agent, "a1_classification", _classification_from_prompt(prompt))
+        dispatch_prompt = _strip_classification_marker(prompt)
+        call_count = _configure_c2_denied(agent)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            result = agent.run_conversation(dispatch_prompt)
+        events = _read_jsonl(evidence_sink)
+        serialized_events = json.dumps(events, sort_keys=True)
+        return {
+            "case_id": case_id,
+            "surface": surface,
+            "prompt_classification": _classification_from_prompt(prompt),
+            "result_completed": bool(result.get("completed")),
+            "result_failed": bool(result.get("failed")),
+            "final_response_digest": _digest(result.get("final_response")),
+            "provider_call_count": call_count(),
+            "event_types": [event["event_type"] for event in events],
+            "resolver_providers": [
+                event.get("canonical_provider")
+                for event in events
+                if event.get("event_type") == "resolver_decision"
+            ],
+            "resolver_hosts": [
+                event.get("canonical_base_url_host")
+                for event in events
+                if event.get("event_type") == "resolver_decision"
+            ],
+            "dispatch_attempted": [
+                event.get("provider_call_attempted")
+                for event in events
+                if event.get("event_type") == "dispatch_result"
+            ],
+            "dispatch_completed": [
+                event.get("provider_call_completed")
+                for event in events
+                if event.get("event_type") == "dispatch_result"
+            ],
+            "rule_ids": [event.get("rule_id") for event in events if event.get("rule_id")],
+            "raw_payload_stored": any(fragment in serialized_events for fragment in _RAW_PAYLOAD_FRAGMENTS),
+        }
+    finally:
+        _restore_env("HERMES_HOME", old_home)
+        _restore_env("HERMES_A1_DISPATCH_GUARD", old_guard)
+        _restore_env("HERMES_A1_EVIDENCE_SINK", old_sink)
+
+
 def _configure_c2_denied(agent: Any) -> Callable[[], int]:
     call = MagicMock(return_value=_mock_response("should-not-run"))
     agent._interruptible_api_call = call
@@ -219,7 +309,7 @@ def _configure_fallback(agent: Any) -> Callable[[], int]:
     return lambda: call.call_count
 
 
-def _make_agent() -> Any:
+def _make_agent(*, platform: str | None = None) -> Any:
     from run_agent import AIAgent
 
     with (
@@ -236,6 +326,7 @@ def _make_agent() -> Any:
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            platform=platform or "",
         )
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."

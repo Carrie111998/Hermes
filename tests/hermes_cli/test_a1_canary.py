@@ -55,6 +55,26 @@ def test_green_canary_harness_proves_denial_streaming_and_fallback_paths(tmp_pat
     assert fallback["resolver_hosts"] == ["localhost:8787", "localhost:11434"]
 
 
+def test_green_canary_harness_includes_cli_gateway_and_cron_surface_denials(tmp_path):
+    output = tmp_path / "a1-green-summary.jsonl"
+
+    records = run_green_canary_harness(output_path=output)
+    by_id = {record["case_id"]: record for record in records}
+
+    for case_id, surface in [
+        ("A1.3-SURFACE-CLI-001", "cli"),
+        ("A1.3-SURFACE-GATEWAY-001", "gateway"),
+        ("A1.3-SURFACE-CRON-001", "cron"),
+    ]:
+        record = by_id[case_id]
+        assert record["surface"] == surface
+        assert record["provider_call_count"] == 0
+        assert record["dispatch_attempted"] == [False]
+        assert record["dispatch_completed"] == [False]
+        assert "a1.c2.frontier-deny" in record["rule_ids"]
+        assert record["event_types"] == ["resolver_decision", "payload_capture", "dispatch_result"]
+
+
 def test_green_canary_cli_returns_nonzero_when_output_missing(tmp_path, capsys):
     output = tmp_path / "cli-summary.jsonl"
 
@@ -62,7 +82,7 @@ def test_green_canary_cli_returns_nonzero_when_output_missing(tmp_path, capsys):
 
     assert exit_code == 0
     records = _read_jsonl(output)
-    assert len(records) == 4
+    assert len(records) == 7
     stdout = capsys.readouterr().out
     assert "A1.3 GREEN canaries passed" in stdout
     assert str(output) in stdout
