@@ -159,10 +159,34 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._stream_needs_break = True
 
 
+def _a1_dispatch_guard_config() -> dict[str, Any]:
+    """Return profile config for the A1 dispatch guard, fail-open on bad config."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = load_config_readonly()
+        section = cfg_get(cfg, "a1", "dispatch_guard", default={})
+        return section if isinstance(section, dict) else {}
+    except Exception:
+        return {}
+
+
+def _a1_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return False
+
+
 def _a1_dispatch_guard_enabled(agent: Any) -> bool:
     """Return whether the A1 model-dispatch guard is active for this turn."""
-    return bool(getattr(agent, "a1_dispatch_guard_enabled", False)) or env_var_enabled(
-        "HERMES_A1_DISPATCH_GUARD"
+    return (
+        bool(getattr(agent, "a1_dispatch_guard_enabled", False))
+        or env_var_enabled("HERMES_A1_DISPATCH_GUARD")
+        or _a1_truthy(_a1_dispatch_guard_config().get("enabled"))
     )
 
 
@@ -171,6 +195,9 @@ def _a1_evidence_sink() -> str:
     explicit = os.environ.get("HERMES_A1_EVIDENCE_SINK", "").strip()
     if explicit:
         return explicit
+    configured = str(_a1_dispatch_guard_config().get("evidence_sink") or "").strip()
+    if configured:
+        return configured
     return str(get_hermes_home() / "a1" / "dispatch_evidence.jsonl")
 
 

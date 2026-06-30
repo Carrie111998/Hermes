@@ -180,3 +180,39 @@ def test_a1_guard_rechecks_runtime_after_fallback_provider_switch(monkeypatch, t
     assert events[0]["canonical_provider"] == "custom:headroom-openrouter-litellm"
     assert events[3]["canonical_provider"] == "local-ollama"
     assert events[3]["canonical_base_url_host"] == "localhost:11434"
+
+
+def test_a1_guard_can_be_enabled_from_profile_config_without_env_override(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    sink = tmp_path / "configured-a1.jsonl"
+    (hermes_home / "config.yaml").write_text(
+        f"""
+a1:
+  dispatch_guard:
+    enabled: true
+    evidence_sink: {sink}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_A1_DISPATCH_GUARD", raising=False)
+    monkeypatch.delenv("HERMES_A1_EVIDENCE_SINK", raising=False)
+    agent = _make_agent()
+    setattr(agent, "a1_classification", "C2_LOCAL_ONLY")
+    provider_call = MagicMock(return_value=_mock_response("should-not-run"))
+    agent._interruptible_api_call = provider_call
+
+    result = agent.run_conversation("do not leave local")
+
+    provider_call.assert_not_called()
+    assert result["failed"] is True
+    events = _read_jsonl(sink)
+    assert [event["event_type"] for event in events] == [
+        "resolver_decision",
+        "payload_capture",
+        "dispatch_result",
+    ]
+    assert events[-1]["rule_id"] == "a1.c2.frontier-deny"
+    assert events[-1]["provider_call_attempted"] is False
