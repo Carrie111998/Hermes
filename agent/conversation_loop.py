@@ -80,7 +80,7 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
-from hermes_constants import PARTIAL_STREAM_STUB_ID
+from hermes_constants import PARTIAL_STREAM_STUB_ID, get_hermes_home
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
@@ -157,6 +157,80 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._current_streamed_assistant_text = ""
     agent._current_streamed_reasoning_text = ""
     agent._stream_needs_break = True
+
+
+def _a1_dispatch_guard_enabled(agent: Any) -> bool:
+    """Return whether the A1 model-dispatch guard is active for this turn."""
+    return bool(getattr(agent, "a1_dispatch_guard_enabled", False)) or env_var_enabled(
+        "HERMES_A1_DISPATCH_GUARD"
+    )
+
+
+def _a1_evidence_sink() -> str:
+    """Resolve the A1 evidence sink path for mandatory pre-dispatch capture."""
+    explicit = os.environ.get("HERMES_A1_EVIDENCE_SINK", "").strip()
+    if explicit:
+        return explicit
+    return str(get_hermes_home() / "a1" / "dispatch_evidence.jsonl")
+
+
+def _a1_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        found: list[str] = []
+        for item in value.values():
+            found.extend(_a1_strings(item))
+        return found
+    if isinstance(value, list):
+        found: list[str] = []
+        for item in value:
+            found.extend(_a1_strings(item))
+        return found
+    return []
+
+
+def _a1_classification_from_request(api_kwargs: dict[str, Any]) -> str:
+    """Extract an explicit A1 classification marker from the outgoing request."""
+    for text in _a1_strings(api_kwargs.get("messages")) + _a1_strings(api_kwargs.get("input")):
+        match = re.search(r"\bCLASSIFICATION\s*[:=]\s*([A-Za-z0-9_+.-]+)", text)
+        if match:
+            return match.group(1).upper()
+    return ""
+
+
+def _a1_runtime_context(
+    agent: Any,
+    api_kwargs: dict[str, Any],
+    *,
+    effective_task_id: str,
+    turn_id: str,
+    api_request_id: str,
+    api_call_count: int,
+) -> dict[str, Any]:
+    allowed_hosts_raw = os.environ.get("HERMES_A1_ALLOWED_BASE_URL_HOSTS", "").strip()
+    allowed_hosts = [h.strip().lower() for h in allowed_hosts_raw.split(",") if h.strip()]
+    return {
+        "api_request_id": api_request_id,
+        "correlation_id": api_request_id,
+        "session_id": getattr(agent, "session_id", "") or "",
+        "surface": getattr(agent, "platform", "") or "",
+        "profile": os.environ.get("HERMES_PROFILE", "").strip(),
+        "classification": _a1_classification_from_request(api_kwargs),
+        "requested_provider": getattr(agent, "provider", "") or "",
+        "requested_model": api_kwargs.get("model") or getattr(agent, "model", "") or "",
+        "canonical_provider": getattr(agent, "provider", "") or "",
+        "canonical_model": api_kwargs.get("model") or getattr(agent, "model", "") or "",
+        "canonical_api_mode": getattr(agent, "api_mode", "") or "",
+        "canonical_base_url": getattr(agent, "base_url", "") or "",
+        "provider_source": "runtime",
+        "policy_version": os.environ.get("HERMES_A1_POLICY_VERSION", "a1.model-dispatch.v1"),
+        "config_hash": os.environ.get("HERMES_A1_CONFIG_HASH", ""),
+        "api_call_count": api_call_count,
+        "task_id": effective_task_id,
+        "turn_id": turn_id,
+        "allowed_base_url_hosts": allowed_hosts,
+    }
 
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
@@ -1990,6 +2064,28 @@ def run_conversation(
                         )
                     return agent._interruptible_api_call(next_api_kwargs)
 
+                provider_call = _perform_api_call
+                if _a1_dispatch_guard_enabled(agent):
+                    from hermes_cli.a1_guard import guarded_model_dispatch
+
+                    def _perform_a1_guarded_api_call(next_api_kwargs):
+                        return guarded_model_dispatch(
+                            api_kwargs=next_api_kwargs,
+                            next_call=_perform_api_call,
+                            runtime_context=_a1_runtime_context(
+                                agent,
+                                next_api_kwargs,
+                                effective_task_id=effective_task_id,
+                                turn_id=turn_id,
+                                api_request_id=api_request_id,
+                                api_call_count=api_call_count,
+                            ),
+                            middleware_trace=list(_llm_middleware_trace),
+                            evidence_sink=_a1_evidence_sink(),
+                        )
+
+                    provider_call = _perform_a1_guarded_api_call
+
                 from hermes_cli.middleware import run_llm_execution_middleware
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
@@ -2004,7 +2100,7 @@ def run_conversation(
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
-                        _perform_api_call,
+                        provider_call,
                         original_request=_original_api_kwargs,
                         task_id=effective_task_id,
                         turn_id=turn_id,
