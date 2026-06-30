@@ -193,7 +193,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
         )
 
     save_env_value(token_env, token)
-    os.environ[token_env] = token  # so the test fetch below sees it
     console.print(f"  [green]✓[/green] stored in {get_env_path()} as {token_env}")
 
     # ------------------------------------------------------------------ region
@@ -430,7 +429,6 @@ def cmd_token(args: argparse.Namespace) -> int:
             )
 
     save_env_value(token_env, token)
-    os.environ[token_env] = token
     # Old cached pulls are keyed on the previous token's fingerprint; drop
     # them so the next startup fetches fresh with the new credential.
     bw.clear_caches()
