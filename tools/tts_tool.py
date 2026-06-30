@@ -1100,7 +1100,7 @@ def _generate_openai_tts(
         speed_default = tts_config.get("speed", 1.0) if isinstance(tts_config, dict) else 1.0
         speed = float(oai_config.get("speed", speed_default))
 
-    # The managed OpenAI audio gateway only proxies MANAGED_OPENAI_TTS_MODELS.
+# The managed OpenAI audio gateway only proxies MANAGED_OPENAI_TTS_MODELS.
     # A model set for direct OpenAI (e.g. "tts-1-hd") 400s there with
     # "Unsupported managed OpenAI speech model", so coerce it — unless the user
     # redirected base_url to their own endpoint, in which case respect it.
@@ -1118,7 +1118,13 @@ def _generate_openai_tts(
         )
         model = DEFAULT_OPENAI_MODEL
 
-    response_format = _tts_response_format_from_path(output_path)
+    # Determine response format from extension.
+    # Always request mp3 from the API — then transcode to OGG/Opus locally
+    # for .ogg targets.  This avoids breaking non-opus-compatible backends
+    # (e.g. Speaches/Kokoro) that reject response_format="opus".
+    wants_opus = output_path.endswith(".ogg")
+    response_format = "mp3"
+    synth_path = (output_path[:-4] + ".mp3") if wants_opus else output_path
 
     OpenAIClient = _import_openai_client()
     client = OpenAIClient(api_key=api_key, base_url=base_url)
@@ -1134,8 +1140,19 @@ def _generate_openai_tts(
             create_kwargs["speed"] = max(0.25, min(4.0, speed))
         response = client.audio.speech.create(**create_kwargs)
 
-        response.stream_to_file(output_path)
-        return output_path
+        response.stream_to_file(synth_path)
+        if wants_opus:
+            converted = _convert_to_opus(synth_path)
+            # Clean up the intermediate mp3 if transcoding succeeded
+            if converted and converted != synth_path:
+                try:
+                    os.remove(synth_path)
+                except OSError:
+                    pass
+                return converted
+            # Transcoding failed — return the mp3 as best-effort
+            return synth_path
+        return synth_path
     finally:
         close = getattr(client, "close", None)
         if callable(close):
