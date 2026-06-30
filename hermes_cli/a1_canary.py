@@ -133,11 +133,14 @@ def _run_case(
     os.environ["HERMES_A1_EVIDENCE_SINK"] = str(evidence_sink)
     try:
         agent = _make_agent()
+        classification = _classification_from_prompt(prompt)
+        setattr(agent, "a1_classification", classification)
+        dispatch_prompt = _strip_classification_marker(prompt)
         call_count = configure(agent)
         # Some denial paths intentionally exercise Hermes error reporting.  Keep
         # the harness output machine-readable by capturing that chatter.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = agent.run_conversation(prompt)
+            result = agent.run_conversation(dispatch_prompt)
         events = _read_jsonl(evidence_sink)
         serialized_events = json.dumps(events, sort_keys=True)
         return {
@@ -277,6 +280,13 @@ def _classification_from_prompt(prompt: str) -> str:
     if first.startswith("CLASSIFICATION="):
         return first.split("=", 1)[1]
     return "UNKNOWN"
+
+
+def _strip_classification_marker(prompt: str) -> str:
+    parts = prompt.split(maxsplit=1)
+    if parts and parts[0].startswith("CLASSIFICATION="):
+        return parts[1] if len(parts) > 1 else ""
+    return prompt
 
 
 def _digest(value: Any) -> str:

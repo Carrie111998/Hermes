@@ -190,12 +190,23 @@ def _a1_strings(value: Any) -> list[str]:
     return []
 
 
-def _a1_classification_from_request(api_kwargs: dict[str, Any]) -> str:
-    """Extract an explicit A1 classification marker from the outgoing request."""
-    for text in _a1_strings(api_kwargs.get("messages")) + _a1_strings(api_kwargs.get("input")):
-        match = re.search(r"\bCLASSIFICATION\s*[:=]\s*([A-Za-z0-9_+.-]+)", text)
-        if match:
-            return match.group(1).upper()
+def _a1_effective_classification(agent: Any) -> str:
+    """Return the effective A1 classification from agent/runtime metadata.
+
+    The dispatch guard must consume classification/taint produced by the
+    local classification pipeline, not prompt text.  Tests and harnesses may
+    inject ``agent.a1_classification`` directly until the full HL-AOS taint
+    provider is wired into Hermes session state.
+    """
+    for attr in ("a1_classification", "effective_classification", "classification"):
+        value = getattr(agent, attr, None)
+        if value:
+            return str(value).strip().upper()
+    metadata = getattr(agent, "runtime_metadata", None)
+    if isinstance(metadata, dict):
+        value = metadata.get("classification") or metadata.get("a1_classification")
+        if value:
+            return str(value).strip().upper()
     return ""
 
 
@@ -216,7 +227,7 @@ def _a1_runtime_context(
         "session_id": getattr(agent, "session_id", "") or "",
         "surface": getattr(agent, "platform", "") or "",
         "profile": os.environ.get("HERMES_PROFILE", "").strip(),
-        "classification": _a1_classification_from_request(api_kwargs),
+        "classification": _a1_effective_classification(agent),
         "requested_provider": getattr(agent, "provider", "") or "",
         "requested_model": api_kwargs.get("model") or getattr(agent, "model", "") or "",
         "canonical_provider": getattr(agent, "provider", "") or "",

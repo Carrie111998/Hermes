@@ -66,10 +66,11 @@ def test_a1_guard_denies_c2_frontier_before_provider_dispatch(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
+    setattr(agent, "a1_classification", "C2_LOCAL_ONLY")
     provider_call = MagicMock(return_value=_mock_response("should-not-run"))
     agent._interruptible_api_call = provider_call
 
-    result = agent.run_conversation("CLASSIFICATION=C2_LOCAL_ONLY do not leave local")
+    result = agent.run_conversation("do not leave local")
 
     provider_call.assert_not_called()
     assert result["failed"] is True
@@ -88,10 +89,11 @@ def test_a1_guard_records_allowed_dispatch_result(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
+    setattr(agent, "a1_classification", "C0_PUBLIC")
     provider_call = MagicMock(return_value=_mock_response("guarded ok"))
     agent._interruptible_api_call = provider_call
 
-    result = agent.run_conversation("CLASSIFICATION=C0_PUBLIC hello")
+    result = agent.run_conversation("hello")
 
     provider_call.assert_called_once()
     assert result["completed"] is True
@@ -111,13 +113,14 @@ def test_a1_guard_wraps_streaming_dispatch_before_provider_call(monkeypatch, tmp
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
+    setattr(agent, "a1_classification", "C0_PUBLIC")
     agent.stream_delta_callback = lambda _delta: None
     streaming_call = MagicMock(return_value=_mock_response("streamed ok"))
     non_streaming_call = MagicMock(return_value=_mock_response("wrong path"))
     agent._interruptible_streaming_api_call = streaming_call
     agent._interruptible_api_call = non_streaming_call
 
-    result = agent.run_conversation("CLASSIFICATION=C0_PUBLIC streaming hello")
+    result = agent.run_conversation("streaming hello")
 
     streaming_call.assert_called_once()
     non_streaming_call.assert_not_called()
@@ -138,6 +141,7 @@ def test_a1_guard_rechecks_runtime_after_fallback_provider_switch(monkeypatch, t
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
+    setattr(agent, "a1_classification", "C0_PUBLIC")
     agent._fallback_chain = [{"provider": "local-ollama", "model": "qwen3.5:9b"}]
     agent._fallback_index = 0
     provider_call = MagicMock(
@@ -158,7 +162,7 @@ def test_a1_guard_rechecks_runtime_after_fallback_provider_switch(monkeypatch, t
 
     agent._try_activate_fallback = MagicMock(side_effect=activate_fallback)
 
-    result = agent.run_conversation("CLASSIFICATION=C0_PUBLIC fallback hello")
+    result = agent.run_conversation("fallback hello")
 
     assert provider_call.call_count == 2
     assert agent._try_activate_fallback.call_count == 1
