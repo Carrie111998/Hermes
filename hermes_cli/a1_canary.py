@@ -151,7 +151,7 @@ def _run_case(
     try:
         agent = _make_agent()
         classification = _classification_from_prompt(prompt)
-        setattr(agent, "a1_classification", classification)
+        setattr(agent, "hl_aos_taint_classification", classification)
         dispatch_prompt = _strip_classification_marker(prompt)
         call_count = configure(agent)
         # Some denial paths intentionally exercise Hermes error reporting.  Keep
@@ -225,7 +225,7 @@ a1:
     os.environ.pop("HERMES_A1_EVIDENCE_SINK", None)
     try:
         agent = _make_agent(platform=surface)
-        setattr(agent, "a1_classification", _classification_from_prompt(prompt))
+        setattr(agent, "hl_aos_taint_classification", _classification_from_prompt(prompt))
         dispatch_prompt = _strip_classification_marker(prompt)
         call_count = _configure_c2_denied(agent)
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):

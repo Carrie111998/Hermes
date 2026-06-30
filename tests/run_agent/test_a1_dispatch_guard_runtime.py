@@ -66,7 +66,7 @@ def test_a1_guard_denies_c2_frontier_before_provider_dispatch(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
-    setattr(agent, "a1_classification", "C2_LOCAL_ONLY")
+    setattr(agent, "hl_aos_taint_classification", "C2_LOCAL_ONLY")
     provider_call = MagicMock(return_value=_mock_response("should-not-run"))
     agent._interruptible_api_call = provider_call
 
@@ -89,7 +89,7 @@ def test_a1_guard_records_allowed_dispatch_result(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
-    setattr(agent, "a1_classification", "C0_PUBLIC")
+    setattr(agent, "hl_aos_taint_classification", "C0_PUBLIC")
     provider_call = MagicMock(return_value=_mock_response("guarded ok"))
     agent._interruptible_api_call = provider_call
 
@@ -113,7 +113,7 @@ def test_a1_guard_wraps_streaming_dispatch_before_provider_call(monkeypatch, tmp
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
-    setattr(agent, "a1_classification", "C0_PUBLIC")
+    setattr(agent, "hl_aos_taint_classification", "C0_PUBLIC")
     agent.stream_delta_callback = lambda _delta: None
     streaming_call = MagicMock(return_value=_mock_response("streamed ok"))
     non_streaming_call = MagicMock(return_value=_mock_response("wrong path"))
@@ -141,7 +141,7 @@ def test_a1_guard_rechecks_runtime_after_fallback_provider_switch(monkeypatch, t
     monkeypatch.setenv("HERMES_A1_DISPATCH_GUARD", "1")
     monkeypatch.setenv("HERMES_A1_EVIDENCE_SINK", str(sink))
     agent = _make_agent()
-    setattr(agent, "a1_classification", "C0_PUBLIC")
+    setattr(agent, "hl_aos_taint_classification", "C0_PUBLIC")
     agent._fallback_chain = [{"provider": "local-ollama", "model": "qwen3.5:9b"}]
     agent._fallback_index = 0
     provider_call = MagicMock(
@@ -200,7 +200,7 @@ a1:
     monkeypatch.delenv("HERMES_A1_DISPATCH_GUARD", raising=False)
     monkeypatch.delenv("HERMES_A1_EVIDENCE_SINK", raising=False)
     agent = _make_agent()
-    setattr(agent, "a1_classification", "C2_LOCAL_ONLY")
+    setattr(agent, "hl_aos_taint_classification", "C2_LOCAL_ONLY")
     provider_call = MagicMock(return_value=_mock_response("should-not-run"))
     agent._interruptible_api_call = provider_call
 

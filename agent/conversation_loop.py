@@ -48,6 +48,8 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.memory_manager import build_memory_context_block
+from agent.hl_aos_classification import read_hl_aos_classification, classification_source, HL_AOS_TAINT_SOURCE_LABEL
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -218,23 +220,26 @@ def _a1_strings(value: Any) -> list[str]:
 
 
 def _a1_effective_classification(agent: Any) -> str:
-    """Return the effective A1 classification from agent/runtime metadata.
+    """Return the effective A1 classification from the frozen HL-AOS taint source.
 
-    The dispatch guard must consume classification/taint produced by the
-    local classification pipeline, not prompt text.  Tests and harnesses may
-    inject ``agent.a1_classification`` directly until the full HL-AOS taint
-    provider is wired into Hermes session state.
+    A1.4 — the legacy multi-attribute fallback chain is removed.  Classification
+    is now read exclusively from the frozen HL-AOS taint pipeline via
+    :func:`agent.hl_aos_classification.read_hl_aos_classification`.  When no
+    certified taint is present the function returns an empty string and the
+    dispatch guard applies its fail-closed policy.
     """
-    for attr in ("a1_classification", "effective_classification", "classification"):
-        value = getattr(agent, attr, None)
-        if value:
-            return str(value).strip().upper()
-    metadata = getattr(agent, "runtime_metadata", None)
-    if isinstance(metadata, dict):
-        value = metadata.get("classification") or metadata.get("a1_classification")
-        if value:
-            return str(value).strip().upper()
-    return ""
+    return read_hl_aos_classification(agent)
+
+
+def _a1_classification_source(agent: Any) -> str:
+    """Return the provenance label for the current HL-AOS classification input.
+
+    Returns the frozen HL-AOS source label when the taint was obtained from the
+    certified HL-AOS pipeline, or ``"unclassified"`` otherwise.  This label is
+    recorded by the dispatch guard's evidence so auditors can tell whether a
+    dispatch decision rested on a certified taint input.
+    """
+    return classification_source(agent)
 
 
 def _a1_runtime_context(
@@ -255,6 +260,7 @@ def _a1_runtime_context(
         "surface": getattr(agent, "platform", "") or "",
         "profile": os.environ.get("HERMES_PROFILE", "").strip(),
         "classification": _a1_effective_classification(agent),
+        "classification_source": _a1_classification_source(agent),
         "requested_provider": getattr(agent, "provider", "") or "",
         "requested_model": api_kwargs.get("model") or getattr(agent, "model", "") or "",
         "canonical_provider": getattr(agent, "provider", "") or "",

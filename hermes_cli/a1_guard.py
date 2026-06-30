@@ -48,6 +48,7 @@ class A1Decision:
     surface: str
     profile: str
     classification: str
+    classification_source: str
     requested_provider: str
     requested_model: str
     canonical_provider: str
@@ -247,6 +248,7 @@ def _build_decision(*, api_kwargs: dict[str, Any], runtime_context: dict[str, An
         surface=str(runtime_context.get("surface") or runtime_context.get("platform") or ""),
         profile=str(runtime_context.get("profile") or ""),
         classification=classification or "UNKNOWN",
+        classification_source=str(runtime_context.get("classification_source") or "unclassified"),
         requested_provider=requested_provider,
         requested_model=requested_model,
         canonical_provider=canonical_provider,

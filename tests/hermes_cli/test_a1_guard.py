@@ -170,6 +170,35 @@ def test_record_dispatch_result_appends_correlated_result(tmp_path):
     assert events[-1]["provider_call_completed"] is True
 
 
+
+def test_guard_records_hl_aos_frozen_classification_source_in_evidence(tmp_path):
+    sink = tmp_path / 'a1.jsonl'
+    guard_model_dispatch(
+        api_kwargs=_request(),
+        runtime_context=_ctx(
+            classification='C0_PUBLIC',
+            classification_source='hl_aos_frozen',
+        ),
+        evidence_sink=sink,
+    )
+    events = _read_jsonl(sink)
+    assert events[0]['classification_source'] == 'hl_aos_frozen'
+
+    guard_model_dispatch(
+        api_kwargs=_request(),
+        runtime_context=_ctx(
+            classification='C0_PUBLIC',
+            classification_source='unclassified',
+        ),
+        evidence_sink=sink,
+    )
+    events = _read_jsonl(sink)
+    # Find the second resolver_decision event
+    resolver_events = [e for e in events if e['event_type'] == 'resolver_decision']
+    assert len(resolver_events) == 2
+    assert resolver_events[1]['classification_source'] == 'unclassified'
+
+
 def test_guarded_model_dispatch_calls_provider_only_after_allowed_envelope(tmp_path):
     sink = tmp_path / "a1.jsonl"
     calls = []
