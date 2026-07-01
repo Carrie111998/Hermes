@@ -530,6 +530,10 @@ class TestRunOauthSetupToken:
     def test_returns_token_from_credential_files(self, monkeypatch, tmp_path):
         """After subprocess completes, reads credentials from Claude Code files."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+            lambda: None,
+        )
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
 
@@ -556,10 +560,30 @@ class TestRunOauthSetupToken:
         # assert_called_once() in CI.
         assert mock_run.called
 
+    def test_returns_token_from_env_var(self, monkeypatch, tmp_path):
+        """Falls back to CLAUDE_CODE_OAUTH_TOKEN env var when no cred files."""
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+            lambda: None,
+        )
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "from-env-var")
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            token = run_oauth_setup_token()
+
+        assert token == "from-env-var"
 
     def test_returns_none_when_no_creds_found(self, monkeypatch, tmp_path):
         """Returns None when subprocess completes but no credentials are found."""
         monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/claude")
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+            lambda: None,
+        )
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)

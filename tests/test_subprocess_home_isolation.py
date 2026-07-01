@@ -113,6 +113,38 @@ class TestGetSubprocessHome:
 
 
 # ---------------------------------------------------------------------------
+# _iter_real_home_candidates()
+# ---------------------------------------------------------------------------
+
+class TestIterRealHomeCandidates:
+    """Regression coverage for explicit env dict isolation."""
+
+    def test_env_dict_does_not_leak_from_os_environ_hermes_real_home(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REAL_HOME", "/stale/parent/home")
+
+        candidates = hermes_constants._iter_real_home_candidates(env={"HOME": "/user/home"})
+
+        assert "/stale/parent/home" not in candidates
+
+    def test_env_dict_hermes_real_home_takes_precedence_over_os_environ(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REAL_HOME", "/stale/parent/home")
+
+        candidates = hermes_constants._iter_real_home_candidates(
+            env={"HERMES_REAL_HOME": "/correct/real/home", "HOME": "/user/home"}
+        )
+
+        assert candidates[0] == "/correct/real/home"
+        assert "/stale/parent/home" not in candidates
+
+    def test_none_env_falls_back_to_os_environ_hermes_real_home(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REAL_HOME", "/real/home")
+
+        candidates = hermes_constants._iter_real_home_candidates(env=None)
+
+        assert "/real/home" in candidates
+
+
+# ---------------------------------------------------------------------------
 # _make_run_env() injection
 # ---------------------------------------------------------------------------
 

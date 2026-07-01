@@ -74,6 +74,13 @@ def test_provision_url_maps_ws_to_http():
     assert relay._provision_url("https://c.example") == "https://c.example/relay/provision"
 
 
+def test_policy_url_maps_ws_to_http():
+    assert relay._policy_url("wss://host.example/relay") == "https://host.example/relay/policy"
+    assert relay._policy_url("ws://host.example/relay") == "http://host.example/relay/policy"
+    assert relay._policy_url("https://host.example") == "https://host.example/relay/policy"
+    assert relay._policy_url("wss://host.example/relay/") == "https://host.example/relay/policy"
+
+
 # ─────────────────────────── trigger logic ───────────────────────────
 
 

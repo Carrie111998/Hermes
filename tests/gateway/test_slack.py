@@ -1768,6 +1768,31 @@ class TestSlackAudioExtResolution:
         assert _slack_mod._resolve_slack_audio_ext(f, f["mimetype"]) == ".ogg"
 
 
+class TestSlackExtToAudioMime:
+    """Unit coverage for the rerouted voice-clip extension → MIME map."""
+
+    @pytest.mark.parametrize(
+        ("ext", "audio_mime"),
+        [
+            (".mp4", "audio/mp4"),
+            (".m4a", "audio/mp4"),
+            (".mp3", "audio/mpeg"),
+            (".mpeg", "audio/mpeg"),
+            (".mpga", "audio/mpeg"),
+            (".wav", "audio/wav"),
+            (".webm", "audio/webm"),
+            (".ogg", "audio/ogg"),
+            (".aac", "audio/aac"),
+            (".flac", "audio/flac"),
+        ],
+    )
+    def test_ext_to_audio_mime_entries(self, ext, audio_mime):
+        assert _slack_mod._SLACK_EXT_TO_AUDIO_MIME[ext] == audio_mime
+
+    def test_unknown_ext_to_audio_mime_falls_back_to_mp4(self):
+        assert _slack_mod._SLACK_EXT_TO_AUDIO_MIME.get(".bin", "audio/mp4") == "audio/mp4"
+
+
 class TestSlackVoiceClipDetection:
     """Unit coverage for the video/mp4-mislabeled voice-clip detector."""
 
@@ -1827,6 +1852,146 @@ class TestIncomingAudioHandling:
         assert len(msg_event.media_urls) == 1
         # media_type stays audio/* so the gateway routes it to STT
         assert msg_event.media_types[0].startswith("audio/")
+
+    @pytest.mark.asyncio
+    async def test_video_mp4_voice_clip_rerouted_to_audio(self, adapter, tmp_path):
+        """A voice clip mislabeled video/mp4 is rerouted to the audio path
+        (cached as audio, reported as audio/mp4) instead of video understanding."""
+        captured = {}
+
+        async def _fake_download(url, ext, audio=False, team_id=""):
+            captured["ext"] = ext
+            captured["audio"] = audio
+            path = tmp_path / f"cached{ext}"
+            path.write_bytes(b"\x00\x00\x00\x18ftypmp42fake mp4 bytes")
+            return str(path)
+
+        with patch.object(adapter, "_download_slack_file", side_effect=_fake_download):
+            event = self._make_event(
+                files=[
+                    {
+                        "mimetype": "video/mp4",
+                        "name": "audio_message.mp4",
+                        "subtype": "slack_audio",
+                        "url_private_download": "https://files.slack.com/audio_message.mp4",
+                        "size": 2048,
+                    }
+                ]
+            )
+            await adapter._handle_slack_message(event)
+
+        assert captured.get("audio") is True
+        assert captured["ext"] in {".mp4", ".m4a"}
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types[0] == "audio/mp4"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("filename", "expected_ext", "expected_audio_mime"),
+        [
+            ("clip.wav", ".wav", "audio/wav"),
+            ("clip.webm", ".webm", "audio/webm"),
+            ("clip.ogg", ".ogg", "audio/ogg"),
+        ],
+    )
+    async def test_video_mp4_voice_clip_rerouted_audio_mime_matches_ext(
+        self, adapter, tmp_path, filename, expected_ext, expected_audio_mime
+    ):
+        """Rerouted voice clips report the MIME type for the cached extension."""
+        captured = {}
+
+        async def _fake_download(url, ext, audio=False, team_id=""):
+            captured["ext"] = ext
+            captured["audio"] = audio
+            path = tmp_path / f"cached{ext}"
+            path.write_bytes(b"fake audio bytes")
+            return str(path)
+
+        with patch.object(adapter, "_download_slack_file", side_effect=_fake_download):
+            event = self._make_event(
+                files=[
+                    {
+                        "mimetype": "video/mp4",
+                        "name": filename,
+                        "subtype": "slack_audio",
+                        "url_private_download": f"https://files.slack.com/{filename}",
+                        "size": 2048,
+                    }
+                ]
+            )
+            await adapter._handle_slack_message(event)
+
+        assert captured.get("audio") is True
+        assert captured["ext"] == expected_ext
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types[0] == expected_audio_mime
+
+    @pytest.mark.asyncio
+    async def test_video_mp4_voice_clip_rerouted_unknown_ext_falls_back_to_mp4(
+        self, adapter, tmp_path
+    ):
+        """Unmapped cached extensions fall back to Slack voice clip audio/mp4."""
+        captured = {}
+
+        async def _fake_download(url, ext, audio=False, team_id=""):
+            captured["ext"] = ext
+            captured["audio"] = audio
+            path = tmp_path / f"cached{ext}"
+            path.write_bytes(b"fake audio bytes")
+            return str(path)
+
+        with (
+            patch.object(_slack_mod, "_resolve_slack_audio_ext", return_value=".bin"),
+            patch.object(adapter, "_download_slack_file", side_effect=_fake_download),
+        ):
+            event = self._make_event(
+                files=[
+                    {
+                        "mimetype": "video/mp4",
+                        "name": "clip.bin",
+                        "subtype": "slack_audio",
+                        "url_private_download": "https://files.slack.com/clip.bin",
+                        "size": 2048,
+                    }
+                ]
+            )
+            await adapter._handle_slack_message(event)
+
+        assert captured.get("audio") is True
+        assert captured["ext"] == ".bin"
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types[0] == "audio/mp4"
+
+    @pytest.mark.asyncio
+    async def test_real_video_still_routed_as_video(self, adapter, tmp_path):
+        """A genuine uploaded video must remain on the video path."""
+
+        async def _fake_download_bytes(url, team_id=""):
+            return b"\x00\x00\x00\x18ftypisomfake real video"
+
+        with patch.object(
+            adapter, "_download_slack_file_bytes", side_effect=_fake_download_bytes
+        ):
+            event = self._make_event(
+                files=[
+                    {
+                        "mimetype": "video/mp4",
+                        "name": "vacation.mp4",
+                        "url_private_download": "https://files.slack.com/vacation.mp4",
+                        "size": 4096,
+                    }
+                ]
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert len(msg_event.media_urls) == 1
+        assert msg_event.media_types[0].startswith("video/"), (
+            "a real video must not be hijacked into the audio path"
+        )
 
 
 # ---------------------------------------------------------------------------
