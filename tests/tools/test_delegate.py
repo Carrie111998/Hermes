@@ -505,6 +505,37 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_child_inherits_hl_aos_taint_classification(self):
+        """A1.5: child must inherit frozen HL-AOS classification taint from parent."""
+        parent = _make_mock_parent(depth=0)
+        parent.hl_aos_taint_classification = "C2_LOCAL_ONLY"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Test taint inheritance",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(
+            mock_child.hl_aos_taint_classification,
+            "C2_LOCAL_ONLY",
+            "Child must inherit parent's frozen HL-AOS classification taint",
+        )
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()

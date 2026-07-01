@@ -1409,6 +1409,16 @@ def _build_child_agent(
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
+    
+    # A5: Inherit HL-AOS classification taint from parent so subagents dispatch
+    # at the same confidentiality level. Without this, a C2 parent could delegate
+    # to a child with no taint, and the child's frontier dispatch would pass the
+    # A1 guard's "unclassified → deny non-local" check, but the dispatch would
+    # occur without explicit C2-aware reasoning (potential leak path).
+    parent_taint = getattr(parent_agent, "hl_aos_taint_classification", None)
+    if parent_taint:
+        child.hl_aos_taint_classification = parent_taint  # type: ignore
+    
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
     # Stash the post-degrade role for introspection (leaf if the
