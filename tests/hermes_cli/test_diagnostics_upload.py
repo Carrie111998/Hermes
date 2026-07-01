@@ -91,6 +91,17 @@ class TestRequestUploadUrl:
 
         resp.read.assert_called_once_with(mod._MAX_UPLOAD_URL_RESPONSE_BYTES + 1)
 
+    def test_rejects_streamed_oversized_upload_url_response(self):
+        import hermes_cli.diagnostics_upload as mod
+
+        limit = mod._MAX_UPLOAD_URL_RESPONSE_BYTES
+        resp = _resp(status=200, body=b"x" * (limit + 1))
+        resp.headers = {}
+        with patch.object(mod.urllib.request, "urlopen", return_value=resp):
+            with pytest.raises(RuntimeError, match="too large"):
+                mod.request_upload_url()
+        resp.read.assert_called_once_with(limit + 1)
+
     def test_non_2xx_raises(self):
         from hermes_cli.diagnostics_upload import request_upload_url
 
