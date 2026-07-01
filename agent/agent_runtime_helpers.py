@@ -2688,6 +2688,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     elif function_name == "memory":
         def _execute(next_args: dict) -> Any:
+            # A1.7 memory write-sink guard: check classification before mutation
+            try:
+                from agent.a1_7_memory_write_guard import check_memory_write_permission
+                target = next_args.get("target", "memory")
+                content = next_args.get("content", "")
+                denied = check_memory_write_permission(agent, target, content)
+                if denied:
+                    result = json.dumps({"success": False, "error": denied, "denied_by": "a1_7_memory_guard"}, ensure_ascii=False)
+                    return _finish_agent_tool(result, next_args)
+            except Exception as e:
+                logger.error("A1.7 memory guard error (fail-closed): %s", e)
+                result = json.dumps({"success": False, "error": "Memory write denied due to guard error", "denied_by": "a1_7_memory_guard"}, ensure_ascii=False)
+                return _finish_agent_tool(result, next_args)
+
             target = next_args.get("target", "memory")
             operations = next_args.get("operations")
             from tools.memory_tool import memory_tool as _memory_tool

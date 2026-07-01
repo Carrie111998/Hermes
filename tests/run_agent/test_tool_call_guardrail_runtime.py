@@ -57,6 +57,7 @@ def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None 
     agent.tool_delay = 0
     agent.compression_enabled = False
     agent.save_trajectories = False
+    agent.hl_aos_taint_classification = "C0"
     return agent
 
 
@@ -201,11 +202,11 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     messages = []
     executed = []
 
-    def fake_handle(name, args, task_id, **kwargs):
-        executed.append((name, args, kwargs["tool_call_id"]))
+    def fake_handle(name, args, task_id, tool_call_id=None, **kwargs):
+        executed.append((name, args, tool_call_id or kwargs["tool_call_id"]))
         return json.dumps({"ok": args["query"]})
 
-    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+    with patch("run_agent.AIAgent._invoke_tool", side_effect=fake_handle):
         agent._execute_tool_calls_concurrent(msg, messages, "task-1")
 
     assert executed == [("web_search", allowed_args, "c-allow")]
