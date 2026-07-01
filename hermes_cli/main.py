@@ -11753,6 +11753,13 @@ def cmd_dashboard(args):
         pass
 
     try:
+        from hermes_cli.desktop_parent_watchdog import start_desktop_parent_watchdog
+
+        start_desktop_parent_watchdog()
+    except Exception:
+        logger.debug("Desktop parent watchdog failed to start", exc_info=True)
+
+    try:
         import fastapi  # noqa: F401
         import uvicorn  # noqa: F401
     except ImportError as e:

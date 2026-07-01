@@ -185,18 +185,16 @@ export class JsonRpcGatewayClient {
 
   close(): void {
     const socket = this.socket
-
-    if (!socket) {
-      return
-    }
+    this.socket = null
 
     try {
-      socket.close()
-    } finally {
-      this.socket = null
-      this.setState('closed')
-      this.rejectAllPending(new Error(this.options.closedErrorMessage))
+      socket?.close()
+    } catch {
+      // ignore
     }
+
+    this.setState('closed')
+    this.rejectAllPending(new Error(this.options.closedErrorMessage))
   }
 
   on<P = unknown>(type: GatewayEventName, handler: (event: GatewayEvent<P>) => void): () => void {

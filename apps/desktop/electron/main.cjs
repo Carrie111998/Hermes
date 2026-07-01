@@ -5303,6 +5303,11 @@ async function spawnPoolBackend(profile, entry) {
         // can still point at the install dir even when spawn cwd is home.
         TERMINAL_CWD: hermesCwd,
         HERMES_DASHBOARD_SESSION_TOKEN: token,
+        // Let the Python dashboard backend self-reap if Electron crashes or is
+        // force-quit. Without this, orphaned desktop backends keep serving stale
+        // ports under launchd/init and the next app launch sees random
+        // disconnects against a dead/stale child.
+        HERMES_DESKTOP_PARENT_PID: String(process.pid),
         // Marks this dashboard backend as desktop-spawned so it runs the cron
         // scheduler tick loop (the gateway isn't running under the app).
         HERMES_DESKTOP: '1',
@@ -5526,6 +5531,10 @@ async function startHermes() {
           ...backend.env,
           TERMINAL_CWD: hermesCwd,
           HERMES_DASHBOARD_SESSION_TOKEN: token,
+          // Let the Python dashboard backend self-reap if Electron crashes or is
+          // force-quit. Otherwise launchd/init adopts the child and it can keep
+          // a stale desktop backend port alive indefinitely.
+          HERMES_DESKTOP_PARENT_PID: String(process.pid),
           // Marks this dashboard backend as desktop-spawned so it runs the cron
           // scheduler tick loop (the gateway isn't running under the app).
           HERMES_DESKTOP: '1',

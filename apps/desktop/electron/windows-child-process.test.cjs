@@ -39,6 +39,7 @@ test('desktop background child processes opt into hidden Windows consoles', () =
   requireHiddenChildOptions(source, /spawn\(\s*py,\s*\['-m', 'hermes_cli\.main', 'uninstall', '--gui-summary'\]/)
 
   assert.match(source, /function unwrapWindowsVenvHermesCommand\(command, backendArgs\)/)
+  assert.match(source, /HERMES_DESKTOP_PARENT_PID: String\(process\.pid\)/)
   assert.match(source, /function getVenvSitePackagesEntries\(venvRoot\)/)
   assert.match(source, /path\.join\(venvRoot, 'Lib', 'site-packages'\)/)
   assert.match(source, /args: \['-m', 'hermes_cli\.main', \.\.\.backendArgs\]/)
