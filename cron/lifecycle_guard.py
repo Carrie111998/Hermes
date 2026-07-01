@@ -48,10 +48,13 @@ class GatewayLifecycleBlocked(ValueError):
 _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
     # Branch A: `hermes gateway restart|stop` — the canonical foot-gun.
+    # Allow Hermes global flags between the executable and `gateway` (for
+    # example `hermes -p worker gateway restart`) so a profiled gateway command
+    # cannot bypass the creation-time lifecycle guard.
     # `start` is intentionally excluded: starting a gateway from inside a
     # gateway is benign (a no-op or "already running" error), and a
     # legitimate cron job might start a sibling profile's gateway.
-    r"(?:hermes\s+gateway\s+(?:restart|stop))"
+    r"(?:hermes\s+(?:-{1,2}\S+(?:\s+(?!gateway\b)\S+)?\s+)*gateway\s+(?:restart|stop))"
     # Branch B: launchctl ops on a hermes-gateway label. macOS launchd
     # labels look like `ai.hermes.gateway` / `hermes-gateway`. Requiring the
     # gateway identifier prevents blocking unrelated hermes services (e.g.

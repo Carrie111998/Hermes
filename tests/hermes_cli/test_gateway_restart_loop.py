@@ -28,6 +28,8 @@ class TestGatewayLifecyclePattern:
     @pytest.mark.parametrize("text", [
         "hermes gateway restart",
         "hermes gateway stop",
+        "hermes -p worker gateway restart",
+        "hermes --profile worker gateway stop",
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase

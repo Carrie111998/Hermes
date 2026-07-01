@@ -108,6 +108,14 @@ class TestWindowsShellDestructiveCommands:
         assert key is not None
         assert desc == "Windows PowerShell destructive delete"
 
+    def test_powershell_value_taking_option_before_command_requires_approval(self):
+        dangerous, key, desc = detect_dangerous_command(
+            r"powershell -ExecutionPolicy Bypass -Command Remove-Item -Recurse -Force C:\tmp\hermes-victim"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert desc == "Windows PowerShell destructive delete"
+
     def test_pwsh_rm_alias_requires_approval(self):
         dangerous, key, desc = detect_dangerous_command(
             r"pwsh -c rm -Recurse -Force C:\tmp\hermes-victim"
@@ -992,11 +1000,12 @@ class TestPatternKeyUniqueness:
         _, key_delete, _ = detect_dangerous_command("find . -name '*.tmp' -delete")
         session = "test_find_collision"
         _clear_session(session)
-        approve_session(session, key_exec)
-        assert is_approved(session, key_exec) is True
-        assert is_approved(session, key_delete) is False, (
-            "approving find -exec rm should not auto-approve find -delete"
-        )
+        with mock_patch.object(approval_module, "_permanent_approved", set()):
+            approve_session(session, key_exec)
+            assert is_approved(session, key_exec) is True
+            assert is_approved(session, key_delete) is False, (
+                "approving find -exec rm should not auto-approve find -delete"
+            )
         _clear_session(session)
 
     def test_legacy_find_key_still_approves_find_exec(self):

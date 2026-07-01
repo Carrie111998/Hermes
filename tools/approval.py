@@ -506,10 +506,13 @@ DANGEROUS_PATTERNS = [
     # PowerShell/pwsh: the destructive verb runs as the default positional
     # argument, so `powershell Remove-Item ...` needs NO explicit -Command.
     # Anchor the verb to the command position (right after the shell name,
-    # after any leading `-Flag` switches, and optionally after -Command/-c)
-    # so bare invocations are caught while a benign path arg containing
-    # "del"/"rm" (e.g. `-File c:\del-logs\run.ps1`) is not.
-    (r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+(?:-(?:command|c)\s+)?["\']?(?:remove-item|rmdir|erase|del|rd|ri|rm)\b', "Windows PowerShell destructive delete"),
+    # after leading PowerShell options, and optionally after -Command/-c) so
+    # bare invocations are caught while a benign path arg containing "del"/"rm"
+    # (e.g. `-File c:\del-logs\run.ps1`) is not. PowerShell has value-taking
+    # options (`-ExecutionPolicy Bypass`, `-File script.ps1`); consume one
+    # non-option value after a leading option unless that value is the actual
+    # destructive verb.
+    (r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-(?!(?:command|c)\b)\S+(?:\s+(?!(?:-|remove-item\b|rmdir\b|erase\b|del\b|rd\b|ri\b|rm\b))\S+)?)*\s+(?:-(?:command|c)\s+)?["\']?(?:remove-item|rmdir|erase|del|rd|ri|rm)\b', "Windows PowerShell destructive delete"),
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:encodedcommand|enc|e)\b', "PowerShell encoded command execution"),
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
     (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
@@ -1502,15 +1505,18 @@ def is_current_session_yolo_enabled() -> bool:
 def is_approved(session_key: str, pattern_key: str) -> bool:
     """Check if a pattern is approved (session-scoped or permanent).
 
-    Accept both the current canonical key and the legacy regex-derived key so
-    existing command_allowlist entries continue to work after key migrations.
+    Permanent command_allowlist entries accept both the current canonical key
+    and the legacy regex-derived key so durable config survives key migrations.
+    Session approvals are intentionally exact: applying a broad legacy alias
+    such as ``find`` to ephemeral approvals would let approving ``find -exec
+    rm`` also approve ``find -delete`` in the same session.
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
         session_approvals = _session_approved.get(session_key, set())
-        return any(alias in session_approvals for alias in aliases)
+        return pattern_key in session_approvals
 
 
 def approve_permanent(pattern_key: str):

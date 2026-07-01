@@ -211,7 +211,10 @@ class TestAcpExecAskGate:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
+        import tools.approval as approval_module
         from tools.approval import check_all_command_guards
+
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
 
         called_with = []
 
@@ -257,11 +260,14 @@ class TestAcpExecAskGate:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
 
+        import tools.approval as approval_module
         from tools.approval import (
             check_all_command_guards,
             reset_hermes_interactive_context,
             set_hermes_interactive_context,
         )
+
+        monkeypatch.setattr(approval_module, "_permanent_approved", set())
 
         called_with = []
 
