@@ -5,8 +5,10 @@ Electron crashes or is force-quit, Python is re-parented to the OS service
 manager and keeps serving a stale, token-protected dashboard port. That orphan can
 burn CPU and leave the next desktop launch talking to a dead/stale backend.
 
-This module is intentionally tiny and stdlib-only so it can start early in the
-``dashboard`` command without dragging in the web server.
+This module is intentionally tiny so it can start early in the ``dashboard``
+command without dragging in the web server. ``psutil`` is a core Hermes
+dependency and is used for cross-platform PID liveness; do not use
+``os.kill(pid, 0)`` here because that sends CTRL_C_EVENT on Windows.
 """
 
 from __future__ import annotations
@@ -35,14 +37,15 @@ def _pid_exists(pid: int) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+        import psutil  # type: ignore
+
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        # psutil is a core dependency. If a stripped install is missing it,
+        # fail safe toward keeping the backend alive rather than using
+        # platform-specific signal probes here. In particular, os.kill(pid, 0)
+        # is not a harmless liveness check on Windows.
         return True
-    except OSError:
-        return False
-    return True
 
 
 def _should_exit_for_parent(
