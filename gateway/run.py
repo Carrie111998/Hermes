@@ -15941,7 +15941,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # is referencing. History can contain the same or similar text
             # multiple times, and without an explicit pointer the agent has to
             # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
+            # 2026-07-01: was [:500] — truncated replied-to posts so Faiz posted a
+            # cut-off ~500-char version and "couldn't see the text above". Telegram
+            # messages cap at 4096; use 8000 so the full quoted message always reaches
+            # the agent (a reply-to a long post must carry the whole post).
+            reply_snippet = event.reply_to_text[:8000]
             if getattr(event, "reply_to_is_own_message", False):
                 message_text = (
                     f'[Replying to your previous message: "{reply_snippet}"]\n\n'
