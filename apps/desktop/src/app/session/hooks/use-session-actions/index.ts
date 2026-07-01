@@ -31,6 +31,7 @@ import {
   setBusy,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentFastMode,
   setCurrentServiceTier,
   setCurrentUsage,
   setFreshDraftReady,
