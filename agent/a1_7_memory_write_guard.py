@@ -66,12 +66,14 @@ def check_memory_write_permission(
         filename = "MEMORY.md" if target == "memory" else "USER.md"
         memory_path = str(mem_dir / filename)
 
-        # Check if memory_path is within any allowed_path
+        # Check if memory_path is equal to or contained within any allowed_path.
+        # Use Path semantics, not raw string prefix matching, so a sibling such as
+        # /tmp/mem does not authorize /tmp/memory/MEMORY.md.
         try:
             target_resolved = Path(memory_path).resolve()
             for allowed in allowed_paths:
                 allowed_resolved = Path(allowed).resolve()
-                if str(target_resolved).startswith(str(allowed_resolved)):
+                if target_resolved == allowed_resolved or allowed_resolved in target_resolved.parents:
                     return None
         except Exception as e:
             return f"Memory write denied: path resolution failed ({e})"

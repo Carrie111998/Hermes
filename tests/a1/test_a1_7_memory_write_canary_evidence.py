@@ -81,7 +81,7 @@ def test_a1_7_memory_write_canary_evidence() -> None:
     required_fields = {
         "case_id", "decision", "reason",
         "classification", "classification_source",
-        "target", "allowed_paths",
+        "target", "allowed_paths", "requested_content_digest",
         "live_memory_write_count",
         "provider_call_count",
         "live_config_touched", "secret_values_read",
@@ -92,6 +92,17 @@ def test_a1_7_memory_write_canary_evidence() -> None:
         assert not missing, (
             f"row {row.get('case_id', '?')} missing fields: {sorted(missing)}"
         )
+        digest = row["requested_content_digest"]
+        assert isinstance(digest, str)
+        assert digest.startswith("sha256:")
+        assert len(digest) == len("sha256:") + 64
+        int(digest.removeprefix("sha256:"), 16)
+
+    # Digest-only invariant: raw synthetic memory payload bytes must not appear in evidence.
+    assert "synthetic C2 memory write payload" not in raw
+    assert "synthetic C0 memory write payload" not in raw
+    assert "synthetic unclassified memory write payload" not in raw
+    assert "synthetic C2 user write payload" not in raw
 
     # Fixed-case IDs and per-case decision assertions
     by_id = {r["case_id"]: r for r in rows}

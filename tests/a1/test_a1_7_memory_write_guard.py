@@ -192,6 +192,23 @@ class TestMemoryWriteGuard:
         assert check_memory_write_permission(agent, "memory", "note") is None
         assert check_memory_write_permission(agent, "user", "pref") is None
 
+    def test_c2_allowed_path_prefix_sibling_does_not_match(self):
+        """C2 allowed_paths uses path containment, not unsafe string-prefix matching."""
+        memdir = _memory_dir()
+        prefix_sibling = memdir[:-1] if len(memdir) > 1 else "/tmp/mem"
+        assert prefix_sibling != memdir
+        assert memdir.startswith(prefix_sibling)
+
+        agent = _make_agent(
+            classification="C2",
+            allowed_paths=[prefix_sibling]
+        )
+
+        result = check_memory_write_permission(agent, "memory", "note")
+
+        assert result is not None
+        assert "MEMORY.md" in result
+
     def test_invoke_tool_denies_before_memory_tool_execution(self):
         """Runtime memory branch denies C2 write before calling memory_tool."""
         agent = _make_runtime_agent(classification="C2")

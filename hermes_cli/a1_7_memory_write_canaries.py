@@ -14,6 +14,7 @@ Cases:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -78,7 +79,7 @@ def _base_row(
         "classification": classification,
         "classification_source": classification_source,
         "target": target,
-        "requested_content_digest": f"sha256:{requested_content[:8]}..." if requested_content else None,
+        "requested_content_digest": f"sha256:{hashlib.sha256(requested_content.encode('utf-8')).hexdigest()}" if requested_content else None,
         "allowed_paths": allowed_paths,
         "live_memory_write_count": 0,
         "provider_call_count": 0,
