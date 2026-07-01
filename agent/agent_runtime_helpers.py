@@ -2524,6 +2524,58 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    # A1.8 execute_code nested write-sink guard: execute_code can mutate files
+    # through raw Python APIs or sandbox RPC tools before direct write_file/patch
+    # guards see a target path, so C2+ sessions fail closed at the parent tool.
+    try:
+        if function_name == "execute_code":
+            from agent.a1_8_execute_code_write_guard import check_execute_code_write_permission
+            denied = check_execute_code_write_permission(agent, function_args.get("code", ""))
+            if denied:
+                result = json.dumps({"error": denied, "status": "blocked", "denied_by": "a1_8_execute_code_write_guard"}, ensure_ascii=False)
+                try:
+                    from model_tools import _emit_post_tool_call_hook
+                    _emit_post_tool_call_hook(
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=result,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        status="blocked",
+                        error_type="a1_8_execute_code_write_denied",
+                        error_message=denied,
+                        middleware_trace=list(_tool_middleware_trace),
+                    )
+                except Exception:
+                    pass
+                return result
+    except Exception as e:
+        if function_name == "execute_code":
+            logger.error("A1.8 execute_code write guard error (fail-closed): %s", e)
+            result = json.dumps({"error": "execute_code blocked due to guard error", "status": "blocked", "denied_by": "a1_8_execute_code_write_guard"}, ensure_ascii=False)
+            try:
+                from model_tools import _emit_post_tool_call_hook
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    status="blocked",
+                    error_type="a1_8_execute_code_write_guard_error",
+                    error_message="execute_code write guard internal error",
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+            except Exception:
+                pass
+            return result
+
     # A1.6 write-sink guard: block durable writes for C2/C3/C4 unless the
     # target path is explicitly allowed.  This must run before registry/tool
     # dispatch so denied write_file/patch requests cannot create or mutate a
