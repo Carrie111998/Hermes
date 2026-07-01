@@ -10,7 +10,7 @@ from gateway.api_server_audit import request_audit_middleware
 
 
 class APIServerLifecycleMixin:
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
             logger.warning("[%s] aiohttp not installed", self.name)
