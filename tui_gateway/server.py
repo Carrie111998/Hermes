@@ -15779,6 +15779,34 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("feed.sources failed")
         return _err(rid, 5201, str(e))
+
+
+@method("feed.publish")
+def _(rid, params: dict) -> dict:
+    """Append articles to the news feed store (the producer side of feed.get).
+
+    Params:
+        - ``source`` (str, required): feed source name (e.g. ``"ai-digest"``),
+          shown as a filter tab and used as the dedup key.
+        - ``articles`` (list[dict], required): each may carry ``title``,
+          ``url``, ``summary``, ``tags``, ``image_url``. Articles are deduped
+          against what was already stored for the same source.
+
+    Returns ``{"total": N}`` — the feed size after the append.
+    """
+    try:
+        from tui_gateway.digest_store import append_digest as _feed_publish
+        source = params.get("source")
+        if not source or not isinstance(source, str):
+            return _err(rid, 4001, "source must be a non-empty string")
+        articles = params.get("articles")
+        if not isinstance(articles, list):
+            return _err(rid, 4001, "articles must be a list")
+        total = _feed_publish(source, articles)
+        return _ok(rid, {"total": total})
+    except Exception as e:
+        logger.exception("feed.publish failed")
+        return _err(rid, 5202, str(e))
     """Read a single wiki page by relative path.
 
     Params:
