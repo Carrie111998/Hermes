@@ -9,9 +9,11 @@ Run with:
 
 from types import SimpleNamespace
 from pathlib import Path
+import json
 
 import pytest
 
+from agent.agent_runtime_helpers import invoke_tool
 from tools.hl_aos_write_guard import check_write_permission, check_write_permission_with_context
 
 
@@ -148,3 +150,43 @@ class TestWritePermissionGuard:
 
         assert check_write_permission(agent, target1) is None
         assert check_write_permission(agent, target2) is None
+
+    def test_invoke_tool_blocks_write_file_before_mutation_for_c2(self, tmp_path):
+        """invoke_tool denies C2 write_file before the target file is created."""
+        agent = _make_agent_with_taint(classification="C2", allowed_paths=[])
+        target = tmp_path / "blocked.txt"
+
+        result = invoke_tool(
+            agent,
+            "write_file",
+            {"path": str(target), "content": "must not be written"},
+            effective_task_id="a1-write-guard-test",
+        )
+        parsed = json.loads(result)
+
+        assert parsed["status"] == "blocked"
+        assert "Write operation denied" in parsed["error"]
+        assert not target.exists()
+
+    def test_invoke_tool_blocks_patch_before_mutation_for_c2(self, tmp_path):
+        """invoke_tool denies C2 patch before the target file is modified."""
+        agent = _make_agent_with_taint(classification="C2", allowed_paths=[])
+        target = tmp_path / "blocked.txt"
+        target.write_text("original", encoding="utf-8")
+
+        result = invoke_tool(
+            agent,
+            "patch",
+            {
+                "mode": "replace",
+                "path": str(target),
+                "old_string": "original",
+                "new_string": "mutated",
+            },
+            effective_task_id="a1-write-guard-test",
+        )
+        parsed = json.loads(result)
+
+        assert parsed["status"] == "blocked"
+        assert "Write operation denied" in parsed["error"]
+        assert target.read_text(encoding="utf-8") == "original"

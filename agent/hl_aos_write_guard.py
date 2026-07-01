@@ -84,6 +84,17 @@ def check_write_permission(agent, target_path: str) -> Optional[str]:
     )
 
 
+def check_write_permission_with_context(agent, target_path: str, context: dict | None = None) -> Optional[str]:
+    """Context-aware wrapper for write-sink guard integrations.
+
+    The current A1.6 policy is path/classification based.  ``context`` is
+    accepted so tool-registry and middleware callers can pass the full tool
+    request without creating a second API shape; future evidence hooks can use
+    it for action-class or correlation metadata without changing callers.
+    """
+    return check_write_permission(agent, target_path)
+
+
 def check_egress_permission(agent, tool_name: str) -> Optional[str]:
     """
     Check if an egress operation (network/tool invocation) is permitted given the agent's HL-AOS classification.

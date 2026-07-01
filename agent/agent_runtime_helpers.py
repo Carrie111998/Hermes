@@ -2524,6 +2524,65 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             pass
         return result
 
+    # A1.6 write-sink guard: block durable writes for C2/C3/C4 unless the
+    # target path is explicitly allowed.  This must run before registry/tool
+    # dispatch so denied write_file/patch requests cannot create or mutate a
+    # file first and report denial afterward.
+    try:
+        from agent.hl_aos_write_guard import check_write_permission_with_context
+        write_target = None
+        if function_name == "write_file":
+            write_target = function_args.get("path")
+        elif function_name == "patch":
+            write_target = function_args.get("path") or "<multi-file-patch>"
+        if write_target:
+            denied = check_write_permission_with_context(agent, str(write_target), function_args)
+            if denied:
+                result = json.dumps({"error": denied, "status": "blocked"}, ensure_ascii=False)
+                try:
+                    from model_tools import _emit_post_tool_call_hook
+                    _emit_post_tool_call_hook(
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=result,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        status="blocked",
+                        error_type="a1_write_denied",
+                        error_message=denied,
+                        middleware_trace=list(_tool_middleware_trace),
+                    )
+                except Exception:
+                    pass
+                return result
+    except Exception as e:
+        # Fail closed: if guard itself breaks, block the write sink.
+        if function_name in {"write_file", "patch"}:
+            logger.error("A1 write guard error (fail-closed): %s", e)
+            result = json.dumps({"error": "Write blocked due to guard error", "status": "blocked"}, ensure_ascii=False)
+            try:
+                from model_tools import _emit_post_tool_call_hook
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                    status="blocked",
+                    error_type="a1_write_guard_error",
+                    error_message="Write guard internal error",
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+            except Exception:
+                pass
+            return result
+
     # A1.6 egress guard: block egress tools for C2/C3/C4 unless allowed
     try:
         from agent.hl_aos_write_guard import check_egress_permission
