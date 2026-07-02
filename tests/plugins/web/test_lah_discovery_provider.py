@@ -4,14 +4,13 @@ instance, no network, no Docker.
 """
 from __future__ import annotations
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from plugins.web.lah_discovery.provider import (
     LahDiscoveryWebSearchProvider,
-    _normalize_lah_discovery_documents,
+    _normalize_lah_discovery_extract_results,
 )
 
 
@@ -29,43 +28,54 @@ def _mock_response(json_body: dict, status_ok: bool = True) -> MagicMock:
         import httpx
 
         resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "404 Not Found", request=MagicMock(), response=resp
+            "500 Internal Server Error", request=MagicMock(), response=resp
         )
     return resp
 
 
-class TestNormalizeLahDiscoveryDocuments:
-    def test_maps_items_to_legacy_document_shape(self):
+class TestNormalizeLahDiscoveryExtractResults:
+    def test_maps_successful_results_to_legacy_document_shape(self):
         raw = {
-            "items": [
+            "results": [
                 {
+                    "url": "https://github.com",
+                    "success": True,
                     "item": {
-                        "source_id": "github",
                         "url": "https://github.com",
                         "title": "",
                         "content": "# GitHub\n\nTrending repos.",
                         "metadata": {},
                     },
-                    "score": 0.9,
+                    "error": None,
                 }
             ]
         }
-        docs = _normalize_lah_discovery_documents(raw, "github")
+        docs = _normalize_lah_discovery_extract_results(raw)
         assert len(docs) == 1
         assert docs[0]["url"] == "https://github.com"
         assert docs[0]["content"] == "# GitHub\n\nTrending repos."
         assert docs[0]["raw_content"] == docs[0]["content"]
-        assert docs[0]["metadata"]["source_id"] == "github"
-        assert docs[0]["metadata"]["score"] == 0.9
+        assert "error" not in docs[0]
 
-    def test_empty_items_returns_empty_list(self):
-        assert _normalize_lah_discovery_documents({"items": []}, "github") == []
+    def test_maps_failed_results_to_error_documents(self):
+        raw = {
+            "results": [
+                {"url": "https://bad.example", "success": False, "item": None, "error": "boom"}
+            ]
+        }
+        docs = _normalize_lah_discovery_extract_results(raw)
+        assert len(docs) == 1
+        assert docs[0]["url"] == "https://bad.example"
+        assert docs[0]["error"] == "boom"
+
+    def test_empty_results_returns_empty_list(self):
+        assert _normalize_lah_discovery_extract_results({"results": []}) == []
 
 
 class TestExtract:
     def test_missing_base_url_returns_error_entries(self):
         provider = LahDiscoveryWebSearchProvider()
-        result = provider.extract(["github"])
+        result = provider.extract(["https://github.com"])
         assert len(result) == 1
         assert "LAH_DISCOVERY_BASE_URL" in result[0]["error"]
 
@@ -73,41 +83,77 @@ class TestExtract:
         monkeypatch.setenv("LAH_DISCOVERY_BASE_URL", "http://localhost:8000")
         mock_resp = _mock_response(
             {
-                "items": [
+                "results": [
                     {
+                        "url": "https://github.com",
+                        "success": True,
                         "item": {
-                            "source_id": "github",
                             "url": "https://github.com",
                             "title": "",
                             "content": "# GitHub",
                             "metadata": {},
                         },
-                        "score": 1.0,
+                        "error": None,
                     }
                 ]
             }
         )
         with patch("httpx.post", return_value=mock_resp) as mock_post:
             provider = LahDiscoveryWebSearchProvider()
-            result = provider.extract(["github"])
+            result = provider.extract(["https://github.com"])
 
         mock_post.assert_called_once()
         called_url = mock_post.call_args.args[0]
-        assert called_url == "http://localhost:8000/discover/github"
+        assert called_url == "http://localhost:8000/extract"
+        called_json = mock_post.call_args.kwargs["json"]
+        assert called_json == {"urls": ["https://github.com"]}
         assert len(result) == 1
         assert result[0]["url"] == "https://github.com"
         assert "error" not in result[0]
 
-    def test_unknown_source_id_fails_closed_with_error_entry(self, monkeypatch):
+    def test_per_url_failure_within_a_successful_batch_fails_closed(self, monkeypatch):
         monkeypatch.setenv("LAH_DISCOVERY_BASE_URL", "http://localhost:8000")
-        mock_resp = _mock_response({"error": "unknown source_id 'reddit'"}, status_ok=False)
+        mock_resp = _mock_response(
+            {
+                "results": [
+                    {
+                        "url": "https://good.example",
+                        "success": True,
+                        "item": {
+                            "url": "https://good.example",
+                            "title": "",
+                            "content": "# ok",
+                            "metadata": {},
+                        },
+                        "error": None,
+                    },
+                    {
+                        "url": "https://bad.example",
+                        "success": False,
+                        "item": None,
+                        "error": "fetch failed for 'https://bad.example'",
+                    },
+                ]
+            }
+        )
         with patch("httpx.post", return_value=mock_resp):
             provider = LahDiscoveryWebSearchProvider()
-            result = provider.extract(["reddit"])
+            result = provider.extract(["https://good.example", "https://bad.example"])
 
-        assert len(result) == 1
-        assert "error" in result[0]
-        assert result[0]["url"] == "reddit"
+        assert len(result) == 2
+        assert "error" not in result[0]
+        assert "error" in result[1]
+        assert result[1]["url"] == "https://bad.example"
+
+    def test_unreachable_api_fails_every_requested_url_closed(self, monkeypatch):
+        monkeypatch.setenv("LAH_DISCOVERY_BASE_URL", "http://localhost:8000")
+        mock_resp = _mock_response({"error": "boom"}, status_ok=False)
+        with patch("httpx.post", return_value=mock_resp):
+            provider = LahDiscoveryWebSearchProvider()
+            result = provider.extract(["https://a.example", "https://b.example"])
+
+        assert len(result) == 2
+        assert all("error" in doc for doc in result)
 
     def test_connection_failure_fails_closed_not_a_crash(self, monkeypatch):
         monkeypatch.setenv("LAH_DISCOVERY_BASE_URL", "http://localhost:8000")
@@ -115,49 +161,11 @@ class TestExtract:
 
         with patch("httpx.post", side_effect=httpx.ConnectError("connection refused")):
             provider = LahDiscoveryWebSearchProvider()
-            result = provider.extract(["github"])
+            result = provider.extract(["https://github.com"])
 
         assert len(result) == 1
         assert "error" in result[0]
         assert "lah-discovery extract failed" in result[0]["error"]
-
-    def test_no_items_discovered_is_an_error_entry_not_silent_empty_success(self, monkeypatch):
-        monkeypatch.setenv("LAH_DISCOVERY_BASE_URL", "http://localhost:8000")
-        mock_resp = _mock_response({"items": []})
-        with patch("httpx.post", return_value=mock_resp):
-            provider = LahDiscoveryWebSearchProvider()
-            result = provider.extract(["github"])
-
-        assert len(result) == 1
-        assert "no items discovered" in result[0]["error"]
-
-    def test_multiple_source_ids_processed_independently(self, monkeypatch):
-        monkeypatch.setenv("LAH_DISCOVERY_BASE_URL", "http://localhost:8000")
-        ok_resp = _mock_response(
-            {
-                "items": [
-                    {
-                        "item": {
-                            "source_id": "github",
-                            "url": "https://github.com",
-                            "title": "",
-                            "content": "# GitHub",
-                            "metadata": {},
-                        },
-                        "score": 1.0,
-                    }
-                ]
-            }
-        )
-        bad_resp = _mock_response({"error": "unknown"}, status_ok=False)
-
-        with patch("httpx.post", side_effect=[ok_resp, bad_resp]):
-            provider = LahDiscoveryWebSearchProvider()
-            result = provider.extract(["github", "reddit"])
-
-        assert len(result) == 2
-        assert "error" not in result[0]
-        assert "error" in result[1]
 
 
 class TestProviderMetadata:
@@ -169,7 +177,7 @@ class TestProviderMetadata:
         assert provider.supports_extract() is True
         assert provider.supports_search() is False
 
-    def test_get_setup_schema_documents_the_source_id_boundary(self):
+    def test_get_setup_schema_documents_the_extract_endpoint(self):
         schema = LahDiscoveryWebSearchProvider().get_setup_schema()
-        assert "source_id" in schema["tag"]
+        assert "/extract" in schema["tag"]
         assert schema["env_vars"][0]["key"] == "LAH_DISCOVERY_BASE_URL"
