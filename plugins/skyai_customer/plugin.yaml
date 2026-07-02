@@ -1,0 +1,10 @@
+name: skyai-customer
+version: 0.1.0
+description: "SkyVision customer-facing SkyAI v2 tools: public catalog, product details, availability slots, and safe append-only event intake."
+author: SkyVision
+kind: backend
+provides_tools:
+  - skyai_catalog_search
+  - skyai_product_detail
+  - skyai_product_slots
+  - skyai_event_log_append
