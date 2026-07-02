@@ -6649,6 +6649,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
             return
 
+        # --- TickTick floating-task nudge callbacks (tt:action:task_id) ---
+        if data.startswith("tt:"):
+            await self._handle_ticktick_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
             return
@@ -6798,6 +6810,125 @@ class TelegramAdapter(BasePlatformAdapter):
             else:
                 # Per-email one-shot: strip keyboard so the action can't fire twice.
                 await query.edit_message_text(text=appended, reply_markup=None)
+        except Exception:
+            pass
+
+    # TickTick button action → (human verb, keep_keyboard) for logging/labels.
+    _TT_ACTION_VERBS = {
+        "d": "schedule tomorrow 9am",
+        "t": "pull into today 5pm",
+        "k": "keep floating",
+        "x": "dismiss",
+    }
+
+    async def _handle_ticktick_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Dispatch a TickTick floating-task nudge callback (tt:action:task_id).
+
+        Buttons are emitted by ~/.hermes/scripts/ticktick_{morning_brief,
+        evening_review}.py. Actions: d=tomorrow 9am, t=today 5pm, k=keep
+        floating, x=dismiss(complete). The heavy lifting lives in the helper
+        script ticktick_button.py so this stays a thin dispatcher.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid task data.")
+            return
+        action, task_id = parts[1], parts[2]
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to act on this task.")
+            return
+
+        if action not in self._TT_ACTION_VERBS:
+            await query.answer(text=f"Unknown action: {action}")
+            return
+
+        # Immediate UI responsiveness: ack the tap right away so Telegram stops
+        # spinning ("shimmering"), then swap the card to a working state.
+        await query.answer()
+        original_html = (query.message.text_html or "") if query.message else ""
+        try:
+            await query.edit_message_text(
+                text=f"{original_html}\n⏳ working…",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+        script_path = _Path.home() / ".hermes" / "scripts" / "ticktick_button.py"
+        if not script_path.exists():
+            logger.error("[%s] ticktick_button.py missing: %s", self.name, script_path)
+            try:
+                await query.edit_message_text(
+                    text=f"{original_html}\n❌ helper missing — action not applied",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            return
+
+        emoji_map = {"d": "📅", "t": "📅", "k": "💤", "x": "✅"}
+        label = ""
+        success = False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(script_path), action, task_id,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=30,
+            )
+            if proc.returncode == 0:
+                label = stdout_bytes.decode("utf-8", errors="replace").strip() or "done"
+                success = True
+                logger.info(
+                    "[%s] ticktick callback ok: action=%s task=%s label=%s",
+                    self.name, action, task_id, label,
+                )
+            else:
+                stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+                last_line = stderr_text.splitlines()[-1] if stderr_text else f"exit {proc.returncode}"
+                label = f"failed: {last_line[:100]}"
+                logger.error(
+                    "[%s] ticktick callback failed: action=%s task=%s rc=%s stderr=%s",
+                    self.name, action, task_id, proc.returncode, stderr_text,
+                )
+        except asyncio.TimeoutError:
+            label = "timed out"
+            logger.error("[%s] ticktick callback timed out: action=%s task=%s", self.name, action, task_id)
+        except Exception as exc:  # noqa: BLE001
+            label = f"error: {exc}"
+            logger.error(
+                "[%s] ticktick callback exception: action=%s task=%s err=%s",
+                self.name, action, task_id, exc, exc_info=True,
+            )
+
+        prefix = emoji_map.get(action, "✅") if success else "❌"
+        try:
+            await query.edit_message_text(
+                text=f"{original_html}\n{prefix} {label}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
         except Exception:
             pass
 
