@@ -3,8 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import yaml
+
 from plugins.skyai_customer import register
 from plugins.skyai_customer import public_tools
+
+
+SKYAI_TOOL_NAMES = {
+    "skyai_catalog_search",
+    "skyai_product_detail",
+    "skyai_product_slots",
+    "skyai_event_log_append",
+}
 
 
 class FakeContext:
@@ -21,13 +31,45 @@ def test_registers_public_safe_skyai_tools() -> None:
     register(ctx)
 
     names = {tool["name"] for tool in ctx.tools}
-    assert names == {
-        "skyai_catalog_search",
-        "skyai_product_detail",
-        "skyai_product_slots",
-        "skyai_event_log_append",
-    }
+    assert names == SKYAI_TOOL_NAMES
     assert {tool["toolset"] for tool in ctx.tools} == {"skyai_customer"}
+
+
+def test_manifest_is_standalone_opt_in_plugin() -> None:
+    manifest = yaml.safe_load(Path("plugins/skyai_customer/plugin.yaml").read_text(encoding="utf-8"))
+
+    assert manifest["name"] == "skyai-customer"
+    assert manifest["kind"] == "standalone"
+    assert set(manifest["provides_tools"]) == SKYAI_TOOL_NAMES
+
+
+def test_plugin_manager_loads_skyai_customer_only_when_enabled(monkeypatch, tmp_path: Path) -> None:
+    from hermes_cli import plugins as plugins_mod
+    from tools.registry import registry
+
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["skyai-customer"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    for tool_name in SKYAI_TOOL_NAMES:
+        registry._tools.pop(tool_name, None)
+
+    manager = plugins_mod.PluginManager()
+    try:
+        manager.discover_and_load()
+
+        loaded = manager._plugins.get("skyai-customer")
+        assert loaded is not None
+        assert loaded.enabled is True
+        assert set(loaded.tools_registered) == SKYAI_TOOL_NAMES
+        assert {registry._tools[name].toolset for name in SKYAI_TOOL_NAMES} == {"skyai_customer"}
+    finally:
+        for tool_name in SKYAI_TOOL_NAMES:
+            registry._tools.pop(tool_name, None)
 
 
 def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
