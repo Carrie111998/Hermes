@@ -1,6 +1,6 @@
 name: web-lah-discovery
 version: 1.0.0
-description: "LAH Discovery Platform — curated multi-source discovery (github, hackernews, blogs, documentation, forums, producthunt) via a self-hosted lah-discovery-platform REST API. Requires LAH_DISCOVERY_BASE_URL. NOTE: extract() takes a registered source_id (e.g. 'github'), not an arbitrary URL — this provider does not do general-purpose web extraction, see provider.py docstring."
+description: "LAH Discovery Platform — opt-in HTTP client for a self-hosted lah-discovery-platform REST API. Requires LAH_DISCOVERY_BASE_URL and uses POST /extract with real URLs for direct content extraction. Not part of the default fallback chain."
 author: NousResearch
 kind: backend
 provides_web_providers:
