@@ -52,6 +52,7 @@ git fetch origin --prune
 python scripts/skyai_v2_upstream_sync_check.py origin/main
 scripts/run_tests.sh \
   tests/plugins/test_skyai_customer_plugin.py \
+  tests/plugins/test_skyai_customer_schema.py \
   tests/scripts/test_skyai_v2_upstream_sync_check.py \
   -q
 git diff --check

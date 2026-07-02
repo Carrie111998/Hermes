@@ -17,7 +17,7 @@ ALLOWED_PREFIXES = (
     "plugins/skyai_customer/",
     "skills/productivity/skyai-customer-hermes-v2/",
     "docs/skyai-v2-",
-    "tests/plugins/test_skyai_customer_plugin.py",
+    "tests/plugins/test_skyai_customer_",
     "tests/scripts/test_skyai_v2_upstream_sync_check.py",
     "scripts/skyai_v2_upstream_sync_check.py",
 )
