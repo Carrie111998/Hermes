@@ -23,6 +23,22 @@ def test_install_script_honors_explicit_browser_override_only() -> None:
     assert "Skipping bundled Chromium download" in text
 
 
+def test_install_script_strips_stale_snap_browser_override() -> None:
+    """Already-affected installs must auto-recover.
+
+    A pre-existing AGENT_BROWSER_EXECUTABLE_PATH pointing at a Snap Chromium is
+    the exact value that hangs the browser tool, and the runtime reads it from
+    .env — so the installer strips it (and a Snap override is rejected even when
+    set explicitly) so the bundled Chromium download runs on update.
+    """
+    text = INSTALL_SH.read_text()
+
+    assert "strip_snap_browser_override()" in text
+    assert '^AGENT_BROWSER_EXECUTABLE_PATH="?/snap/' in text
+    # Both install paths invoke the migration before resolving a browser.
+    assert text.count("strip_snap_browser_override") >= 3
+    # A snap path is rejected by find_system_browser itself.
+    assert "/snap/*) return 1 ;;" in text
 
 
 def test_playwright_installs_are_timeout_guarded() -> None:
@@ -199,4 +215,74 @@ def test_no_retry_when_native_succeeds_on_ubuntu_26() -> None:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# §4.6 — quoted env write: a browser path containing spaces must round-trip
+# through .env intact. The override is written double-quoted
+# (AGENT_BROWSER_EXECUTABLE_PATH="<path>") so `set -a; . .env` sources the
+# full path as one word under both bash and POSIX sh, instead of splitting on
+# the space and leaving the tail as a bare assignment/parse error.
+# ---------------------------------------------------------------------------
+
+def _run_configure_and_source(shell: str, browser_path: str) -> dict:
+    """Run configure_browser_env_from_system_browser against a temp HERMES_HOME
+    with a pre-seeded DETECTED_BROWSER_EXECUTABLE, then re-source the resulting
+    .env under the requested shell and return AGENT_BROWSER_EXECUTABLE_PATH."""
+    import tempfile, os
+    src = INSTALL_SH.read_text()
+    import re
+    m = re.search(r"^configure_browser_env_from_system_browser\(\) \{.*?^\}",
+                  src, re.MULTILINE | re.DOTALL)
+    assert m, "could not extract configure_browser_env_from_system_browser()"
+    body = m.group(0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        harness = f"""
+set -u
+HERMES_HOME={tmp!r}
+DETECTED_BROWSER_EXECUTABLE={browser_path!r}
+log_info() {{ :; }}
+log_success() {{ :; }}
+log_warn() {{ :; }}
+find_system_browser() {{ printf '%s' {browser_path!r}; }}
+{body}
+configure_browser_env_from_system_browser
+"""
+        # First run configure_*() under bash (the installer's own shell).
+        proc = subprocess.run(["bash", "-c", harness], capture_output=True,
+                              text=True)
+        assert proc.returncode == 0, proc.stderr
+        env_file = Path(tmp) / ".env"
+        assert env_file.exists(), ".env was not created"
+        raw = env_file.read_text()
+        # Re-source the written .env under the requested shell and read back
+        # the value of AGENT_BROWSER_EXECUTABLE_PATH, simulating the runtime
+        # loader. `set -a` exports every assignment so it survives the subshell.
+        env_path = str(env_file)
+        source_cmd = f"set -a; . '{env_path}' >/dev/null 2>&1; printf '%s' \"${{AGENT_BROWSER_EXECUTABLE_PATH:-<unset>}}\""
+        proc2 = subprocess.run([shell, "-c", source_cmd],
+                               capture_output=True, text=True)
+        return {"raw_env": raw, "sourced": proc2.stdout, "rc": proc2.returncode,
+                "stderr": proc2.stderr}
+
+
+def test_quoted_spaced_browser_path_round_trips_under_bash() -> None:
+    """A browser path with a space survives the write+source round-trip (bash)."""
+    spaced = "/opt/My Browser/chrome"
+    r = _run_configure_and_source("bash", spaced)
+    assert r["sourced"] == spaced, (r["raw_env"], r["sourced"], r["stderr"])
+
+
+def test_quoted_spaced_browser_path_round_trips_under_sh() -> None:
+    """A browser path with a space survives the write+source round-trip (POSIX sh)."""
+    spaced = "/opt/My Browser/chrome"
+    r = _run_configure_and_source("sh", spaced)
+    assert r["sourced"] == spaced, (r["raw_env"], r["sourced"], r["stderr"])
+
+
+def test_quoted_browser_env_write_is_double_quoted() -> None:
+    """The .env line is written double-quoted so the loader keeps it whole."""
+    r = _run_configure_and_source("bash", "/usr/bin/chromium")
+    assert 'AGENT_BROWSER_EXECUTABLE_PATH="/usr/bin/chromium"' in r["raw_env"]
 
