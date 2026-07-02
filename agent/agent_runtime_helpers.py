@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from agent.persistence_markers import _DB_CONTENT_UPDATE_PENDING
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -3964,6 +3965,10 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             messages[target_idx]["content"] = f"{existing_content}{marker}"
     else:
         messages[target_idx]["content"] = existing_content + marker
+    # The result may already have been incrementally flushed. Mark only this
+    # intentional mutation for an in-place durable update; generic content
+    # drift can also come from sequence repair and must not rewrite other rows.
+    messages[target_idx][_DB_CONTENT_UPDATE_PENDING] = True
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

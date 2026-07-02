@@ -11571,7 +11571,6 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
 
         def close(self):
             return None
-
     class FakeAgent:
         def __init__(self):
             self.model = "test-model"
@@ -11620,6 +11619,154 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
     finally:
         for k in list(server._sessions):
             server._sessions.pop(k, None)
+
+
+def test_session_branch_tool_metadata_survives_steer_flush(monkeypatch, tmp_path):
+    """Branch-copied tool messages must stay steer-updatable in the child."""
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    seed = SessionDB(db_path=db_path)
+    seed.create_session("parent-key", source="tui")
+    seed.append_message(
+        "parent-key",
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "web_search", "arguments": "{}"},
+            }
+        ],
+    )
+    seed.append_message(
+        "parent-key",
+        "tool",
+        "old result",
+        tool_name="web_search",
+        tool_call_id="c1",
+    )
+    history = seed.get_messages_as_conversation(
+        "parent-key",
+        repair_alternation=True,
+        include_row_ids=True,
+    )
+    parent_row_id = next(
+        msg["_row_id"] for msg in history if msg["role"] == "tool"
+    )
+    for msg in history:
+        msg["_db_persisted"] = True
+    seed.close()
+
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+
+    class _RealDB(SessionDB):
+        def __init__(self, db_path=None):
+            super().__init__(db_path=tmp_path / "state.db")
+
+    class FakeAgent:
+        def __init__(self):
+            self.model = "test-model"
+            self.session_id = None
+
+    parent = {
+        "session_key": "parent-key",
+        "history": history,
+        "history_lock": threading.Lock(),
+        "running": False,
+        "cols": 80,
+        "profile_home": str(profile_home),
+        "source": "tui",
+        "agent": FakeAgent(),
+        "created_at": 1.0,
+        "last_active": 1.0,
+        "cwd": str(tmp_path),
+    }
+    server._sessions["parent"] = parent
+    monkeypatch.setattr("hermes_state.SessionDB", _RealDB)
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *a, **k: (None, None)
+    )
+    monkeypatch.setattr(server, "_make_agent", lambda *a, **k: FakeAgent())
+    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.branch",
+                "params": {"session_id": "parent", "name": "forked"},
+            }
+        )
+        assert "result" in resp, resp
+        child_sid = resp["result"]["session_id"]
+        child_key = resp["result"]["stored_session_id"]
+        child_history = server._sessions[child_sid]["history"]
+
+        child_tool = next(msg for msg in child_history if msg["role"] == "tool")
+        assert child_tool["_row_id"] != parent_row_id
+
+        from run_agent import AIAgent
+
+        hermes_home = tmp_path / "hermes-home"
+        (hermes_home / "logs").mkdir(parents=True)
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent._hermes_home", hermes_home),
+            patch("agent.model_metadata.fetch_model_metadata", return_value={}),
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                session_db=SessionDB(db_path=db_path),
+                session_id=child_key,
+            )
+        agent._ensure_db_session()
+        agent.steer("prefer the smaller fix")
+        agent._apply_pending_steer_to_tool_results(child_history, 1)
+        assert agent._flush_messages_to_session_db(child_history) is True
+
+        check = SessionDB(db_path=db_path)
+        try:
+            child_rows = [
+                row
+                for row in check.get_messages(child_key)
+                if row["role"] == "tool"
+            ]
+            assert len(child_rows) == 1
+            assert child_rows[0]["tool_call_id"] == "c1"
+            assert child_rows[0]["tool_name"] == "web_search"
+            assert child_rows[0]["id"] == child_tool["_row_id"]
+            assert "prefer the smaller fix" in child_rows[0]["content"]
+            assert child_tool.get("_db_content_update_pending") is None
+            child_asst = [
+                row
+                for row in check.get_messages(child_key)
+                if row["role"] == "assistant"
+            ]
+            assert child_asst[0]["tool_calls"]
+            parent_rows = [
+                row
+                for row in check.get_messages("parent-key")
+                if row["role"] == "tool"
+            ]
+            assert parent_rows[0]["content"] == "old result"
+        finally:
+            check.close()
+    finally:
+        for key in list(server._sessions):
+            server._sessions.pop(key, None)
 
 
 def test_pending_title_finalizer_uses_session_profile_db(monkeypatch, tmp_path):

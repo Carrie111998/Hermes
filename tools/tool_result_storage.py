@@ -29,6 +29,7 @@ import re
 import shlex
 import uuid
 
+from agent.persistence_markers import _DB_CONTENT_UPDATE_PENDING
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -246,6 +247,13 @@ def enforce_turn_budget(
             total_size -= size
             total_size += len(replacement)
             tool_messages[idx]["content"] = replacement
+            # The aggregate budget runs AFTER the per-tool incremental flush,
+            # so this in-place rewrite would otherwise leave the durable
+            # state.db row holding the pre-budget content while the model saw
+            # the replacement. Flag it for an in-place durable update (same
+            # contract as the /steer marker append; a no-op for messages the
+            # flush has not written yet).
+            tool_messages[idx][_DB_CONTENT_UPDATE_PENDING] = True
             logger.info(
                 "Budget enforcement: persisted tool result %s (%d chars)",
                 tool_use_id, size,

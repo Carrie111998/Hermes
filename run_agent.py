@@ -264,19 +264,34 @@ def _is_ephemeral_scaffolding(msg: Any) -> bool:
 
 _MAX_TOOL_WORKERS = 8
 
-# Intrinsic marker stamped on a message dict once it has been written to the
-# SQLite session store.  Used by ``_flush_messages_to_session_db`` to decide
-# what is already durable.  An object-identity (``id(msg)``) dedup set cannot be
-# trusted across turns: once a flushed message dict is dropped from the live
-# list (e.g. by scaffolding rewind or in-place compaction) and garbage-
-# collected, CPython is free to hand its address to a brand-new assistant/tool
-# message, whose ``id()`` then collides with the stale entry and the real turn
-# is silently never persisted.  A marker bound to the dict itself cannot be
-# aliased that way.  The ``_`` prefix is mandatory: the wire sanitizers
-# (agent/transports/chat_completions.py, agent/chat_completion_helpers.py) strip
-# every top-level ``_``-prefixed key before the request leaves the process, so
-# this never reaches a strict OpenAI-compatible gateway.
-_DB_PERSISTED_MARKER = "_db_persisted"
+# See agent/persistence_markers.py for why the marker must live on the dict
+# itself rather than in an id()-keyed set.  The ``_`` prefix is mandatory: the
+# wire sanitizers (agent/transports/chat_completions.py,
+# agent/chat_completion_helpers.py) strip every top-level ``_``-prefixed key
+# before the request leaves the process, so these never reach a strict
+# OpenAI-compatible gateway.
+from agent.persistence_markers import (  # noqa: E402
+    _DB_PERSISTED_MARKER,
+    _DB_CONTENT_UPDATE_PENDING,
+)
+
+
+def _db_normalized_content(content: Any) -> Any:
+    """Reduce message content to the scalar value written to state.db."""
+    if _is_multimodal_tool_result(content):
+        return _multimodal_text_summary(content)
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text_parts.append(str(part.get("text", "")))
+            elif (
+                isinstance(part, dict)
+                and part.get("type") in {"image", "image_url", "input_image"}
+            ):
+                text_parts.append("[screenshot]")
+        return "\n".join(text_parts) if text_parts else None
+    return content
 
 
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
@@ -2008,10 +2023,10 @@ class AIAgent:
         ``_flushed_db_message_ids`` attribute is now only a one-shot seed
         (translated to markers, then cleared each flush), not a persisted set.
 
-        Note: the marker is stamped on the live/shared conversation dict, which
-        correctly makes re-persistence idempotent across turns. No code path
-        edits a persisted message's content/role in place expecting a re-write
-        (in-place compaction resets the seed and re-diffs by identity).
+        Intentional post-INSERT content mutations set
+        ``_DB_CONTENT_UPDATE_PENDING``. Those rows are updated in place using
+        the row id stamped on a message written by this process, or (for a
+        cold-resumed tool result) its protocol-level ``tool_call_id``.
         """
         # Persistence-isolated agents (e.g. the background skill/memory review
         # fork) must NEVER write into the canonical session store. The fork
@@ -2084,8 +2099,9 @@ class AIAgent:
             # skipped as ephemeral scaffolding / non-dict), and no code path
             # pops _DB_PERSISTED_MARKER from a live dict in place (compression
             # strips markers on fresh copies, which breaks identity here and
-            # forces a full re-scan). Identity match ⇒ identical skip decision,
-            # so starting after the matched prefix is behavior-preserving.
+            # forces a full re-scan). A post-INSERT content mutation is the one
+            # exception: it keeps object identity but sets an explicit pending
+            # flag, so the prefix walk must stop before that message.
             _scan_start = 0
             _prev_prefix = getattr(self, "_db_flush_scan_prefix", None)
             if isinstance(_prev_prefix, list):
@@ -2093,6 +2109,10 @@ class AIAgent:
                 while (
                     _scan_start < _limit
                     and messages[_scan_start] is _prev_prefix[_scan_start]
+                    and not (
+                        isinstance(messages[_scan_start], dict)
+                        and messages[_scan_start].get(_DB_CONTENT_UPDATE_PENDING)
+                    )
                 ):
                     _scan_start += 1
 
@@ -2115,13 +2135,33 @@ class AIAgent:
                 # the synthetic pair buried mid-list, not just at the tail.
                 if _is_ephemeral_scaffolding(msg):
                     continue
-                if msg.get(_DB_PERSISTED_MARKER):
-                    continue
                 # Already-durable messages: either carried over from the loaded
                 # history copy, or seeded by a caller. Stamp them so future
                 # flushes skip them without consulting any id() set again.
-                if id(msg) in history_ids or id(msg) in seed_ids:
+                already_persisted = bool(msg.get(_DB_PERSISTED_MARKER))
+                if not already_persisted and (
+                    id(msg) in history_ids or id(msg) in seed_ids
+                ):
                     msg[_DB_PERSISTED_MARKER] = True
+                    already_persisted = True
+                if already_persisted:
+                    if msg.get(_DB_CONTENT_UPDATE_PENDING):
+                        updated_row_id = self._session_db.update_tool_message_content(
+                            message_row_id=msg.get("_row_id"),
+                            content=_db_normalized_content(msg.get("content")),
+                            session_id=self.session_id,
+                            tool_call_id=msg.get("tool_call_id"),
+                            compression_lock_holder=getattr(
+                                self, "_active_compression_lock_holder", None
+                            ),
+                        )
+                        if updated_row_id is None:
+                            raise RuntimeError(
+                                "could not resolve durable row for pending "
+                                f"{msg.get('role', 'unknown')} content update"
+                            )
+                        msg["_row_id"] = updated_row_id
+                        msg.pop(_DB_CONTENT_UPDATE_PENDING, None)
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
@@ -2199,17 +2239,7 @@ class AIAgent:
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
-                if _is_multimodal_tool_result(content):
-                    content = _multimodal_text_summary(content)
-                elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip images, keep text.
-                    _txt = []
-                    for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
-                            _txt.append(str(p.get("text", "")))
-                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
-                            _txt.append("[screenshot]")
-                    content = "\n".join(_txt) if _txt else None
+                write_content = _db_normalized_content(content)
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:
                     tool_calls_data = [
@@ -2220,7 +2250,7 @@ class AIAgent:
                     tool_calls_data = msg["tool_calls"]
                 _batch_rows.append({
                     "role": role,
-                    "content": content,
+                    "content": write_content,
                     "tool_name": msg.get("tool_name"),
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),
@@ -2251,15 +2281,23 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
+                inserted_row_ids = self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
+                    return_row_ids=True,
                 )
-                for _written in _batch_msgs:
+                if len(inserted_row_ids) != len(_batch_msgs):
+                    raise RuntimeError(
+                        "session batch insert returned an unexpected row-id count"
+                    )
+                for _written, _row_id in zip(_batch_msgs, inserted_row_ids):
                     _written[_DB_PERSISTED_MARKER] = True
+                    if _written.get("role") == "tool":
+                        _written["_row_id"] = _row_id
+                    _written.pop(_DB_CONTENT_UPDATE_PENDING, None)
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
@@ -2963,8 +3001,10 @@ class AIAgent:
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):
                     continue
+                msg = dict(msg)
+                msg.pop(_DB_PERSISTED_MARKER, None)
+                msg.pop(_DB_CONTENT_UPDATE_PENDING, None)
                 if msg.get("role") == "assistant" and msg.get("content"):
-                    msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
                 # Defence-in-depth: redact credentials from every message
                 # content before persistence. Catches PATs / API keys / Bearer
@@ -2972,7 +3012,6 @@ class AIAgent:
                 # output, or user paste. Respects HERMES_REDACT_SECRETS via
                 # redact_sensitive_text — no-op when disabled. (#19798, #19845)
                 if "content" in msg:
-                    msg = dict(msg)
                     msg["content"] = self._redact_message_content(msg.get("content"))
                 cleaned.append(msg)
 

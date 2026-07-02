@@ -73,6 +73,7 @@ from agent.model_metadata import (
     parse_available_output_tokens_from_error,
     save_context_length,
 )
+from agent.persistence_markers import _DB_CONTENT_UPDATE_PENDING
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
     build_prompt_cache_plan,
@@ -1514,6 +1515,7 @@ def run_conversation(
                             _sm["content"] = blocks
                         except Exception:
                             pass
+                    _sm[_DB_CONTENT_UPDATE_PENDING] = True
                     _injected = True
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",

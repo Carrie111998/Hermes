@@ -501,6 +501,26 @@ class TestSessionJsonSnapshotOptIn:
             "Opt-in writer must produce session_{sid}.json under logs_dir"
         )
 
+    def test_save_session_log_strips_internal_db_metadata(self, agent, tmp_path):
+        agent._session_json_enabled = True
+        agent.logs_dir = tmp_path
+        message = {
+            "role": "tool",
+            "content": "result",
+            "_db_persisted": True,
+            "_db_content_update_pending": True,
+        }
+
+        agent._save_session_log([message])
+
+        snapshot = json.loads(
+            (tmp_path / f"session_{agent.session_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        stored = snapshot["messages"][0]
+        assert all(not key.startswith("_db_") for key in stored)
+
     def test_logs_dir_retained_for_request_dumps(self, agent):
         # logs_dir is kept unconditionally because
         # agent_runtime_helpers.dump_api_request_debug still writes
@@ -6050,4 +6070,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
