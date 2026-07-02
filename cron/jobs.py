@@ -1520,6 +1520,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
+    _notify_apns_job_run(job_id, success)
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -1602,6 +1603,39 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def _notify_apns_job_run(job_id: str, success: bool) -> None:
+    """Push a cron-completion notification to registered APNs devices.
+
+    Fires server-side at run completion, so pushes reach devices whose app is
+    dead or asleep — the native app's 60s poller only works while it runs.
+    notify_all is a silent no-op unless APNS_* env vars are configured, and
+    delivers on a daemon thread, so this never blocks the scheduler.
+    """
+    try:
+        from tui_gateway.apns_sender import is_configured, notify_all
+
+        if not is_configured():
+            return
+        name = job_id
+        try:
+            for job in load_jobs():
+                if job["id"] == job_id:
+                    name = job.get("name") or job_id
+                    break
+        except Exception:
+            pass
+        status = "✓ ok" if success else "✗ error"
+        notify_all(
+            f"Cron: {name}",
+            status,
+            category="cronComplete",
+            thread_id=f"cron-{job_id}",
+            extra={"job_id": job_id},
+        )
+    except Exception:
+        logger.exception("APNs cron notify failed")
 
 
 def claim_dispatch(job_id: str) -> bool:

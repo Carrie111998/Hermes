@@ -1145,6 +1145,58 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     if payload is not None:
         params["payload"] = payload
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    _mirror_event_to_apns(event, sid, payload)
+
+
+# Events worth waking a device for. Streaming deltas and tool chatter are
+# deliberately excluded — APNs pushes are for "needs you" / "finished" moments.
+_APNS_PUSHED_EVENTS = frozenset({"approval.request", "clarify.request", "message.complete"})
+
+
+def _mirror_event_to_apns(event: str, sid: str, payload: dict | None) -> None:
+    """Mirror selected gateway events to registered APNs devices.
+
+    WS delivery only reaches live in-app clients; APNs reaches devices whose
+    app is dead or asleep. notify_all is a no-op unless APNS_* env vars are
+    set, and delivery runs on a daemon thread — this never blocks emission.
+    """
+    if event not in _APNS_PUSHED_EVENTS:
+        return
+    try:
+        from tui_gateway.apns_sender import is_configured, notify_all
+
+        if not is_configured():
+            return
+        data = payload or {}
+        if event == "approval.request":
+            notify_all(
+                "Approval Required",
+                str(data.get("command", ""))[:200] or "A command needs your approval",
+                category="approval",
+                session_id=sid,
+                thread_id=sid,
+            )
+        elif event == "clarify.request":
+            notify_all(
+                "Question",
+                str(data.get("question", ""))[:200] or "The agent needs clarification",
+                category="clarify",
+                session_id=sid,
+                thread_id=sid,
+            )
+        elif event == "message.complete":
+            if data.get("status", "complete") != "complete":
+                return
+            text = str(data.get("text", ""))[:200]
+            notify_all(
+                "Response Complete",
+                text or "The agent finished responding",
+                category="responseComplete",
+                session_id=sid,
+                thread_id=sid,
+            )
+    except Exception:
+        logger.exception("APNs mirror failed")
 
 
 _compute_host_supervisor = None
@@ -15807,6 +15859,56 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         logger.exception("feed.publish failed")
         return _err(rid, 5202, str(e))
+
+
+@method("push.register")
+def _(rid, params: dict) -> dict:
+    """Register an APNs device token for remote push notifications.
+
+    Params:
+        - ``token`` (str, required): hex APNs device token.
+        - ``platform`` (str): "macos" (default) or "ios".
+        - ``device_name`` (str, optional): human-readable device label.
+        - ``bundle_id`` (str, optional): per-device topic override (macOS and
+          iOS builds have different bundle ids).
+
+    Returns the stored entry plus ``apns_configured`` so clients can tell the
+    user when the gateway has no APNs credentials.
+    """
+    try:
+        from tui_gateway.apns_sender import is_configured
+        from tui_gateway.push_store import register_token
+
+        token = params.get("token")
+        if not token or not isinstance(token, str):
+            return _err(rid, 4001, "token must be a non-empty string")
+        entry = register_token(
+            token,
+            platform=params.get("platform", "macos"),
+            device_name=params.get("device_name", ""),
+            bundle_id=params.get("bundle_id"),
+        )
+        if "error" in entry:
+            return _err(rid, 4001, entry["error"])
+        return _ok(rid, {"registered": True, "apns_configured": is_configured(), "entry": entry})
+    except Exception as e:
+        logger.exception("push.register failed")
+        return _err(rid, 5210, str(e))
+
+
+@method("push.unregister")
+def _(rid, params: dict) -> dict:
+    """Remove an APNs device token (e.g. on sign-out)."""
+    try:
+        from tui_gateway.push_store import unregister_token
+
+        token = params.get("token")
+        if not token or not isinstance(token, str):
+            return _err(rid, 4001, "token must be a non-empty string")
+        return _ok(rid, {"removed": unregister_token(token)})
+    except Exception as e:
+        logger.exception("push.unregister failed")
+        return _err(rid, 5211, str(e))
     """Read a single wiki page by relative path.
 
     Params:
