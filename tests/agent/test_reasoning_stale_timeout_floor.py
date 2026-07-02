@@ -82,6 +82,12 @@ import pytest
     ("anthropic/claude-sonnet-4-20250514", 180.0),
     ("anthropic/claude-sonnet-4.5", 180.0),
     ("anthropic/claude-sonnet-4.6", 180.0),
+    # Bare canonical `claude-sonnet-4` (no trailing minor) — exercises the
+    # end-of-string branch `(?:$|[\-._])` of the compiled pattern, which the
+    # separator-suffixed cases above never reach.  This exact ID appears in
+    # repo examples/configs, so the floor must resolve for it too.
+    ("anthropic/claude-sonnet-4", 180.0),
+    ("claude-sonnet-4", 180.0),
     # Anthropic Mythos-class named reasoning models — deep-reasoning tier.
     ("anthropic/claude-fable-5", 600.0),
     ("claude-fable-5", 600.0),
