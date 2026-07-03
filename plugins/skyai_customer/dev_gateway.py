@@ -18,6 +18,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from textwrap import dedent
 from typing import Any, Awaitable, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -311,162 +312,709 @@ def sanitize_runtime_error(exc: Exception) -> str:
 
 
 def render_widget_html(settings: CanarySettings) -> str:
-    return f"""<!doctype html>
-<html lang="bg">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SkyAI v2 DEV Canary</title>
-  <style>
-    :root {{
-      color-scheme: light;
-      --sky: #32BCAD;
-      --line: #d8e2ea;
-      --soft: #f4f8fb;
-      --text: #10202b;
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background: #fff;
-    }}
-    .shell {{
-      min-height: 100vh;
-      display: grid;
-      grid-template-rows: auto 1fr auto;
-      border: 1px solid var(--line);
-    }}
-    header {{
-      padding: 14px 16px;
-      background: var(--sky);
-      color: #fff;
-      font-weight: 700;
-    }}
-    header small {{
-      display: block;
-      margin-top: 2px;
-      font-size: 12px;
-      font-weight: 500;
-      opacity: .88;
-    }}
-    #messages {{
-      padding: 16px;
-      overflow: auto;
-      background: linear-gradient(#fff, var(--soft));
-    }}
-    .msg {{
-      max-width: 88%;
-      margin: 0 0 12px;
-      padding: 11px 13px;
-      border-radius: 14px;
-      line-height: 1.35;
-      white-space: pre-wrap;
-      box-shadow: 0 1px 2px rgba(16, 32, 43, .08);
-    }}
-    .assistant {{ background: #fff; border: 1px solid var(--line); }}
-    .user {{ margin-left: auto; background: var(--sky); color: #fff; }}
-    form {{
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 10px;
-      padding: 12px;
-      border-top: 1px solid var(--line);
-      background: #fff;
-    }}
-    textarea {{
-      min-height: 48px;
-      max-height: 120px;
-      resize: vertical;
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 12px;
-      font: inherit;
-    }}
-    button {{
-      min-width: 54px;
-      border: 0;
-      border-radius: 12px;
-      background: var(--sky);
-      color: #fff;
-      font-size: 22px;
-      cursor: pointer;
-    }}
-    button:disabled {{ opacity: .55; cursor: wait; }}
-  </style>
-</head>
-<body>
-  <main class="shell">
-    <header>
-      SkyAI v2 DEV
-      <small>{settings.version} · Hermes canary</small>
-    </header>
-    <section id="messages" aria-live="polite">
-      <div class="msg assistant">Здравей! Аз съм SkyAI v2 DEV canary. Мога да помогна с ориентация за SkyVision преживявания, ваучери и резервации. Какво търсиш днес?</div>
-    </section>
-    <form id="composer">
-      <textarea id="message" placeholder="Напиши съобщение..." autocomplete="off"></textarea>
-      <button id="send" type="submit" aria-label="Изпрати">›</button>
-    </form>
-  </main>
-  <script>
-    const messagesEl = document.getElementById('messages');
-    const form = document.getElementById('composer');
-    const input = document.getElementById('message');
-    const send = document.getElementById('send');
-    const storageKey = 'skyai-v2-canary-conversation-id';
-    const conversationId = localStorage.getItem(storageKey) || crypto.randomUUID();
-    localStorage.setItem(storageKey, conversationId);
-    const history = [];
+    return dedent(
+        """
+        <!doctype html>
+        <html lang="bg">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <meta name="skyvision-clean-dev-version" content="__SKYAI_VERSION__" />
+          <title>SkyAI асистент | SkyVision</title>
+          <style>
+            :root {
+              color-scheme: light;
+              --bg: #f7fafc;
+              --panel: #ffffff;
+              --ink: #172033;
+              --muted: #5b667a;
+              --line: #d8e0ea;
+              --accent: #32BCAD;
+              --accent-strong: #275E7C;
+              --accent-soft: #e8faf8;
+              --danger: #9f2e2e;
+            }
 
-    function addMessage(role, text) {{
-      const node = document.createElement('div');
-      node.className = `msg ${{role === 'user' ? 'user' : 'assistant'}}`;
-      node.textContent = text;
-      messagesEl.appendChild(node);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
-      if (role === 'user' || role === 'assistant') {{
-        history.push({{ role, content: text }});
-        while (history.length > 12) history.shift();
-      }}
-      return node;
-    }}
+            * { box-sizing: border-box; }
 
-    form.addEventListener('submit', async (event) => {{
-      event.preventDefault();
-      const text = input.value.trim();
-      if (!text) return;
-      input.value = '';
-      const payloadHistory = history.slice();
-      addMessage('user', text);
-      send.disabled = true;
-      const pending = addMessage('assistant', 'Мисля...');
-      try {{
-        const response = await fetch('/chatkit/dev-message', {{
-          method: 'POST',
-          headers: {{ 'Content-Type': 'application/json' }},
-          body: JSON.stringify({{
-            conversation_id: conversationId,
-            message: text,
-            history: payloadHistory,
-            surface: 'skyai_v2_dev_widget'
-          }})
-        }});
-        const data = await response.json();
-        pending.textContent = data.reply || data.reason || data.error || 'SkyAI v2 не върна отговор.';
-        history[history.length - 1] = {{ role: 'assistant', content: pending.textContent }};
-      }} catch (error) {{
-        pending.textContent = 'В момента не успях да се свържа със SkyAI v2 DEV canary.';
-        history[history.length - 1] = {{ role: 'assistant', content: pending.textContent }};
-      }} finally {{
-        send.disabled = false;
-        input.focus();
-      }}
-    }});
-  </script>
-</body>
-</html>"""
+            html,
+            body {
+              width: 100%;
+              height: 100%;
+              margin: 0;
+              background: var(--bg);
+              color: var(--ink);
+              font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+              font-size: 14px;
+              letter-spacing: 0;
+            }
+
+            body {
+              display: grid;
+              grid-template-rows: auto 1fr auto;
+              overflow: hidden;
+            }
+
+            header {
+              align-items: center;
+              border-bottom: 1px solid var(--line);
+              background: var(--panel);
+              display: flex;
+              gap: 12px;
+              min-height: 58px;
+              padding: 10px 14px;
+            }
+
+            .brand-logo {
+              display: block;
+              flex: 0 0 auto;
+              height: 32px;
+              max-width: 132px;
+              object-fit: contain;
+              width: 132px;
+            }
+
+            .brand-copy {
+              min-width: 0;
+            }
+
+            h1 {
+              margin: 0;
+              font-size: 15px;
+              line-height: 1.25;
+              font-weight: 750;
+            }
+
+            .version {
+              margin-top: 4px;
+              color: var(--muted);
+              font-size: 12px;
+              line-height: 1.35;
+              overflow-wrap: anywhere;
+            }
+
+            .version:empty {
+              display: none;
+            }
+
+            .messages {
+              min-height: 0;
+              overflow-y: auto;
+              padding: 14px;
+              display: flex;
+              flex-direction: column;
+              gap: 10px;
+            }
+
+            .message {
+              max-width: 88%;
+              padding: 10px 11px;
+              border: 1px solid var(--line);
+              border-radius: 8px;
+              background: var(--panel);
+              line-height: 1.42;
+              white-space: pre-wrap;
+              overflow-wrap: anywhere;
+            }
+
+            .message--user {
+              align-self: flex-end;
+              color: #ffffff;
+              border-color: var(--accent);
+              background: var(--accent);
+            }
+
+            .message--assistant {
+              align-self: flex-start;
+            }
+
+            .message--typing {
+              display: inline-flex;
+              align-items: center;
+              width: auto;
+              min-width: 48px;
+              min-height: 38px;
+            }
+
+            .typing-dots {
+              display: inline-flex;
+              align-items: center;
+              gap: 4px;
+            }
+
+            .typing-dots span {
+              width: 6px;
+              height: 6px;
+              border-radius: 999px;
+              background: var(--muted);
+              animation: typing-pulse 1.05s ease-in-out infinite;
+            }
+
+            .typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+            .typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+            @keyframes typing-pulse {
+              0%, 80%, 100% {
+                opacity: 0.35;
+                transform: translateY(0);
+              }
+              40% {
+                opacity: 1;
+                transform: translateY(-3px);
+              }
+            }
+
+            @media (prefers-reduced-motion: reduce) {
+              .typing-dots span {
+                animation: none;
+                opacity: 0.72;
+              }
+            }
+
+            .message--error {
+              align-self: flex-start;
+              color: var(--danger);
+              border-color: #efb4b4;
+              background: #fff7f7;
+            }
+
+            .trace {
+              color: var(--muted);
+              font-size: 12px;
+              line-height: 1.35;
+            }
+
+            .cards {
+              display: grid;
+              gap: 8px;
+              margin-top: -2px;
+            }
+
+            .card {
+              display: grid;
+              grid-template-columns: 72px 1fr;
+              min-height: 72px;
+              overflow: hidden;
+              border: 1px solid var(--line);
+              border-radius: 8px;
+              background: var(--panel);
+              text-decoration: none;
+              color: inherit;
+            }
+
+            .card__image {
+              width: 72px;
+              height: 100%;
+              min-height: 72px;
+              object-fit: cover;
+              background: #e8eef5;
+            }
+
+            .card__body {
+              min-width: 0;
+              padding: 8px 9px;
+            }
+
+            .card__title {
+              display: block;
+              font-weight: 720;
+              line-height: 1.3;
+              overflow-wrap: anywhere;
+            }
+
+            .card__meta {
+              display: block;
+              margin-top: 4px;
+              color: var(--muted);
+              font-size: 12px;
+              line-height: 1.35;
+            }
+
+            form {
+              display: grid;
+              grid-template-columns: 1fr auto auto;
+              gap: 8px;
+              padding: 10px;
+              border-top: 1px solid var(--line);
+              background: var(--panel);
+            }
+
+            textarea {
+              width: 100%;
+              min-height: 42px;
+              max-height: 120px;
+              resize: vertical;
+              padding: 10px;
+              border: 1px solid var(--line);
+              border-radius: 8px;
+              color: var(--ink);
+              font: inherit;
+              line-height: 1.35;
+              outline: none;
+            }
+
+            textarea:focus {
+              border-color: var(--accent);
+              box-shadow: 0 0 0 2px rgba(50, 188, 173, 0.16);
+            }
+
+            button {
+              width: 48px;
+              min-height: 42px;
+              border: 0;
+              border-radius: 8px;
+              background: var(--accent);
+              color: #ffffff;
+              font: inherit;
+              font-weight: 800;
+              cursor: pointer;
+            }
+
+            button:hover { background: var(--accent-strong); }
+            button:disabled { cursor: wait; opacity: 0.62; }
+
+            .voice-button {
+              display: inline-grid;
+              place-items: center;
+              border: 1px solid var(--line);
+              background: var(--panel);
+              color: var(--accent);
+            }
+
+            .voice-button:hover {
+              border-color: var(--accent);
+              background: var(--accent-soft);
+            }
+
+            .voice-button:disabled {
+              cursor: not-allowed;
+              background: #edf2f7;
+              color: var(--muted);
+            }
+
+            .voice-button--listening {
+              border-color: var(--danger);
+              background: #fff7f7;
+              color: var(--danger);
+            }
+
+            .voice-button svg {
+              width: 20px;
+              height: 20px;
+              stroke: currentColor;
+              stroke-width: 2;
+              stroke-linecap: round;
+              stroke-linejoin: round;
+              fill: none;
+            }
+
+            .voice-status {
+              grid-column: 1 / -1;
+              min-height: 16px;
+              color: var(--muted);
+              font-size: 12px;
+              line-height: 1.35;
+            }
+
+            .voice-status:empty {
+              display: none;
+            }
+
+            .voice-status--error {
+              color: var(--danger);
+            }
+          </style>
+        </head>
+        <body>
+          <header>
+            <img class="brand-logo" src="https://skyvision.bg/assets/img/logo.svg" alt="SkyVision" />
+            <div class="brand-copy">
+              <h1>SkyAI асистент</h1>
+              <div class="version" id="version" title="__SKYAI_VERSION__"></div>
+            </div>
+          </header>
+          <main class="messages" id="messages" aria-live="polite"></main>
+          <form id="form" autocomplete="off">
+            <textarea id="input" name="message" maxlength="4000" rows="2" placeholder="Напиши съобщение..." required></textarea>
+            <button id="voice" class="voice-button" type="button" aria-label="Гласово въвеждане" aria-pressed="false" title="Гласово въвеждане">
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"></path>
+                <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                <path d="M12 19v3"></path>
+                <path d="M8 22h8"></path>
+              </svg>
+            </button>
+            <button id="send" type="submit" aria-label="Изпрати">➜</button>
+            <div id="voice-status" class="voice-status" role="status" aria-live="polite"></div>
+          </form>
+          <script>
+            (() => {
+              const params = new URLSearchParams(window.location.search);
+              const metaVersion = document.querySelector('meta[name="skyvision-clean-dev-version"]').content;
+              const state = {
+                conversationId: params.get('conversation_id') || `skyvision-hermes-${Date.now().toString(36)}`,
+                busy: false,
+                listening: false,
+                turns: [],
+                voiceSupported: false,
+                voiceHadError: false,
+              };
+              const elements = {
+                form: document.getElementById('form'),
+                input: document.getElementById('input'),
+                voice: document.getElementById('voice'),
+                voiceStatus: document.getElementById('voice-status'),
+                send: document.getElementById('send'),
+                messages: document.getElementById('messages'),
+                version: document.getElementById('version'),
+              };
+              let recognition = null;
+              let voiceBaseText = '';
+              let voiceFinalText = '';
+              let voiceMediaStream = null;
+
+              function appendMessage(role, text) {
+                const node = document.createElement('div');
+                node.className = `message message--${role}`;
+                node.textContent = text;
+                elements.messages.appendChild(node);
+                elements.messages.scrollTop = elements.messages.scrollHeight;
+                return node;
+              }
+
+              function showTypingIndicator() {
+                const node = document.createElement('div');
+                node.className = 'message message--assistant message--typing';
+                node.setAttribute('role', 'status');
+                node.setAttribute('aria-label', 'SkyAI пише');
+                const dots = document.createElement('span');
+                dots.className = 'typing-dots';
+                dots.setAttribute('aria-hidden', 'true');
+                dots.appendChild(document.createElement('span'));
+                dots.appendChild(document.createElement('span'));
+                dots.appendChild(document.createElement('span'));
+                node.appendChild(dots);
+                elements.messages.appendChild(node);
+                elements.messages.scrollTop = elements.messages.scrollHeight;
+                return node;
+              }
+
+              function removeTypingIndicator(node) {
+                if (node && node.parentNode) node.parentNode.removeChild(node);
+              }
+
+              function rememberTurn(role, content) {
+                const text = String(content || '').trim();
+                if (!text || !['user', 'assistant'].includes(role)) return;
+                state.turns.push({ role, content: text.slice(0, 900) });
+                state.turns = state.turns.slice(-8);
+              }
+
+              function appendTrace(response) {
+                if (params.get('debug') !== '1') return;
+                const trace = response && response.trace ? response.trace : {};
+                const node = document.createElement('div');
+                node.className = 'trace';
+                const fallback = trace.fallback_active || trace.fallback ? 'fallback=on' : 'fallback=off';
+                const model = trace.customer_model || (trace.model_lane === 'openai_codex_cli' ? 'gpt-5.5' : trace.model_lane || 'gpt-5.5');
+                const auth = trace.auth_route === 'chatgpt_oauth_pro' ? 'oauth=chatgpt_pro' : trace.auth_route ? `auth=${trace.auth_route}` : '';
+                const status = response.status || 'unknown-status';
+                node.textContent = auth ? `${status} · ${model} · ${auth} · ${fallback}` : `${status} · ${model} · ${fallback}`;
+                elements.messages.appendChild(node);
+              }
+
+              function appendCards(cards) {
+                if (!Array.isArray(cards) || cards.length === 0) return;
+                const list = document.createElement('div');
+                list.className = 'cards';
+                cards.forEach(card => {
+                  if (!card || !card.title) return;
+                  const link = document.createElement(card.url ? 'a' : 'article');
+                  link.className = 'card';
+                  if (card.url) {
+                    link.href = card.url;
+                    link.target = '_blank';
+                    link.rel = 'noopener noreferrer';
+                  }
+                  const image = document.createElement('img');
+                  image.className = 'card__image';
+                  image.alt = '';
+                  image.loading = 'lazy';
+                  if (card.image_url || card.image) image.src = card.image_url || card.image;
+                  const body = document.createElement('span');
+                  body.className = 'card__body';
+                  const title = document.createElement('strong');
+                  title.className = 'card__title';
+                  title.textContent = card.title;
+                  const meta = document.createElement('span');
+                  meta.className = 'card__meta';
+                  meta.textContent = [
+                    card.location,
+                    card.duration,
+                    card.price_text || (card.price_eur ? `€${card.price_eur}` : '')
+                  ].filter(Boolean).join(' · ');
+                  body.appendChild(title);
+                  if (meta.textContent) body.appendChild(meta);
+                  link.appendChild(image);
+                  link.appendChild(body);
+                  list.appendChild(link);
+                });
+                if (list.childElementCount > 0) {
+                  elements.messages.appendChild(list);
+                  elements.messages.scrollTop = elements.messages.scrollHeight;
+                }
+              }
+
+              async function loadVersion() {
+                try {
+                  const response = await fetch('/version', { headers: { Accept: 'application/json' } });
+                  if (!response.ok) return;
+                  const payload = await response.json();
+                  const commit = payload.commit ? payload.commit.slice(0, 12) : 'unknown';
+                  const buildLabel = `build: ${payload.version || metaVersion} · commit: ${commit}`;
+                  elements.version.textContent = params.get('debug') === '1' ? buildLabel : '';
+                  elements.version.title = buildLabel;
+                } catch {
+                  const buildLabel = `build: ${metaVersion} · commit: unavailable`;
+                  elements.version.textContent = params.get('debug') === '1' ? buildLabel : '';
+                  elements.version.title = buildLabel;
+                }
+              }
+
+              async function sendMessage(message) {
+                state.busy = true;
+                elements.send.disabled = true;
+                if (state.listening && recognition) recognition.stop();
+                if (state.voiceSupported) elements.voice.disabled = true;
+                const typingNode = showTypingIndicator();
+                try {
+                  const response = await fetch('/chatkit/message', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                    body: JSON.stringify({
+                      message,
+                      messages: state.turns.slice(-8),
+                      conversation_id: state.conversationId,
+                      customer_id: params.get('customer_id') || undefined,
+                      domain_key: params.get('domain_key') || undefined,
+                      metadata: buildClientMetadata(),
+                    }),
+                  });
+                  const payload = await response.json();
+                  if (!response.ok) {
+                    throw new Error(payload.detail || payload.reason || payload.error || `HTTP ${response.status}`);
+                  }
+                  state.conversationId = payload.conversation_id || state.conversationId;
+                  removeTypingIndicator(typingNode);
+                  appendMessage(payload.unavailable ? 'error' : 'assistant', payload.reply || 'Няма отговор.');
+                  if (!payload.unavailable && payload.reply) rememberTurn('assistant', payload.reply);
+                  appendCards(payload.cards);
+                  appendTrace(payload);
+                } catch (error) {
+                  const rawMessage = error && error.message ? String(error.message) : 'unknown error';
+                  const friendlyMessage = rawMessage === 'Load failed'
+                    ? 'Връзката със SkyAI прекъсна временно. Опитай пак след малко.'
+                    : `SkyAI не върна отговор: ${rawMessage}`;
+                  removeTypingIndicator(typingNode);
+                  appendMessage('error', friendlyMessage);
+                } finally {
+                  removeTypingIndicator(typingNode);
+                  state.busy = false;
+                  elements.send.disabled = false;
+                  if (state.voiceSupported) elements.voice.disabled = false;
+                  elements.input.focus();
+                }
+              }
+
+              function buildClientMetadata() {
+                const nav = window.navigator || {};
+                const screenInfo = window.screen || {};
+                const resolvedTimeZone = (() => {
+                  try {
+                    return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+                  } catch {
+                    return '';
+                  }
+                })();
+                return {
+                  surface: 'widget_chatkit_dev',
+                  widget_version: metaVersion,
+                  page_referrer: document.referrer || '',
+                  browser_language: nav.language || '',
+                  browser_languages: Array.isArray(nav.languages) ? nav.languages.join(',') : '',
+                  timezone: resolvedTimeZone,
+                  viewport: `${window.innerWidth || 0}x${window.innerHeight || 0}`,
+                  screen: `${screenInfo.width || 0}x${screenInfo.height || 0}`,
+                  device_pixel_ratio: String(window.devicePixelRatio || 1),
+                };
+              }
+
+              function setVoiceListening(listening) {
+                state.listening = listening;
+                elements.voice.classList.toggle('voice-button--listening', listening);
+                elements.voice.setAttribute('aria-pressed', listening ? 'true' : 'false');
+                elements.voice.title = listening ? 'Спри гласовото въвеждане' : 'Гласово въвеждане';
+              }
+
+              function setVoiceStatus(message) {
+                elements.voiceStatus.textContent = message || '';
+                elements.voiceStatus.classList.remove('voice-status--error');
+              }
+
+              function setVoiceError(message) {
+                elements.voiceStatus.textContent = message || '';
+                elements.voiceStatus.classList.add('voice-status--error');
+              }
+
+              function applyVoiceTranscript(interimText) {
+                const captured = [voiceFinalText, interimText || ''].map(part => part.trim()).filter(Boolean).join(' ');
+                const nextValue = voiceBaseText && captured ? `${voiceBaseText}\\n${captured}` : (voiceBaseText || captured);
+                elements.input.value = nextValue;
+                elements.input.focus();
+              }
+
+              function stopVoiceMediaStream() {
+                if (!voiceMediaStream) return;
+                voiceMediaStream.getTracks().forEach(track => track.stop());
+                voiceMediaStream = null;
+              }
+
+              async function requestMicrophoneAccess() {
+                if (!window.navigator || !window.navigator.mediaDevices || !window.navigator.mediaDevices.getUserMedia) {
+                  throw new Error('media_devices_unavailable');
+                }
+                voiceMediaStream = await window.navigator.mediaDevices.getUserMedia({ audio: true });
+                stopVoiceMediaStream();
+              }
+
+              function voiceErrorMessage(error) {
+                if (error === 'NotAllowedError' || error === 'PermissionDeniedError' || error === 'not-allowed' || error === 'security') {
+                  return 'Браузърът блокира микрофона. Разреши достъп до микрофона и опитай пак.';
+                }
+                if (error === 'NotFoundError' || error === 'DevicesNotFoundError' || error === 'not-found' || error === 'audio-capture') {
+                  return 'Не намирам активен микрофон.';
+                }
+                if (error === 'no-speech') {
+                  return 'Не чух звук. Опитай пак.';
+                }
+                if (error === 'network') {
+                  return 'Гласовото разпознаване прекъсна. Опитай пак.';
+                }
+                if (error === 'media_devices_unavailable') {
+                  return 'Този браузър не дава достъп до микрофона тук.';
+                }
+                return 'Гласовото въвеждане не успя. Опитай пак.';
+              }
+
+              function setupVoiceInput() {
+                const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+                state.voiceSupported = Boolean(
+                  SpeechRecognitionCtor &&
+                  window.isSecureContext &&
+                  window.navigator &&
+                  window.navigator.mediaDevices &&
+                  window.navigator.mediaDevices.getUserMedia
+                );
+                if (!state.voiceSupported) {
+                  elements.voice.disabled = true;
+                  elements.voice.title = 'Гласовото въвеждане не се поддържа от този браузър';
+                  return;
+                }
+
+                recognition = new SpeechRecognitionCtor();
+                recognition.lang = 'bg-BG';
+                recognition.interimResults = true;
+                recognition.continuous = false;
+                recognition.maxAlternatives = 1;
+
+                recognition.onstart = () => {
+                  voiceBaseText = elements.input.value.trim();
+                  voiceFinalText = '';
+                  state.voiceHadError = false;
+                  setVoiceListening(true);
+                  setVoiceStatus('Слушам...');
+                };
+
+                recognition.onresult = event => {
+                  let interimText = '';
+                  for (let index = event.resultIndex; index < event.results.length; index += 1) {
+                    const transcript = event.results[index][0].transcript.trim();
+                    if (!transcript) continue;
+                    if (event.results[index].isFinal) {
+                      voiceFinalText = [voiceFinalText, transcript].filter(Boolean).join(' ');
+                    } else {
+                      interimText = [interimText, transcript].filter(Boolean).join(' ');
+                    }
+                  }
+                  applyVoiceTranscript(interimText);
+                  if (voiceFinalText || interimText) setVoiceStatus('Разпознавам...');
+                };
+
+                recognition.onerror = event => {
+                  const error = event && event.error ? String(event.error) : 'unknown';
+                  state.voiceHadError = true;
+                  setVoiceError(voiceErrorMessage(error));
+                };
+
+                recognition.onend = () => {
+                  stopVoiceMediaStream();
+                  setVoiceListening(false);
+                  if (state.voiceHadError) return;
+                  setVoiceStatus(voiceFinalText ? 'Готово.' : 'Не чух ясно. Опитай пак.');
+                };
+
+                elements.voice.addEventListener('click', async () => {
+                  if (state.busy) return;
+                  if (state.listening) {
+                    recognition.stop();
+                    return;
+                  }
+                  try {
+                    setVoiceStatus('Разрешаване на микрофона...');
+                    await requestMicrophoneAccess();
+                    recognition.start();
+                  } catch (error) {
+                    const errorName = error && error.name ? String(error.name) : '';
+                    const errorMessage = error && error.message ? String(error.message) : '';
+                    setVoiceListening(false);
+                    stopVoiceMediaStream();
+                    setVoiceError(voiceErrorMessage(errorName || errorMessage || 'unknown'));
+                  }
+                });
+              }
+
+              elements.form.addEventListener('submit', event => {
+                event.preventDefault();
+                if (state.busy) return;
+                if (state.listening && recognition) recognition.stop();
+                const message = elements.input.value.trim();
+                if (!message) return;
+                elements.input.value = '';
+                appendMessage('user', message);
+                rememberTurn('user', message);
+                void sendMessage(message);
+              });
+
+              elements.input.addEventListener('keydown', event => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  elements.form.requestSubmit();
+                }
+              });
+
+              appendMessage(
+                'assistant',
+                'Здравей! Аз съм SkyAI, асистентът на SkyVision. Мога да ти помогна да избереш преживяване, да проверим свободни часове, да се ориентираш с ваучер или резервация, или просто да намерим добър подарък. Какво търсиш днес?'
+              );
+              setupVoiceInput();
+              void loadVersion();
+              elements.input.focus();
+            })();
+          </script>
+        </body>
+        </html>
+        """
+    ).replace("__SKYAI_VERSION__", settings.version)
 
 
 async def build_chat_response(

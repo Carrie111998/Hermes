@@ -138,11 +138,16 @@ def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
 def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path) -> None:
     html = dev_gateway.render_widget_html(settings(tmp_path, version="test-version"))
 
-    assert "<title>SkyAI v2 DEV Canary</title>" in html
+    assert "<title>SkyAI асистент | SkyVision</title>" in html
+    assert 'meta name="skyvision-clean-dev-version" content="test-version"' in html
+    assert "<h1>SkyAI асистент</h1>" in html
     assert "#32BCAD" in html
+    assert "#275E7C" in html
     assert "test-version" in html
-    assert "fetch('/chatkit/dev-message'" in html
-    assert "skyai-v2-canary-conversation-id" in html
+    assert "fetch('/chatkit/message'" in html
+    assert "message--typing" in html
+    assert "card__image" in html
+    assert "appendCards(payload.cards)" in html
 
 
 def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
