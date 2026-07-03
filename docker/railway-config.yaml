@@ -64,4 +64,7 @@ toolsets:
 platform_toolsets:
   cli: [hermes-cli]
   discord: [hermes-discord]
-  whatsapp: [kanban, todo, session_search]
+  # Pas de `todo` : GLM s'en servait comme planning en mémoire au lieu de créer une
+  # carte. Son SEUL moyen d'action = kanban. session_search reste pour rappeler le
+  # contexte (repo/projet d'une conversation passée).
+  whatsapp: [kanban, session_search]
