@@ -13,6 +13,7 @@ SKYAI_TOOL_NAMES = {
     "skyai_catalog_search",
     "skyai_product_detail",
     "skyai_product_slots",
+    "skyai_campaign_knowledge",
     "skyai_event_log_append",
 }
 
@@ -77,7 +78,27 @@ def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
 
     def fake_http_json(url: str, *, timeout: float = 8.0):
         calls.append(url)
-        return {"data": {"title": "Офроуд с ATV", "secret": "drop-me"}}
+        return {
+            "data": {
+                "name": "Офроуд с ATV",
+                "slug": "офроуд-атв-под-наем/семейна-офроуд-разходка-с-атв",
+                "price": "88",
+                "duration": "90 - 120 минути",
+                "configurator": {
+                    "additions": [
+                        {
+                            "options": [
+                                {
+                                    "label": "- за 1 участник над 18 г. на 1 ATV",
+                                    "price": "88",
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "secret": "drop-me",
+            }
+        }
 
     monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
 
@@ -88,7 +109,18 @@ def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
     assert result["status"] == "ok"
     assert result["product_path"] == "офроуд-атв-под-наем/семейна-офроуд-разходка-с-атв"
     assert "%D0%BF%D0%BE%D0%B4%D0%B0%D1%80%D1%8A%D0%BA" not in calls[0]
-    assert result["detail"] == {"title": "Офроуд с ATV"}
+    assert result["detail"]["title"] == "Офроуд с ATV"
+    assert result["detail"]["public_url"] == (
+        "https://skyvision.bg/подарък/офроуд-атв-под-наем/семейна-офроуд-разходка-с-атв/"
+    )
+    assert result["detail"]["price_eur"] == "44.99"
+    assert result["detail"]["configurator"]["options"] == [
+        {
+            "label": "- за 1 участник над 18 г. на 1 ATV",
+            "price_bgn": "88.00",
+            "price_eur": "44.99",
+        }
+    ]
 
 
 def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> None:
@@ -98,8 +130,8 @@ def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> 
         calls.append(url)
         return {
             "data": [
-                {"id": 1, "title": "Масаж", "priceEur": "90", "location": "София"},
-                {"id": 2, "title": "SPA", "priceEur": "95", "location": "София"},
+                {"id": 1, "title": "Масаж", "price": "100", "location": "София"},
+                {"id": 2, "title": "SPA", "price": "186", "location": "София"},
             ]
         }
 
@@ -117,6 +149,56 @@ def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> 
     assert "search=%D0%BC%D0%B0%D1%81%D0%B0%D0%B6%20%D0%A1%D0%BE%D1%84%D0%B8%D1%8F" in calls[0]
     assert "minPrice=156" in calls[0]
     assert "maxPrice=196" in calls[0]
+    assert result["items"][0]["price_eur"] == "51.13"
+
+
+def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
+    result = public_tools.handle_skyai_campaign_knowledge(
+        topic="Клиент пита дали бонусният полет може да е за подарения човек",
+        include_terms=True,
+    )
+
+    assert result["status"] == "ok"
+    campaign = result["active_campaigns"][0]
+    assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
+    assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]
+    assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
+
+
+def test_product_slots_compacts_fixed_slots_and_marks_fixed_mode(monkeypatch) -> None:
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        return {
+            "fixedSlots": [
+                {
+                    "id": 1,
+                    "start": "2026-07-06T05:00:00.000000Z",
+                    "end": "2026-07-06T05:40:00.000000Z",
+                    "slots": [
+                        {
+                            "id": 10,
+                            "status": "free",
+                            "start": "2026-07-06T05:00:00.000000Z",
+                            "end": "2026-07-06T05:40:00.000000Z",
+                        }
+                    ],
+                }
+            ],
+            "requestSlots": [{"start": "2026-07-06T08:00:00", "end": "2026-07-06T08:40:00"}],
+            "workingPeriods": [],
+        }
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_product_slots(
+        product_id=10536,
+        start_date="2026-07-03",
+        end_date="2026-07-17",
+    )
+
+    assert result["status"] == "ok"
+    assert result["availability_mode"] == "fixed_slots_available_direct_booking"
+    assert result["fixed_slots"][0]["free_slots_count"] == 1
+    assert result["fixed_slots"][0]["first_free_slot"]["id"] == 10
 
 
 def test_event_log_append_rejects_sensitive_payload(monkeypatch, tmp_path: Path) -> None:

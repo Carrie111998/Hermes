@@ -132,6 +132,7 @@ def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
     assert ("GET", "/widget/chatkit/") in routes
     assert ("POST", "/chatkit/dev-message") in routes
     assert ("POST", "/chatkit/message") in routes
+    assert ("POST", "/qa/compare") in routes
 
 
 def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path) -> None:
@@ -199,3 +200,77 @@ def test_sanitize_runtime_error_redacts_token_markers() -> None:
     assert dev_gateway.sanitize_runtime_error(
         RuntimeError("Bearer abc123 access_token=secret refresh_token:secret2 api_key=secret3")
     ) == "Bearer [redacted] access_token=[redacted] refresh_token=[redacted] api_key=[redacted]"
+
+
+def test_format_discord_mirror_message_uses_customer_visible_shape() -> None:
+    message = dev_gateway.format_discord_mirror_message(
+        {"conversation_id": "c1", "message": "Търся подарък"},
+        {
+            "status": "ok",
+            "version": "v-test",
+            "conversation_id": "c1",
+            "reply": "Имаме чудесни идеи.",
+            "trace": {
+                "runtime": "hermes_agent",
+                "toolset": "skyai_customer",
+                "live_model": True,
+                "fallback": False,
+                "latency_ms": 12,
+            },
+        },
+    )
+
+    assert "**Клиент**" in message
+    assert "**SkyAI**" in message
+    assert "Търся подарък" in message
+    assert "Имаме чудесни идеи." in message
+    assert "toolset=skyai_customer" in message
+
+
+@pytest.mark.asyncio
+async def test_mirror_to_discord_skips_when_disabled(tmp_path: Path) -> None:
+    result = await dev_gateway.mirror_to_discord(
+        {"message": "Здравей"},
+        {"status": "ok", "reply": "Здравей", "trace": {}},
+        settings(tmp_path),
+    )
+
+    assert result == {"status": "skipped", "reason": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_build_compare_response_runs_dev_and_prod_sides(tmp_path: Path) -> None:
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        return f"DEV: {message}"
+
+    def fake_prod_caller(payload, canary_settings):
+        return {
+            "status": "ok",
+            "version": "prod-v",
+            "reply": f"PROD: {payload['message']}",
+            "cards": [{"title": "card"}],
+            "trace": {"model": "gpt-5.5", "latency_ms": 20},
+        }
+
+    response = await dev_gateway.build_compare_response(
+        {"conversation_id": "c1", "message": "Има ли масаж?"},
+        settings(tmp_path, compare_prod_base_url="https://prod.example"),
+        agent_runner=fake_runner,
+        prod_caller=fake_prod_caller,
+    )
+
+    assert response["status"] == "ok"
+    assert response["dev_v2"]["reply"] == "DEV: Има ли масаж?"
+    assert response["prod_current"]["reply"] == "PROD: Има ли масаж?"
+    assert response["prod_current"]["cards_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_compare_response_requires_prod_base_url(tmp_path: Path) -> None:
+    response = await dev_gateway.build_compare_response(
+        {"conversation_id": "c1", "message": "Здравей"},
+        settings(tmp_path),
+    )
+
+    assert response["status"] == "error"
+    assert response["error"] == "compare_prod_not_configured"

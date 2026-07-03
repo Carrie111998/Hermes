@@ -21,6 +21,9 @@ The first slice adds:
 - public catalog search tool;
 - public product detail tool;
 - public product slots tool;
+- curated public campaign knowledge tool;
+- Discord mirror v2 sidecar for canary conversations;
+- DEV-only comparison endpoint for SkyAI v2 canary vs current PROD SkyAI;
 - sanitized local append-only event stub;
 - dedicated `skyai-v2-dev` profile bootstrap script;
 - DEV-only FAB-compatible canary endpoint;
@@ -32,7 +35,8 @@ The first slice adds:
 - No PROD traffic switch.
 - No Cloud SQL provisioning.
 - No Redis provisioning.
-- No Discord bot permission changes.
+- No Discord bot permission changes in code; mirror activates only when the
+  DEV runtime is configured with a bot token and channel id.
 - No customer/order/payment/voucher mutation.
 - No Muncho canonical brain writes.
 
@@ -43,7 +47,8 @@ The first slice adds:
 3. Add Cloud SQL `skyai_ci.events` insert-only backend behind explicit
    `SKYAI_CI_DATABASE_URL` / `SKYAI_CI_EVENT_WRITE_ENABLED` gates.
 4. Mirror every canary thread to the SkyAI Discord channel.
-5. Run side-by-side live canary with instant rollback to current PROD SkyAI.
+5. Run side-by-side live canary through `/qa/compare` with instant rollback to
+   current PROD SkyAI.
 
 ## DEV Canary Bootstrap
 
@@ -61,11 +66,26 @@ python -m plugins.skyai_customer.dev_gateway \
 curl -X POST http://127.0.0.1:8787/chatkit/dev-message \
   -H 'Content-Type: application/json' \
   -d '{"conversation_id":"dev-smoke","message":"Здравей, търся подарък за двама"}'
+curl -X POST http://127.0.0.1:8787/qa/compare \
+  -H 'Content-Type: application/json' \
+  -d '{"conversation_id":"compare-smoke","message":"Има ли масаж в София?"}'
 ```
 
 The canary gateway is loopback/dry-run by default. Live model calls require
 `--live-model`. Private RFC1918 binds still require `--allow-public-bind`;
 public or wildcard binds also require an explicit token gate.
+
+Optional DEV-only environment gates:
+
+- `SKYAI_DISCORD_MIRROR_ENABLED=true`
+- `SKYAI_DISCORD_BOT_TOKEN=...` or `DISCORD_BOT_TOKEN=...`
+- `SKYAI_DISCORD_MIRROR_CHANNEL_ID=1510888721614901358`
+- `SKYAI_DISCORD_MIRROR_CREATE_THREADS=true`
+- `SKYAI_COMPARE_PROD_BASE_URL=https://<current-prod-skyai>`
+
+The Discord mirror and comparison endpoint are gateway sidecars, not model
+tools. The customer-facing Hermes model cannot call Discord, mutate PROD, or
+read internal reports.
 
 ## Daily Upstream Sync Policy
 

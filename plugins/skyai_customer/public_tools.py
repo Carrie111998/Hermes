@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
@@ -29,6 +29,10 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 8.0
 MAX_CATALOG_SIZE = 3000
 MAX_RETURN_ITEMS = 12
 MAX_EVENT_PROPERTY_VALUE_LENGTH = 500
+MAX_TEXT_FIELD_LENGTH = 900
+MAX_DETAIL_LIST_ITEMS = 8
+MAX_CONFIGURATOR_OPTIONS = 10
+PUBLIC_SITE_BASE_URL = "https://skyvision.bg"
 
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -126,6 +130,29 @@ SKYAI_PRODUCT_SLOTS_SCHEMA = {
     },
 }
 
+SKYAI_CAMPAIGN_KNOWLEDGE_SCHEMA = {
+    "name": "skyai_campaign_knowledge",
+    "description": (
+        "Return curated public SkyVision campaign and brand guidance for customer conversations. "
+        "Use when the customer asks about bonuses, active campaigns, the free panoramic flight, "
+        "or when a light sales note about an active campaign can help a purchase decision. "
+        "Do not use it as a keyword router and do not force campaign text into unrelated support answers."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "topic": {
+                "type": "string",
+                "description": "Short description of the customer context or question.",
+            },
+            "include_terms": {
+                "type": "boolean",
+                "description": "Whether the customer explicitly needs campaign terms or eligibility details.",
+            },
+        },
+    },
+}
+
 SKYAI_EVENT_LOG_APPEND_SCHEMA = {
     "name": "skyai_event_log_append",
     "description": (
@@ -157,6 +184,25 @@ def _money_eur_to_bgn(value: float | int | str | None) -> int:
         return 0
     decimal = Decimal(str(value)) * BGN_PER_EUR
     return int(decimal.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _money_bgn_to_eur(value: float | int | str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        decimal = Decimal(str(value)) / BGN_PER_EUR
+    except Exception:
+        return None
+    return str(decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _money_decimal_string(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    try:
+        return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except Exception:
+        return str(value)
 
 
 def _safe_limit(limit: int | None) -> int:
@@ -217,6 +263,10 @@ def handle_skyai_product_slots(
 ) -> dict[str, Any]:
     if int(product_id) <= 0:
         return {"status": "error", "error": "invalid_product_id"}
+    if not start_date and not end_date:
+        today = date.today()
+        start_date = today.isoformat()
+        end_date = (today + timedelta(days=14)).isoformat()
     query = ""
     if start_date and end_date:
         _validate_iso_date(start_date)
@@ -227,16 +277,89 @@ def handle_skyai_product_slots(
     fixed = payload.get("fixedSlots") or []
     request_slots = payload.get("requestSlots") or []
     working_periods = payload.get("workingPeriods") or []
+    fixed_count = len(fixed) if isinstance(fixed, list) else 0
+    request_count = len(request_slots) if isinstance(request_slots, list) else 0
+    working_count = len(working_periods) if isinstance(working_periods, list) else 0
+    if fixed_count:
+        availability_mode = "fixed_slots_available_direct_booking"
+        visible_request_slots: list[dict[str, Any]] = []
+    elif request_count:
+        availability_mode = "request_slots_possible_no_fixed_slots_in_range"
+        visible_request_slots = _compact_request_slots(request_slots, 12)
+    elif working_count:
+        availability_mode = "working_periods_only"
+        visible_request_slots = []
+    else:
+        availability_mode = "no_public_slots_in_range"
+        visible_request_slots = []
     return {
         "status": "ok",
         "source": "skyvision_public_events",
         "product_id": int(product_id),
-        "fixed_slots_count": len(fixed) if isinstance(fixed, list) else 0,
-        "request_slots_count": len(request_slots) if isinstance(request_slots, list) else 0,
-        "working_periods_count": len(working_periods) if isinstance(working_periods, list) else 0,
-        "fixed_slots": _first_items(fixed, 12),
-        "request_slots": _first_items(request_slots, 12),
-        "working_periods": _first_items(working_periods, 12),
+        "range": {"start_date": start_date, "end_date": end_date},
+        "availability_mode": availability_mode,
+        "guidance": (
+            "Фиксираните слотове са за директна резервация. Запитванията са ориентир само "
+            "когато няма фиксирани слотове за периода; не смесвай двата режима в отговора."
+        ),
+        "fixed_slots_count": fixed_count,
+        "request_slots_count": request_count,
+        "working_periods_count": working_count,
+        "fixed_slots": _compact_fixed_slots(fixed, 12),
+        "request_slots": visible_request_slots,
+        "working_periods": _first_items(working_periods, 6),
+    }
+
+
+def handle_skyai_campaign_knowledge(
+    topic: str = "",
+    include_terms: bool = False,
+) -> dict[str, Any]:
+    """Return curated public campaign facts without exposing internal state."""
+    return {
+        "status": "ok",
+        "source": "skyvision_curated_public_campaign_knowledge",
+        "topic": _truncate_text(topic, 300),
+        "active_campaigns": [
+            {
+                "name": "Подарък панорамен полет над морето",
+                "public_url": "https://skyvision.bg/campaign/free-panoramic-flight/",
+                "terms_url": "https://panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto",
+                "customer_summary": (
+                    "SkyVision благодари на клиентите с безплатен панорамен полет над морето "
+                    "към покупка или директна BookNow резервация, според условията на кампанията."
+                ),
+                "sales_tone": (
+                    "Поднасяй бонуса като приятен SkyVision жест, не като суха правна бележка. "
+                    "Не го повтаряй във всеки отговор и не го вкарвай, ако клиентът пита за чист support казус."
+                ),
+                "booknow_nuance": (
+                    "При BookNow бонусният полет се ползва след основното преживяване, защото BookNow "
+                    "е конкретна резервация със защита за клиента и възможно възстановяване на пари, "
+                    "ако изпълнителят не може да проведе резервацията."
+                ),
+                "voucher_nuance": (
+                    "При ваучер сделката е за период на валидност, не за конкретен слот; ако дата отпадне, "
+                    "клиентът може да резервира друга дата в рамките на валидността."
+                ),
+            }
+        ],
+        "founder_transfer_guidance": {
+            "use_only_when_customer_asks_to_transfer_bonus_flight": True,
+            "summary": (
+                "Емил Ломлиев и Малина основават SkyVision през 2007, за да споделят страстта си към "
+                "летенето. При казуси за преотстъпване на бонусния полет SkyAI може да обясни, че Емил "
+                "лично разглежда такива случаи и досега SkyVision не е отказвал, когато клиентът иска "
+                "жестът да зарадва друг човек."
+            ),
+            "public_founder_contact": "+359 886 417 142",
+        },
+        "terms": {
+            "include_terms_requested": bool(include_terms),
+            "terms_url": "https://panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto",
+            "general_terms_url": "https://skyvision.bg/общи-условия/",
+            "privacy_notice_url": "https://skyvision.bg/уведомление-за-обработване-на-лични-д/",
+        },
     }
 
 
@@ -305,17 +428,23 @@ def _extract_products(payload: Any) -> list[dict[str, Any]]:
 
 
 def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
+    slug = str(item.get("slug") or "").strip("/")
+    price_bgn = item.get("price") or item.get("price_bgn") or item.get("priceBgn")
+    price_eur = item.get("price_eur") or item.get("priceEur") or _money_bgn_to_eur(price_bgn)
     return {
         "id": item.get("id") or item.get("product_id"),
         "title": item.get("title") or item.get("name"),
-        "slug": item.get("slug"),
+        "slug": slug or None,
         "category_slug": item.get("category_slug") or item.get("categorySlug"),
-        "url": item.get("url"),
-        "location": item.get("location") or item.get("city") or item.get("region"),
-        "price": item.get("price") or item.get("price_bgn") or item.get("priceBgn"),
-        "price_eur": item.get("price_eur") or item.get("priceEur"),
+        "public_url": item.get("url") or _public_product_url(slug),
+        "location": item.get("location") or item.get("locationName") or item.get("city") or item.get("region"),
+        "location_area": item.get("locationArea"),
+        "price_bgn": _money_decimal_string(price_bgn),
+        "price_eur": _money_decimal_string(price_eur),
         "duration": item.get("duration"),
         "participants": item.get("participants") or item.get("participant_count"),
+        "provider": _provider_name(item.get("provider")),
+        "image": _first_image(item),
     }
 
 
@@ -323,42 +452,207 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"raw_type": type(payload).__name__}
     source = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    allowed = {
-        "id",
-        "title",
-        "name",
-        "slug",
-        "category_slug",
-        "categorySlug",
-        "url",
-        "location",
-        "city",
-        "region",
-        "price",
-        "price_bgn",
-        "priceBgn",
-        "price_eur",
-        "priceEur",
-        "duration",
-        "participants",
-        "participant_count",
-        "min_age",
-        "max_weight",
-        "description",
-        "included",
-        "requirements",
-        "variants",
-        "options",
-        "images",
-        "provider",
+    slug = str(source.get("slug") or "").strip("/")
+    metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+    price_bgn = source.get("price") or source.get("price_bgn") or source.get("priceBgn")
+    price_eur = source.get("price_eur") or source.get("priceEur") or _money_bgn_to_eur(price_bgn)
+    return {
+        "id": source.get("id") or source.get("product_id"),
+        "title": source.get("title") or source.get("name"),
+        "slug": slug or None,
+        "public_url": metadata.get("canonical") or source.get("url") or _public_product_url(slug),
+        "location": source.get("location") or source.get("locationName") or source.get("city"),
+        "location_area": source.get("locationArea") or source.get("region"),
+        "price_bgn": _money_decimal_string(price_bgn),
+        "price_eur": _money_decimal_string(price_eur),
+        "duration": source.get("duration"),
+        "minimum_age": source.get("minimumAge") or source.get("min_age"),
+        "maximum_weight": source.get("maximumWeight") or source.get("maxWeight"),
+        "for_kids": source.get("forKids") or source.get("children") or source.get("isForChildren"),
+        "weather": source.get("weather"),
+        "service_for_who": source.get("serviceForWho"),
+        "schedule": _truncate_text(source.get("schedule")),
+        "cancellation_policy": source.get("cancellationPolicy"),
+        "can_book": _boolish(source.get("canBook")),
+        "can_buy_voucher": _boolish(source.get("canBuyVoucher")),
+        "includes_bonus": _boolish(source.get("includesBonus") or source.get("canReceiveBonusProduct")),
+        "provider": _provider_name(source.get("provider")),
+        "description": _truncate_text(source.get("description") or source.get("aboutDescription")),
+        "included": _compact_text_list(source.get("included")),
+        "needed": _compact_text_list(source.get("needed")),
+        "important": _truncate_text(source.get("important")),
+        "restrictions": _truncate_text(source.get("otherRestrictions")),
+        "locations": _compact_locations(source.get("locations")),
+        "configurator": _compact_configurator(source.get("configurator")),
+        "images": _compact_gallery(source.get("gallery") or source.get("images")),
     }
-    return {key: value for key, value in source.items() if key in allowed}
 
 
 def _first_items(value: Any, limit: int) -> list[Any]:
     if not isinstance(value, list):
         return []
     return value[:limit]
+
+
+def _compact_fixed_slots(value: Any, limit: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in value[:limit]:
+        if not isinstance(item, dict):
+            continue
+        slots = item.get("slots") if isinstance(item.get("slots"), list) else []
+        free_slots = [slot for slot in slots if isinstance(slot, dict) and slot.get("status") == "free"]
+        compact.append(
+            {
+                "event_id": item.get("id"),
+                "start": item.get("start"),
+                "end": item.get("end"),
+                "free_slots_count": len(free_slots),
+                "first_free_slot": {
+                    "id": free_slots[0].get("id"),
+                    "start": free_slots[0].get("start"),
+                    "end": free_slots[0].get("end"),
+                }
+                if free_slots
+                else None,
+            }
+        )
+    return compact
+
+
+def _compact_request_slots(value: Any, limit: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in value[:limit]:
+        if isinstance(item, dict):
+            compact.append({"start": item.get("start"), "end": item.get("end")})
+    return compact
+
+
+def _public_product_url(slug: str) -> str | None:
+    slug = (slug or "").strip("/")
+    if not slug:
+        return None
+    if slug.startswith("подарък/"):
+        slug = slug[len("подарък/") :]
+    return f"{PUBLIC_SITE_BASE_URL}/подарък/{slug}/"
+
+
+def _provider_name(value: Any) -> str | None:
+    if isinstance(value, dict):
+        return value.get("name") or value.get("title")
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _first_image(item: dict[str, Any]) -> str | None:
+    for key in ("image", "thumbnail", "cover"):
+        value = item.get(key)
+        if isinstance(value, str) and value:
+            return value
+    gallery = item.get("gallery") or item.get("images")
+    if isinstance(gallery, list) and gallery:
+        first = gallery[0]
+        if isinstance(first, dict):
+            return first.get("src") or first.get("url")
+        if isinstance(first, str):
+            return first
+    return None
+
+
+def _compact_gallery(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    gallery: list[dict[str, str]] = []
+    for item in value[:4]:
+        if isinstance(item, dict):
+            src = item.get("src") or item.get("url")
+            if src:
+                gallery.append({"src": str(src), "alt": str(item.get("alt") or "")[:160]})
+        elif isinstance(item, str):
+            gallery.append({"src": item, "alt": ""})
+    return gallery
+
+
+def _compact_text_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [_truncate_text(item, 260) for item in value[:MAX_DETAIL_LIST_ITEMS] if item]
+
+
+def _compact_locations(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    locations: list[dict[str, Any]] = []
+    for item in value[:MAX_DETAIL_LIST_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        coordinates = item.get("coordinates") if isinstance(item.get("coordinates"), dict) else {}
+        locations.append(
+            {
+                "name": item.get("name"),
+                "lat": coordinates.get("lat"),
+                "lng": coordinates.get("lng"),
+            }
+        )
+    return locations
+
+
+def _compact_configurator(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    additions = value.get("additions") if isinstance(value.get("additions"), list) else []
+    options: list[dict[str, Any]] = []
+    for addition in additions:
+        if not isinstance(addition, dict):
+            continue
+        for option in addition.get("options") or []:
+            if not isinstance(option, dict):
+                continue
+            price_bgn = option.get("price")
+            options.append(
+                {
+                    "label": _truncate_text(option.get("label") or option.get("labelVoucher"), 220),
+                    "price_bgn": _money_decimal_string(price_bgn),
+                    "price_eur": _money_bgn_to_eur(price_bgn),
+                }
+            )
+            if len(options) >= MAX_CONFIGURATOR_OPTIONS:
+                break
+        if len(options) >= MAX_CONFIGURATOR_OPTIONS:
+            break
+    return {
+        "name": value.get("name"),
+        "voucher_name": value.get("nameVoucher"),
+        "validity": value.get("validity"),
+        "base_price_bgn": _money_decimal_string(value.get("price")),
+        "base_price_eur": _money_bgn_to_eur(value.get("price")),
+        "options": options,
+    }
+
+
+def _truncate_text(value: Any, limit: int = MAX_TEXT_FIELD_LENGTH) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _boolish(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "да"}
+    return bool(value)
 
 
 def _validate_iso_date(value: str) -> None:
