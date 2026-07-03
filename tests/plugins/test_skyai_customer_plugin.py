@@ -193,6 +193,8 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     campaign = result["active_campaigns"][0]
     assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]
+    assert campaign["bonus_product"]["product_id"] == 95435
+    assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
     assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
 
 

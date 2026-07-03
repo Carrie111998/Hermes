@@ -144,6 +144,13 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "skyai-v2-canary-conversation-id" in html
 
 
+def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+
+    assert "bonus_product.product_id" in prompt
+    assert "skyai_product_slots" in prompt
+
+
 def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> None:
     seen = {}
 
