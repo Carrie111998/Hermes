@@ -1,5 +1,6 @@
 """Tests for tools/tool_approval.py — blocking per-call approval for WRITE tools."""
 
+import json
 import threading
 
 import pytest
@@ -105,6 +106,9 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert "not performed" in result.lower()
+        # Machine-readable status: an explicit deny is NOT turn-ending — the
+        # agent continues and reports the denial inline.
+        assert json.loads(result)["status"] == "approval_denied"
 
     def test_should_remember_a_session_grant_so_the_next_call_doesnt_prompt(self):
         register_tool_approval_notify(SESSION, _resolving_notify("session"))
@@ -126,12 +130,30 @@ class TestMaybeRequireToolApproval:
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
         assert "approval" in result.lower()
+        # No surface at all → NOT the turn-ending status: interrupting a
+        # headless run on its first gated write would be wrong (there was
+        # never anyone who could have answered in time).
+        assert json.loads(result)["status"] != "approval_no_response"
 
     def test_should_fail_closed_on_timeout(self, monkeypatch):
         monkeypatch.setenv("OMNIO_TOOL_APPROVAL_TIMEOUT", "0")
         register_tool_approval_notify(SESSION, lambda event: None)  # never resolves
         result = maybe_require_tool_approval(GATED, "call-1")
         assert result is not None
+        # A genuine timeout with a real interactive surface IS turn-ending.
+        assert json.loads(result)["status"] == "approval_no_response"
+
+    def test_notify_raising_is_a_plumbing_error_not_a_user_timeout(self):
+        # The notify callback raising means the card was never actually shown
+        # (chat stream write failed etc.) — the user may still be present, so
+        # this must NOT look like a genuine no-response timeout.
+        def raising_notify(event):
+            raise RuntimeError("stream write failed")
+
+        register_tool_approval_notify(SESSION, raising_notify)
+        result = maybe_require_tool_approval(GATED, "call-1")
+        assert result is not None
+        assert json.loads(result)["status"] == "approval_error"
 
     def test_should_surface_the_interaction_with_options_and_scopes(self):
         captured = {}
@@ -154,7 +176,9 @@ class TestAlwaysScope:
     current chat) and survives clear_session — it resets only on gateway restart."""
 
     def test_should_record_an_always_grant(self):
-        assert resolve_tool_approval(SESSION, GATED, "always") is True
+        # No waiter pending here, so the call itself returns False (nothing
+        # released) even though the always grant is recorded for next time.
+        assert resolve_tool_approval(SESSION, GATED, "always") is False
         assert is_always_approved(GATED) is True
 
     def test_always_is_not_a_session_grant(self):
@@ -183,9 +207,26 @@ class TestResolveToolApproval:
         assert resolve_tool_approval(SESSION, GATED, "forever") is False
 
     def test_should_record_a_session_grant_even_with_no_pending_wait(self):
-        # Resolve arriving before the guard blocked still records the grant.
-        assert resolve_tool_approval(SESSION, GATED, "session") is True
+        # Resolve arriving before the guard blocked (or after it timed out)
+        # still records the grant for the NEXT call — but returns False since
+        # no waiter was actually released for THIS decision.
+        assert resolve_tool_approval(SESSION, GATED, "session") is False
         assert is_tool_approved(SESSION, GATED) is True
+
+    def test_no_waiter_once_records_nothing_and_returns_false(self):
+        assert resolve_tool_approval(SESSION, GATED, "once") is False
+        assert is_tool_approved(SESSION, GATED) is False
+        assert is_always_approved(GATED) is False
+
+    def test_no_waiter_session_records_grant_but_returns_false(self):
+        assert resolve_tool_approval(SESSION, GATED, "session") is False
+        assert is_tool_approved(SESSION, GATED) is True
+
+    def test_waiter_present_once_returns_true(self):
+        entry = _ApprovalWait(GATED, "call-A")
+        _waits[SESSION] = [entry]
+        assert resolve_tool_approval(SESSION, GATED, "once", "call-A") is True
+        assert entry.result == "once" and entry.event.is_set()
 
     def test_should_scope_grants_per_session(self):
         resolve_tool_approval(SESSION, GATED, "session")
@@ -287,6 +328,9 @@ class TestFailClosedDenial:
         result = fail_closed_denial(GATED)
         assert result is not None
         assert "approval" in result.lower()
+        # A guard-error path: the user may well be present, so this must NOT
+        # be the turn-ending status — the agent continues and reports it.
+        assert json.loads(result)["status"] != "approval_no_response"
 
     def test_should_allow_an_ungated_read(self):
         assert fail_closed_denial(READ) is None
@@ -296,7 +340,9 @@ class TestFailClosedDenial:
             raise RuntimeError("cannot classify")
 
         monkeypatch.setattr(tool_approval, "is_gated_tool", boom)
-        assert fail_closed_denial(GATED) is not None
+        result = fail_closed_denial(GATED)
+        assert result is not None
+        assert json.loads(result)["status"] != "approval_no_response"
 
 
 class TestClearSession:

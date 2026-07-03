@@ -2322,13 +2322,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
+                from tools.tool_approval import CONNECTORS_TOOL_PREFIX
                 _started_tool_call_ids.discard(tool_call_id)
                 completed = {
                     "tool": function_name,
                     "toolCallId": tool_call_id,
                     "status": "completed",
                 }
-                # request_user_input returns one of two result shapes; the plugin
+                # request_user_input returns one of three result shapes; the plugin
                 # owns which, and we honor it here:
                 #  - status "answered": the worker blocked and the user's answer IS
                 #    the result. Surface it on the completed event under
@@ -2340,15 +2341,47 @@ class APIServerAdapter(BasePlatformAdapter):
                 #    offer, killswitch fallback, or no surface) — end the turn now
                 #    (legacy behavior; the loop returns finish_reason="stop") so the
                 #    user's answer, if any, is the next turn.
+                #  - status "no_response": the blocking wait ended without an answer
+                #    (timed out, or the wait was released by a stop/disconnect). Also
+                #    turn-ending: the card stays open in the chat, and the user's late
+                #    answer becomes the next turn's user message rather than a stale
+                #    inline result. No no-surface carve-out is needed here (unlike the
+                #    approval gate's approval_error): this closure is only wired as the
+                #    tool_complete_callback for this interactive chat handler, so a
+                #    headless /v1/runs task's request_user_input calls never reach it.
                 turn_ending = False
+                interrupt_message = "awaiting user interaction (request_user_input)"
                 if function_name == "request_user_input":
                     try:
                         parsed = json.loads(function_result or "{}")
                     except Exception:
                         parsed = {}
-                    if parsed.get("status") == "answered":
+                    # A JSON-valid but non-dict result (e.g. the tool somehow
+                    # returned a bare string/array) has no `.get` shape to read —
+                    # guard it the same way the connector-approval branch below
+                    # does, rather than letting a malformed result raise here.
+                    if isinstance(parsed, dict) and parsed.get("status") == "answered":
                         completed["interaction"] = {"answered": parsed.get("response", "")}
-                    turn_ending = parsed.get("status") == "presented"
+                    turn_ending = isinstance(parsed, dict) and parsed.get("status") in (
+                        "presented",
+                        "no_response",
+                    )
+                # Connector write-approval gate (tools/tool_approval.py): the wait
+                # for the approval card ended unresolved (timeout, or an
+                # interrupt/stop releasing the waiter) while a real approval
+                # surface was registered. Like request_user_input's "no_response"
+                # above, this ends the turn, so a late decision lands as the next
+                # turn rather than trying to resume a call the agent has moved on
+                # from. An explicit deny is NOT turn-ending — that's today's
+                # inline denial-and-continue behavior, unchanged.
+                elif function_name.startswith(CONNECTORS_TOOL_PREFIX):
+                    try:
+                        parsed = json.loads(function_result or "{}")
+                    except Exception:
+                        parsed = {}
+                    if isinstance(parsed, dict) and parsed.get("status") == "approval_no_response":
+                        turn_ending = True
+                        interrupt_message = "awaiting user approval (tool approval timed out)"
                 # Omnia task-list tracker: the `todo` tool returns the full current
                 # list ({"todos": [{id, content, status}], "summary": {...}}) on every
                 # call. Forward the `todos` array on the completed event so the Omnia
@@ -2368,9 +2401,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 _stream_q.put(("__tool_progress__", completed))
                 if turn_ending and agent_ref[0] is not None:
                     try:
-                        agent_ref[0].interrupt("awaiting user interaction (request_user_input)")
+                        agent_ref[0].interrupt(interrupt_message)
                     except Exception:
-                        pass
+                        # The UI already shows a hard "timed out" / "expired"
+                        # state for this card (request_user_input no_response,
+                        # or a connector-approval timeout) — if the interrupt
+                        # itself fails, the agent keeps running underneath that
+                        # UI with nothing telling us. Log loudly so this isn't
+                        # silent; don't re-raise, the tool-complete event must
+                        # still ship.
+                        logger.warning(
+                            "[api_server] failed to interrupt agent for turn-ending "
+                            "tool completion (tool_call_id=%s, function_name=%s)",
+                            tool_call_id,
+                            function_name,
+                            exc_info=True,
+                        )
 
             def _on_tool_progress(event_type, name=None, preview=None, args=None, **kwargs):
                 """Forward SUBAGENT activity so a ``delegate_task`` batch isn't silent.
@@ -4811,6 +4857,13 @@ class APIServerAdapter(BasePlatformAdapter):
         head — which is what keeps two writes pending in one turn from
         cross-talking. A `session`-scope decision is also remembered so later
         calls of the same tool skip the prompt.
+
+        The response's ``recorded`` field is True only when a blocked waiter
+        was actually released by this call — i.e. the write is still live and
+        will proceed/deny per ``choice``. False means the wait already ended
+        (timed out, or the turn moved on) before this decision arrived: the
+        card in the UI is stale and the write did not run, even for a
+        `session`/`always` scope that still got persisted for next time.
         """
         auth_err = self._check_auth(request)
         if auth_err:
