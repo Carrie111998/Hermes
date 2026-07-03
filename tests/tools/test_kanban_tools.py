@@ -56,7 +56,8 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_request_review", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
@@ -137,7 +138,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_block",
+        "kanban_request_review", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
@@ -741,6 +743,57 @@ def test_block_rejects_empty_reason(worker_env):
     for bad in ["", "   ", None]:
         out = kt._handle_block({"reason": bad})
         assert json.loads(out).get("error")
+
+
+def test_request_review_happy_path(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_request_review({"summary": "impl done + tests green"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "review"
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "review"
+    finally:
+        conn.close()
+
+
+def test_request_review_rejects_empty_summary(worker_env):
+    from tools import kanban_tools as kt
+    for bad in ["", "   ", None]:
+        out = kt._handle_request_review({"summary": bad})
+        assert json.loads(out).get("error")
+    # Task must not have moved on a rejected call.
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_worker_request_review_rejects_foreign_task_id(worker_env):
+    """A worker cannot request review on a task that isn't its own (#19534)."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="sibling")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_request_review({"task_id": other, "summary": "evil"})
+    d = json.loads(out)
+    assert "refusing to mutate" in d.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, other).status == "ready"
+    finally:
+        conn.close()
 
 
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):
@@ -1785,7 +1838,9 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     details (workspace kinds, deliverable artifacts, created-card claims,
     profile discovery) when the standalone kanban-worker / kanban-orchestrator
     skills were removed and folded into this always-injected guidance, so the
-    ceiling is sized to fit that content with a little headroom.
+    ceiling is sized to fit that content with a little headroom. The
+    first-class review hand-off guidance (kanban_request_review) was later
+    folded in too, so the ceiling accounts for it.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -1795,7 +1850,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
