@@ -4,8 +4,9 @@
 # Netlify via CLI (installé dans l'image), auth NETLIFY_AUTH_TOKEN.
 # Les ${VAR} sont interpolées depuis l'environnement du process (injecté par Railway).
 
+# Modèle par défaut : Z.AI GLM 5.2 (via OpenRouter, OPENROUTER_API_KEY).
 model:
-  default: "qwen/qwen3.6-plus"
+  default: "z-ai/glm-5.2"
   provider: "openrouter"
 
 terminal:
