@@ -4,9 +4,11 @@
 # injected by Railway and loaded from the container's .env file.
 
 model:
-  # Orchestrateur (profil défaut) : GLM 5.2 — suit mieux les consignes de routage
-  # que Qwen 3.6 (qui faisait le travail lui-même au lieu de créer une carte Kanban).
-  default: "z-ai/glm-5.2"
+  # Orchestrateur (profil défaut) : Claude Haiku 4.5 — modèle frontier discipliné en
+  # tool-calling (route via kanban_create, réponses courtes). GLM 5.2 fumblait (appelait
+  # kanban_show au lieu de kanban_create, ou générait le contenu en texte → tronqué) ;
+  # Qwen faisait le travail lui-même. Via OpenRouter (OPENROUTER_API_KEY).
+  default: "anthropic/claude-haiku-4.5"
   provider: "openrouter"
 
 gateway:
