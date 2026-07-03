@@ -84,3 +84,32 @@ def test_env_loader_does_not_split_concatenated_text():
         assert parsed_token == f"{token}ANTHROPIC_API_KEY=sk-ant-test"
     finally:
         env_path.unlink(missing_ok=True)
+
+
+def test_env_loader_warns_when_repair_write_fails(capsys):
+    """A failed .env repair (e.g. Windows file lock during atomic_replace)
+    must warn on stderr instead of silently leaving the corrupted file for
+    python-dotenv to mis-parse — the exact failure mode of #8908."""
+    from hermes_cli import env_loader
+
+    corrupted = "TELEGRAM_BOT_TOKEN=0123456789:testANTHROPIC_API_KEY=sk-ant\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".env", delete=False, encoding="utf-8"
+    ) as f:
+        f.write(corrupted)
+        env_path = Path(f.name)
+
+    def _locked_replace(src, dst):
+        raise PermissionError("[WinError 32] file is in use")
+
+    try:
+        with patch.object(env_loader, "atomic_replace", _locked_replace):
+            env_loader._sanitize_env_file_if_needed(env_path)
+
+        err = capsys.readouterr().err
+        assert "hermes env:" in err
+        assert str(env_path) in err
+        # File must be left as-is (repair failed, nothing destroyed)
+        assert Path(env_path).read_text(encoding="utf-8") == corrupted
+    finally:
+        env_path.unlink(missing_ok=True)
