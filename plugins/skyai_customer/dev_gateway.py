@@ -22,6 +22,8 @@ from typing import Any, Awaitable, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from plugins.skyai_customer import public_tools
+
 try:
     from aiohttp import web
 
@@ -42,8 +44,21 @@ MAX_HISTORY_TURNS = 12
 DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 DISCORD_MESSAGE_LIMIT = 1900
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
+SKYVISION_PRODUCT_URL_RE = re.compile(
+    r"https://(?:www\.)?skyvision\.bg/[^\s<>\]\)\"']+",
+    re.IGNORECASE,
+)
+NON_PRODUCT_PATH_PREFIXES = frozenset(
+    {
+        "booknow",
+        "campaign/",
+        "контакти",
+        "общи-условия",
+        "уведомление-за-обработване-на-лични-д",
+    }
+)
 
-AgentRunner = Callable[[str, list[dict[str, str]], str, "CanarySettings"], Awaitable[str]]
+AgentRunner = Callable[[str, list[dict[str, str]], str, "CanarySettings"], Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -465,7 +480,9 @@ async def build_chat_response(
     history = extract_history(payload)
     conversation_id = conversation_id_from_payload(payload)
     started = time.monotonic()
-    reply = await agent_runner(message, history, conversation_id, settings)
+    runner_result = await agent_runner(message, history, conversation_id, settings)
+    reply, runner_cards = _coerce_runner_result(runner_result)
+    cards = runner_cards or await asyncio.to_thread(build_cards_from_reply, reply)
     latency_ms = int((time.monotonic() - started) * 1000)
 
     return {
@@ -473,7 +490,7 @@ async def build_chat_response(
         "version": settings.version,
         "conversation_id": conversation_id,
         "reply": reply,
-        "cards": [],
+        "cards": cards,
         "trace": {
             "runtime": "hermes_agent",
             "profile_home": str(settings.profile_home),
@@ -483,6 +500,111 @@ async def build_chat_response(
             "latency_ms": latency_ms,
         },
     }
+
+
+def _coerce_runner_result(result: Any) -> tuple[str, list[dict[str, Any]]]:
+    if isinstance(result, dict):
+        reply = str(
+            result.get("reply")
+            or result.get("final_response")
+            or result.get("content")
+            or result.get("message")
+            or ""
+        ).strip()
+        return reply, _normalize_cards(result.get("cards"))
+    return str(result or "").strip(), []
+
+
+def build_cards_from_reply(reply: str, *, limit: int = 4) -> list[dict[str, Any]]:
+    cards: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for url in _extract_product_urls(reply):
+        if url in seen:
+            continue
+        seen.add(url)
+        card = _card_from_product_url(url)
+        if card:
+            cards.append(card)
+        if len(cards) >= limit:
+            break
+    return cards
+
+
+def _extract_product_urls(reply: str) -> list[str]:
+    if not isinstance(reply, str) or not reply:
+        return []
+    urls: list[str] = []
+    for match in SKYVISION_PRODUCT_URL_RE.finditer(reply):
+        url = _clean_extracted_url(match.group(0))
+        if _is_public_product_url(url):
+            urls.append(url)
+    return urls
+
+
+def _clean_extracted_url(url: str) -> str:
+    return url.rstrip(".,;:!?)]}»”'\"")
+
+
+def _is_public_product_url(url: str) -> bool:
+    path = public_tools.normalize_product_path(product_url=url)
+    if not path or "/" not in path:
+        return False
+    lowered = path.lower()
+    return not any(lowered.startswith(prefix) for prefix in NON_PRODUCT_PATH_PREFIXES)
+
+
+def _card_from_product_url(url: str) -> dict[str, Any]:
+    try:
+        result = public_tools.handle_skyai_product_detail(product_url=url)
+    except Exception:
+        return _normalize_card({"public_url": url})
+    if result.get("status") != "ok" or not isinstance(result.get("detail"), dict):
+        return _normalize_card({"public_url": url})
+    return _normalize_card(result["detail"])
+
+
+def _normalize_cards(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        card = _normalize_card(item)
+        if card:
+            normalized.append(card)
+    return normalized
+
+
+def _normalize_card(card: dict[str, Any]) -> dict[str, Any]:
+    title = card.get("title") or card.get("name")
+    public_url = card.get("public_url") or card.get("url") or card.get("href") or card.get("link")
+    image = card.get("image") or card.get("image_url") or card.get("thumbnail") or card.get("cover")
+    if not image and isinstance(card.get("images"), list) and card["images"]:
+        first = card["images"][0]
+        if isinstance(first, dict):
+            image = first.get("src") or first.get("url")
+        elif isinstance(first, str):
+            image = first
+    normalized = {
+        "title": _clean_card_text(title),
+        "public_url": str(public_url).strip() if public_url else None,
+        "price_eur": _clean_card_text(card.get("price_eur") or card.get("priceEur")),
+        "price_bgn": _clean_card_text(card.get("price_bgn") or card.get("priceBgn")),
+        "price_text": _clean_card_text(card.get("price") or card.get("price_text")),
+        "location": _clean_card_text(card.get("location")),
+        "location_area": _clean_card_text(card.get("location_area") or card.get("locationArea")),
+        "duration": _clean_card_text(card.get("duration")),
+        "image": str(image).strip() if image else None,
+    }
+    return {key: value for key, value in normalized.items() if value not in ("", None)}
+
+
+def _clean_card_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    return text[:260] if text else None
 
 
 def _authorize(request: "web.Request", settings: CanarySettings) -> bool:
@@ -668,6 +790,10 @@ async def build_compare_response(
         "question": extract_message(payload),
         "dev_v2": _compact_compare_side(dev_response),
         "prod_current": _compact_compare_side(prod_response),
+        "cards_compare": _compare_card_sets(
+            dev_response.get("cards"),
+            prod_response.get("cards"),
+        ),
     }
 
 
@@ -696,11 +822,13 @@ def _call_prod_skyai(payload: dict[str, Any], settings: CanarySettings) -> dict[
 
 def _compact_compare_side(response: dict[str, Any]) -> dict[str, Any]:
     trace = response.get("trace") if isinstance(response.get("trace"), dict) else {}
+    cards = _normalize_cards(response.get("cards"))
     return {
         "status": response.get("status"),
         "version": response.get("version"),
         "reply": response.get("reply") or response.get("reason") or response.get("error"),
-        "cards_count": len(response.get("cards") or []) if isinstance(response.get("cards"), list) else 0,
+        "cards_count": len(cards),
+        "cards": cards,
         "trace": {
             key: trace.get(key)
             for key in (
@@ -715,6 +843,42 @@ def _compact_compare_side(response: dict[str, Any]) -> dict[str, Any]:
             if key in trace
         },
     }
+
+
+def _compare_card_sets(dev_cards_raw: Any, prod_cards_raw: Any) -> dict[str, Any]:
+    dev_cards = _normalize_cards(dev_cards_raw)
+    prod_cards = _normalize_cards(prod_cards_raw)
+    dev_urls = {_canonical_card_url(card) for card in dev_cards if _canonical_card_url(card)}
+    prod_urls = {_canonical_card_url(card) for card in prod_cards if _canonical_card_url(card)}
+    dev_titles = {_canonical_card_title(card) for card in dev_cards if _canonical_card_title(card)}
+    prod_titles = {_canonical_card_title(card) for card in prod_cards if _canonical_card_title(card)}
+    return {
+        "dev_count": len(dev_cards),
+        "prod_count": len(prod_cards),
+        "shared_urls": sorted(dev_urls & prod_urls),
+        "only_dev_urls": sorted(dev_urls - prod_urls),
+        "only_prod_urls": sorted(prod_urls - dev_urls),
+        "shared_titles": sorted(dev_titles & prod_titles),
+        "only_dev_titles": sorted(dev_titles - prod_titles),
+        "only_prod_titles": sorted(prod_titles - dev_titles),
+        "dev_missing_price_count": _missing_field_count(dev_cards, ("price_eur", "price_text")),
+        "prod_missing_price_count": _missing_field_count(prod_cards, ("price_eur", "price_text")),
+        "dev_missing_image_count": _missing_field_count(dev_cards, ("image",)),
+        "prod_missing_image_count": _missing_field_count(prod_cards, ("image",)),
+    }
+
+
+def _canonical_card_url(card: dict[str, Any]) -> str:
+    value = str(card.get("public_url") or "").strip()
+    return value.rstrip("/")
+
+
+def _canonical_card_title(card: dict[str, Any]) -> str:
+    return str(card.get("title") or "").strip().casefold()
+
+
+def _missing_field_count(cards: list[dict[str, Any]], fields: tuple[str, ...]) -> int:
+    return sum(1 for card in cards if not any(card.get(field) for field in fields))
 
 
 def create_app(

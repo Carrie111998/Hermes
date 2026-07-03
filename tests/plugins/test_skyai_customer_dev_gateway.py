@@ -144,6 +144,43 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "skyai-v2-canary-conversation-id" in html
 
 
+def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> None:
+    seen = {}
+
+    def fake_detail(product_url="", product_path=""):
+        seen["product_url"] = product_url
+        return {
+            "status": "ok",
+            "detail": {
+                "title": "Полет с жирокоптер MTO-Sport",
+                "public_url": "https://skyvision.bg/подарък/полет-с-жирокоптер/полет-с-жирокоптер-mto-sport/",
+                "price_eur": "101.75",
+                "price_bgn": "199.00",
+                "location": "Приморско",
+                "images": [{"src": "https://cdn.example/gyro.jpg"}],
+            },
+        }
+
+    monkeypatch.setattr(dev_gateway.public_tools, "handle_skyai_product_detail", fake_detail)
+
+    cards = dev_gateway.build_cards_from_reply(
+        "Виж [този полет](https://skyvision.bg/подарък/полет-с-жирокоптер/полет-с-жирокоптер-mto-sport/). "
+        "Кампанията е тук: https://skyvision.bg/campaign/free-panoramic-flight/"
+    )
+
+    assert seen["product_url"].startswith("https://skyvision.bg/подарък/полет-с-жирокоптер/")
+    assert cards == [
+        {
+            "title": "Полет с жирокоптер MTO-Sport",
+            "public_url": "https://skyvision.bg/подарък/полет-с-жирокоптер/полет-с-жирокоптер-mto-sport/",
+            "price_eur": "101.75",
+            "price_bgn": "199.00",
+            "location": "Приморско",
+            "image": "https://cdn.example/gyro.jpg",
+        }
+    ]
+
+
 def test_resolve_profile_runtime_reads_model_dict() -> None:
     runtime = dev_gateway._resolve_profile_runtime(
         {
@@ -263,6 +300,69 @@ async def test_build_compare_response_runs_dev_and_prod_sides(tmp_path: Path) ->
     assert response["dev_v2"]["reply"] == "DEV: Има ли масаж?"
     assert response["prod_current"]["reply"] == "PROD: Има ли масаж?"
     assert response["prod_current"]["cards_count"] == 1
+    assert response["cards_compare"]["prod_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_compare_response_compares_card_links_prices_and_images(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fake_detail(product_url="", product_path=""):
+        return {
+            "status": "ok",
+            "detail": {
+                "title": "Масаж за двама",
+                "public_url": "https://skyvision.bg/подарък/масаж/масаж-за-двама/",
+                "price_eur": "90.00",
+                "location": "София",
+                "images": [{"src": "https://cdn.example/massage.jpg"}],
+            },
+        }
+
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        return "Бих предложил https://skyvision.bg/подарък/масаж/масаж-за-двама/"
+
+    def fake_prod_caller(payload, canary_settings):
+        return {
+            "status": "ok",
+            "version": "prod-v",
+            "reply": "PROD reply",
+            "cards": [
+                {
+                    "title": "Масаж за двама",
+                    "url": "https://skyvision.bg/подарък/масаж/масаж-за-двама/",
+                    "price_eur": "90.00",
+                    "image_url": "https://cdn.example/massage.jpg",
+                }
+            ],
+            "trace": {"model": "gpt-5.5"},
+        }
+
+    monkeypatch.setattr(dev_gateway.public_tools, "handle_skyai_product_detail", fake_detail)
+
+    response = await dev_gateway.build_compare_response(
+        {"conversation_id": "c1", "message": "Има ли масаж?"},
+        settings(tmp_path, compare_prod_base_url="https://prod.example"),
+        agent_runner=fake_runner,
+        prod_caller=fake_prod_caller,
+    )
+
+    assert response["dev_v2"]["cards"] == [
+        {
+            "title": "Масаж за двама",
+            "public_url": "https://skyvision.bg/подарък/масаж/масаж-за-двама/",
+            "price_eur": "90.00",
+            "location": "София",
+            "image": "https://cdn.example/massage.jpg",
+        }
+    ]
+    assert response["cards_compare"]["shared_urls"] == [
+        "https://skyvision.bg/подарък/масаж/масаж-за-двама"
+    ]
+    assert response["cards_compare"]["shared_titles"] == ["масаж за двама"]
+    assert response["cards_compare"]["dev_missing_price_count"] == 0
+    assert response["cards_compare"]["prod_missing_image_count"] == 0
 
 
 @pytest.mark.asyncio
