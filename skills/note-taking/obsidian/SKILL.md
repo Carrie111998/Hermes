@@ -59,3 +59,23 @@ Use `patch` for focused note changes when the current content gives you stable c
 ## Wikilinks
 
 Obsidian links notes with `[[Note Name]]` syntax. When creating notes, use these to link related content.
+
+## Railway deployment — GitHub PAT for vault sync
+
+The vault lives in a private GitHub repo. On Railway, the agent needs a Personal Access Token to clone/pull/push.
+
+**1. Add the token as a Railway env var:**
+
+- Variable name: `GITHUB_PAT` (or `GH_TOKEN`)
+- Value: `github_pat_...` (the full token)
+
+**2. Configure git credentials at container startup.** Either copy the token into `~/.hermes/.env`, or set up a git credential helper directly. Example entrypoint snippet:
+
+```bash
+if [ -n "$GITHUB_PAT" ]; then
+  git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=$GITHUB_PAT"; }; f'
+  export GITHUB_TOKEN=$GITHUB_PAT
+fi
+```
+
+This way every fresh Railway deployment has git access to the vault without manual intervention.

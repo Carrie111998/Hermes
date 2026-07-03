@@ -80,10 +80,14 @@ def _stored_token_scopes() -> list[str]:
 
 
 def _gws_binary() -> str | None:
-    override = os.getenv("HERMES_GWS_BIN")
-    if override:
-        return override
-    return shutil.which("gws")
+    # The gws CLI (Rust) only accepts authorized_user-format credentials with a
+    # "type" field. Hermes' google_token.json (and the entrypoint's bridged
+    # gws-config/credentials.json) do not carry that field, so gws fails with
+    # "Failed to parse authorized user credentials: missing field `type`".
+    # Default to the Python google-api-client path (get_credentials +
+    # from_authorized_user_file), which works with the Hermes token format.
+    # Only route through gws when explicitly opted in via HERMES_GWS_BIN.
+    return os.getenv("HERMES_GWS_BIN")
 
 
 def _gws_env() -> dict[str, str]:

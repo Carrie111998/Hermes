@@ -1,7 +1,7 @@
 ---
 name: ocr-and-documents
-description: "Extract text from PDFs/scans (pymupdf, marker-pdf)."
-version: 2.3.0
+description: "Extract text from PDFs/scans (pymupdf, tesseract, marker-pdf)."
+version: 2.4.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -32,27 +32,36 @@ Only use local extraction when: the file is local, web_extract fails, or you nee
 
 ## Step 2: Choose Local Extractor
 
-| Feature | pymupdf (~25MB) | marker-pdf (~3-5GB) |
-|---------|-----------------|---------------------|
-| **Text-based PDF** | ✅ | ✅ |
-| **Scanned PDF (OCR)** | ❌ | ✅ (90+ languages) |
-| **Tables** | ✅ (basic) | ✅ (high accuracy) |
-| **Equations / LaTeX** | ❌ | ✅ |
-| **Code blocks** | ❌ | ✅ |
-| **Forms** | ❌ | ✅ |
-| **Headers/footers removal** | ❌ | ✅ |
-| **Reading order detection** | ❌ | ✅ |
-| **Images extraction** | ✅ (embedded) | ✅ (with context) |
-| **Images → text (OCR)** | ❌ | ✅ |
-| **EPUB** | ✅ | ✅ |
-| **Markdown output** | ✅ (via pymupdf4llm) | ✅ (native, higher quality) |
-| **Install size** | ~25MB | ~3-5GB (PyTorch + models) |
-| **Speed** | Instant | ~1-14s/page (CPU), ~0.2s/page (GPU) |
+| Feature | pymupdf (~25MB) | tesseract (~150MB) | marker-pdf (~3-5GB) |
+|---------|-----------------|--------------------|---------------------|
+| **Text-based PDF** | ✅ | ✅ (overkill) | ✅ |
+| **Scanned PDF (OCR)** | ❌ | ✅ | ✅ (90+ languages) |
+| **Images → text (OCR)** | ❌ | ✅ | ✅ |
+| **Tables** | ✅ (basic) | ❌ | ✅ (high accuracy) |
+| **Equations / LaTeX** | ❌ | ❌ | ✅ |
+| **Forms** | ❌ | ❌ | ✅ |
+| **Reading order / layout** | ❌ | ❌ (line-by-line) | ✅ |
+| **Images extraction** | ✅ (embedded) | ❌ | ✅ (with context) |
+| **EPUB** | ✅ | ❌ | ✅ |
+| **Markdown output** | ✅ (via pymupdf4llm) | ❌ (plain text) | ✅ (native, higher quality) |
+| **Install size** | ~25MB | ~150MB | ~3-5GB (PyTorch + models) |
+| **Speed** | Instant | ~0.5-2s/page | ~1-14s/page (CPU), ~0.2s/page (GPU) |
 
-**Decision**: Use pymupdf unless you need OCR, equations, forms, or complex layout analysis.
+**Decision ladder**:
+1. **Text-based PDF** (text is selectable) → **pymupdf**. Instant, no OCR needed.
+2. **Scanned PDF or image** (text not selectable) → **tesseract**. Lightweight OCR, no GPU.
+3. **Complex layout, equations, tables, forms, or reading-order matters** → **marker-pdf**. Only when 1–2 fall short.
+
+In the Docker/Railway image, pymupdf and tesseract (+ eng/fra language data) are
+**pre-baked** — they work immediately, no install, even as the non-root runtime
+user. marker-pdf is **not** baked (its ~5GB footprint is impractical there).
 
 If the user needs marker capabilities but the system lacks ~5GB free disk:
-> "This document needs OCR/advanced extraction (marker-pdf), which requires ~5GB for PyTorch and models. Your system has [X]GB free. Options: free up space, provide a URL so I can use web_extract, or I can try pymupdf which works for text-based PDFs but not scanned documents or equations."
+> "This document needs ML-grade extraction (marker-pdf), which requires ~5GB for PyTorch and models. Your system has [X]GB free. Options: free up space, provide a URL so I can use web_extract, or I can try tesseract (lightweight OCR — handles scans/images but not equations or complex tables)."
+
+**Never** `apt-get install tesseract` at runtime — the agent runs as a non-root
+user, so it fails. tesseract is baked into the image; if it is genuinely missing
+in some other environment, add it to the Dockerfile apt layer and rebuild.
 
 ---
 
@@ -81,6 +90,33 @@ for page in doc:
     print(page.get_text())
 "
 ```
+
+---
+
+## tesseract (lightweight OCR)
+
+For scanned PDFs and images. Pre-baked in the Docker image (engine + `eng`/`fra`
+language data + poppler); the Python wrappers (`pytesseract`, `pillow`,
+`pdf2image`) are baked too. On other systems install with:
+
+```bash
+# system engine (needs root) + python wrappers
+apt-get install -y tesseract-ocr tesseract-ocr-fra poppler-utils   # Debian/Ubuntu
+pip install pytesseract pillow pdf2image
+```
+
+**Via helper script**:
+```bash
+python scripts/extract_tesseract.py scan.png                 # OCR an image
+python scripts/extract_tesseract.py scan.pdf                 # OCR a scanned PDF
+python scripts/extract_tesseract.py scan.pdf --lang fra      # French (default: eng)
+python scripts/extract_tesseract.py scan.pdf --lang eng+fra  # multiple languages
+python scripts/extract_tesseract.py scan.pdf --pages 0-4     # specific pages
+python scripts/extract_tesseract.py scan.png --dpi 300       # PDF raster DPI
+```
+
+Run `tesseract --list-langs` to see installed languages. To add one, append the
+matching `tesseract-ocr-<lang>` package to the Dockerfile apt layer and rebuild.
 
 ---
 
@@ -165,7 +201,8 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 
 - `web_extract` is always first choice for URLs
 - pymupdf is the safe default — instant, no models, works everywhere
-- marker-pdf is for OCR, scanned docs, equations, complex layouts — install only when needed
+- tesseract is the lightweight OCR for scans/images — baked into the Docker image, no runtime install
+- marker-pdf is for equations, complex layouts, high-accuracy tables — install only when needed
 - Both helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use
 - For Word docs: `pip install python-docx` (better than OCR — parses actual structure)
