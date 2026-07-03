@@ -284,5 +284,40 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
 
 
+def test_print_tui_exit_summary_includes_resume_and_token_totals(monkeypatch, capsys):
+    import hermes_cli.main as main_mod
+
+    class _FakeDB:
+        def get_session(self, session_id):
+            assert session_id == "20260409_000001_abc123"
+            return {
+                "message_count": 2,
+                "input_tokens": 10,
+                "output_tokens": 6,
+                "cache_read_tokens": 2,
+                "cache_write_tokens": 2,
+                "reasoning_tokens": 1,
+            }
+
+        def get_session_title(self, _session_id):
+            return "demo title"
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules, "hermes_state", types.SimpleNamespace(SessionDB=lambda: _FakeDB())
+    )
+
+    main_mod._print_tui_exit_summary("20260409_000001_abc123")
+    out = capsys.readouterr().out
+
+    assert "Resume this session with:" in out
+    assert "hermes --tui --resume 20260409_000001_abc123" in out
+    assert 'hermes --tui -c "demo title"' in out
+    # Total is input + output + cache (10 + 6 + 4) = 20. reasoning_tokens (1) is
+    # a subset of output_tokens and must NOT be added again — matches
+    # CanonicalUsage.total_tokens. It is still surfaced as the breakdown value.
+    assert "Tokens:         20 (in 10, out 6, cache 4, reasoning 1)" in out
 
 
