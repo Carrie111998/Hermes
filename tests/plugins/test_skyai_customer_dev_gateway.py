@@ -158,7 +158,8 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "skyai_support_knowledge" in prompt
     assert "подаръчен ефект" in prompt
     assert "EUR е първа цена" in prompt
-    assert "2-3 различни посоки" in prompt
+    assert "максимум 3 различни посоки" in prompt
+    assert "Не добавяй четвърти конкретен продукт" in prompt
     assert "не можеш да го покажеш и като card/link" in prompt
     assert "без суха опашка с terms/URL dump" in prompt
     assert "според условията" in prompt
