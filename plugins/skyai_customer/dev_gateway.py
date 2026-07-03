@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ipaddress
 import os
 import re
 import uuid
@@ -52,6 +53,14 @@ def is_loopback_host(host: str) -> bool:
     return bool(host and host.strip().lower() in LOOPBACK_HOSTS)
 
 
+def is_private_bind_host(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host.strip())
+    except ValueError:
+        return False
+    return bool(ip.is_private and not ip.is_loopback and not ip.is_unspecified)
+
+
 def validate_settings(settings: CanarySettings) -> None:
     if not AIOHTTP_AVAILABLE:
         raise RuntimeError("aiohttp is required for the SkyAI v2 canary gateway")
@@ -60,7 +69,11 @@ def validate_settings(settings: CanarySettings) -> None:
             "SkyAI v2 canary gateway refuses non-loopback binds unless "
             "--allow-public-bind is set explicitly"
         )
-    if not is_loopback_host(settings.host) and not settings.auth_token:
+    if (
+        not is_loopback_host(settings.host)
+        and not is_private_bind_host(settings.host)
+        and not settings.auth_token
+    ):
         raise ValueError("A bearer token is required for non-loopback canary binds")
 
 

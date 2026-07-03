@@ -29,6 +29,14 @@ def test_validate_settings_requires_token_for_public_bind(tmp_path: Path) -> Non
         )
 
 
+def test_validate_settings_allows_private_bind_with_explicit_gate_without_token(
+    tmp_path: Path,
+) -> None:
+    dev_gateway.validate_settings(
+        settings(tmp_path, host="10.80.0.3", allow_public_bind=True)
+    )
+
+
 def test_extract_message_accepts_fab_style_payload() -> None:
     payload = {
         "conversation_id": "abc",
