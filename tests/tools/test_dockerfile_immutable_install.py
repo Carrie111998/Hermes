@@ -29,7 +29,14 @@ def test_dockerfile_keeps_mutable_state_under_opt_data() -> None:
 
     assert "ENV HERMES_HOME=/opt/data" in text
     assert "ENV HERMES_WRITE_SAFE_ROOT=/opt/data" in text
-    assert 'VOLUME [ "/opt/data" ]' in text
+    # Fork divergence (Railway): upstream declares VOLUME [ "/opt/data" ], but
+    # Railway rejects images that declare a VOLUME, so the bespoke Railway
+    # Dockerfile omits it and persists /opt/data via a Railway-mounted volume
+    # instead. The mount point is still created (mkdir -p /opt/data) and mutable
+    # state still lives under /opt/data — only the persistence mechanism differs.
+    # Re-asserted to the fork's reality so this contract stays green on merges.
+    assert 'VOLUME [ "/opt/data" ]' not in text
+    assert "RUN mkdir -p /opt/data" in text
 
 
 def test_dockerfile_disables_runtime_install_mutations() -> None:

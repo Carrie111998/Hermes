@@ -1,0 +1,9 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = ""
+restartPolicyType = "ALWAYS"
+restartPolicyMaxRetries = 10
+startCommand = "/opt/hermes/docker/entrypoint.sh gateway"

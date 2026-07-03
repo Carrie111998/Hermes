@@ -106,3 +106,6 @@ acp_registry/
 .gitattributes
 .hadolint.yaml
 .mailmap
+
+# Claude Code local workspace — keep out of the image build context
+.claude/

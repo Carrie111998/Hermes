@@ -1,0 +1,57 @@
+# Hermes Agent — Railway Configuration
+# Pre-configured for Discord gateway with direct Anthropic API.
+# Environment variables (ANTHROPIC_API_KEY, DISCORD_BOT_TOKEN) are
+# injected by Railway and loaded from the container's .env file.
+
+model:
+  default: "qwen/qwen3.6-plus"
+  provider: "openrouter"
+
+gateway:
+  platforms:
+    - discord
+    # - whatsapp   # EN PAUSE (2026-07-02). Réactiver = décommenter cette ligne
+    #              + WHATSAPP_ENABLED=true, idéalement sur un NUMÉRO DÉDIÉ en mode bot.
+    #              Note : la présence dans cette liste force le chargement de la
+    #              plateforme, même si WHATSAPP_ENABLED=false — d'où le commentaire ici.
+
+terminal:
+  backend: local
+
+# WhatsApp (groupes) — EN PAUSE (2026-07-02). ⚠️ Ce bloc `whatsapp:` DOIT rester
+# commenté tant que WhatsApp est en pause : sa seule présence (avec `extra`) fait
+# passer la porte d'auto-activation de gateway/config.py (is_connected → True) et
+# relance l'adaptateur + le bridge Baileys, MÊME retiré de gateway.platforms et
+# MÊME avec WHATSAPP_ENABLED=false. Pour réactiver : décommenter ce bloc + remettre
+# `- whatsapp` dans gateway.platforms + WHATSAPP_ENABLED=true, sur un NUMÉRO DÉDIÉ
+# en mode bot, et remplir group_allow_from avec les JID @g.us.
+# whatsapp:
+#   group_policy: "allowlist"
+#   group_allow_from:
+#     - "1203630XXXXXXXXXX@g.us"     # groupe "corrections web" (JID @g.us)
+#   require_mention: true
+#   mention_patterns:
+#     - "@bot"
+#     - "@hermes"
+#   free_response_chats:              # groupes dédiés où TOUT message = une demande
+#     - "1203630XXXXXXXXXX@g.us"
+#   dm_policy: "allowlist"
+#   allow_from:
+#     - "336XXXXXXXX"                 # Gilles (numéro sans +)
+
+compression:
+  enabled: true
+
+# Kanban multi-agent coordination. This (default) profile runs the foreground
+# gateway on Railway, so it hosts the dispatcher that claims tasks and spawns
+# workers (`hermes -p <assignee> chat -q "work kanban task <id>"`) into the
+# web-design / web-dev profiles. The board is shared at <root>/kanban.db across
+# all profiles (see hermes_cli/kanban_db.py: kanban_home).
+kanban:
+  dispatch_in_gateway: true
+
+# Enables the Kanban orchestrator tool surface (kanban_create/list/unblock) so
+# this profile can create and assign cross-profile tasks. The gate reads this
+# top-level toolset list (tools/kanban_tools.py: _profile_has_kanban_toolset).
+toolsets:
+  - kanban
