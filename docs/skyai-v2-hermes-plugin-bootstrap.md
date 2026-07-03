@@ -48,7 +48,13 @@ The first slice adds:
 ## DEV Canary Bootstrap
 
 ```bash
-python scripts/skyai_v2_bootstrap_dev_profile.py --apply --inherit-model-config
+python scripts/skyai_v2_bootstrap_dev_profile.py \
+  --apply \
+  --inherit-model-config \
+  --model-default gpt-5.5 \
+  --model-provider openai-codex \
+  --model-base-url https://chatgpt.com/backend-api/codex \
+  --model-api-mode codex_responses
 python -m plugins.skyai_customer.dev_gateway \
   --dev \
   --profile-home ~/.hermes/profiles/skyai-v2-dev
@@ -58,7 +64,8 @@ curl -X POST http://127.0.0.1:8787/chatkit/dev-message \
 ```
 
 The canary gateway is loopback/dry-run by default. Live model calls require
-`--live-model`; public binds require an explicit token gate.
+`--live-model`. Private RFC1918 binds still require `--allow-public-bind`;
+public or wildcard binds also require an explicit token gate.
 
 ## Daily Upstream Sync Policy
 

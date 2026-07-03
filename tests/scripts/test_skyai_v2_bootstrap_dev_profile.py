@@ -50,6 +50,46 @@ def test_bootstrap_profile_can_inherit_nonsecret_model_config(tmp_path: Path) ->
     assert config["model"] == model_config
 
 
+def test_merge_model_config_explicit_values_override_inherited_fields() -> None:
+    assert bootstrap.merge_model_config(
+        {
+            "default": "gpt-5.4-mini",
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+        },
+        {
+            "default": "gpt-5.5",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "",
+        },
+    ) == {
+        "default": "gpt-5.5",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+    }
+
+
+def test_parse_args_accepts_explicit_model_flags() -> None:
+    args = bootstrap.parse_args(
+        [
+            "--model-default",
+            "gpt-5.5",
+            "--model-provider",
+            "openai-codex",
+            "--model-base-url",
+            "https://chatgpt.com/backend-api/codex",
+            "--model-api-mode",
+            "codex_responses",
+        ]
+    )
+
+    assert args.model_default == "gpt-5.5"
+    assert args.model_provider == "openai-codex"
+    assert args.model_base_url == "https://chatgpt.com/backend-api/codex"
+    assert args.model_api_mode == "codex_responses"
+
+
 def test_load_nonsecret_root_model_config_filters_secret_like_fields(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

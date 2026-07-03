@@ -120,6 +120,17 @@ def load_nonsecret_root_model_config(root_home: Path | None = None) -> Any:
     return {key: model[key] for key in MODEL_CONFIG_KEYS if key in model}
 
 
+def merge_model_config(base_config: Any = "", explicit_config: dict[str, str] | None = None) -> Any:
+    explicit_config = {key: value for key, value in (explicit_config or {}).items() if value}
+    if not explicit_config:
+        return base_config
+    if isinstance(base_config, dict):
+        merged = dict(base_config)
+        merged.update(explicit_config)
+        return merged
+    return explicit_config
+
+
 def build_profile_config(model_config: Any = "") -> dict[str, Any]:
     return {
         "model": model_config,
@@ -224,6 +235,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--profile-name", default=DEFAULT_PROFILE_NAME)
     parser.add_argument("--profile-home", type=Path)
+    parser.add_argument("--model-default", help="Explicit non-secret default model name")
+    parser.add_argument("--model-provider", help="Explicit non-secret model provider id")
+    parser.add_argument("--model-base-url", help="Explicit non-secret model provider base URL")
+    parser.add_argument("--model-api-mode", help="Explicit non-secret model API mode")
     return parser.parse_args(argv)
 
 
@@ -231,6 +246,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     profile_home = args.profile_home or default_profile_home(args.profile_name)
     model_config = load_nonsecret_root_model_config() if args.inherit_model_config else ""
+    model_config = merge_model_config(
+        model_config,
+        {
+            "default": args.model_default or "",
+            "provider": args.model_provider or "",
+            "base_url": args.model_base_url or "",
+            "api_mode": args.model_api_mode or "",
+        },
+    )
     result = bootstrap_profile(
         profile_home,
         apply=args.apply,

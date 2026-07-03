@@ -34,12 +34,18 @@ intelligence.
 
 ## DEV Canary Gateway
 
-Bootstrap the dedicated SkyAI v2 DEV profile. Use `--inherit-model-config` for
-live-model canaries; it copies only non-secret provider/model fields from the
-root Hermes config:
+Bootstrap the dedicated SkyAI v2 DEV profile. Use `--inherit-model-config`
+when the root Hermes config exists; it copies only non-secret provider/model
+fields. VM canaries may pass the same non-secret fields explicitly:
 
 ```bash
-python scripts/skyai_v2_bootstrap_dev_profile.py --apply --inherit-model-config
+python scripts/skyai_v2_bootstrap_dev_profile.py \
+  --apply \
+  --inherit-model-config \
+  --model-default gpt-5.5 \
+  --model-provider openai-codex \
+  --model-base-url https://chatgpt.com/backend-api/codex \
+  --model-api-mode codex_responses
 ```
 
 Start the FAB-compatible canary surface in dry-run mode:
@@ -60,5 +66,6 @@ curl -X POST http://127.0.0.1:8787/chatkit/dev-message \
 ```
 
 Dry-run is the default. Calling the live Hermes model requires the explicit
-`--live-model` flag. Non-loopback binds require both `--allow-public-bind` and
-a bearer token from `SKYAI_V2_CANARY_TOKEN`.
+`--live-model` flag. Private RFC1918 binds still require `--allow-public-bind`;
+public or wildcard binds also require a bearer token from
+`SKYAI_V2_CANARY_TOKEN`.
