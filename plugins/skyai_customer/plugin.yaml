@@ -1,6 +1,6 @@
 name: skyai-customer
 version: 0.1.0
-description: "SkyVision customer-facing SkyAI v2 tools: public catalog, product details, availability slots, campaign knowledge, and safe append-only event intake."
+description: "SkyVision customer-facing SkyAI v2 tools: public catalog, product details, availability slots, campaign/support knowledge, and safe append-only event intake."
 author: SkyVision
 kind: standalone
 provides_tools:
@@ -8,4 +8,5 @@ provides_tools:
   - skyai_product_detail
   - skyai_product_slots
   - skyai_campaign_knowledge
+  - skyai_support_knowledge
   - skyai_event_log_append

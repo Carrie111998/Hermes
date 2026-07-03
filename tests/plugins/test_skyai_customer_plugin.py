@@ -14,6 +14,7 @@ SKYAI_TOOL_NAMES = {
     "skyai_product_detail",
     "skyai_product_slots",
     "skyai_campaign_knowledge",
+    "skyai_support_knowledge",
     "skyai_event_log_append",
 }
 
@@ -196,6 +197,54 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
     assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
+
+
+def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> None:
+    result = public_tools.handle_skyai_support_knowledge(
+        topic="Клиент пита как да напише пожелание, как се доставя и как да удължи ваучер",
+        include_contacts=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["source"] == "skyvision_curated_public_support_knowledge"
+    assert "Честитка" in result["gift_voucher_presentation"]["voucher_blanks"]
+    assert result["gift_voucher_presentation"]["packaging_options"] == [
+        {
+            "name": "Безплатна опаковка",
+            "price_eur": "0.00",
+            "price_bgn": "0.00",
+            "note": "универсална физическа опаковка",
+        },
+        {
+            "name": "Син плик Лукс",
+            "price_eur": "2.00",
+            "price_bgn": "3.91",
+            "note": "по-официален и премиум вид",
+        },
+        {
+            "name": "Плик с кауза „Пингвин“",
+            "price_eur": "5.00",
+            "price_bgn": "9.78",
+            "note": "физически плик с кауза",
+        },
+        {
+            "name": "Електронен ваучер",
+            "price_eur": "0.00",
+            "price_bgn": "0.00",
+            "note": "най-бързият вариант; не е физическа опаковка",
+        },
+    ]
+    assert result["delivery"]["courier"] == "Speedy"
+    assert result["delivery"]["current_fee"] == "безплатна доставка"
+    assert result["delivery"]["office_locator_url"] == "https://www.speedy.bg/bg/speedy-offices"
+    assert result["payment_methods"]["online_checkout_options"] == ["Карта", "EasyPay", "Наложен платеж"]
+    assert result["payment_methods"]["bank_transfer"]["available_in_online_checkout"] is False
+    assert result["payment_methods"]["bank_transfer"]["answer_only_if_asked"] is True
+    assert "удължаване" in " ".join(result["vouchers"]["extension_flow"])
+    assert "двата ваучера" in " ".join(result["vouchers"]["combine_or_use_multiple_vouchers_flow"])
+    assert result["official_contacts"]["contacts_page"] == "https://skyvision.bg/контакти/"
+    assert result["official_contacts"]["email"] == "info@skyvision.bg"
+    assert "+359 (0) 700 20 200" in result["official_contacts"]["phones"]
 
 
 def test_product_slots_compacts_fixed_slots_and_marks_fixed_mode(monkeypatch) -> None:

@@ -153,6 +153,28 @@ SKYAI_CAMPAIGN_KNOWLEDGE_SCHEMA = {
     },
 }
 
+SKYAI_SUPPORT_KNOWLEDGE_SCHEMA = {
+    "name": "skyai_support_knowledge",
+    "description": (
+        "Return curated public SkyVision commerce/support facts for customer conversations: "
+        "gift voucher blanks and packaging, Speedy delivery, checkout payment methods, official contacts, "
+        "voucher extension flow, and using/combining voucher value. Use as evidence, not as a keyword router."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "topic": {
+                "type": "string",
+                "description": "Short description of the customer question or support context.",
+            },
+            "include_contacts": {
+                "type": "boolean",
+                "description": "Whether to include official SkyVision contact details in the answer.",
+            },
+        },
+    },
+}
+
 SKYAI_EVENT_LOG_APPEND_SCHEMA = {
     "name": "skyai_event_log_append",
     "description": (
@@ -370,6 +392,114 @@ def handle_skyai_campaign_knowledge(
             "general_terms_url": "https://skyvision.bg/общи-условия/",
             "privacy_notice_url": "https://skyvision.bg/уведомление-за-обработване-на-лични-д/",
         },
+    }
+
+
+def handle_skyai_support_knowledge(
+    topic: str = "",
+    include_contacts: bool = False,
+) -> dict[str, Any]:
+    """Return curated public commerce/support facts without exposing internal state."""
+    contacts = {
+        "contacts_page": "https://skyvision.bg/контакти/",
+        "phones": ["+359 (0) 700 20 200", "+359 (0) 2 425 9795"],
+        "email": "info@skyvision.bg",
+        "client_working_hours": "Понеделник - Петък, 09:00-17:00",
+        "closed": "Събота, неделя и официални празници",
+        "tone_guidance": "Когато насочваш към екипа, дай точните контакти и кажи човешки, че ще се радваме да помогнем.",
+    }
+    return {
+        "status": "ok",
+        "source": "skyvision_curated_public_support_knowledge",
+        "topic": _truncate_text(topic, 300),
+        "gift_voucher_presentation": {
+            "voucher_blanks": [
+                "Класик",
+                "Романс",
+                "Честитка",
+                "Вдъхновение",
+                "Адреналин",
+                "Vibe",
+            ],
+            "wish_flow": [
+                "При покупка на ваучер клиентът избира бланка и може да попълни поле „Поздрав“.",
+                "Полето „Поздрав“ е личното пожелание и се показва веднага в интерактивния preview на ваучера.",
+                "Полето „Име на ползвател“ е отделно от пожеланието.",
+                "Ако пожеланието трябва да се коригира след поръчка, това може да стане от панела или през екипа на SkyVision, докато ваучерът още не е подготвен/изпратен.",
+            ],
+            "packaging_options": [
+                {
+                    "name": "Безплатна опаковка",
+                    "price_eur": "0.00",
+                    "price_bgn": "0.00",
+                    "note": "универсална физическа опаковка",
+                },
+                {
+                    "name": "Син плик Лукс",
+                    "price_eur": "2.00",
+                    "price_bgn": "3.91",
+                    "note": "по-официален и премиум вид",
+                },
+                {
+                    "name": "Плик с кауза „Пингвин“",
+                    "price_eur": "5.00",
+                    "price_bgn": "9.78",
+                    "note": "физически плик с кауза",
+                },
+                {
+                    "name": "Електронен ваучер",
+                    "price_eur": "0.00",
+                    "price_bgn": "0.00",
+                    "note": "най-бързият вариант; не е физическа опаковка",
+                },
+            ],
+            "answer_guidance": (
+                "Ако клиентът пита за официален подарък, бланка или пожелание, обясни ясно разликата "
+                "между бланка, поздрав, име на ползвател, физическа опаковка и електронен ваучер."
+            ),
+        },
+        "delivery": {
+            "courier": "Speedy",
+            "current_fee": "безплатна доставка",
+            "office_locator_url": "https://www.speedy.bg/bg/speedy-offices",
+            "office_or_locker_flow": [
+                "При доставка до офис или автомат на Speedy клиентът трябва да избере населеното място.",
+                "После трябва да маркира опцията за доставка до офис/автомат на Speedy.",
+                "След това избира конкретния офис или автомат от падащото меню.",
+                "Не е добре просто да се изпише адресът на офис на Speedy като обикновен адрес, защото пратката може да не бъде разпозната като офис/автомат и да се забави.",
+            ],
+            "working_hours_guidance": (
+                "Работното време зависи от конкретния офис/автомат и трябва да се провери в Speedy локатора."
+            ),
+        },
+        "payment_methods": {
+            "online_checkout_options": ["Карта", "EasyPay", "Наложен платеж"],
+            "bank_transfer": {
+                "available_in_online_checkout": False,
+                "answer_only_if_asked": True,
+                "guidance": "Ако клиентът пита за банков превод, кажи кратко, че не е онлайн checkout опция.",
+            },
+            "guidance": (
+                "Не изброявай липсващи методи без причина. Ако клиентът пита как може да плати, "
+                "кажи наличните checkout опции ясно и кратко."
+            ),
+        },
+        "vouchers": {
+            "extension_flow": [
+                "Клиентът влиза в профила си в SkyVision.",
+                "Отваря „Моят ваучер“/„Ваучери“ и добавя ваучера, ако още не е добавен.",
+                "Отваря конкретния ваучер и използва наличната опция за удължаване, ако системата я показва.",
+                "Ако опцията не се вижда, има проблем или ваучерът е в особен статус, насочи към официалните контакти с номер на ваучера/поръчката.",
+            ],
+            "combine_or_use_multiple_vouchers_flow": [
+                "Клиентът добавя двата ваучера в профила си от „Ваучери“.",
+                "Стойността им се използва като ваучерна стойност/депозит в SkyVision профила.",
+                "След това избира преживяване, минава през „Резервирай/BookNow“ и избира „Имам ваучер“.",
+                "Ако целта е два ваучера да се използват за една конкретна резервация и интерфейсът не позволява това, насочи към екипа на SkyVision с номер на ваучер/поръчка.",
+            ],
+            "privacy_guidance": "Не искай кодове на ваучери в публичния чат; за съдействие насочи към официалните контакти.",
+        },
+        "official_contacts": contacts if include_contacts else {"available_if_needed": True},
     }
 
 
