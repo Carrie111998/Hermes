@@ -156,6 +156,10 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "bonus_product.product_id" in prompt
     assert "skyai_product_slots" in prompt
     assert "skyai_support_knowledge" in prompt
+    assert "подаръчен ефект" in prompt
+    assert "BookNow е собствената директна резервационна система" in prompt
+    assert "founder_transfer_guidance" in prompt
+    assert "Емил Ломлиев" in prompt
 
 
 def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> None:

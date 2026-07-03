@@ -269,6 +269,10 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
     assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
+    founder_summary = result["founder_transfer_guidance"]["summary"]
+    assert "съосновател" in founder_summary
+    assert "пилот-инструктор" in founder_summary
+    assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
 
 
 def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> None:
@@ -280,6 +284,7 @@ def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> Non
     assert result["status"] == "ok"
     assert result["source"] == "skyvision_curated_public_support_knowledge"
     assert "Честитка" in result["gift_voucher_presentation"]["voucher_blanks"]
+    assert "Редактирай поздрава" in " ".join(result["gift_voucher_presentation"]["wish_flow"])
     assert result["gift_voucher_presentation"]["packaging_options"] == [
         {
             "name": "Безплатна опаковка",

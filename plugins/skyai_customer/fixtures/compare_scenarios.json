@@ -60,6 +60,26 @@
     "focus": "payment methods: card, EasyPay, cash on delivery; no bank transfer"
   },
   {
+    "id": "broad_gift_diverse",
+    "message": "Търся подарък за мъж в Пловдив, но нямам конкретна идея. Какво би предложил?",
+    "focus": "broad sales discovery should offer varied directions, not three near-identical products"
+  },
+  {
+    "id": "repeat_specific_parachute",
+    "message": "Не, държа да е точно скок с парашут, не балон или друго летене. Какво имате?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Търся скок с парашут около Шумен."
+      },
+      {
+        "role": "assistant",
+        "content": "Мога да предложа скок с парашут, а около Шумен има и балон като по-близка летателна алтернатива."
+      }
+    ],
+    "focus": "respect repeated specific customer intent; do not keep pushing alternatives after clarification"
+  },
+  {
     "id": "support_contacts",
     "message": "Къде да пиша на официалната поддръжка на SkyVision?",
     "focus": "official contacts and working hours"
