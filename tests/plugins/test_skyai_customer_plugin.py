@@ -73,6 +73,37 @@ def test_plugin_manager_loads_skyai_customer_only_when_enabled(monkeypatch, tmp_
             registry._tools.pop(tool_name, None)
 
 
+def test_registered_tool_handlers_accept_hermes_dispatch_context(monkeypatch, tmp_path: Path) -> None:
+    from tools.registry import registry
+
+    ctx = FakeContext()
+    register(ctx)
+    monkeypatch.setenv("SKYAI_V2_EVENT_LOG_PATH", str(tmp_path / "events.jsonl"))
+
+    try:
+        for tool in ctx.tools:
+            registry.register(
+                name=tool["name"],
+                schema=tool["schema"],
+                handler=tool["handler"],
+                toolset=tool["toolset"],
+            )
+        result = registry.dispatch(
+            "skyai_event_log_append",
+            {
+                "event_type": "product_recommended",
+                "properties": {"product_id": 10536},
+            },
+            task_id="runtime-task",
+        )
+
+        assert result["status"] == "ok"
+        assert (tmp_path / "events.jsonl").exists()
+    finally:
+        for tool_name in SKYAI_TOOL_NAMES:
+            registry._tools.pop(tool_name, None)
+
+
 def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
     calls: list[str] = []
 

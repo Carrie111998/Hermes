@@ -7,6 +7,9 @@ customer/admin systems.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 from plugins.skyai_customer.public_tools import (
     SKYAI_CATALOG_SEARCH_SCHEMA,
     SKYAI_CAMPAIGN_KNOWLEDGE_SCHEMA,
@@ -50,6 +53,17 @@ _TOOLS = (
 )
 
 
+def _tool_handler(handler: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
+    """Adapt public-safe helpers to Hermes registry's ``handler(args, **ctx)`` call shape."""
+
+    def wrapped(args: dict[str, Any] | None = None, **_context: Any) -> dict[str, Any]:
+        if not isinstance(args, dict):
+            args = {}
+        return handler(**args)
+
+    return wrapped
+
+
 def register(ctx) -> None:
     """Register SkyAI v2 public-safe tools."""
     for name, schema, handler in _TOOLS:
@@ -57,6 +71,6 @@ def register(ctx) -> None:
             name=name,
             toolset="skyai_customer",
             schema=schema,
-            handler=handler,
+            handler=_tool_handler(handler),
             emoji="AI",
         )
