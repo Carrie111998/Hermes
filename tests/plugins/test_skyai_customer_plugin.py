@@ -236,7 +236,8 @@ def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> Non
     ]
     assert result["delivery"]["courier"] == "Speedy"
     assert result["delivery"]["current_fee"] == "безплатна доставка"
-    assert result["delivery"]["office_locator_url"] == "https://www.speedy.bg/bg/speedy-offices"
+    assert result["delivery"]["office_locator_url"] == "https://www.speedy.bg/bg/speedy-offices-automats"
+    assert "EUR първо" in result["gift_voucher_presentation"]["answer_guidance"]
     assert result["payment_methods"]["online_checkout_options"] == ["Карта", "EasyPay", "Наложен платеж"]
     assert result["payment_methods"]["bank_transfer"]["available_in_online_checkout"] is False
     assert result["payment_methods"]["bank_transfer"]["answer_only_if_asked"] is True
