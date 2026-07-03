@@ -320,7 +320,7 @@ def render_widget_html(settings: CanarySettings) -> str:
   <style>
     :root {{
       color-scheme: light;
-      --sky: #118c91;
+      --sky: #32BCAD;
       --line: #d8e2ea;
       --soft: #f4f8fb;
       --text: #10202b;

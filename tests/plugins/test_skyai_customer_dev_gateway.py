@@ -139,6 +139,7 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     html = dev_gateway.render_widget_html(settings(tmp_path, version="test-version"))
 
     assert "<title>SkyAI v2 DEV Canary</title>" in html
+    assert "#32BCAD" in html
     assert "test-version" in html
     assert "fetch('/chatkit/dev-message'" in html
     assert "skyai-v2-canary-conversation-id" in html
