@@ -4,7 +4,9 @@
 # injected by Railway and loaded from the container's .env file.
 
 model:
-  default: "qwen/qwen3.6-plus"
+  # Orchestrateur (profil défaut) : GLM 5.2 — suit mieux les consignes de routage
+  # que Qwen 3.6 (qui faisait le travail lui-même au lieu de créer une carte Kanban).
+  default: "z-ai/glm-5.2"
   provider: "openrouter"
 
 gateway:
