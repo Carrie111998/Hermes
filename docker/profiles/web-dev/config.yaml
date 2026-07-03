@@ -1,0 +1,46 @@
+# Profil Web DEV — WMH Project
+# Persona : SOUL.md (dev full-stack web). Amorcé sur le volume par docker/entrypoint.sh.
+# Connecteurs : GitHub (MCP remote) + Supabase (MCP stdio, org-wide read-only).
+# Netlify via CLI (installé dans l'image), auth NETLIFY_AUTH_TOKEN.
+# Les ${VAR} sont interpolées depuis l'environnement du process (injecté par Railway).
+
+model:
+  default: "qwen/qwen3.6-plus"
+  provider: "openrouter"
+
+terminal:
+  backend: local
+
+# Voir web-design/config.yaml — active la coordination Kanban (orchestrateur + worker).
+toolsets:
+  - kanban
+
+# Autonomie non-supervisée : un assesseur LLM évalue et auto-approuve/refuse les
+# commandes dangereuses + execute_code, au lieu de bloquer en attente d'une
+# validation humaine en chat (défaut approvals.mode=manual, cf. #30882). Sans ça,
+# netlify/git/build restent bloqués. provider "auto" => OpenRouter (gemini-flash,
+# rapide/économe) via OPENROUTER_API_KEY.
+auxiliary:
+  approval:
+    provider: "auto"
+    model: ""
+
+mcp_servers:
+  # GitHub — serveur MCP officiel hébergé, auth par PAT en Bearer.
+  # (https://github.com/github/github-mcp-server)
+  github:
+    url: "https://api.githubcopilot.com/mcp/"
+    headers:
+      Authorization: "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    enabled: true
+
+  # Supabase — pas de --project-ref => mode compte/organisation : accès à TOUS les
+  # projets visibles par le token (list_organizations/list_projects/get_project…),
+  # l'agent cible un projet par `project_id`. --read-only : lecture/inspection
+  # uniquement (retirer si l'écriture/déploiement inter-projets devient nécessaire).
+  supabase:
+    command: "npx"
+    args: ["-y", "@supabase/mcp-server-supabase@latest", "--read-only"]
+    env:
+      SUPABASE_ACCESS_TOKEN: "${SUPABASE_ACCESS_TOKEN}"
+    enabled: true

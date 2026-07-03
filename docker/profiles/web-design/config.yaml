@@ -1,0 +1,27 @@
+# Profil Web Design — WMH Project
+# Persona : SOUL.md (design & intégration web, fidélité maquette, mobile-first).
+# Aucun connecteur MCP requis. Amorcé sur le volume par docker/entrypoint.sh.
+
+# Gemini 3.1 Pro pour le jugement esthétique/vision (le bundle web-design-charter
+# déconseille qwen, non validé sur ce use case). Via OpenRouter.
+model:
+  default: "google/gemini-3.1-pro"
+  provider: "openrouter"
+
+terminal:
+  backend: local
+
+# Coordination multi-agents. La porte Kanban lit ce toolset top-level
+# (tools/kanban_tools.py: _profile_has_kanban_toolset). Permet à ce profil de
+# créer/assigner des tâches et d'agir comme worker sur le board partagé
+# (<root>/kanban.db, commun aux profils).
+toolsets:
+  - kanban
+
+# Autonomie non-supervisée : assesseur LLM pour auto-approuver/refuser les
+# commandes dangereuses au lieu de bloquer en attente d'une validation humaine
+# (défaut approvals.mode=manual, cf. #30882). provider "auto" => OpenRouter.
+auxiliary:
+  approval:
+    provider: "auto"
+    model: ""
