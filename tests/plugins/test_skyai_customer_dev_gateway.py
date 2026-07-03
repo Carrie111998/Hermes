@@ -122,3 +122,61 @@ def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
     assert ("GET", "/version") in routes
     assert ("POST", "/chatkit/dev-message") in routes
     assert ("POST", "/chatkit/message") in routes
+
+
+def test_resolve_profile_runtime_reads_model_dict() -> None:
+    runtime = dev_gateway._resolve_profile_runtime(
+        {
+            "model": {
+                "default": "gpt-5.5",
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+            }
+        }
+    )
+
+    assert runtime == {
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+        "api_key": "",
+    }
+
+
+def test_resolve_agent_runtime_refreshes_codex_credentials() -> None:
+    seen = {}
+
+    def fake_codex_resolver(**kwargs):
+        seen.update(kwargs)
+        return {
+            "api_key": "fresh-oauth-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+        }
+
+    runtime = dev_gateway._resolve_agent_runtime(
+        {
+            "model": {
+                "default": "gpt-5.5",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            }
+        },
+        codex_credential_resolver=fake_codex_resolver,
+    )
+
+    assert seen == {"refresh_if_expiring": True}
+    assert runtime == {
+        "model": "gpt-5.5",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+        "api_key": "fresh-oauth-token",
+    }
+
+
+def test_sanitize_runtime_error_redacts_token_markers() -> None:
+    assert dev_gateway.sanitize_runtime_error(
+        RuntimeError("Bearer abc123 access_token=secret refresh_token:secret2 api_key=secret3")
+    ) == "Bearer [redacted] access_token=[redacted] refresh_token=[redacted] api_key=[redacted]"

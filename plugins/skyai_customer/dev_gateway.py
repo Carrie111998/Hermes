@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -161,6 +162,7 @@ def _run_agent_turn(
 
     token = set_hermes_home_override(profile_home)
     try:
+        from hermes_cli.config import load_config
         from hermes_cli.plugins import discover_plugins, get_plugin_manager
 
         discover_plugins(force=True)
@@ -172,7 +174,13 @@ def _run_agent_turn(
 
         from run_agent import AIAgent
 
+        runtime = _resolve_agent_runtime(load_config())
         agent = AIAgent(
+            model=runtime["model"],
+            provider=runtime["provider"],
+            base_url=runtime["base_url"],
+            api_key=runtime["api_key"] or None,
+            api_mode=runtime["api_mode"],
             enabled_toolsets=[SKYAI_TOOLSET],
             disabled_toolsets=[],
             max_iterations=8,
@@ -192,6 +200,59 @@ def _run_agent_turn(
         return str(result.get("final_response") or "").strip()
     finally:
         reset_hermes_home_override(token)
+
+
+def _resolve_profile_runtime(config: dict[str, Any]) -> dict[str, str]:
+    model_config = config.get("model") if isinstance(config, dict) else {}
+    if isinstance(model_config, str):
+        return {
+            "model": model_config.strip(),
+            "provider": "",
+            "base_url": "",
+            "api_mode": "",
+            "api_key": "",
+        }
+    if not isinstance(model_config, dict):
+        model_config = {}
+    return {
+        "model": str(model_config.get("default") or "").strip(),
+        "provider": str(model_config.get("provider") or "").strip(),
+        "base_url": str(model_config.get("base_url") or "").strip(),
+        "api_mode": str(model_config.get("api_mode") or "").strip(),
+        "api_key": "",
+    }
+
+
+def _resolve_agent_runtime(
+    config: dict[str, Any],
+    *,
+    codex_credential_resolver: Callable[..., dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    runtime = _resolve_profile_runtime(config)
+    if runtime["provider"] != "openai-codex":
+        return runtime
+
+    if codex_credential_resolver is None:
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+
+        codex_credential_resolver = resolve_codex_runtime_credentials
+
+    creds = codex_credential_resolver(refresh_if_expiring=True)
+    runtime["api_key"] = str(creds.get("api_key") or "").strip()
+    runtime["base_url"] = runtime["base_url"] or str(creds.get("base_url") or "").strip()
+    return runtime
+
+
+def sanitize_runtime_error(exc: Exception) -> str:
+    text = " ".join(str(exc).split()) or type(exc).__name__
+    text = re.sub(r"Bearer\s+\S+", "Bearer [redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(access_token|refresh_token|api_key)\b\s*[:=]\s*\S+",
+        r"\1=[redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text[:240]
 
 
 async def build_chat_response(
@@ -271,7 +332,18 @@ def create_app(
             return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
-        response = await build_chat_response(payload, settings, agent_runner)
+        try:
+            response = await build_chat_response(payload, settings, agent_runner)
+        except Exception as exc:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "agent_runtime_error",
+                    "version": settings.version,
+                    "reason": sanitize_runtime_error(exc),
+                },
+                status=502,
+            )
         status = 200 if response.get("status") == "ok" else 400
         return web.json_response(response, status=status)
 

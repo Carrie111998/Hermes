@@ -48,7 +48,7 @@ The first slice adds:
 ## DEV Canary Bootstrap
 
 ```bash
-python scripts/skyai_v2_bootstrap_dev_profile.py --apply
+python scripts/skyai_v2_bootstrap_dev_profile.py --apply --inherit-model-config
 python -m plugins.skyai_customer.dev_gateway \
   --dev \
   --profile-home ~/.hermes/profiles/skyai-v2-dev

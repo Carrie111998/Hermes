@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - depends on the invoking Python
 
 
 DEFAULT_PROFILE_NAME = "skyai-v2-dev"
+MODEL_CONFIG_KEYS = frozenset({"default", "provider", "base_url", "api_mode"})
 PROFILE_DIRS = (
     "memories",
     "sessions",
@@ -97,9 +98,31 @@ def default_profile_home(profile_name: str = DEFAULT_PROFILE_NAME) -> Path:
     return get_default_hermes_root() / "profiles" / profile_name
 
 
-def build_profile_config() -> dict[str, Any]:
+def read_yaml_or_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    if yaml is not None:
+        parsed = yaml.safe_load(text) or {}
+        return parsed if isinstance(parsed, dict) else {}
+    parsed = json.loads(text)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def load_nonsecret_root_model_config(root_home: Path | None = None) -> Any:
+    root_home = root_home or get_default_hermes_root()
+    cfg = read_yaml_or_json(root_home / "config.yaml")
+    model = cfg.get("model", "")
+    if isinstance(model, str):
+        return model
+    if not isinstance(model, dict):
+        return ""
+    return {key: model[key] for key in MODEL_CONFIG_KEYS if key in model}
+
+
+def build_profile_config(model_config: Any = "") -> dict[str, Any]:
     return {
-        "model": "",
+        "model": model_config,
         "plugins": {
             "enabled": ["skyai-customer"],
         },
@@ -151,7 +174,13 @@ def dump_profile_config(config: dict[str, Any]) -> str:
     return json.dumps(config, indent=2, ensure_ascii=False) + "\n"
 
 
-def bootstrap_profile(profile_home: Path, *, apply: bool = False, force: bool = False) -> dict[str, Any]:
+def bootstrap_profile(
+    profile_home: Path,
+    *,
+    apply: bool = False,
+    force: bool = False,
+    model_config: Any = "",
+) -> dict[str, Any]:
     profile_home = profile_home.expanduser()
     files = {
         "config.yaml": profile_home / "config.yaml",
@@ -173,7 +202,7 @@ def bootstrap_profile(profile_home: Path, *, apply: bool = False, force: bool = 
     for dirname in PROFILE_DIRS:
         (profile_home / dirname).mkdir(parents=True, exist_ok=True)
 
-    config_text = dump_profile_config(build_profile_config())
+    config_text = dump_profile_config(build_profile_config(model_config=model_config))
     actions["file_status"] = {
         "config.yaml": _write_text(files["config.yaml"], config_text, force=force),
         ".env": _write_text(files[".env"], ENV_TEMPLATE, force=force),
@@ -188,6 +217,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="Write the DEV profile files")
     parser.add_argument("--force", action="store_true", help="Overwrite existing profile files")
+    parser.add_argument(
+        "--inherit-model-config",
+        action="store_true",
+        help="Copy non-secret model/provider fields from the root Hermes config",
+    )
     parser.add_argument("--profile-name", default=DEFAULT_PROFILE_NAME)
     parser.add_argument("--profile-home", type=Path)
     return parser.parse_args(argv)
@@ -196,7 +230,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     profile_home = args.profile_home or default_profile_home(args.profile_name)
-    result = bootstrap_profile(profile_home, apply=args.apply, force=args.force)
+    model_config = load_nonsecret_root_model_config() if args.inherit_model_config else ""
+    result = bootstrap_profile(
+        profile_home,
+        apply=args.apply,
+        force=args.force,
+        model_config=model_config,
+    )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

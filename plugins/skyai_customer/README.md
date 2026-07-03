@@ -34,10 +34,12 @@ intelligence.
 
 ## DEV Canary Gateway
 
-Bootstrap the dedicated SkyAI v2 DEV profile:
+Bootstrap the dedicated SkyAI v2 DEV profile. Use `--inherit-model-config` for
+live-model canaries; it copies only non-secret provider/model fields from the
+root Hermes config:
 
 ```bash
-python scripts/skyai_v2_bootstrap_dev_profile.py --apply
+python scripts/skyai_v2_bootstrap_dev_profile.py --apply --inherit-model-config
 ```
 
 Start the FAB-compatible canary surface in dry-run mode:

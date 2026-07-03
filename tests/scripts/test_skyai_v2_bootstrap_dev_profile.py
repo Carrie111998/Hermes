@@ -35,6 +35,46 @@ def test_bootstrap_profile_apply_creates_dedicated_skyai_profile(tmp_path: Path)
     assert config["skyai_v2"]["canary_gateway"]["host"] == "127.0.0.1"
 
 
+def test_bootstrap_profile_can_inherit_nonsecret_model_config(tmp_path: Path) -> None:
+    profile_home = tmp_path / "profiles" / "skyai-v2-dev"
+    model_config = {
+        "default": "gpt-5.5",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_mode": "codex_responses",
+    }
+
+    bootstrap.bootstrap_profile(profile_home, apply=True, model_config=model_config)
+
+    config = yaml.safe_load((profile_home / "config.yaml").read_text(encoding="utf-8"))
+    assert config["model"] == model_config
+
+
+def test_load_nonsecret_root_model_config_filters_secret_like_fields(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "default": "gpt-5.5",
+                    "provider": "openai-codex",
+                    "api_mode": "codex_responses",
+                    "api_key": "must-not-copy",
+                    "token": "must-not-copy",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert bootstrap.load_nonsecret_root_model_config(root) == {
+        "default": "gpt-5.5",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+    }
+
+
 def test_bootstrap_config_has_no_generic_database_url_fallback() -> None:
     config_text = bootstrap.dump_profile_config(bootstrap.build_profile_config())
 
