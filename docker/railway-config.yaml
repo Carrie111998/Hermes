@@ -48,7 +48,18 @@ kanban:
   dispatch_in_gateway: true
 
 # Enables the Kanban orchestrator tool surface (kanban_create/list/unblock) so
-# this profile can create and assign cross-profile tasks. The gate reads this
-# top-level toolset list (tools/kanban_tools.py: _profile_has_kanban_toolset).
+# this profile can create and assign cross-profile tasks. Le gate lit cette liste
+# top-level (tools/kanban_tools.py: _profile_has_kanban_toolset).
 toolsets:
   - kanban
+
+# Outils PAR PLATEFORME. Le profil défaut est l'ORCHESTRATEUR : sur WhatsApp il doit
+# UNIQUEMENT trier et router (kanban_create), jamais coder/déployer. On restreint donc
+# whatsapp à un set minimal (kanban + planning + rappel) — SANS terminal/file/web/browser,
+# qui poussaient qwen à faire le travail lui-même au lieu de créer une carte. Sa réponse
+# texte part quand même dans le groupe (auto, pas besoin d'outil). Les autres plateformes
+# gardent leurs presets complets (Discord/chat non impactés).
+platform_toolsets:
+  cli: [hermes-cli]
+  discord: [hermes-discord]
+  whatsapp: [kanban, todo, session_search]
