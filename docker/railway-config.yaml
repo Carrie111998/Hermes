@@ -10,34 +10,30 @@ model:
 gateway:
   platforms:
     - discord
-    # - whatsapp   # EN PAUSE (2026-07-02). Réactiver = décommenter cette ligne
-    #              + WHATSAPP_ENABLED=true, idéalement sur un NUMÉRO DÉDIÉ en mode bot.
-    #              Note : la présence dans cette liste force le chargement de la
-    #              plateforme, même si WHATSAPP_ENABLED=false — d'où le commentaire ici.
+    - whatsapp   # ACTIF (2026-07-02) — compte DÉDIÉ 33685686316, mode bot.
+                 # Pour re-pauser : recommenter ceci ET le bloc `whatsapp:` plus bas.
 
 terminal:
   backend: local
 
-# WhatsApp (groupes) — EN PAUSE (2026-07-02). ⚠️ Ce bloc `whatsapp:` DOIT rester
-# commenté tant que WhatsApp est en pause : sa seule présence (avec `extra`) fait
-# passer la porte d'auto-activation de gateway/config.py (is_connected → True) et
-# relance l'adaptateur + le bridge Baileys, MÊME retiré de gateway.platforms et
-# MÊME avec WHATSAPP_ENABLED=false. Pour réactiver : décommenter ce bloc + remettre
-# `- whatsapp` dans gateway.platforms + WHATSAPP_ENABLED=true, sur un NUMÉRO DÉDIÉ
-# en mode bot, et remplir group_allow_from avec les JID @g.us.
-# whatsapp:
-#   group_policy: "allowlist"
-#   group_allow_from:
-#     - "1203630XXXXXXXXXX@g.us"     # groupe "corrections web" (JID @g.us)
-#   require_mention: true
-#   mention_patterns:
-#     - "@bot"
-#     - "@hermes"
-#   free_response_chats:              # groupes dédiés où TOUT message = une demande
-#     - "1203630XXXXXXXXXX@g.us"
-#   dm_policy: "allowlist"
-#   allow_from:
-#     - "336XXXXXXXX"                 # Gilles (numéro sans +)
+# WhatsApp (groupes) — ACTIF (2026-07-02). Compte DÉDIÉ 33685686316 en mode bot.
+# ⚠️ La présence de ce bloc (avec `extra`) participe à l'activation via la porte
+# d'auto-activation de gateway/config.py (is_connected → True). Pour PAUSER WhatsApp,
+# il faut recommenter TOUT ce bloc ET retirer `- whatsapp` de gateway.platforms.
+# Poste fermé par défaut : group_policy=allowlist SANS JID => aucun groupe traité tant
+# que group_allow_from n'est pas rempli (sécurité). L'allowlist DM vient de la var
+# Railway WHATSAPP_ALLOWED_USERS (=33609152093, le perso de Gilles, pour piloter en DM).
+whatsapp:
+  group_policy: "allowlist"
+  # group_allow_from:                 # à remplir avec le JID @g.us du groupe de test
+  #   - "1203630XXXXXXXXXX@g.us"
+  require_mention: true
+  mention_patterns:
+    - "@bot"
+    - "@hermes"
+  # free_response_chats:              # groupes où TOUT message = une demande (sans @bot)
+  #   - "1203630XXXXXXXXXX@g.us"
+  dm_policy: "allowlist"             # allow_from fourni par WHATSAPP_ALLOWED_USERS (var Railway)
 
 compression:
   enabled: true
