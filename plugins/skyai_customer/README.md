@@ -31,3 +31,32 @@ This is only a development stand-in. Production should move to a dedicated
 Cloud SQL schema such as `skyai_ci.events` with append-only insert privileges.
 Do not enable a generic `DATABASE_URL` fallback for SkyAI customer
 intelligence.
+
+## DEV Canary Gateway
+
+Bootstrap the dedicated SkyAI v2 DEV profile:
+
+```bash
+python scripts/skyai_v2_bootstrap_dev_profile.py --apply
+```
+
+Start the FAB-compatible canary surface in dry-run mode:
+
+```bash
+python -m plugins.skyai_customer.dev_gateway \
+  --dev \
+  --profile-home ~/.hermes/profiles/skyai-v2-dev
+```
+
+Smoke it locally:
+
+```bash
+curl http://127.0.0.1:8787/health
+curl -X POST http://127.0.0.1:8787/chatkit/dev-message \
+  -H 'Content-Type: application/json' \
+  -d '{"conversation_id":"dev-smoke","message":"Здравей, търся подарък за двама"}'
+```
+
+Dry-run is the default. Calling the live Hermes model requires the explicit
+`--live-model` flag. Non-loopback binds require both `--allow-public-bind` and
+a bearer token from `SKYAI_V2_CANARY_TOKEN`.

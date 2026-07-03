@@ -22,6 +22,8 @@ The first slice adds:
 - public product detail tool;
 - public product slots tool;
 - sanitized local append-only event stub;
+- dedicated `skyai-v2-dev` profile bootstrap script;
+- DEV-only FAB-compatible canary endpoint;
 - operator skill describing SkyAI v2 boundaries, tone, BookNow/campaign
   knowledge, and learning loop.
 
@@ -37,11 +39,26 @@ The first slice adds:
 ## Next Gates
 
 1. Enable the plugin in a dedicated SkyAI v2 Hermes profile.
-2. Add Cloud SQL `skyai_ci.events` insert-only backend behind explicit
+2. Run the DEV canary gateway locally or behind a DEV-only ingress.
+3. Add Cloud SQL `skyai_ci.events` insert-only backend behind explicit
    `SKYAI_CI_DATABASE_URL` / `SKYAI_CI_EVENT_WRITE_ENABLED` gates.
-3. Add a small public gateway/FAB-compatible endpoint for canary traffic.
 4. Mirror every canary thread to the SkyAI Discord channel.
 5. Run side-by-side live canary with instant rollback to current PROD SkyAI.
+
+## DEV Canary Bootstrap
+
+```bash
+python scripts/skyai_v2_bootstrap_dev_profile.py --apply
+python -m plugins.skyai_customer.dev_gateway \
+  --dev \
+  --profile-home ~/.hermes/profiles/skyai-v2-dev
+curl -X POST http://127.0.0.1:8787/chatkit/dev-message \
+  -H 'Content-Type: application/json' \
+  -d '{"conversation_id":"dev-smoke","message":"Здравей, търся подарък за двама"}'
+```
+
+The canary gateway is loopback/dry-run by default. Live model calls require
+`--live-model`; public binds require an explicit token gate.
 
 ## Daily Upstream Sync Policy
 
@@ -53,6 +70,8 @@ python scripts/skyai_v2_upstream_sync_check.py origin/main
 scripts/run_tests.sh \
   tests/plugins/test_skyai_customer_plugin.py \
   tests/plugins/test_skyai_customer_schema.py \
+  tests/plugins/test_skyai_customer_dev_gateway.py \
+  tests/scripts/test_skyai_v2_bootstrap_dev_profile.py \
   tests/scripts/test_skyai_v2_upstream_sync_check.py \
   -q
 git diff --check
