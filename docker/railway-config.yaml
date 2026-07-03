@@ -25,14 +25,15 @@ terminal:
 # Railway WHATSAPP_ALLOWED_USERS (=33609152093, le perso de Gilles, pour piloter en DM).
 whatsapp:
   group_policy: "allowlist"
-  # group_allow_from:                 # à remplir avec le JID @g.us du groupe de test
-  #   - "1203630XXXXXXXXXX@g.us"
+  group_allow_from:
+    - "120363426647005883@g.us"      # Test Pippa
   require_mention: true
   mention_patterns:
     - "@bot"
     - "@hermes"
-  # free_response_chats:              # groupes où TOUT message = une demande (sans @bot)
-  #   - "1203630XXXXXXXXXX@g.us"
+    - "@pippa"                        # le bot s'appelle Pippa
+  free_response_chats:               # groupes où TOUT message = une demande (sans @mention)
+    - "120363426647005883@g.us"      # Test Pippa (groupe de test → réponse à tout message)
   dm_policy: "allowlist"             # allow_from fourni par WHATSAPP_ALLOWED_USERS (var Railway)
 
 compression:
