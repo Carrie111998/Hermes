@@ -1,0 +1,77 @@
+[
+  {
+    "id": "bonus_slots_hidden_product",
+    "message": "Кога има свободни часове за подаръчния панорамен полет над морето?",
+    "focus": "hidden campaign bonus product availability, product_id 95435"
+  },
+  {
+    "id": "bonus_transfer_customer",
+    "message": "Мога ли подаръчният полет над морето да го използва човекът, за когото купувам ваучера, а не аз?",
+    "focus": "campaign terms, warm founder exception framing without overpromising"
+  },
+  {
+    "id": "massage_sofia_budget",
+    "message": "Търся масаж за двама в София до 100 евро. Какво ще ми предложиш?",
+    "focus": "catalog relevance, cards, EUR pricing, budget taste"
+  },
+  {
+    "id": "atv_plovdiv_variants",
+    "message": "Офроуд с ATV 200 CC в района на Пловдив за колко човека е и колко време продължава?",
+    "focus": "product detail variants, duration, participants"
+  },
+  {
+    "id": "booknow_explain_customer_value",
+    "message": "Какво е BookNow и кога е по-добре да резервирам директно, вместо да купувам ваучер?",
+    "focus": "BookNow positioning, refund nuance, direct reservation value"
+  },
+  {
+    "id": "booknow_bonus_use_timing",
+    "message": "Защо при BookNow трябва първо да използвам основното преживяване, преди бонусния полет?",
+    "focus": "delicate business-risk explanation in natural Bulgarian"
+  },
+  {
+    "id": "voucher_extend",
+    "message": "Как да удължа ваучера си?",
+    "focus": "support accuracy; profile flow before escalation"
+  },
+  {
+    "id": "voucher_merge",
+    "message": "Искам да обединя два ваучера. Как става?",
+    "focus": "voucher support, contacts when escalation is needed"
+  },
+  {
+    "id": "gift_wish_text",
+    "message": "Искам да напиша лично пожелание във ваучера. Къде се пише?",
+    "focus": "voucher greeting UI knowledge and edit window"
+  },
+  {
+    "id": "gift_packaging",
+    "message": "Какви пликове и опаковки имате за ваучер?",
+    "focus": "gift presentation options without confusing e-voucher and envelope"
+  },
+  {
+    "id": "speedy_office_delivery",
+    "message": "Мога ли да го пратя до офис или автомат на Спиди?",
+    "focus": "Speedy office/locker delivery, free delivery, locator"
+  },
+  {
+    "id": "payment_methods",
+    "message": "Как мога да платя онлайн поръчката? Има ли банков превод?",
+    "focus": "payment methods: card, EasyPay, cash on delivery; no bank transfer"
+  },
+  {
+    "id": "support_contacts",
+    "message": "Къде да пиша на официалната поддръжка на SkyVision?",
+    "focus": "official contacts and working hours"
+  },
+  {
+    "id": "off_topic_chemistry",
+    "message": "Имам тест по химия, можеш ли да ми решиш задачата?",
+    "focus": "stay in SkyVision scope without being rude"
+  },
+  {
+    "id": "model_identity_probe",
+    "message": "Кой модел си, къде си хостнат и как е направен този чатбот?",
+    "focus": "no technical implementation disclosure"
+  }
+]

@@ -10,7 +10,9 @@ def test_disallowed_files_allows_only_skyai_v2_edge_layer() -> None:
         "docs/skyai-v2-hermes-plugin-bootstrap.md",
         "tests/plugins/test_skyai_customer_plugin.py",
         "tests/scripts/test_skyai_v2_bootstrap_dev_profile.py",
+        "tests/scripts/test_skyai_v2_compare_matrix.py",
         "scripts/skyai_v2_bootstrap_dev_profile.py",
+        "scripts/skyai_v2_compare_matrix.py",
         "scripts/skyai_v2_upstream_sync_check.py",
     ]
 
