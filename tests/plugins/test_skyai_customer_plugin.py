@@ -256,6 +256,27 @@ def test_catalog_search_falls_back_to_daily_index_and_reranks(monkeypatch) -> No
     assert all("/подарък/" in item["public_url"] for item in result["items"])
 
 
+def test_catalog_ranking_diversifies_broad_discovery_without_hurting_specific_queries() -> None:
+    ranked = [
+        {"id": 1, "title": "Офроуд разходка с АТВ до Пловдив", "category_slug": "офроуд-атв-под-наем"},
+        {"id": 2, "title": "Офроуд с АТВ 200 CC в района на Пловдив", "category_slug": "офроуд-атв-под-наем"},
+        {"id": 3, "title": "Самостоятелен бънджи скок от балон - Пловдив", "category_slug": "скок-с-бънджи"},
+        {"id": 4, "title": "Дегустация на вино за двама в Пловдив", "category_slug": "винени-турове-дегустации"},
+    ]
+
+    broad = public_tools._diversify_ranked_products(
+        ranked,
+        tokens=["подарък", "мъж", "пловдив"],
+    )
+    specific = public_tools._diversify_ranked_products(
+        ranked,
+        tokens=["атв", "пловдив"],
+    )
+
+    assert [item["id"] for item in broad[:3]] == [1, 3, 4]
+    assert [item["id"] for item in specific[:2]] == [1, 2]
+
+
 def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     result = public_tools.handle_skyai_campaign_knowledge(
         topic="Клиент пита дали бонусният полет може да е за подарения човек",

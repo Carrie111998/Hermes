@@ -386,8 +386,44 @@ def _rank_products(
         scored.append((score - (index * 0.0001), item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     if scored:
-        return [item for _score, item in scored]
+        return _diversify_ranked_products([item for _score, item in scored], tokens=tokens)
     return filtered
+
+
+def _diversify_ranked_products(
+    ranked: list[dict[str, Any]],
+    *,
+    tokens: list[str],
+) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    seen_generic_families: set[str] = set()
+    for item in ranked:
+        family = _product_family_key(item)
+        if not family or _product_family_matches_query(family, tokens) or family not in seen_generic_families:
+            selected.append(item)
+            if family and not _product_family_matches_query(family, tokens):
+                seen_generic_families.add(family)
+            continue
+        deferred.append(item)
+    return [*selected, *deferred]
+
+
+def _product_family_key(item: dict[str, Any]) -> str:
+    category = item.get("category_slug") or item.get("categorySlug")
+    if category:
+        return _normalize_search_text(category)
+    slug = str(item.get("slug") or "").strip("/")
+    if slug:
+        return _normalize_search_text(slug.split("/", 1)[0])
+    title = _normalize_search_text(item.get("title") or item.get("name"))
+    return " ".join(title.split()[:3])
+
+
+def _product_family_matches_query(family: str, tokens: list[str]) -> bool:
+    if not family or not tokens:
+        return False
+    return any(token in family for token in tokens)
 
 
 def _filter_products_by_budget(
