@@ -7337,7 +7337,23 @@ def show_config():
     # Model settings
     print()
     print(color("◆ Model", Colors.CYAN, Colors.BOLD))
-    print(f"  Model:        {redact_config_value(config.get('model', 'not set'))}")
+    # `model` may be a bare string (legacy/fresh config) or a dict in the
+    # modern shape ({"default": ..., "provider": ...}, see normalization at
+    # the resolve_* sites). Render the name, not the raw dict repr. Pass values
+    # through redact_config_value so any secret-shaped content stays masked.
+    _model_val = config.get('model')
+    if isinstance(_model_val, dict):
+        _model_name = str(redact_config_value((_model_val.get('default') or _model_val.get('model') or ''))).strip()
+        _model_provider = (_model_val.get('provider') or '').strip()
+        if _model_name:
+            _model_display = f"{_model_name} ({_model_provider})" if _model_provider else _model_name
+        else:
+            _model_display = color('(not set)', Colors.DIM)
+    elif isinstance(_model_val, str) and _model_val.strip():
+        _model_display = str(redact_config_value(_model_val.strip()))
+    else:
+        _model_display = color('(not set)', Colors.DIM)
+    print(f"  Model:        {_model_display}")
     _cfg_max_turns = config.get('agent', {}).get('max_turns', DEFAULT_CONFIG['agent']['max_turns'])
     print(f"  Max turns:    {_cfg_max_turns}")
     # Warn on stale HERMES_MAX_ITERATIONS ghost in .env that disagrees with

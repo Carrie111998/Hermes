@@ -2824,6 +2824,15 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     _ACTION_RESULTS.pop(name, None)
     _ACTION_COMMANDS[name] = tuple(subcommand)
     _ACTION_PROCS[name] = proc
+
+    # Reap the process as soon as it exits so it doesn't linger as a zombie
+    # if no client polls /api/actions/{name}/status after completion.
+    threading.Thread(
+        target=proc.wait,
+        name=f"reap-{name}",
+        daemon=True,
+    ).start()
+
     return proc
 
 
