@@ -1,0 +1,24 @@
+# Profil WMH Offers — Propositions Digitales
+# Persona : SOUL.md (pipeline digital offers, devis, PPTX, council).
+# Skills préchargées via external_dirs : wmh-digital-offers, wmh-pptx-presentations,
+#   devis-digital, llm-council (dans /opt/data/skills/wmh/).
+# Amorcé sur le volume par docker/entrypoint.sh.
+
+model:
+  default: "anthropic/claude-fable-5"
+  provider: "openrouter"
+
+terminal:
+  backend: local
+
+toolsets:
+  - kanban
+
+auxiliary:
+  approval:
+    provider: "auto"
+    model: ""
+
+skills:
+  external_dirs:
+    - /opt/data/skills

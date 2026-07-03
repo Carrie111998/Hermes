@@ -140,12 +140,14 @@ fi
 # to keep connectors + the kanban toolset in sync; SOUL.md is only seeded when
 # absent so manual edits survive reboots. The shared kanban board at
 # $HERMES_HOME/kanban.db lets the profiles delegate work to each other.
-for _p in web-design web-dev; do
+for _p in web-design web-dev wmh-offers; do
     _pdir="$HERMES_HOME/profiles/$_p"
     _tmpl="$INSTALL_DIR/docker/profiles/$_p"
     if [ ! -d "$_pdir" ]; then
         if [ "$_p" = "web-design" ]; then
             _desc="Design & intégration web (maquettes, UI, responsive)"
+        elif [ "$_p" = "wmh-offers" ]; then
+            _desc="Propositions digitales — pipeline offres, devis, PPTX WMH"
         else
             _desc="Dev full-stack web — GitHub, Supabase, Netlify"
         fi
