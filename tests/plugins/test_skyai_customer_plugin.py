@@ -157,6 +157,8 @@ def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
 
 def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> None:
     calls: list[str] = []
+    public_tools._CATALOG_INDEX_CACHE["items"] = None
+    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
 
     def fake_http_json(url: str, *, timeout: float = 8.0):
         calls.append(url)
@@ -181,7 +183,77 @@ def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> 
     assert "search=%D0%BC%D0%B0%D1%81%D0%B0%D0%B6%20%D0%A1%D0%BE%D1%84%D0%B8%D1%8F" in calls[0]
     assert "minPrice=156" in calls[0]
     assert "maxPrice=196" in calls[0]
-    assert result["items"][0]["price_eur"] == "51.13"
+    assert result["items"][0]["title"] == "SPA"
+    assert result["items"][0]["price_eur"] == "95.10"
+
+
+def test_catalog_search_falls_back_to_daily_index_and_reranks(monkeypatch) -> None:
+    calls: list[str] = []
+    public_tools._CATALOG_INDEX_CACHE["items"] = None
+    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
+
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        calls.append(url)
+        if url.endswith("search="):
+            return {
+                "data": [
+                    {
+                        "id": 1,
+                        "name": "Йога клас с малки кученца в София",
+                        "price": "45",
+                        "slug": "приключения-с-домашни-любимци/йога-клас-с-малки-кученца-софия",
+                        "locationName": "София",
+                    },
+                    {
+                        "id": 2,
+                        "name": "Уелнес ритуал за двама: Сауна и масаж",
+                        "price": "195.583",
+                        "slug": "релакс-зона/сауна-и-масаж-за-двама",
+                        "locationName": "София",
+                    },
+                    {
+                        "id": 3,
+                        "name": "Кралски синхронен масаж за двойки или приятели",
+                        "price": "130",
+                        "slug": "масажи/кралски-синхронен-масаж-за-двойки-или-приятели",
+                        "locationName": "София",
+                    },
+                    {
+                        "id": 4,
+                        "name": "Какаов синхронен масаж за двама – гръб или цяло тяло",
+                        "price": "120",
+                        "slug": "масажи/какаов-синхронен-масаж-за-двама-цяло-тяло",
+                        "locationName": "София",
+                    },
+                    {
+                        "id": 5,
+                        "name": "Сладкарски курс за Италиански десерти",
+                        "price": "115.39",
+                        "slug": "сладкарски-курс/италиански-десерти",
+                        "locationName": "София-град",
+                    },
+                ]
+            }
+        return {"data": []}
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_catalog_search(
+        query="Търся масаж за двама в София до 100 евро.",
+        limit=3,
+    )
+
+    assert result["status"] == "ok"
+    assert result["filters"]["max_price_eur"] == 100.0
+    assert result["filters"]["inferred_from_query"]["max_price_eur"] is True
+    assert len(calls) == 2
+    assert calls[1].endswith("search=")
+    assert [item["title"] for item in result["items"]] == [
+        "Уелнес ритуал за двама: Сауна и масаж",
+        "Кралски синхронен масаж за двойки или приятели",
+        "Какаов синхронен масаж за двама – гръб или цяло тяло",
+    ]
+    assert all("/подарък/" in item["public_url"] for item in result["items"])
 
 
 def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:

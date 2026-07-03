@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -33,6 +34,61 @@ MAX_TEXT_FIELD_LENGTH = 900
 MAX_DETAIL_LIST_ITEMS = 8
 MAX_CONFIGURATOR_OPTIONS = 10
 PUBLIC_SITE_BASE_URL = "https://skyvision.bg"
+CATALOG_INDEX_TTL_SECONDS = int(os.getenv("SKYAI_CATALOG_INDEX_TTL_SECONDS", "21600"))
+
+_CATALOG_INDEX_CACHE: dict[str, Any] = {"expires_at": 0.0, "items": None}
+
+_QUERY_STOPWORDS = frozenset(
+    {
+        "аз",
+        "ако",
+        "без",
+        "бих",
+        "във",
+        "вече",
+        "дали",
+        "дайте",
+        "добре",
+        "до",
+        "eur",
+        "euro",
+        "евро",
+        "за",
+        "има",
+        "имате",
+        "искам",
+        "какво",
+        "като",
+        "към",
+        "ли",
+        "ми",
+        "може",
+        "мога",
+        "моля",
+        "на",
+        "не",
+        "нещо",
+        "някакъв",
+        "около",
+        "от",
+        "по",
+        "предложиш",
+        "препоръчаш",
+        "със",
+        "това",
+        "трябва",
+        "търся",
+        "ще",
+    }
+)
+_TOKEN_EXPANSIONS = {
+    "двама": ("двойка", "двойки", "двоен"),
+    "двойка": ("двама", "двойки"),
+    "двойки": ("двама", "двойка"),
+    "спа": ("spa", "уелнес", "релакс"),
+    "spa": ("спа", "уелнес", "релакс"),
+    "уелнес": ("спа", "spa", "релакс"),
+}
 
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -233,31 +289,287 @@ def _safe_limit(limit: int | None) -> int:
     return max(1, min(MAX_RETURN_ITEMS, int(limit)))
 
 
+def _infer_price_bounds_from_query(
+    query: str,
+    *,
+    min_price_eur: float | None,
+    max_price_eur: float | None,
+) -> tuple[float | None, float | None]:
+    text = _normalize_search_text(query)
+    inferred_min = min_price_eur
+    inferred_max = max_price_eur
+    if inferred_max is None:
+        eur_match = re.search(r"(?:до|под|около|към)?\s*(\d+(?:[.,]\d+)?)\s*(?:евро|eur|euro|€)", text)
+        if eur_match:
+            inferred_max = _float_or_none(eur_match.group(1))
+    if inferred_max is None:
+        bgn_match = re.search(r"(?:до|под|около|към)?\s*(\d+(?:[.,]\d+)?)\s*(?:лв|лева|bgn)", text)
+        bgn_value = _float_or_none(bgn_match.group(1)) if bgn_match else None
+        if bgn_value is not None:
+            inferred_max = float(Decimal(str(bgn_value)) / BGN_PER_EUR)
+    return inferred_min, inferred_max
+
+
+def _float_or_none(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _catalog_search_candidates(
+    *,
+    query: str,
+    direct_items: list[dict[str, Any]],
+    min_price_eur: float | None,
+    max_price_eur: float | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    merged = _dedupe_products(direct_items)
+    if query.strip() and len(merged) < limit:
+        try:
+            merged = _dedupe_products([*merged, *_catalog_index_items()])
+        except Exception:
+            pass
+    if not query.strip():
+        return _filter_products_by_budget(merged, min_price_eur, max_price_eur)[:limit]
+    ranked = _rank_products(
+        merged,
+        query=query,
+        min_price_eur=min_price_eur,
+        max_price_eur=max_price_eur,
+    )
+    return ranked[:limit]
+
+
+def _catalog_index_items() -> list[dict[str, Any]]:
+    now = time.monotonic()
+    cached = _CATALOG_INDEX_CACHE.get("items")
+    if isinstance(cached, list) and now < float(_CATALOG_INDEX_CACHE.get("expires_at") or 0):
+        return [item for item in cached if isinstance(item, dict)]
+    url = f"{PUBLIC_CATALOG_BASE_URL}/products?page=1&size={MAX_CATALOG_SIZE}&sort=&minPrice=0&maxPrice=4000&search="
+    items = _extract_products(_http_json(url))
+    _CATALOG_INDEX_CACHE["items"] = items
+    _CATALOG_INDEX_CACHE["expires_at"] = now + max(60, CATALOG_INDEX_TTL_SECONDS)
+    return items
+
+
+def _dedupe_products(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for item in items:
+        key = str(item.get("id") or item.get("product_id") or item.get("slug") or item.get("name") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _rank_products(
+    items: list[dict[str, Any]],
+    *,
+    query: str,
+    min_price_eur: float | None,
+    max_price_eur: float | None,
+) -> list[dict[str, Any]]:
+    tokens = _query_tokens(query)
+    filtered = _filter_products_by_budget(items, min_price_eur, max_price_eur)
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for index, item in enumerate(filtered):
+        score = _product_relevance_score(item, tokens=tokens, max_price_eur=max_price_eur)
+        if score <= 0:
+            continue
+        # Stable tie-breaker preserves catalog popularity/order when evidence is equal.
+        scored.append((score - (index * 0.0001), item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    if scored:
+        return [item for _score, item in scored]
+    return filtered
+
+
+def _filter_products_by_budget(
+    items: list[dict[str, Any]],
+    min_price_eur: float | None,
+    max_price_eur: float | None,
+) -> list[dict[str, Any]]:
+    if min_price_eur is None and max_price_eur is None:
+        return items
+    filtered: list[dict[str, Any]] = []
+    max_with_tolerance = max_price_eur * 1.08 if max_price_eur is not None else None
+    for item in items:
+        price_eur = _product_price_eur(item)
+        if price_eur is None:
+            filtered.append(item)
+            continue
+        if min_price_eur is not None and price_eur < min_price_eur * 0.92:
+            continue
+        if max_with_tolerance is not None and price_eur > max_with_tolerance:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _product_relevance_score(
+    item: dict[str, Any],
+    *,
+    tokens: list[str],
+    max_price_eur: float | None,
+) -> float:
+    if not tokens:
+        return 1.0
+    title = _normalize_search_text(item.get("title") or item.get("name"))
+    slug = _normalize_search_text(item.get("slug"))
+    location = _normalize_search_text(
+        " ".join(
+            str(value or "")
+            for value in (
+                item.get("location"),
+                item.get("locationName"),
+                item.get("locationArea"),
+                item.get("city"),
+                item.get("region"),
+            )
+        )
+    )
+    provider = _normalize_search_text(_provider_name(item.get("provider")))
+    restrictions = item.get("restrictions") if isinstance(item.get("restrictions"), dict) else {}
+    detail = _normalize_search_text(
+        " ".join(
+            str(value or "")
+            for value in (
+                restrictions.get("duration"),
+                restrictions.get("serviceForWho"),
+                restrictions.get("forKids"),
+                item.get("duration"),
+                item.get("participants"),
+            )
+        )
+    )
+    combined = f"{title} {slug} {location} {provider} {detail}"
+    score = 0.0
+    for token in tokens:
+        if token in title:
+            score += 8.0
+        if token in slug:
+            score += 5.0
+        if token in location:
+            score += 6.0
+        if token in detail:
+            score += 3.0
+        if token in provider:
+            score += 1.0
+        if token in combined:
+            score += 1.0
+    if max_price_eur is not None:
+        price_eur = _product_price_eur(item)
+        if price_eur is not None:
+            closeness = max(0.0, 1.0 - min(abs(price_eur - max_price_eur) / max(max_price_eur, 1.0), 1.0))
+            score += closeness * 8.0
+            if price_eur < max_price_eur * 0.35:
+                score -= 2.0
+            elif price_eur < max_price_eur * 0.55:
+                score -= 0.8
+            elif price_eur >= max_price_eur * 0.55:
+                score += 1.5
+    orders_count = item.get("ordersCount")
+    if isinstance(orders_count, int) and orders_count > 0:
+        score += min(2.0, orders_count / 100.0)
+    rating_count = item.get("ratingCount")
+    if isinstance(rating_count, int) and rating_count > 0:
+        score += min(1.0, rating_count / 50.0)
+    return score
+
+
+def _query_tokens(query: str) -> list[str]:
+    normalized = _normalize_search_text(query)
+    raw_tokens = re.findall(r"[a-zа-я0-9]+", normalized, flags=re.IGNORECASE)
+    tokens: list[str] = []
+    for token in raw_tokens:
+        if token.isdigit() or token in _QUERY_STOPWORDS:
+            continue
+        if len(token) <= 2 and token not in {"atv", "спа", "spa"}:
+            continue
+        tokens.append(token)
+        tokens.extend(_TOKEN_EXPANSIONS.get(token, ()))
+    return _dedupe_strings(tokens)
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _normalize_search_text(value: Any) -> str:
+    text = str(value or "").casefold()
+    text = text.replace("ё", "е")
+    text = re.sub(r"[_/\\-]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _product_price_eur(item: dict[str, Any]) -> float | None:
+    price_eur = item.get("price_eur") or item.get("priceEur")
+    if price_eur not in (None, ""):
+        return _float_or_none(str(price_eur))
+    price_bgn = item.get("price") or item.get("price_bgn") or item.get("priceBgn")
+    if price_bgn in (None, ""):
+        return None
+    try:
+        return float(Decimal(str(price_bgn)) / BGN_PER_EUR)
+    except Exception:
+        return None
+
+
 def handle_skyai_catalog_search(
     query: str = "",
     min_price_eur: float | None = None,
     max_price_eur: float | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
+    inferred_min_price_eur, inferred_max_price_eur = _infer_price_bounds_from_query(
+        query,
+        min_price_eur=min_price_eur,
+        max_price_eur=max_price_eur,
+    )
     size = MAX_CATALOG_SIZE
-    min_price_bgn = _money_eur_to_bgn(min_price_eur)
-    max_price_bgn = _money_eur_to_bgn(max_price_eur) if max_price_eur is not None else 4000
+    safe_limit = _safe_limit(limit)
+    min_price_bgn = _money_eur_to_bgn(inferred_min_price_eur)
+    max_price_bgn = _money_eur_to_bgn(inferred_max_price_eur) if inferred_max_price_eur is not None else 4000
     url = (
         f"{PUBLIC_CATALOG_BASE_URL}/products"
         f"?page=1&size={size}&sort=&minPrice={min_price_bgn}&maxPrice={max_price_bgn}"
         f"&search={quote(query or '')}"
     )
-    payload = _http_json(url)
-    items = _extract_products(payload)[: _safe_limit(limit)]
+    direct_items = _extract_products(_http_json(url))
+    items = _catalog_search_candidates(
+        query=query,
+        direct_items=direct_items,
+        min_price_eur=inferred_min_price_eur,
+        max_price_eur=inferred_max_price_eur,
+        limit=safe_limit,
+    )
     return {
         "status": "ok",
         "source": "skyvision_public_cache",
         "query": query or "",
         "filters": {
-            "min_price_eur": min_price_eur,
-            "max_price_eur": max_price_eur,
+            "min_price_eur": inferred_min_price_eur,
+            "max_price_eur": inferred_max_price_eur,
             "min_price_bgn": min_price_bgn,
             "max_price_bgn": max_price_bgn,
+            "inferred_from_query": {
+                "min_price_eur": min_price_eur is None and inferred_min_price_eur is not None,
+                "max_price_eur": max_price_eur is None and inferred_max_price_eur is not None,
+            },
         },
         "count": len(items),
         "items": [_sanitize_product_summary(item) for item in items],

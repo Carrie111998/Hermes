@@ -122,12 +122,28 @@ def run_matrix(
     bearer_token: str = "",
     caller: CompareCaller = call_compare,
     run_id: str | None = None,
+    progress: bool = False,
 ) -> dict[str, Any]:
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     results = []
-    for scenario in scenarios:
+    for index, scenario in enumerate(scenarios, start=1):
+        if progress:
+            print(
+                f"[{index}/{len(scenarios)}] {scenario['id']}...",
+                file=sys.stderr,
+                flush=True,
+            )
         payload = build_compare_payload(scenario, run_id=run_id)
         response = caller(base_url, payload, timeout, bearer_token)
+        if progress:
+            summary = summarize_compare_response(scenario, response)
+            print(
+                f"[{index}/{len(scenarios)}] {scenario['id']} done: "
+                f"status={summary['status']} dev_cards={summary['dev_cards']} "
+                f"prod_cards={summary['prod_cards']}",
+                file=sys.stderr,
+                flush=True,
+            )
         results.append(
             {
                 "scenario": scenario,
@@ -185,6 +201,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="Optional max number of scenarios.")
     parser.add_argument("--timeout", type=float, default=150.0)
     parser.add_argument("--token-env", default="SKYAI_V2_CANARY_TOKEN")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-scenario progress on stderr.")
     return parser.parse_args(argv)
 
 
@@ -199,6 +216,7 @@ def main(argv: list[str]) -> int:
         base_url=args.base_url,
         timeout=args.timeout,
         bearer_token=token,
+        progress=not args.quiet,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
