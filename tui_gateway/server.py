@@ -1043,6 +1043,9 @@ def _teardown_popped_session(
                 )
         except Exception:
             logger.debug("failed waiting for session turn thread", exc_info=True)
+    logger.info(
+        "session closed sid=%s end_reason=%s", session.get("_sid", ""), end_reason
+    )
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -1422,6 +1425,24 @@ def _close_sessions_for_transport(
                     continue
                 session["transport"] = _detached_ws_transport
                 session.pop("_client_gone_interrupt_requested", None)
+            # Close the slash_worker immediately on detach — it's ~13 MB per
+            # process and the Desktop app uses one WS for all sessions, so
+            # switching sessions leaves the old workers alive until the 6 h TTL
+            # reaper or the 20 s orphan reaper fires (which may not fire at all
+            # if the session is flagged running by a background curator review).
+            # The worker is recreated lazily on the next slash command: the
+            # slash.exec handler and _restart_slash_worker both handle
+            # worker=None. Only the park-to-sentinel fall-through above
+            # reaches here — both viewer/rebind `continue` paths keep the
+            # session attached — and the close runs OUTSIDE _sessions_lock so
+            # the subprocess teardown never stalls the global session lock.
+            worker = session.get("slash_worker")
+            if worker:
+                try:
+                    worker.close()
+                except Exception:
+                    pass
+                session["slash_worker"] = None
             detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
