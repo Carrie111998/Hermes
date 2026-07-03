@@ -986,31 +986,6 @@ class PhotonAdapter(BasePlatformAdapter):
         # discord/whatsapp adapters use for their sidecar spawns.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
-        try:
-            patch = subprocess.run(  # noqa: S603
-                [
-                    self._node_bin,
-                    str(_SIDECAR_DIR / "patch-spectrum-mixed-attachments.mjs"),
-                    str(_SIDECAR_DIR),
-                ],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=10,
-                check=False,
-                # Windows: suppress the brief console flash this short-lived
-                # node patch run would otherwise pop on every sidecar start.
-                creationflags=windows_hide_flags(),
-            )
-            if patch.returncode != 0:
-                raise RuntimeError((patch.stderr or patch.stdout or "").strip())
-            if patch.stderr.strip():
-                logger.debug("[photon] %s", patch.stderr.strip())
-        except Exception as exc:
-            logger.warning(
-                "[photon] failed to apply Spectrum mixed attachment patch: %s",
-                exc,
-            )
-
         self._sidecar_proc = subprocess.Popen(  # noqa: S603
             [self._node_bin, str(_SIDECAR_DIR / "index.mjs")],
             stdin=subprocess.PIPE,
