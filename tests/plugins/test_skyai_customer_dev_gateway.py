@@ -127,9 +127,20 @@ def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
     routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
 
     assert ("GET", "/health") in routes
+    assert ("GET", "/ready") in routes
     assert ("GET", "/version") in routes
+    assert ("GET", "/widget/chatkit/") in routes
     assert ("POST", "/chatkit/dev-message") in routes
     assert ("POST", "/chatkit/message") in routes
+
+
+def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path) -> None:
+    html = dev_gateway.render_widget_html(settings(tmp_path, version="test-version"))
+
+    assert "<title>SkyAI v2 DEV Canary</title>" in html
+    assert "test-version" in html
+    assert "fetch('/chatkit/dev-message'" in html
+    assert "skyai-v2-canary-conversation-id" in html
 
 
 def test_resolve_profile_runtime_reads_model_dict() -> None:

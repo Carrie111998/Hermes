@@ -268,6 +268,165 @@ def sanitize_runtime_error(exc: Exception) -> str:
     return text[:240]
 
 
+def render_widget_html(settings: CanarySettings) -> str:
+    return f"""<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SkyAI v2 DEV Canary</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --sky: #118c91;
+      --line: #d8e2ea;
+      --soft: #f4f8fb;
+      --text: #10202b;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: #fff;
+    }}
+    .shell {{
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      border: 1px solid var(--line);
+    }}
+    header {{
+      padding: 14px 16px;
+      background: var(--sky);
+      color: #fff;
+      font-weight: 700;
+    }}
+    header small {{
+      display: block;
+      margin-top: 2px;
+      font-size: 12px;
+      font-weight: 500;
+      opacity: .88;
+    }}
+    #messages {{
+      padding: 16px;
+      overflow: auto;
+      background: linear-gradient(#fff, var(--soft));
+    }}
+    .msg {{
+      max-width: 88%;
+      margin: 0 0 12px;
+      padding: 11px 13px;
+      border-radius: 14px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+      box-shadow: 0 1px 2px rgba(16, 32, 43, .08);
+    }}
+    .assistant {{ background: #fff; border: 1px solid var(--line); }}
+    .user {{ margin-left: auto; background: var(--sky); color: #fff; }}
+    form {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      padding: 12px;
+      border-top: 1px solid var(--line);
+      background: #fff;
+    }}
+    textarea {{
+      min-height: 48px;
+      max-height: 120px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      font: inherit;
+    }}
+    button {{
+      min-width: 54px;
+      border: 0;
+      border-radius: 12px;
+      background: var(--sky);
+      color: #fff;
+      font-size: 22px;
+      cursor: pointer;
+    }}
+    button:disabled {{ opacity: .55; cursor: wait; }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      SkyAI v2 DEV
+      <small>{settings.version} · Hermes canary</small>
+    </header>
+    <section id="messages" aria-live="polite">
+      <div class="msg assistant">Здравей! Аз съм SkyAI v2 DEV canary. Мога да помогна с ориентация за SkyVision преживявания, ваучери и резервации. Какво търсиш днес?</div>
+    </section>
+    <form id="composer">
+      <textarea id="message" placeholder="Напиши съобщение..." autocomplete="off"></textarea>
+      <button id="send" type="submit" aria-label="Изпрати">›</button>
+    </form>
+  </main>
+  <script>
+    const messagesEl = document.getElementById('messages');
+    const form = document.getElementById('composer');
+    const input = document.getElementById('message');
+    const send = document.getElementById('send');
+    const storageKey = 'skyai-v2-canary-conversation-id';
+    const conversationId = localStorage.getItem(storageKey) || crypto.randomUUID();
+    localStorage.setItem(storageKey, conversationId);
+    const history = [];
+
+    function addMessage(role, text) {{
+      const node = document.createElement('div');
+      node.className = `msg ${{role === 'user' ? 'user' : 'assistant'}}`;
+      node.textContent = text;
+      messagesEl.appendChild(node);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (role === 'user' || role === 'assistant') {{
+        history.push({{ role, content: text }});
+        while (history.length > 12) history.shift();
+      }}
+      return node;
+    }}
+
+    form.addEventListener('submit', async (event) => {{
+      event.preventDefault();
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      const payloadHistory = history.slice();
+      addMessage('user', text);
+      send.disabled = true;
+      const pending = addMessage('assistant', 'Мисля...');
+      try {{
+        const response = await fetch('/chatkit/dev-message', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            conversation_id: conversationId,
+            message: text,
+            history: payloadHistory,
+            surface: 'skyai_v2_dev_widget'
+          }})
+        }});
+        const data = await response.json();
+        pending.textContent = data.reply || data.reason || data.error || 'SkyAI v2 не върна отговор.';
+        history[history.length - 1] = {{ role: 'assistant', content: pending.textContent }};
+      }} catch (error) {{
+        pending.textContent = 'В момента не успях да се свържа със SkyAI v2 DEV canary.';
+        history[history.length - 1] = {{ role: 'assistant', content: pending.textContent }};
+      }} finally {{
+        send.disabled = false;
+        input.focus();
+      }}
+    }});
+  </script>
+</body>
+</html>"""
+
+
 async def build_chat_response(
     payload: dict[str, Any],
     settings: CanarySettings,
@@ -336,6 +495,12 @@ def create_app(
             }
         )
 
+    async def widget(_request: "web.Request") -> "web.Response":
+        return web.Response(
+            text=render_widget_html(settings),
+            content_type="text/html",
+        )
+
     async def chat(request: "web.Request") -> "web.Response":
         if not _authorize(request, settings):
             return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
@@ -362,7 +527,9 @@ def create_app(
 
     app = web.Application(client_max_size=1_000_000)
     app.router.add_get("/health", health)
+    app.router.add_get("/ready", health)
     app.router.add_get("/version", version)
+    app.router.add_get("/widget/chatkit/", widget)
     app.router.add_post("/chatkit/dev-message", chat)
     app.router.add_post("/chatkit/message", chat)
     return app
