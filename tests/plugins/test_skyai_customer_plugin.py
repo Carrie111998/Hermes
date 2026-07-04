@@ -408,13 +408,29 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     campaign = result["active_campaigns"][0]
     assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]
+    assert "купувача/резервиращия" in campaign["customer_summary"]
+    assert "благодарност от SkyVision към купувача" in campaign["sales_tone"]
+    assert "Не добавяй terms/URL/legal детайли" in campaign["sales_tone"]
+    assert campaign["bonus_owner"]["default"].startswith("купувачът")
+    assert "Не казвай, че бонусът автоматично е за получателя" in campaign["bonus_owner"]["do_not_say"]
+    assert campaign["campaign_2026_facts"]["public_page"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
+    assert campaign["campaign_2026_facts"]["archive_2025_url"] == (
+        "https://skyvision.bg/campaign/free-panoramic-flight-2025/"
+    )
+    assert campaign["campaign_2026_facts"]["validity"] == "12 месеца от датата на покупката"
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
+    assert campaign["bonus_product"]["public_url"] == (
+        "https://skyvision.bg/подарък/полет-с-жирокоптер/панорамен-полет-над-морето/"
+    )
+    assert campaign["bonus_product"]["duration"] == "10 мин."
+    assert campaign["bonus_product"]["location"] == "Летище Приморско"
     assert "Не го повтаряй във всеки отговор" in campaign["sales_tone"]
     assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
     founder_summary = result["founder_transfer_guidance"]["summary"]
     assert "съосновател" in founder_summary
     assert "пилот-инструктор" in founder_summary
+    assert "Default-ът остава: бонусът е благодарност към купувача" in founder_summary
     assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
 
 
@@ -433,27 +449,30 @@ def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> Non
             "name": "Безплатна опаковка",
             "price_eur": "0.00",
             "price_bgn": "0.00",
-            "note": "универсална физическа опаковка",
+            "note": "универсална подаръчна опаковка",
         },
         {
-            "name": "Син плик Лукс",
+            "name": "Син плик „Лукс“",
             "price_eur": "2.00",
             "price_bgn": "3.91",
-            "note": "по-официален и премиум вид",
+            "note": "класическият SkyVision син плик с червен восъчен печат; разпознаваем премиум вариант",
         },
         {
             "name": "Плик с кауза „Пингвин“",
             "price_eur": "5.00",
             "price_bgn": "9.78",
-            "note": "физически плик с кауза",
+            "note": "подаръчен плик с кауза",
         },
         {
             "name": "Електронен ваучер",
             "price_eur": "0.00",
             "price_bgn": "0.00",
-            "note": "най-бързият вариант; не е физическа опаковка",
+            "note": "най-бързият вариант, когато подаръкът трябва да се изпрати веднага онлайн",
         },
     ]
+    serialized = str(result["gift_voucher_presentation"])
+    assert "физическа опаковка" not in serialized
+    assert "червен восъчен печат" in serialized
     assert result["delivery"]["courier"] == "Speedy"
     assert result["delivery"]["current_fee"] == "безплатна доставка"
     assert result["delivery"]["office_locator_url"] == "https://www.speedy.bg/bg/speedy-offices-automats"

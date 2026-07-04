@@ -171,9 +171,15 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "С по-млад, неформален клиент" in prompt
     assert "с по-улегнал клиент" in prompt
     assert "емотикони като човешки акцент" in prompt
+    assert "силно попадение" in prompt
+    assert "ще й легне" in prompt
+    assert "риск да е прекалено екстремно" in prompt
+    assert "консултативен sales подход" in prompt
     assert "бонуси, безплатна доставка, безплатна опаковка" in prompt
     assert "рейтинг, популярност" in prompt
     assert "не повтаряй един и същи коз механично" in prompt
+    assert "При първия ясен sales отговор" in prompt
+    assert "бонусния полет като благодарност към купувача" in prompt
     assert "най-близките географски смислени места" in prompt
     assert "има добри варианти в близък радиус" in prompt
     assert "не прескачай към далечни предложения" in prompt
@@ -191,9 +197,16 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "клиентът реално се колебае около покупка" in prompt
     assert "Ако клиентът каже, че вече е разбрал бонуса" in prompt
     assert "според условията" in prompt
+    assert "не го повтаряй в следващия sales отговор" in prompt
+    assert "не казвай „физическа опаковка“" in prompt
+    assert "Син плик „Лукс“" in prompt
+    assert "червен восъчен печат" in prompt
     assert "BookNow е собствената директна резервационна система" in prompt
     assert "founder_transfer_guidance" in prompt
     assert "Емил Ломлиев" in prompt
+    assert "бонусният полет" in prompt
+    assert "по правило това е благодарност" in prompt
+    assert "не автоматично подарък за получателя" in prompt
 
 
 def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> None:
