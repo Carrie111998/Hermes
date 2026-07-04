@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -49,6 +51,7 @@ _QUERY_STOPWORDS = frozenset(
         "дали",
         "дайте",
         "добре",
+        "ден",
         "до",
         "eur",
         "euro",
@@ -65,6 +68,9 @@ _QUERY_STOPWORDS = frozenset(
         "може",
         "мога",
         "моля",
+        "помощ",
+        "повод",
+        "рожден",
         "на",
         "не",
         "нещо",
@@ -78,6 +84,12 @@ _QUERY_STOPWORDS = frozenset(
         "това",
         "трябва",
         "търся",
+        "уникален",
+        "уникална",
+        "уникално",
+        "въздействащ",
+        "въздействаща",
+        "въздействащо",
         "ще",
     }
 )
@@ -88,7 +100,135 @@ _TOKEN_EXPANSIONS = {
     "спа": ("spa", "уелнес", "релакс"),
     "spa": ("спа", "уелнес", "релакс"),
     "уелнес": ("спа", "spa", "релакс"),
+    "приятелка": ("жена", "дама"),
+    "майка": ("жена", "дама"),
+    "съпруга": ("жена", "дама"),
+    "дама": ("жена", "приятелка"),
 }
+
+_CALM_QUERY_TOKENS = frozenset(
+    {
+        "спокоен",
+        "спокойна",
+        "спокойно",
+        "позитивен",
+        "позитивна",
+        "позитивно",
+        "релакс",
+        "лежерен",
+        "лежерна",
+        "нежен",
+        "нежна",
+    }
+)
+_CALM_PRODUCT_SIGNALS = frozenset(
+    {
+        "арт",
+        "бюти",
+        "вечеря",
+        "винен",
+        "вино",
+        "визия",
+        "гурме",
+        "дегустация",
+        "йога",
+        "козметика",
+        "кулинар",
+        "масаж",
+        "музикален",
+        "нощувка",
+        "почивка",
+        "релакс",
+        "рисуване",
+        "романтика",
+        "солна",
+        "спа",
+        "стил",
+        "творчески",
+        "терапия",
+        "уелнес",
+        "флотация",
+    }
+)
+_EXTREME_PRODUCT_SIGNALS = frozenset(
+    {
+        "адреналин",
+        "акваланг",
+        "атв",
+        "бънджи",
+        "гмуркане",
+        "джет",
+        "екстрем",
+        "жирокоптер",
+        "мотор",
+        "офроуд",
+        "парапланер",
+        "парашут",
+        "полет",
+        "рафтинг",
+        "самолет",
+        "скок",
+        "стрелба",
+    }
+)
+
+_KNOWN_LOCATION_COORDS = {
+    "сливен": (42.6817, 26.3229),
+    "ямбол": (42.4842, 26.5035),
+    "бургас": (42.5048, 27.4626),
+    "стара загора": (42.4258, 25.6345),
+    "казанлък": (42.6194, 25.3930),
+    "павел баня": (42.5942, 25.2089),
+    "приморско": (42.2679, 27.7561),
+    "созопол": (42.4173, 27.6962),
+    "несебър": (42.6601, 27.7206),
+    "сопот": (42.6520, 24.7545),
+    "пловдив": (42.1354, 24.7453),
+    "софия": (42.6977, 23.3219),
+    "варна": (43.2141, 27.9147),
+    "велико търново": (43.0757, 25.6172),
+    "русе": (43.8356, 25.9657),
+    "велинград": (42.0275, 23.9916),
+}
+_LOCATION_ALIASES = {
+    "sliven": "сливен",
+    "yambol": "ямбол",
+    "burgas": "бургас",
+    "stara zagora": "стара загора",
+    "stara zagora province": "стара загора",
+    "plovdiv": "пловдив",
+    "plovdiv province": "пловдив",
+    "sofia": "софия",
+    "sofia city province": "софия",
+    "sofia province": "софия",
+    "varna": "варна",
+    "varna province": "варна",
+    "dobrich province": "варна",
+    "pazardzhik": "велинград",
+    "blagoevgrad province": "благоевград",
+    "smoljan": "смолян",
+    "montana province": "монтана",
+    "район бургас": "бургас",
+    "обл бургас": "бургас",
+    "област бургас": "бургас",
+    "район сливен": "сливен",
+    "обл сливен": "сливен",
+    "област сливен": "сливен",
+    "район стара загора": "стара загора",
+    "обл стара загора": "стара загора",
+    "област стара загора": "стара загора",
+}
+
+
+@dataclass(frozen=True)
+class QueryTraits:
+    tokens: list[str]
+    normalized: str
+    requested_location: str | None = None
+    requested_coordinates: tuple[float, float] | None = None
+    calm_recipient: bool = False
+    mature_recipient: bool = False
+    broad_discovery: bool = False
 
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -328,7 +468,7 @@ def _catalog_search_candidates(
     limit: int,
 ) -> list[dict[str, Any]]:
     merged = _dedupe_products(direct_items)
-    if query.strip() and len(merged) < limit:
+    if query.strip():
         try:
             merged = _dedupe_products([*merged, *_catalog_index_items()])
         except Exception:
@@ -375,34 +515,45 @@ def _rank_products(
     min_price_eur: float | None,
     max_price_eur: float | None,
 ) -> list[dict[str, Any]]:
-    tokens = _query_tokens(query)
+    traits = _query_traits(query)
+    tokens = traits.tokens
     filtered = _filter_products_by_budget(items, min_price_eur, max_price_eur)
     scored: list[tuple[float, dict[str, Any]]] = []
     for index, item in enumerate(filtered):
-        score = _product_relevance_score(item, tokens=tokens, max_price_eur=max_price_eur)
+        score = _product_relevance_score(item, traits=traits, max_price_eur=max_price_eur)
         if score <= 0:
             continue
+        item = {**item}
+        if traits.requested_location:
+            item["_skyai_requested_location"] = traits.requested_location
+        distance_km = _product_distance_km(item, traits)
+        if distance_km is not None:
+            item["_skyai_distance_km"] = round(distance_km)
+        item["_skyai_category_key"] = _product_family_key(item)
         # Stable tie-breaker preserves catalog popularity/order when evidence is equal.
         scored.append((score - (index * 0.0001), item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     if scored:
-        return _diversify_ranked_products([item for _score, item in scored], tokens=tokens)
+        return _diversify_ranked_products([item for _score, item in scored], traits=traits)
     return filtered
 
 
 def _diversify_ranked_products(
     ranked: list[dict[str, Any]],
     *,
-    tokens: list[str],
+    tokens: list[str] | None = None,
+    traits: QueryTraits | None = None,
 ) -> list[dict[str, Any]]:
+    if traits is None:
+        traits = QueryTraits(tokens=tokens or [], normalized="")
     selected: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     seen_generic_families: set[str] = set()
     for item in ranked:
         family = _product_family_key(item)
-        if not family or _product_family_matches_query(family, tokens) or family not in seen_generic_families:
+        if not family or _product_family_matches_query(family, traits.tokens) or family not in seen_generic_families:
             selected.append(item)
-            if family and not _product_family_matches_query(family, tokens):
+            if family and not _product_family_matches_query(family, traits.tokens):
                 seen_generic_families.add(family)
             continue
         deferred.append(item)
@@ -424,6 +575,96 @@ def _product_family_matches_query(family: str, tokens: list[str]) -> bool:
     if not family or not tokens:
         return False
     return any(token in family for token in tokens)
+
+
+def _query_traits(query: str) -> QueryTraits:
+    normalized = _normalize_search_text(query)
+    tokens = _query_tokens(query)
+    requested_location = _find_known_location(normalized)
+    requested_coordinates = _KNOWN_LOCATION_COORDS.get(requested_location or "")
+    mature_recipient = bool(re.search(r"\b(?:50\s*\+|над\s+50|около\s+50)\b", normalized))
+    calm_recipient = bool(
+        any(token in _CALM_QUERY_TOKENS for token in tokens)
+        or mature_recipient
+        or "не екстрем" in normalized
+    )
+    broad_discovery = bool(
+        any(token in tokens for token in ("подарък", "подаръка", "идея", "идеи"))
+        and not any(_product_family_matches_query(family, tokens) for family in _SPECIFIC_PRODUCT_FAMILIES)
+    )
+    return QueryTraits(
+        tokens=tokens,
+        normalized=normalized,
+        requested_location=requested_location,
+        requested_coordinates=requested_coordinates,
+        calm_recipient=calm_recipient,
+        mature_recipient=mature_recipient,
+        broad_discovery=broad_discovery,
+    )
+
+
+_SPECIFIC_PRODUCT_FAMILIES = frozenset(
+    {
+        "атв",
+        "бънджи",
+        "жирокоптер",
+        "масаж",
+        "парапланер",
+        "парашут",
+        "самолет",
+        "спа",
+        "флотация",
+    }
+)
+
+
+def _find_known_location(text: str) -> str | None:
+    normalized = _normalize_search_text(text)
+    for alias, canonical in sorted(_LOCATION_ALIASES.items(), key=lambda pair: len(pair[0]), reverse=True):
+        if alias in normalized and canonical in _KNOWN_LOCATION_COORDS:
+            return canonical
+    for location in sorted(_KNOWN_LOCATION_COORDS, key=len, reverse=True):
+        if location in normalized:
+            return location
+    return None
+
+
+def _product_location_text(item: dict[str, Any]) -> str:
+    return _normalize_search_text(
+        " ".join(
+            str(value or "")
+            for value in (
+                item.get("location"),
+                item.get("locationName"),
+                item.get("locationArea"),
+                item.get("city"),
+                item.get("region"),
+            )
+        )
+    )
+
+
+def _product_known_location(item: dict[str, Any]) -> str | None:
+    return _find_known_location(_product_location_text(item))
+
+
+def _product_distance_km(item: dict[str, Any], traits: QueryTraits) -> float | None:
+    if not traits.requested_coordinates:
+        return None
+    product_location = _product_known_location(item)
+    coordinates = _KNOWN_LOCATION_COORDS.get(product_location or "")
+    if not coordinates:
+        return None
+    return _haversine_km(traits.requested_coordinates, coordinates)
+
+
+def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
+    lat1, lon1 = map(math.radians, a)
+    lat2, lon2 = map(math.radians, b)
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    hav = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 6371.0 * 2 * math.asin(math.sqrt(hav))
 
 
 def _filter_products_by_budget(
@@ -451,25 +692,15 @@ def _filter_products_by_budget(
 def _product_relevance_score(
     item: dict[str, Any],
     *,
-    tokens: list[str],
+    traits: QueryTraits,
     max_price_eur: float | None,
 ) -> float:
+    tokens = traits.tokens
     if not tokens:
         return 1.0
     title = _normalize_search_text(item.get("title") or item.get("name"))
     slug = _normalize_search_text(item.get("slug"))
-    location = _normalize_search_text(
-        " ".join(
-            str(value or "")
-            for value in (
-                item.get("location"),
-                item.get("locationName"),
-                item.get("locationArea"),
-                item.get("city"),
-                item.get("region"),
-            )
-        )
-    )
+    location = _product_location_text(item)
     provider = _normalize_search_text(_provider_name(item.get("provider")))
     restrictions = item.get("restrictions") if isinstance(item.get("restrictions"), dict) else {}
     detail = _normalize_search_text(
@@ -499,6 +730,8 @@ def _product_relevance_score(
             score += 1.0
         if token in combined:
             score += 1.0
+    score += _location_relevance_score(item, traits)
+    score += _recipient_fit_score(title=title, slug=slug, detail=detail, traits=traits)
     if max_price_eur is not None:
         price_eur = _product_price_eur(item)
         if price_eur is not None:
@@ -516,6 +749,53 @@ def _product_relevance_score(
     rating_count = item.get("ratingCount")
     if isinstance(rating_count, int) and rating_count > 0:
         score += min(1.0, rating_count / 50.0)
+    return score
+
+
+def _location_relevance_score(item: dict[str, Any], traits: QueryTraits) -> float:
+    if not traits.requested_location:
+        return 0.0
+    product_location = _product_known_location(item)
+    if not product_location:
+        text = _product_location_text(item)
+        return 1.5 if "онлайн" in text or "цяла българия" in text else -3.0
+    if product_location == traits.requested_location:
+        return 14.0
+    distance = _product_distance_km(item, traits)
+    if distance is None:
+        return 0.0
+    if distance <= 45:
+        return 16.0
+    if distance <= 90:
+        return 14.0
+    if distance <= 130:
+        return 10.0
+    if distance <= 180:
+        return -10.0
+    if distance <= 240:
+        return -12.0
+    return -14.0
+
+
+def _recipient_fit_score(
+    *,
+    title: str,
+    slug: str,
+    detail: str,
+    traits: QueryTraits,
+) -> float:
+    if not traits.calm_recipient:
+        return 0.0
+    combined = f"{title} {slug} {detail}"
+    calm_hits = sum(1 for signal in _CALM_PRODUCT_SIGNALS if signal in combined)
+    extreme_hits = sum(1 for signal in _EXTREME_PRODUCT_SIGNALS if signal in combined)
+    score = min(14.0, calm_hits * 4.0)
+    if extreme_hits:
+        score -= min(16.0, extreme_hits * 4.0)
+    if traits.mature_recipient and any(signal in combined for signal in ("детски", "дете", "деца", "ученик", "тийн")):
+        score -= 14.0
+    if "жена" in traits.tokens and any(signal in combined for signal in ("козметика", "визия", "стил", "терапия", "релакс")):
+        score += 3.0
     return score
 
 
@@ -927,9 +1207,12 @@ def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
         "title": item.get("title") or item.get("name"),
         "slug": slug or None,
         "category_slug": item.get("category_slug") or item.get("categorySlug"),
+        "category_key": item.get("_skyai_category_key") or _product_family_key(item),
         "public_url": item.get("url") or _public_product_url(slug),
         "location": item.get("location") or item.get("locationName") or item.get("city") or item.get("region"),
         "location_area": item.get("locationArea"),
+        "distance_from_requested_location_km": item.get("_skyai_distance_km"),
+        "requested_location": item.get("_skyai_requested_location"),
         "price_bgn": _money_decimal_string(price_bgn),
         "price_eur": _money_decimal_string(price_eur),
         "duration": item.get("duration"),

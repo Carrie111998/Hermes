@@ -65,6 +65,11 @@
     "focus": "broad sales discovery should offer varied directions, not three near-identical products"
   },
   {
+    "id": "calm_friend_50_sliven",
+    "message": "Моля за помощ. Близка и най-добра приятелка има рожден ден. Подаръкът да бъде уникален и въздействащ. Тя е от Сливен, може ли в града или близко място. Тя е спокоен и позитивен човек, 50+.",
+    "focus": "recipient profile and geography: calm mature friend near Sliven should avoid extreme flights and duplicate categories"
+  },
+  {
     "id": "repeat_specific_parachute",
     "message": "Не, държа да е точно скок с парашут, не балон или друго летене. Какво имате?",
     "history": [

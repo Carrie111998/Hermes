@@ -277,6 +277,90 @@ def test_catalog_ranking_diversifies_broad_discovery_without_hurting_specific_qu
     assert [item["id"] for item in specific[:2]] == [1, 2]
 
 
+def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeypatch) -> None:
+    public_tools._CATALOG_INDEX_CACHE["items"] = None
+    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
+
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        if url.endswith("search="):
+            return {
+                "data": [
+                    {
+                        "id": 10,
+                        "name": "Флотация и релаксиращ масаж",
+                        "price": "225",
+                        "slug": "флотация/флотация-масаж-бургас",
+                        "locationName": "Бургас",
+                        "locationArea": "Burgas",
+                    },
+                    {
+                        "id": 11,
+                        "name": "Петзвезден делничен СПА релакс за двама",
+                        "price": "289.50",
+                        "slug": "спа-и-релакс/petzvezden-spa-relaks-za-dvama-v-dianamar",
+                        "locationName": "Павел баня",
+                        "locationArea": "Stara Zagora",
+                    },
+                    {
+                        "id": 12,
+                        "name": "Квилинг брънч: хартиено изкуство, създадено от Вашите ръце",
+                        "price": "140",
+                        "slug": "творчески-подаръци/квилинг-брънч",
+                        "locationName": "София",
+                        "locationArea": "Sofia City Province",
+                    },
+                ]
+            }
+        return {
+            "data": [
+                {
+                    "id": 1,
+                    "name": "Панорамен полет с парапланер в Сопот",
+                    "price": "127.13",
+                    "slug": "полет-с-парапланер/панорамен-полет-с-парапланер-на-сопот-с-пещана",
+                    "locationName": "Сопот",
+                    "locationArea": "Plovdiv Province",
+                },
+                {
+                    "id": 2,
+                    "name": "Панорамен полет с парапланер – Сопот или София",
+                    "price": "127.13",
+                    "slug": "полет-с-парапланер/сопот-полет-с-парапланер-с-пилот-гущера",
+                    "locationName": "Сопот",
+                    "locationArea": "Plovdiv Province",
+                },
+                {
+                    "id": 3,
+                    "name": "Нощувка и преживяване за двама в района на Пловдив",
+                    "price": "262.08",
+                    "slug": "приключенска-почивка/нощувка-и-преживяване-за-двама-2",
+                    "locationName": "Пловдив",
+                    "locationArea": "Plovdiv Province",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_catalog_search(
+        query=(
+            "Подарък за близка приятелка от Сливен. "
+            "Тя е спокоен и позитивен човек, 50+."
+        ),
+        limit=3,
+    )
+
+    titles = [item["title"] for item in result["items"]]
+    assert titles[:2] == [
+        "Флотация и релаксиращ масаж",
+        "Петзвезден делничен СПА релакс за двама",
+    ]
+    assert "Панорамен полет с парапланер в Сопот" not in titles[:2]
+    assert result["items"][0]["requested_location"] == "сливен"
+    assert result["items"][0]["distance_from_requested_location_km"] is not None
+    assert all(item["category_key"] for item in result["items"])
+
+
 def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     result = public_tools.handle_skyai_campaign_knowledge(
         topic="Клиент пита дали бонусният полет може да е за подарения човек",

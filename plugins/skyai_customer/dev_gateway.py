@@ -167,9 +167,16 @@ def build_skyai_system_prompt() -> str:
         "публичните SkyAI tools и се дръж по evidence-а от тях. Не казвай, че нямаш "
         "достъп до каталога, преди да си пробвал tool. Не измисляй линкове; за "
         "продукти използвай само public_url от tool-а, който трябва да е към /подарък/. "
+        "Когато клиентът описва получателя на подаръка, съобрази temperament, възраст, "
+        "повод и близост, преди да гониш wow ефект. За спокоен/по-зрял профил започвай "
+        "от по-меките, красиви, релакс, гурме, творчески или преживявания за спомен, "
+        "а не от екстремни полети и адреналин, освен ако клиентът сам поиска това. "
         "Когато клиентът дава ориентировъчен горен бюджет, подреди предложенията по "
         "подаръчен ефект и близост до нуждата, не автоматично от най-евтиното към "
         "най-скъпото; много евтини опции са ок само ако са наистина по-подходящи. "
+        "Когато няма добро попадение в търсения град, използвай distance/context от "
+        "catalog tool-а: първо търси най-близките географски смислени места, после "
+        "по-големи близки градове с по-богат избор, и кажи това човешки. "
         "Когато изписваш цени, EUR е първа цена; BGN може да е вторично уточнение. "
         "Когато търсенето е широко и клиентът още няма ясна посока, не прави дълъг "
         "каталогов списък: предложи максимум 3 различни посоки с най-силните cards "
@@ -450,6 +457,46 @@ def render_widget_html(settings: CanarySettings) -> str:
               align-self: flex-start;
             }
 
+            .message--rich {
+              white-space: normal;
+            }
+
+            .message--rich p {
+              margin: 0 0 8px;
+            }
+
+            .message--rich p:last-child,
+            .message--rich ul:last-child,
+            .message--rich ol:last-child {
+              margin-bottom: 0;
+            }
+
+            .message--rich ul,
+            .message--rich ol {
+              margin: 6px 0 8px 20px;
+              padding: 0;
+            }
+
+            .message--rich li {
+              margin: 4px 0;
+              padding-left: 2px;
+            }
+
+            .message--rich strong {
+              font-weight: 760;
+            }
+
+            .message--rich a {
+              color: var(--brand);
+              font-weight: 650;
+              text-decoration: none;
+              overflow-wrap: anywhere;
+            }
+
+            .message--rich a:hover {
+              text-decoration: underline;
+            }
+
             .message--typing {
               display: inline-flex;
               align-items: center;
@@ -695,10 +742,93 @@ def render_widget_html(settings: CanarySettings) -> str:
               let voiceFinalText = '';
               let voiceMediaStream = null;
 
+              function escapeHtml(value) {
+                return String(value || '').replace(/[&<>"']/g, char => ({
+                  '&': '&amp;',
+                  '<': '&lt;',
+                  '>': '&gt;',
+                  '"': '&quot;',
+                  "'": '&#39;',
+                })[char]);
+              }
+
+              function safeUrl(value) {
+                const url = String(value || '').trim();
+                return /^https:\\/\\//i.test(url) ? url : '';
+              }
+
+              function renderInlineMarkdown(value) {
+                let html = escapeHtml(value);
+                const links = [];
+                html = html.replace(/\\[([^\\]]{1,180})\\]\\((https:\\/\\/[^\\s)]+)\\)/g, (_match, label, url) => {
+                  const href = safeUrl(url);
+                  if (!href) return label;
+                  const token = `@@SKYAI_LINK_${links.length}@@`;
+                  links.push([token, `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`]);
+                  return token;
+                });
+                html = html.replace(/(^|\\s)(https:\\/\\/[^\\s<]+)(?=$|\\s)/g, (_match, prefix, url) => {
+                  const href = safeUrl(url.replace(/[.,;:!?)]$/, ''));
+                  if (!href) return `${prefix}${url}`;
+                  const suffix = url.slice(href.length);
+                  return `${prefix}<a href="${href}" target="_blank" rel="noopener noreferrer">${href}</a>${suffix}`;
+                });
+                html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+                links.forEach(([token, link]) => {
+                  html = html.replace(token, link);
+                });
+                return html;
+              }
+
+              function renderAssistantMarkdown(text) {
+                const lines = String(text || '').split(/\\r?\\n/);
+                const output = [];
+                let listType = null;
+                function closeList() {
+                  if (!listType) return;
+                  output.push(`</${listType}>`);
+                  listType = null;
+                }
+                function openList(type) {
+                  if (listType === type) return;
+                  closeList();
+                  listType = type;
+                  output.push(`<${type}>`);
+                }
+                lines.forEach(rawLine => {
+                  const line = rawLine.trim();
+                  if (!line) {
+                    closeList();
+                    return;
+                  }
+                  const ordered = line.match(/^\\d+[.)]\\s+(.+)$/);
+                  if (ordered) {
+                    openList('ol');
+                    output.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`);
+                    return;
+                  }
+                  const bullet = line.match(/^[-•]\\s+(.+)$/);
+                  if (bullet) {
+                    openList('ul');
+                    output.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
+                    return;
+                  }
+                  closeList();
+                  output.push(`<p>${renderInlineMarkdown(line)}</p>`);
+                });
+                closeList();
+                return output.join('');
+              }
+
               function appendMessage(role, text) {
                 const node = document.createElement('div');
                 node.className = `message message--${role}`;
-                node.textContent = text;
+                if (role === 'assistant') {
+                  node.classList.add('message--rich');
+                  node.innerHTML = renderAssistantMarkdown(text);
+                } else {
+                  node.textContent = text;
+                }
                 elements.messages.appendChild(node);
                 elements.messages.scrollTop = elements.messages.scrollHeight;
                 return node;

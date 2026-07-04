@@ -148,6 +148,10 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "message--typing" in html
     assert "card__image" in html
     assert "appendCards(payload.cards)" in html
+    assert "renderAssistantMarkdown" in html
+    assert "message--rich" in html
+    assert "node.innerHTML = renderAssistantMarkdown(text)" in html
+    assert "escapeHtml" in html
 
 
 def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
@@ -158,6 +162,9 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "skyai_support_knowledge" in prompt
     assert "подаръчен ефект" in prompt
     assert "EUR е първа цена" in prompt
+    assert "съобрази temperament, възраст" in prompt
+    assert "спокоен/по-зрял профил" in prompt
+    assert "най-близките географски смислени места" in prompt
     assert "максимум 3 различни посоки" in prompt
     assert "Не добавяй четвърти конкретен продукт" in prompt
     assert "не можеш да го покажеш и като card/link" in prompt
