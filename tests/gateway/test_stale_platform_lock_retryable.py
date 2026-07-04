@@ -54,12 +54,22 @@ def adapter():
     obj._fatal_error_handler = None
     obj._platform_lock_scope = None
     obj._platform_lock_identity = None
+    obj._platform_lock_contention = False
     obj._status_write_logged = None
     return obj
 
 
 def test_stale_lock_failure_is_retryable(adapter):
-    """Lock failure must be retryable, not permanently fatal (#54167)."""
+    """Lock held by a live process sets contention flag, not a fatal error.
+
+    When ``acquire_scoped_lock`` returns ``(False, existing_with_pid)``
+    it means the O_EXCL open failed because another live process holds the
+    lock.  ``_acquire_platform_lock`` treats this as **expected contention**
+    (standby mode), not a fatal error — the gateway runner checks
+    ``_platform_lock_contention`` and periodically rechecks.  Setting a
+    fatal error would bypass that standby cycle and force an unnecessary
+    reconnect loop.  Regression against #54167.
+    """
     with patch(
         "gateway.status.acquire_scoped_lock",
         return_value=(False, {"pid": 99999, "start_time": "2026-01-01T00:00:00Z"}),
@@ -69,5 +79,6 @@ def test_stale_lock_failure_is_retryable(adapter):
         )
 
     assert result is False
-    assert adapter._fatal_error_retryable is True
-    assert adapter._fatal_error_code == "telegram-bot-token_lock"
+    assert adapter._platform_lock_contention is True
+    # _set_fatal_error is NOT called for live-process contention
+    assert adapter._fatal_error_code is None

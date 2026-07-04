@@ -1024,13 +1024,25 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
                                     break
                     except (OSError, PermissionError):
                         pass
-        if stale:
+        if not stale:
+            # Heartbeat-based stale detection: if the lock has not been
+            # refreshed within _SCOPED_LOCK_STALE_TIMEOUT_S, the holder
+            # may be hung or unresponsive even when the PID appears alive.
+            # On platforms where PID-liveness checks are unreliable (macOS
+            # without /proc, Windows) this is the primary stale oracle.
             try:
-                lock_path.unlink(missing_ok=True)
-            except OSError:
+                updated = existing.get("updated_at")
+                if updated:
+                    from datetime import timezone as _tz
+                    updated_dt = datetime.fromisoformat(updated)
+                    age = (datetime.now(_tz.utc) - updated_dt).total_seconds()
+                    if age > _SCOPED_LOCK_STALE_TIMEOUT_S:
+                        stale = True
+            except (TypeError, ValueError):
                 pass
-        else:
-            return False, existing
+
+        if stale:
+            lock_path.unlink(missing_ok=True)
 
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -1046,6 +1058,44 @@ def acquire_scoped_lock(scope: str, identity: str, metadata: Optional[dict[str, 
             pass
         raise
     return True, None
+
+
+# ── Heartbeat / refresh interval for scoped locks ─────────────────────
+# The lock holder should call refresh_scoped_lock() every
+# _SCOPED_LOCK_HEARTBEAT_S seconds.  acquire_scoped_lock() treats a lock
+# with updated_at older than 3× this interval as stale, even when the
+# original PID appears alive, to guard against hung-but-unresponsive
+# processes on platforms where PID-liveness checks are unreliable.
+_SCOPED_LOCK_HEARTBEAT_S = 15
+_SCOPED_LOCK_STALE_TIMEOUT_S = 3 * _SCOPED_LOCK_HEARTBEAT_S  # 45s
+
+
+def refresh_scoped_lock(scope: str, identity: str) -> bool:
+    """Update the ``updated_at`` timestamp on a scoped lock owned by this process.
+
+    Returns True if the lock was refreshed successfully, False if the lock
+    does not exist or is no longer owned by this process (caller should stop
+    the heartbeat loop and re-acquire).
+    """
+    lock_path = _get_scope_lock_path(scope, identity)
+    existing = _read_json_file(lock_path)
+    if not existing:
+        return False
+    try:
+        existing_pid = int(existing["pid"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if existing_pid != os.getpid():
+        return False
+    if existing.get("start_time") != _get_process_start_time(os.getpid()):
+        return False
+    # Own — update the timestamp in place
+    existing["updated_at"] = _utc_now_iso()
+    try:
+        _write_json_file(lock_path, existing)
+        return True
+    except Exception:
+        return False
 
 
 def release_scoped_lock(scope: str, identity: str) -> None:

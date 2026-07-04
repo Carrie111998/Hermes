@@ -91,6 +91,7 @@ class TestClassifiedError:
         assert e.should_fallback is False
         assert e.status_code is None
         assert e.message == ""
+        assert e.is_stream_stale is False
 
 
 # ── Test: Status code extraction ───────────────────────────────────────
@@ -1775,7 +1776,6 @@ class TestMultimodalToolContentUnsupported:
         e = MockAPIError("bad request: missing field 'model'", status_code=400)
         result = classify_api_error(e, provider="openrouter", model="anthropic/claude-sonnet-4")
 
-
 class TestOpenRouterUpstreamRateLimit:
     """Distinguish upstream-provider 429 from account-level 429 on OpenRouter.
 
@@ -1881,3 +1881,106 @@ class TestOpenRouterUpstreamRateLimit:
         # Overload disambiguation runs first; the outer message is the overload
         # phrase, so this is an overload, not an upstream rate-limit.
         assert result.reason == FailoverReason.overloaded
+
+
+# ── Test: Cloudflare 520/521/524 timeout classification ───────────────────
+
+class TestCloudflareOriginErrors:
+    """HTTP 520/521/524 from Cloudflare should classify as timeout, not
+    server_error, so the retry loop uses timeout backoff and triggers
+    provider fallback."""
+
+    def test_520_classified_as_timeout(self):
+        e = MockAPIError("Cloudflare: Origin Error (520)", status_code=520)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_521_classified_as_timeout(self):
+        e = MockAPIError("Cloudflare: Origin Down (521)", status_code=521)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_524_classified_as_timeout(self):
+        e = MockAPIError("Cloudflare: Origin Timeout (524)", status_code=524)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_500_still_server_error_not_timeout(self):
+        """Guard: a plain 500 must remain server_error, not timeout."""
+        e = MockAPIError("Internal Server Error", status_code=500)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+
+
+# ── Test: is_stream_stale heuristic ───────────────────────────────────────
+
+class TestIsStreamStale:
+    """The is_stream_stale flag should be set on transport errors whose
+    message matches known stale-stream / broken-pipe patterns, and not
+    set on other transport errors."""
+
+    @pytest.mark.parametrize("message", [
+        "broken pipe",
+        "BrokenPipeError: broken pipe",
+        "stale stream detected after 20s",
+        "Stream stale for 20s",
+        "connection lost",
+        "network connection lost",
+        "connection reset",
+        "connection terminated",
+        "peer closed connection",
+        "upstream connect error",
+        "upstream connect error or disconnect/reset before headers",
+    ])
+    def test_stream_stale_pattern_sets_flag(self, message):
+        """Transport errors matching stale-stream patterns must set
+        is_stream_stale=True.  Use ConnectionError as the base type so
+        the error hits the transport heuristics (step 7), not the
+        unknown fallthrough (step 8)."""
+        e = ConnectionError(message)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout, (
+            f"Expected timeout for message {message!r}, got {result.reason}"
+        )
+        assert result.is_stream_stale is True, (
+            f"is_stream_stale should be True for message: {message!r}"
+        )
+
+    @pytest.mark.parametrize("message", [
+        "Read timed out after 60s",
+        "Connection refused: localhost:11434",
+        "Connection refused",
+        "timed out",
+        "generic network error",
+    ])
+    def test_plain_timeout_does_not_set_stale_flag(self, message):
+        """Transport errors that do NOT match stale-stream patterns must
+        leave is_stream_stale as False.  Use ConnectionError as the base
+        type so the error hits the transport heuristics (step 7)."""
+        e = ConnectionError(message)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout, (
+            f"Expected timeout for message {message!r}, got {result.reason}"
+        )
+        assert result.is_stream_stale is False, (
+            f"is_stream_stale should be False for message: {message!r}"
+        )
+
+    def test_broken_pipe_exception_sets_stale_flag(self):
+        """A full BrokenPipeError exception (not just message string)
+        should also set is_stream_stale=True."""
+        e = BrokenPipeError("[Errno 32] Broken pipe")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout
+        assert result.is_stream_stale is True
+
+    def test_connection_refused_does_not_set_stale_flag(self):
+        """ConnectionRefusedError is a transport error but not stale-stream."""
+        e = ConnectionRefusedError("Connection refused: localhost:11434")
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.timeout
+        assert result.is_stream_stale is False

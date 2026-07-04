@@ -78,9 +78,11 @@ async def test_connect_rejects_same_host_token_lock(monkeypatch):
     ok = await adapter.connect()
 
     assert ok is False
-    assert adapter.fatal_error_code == "telegram-bot-token_lock"
-    assert adapter.has_fatal_error is True
-    assert "already in use" in adapter.fatal_error_message
+    # Lock held by a live process sets contention flag, not a fatal error.
+    # The gateway runner checks _platform_lock_contention and enters standby
+    # mode with periodic re-check (see gateway/run.py line ~6225).
+    assert adapter._platform_lock_contention is True
+    assert adapter.has_fatal_error is False
 
 
 @pytest.mark.asyncio

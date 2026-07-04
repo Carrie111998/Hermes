@@ -118,6 +118,7 @@ from agent.iteration_budget import IterationBudget
 
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
+    get_min_provider_stale_timeout_by_url,
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
@@ -3899,6 +3900,73 @@ class AIAgent:
                 _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
             elif hasattr(_socket, "TCP_KEEPALIVE"):
                 _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+
+            # ── Disable connection keepalive for aggressively-closing gateways ──
+            # Some provider gateways (opencode.ai, DeepSeek upstream) close idle
+            # connections at the load balancer within <5s of inactivity.  The
+            # client-side keepalive pool can't reliably race this, so pooled
+            # connections are often dead when retrieved — producing [Errno 32]
+            # Broken pipe on the next write (#a8fa1329, root cause of 51+ daily
+            # failures in pipeline cron jobs).
+            #
+            # Decision hierarchy (first match wins):
+            # 1. Config-driven: if the URL matches a provider in config and that
+            #    provider's minimum stale_timeout_seconds across all models
+            #    is <= 180 (3 min), disable keepalive — providers with short
+            #    stale timeouts are likely behind load balancers that close idle
+            #    connections aggressively.
+            # 2. Hostname-based safety net: hardcoded known-gateway hostnames.
+            # max_keepalive=0 forces a fresh TCP connection on every request,
+            # eliminating the stale-connection-reuse race entirely.  The marginal
+            # TCP handshake cost (~1 round-trip ~20ms) is negligible against
+            # 300-600s streaming requests.
+            _gateway_base_url = str(base_url or "").lower()
+            _disable_keepalive = False
+
+            # ── Decision path 1: config-driven stale timeout detection ──
+            # If get_min_provider_stale_timeout_by_url returns a value and it's
+            # <= 180s, the provider aggressively closes idle connections.
+            _decision_source = "default"
+            _config_timeout = get_min_provider_stale_timeout_by_url(
+                _gateway_base_url
+            )
+            if _config_timeout is not None:
+                _disable_keepalive = _config_timeout <= 180.0
+                _decision_source = (
+                    "config (stale_timeout={:.0f}s <= 180s)".format(_config_timeout)
+                    if _disable_keepalive
+                    else "config (stale_timeout={:.0f}s > 180s)".format(_config_timeout)
+                )
+
+            # ── Decision path 2: hostname safety net ──
+            if not _disable_keepalive:
+                _no_keepalive_gateways = (
+                    "opencode.ai",
+                )
+                if any(_host in _gateway_base_url for _host in _no_keepalive_gateways):
+                    _disable_keepalive = True
+                    _decision_source = "hostname"
+
+            logger.debug(
+                "Keepalive decision for %s: disabled=%s (source=%s)",
+                _gateway_base_url, _disable_keepalive, _decision_source,
+            )
+
+            if _disable_keepalive:
+                _pool_limits = _httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=0,
+                    keepalive_expiry=0.0,
+                )
+            else:
+                # Explicit pool limits to prevent stale connection reuse.
+                # Default httpx keepalive expiry (5s) is short, but reducing
+                # it further helps bursty reconnection patterns.
+                _pool_limits = _httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=10,
+                    keepalive_expiry=1.0,
+                )
             # When a custom transport is provided, httpx won't auto-read proxy
             # from env vars (allow_env_proxies = trust_env and transport is None).
             # Explicitly read proxy settings while still honoring NO_PROXY for
@@ -3907,7 +3975,11 @@ class AIAgent:
             # verify lives on the transport: httpx ignores the client-level
             # ``verify`` when a custom ``transport=`` is supplied.
             return _httpx.Client(
-                transport=_httpx.HTTPTransport(socket_options=_sock_opts, verify=verify),
+                transport=_httpx.HTTPTransport(
+                    socket_options=_sock_opts,
+                    limits=_pool_limits,
+                    verify=verify,
+                ),
                 proxy=_proxy,
             )
         except Exception:

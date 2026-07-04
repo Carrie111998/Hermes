@@ -2398,6 +2398,11 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Scoped lock refresh (heartbeat) — periodically refreshes the file-based
+        # platform lock so other gateway processes cannot steal it while this
+        # adapter is still running. Started by subclasses after successful
+        # connection; cancelled automatically in _release_platform_lock.
+        self._platform_lock_refresh_task: Optional[asyncio.Task] = None
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -2735,25 +2740,102 @@ class BasePlatformAdapter(ABC):
             scope, identity, metadata={'platform': self.platform.value}
         )
         if acquired:
+            self._platform_lock_contention = False
             return True
         owner_pid = existing.get('pid') if isinstance(existing, dict) else None
+        if owner_pid:
+            # Lock is held by a live process — graceful contention, not an error.
+            # Secondary gateways sharing the same credential (e.g. same Telegram
+            # bot token across profiles) will hit this path.  The adapter should
+            # fall back to standby/send-only mode rather than entering a retry
+            # loop.  The caller (connect()) checks _platform_lock_contention to
+            # decide whether to queue for reconnection or wait silently.
+            logger.info(
+                '[%s] %s already in use by PID %s — running in standby mode '
+                '(poll lock held by another gateway instance).',
+                self.name, resource_desc, owner_pid,
+            )
+            self._platform_lock_contention = True
+            return False
+        # No PID in existing record or stale record that couldn't be cleaned
+        # up — this is unusual and may warrant a retry.
         message = (
-            f'{resource_desc} already in use'
-            + (f' (PID {owner_pid})' if owner_pid else '')
-            + '. Stop the other gateway first.'
+            f'{resource_desc} lock acquire failed'
+            + (f' (stale PID {owner_pid})' if owner_pid else '')
+            + '.'
         )
-        logger.error('[%s] %s', self.name, message)
+        logger.warning('[%s] %s', self.name, message)
         self._set_fatal_error(f'{scope}_lock', message, retryable=True)
         return False
 
     def _release_platform_lock(self) -> None:
         """Release the scoped lock acquired by _acquire_platform_lock."""
+        # Cancel the refresh heartbeat first so it stops scheduling refreshes
+        # into a lock we are about to release.
+        if self._platform_lock_refresh_task is not None:
+            self._platform_lock_refresh_task.cancel()
+            self._platform_lock_refresh_task = None
         identity = getattr(self, '_platform_lock_identity', None)
         if not identity:
             return
         from gateway.status import release_scoped_lock
         release_scoped_lock(self._platform_lock_scope, identity)
         self._platform_lock_identity = None
+
+    async def _start_lock_refresh_loop(self) -> None:
+        """Start the background lock-refresh heartbeat.
+
+        The lock refresh loop keeps the file-based scoped lock alive by
+        periodically updating its ``updated_at`` timestamp.  Without this,
+        the lock's stale timer (45s) expires and another gateway process
+        can acquire it, leading to concurrent polling on the same credential
+        (e.g. two Telegram gateways polling the same bot token).
+
+        Safe to call multiple times: cancels any existing refresh task first.
+        Call after the lock is acquired (``_acquire_platform_lock`` returned
+        True) and the adapter is connected.
+
+        The loop stops automatically via ``_release_platform_lock``.
+        """
+        if self._platform_lock_refresh_task is not None:
+            if not self._platform_lock_refresh_task.done():
+                self._platform_lock_refresh_task.cancel()
+            self._platform_lock_refresh_task = None
+        scope = getattr(self, '_platform_lock_scope', None)
+        identity = getattr(self, '_platform_lock_identity', None)
+        if not scope or not identity:
+            return
+        loop = asyncio.get_running_loop()
+        self._platform_lock_refresh_task = loop.create_task(
+            self._lock_refresh_loop_body(scope, identity)
+        )
+
+    @staticmethod
+    async def _lock_refresh_loop_body(scope: str, identity: str) -> None:
+        """Periodically refresh the scoped lock while the adapter runs.
+
+        Designed to be run as a background asyncio task.  Refreshes the lock
+        every 15 seconds (matching ``_SCOPED_LOCK_HEARTBEAT_S`` in
+        ``gateway/status.py``) so the lock's stale timeout (45s, 3× heartbeats)
+        never expires while the adapter is healthy.
+        """
+        from gateway.status import refresh_scoped_lock
+
+        while True:
+            try:
+                await asyncio.sleep(15)
+                refresh_scoped_lock(scope, identity)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                # A single refresh failure is not fatal — the lock still has
+                # ~30s of life before it becomes stale.  Log at debug so we
+                # don't spam the log on transient filesystem errors.
+                logger.debug(
+                    "Lock refresh failed for %s/%s (non-fatal)",
+                    scope, identity[:8] if identity else "?",
+                    exc_info=True,
+                )
 
     @property
     def name(self) -> str:
