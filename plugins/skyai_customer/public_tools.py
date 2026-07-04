@@ -1189,7 +1189,7 @@ def handle_skyai_campaign_knowledge(
                 "public_url": "https://skyvision.bg/campaign/free-panoramic-flight/",
                 "terms_url": "https://panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto",
                 "customer_summary": (
-                    "SkyVision благодари на купувача/резервиращия с безплатен панорамен полет "
+                    "SkyVision благодари на човека, който купува или резервира, с безплатен панорамен полет "
                     "над морето към покупка или директна BookNow резервация."
                 ),
                 "sales_tone": (
@@ -1200,7 +1200,7 @@ def handle_skyai_campaign_knowledge(
                     "Не добавяй terms/URL/legal детайли, освен ако клиентът сам пита за условия или eligibility."
                 ),
                 "bonus_owner": {
-                    "default": "купувачът/резервиращият, който прави успешната поръчка или BookNow резервация",
+                    "default": "човекът, който прави успешната поръчка или BookNow резервация",
                     "customer_facing_framing": (
                         "Бонусът е нашето лично благодаря към теб като купувач, че избираш SkyVision. "
                         "Получателят на ваучера получава избраното преживяване, а ти получаваш възможност "

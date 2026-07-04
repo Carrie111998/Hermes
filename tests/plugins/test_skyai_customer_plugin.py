@@ -417,10 +417,10 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     campaign = result["active_campaigns"][0]
     assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]
-    assert "купувача/резервиращия" in campaign["customer_summary"]
+    assert "човека, който купува или резервира" in campaign["customer_summary"]
     assert "благодарност от SkyVision към купувача" in campaign["sales_tone"]
     assert "Не добавяй terms/URL/legal детайли" in campaign["sales_tone"]
-    assert campaign["bonus_owner"]["default"].startswith("купувачът")
+    assert campaign["bonus_owner"]["default"].startswith("човекът")
     assert "Не казвай, че бонусът автоматично е за получателя" in campaign["bonus_owner"]["do_not_say"]
     assert campaign["campaign_2026_facts"]["public_page"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert campaign["campaign_2026_facts"]["archive_2025_url"] == (

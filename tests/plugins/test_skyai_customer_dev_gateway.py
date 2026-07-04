@@ -175,6 +175,8 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "с по-улегнал клиент" in prompt
     assert "емотикони като човешки акцент" in prompt
     assert "силно попадение" in prompt
+    assert "силни попадения" in prompt
+    assert "„попадение“" in prompt
     assert "ще й легне" in prompt
     assert "риск да е прекалено екстремно" in prompt
     assert "консултативен sales подход" in prompt
@@ -190,7 +192,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "рейтинг, популярност" in prompt
     assert "не повтаряй един и същи коз механично" in prompt
     assert "При първия ясен sales отговор" in prompt
-    assert "бонусния полет като благодарност към купувача" in prompt
+    assert "бонусния полет като благодарност към човека, който купува" in prompt
     assert "най-близките географски смислени места" in prompt
     assert "има добри варианти в близък радиус" in prompt
     assert "не прескачай към далечни предложения" in prompt
@@ -217,6 +219,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "Емил Ломлиев" in prompt
     assert "бонусният полет" in prompt
     assert "по правило това е благодарност" in prompt
+    assert "към човека, който купува или резервира" in prompt
     assert "не автоматично подарък за получателя" in prompt
 
 
