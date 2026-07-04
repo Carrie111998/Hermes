@@ -408,6 +408,12 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     )
 
     assert result["status"] == "ok"
+    sales_playbook = result["sales_playbook"]
+    assert "Работи консултативно" in sales_playbook["principles"][0]
+    assert "1-3 релевантни посоки" in sales_playbook["principles"][1]
+    assert "public tool evidence" in sales_playbook["principles"][4]
+    assert "Бонусният полет" in sales_playbook["skyvision_application"]
+    assert "не keyword guard-и" in sales_playbook["guardrail"]
     campaign = result["active_campaigns"][0]
     assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]

@@ -178,6 +178,14 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "ще й легне" in prompt
     assert "риск да е прекалено екстремно" in prompt
     assert "консултативен sales подход" in prompt
+    assert "SkyAI sales playbook" in prompt
+    assert "работи консултативно, не като каталог с реплики" in prompt
+    assert "ако клиентът уточни нещо" in prompt
+    assert "1-3 релевантни посоки" in prompt
+    assert "Персонализирай само по това, което клиентът доброволно казва" in prompt
+    assert "Всяка препоръка трябва да има причина" in prompt
+    assert "един релевантен търговски коз" in prompt
+    assert "не ги изреждай всички" in prompt
     assert "бонуси, безплатна доставка, безплатна опаковка" in prompt
     assert "рейтинг, популярност" in prompt
     assert "не повтаряй един и същи коз механично" in prompt
