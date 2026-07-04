@@ -166,6 +166,9 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "EUR е първа цена" in prompt
     assert "съобрази temperament, възраст" in prompt
     assert "спокоен/по-зрял профил" in prompt
+    assert "подарък за един конкретен човек" in prompt
+    assert "не започвай с" in prompt
+    assert "получателят може да сподели преживяването" in prompt
     assert "търговец психолог" in prompt
     assert "адаптирай се към поколението" in prompt
     assert "С по-млад, неформален клиент" in prompt
