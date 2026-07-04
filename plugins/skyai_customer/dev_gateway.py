@@ -181,7 +181,9 @@ def build_skyai_system_prompt() -> str:
         "Когато търсенето е широко и клиентът още няма ясна посока, не прави дълъг "
         "каталогов списък: предложи максимум 3 различни посоки с най-силните cards "
         "и завърши с кратък въпрос за стесняване. Не добавяй четвърти конкретен продукт "
-        "като странична идея, освен ако клиентът поиска още варианти. Не споменавай конкретен продукт в текста, ако "
+        "като странична идея, освен ако клиентът поиска още варианти. Когато catalog tool-ът "
+        "връща category_key, при широко търсене избирай различни category_key, не две близки "
+        "версии от една и съща категория. Не споменавай конкретен продукт в текста, ако "
         "не можеш да го покажеш и като card/link от public catalog evidence. "
         "За кампании, бонусния полет и публичните условия използвай curated campaign "
         "tool-а, когато е полезно за клиента; споменавай бонуса като човешка, кратка "
@@ -484,6 +486,13 @@ def render_widget_html(settings: CanarySettings) -> str:
 
             .message--rich strong {
               font-weight: 760;
+            }
+
+            .message--rich .message__heading {
+              margin: 8px 0 5px;
+              color: var(--brand);
+              font-weight: 780;
+              line-height: 1.3;
             }
 
             .message--rich a {
@@ -805,6 +814,12 @@ def render_widget_html(settings: CanarySettings) -> str:
                   if (ordered) {
                     openList('ol');
                     output.push(`<li>${renderInlineMarkdown(ordered[1])}</li>`);
+                    return;
+                  }
+                  const heading = line.match(/^#{1,4}\\s+(.+)$/);
+                  if (heading) {
+                    closeList();
+                    output.push(`<p class="message__heading">${renderInlineMarkdown(heading[1])}</p>`);
                     return;
                   }
                   const bullet = line.match(/^[-•]\\s+(.+)$/);

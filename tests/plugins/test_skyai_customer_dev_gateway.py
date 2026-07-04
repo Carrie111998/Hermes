@@ -152,6 +152,8 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "message--rich" in html
     assert "node.innerHTML = renderAssistantMarkdown(text)" in html
     assert "escapeHtml" in html
+    assert "message__heading" in html
+    assert "line.match(/^#{1,4}" in html
 
 
 def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
@@ -167,6 +169,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "най-близките географски смислени места" in prompt
     assert "максимум 3 различни посоки" in prompt
     assert "Не добавяй четвърти конкретен продукт" in prompt
+    assert "избирай различни category_key" in prompt
     assert "не можеш да го покажеш и като card/link" in prompt
     assert "без суха опашка с terms/URL dump" in prompt
     assert "според условията" in prompt
