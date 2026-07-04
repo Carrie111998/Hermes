@@ -37,6 +37,23 @@ MAX_DETAIL_LIST_ITEMS = 8
 MAX_CONFIGURATOR_OPTIONS = 10
 PUBLIC_SITE_BASE_URL = "https://skyvision.bg"
 CATALOG_INDEX_TTL_SECONDS = int(os.getenv("SKYAI_CATALOG_INDEX_TTL_SECONDS", "21600"))
+VALUE_VOUCHER_PUBLIC_URL = f"{PUBLIC_SITE_BASE_URL}/подарък/ваучер-за-подарък-на-стойност/"
+VALUE_VOUCHER_OPTION = {
+    "title": "Ваучер за подарък на стойност",
+    "public_url": VALUE_VOUCHER_PUBLIC_URL,
+    "price_text": "стойност по избор",
+    "location": "валиден за SkyVision каталога",
+    "category_key": "voucher-value",
+    "summary": (
+        "Универсален, стилен подарък, който оставя избора на преживяване на получателя "
+        "сред 1000+ SkyVision преживявания."
+    ),
+    "important_note": (
+        "Не казвай, че само този ваучер дава свобода: всеки SkyVision ваучер работи като "
+        "стойност/депозит. Разликата е, че ваучерът на стойност не изписва конкретна услуга "
+        "и изглежда като съзнателно оставен избор за получателя."
+    ),
+}
 
 _CATALOG_INDEX_CACHE: dict[str, Any] = {"expires_at": 0.0, "items": None}
 
@@ -179,11 +196,16 @@ _KNOWN_LOCATION_COORDS = {
     "стара загора": (42.4258, 25.6345),
     "казанлък": (42.6194, 25.3930),
     "павел баня": (42.5942, 25.2089),
+    "могилово": (42.4250, 25.6270),
     "приморско": (42.2679, 27.7561),
     "созопол": (42.4173, 27.6962),
     "несебър": (42.6601, 27.7206),
+    "балчик": (43.4217, 28.1585),
     "сопот": (42.6520, 24.7545),
     "пловдив": (42.1354, 24.7453),
+    "житница": (42.3540, 24.7250),
+    "пазарджик": (42.1928, 24.3336),
+    "сърница": (41.7386, 24.0249),
     "софия": (42.6977, 23.3219),
     "варна": (43.2141, 27.9147),
     "велико търново": (43.0757, 25.6172),
@@ -204,7 +226,9 @@ _LOCATION_ALIASES = {
     "varna": "варна",
     "varna province": "варна",
     "dobrich province": "варна",
-    "pazardzhik": "велинград",
+    "pazardzhik": "пазарджик",
+    "pazardzhik province": "пазарджик",
+    "sarnitsa": "сърница",
     "blagoevgrad province": "благоевград",
     "smoljan": "смолян",
     "montana province": "монтана",
@@ -519,6 +543,64 @@ def _catalog_search_candidates(
     return ranked[:limit]
 
 
+def _catalog_location_context(items: list[dict[str, Any]], traits: QueryTraits) -> dict[str, Any] | None:
+    if not traits.requested_location:
+        return None
+    distances = sorted(
+        {
+            int(distance)
+            for item in items
+            if isinstance((distance := item.get("_skyai_distance_km")), int)
+        }
+    )
+    if not distances:
+        return {
+            "requested_location": traits.requested_location,
+            "guidance": (
+                "Клиентът е дал локация, но върнатите кандидати нямат надеждна дистанция. "
+                "Кажи това внимателно и не се преструвай, че са близо."
+            ),
+        }
+    nearest = distances[0]
+    farthest = distances[-1]
+    if nearest <= 120:
+        guidance = (
+            "Има географски близки кандидати. Дръж отговора около най-близките релевантни "
+            "варианти и не прескачай към далечни градове, освен ако клиентът поиска повече "
+            "лукс, море или по-различна посока."
+        )
+    else:
+        guidance = (
+            "Няма силен близък кандидат. Обясни, че разширяваш радиуса, и попитай дали "
+            "за клиента е по-важна близостта или най-точното преживяване."
+        )
+    return {
+        "requested_location": traits.requested_location,
+        "nearest_returned_distance_km": nearest,
+        "farthest_returned_distance_km": farthest,
+        "guidance": guidance,
+    }
+
+
+def _catalog_value_voucher_option(items: list[dict[str, Any]], traits: QueryTraits) -> dict[str, Any] | None:
+    if not traits.requested_location or not traits.broad_discovery:
+        return None
+    has_exact_location_match = any(_product_known_location(item) == traits.requested_location for item in items)
+    if has_exact_location_match:
+        return None
+    return {
+        **VALUE_VOUCHER_OPTION,
+        "when_to_use": (
+            "Добра алтернатива, когато няма достатъчно релевантно предложение в точната локация, "
+            "или когато клиентът иска подарък, но не е сигурен кое преживяване ще зарадва получателя."
+        ),
+        "answer_guidance": (
+            "Предложи го човешки като четвърта, универсална опция след най-близките релевантни cards. "
+            "Не го представяй като отказ от търсене, а като елегантен начин подареният човек сам да избере."
+        ),
+    }
+
+
 def _catalog_index_items() -> list[dict[str, Any]]:
     now = time.monotonic()
     cached = _CATALOG_INDEX_CACHE.get("items")
@@ -680,6 +762,14 @@ def _product_location_text(item: dict[str, Any]) -> str:
 
 
 def _product_known_location(item: dict[str, Any]) -> str | None:
+    for key in ("locationName", "location", "city"):
+        location = _find_known_location(str(item.get(key) or ""))
+        if location:
+            return location
+    for key in ("locationArea", "region"):
+        location = _find_known_location(str(item.get(key) or ""))
+        if location:
+            return location
     return _find_known_location(_product_location_text(item))
 
 
@@ -799,6 +889,18 @@ def _location_relevance_score(item: dict[str, Any], traits: QueryTraits) -> floa
     distance = _product_distance_km(item, traits)
     if distance is None:
         return 0.0
+    if traits.broad_discovery:
+        if distance <= 45:
+            return 24.0
+        if distance <= 90:
+            return 21.0
+        if distance <= 120:
+            return 15.0
+        if distance <= 150:
+            return -12.0
+        if distance <= 200:
+            return -28.0
+        return -44.0
     if distance <= 45:
         return 16.0
     if distance <= 90:
@@ -908,6 +1010,7 @@ def handle_skyai_catalog_search(
         max_price_eur=inferred_max_price_eur,
         limit=safe_limit,
     )
+    traits = _query_traits(query)
     return {
         "status": "ok",
         "source": "skyvision_public_cache",
@@ -923,6 +1026,8 @@ def handle_skyai_catalog_search(
             },
         },
         "count": len(items),
+        "location_context": _catalog_location_context(items, traits),
+        "value_voucher_option": _catalog_value_voucher_option(items, traits),
         "items": [_sanitize_product_summary(item) for item in items],
     }
 

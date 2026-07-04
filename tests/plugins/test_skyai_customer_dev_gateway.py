@@ -175,8 +175,14 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "рейтинг, популярност" in prompt
     assert "не повтаряй един и същи коз механично" in prompt
     assert "най-близките географски смислени места" in prompt
+    assert "има добри варианти в близък радиус" in prompt
+    assert "не прескачай към далечни предложения" in prompt
+    assert "по-важна близостта или най-точното преживяване" in prompt
     assert "максимум 3 различни посоки" in prompt
     assert "Не добавяй четвърти конкретен продукт" in prompt
+    assert "value_voucher_option" in prompt
+    assert "не изписва конкретна услуга" in prompt
+    assert "включи public_url от value_voucher_option" in prompt
     assert "избирай различни category_key" in prompt
     assert "не можеш да го покажеш и като card/link" in prompt
     assert "без суха опашка с terms/URL dump" in prompt
@@ -223,6 +229,21 @@ def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> N
             "price_bgn": "199.00",
             "location": "Приморско",
             "image": "https://cdn.example/gyro.jpg",
+        }
+    ]
+
+
+def test_build_cards_from_reply_supports_value_voucher_special_url() -> None:
+    cards = dev_gateway.build_cards_from_reply(
+        "Ако искаш да оставиш избора на нея, виж https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/"
+    )
+
+    assert cards == [
+        {
+            "title": "Ваучер за подарък на стойност",
+            "public_url": "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/",
+            "price_text": "стойност по избор",
+            "location": "валиден за SkyVision каталога",
         }
     ]
 

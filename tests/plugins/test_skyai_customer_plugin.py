@@ -300,6 +300,14 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
             return {
                 "data": [
                     {
+                        "id": 9,
+                        "name": "Вино и СПА пакет Стандарт за двама",
+                        "price": "255",
+                        "slug": "винен-туризъм/вино-и-спа-пакет-стандарт-за-двама",
+                        "locationName": "Могилово",
+                        "locationArea": "Stara Zagora",
+                    },
+                    {
                         "id": 10,
                         "name": "Флотация и релаксиращ масаж",
                         "price": "225",
@@ -322,6 +330,14 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
                         "slug": "творчески-подаръци/квилинг-брънч",
                         "locationName": "София",
                         "locationArea": "Sofia City Province",
+                    },
+                    {
+                        "id": 13,
+                        "name": "Романтика за двама: делнична почивка с вино и плодове",
+                        "price": "166",
+                        "slug": "романтика-за-двама/делнична-почивка-с-вино-и-плодове",
+                        "locationName": "Сърница",
+                        "locationArea": "Pazardzhik Province",
                     },
                 ]
             }
@@ -365,13 +381,20 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
     )
 
     titles = [item["title"] for item in result["items"]]
-    assert titles[:2] == [
-        "Флотация и релаксиращ масаж",
-        "Петзвезден делничен СПА релакс за двама",
-    ]
-    assert "Панорамен полет с парапланер в Сопот" not in titles[:2]
+    assert "Панорамен полет с парапланер в Сопот" not in titles
+    assert "Нощувка и преживяване за двама в района на Пловдив" not in titles
+    assert "Романтика за двама: делнична почивка с вино и плодове" not in titles[:3]
     assert result["items"][0]["requested_location"] == "сливен"
     assert result["items"][0]["distance_from_requested_location_km"] is not None
+    assert max(item["distance_from_requested_location_km"] for item in result["items"]) <= 120
+    assert result["location_context"]["requested_location"] == "сливен"
+    assert result["location_context"]["nearest_returned_distance_km"] <= 120
+    assert "Има географски близки кандидати" in result["location_context"]["guidance"]
+    assert result["value_voucher_option"]["public_url"] == (
+        "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/"
+    )
+    assert "не изписва конкретна услуга" in result["value_voucher_option"]["important_note"]
+    assert "четвърта, универсална опция" in result["value_voucher_option"]["answer_guidance"]
     assert all(item["category_key"] for item in result["items"])
 
 
