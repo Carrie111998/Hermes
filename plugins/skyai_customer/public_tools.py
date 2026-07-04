@@ -167,6 +167,41 @@ _CALM_PRODUCT_SIGNALS = frozenset(
         "флотация",
     }
 )
+_SINGLE_RECIPIENT_GIFT_SIGNALS = frozenset(
+    {
+        "баща",
+        "брат",
+        "дама",
+        "жена",
+        "майка",
+        "мъж",
+        "приятел",
+        "приятелка",
+        "съпруг",
+        "съпруга",
+    }
+)
+_MULTI_RECIPIENT_GIFT_SIGNALS = frozenset(
+    {
+        "двама",
+        "двойка",
+        "двойки",
+        "семейство",
+        "семеен",
+        "семейна",
+        "група",
+        "компания",
+    }
+)
+_TWO_PERSON_PRODUCT_SIGNALS = frozenset(
+    {
+        "за двама",
+        "двама",
+        "двойка",
+        "двойки",
+        "романтика",
+    }
+)
 _EXTREME_PRODUCT_SIGNALS = frozenset(
     {
         "адреналин",
@@ -253,6 +288,7 @@ class QueryTraits:
     calm_recipient: bool = False
     mature_recipient: bool = False
     broad_discovery: bool = False
+    single_recipient_gift: bool = False
 
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -582,6 +618,19 @@ def _catalog_location_context(items: list[dict[str, Any]], traits: QueryTraits) 
     }
 
 
+def _catalog_recipient_context(traits: QueryTraits) -> dict[str, Any] | None:
+    if not traits.single_recipient_gift:
+        return None
+    return {
+        "gift_recipient_scope": "single_recipient",
+        "guidance": (
+            "Клиентът изглежда избира подарък за един конкретен човек. Предпочитай индивидуални "
+            "преживявания. Ако вариант за двама остава най-подходящ, рамкирай го като възможност "
+            "получателят да сподели преживяването с близък човек, не като подарък за двама по default."
+        ),
+    }
+
+
 def _catalog_value_voucher_option(items: list[dict[str, Any]], traits: QueryTraits) -> dict[str, Any] | None:
     if not traits.requested_location or not traits.broad_discovery:
         return None
@@ -709,6 +758,11 @@ def _query_traits(query: str) -> QueryTraits:
         any(token in tokens for token in ("подарък", "подаръка", "идея", "идеи"))
         and not any(_product_family_matches_query(family, tokens) for family in _SPECIFIC_PRODUCT_FAMILIES)
     )
+    single_recipient_gift = bool(
+        broad_discovery
+        and any(token in _SINGLE_RECIPIENT_GIFT_SIGNALS for token in tokens)
+        and not any(token in _MULTI_RECIPIENT_GIFT_SIGNALS for token in tokens)
+    )
     return QueryTraits(
         tokens=tokens,
         normalized=normalized,
@@ -717,6 +771,7 @@ def _query_traits(query: str) -> QueryTraits:
         calm_recipient=calm_recipient,
         mature_recipient=mature_recipient,
         broad_discovery=broad_discovery,
+        single_recipient_gift=single_recipient_gift,
     )
 
 
@@ -933,6 +988,8 @@ def _recipient_fit_score(
         score -= 14.0
     if "жена" in traits.tokens and any(signal in combined for signal in ("козметика", "визия", "стил", "терапия", "релакс")):
         score += 3.0
+    if traits.single_recipient_gift and any(signal in combined for signal in _TWO_PERSON_PRODUCT_SIGNALS):
+        score -= 7.0
     return score
 
 
@@ -1027,6 +1084,7 @@ def handle_skyai_catalog_search(
         },
         "count": len(items),
         "location_context": _catalog_location_context(items, traits),
+        "recipient_context": _catalog_recipient_context(traits),
         "value_voucher_option": _catalog_value_voucher_option(items, traits),
         "items": [_sanitize_product_summary(item) for item in items],
     }

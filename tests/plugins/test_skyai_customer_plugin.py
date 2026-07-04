@@ -381,6 +381,7 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
     )
 
     titles = [item["title"] for item in result["items"]]
+    assert titles[0] == "Флотация и релаксиращ масаж"
     assert "Панорамен полет с парапланер в Сопот" not in titles
     assert "Нощувка и преживяване за двама в района на Пловдив" not in titles
     assert "Романтика за двама: делнична почивка с вино и плодове" not in titles[:3]
@@ -390,6 +391,8 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
     assert result["location_context"]["requested_location"] == "сливен"
     assert result["location_context"]["nearest_returned_distance_km"] <= 120
     assert "Има географски близки кандидати" in result["location_context"]["guidance"]
+    assert result["recipient_context"]["gift_recipient_scope"] == "single_recipient"
+    assert "един конкретен човек" in result["recipient_context"]["guidance"]
     assert result["value_voucher_option"]["public_url"] == (
         "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/"
     )
