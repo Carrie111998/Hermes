@@ -440,6 +440,23 @@ def _isolate_hermes_home(_hermetic_environment):
     return None
 
 
+@pytest.fixture(autouse=True)
+def _no_real_browser(monkeypatch):
+    """No test may open a real browser window.
+
+    Several OAuth login paths (xAI/Anthropic/Spotify loopback logins) call
+    ``webbrowser.open(authorize_url)`` when a graphical browser is available.
+    On a developer's machine (macOS: always graphical) a test that reaches
+    that path without stubbing ``open_browser=False`` pops a real auth page —
+    e.g. ``test_auth_manual_paste`` popping ``auth.x.ai`` during a local full
+    run. CI never caught it (headless → guard returns False). Patch the single
+    chokepoint ``webbrowser.open`` to a no-op so no test can ever hijack the
+    dev's browser, regardless of which login path it exercises.
+    """
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", lambda *a, **k: True, raising=True)
+
+
 # ── Module-level state reset — replaced by per-file process isolation ──────
 #
 # Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
