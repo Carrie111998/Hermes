@@ -165,7 +165,16 @@ def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> 
         return {
             "data": [
                 {"id": 1, "title": "Масаж", "price": "100", "location": "София"},
-                {"id": 2, "title": "SPA", "price": "186", "location": "София"},
+                {
+                    "id": 2,
+                    "title": "SPA",
+                    "price": "186",
+                    "oldPrice": "220",
+                    "rating": "4.9",
+                    "ratingCount": "27",
+                    "ordersCount": "105",
+                    "location": "София",
+                },
             ]
         }
 
@@ -185,6 +194,11 @@ def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> 
     assert "maxPrice=196" in calls[0]
     assert result["items"][0]["title"] == "SPA"
     assert result["items"][0]["price_eur"] == "95.10"
+    assert result["items"][0]["old_price_eur"] == "112.48"
+    assert result["items"][0]["rating"] == "4.90"
+    assert result["items"][0]["rating_count"] == 27
+    assert result["items"][0]["orders_count"] == 105
+    assert result["items"][0]["is_on_offer"] is True
 
 
 def test_catalog_search_falls_back_to_daily_index_and_reranks(monkeypatch) -> None:
@@ -373,6 +387,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
+    assert "Не го повтаряй във всеки отговор" in campaign["sales_tone"]
     assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
     founder_summary = result["founder_transfer_guidance"]["summary"]
     assert "съосновател" in founder_summary

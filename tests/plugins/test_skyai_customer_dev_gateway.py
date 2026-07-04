@@ -166,12 +166,24 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "EUR е първа цена" in prompt
     assert "съобрази temperament, възраст" in prompt
     assert "спокоен/по-зрял профил" in prompt
+    assert "търговец психолог" in prompt
+    assert "адаптирай се към поколението" in prompt
+    assert "С по-млад, неформален клиент" in prompt
+    assert "с по-улегнал клиент" in prompt
+    assert "емотикони като човешки акцент" in prompt
+    assert "бонуси, безплатна доставка, безплатна опаковка" in prompt
+    assert "рейтинг, популярност" in prompt
+    assert "не повтаряй един и същи коз механично" in prompt
     assert "най-близките географски смислени места" in prompt
     assert "максимум 3 различни посоки" in prompt
     assert "Не добавяй четвърти конкретен продукт" in prompt
     assert "избирай различни category_key" in prompt
     assert "не можеш да го покажеш и като card/link" in prompt
     assert "без суха опашка с terms/URL dump" in prompt
+    assert "обикновено представи конкретния бонус само веднъж" in prompt
+    assert "Не го повтаряй в следващия си отговор" in prompt
+    assert "клиентът реално се колебае около покупка" in prompt
+    assert "Ако клиентът каже, че вече е разбрал бонуса" in prompt
     assert "според условията" in prompt
     assert "BookNow е собствената директна резервационна система" in prompt
     assert "founder_transfer_guidance" in prompt

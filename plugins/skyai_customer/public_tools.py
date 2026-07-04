@@ -423,6 +423,41 @@ def _money_decimal_string(value: Any) -> str | None:
         return str(value)
 
 
+def _int_or_none(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _rating_value(item: dict[str, Any]) -> str | None:
+    value = (
+        item.get("rating")
+        or item.get("averageRating")
+        or item.get("avgRating")
+        or item.get("ratingValue")
+    )
+    if value is None or value == "":
+        return None
+    try:
+        return str(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    except Exception:
+        return str(value)
+
+
+def _is_on_offer(item: dict[str, Any], old_price_bgn: Any) -> bool | None:
+    explicit = _boolish(
+        item.get("isOnOffer")
+        or item.get("is_on_offer")
+        or item.get("hasDiscount")
+    )
+    if explicit is not None:
+        return explicit
+    return old_price_bgn is not None and old_price_bgn != ""
+
+
 def _safe_limit(limit: int | None) -> int:
     if not limit:
         return 8
@@ -1202,6 +1237,8 @@ def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
     slug = str(item.get("slug") or "").strip("/")
     price_bgn = item.get("price") or item.get("price_bgn") or item.get("priceBgn")
     price_eur = item.get("price_eur") or item.get("priceEur") or _money_bgn_to_eur(price_bgn)
+    old_price_bgn = item.get("oldPrice") or item.get("old_price") or item.get("regularPrice")
+    old_price_eur = item.get("oldPriceEur") or item.get("old_price_eur") or _money_bgn_to_eur(old_price_bgn)
     return {
         "id": item.get("id") or item.get("product_id"),
         "title": item.get("title") or item.get("name"),
@@ -1215,6 +1252,12 @@ def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
         "requested_location": item.get("_skyai_requested_location"),
         "price_bgn": _money_decimal_string(price_bgn),
         "price_eur": _money_decimal_string(price_eur),
+        "old_price_bgn": _money_decimal_string(old_price_bgn),
+        "old_price_eur": _money_decimal_string(old_price_eur),
+        "rating": _rating_value(item),
+        "rating_count": _int_or_none(item.get("ratingCount") or item.get("reviewsCount")),
+        "orders_count": _int_or_none(item.get("ordersCount")),
+        "is_on_offer": _is_on_offer(item, old_price_bgn),
         "duration": item.get("duration"),
         "participants": item.get("participants") or item.get("participant_count"),
         "provider": _provider_name(item.get("provider")),
@@ -1230,6 +1273,8 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
     metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
     price_bgn = source.get("price") or source.get("price_bgn") or source.get("priceBgn")
     price_eur = source.get("price_eur") or source.get("priceEur") or _money_bgn_to_eur(price_bgn)
+    old_price_bgn = source.get("oldPrice") or source.get("old_price") or source.get("regularPrice")
+    old_price_eur = source.get("oldPriceEur") or source.get("old_price_eur") or _money_bgn_to_eur(old_price_bgn)
     return {
         "id": source.get("id") or source.get("product_id"),
         "title": source.get("title") or source.get("name"),
@@ -1239,6 +1284,12 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
         "location_area": source.get("locationArea") or source.get("region"),
         "price_bgn": _money_decimal_string(price_bgn),
         "price_eur": _money_decimal_string(price_eur),
+        "old_price_bgn": _money_decimal_string(old_price_bgn),
+        "old_price_eur": _money_decimal_string(old_price_eur),
+        "rating": _rating_value(source),
+        "rating_count": _int_or_none(source.get("ratingCount") or source.get("reviewsCount")),
+        "orders_count": _int_or_none(source.get("ordersCount")),
+        "is_on_offer": _is_on_offer(source, old_price_bgn),
         "duration": source.get("duration"),
         "minimum_age": source.get("minimumAge") or source.get("min_age"),
         "maximum_weight": source.get("maximumWeight") or source.get("maxWeight"),
