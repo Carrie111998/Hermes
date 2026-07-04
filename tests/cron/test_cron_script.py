@@ -90,7 +90,7 @@ class TestRunJobScript:
         script = cron_env / "scripts" / "test.py"
         script.write_text('print("hello from script")\n')
 
-        success, output = _run_job_script(str(script))
+        success, output, stderr = _run_job_script(str(script))
         assert success is True
         assert output == "hello from script"
 
@@ -100,10 +100,47 @@ class TestRunJobScript:
         script = cron_env / "scripts" / "relative.py"
         script.write_text('print("relative works")\n')
 
-        success, output = _run_job_script("relative.py")
+        success, output, stderr = _run_job_script("relative.py")
         assert success is True
         assert output == "relative works"
 
+
+
+    def test_script_not_found(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        success, output, stderr = _run_job_script("nonexistent_script.py")
+        assert success is False
+        assert "not found" in output.lower()
+        assert stderr == ""
+
+    def test_script_nonzero_exit_splits_stdout_and_stderr(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "fail.py"
+        script.write_text(textwrap.dedent("""\
+            import sys
+            print("partial output")
+            print("error info", file=sys.stderr)
+            sys.exit(1)
+        """))
+
+        success, output, stderr = _run_job_script(str(script))
+        assert success is False
+        assert output == "partial output"
+        assert "Script exited with code 1" in stderr
+        assert "error info" in stderr
+
+    def test_script_empty_output(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "empty.py"
+        script.write_text("# no output\n")
+
+        success, output, stderr = _run_job_script(str(script))
+        assert success is True
+        assert output == ""
+        assert stderr == ""
 
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""
@@ -126,9 +163,10 @@ class TestRunJobScript:
             )
         )
 
-        success, output = _run_job_script("env_probe.py")
+        success, output, stderr = _run_job_script("env_probe.py")
         assert success is True
         assert output == "ABSENT"
+        assert stderr == ""
 
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         from cron import scheduler as sched_mod
@@ -162,10 +200,11 @@ class TestRunJobScript:
         monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
         monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
 
-        success, output = _run_job_script("probe.py")
+        success, output, stderr = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
+        assert stderr == ""
         assert captured["argv"] == [str(base_python), str(script.resolve())]
         assert captured["kwargs"]["creationflags"] == 0x08000000
         env = captured["kwargs"]["env"]
@@ -190,10 +229,11 @@ class TestRunJobScript:
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
         monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
 
-        success, output = _run_job_script("probe.py")
+        success, output, stderr = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
+        assert stderr == ""
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
@@ -297,16 +337,26 @@ class TestScriptPathContainment:
         outside_script = cron_env / "outside.py"
         outside_script.write_text('print("should not run")\n')
 
-        success, output = _run_job_script(str(outside_script))
+        success, output, stderr = _run_job_script(str(outside_script))
         assert success is False
         assert "blocked" in output.lower() or "outside" in output.lower()
 
+
+
+    def test_absolute_path_tmp_blocked(self, cron_env):
+        """Absolute paths to /tmp must be rejected."""
+        from cron.scheduler import _run_job_script
+
+        success, output, stderr = _run_job_script("/tmp/evil.py")
+        assert success is False
+        assert "blocked" in output.lower() or "outside" in output.lower()
+        assert stderr == ""
 
     def test_tilde_path_blocked(self, cron_env):
         """~ prefixed paths must be rejected (expanduser bypasses check)."""
         from cron.scheduler import _run_job_script
 
-        success, output = _run_job_script("~/evil.py")
+        success, output, stderr = _run_job_script("~/evil.py")
         assert success is False
         assert "blocked" in output.lower() or "outside" in output.lower()
 
@@ -314,7 +364,7 @@ class TestScriptPathContainment:
         """~/../../../tmp/evil.py must be rejected."""
         from cron.scheduler import _run_job_script
 
-        success, output = _run_job_script("~/../../../tmp/evil.py")
+        success, output, stderr = _run_job_script("~/../../../tmp/evil.py")
         assert success is False
         assert "blocked" in output.lower() or "outside" in output.lower()
 
@@ -322,7 +372,7 @@ class TestScriptPathContainment:
         """../../etc/passwd style traversal must still be blocked."""
         from cron.scheduler import _run_job_script
 
-        success, output = _run_job_script("../../etc/passwd")
+        success, output, stderr = _run_job_script("../../etc/passwd")
         assert success is False
         assert "blocked" in output.lower() or "outside" in output.lower()
 
@@ -333,7 +383,7 @@ class TestScriptPathContainment:
         script = cron_env / "scripts" / "good.py"
         script.write_text('print("ok")\n')
 
-        success, output = _run_job_script("good.py")
+        success, output, stderr = _run_job_script("good.py")
         assert success is True
         assert output == "ok"
 
@@ -346,10 +396,23 @@ class TestScriptPathContainment:
         script = subdir / "check.py"
         script.write_text('print("sub ok")\n')
 
-        success, output = _run_job_script("monitors/check.py")
+        success, output, stderr = _run_job_script("monitors/check.py")
         assert success is True
         assert output == "sub ok"
 
+
+
+    def test_absolute_path_inside_scripts_dir_allowed(self, cron_env):
+        """Absolute paths that resolve WITHIN scripts/ should work."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "abs_ok.py"
+        script.write_text('print("abs ok")\n')
+
+        success, output, stderr = _run_job_script(str(script))
+        assert success is True
+        assert output == "abs ok"
+        assert stderr == ""
 
     @pytest.mark.skipif(
         sys.platform == "win32",
@@ -367,7 +430,7 @@ class TestScriptPathContainment:
         link = cron_env / "scripts" / "sneaky.py"
         link.symlink_to(outside)
 
-        success, output = _run_job_script("sneaky.py")
+        success, output, stderr = _run_job_script("sneaky.py")
         assert success is False
         assert "blocked" in output.lower() or "outside" in output.lower()
 
