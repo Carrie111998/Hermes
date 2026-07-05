@@ -934,6 +934,11 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    "fallback_promotions": {
+        "enabled": True,
+        "providers": ["nous"],
+        "position": "prepend",
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
