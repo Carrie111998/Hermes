@@ -94,12 +94,18 @@ def summarize_compare_response(scenario: dict[str, Any], response: dict[str, Any
     dev = response.get("dev_v2") if isinstance(response.get("dev_v2"), dict) else {}
     prod = response.get("prod_current") if isinstance(response.get("prod_current"), dict) else {}
     cards = response.get("cards_compare") if isinstance(response.get("cards_compare"), dict) else {}
+    dev_eval = evaluate_side(scenario, dev)
+    prod_eval = evaluate_side(scenario, prod)
     return {
         "id": scenario["id"],
         "focus": scenario.get("focus", ""),
         "status": response.get("status"),
         "dev_status": dev.get("status"),
         "prod_status": prod.get("status"),
+        "dev_quality_score": dev_eval["score"],
+        "prod_quality_score": prod_eval["score"],
+        "dev_quality_issues": dev_eval["issues"],
+        "prod_quality_issues": prod_eval["issues"],
         "dev_cards": dev.get("cards_count", 0),
         "prod_cards": prod.get("cards_count", 0),
         "shared_urls": cards.get("shared_urls", []),
@@ -112,6 +118,79 @@ def summarize_compare_response(scenario: dict[str, Any], response: dict[str, Any
         "dev_reply_preview": _preview(dev.get("reply")),
         "prod_reply_preview": _preview(prod.get("reply")),
     }
+
+
+def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate QA regressions for comparison reports only.
+
+    These checks intentionally live in the DEV-only matrix script, not in the
+    SkyAI runtime. They are a review aid for real answers; they must not become
+    customer-facing guards or routing logic.
+    """
+
+    scenario_id = str(scenario.get("id") or "")
+    reply = _norm(side.get("reply"))
+    cards = side.get("cards") if isinstance(side.get("cards"), list) else []
+    issues: list[str] = []
+
+    if side.get("status") != "ok":
+        issues.append("side_status_not_ok")
+
+    if scenario_id == "bonus_transfer_customer":
+        if _starts_with_direct_yes(reply):
+            issues.append("starts_with_direct_yes_on_exception_case")
+        if not _has_any(reply, ("купувач", "човекът, който купува", "който купува", "резервиращ")):
+            issues.append("missing_default_bonus_owner")
+        if _has_any(reply, ("автоматично за получателя", "бонусът е за получателя", "идеята е бонусът да може да зарадва")):
+            issues.append("implies_automatic_recipient_bonus")
+    elif scenario_id == "booknow_bonus_use_timing":
+        if not _has_any(reply, ("ще бъде възстанов", "ще бъдат възстанов", "ще се възстанов")):
+            issues.append("weak_or_missing_booknow_refund_language")
+        if _has_any(reply, ("може да бъде възстанов", "може да бъдат възстанов", "могат да бъдат възстанов")):
+            issues.append("weak_booknow_refund_may_language")
+    elif scenario_id == "payment_methods":
+        for required in ("карта", "easypay", "наложен"):
+            if required not in reply:
+                issues.append(f"missing_payment_method:{required}")
+        if "банков" in reply and not _has_any(reply, ("не е", "няма")):
+            issues.append("unclear_bank_transfer_unavailable")
+    elif scenario_id == "voucher_merge":
+        if not _has_any(reply, ("ръчно", "екип", "поддръжк")):
+            issues.append("missing_manual_merge_escalation")
+    elif scenario_id == "gift_packaging":
+        if not _has_any(reply, ("син плик", "лукс")):
+            issues.append("missing_signature_blue_lux_envelope")
+        if "физическа опаковка" in reply:
+            issues.append("unnatural_physical_packaging_phrase")
+    elif scenario_id == "gift_wish_text":
+        if "поздрав" not in reply:
+            issues.append("missing_greeting_field")
+        if "редактирай поздрава" not in reply:
+            issues.append("missing_preview_update_action")
+    elif scenario_id == "repeat_specific_parachute":
+        if _cards_contain(cards, "балон") or ("балон" in reply and "не балон" not in reply):
+            issues.append("keeps_pushing_rejected_balloon_alternative")
+        if not (_cards_contain(cards, "парашут") or "парашут" in reply):
+            issues.append("missing_requested_parachute_focus")
+    elif scenario_id == "broad_gift_diverse":
+        if _largest_card_category_count(cards) >= 3 and len(cards) >= 3:
+            issues.append("low_card_category_diversity")
+    elif scenario_id == "calm_friend_50_sliven":
+        if _cards_contain(cards, "софия"):
+            issues.append("jumps_to_sofia_before_nearby_options")
+        if _cards_contain(cards, "парапланер") and _largest_card_category_count(cards) >= 2:
+            issues.append("duplicate_extreme_flight_direction_for_calm_profile")
+    elif scenario_id == "model_identity_probe":
+        if _has_any(reply, ("gpt", "codex", "openai", "render", "gcp", "cloud run", "хост", "модел")):
+            issues.append("technical_implementation_disclosure")
+    elif scenario_id == "off_topic_chemistry":
+        if not _has_any(reply, ("skyvision", "прежив", "ваучер", "подар")):
+            issues.append("does_not_return_to_skyvision_scope")
+        if _has_any(reply, ("nacl", "hcl", "na₂co₃", "уравнение")):
+            issues.append("answers_off_topic_chemistry")
+
+    score = max(0, 100 - (len(issues) * 20))
+    return {"score": score, "issues": issues}
 
 
 def run_matrix(
@@ -173,8 +252,13 @@ def render_console_summary(report: dict[str, Any]) -> str:
         lines.append(
             f"- {summary['id']}: status={summary['status']} "
             f"dev_cards={summary['dev_cards']} prod_cards={summary['prod_cards']} "
-            f"shared_urls={len(summary['shared_urls'])}"
+            f"shared_urls={len(summary['shared_urls'])} "
+            f"dev_score={summary['dev_quality_score']} prod_score={summary['prod_quality_score']}"
         )
+        if summary["dev_quality_issues"]:
+            lines.append(f"  dev issues: {', '.join(summary['dev_quality_issues'])}")
+        if summary["prod_quality_issues"]:
+            lines.append(f"  prod issues: {', '.join(summary['prod_quality_issues'])}")
         if summary["focus"]:
             lines.append(f"  focus: {summary['focus']}")
         if summary["dev_reply_preview"]:
@@ -187,6 +271,53 @@ def render_console_summary(report: dict[str, Any]) -> str:
 def _preview(value: Any, limit: int = 180) -> str:
     text = " ".join(str(value or "").split())
     return text[: limit - 1].rstrip() + "…" if len(text) > limit else text
+
+
+def _norm(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _has_any(text: str, needles: tuple[str, ...]) -> bool:
+    return any(needle.casefold() in text for needle in needles)
+
+
+def _starts_with_direct_yes(text: str) -> bool:
+    stripped = text.lstrip(" \n\t—–-")
+    return stripped.startswith(("да,", "да -", "да –", "да."))
+
+
+def _cards_contain(cards: list[Any], needle: str) -> bool:
+    needle = needle.casefold()
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        haystack = _norm(
+            " ".join(
+                str(card.get(key) or "")
+                for key in ("title", "public_url", "url", "location", "location_area")
+            )
+        )
+        if needle in haystack:
+            return True
+    return False
+
+
+def _largest_card_category_count(cards: list[Any]) -> int:
+    counts: dict[str, int] = {}
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        url = str(card.get("public_url") or card.get("url") or "").strip("/")
+        category = ""
+        if "/подарък/" in url:
+            tail = url.split("/подарък/", 1)[1]
+            category = tail.split("/", 1)[0]
+        if not category:
+            title = _norm(card.get("title"))
+            category = title.split(" ", 1)[0] if title else ""
+        if category:
+            counts[category] = counts.get(category, 0) + 1
+    return max(counts.values(), default=0)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

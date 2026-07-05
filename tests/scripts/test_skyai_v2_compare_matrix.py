@@ -75,6 +75,10 @@ def test_run_matrix_uses_injected_caller_and_summarizes_cards() -> None:
         "status": "ok",
         "dev_status": "ok",
         "prod_status": "ok",
+        "dev_quality_score": 100,
+        "prod_quality_score": 100,
+        "dev_quality_issues": [],
+        "prod_quality_issues": [],
         "dev_cards": 1,
         "prod_cards": 2,
         "shared_urls": ["https://skyvision.bg/подарък/a"],
@@ -100,6 +104,10 @@ def test_render_console_summary_contains_core_counts() -> None:
                     "status": "ok",
                     "dev_cards": 1,
                     "prod_cards": 2,
+                    "dev_quality_score": 80,
+                    "prod_quality_score": 100,
+                    "dev_quality_issues": ["example_issue"],
+                    "prod_quality_issues": [],
                     "shared_urls": ["x"],
                     "focus": "cards",
                     "dev_reply_preview": "DEV",
@@ -112,4 +120,58 @@ def test_render_console_summary_contains_core_counts() -> None:
     rendered = matrix.render_console_summary(report)
 
     assert "SkyAI v2 compare matrix: 1 scenarios" in rendered
-    assert "case1: status=ok dev_cards=1 prod_cards=2 shared_urls=1" in rendered
+    assert "case1: status=ok dev_cards=1 prod_cards=2 shared_urls=1 dev_score=80 prod_score=100" in rendered
+    assert "dev issues: example_issue" in rendered
+
+
+def test_evaluate_bonus_transfer_requires_default_buyer_owner() -> None:
+    scenario = {"id": "bonus_transfer_customer"}
+    side = {
+        "status": "ok",
+        "reply": "Да, идеята е бонусът да може да зарадва и човека, за когото купувате подаръка.",
+        "cards": [],
+    }
+
+    result = matrix.evaluate_side(scenario, side)
+
+    assert result["score"] == 40
+    assert result["issues"] == [
+        "starts_with_direct_yes_on_exception_case",
+        "missing_default_bonus_owner",
+        "implies_automatic_recipient_bonus",
+    ]
+
+
+def test_evaluate_booknow_refund_language_prefers_will_be_refunded() -> None:
+    scenario = {"id": "booknow_bonus_use_timing"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "При лошо време парите може да бъдат възстановени.",
+            "cards": [],
+        },
+    )
+
+    assert "weak_or_missing_booknow_refund_language" in result["issues"]
+    assert "weak_booknow_refund_may_language" in result["issues"]
+
+
+def test_evaluate_broad_gift_diversity_uses_cards_only_in_qa_script() -> None:
+    scenario = {"id": "broad_gift_diverse"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "Ето три идеи.",
+            "cards": [
+                {"title": "ATV 1", "public_url": "https://skyvision.bg/подарък/офроуд/a/"},
+                {"title": "ATV 2", "public_url": "https://skyvision.bg/подарък/офроуд/b/"},
+                {"title": "ATV 3", "public_url": "https://skyvision.bg/подарък/офроуд/c/"},
+            ],
+        },
+    )
+
+    assert result["issues"] == ["low_card_category_diversity"]
