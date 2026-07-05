@@ -15803,6 +15803,34 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5055, str(e))
 
 
+@method("wiki.changeset_diff")
+def _(rid, params: dict) -> dict:
+    """Return the unified git diff for a single changeset.
+
+    Params:
+        - ``id`` (str, required): changeset id from wiki.changesets.
+        - ``wiki`` (str, optional): wiki name (omit for default).
+
+    Returns ``{"diff": "<unified diff>", "changeset": {...}}``. When the wiki
+    isn't git-initialized (older captures), returns error code 5057 with the
+    changeset attached so clients can still show metadata.
+    """
+    try:
+        changeset_id = params.get("id")
+        if not changeset_id or not isinstance(changeset_id, str):
+            return _err(rid, 4001, "id must be a non-empty string")
+        wiki_path = resolve_wiki(params.get("wiki"))
+        from tui_gateway.wiki_api import wiki_changeset_diff
+
+        result = wiki_changeset_diff(changeset_id, wiki_path=wiki_path)
+        if "error" in result:
+            return _err(rid, 5057, result["error"])
+        return _ok(rid, result)
+    except Exception as e:
+        logger.exception("wiki.changeset_diff failed")
+        return _err(rid, 5056, str(e))
+
+
 @method("feed.get")
 def _(rid, params: dict) -> dict:
     """Return curated news feed from digest pipelines."""
