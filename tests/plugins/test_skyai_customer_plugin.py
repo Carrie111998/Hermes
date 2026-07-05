@@ -274,20 +274,21 @@ def test_catalog_ranking_diversifies_broad_discovery_without_hurting_specific_qu
     ranked = [
         {"id": 1, "title": "Офроуд разходка с АТВ до Пловдив", "category_slug": "офроуд-атв-под-наем"},
         {"id": 2, "title": "Офроуд с АТВ 200 CC в района на Пловдив", "category_slug": "офроуд-атв-под-наем"},
-        {"id": 3, "title": "Самостоятелен бънджи скок от балон - Пловдив", "category_slug": "скок-с-бънджи"},
+        {"id": 3, "title": "ОФРОУД ТУР С ЕЛЕКТРИЧЕСКИ МОТОР КРАЙ ПЛОВДИВ", "category_slug": "приключения-с-мотор"},
         {"id": 4, "title": "Дегустация на вино за двама в Пловдив", "category_slug": "винени-турове-дегустации"},
+        {"id": 5, "title": "Панорамно издигане с балон в Пловдив", "category_slug": "издигане-с-балон"},
     ]
 
     broad = public_tools._diversify_ranked_products(
         ranked,
-        tokens=["подарък", "мъж", "пловдив"],
+        traits=public_tools._query_traits("Търся подарък за мъж в Пловдив"),
     )
     specific = public_tools._diversify_ranked_products(
         ranked,
         tokens=["атв", "пловдив"],
     )
 
-    assert [item["id"] for item in broad[:3]] == [1, 3, 4]
+    assert [item["id"] for item in broad[:3]] == [1, 4, 5]
     assert [item["id"] for item in specific[:2]] == [1, 2]
 
 
@@ -487,6 +488,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "1-3 релевантни посоки" in sales_playbook["principles"][1]
     assert "public tool evidence" in sales_playbook["principles"][4]
     assert "Бонусният полет" in sales_playbook["skyvision_application"]
+    assert "различни усещания" in sales_playbook["skyvision_application"]
     assert "не keyword guard-и" in sales_playbook["guardrail"]
     campaign = result["active_campaigns"][0]
     assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
@@ -494,6 +496,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "човека, който купува или резервира" in campaign["customer_summary"]
     assert "благодарност от SkyVision към купувача" in campaign["sales_tone"]
     assert "Не добавяй terms/URL/legal детайли" in campaign["sales_tone"]
+    assert "любовта към летенето" in campaign["sales_tone"]
     assert campaign["bonus_owner"]["default"].startswith("човекът")
     assert "Не казвай, че бонусът автоматично е за получателя" in campaign["bonus_owner"]["do_not_say"]
     assert campaign["campaign_2026_facts"]["public_page"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
@@ -516,6 +519,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "съосновател" in founder_summary
     assert "пилот-инструктор" in founder_summary
     assert "Default-ът остава: бонусът е благодарност към купувача" in founder_summary
+    assert "човешки жест" in founder_summary
     assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
 
 
@@ -561,8 +565,13 @@ def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> Non
     assert result["delivery"]["courier"] == "Speedy"
     assert result["delivery"]["current_fee"] == "безплатна доставка"
     assert result["delivery"]["office_locator_url"] == "https://www.speedy.bg/bg/speedy-offices-automats"
+    assert "15:00" in result["delivery"]["dispatch_cutoff"]
+    assert "locator URL" in result["delivery"]["working_hours_guidance"]
     assert "EUR първо" in result["gift_voucher_presentation"]["answer_guidance"]
     assert result["payment_methods"]["online_checkout_options"] == ["Карта", "EasyPay", "Наложен платеж"]
+    assert result["payment_methods"]["cash_on_delivery"]["not_for"] == (
+        "електронен ваучер и директна BookNow резервация"
+    )
     assert result["payment_methods"]["bank_transfer"]["available_in_online_checkout"] is False
     assert result["payment_methods"]["bank_transfer"]["answer_only_if_asked"] is True
     assert "удължаване" in " ".join(result["vouchers"]["extension_flow"])

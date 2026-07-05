@@ -207,11 +207,15 @@ _EXTREME_PRODUCT_SIGNALS = frozenset(
         "адреналин",
         "акваланг",
         "атв",
+        "бъги",
         "бънджи",
         "гмуркане",
         "джет",
         "екстрем",
         "жирокоптер",
+        "каньон",
+        "катерене",
+        "каяк",
         "мотор",
         "офроуд",
         "парапланер",
@@ -220,7 +224,37 @@ _EXTREME_PRODUCT_SIGNALS = frozenset(
         "рафтинг",
         "самолет",
         "скок",
+        "sup",
         "стрелба",
+        "трактор",
+        "уиндсърф",
+        "шофиране",
+        "виа ферат",
+        "водни спортове",
+    }
+)
+_HIGH_ADRENALINE_PRODUCT_SIGNALS = frozenset(
+    {
+        "акваланг",
+        "бънджи",
+        "гмуркане",
+        "джет",
+        "екстрем",
+        "парашут",
+        "рафтинг",
+        "скок",
+        "стрелба",
+    }
+)
+_ADRENALINE_QUERY_SIGNALS = frozenset(
+    {
+        "адреналин",
+        "екстрем",
+        "силно",
+        "силна",
+        "приключение",
+        "приключенски",
+        "скок",
     }
 )
 
@@ -716,12 +750,26 @@ def _diversify_ranked_products(
     selected: list[dict[str, Any]] = []
     deferred: list[dict[str, Any]] = []
     seen_generic_families: set[str] = set()
+    seen_broad_vibes: set[str] = set()
     for item in ranked:
         family = _product_family_key(item)
+        vibe = _product_broad_vibe_key(item)
+        family_matches_query = _product_family_matches_query(family, traits.tokens)
+        if (
+            traits.broad_discovery
+            and not family_matches_query
+            and vibe
+            and vibe in seen_broad_vibes
+            and len(selected) < 4
+        ):
+            deferred.append(item)
+            continue
         if not family or _product_family_matches_query(family, traits.tokens) or family not in seen_generic_families:
             selected.append(item)
-            if family and not _product_family_matches_query(family, traits.tokens):
+            if family and not family_matches_query:
                 seen_generic_families.add(family)
+            if traits.broad_discovery and vibe and not family_matches_query:
+                seen_broad_vibes.add(vibe)
             continue
         deferred.append(item)
     return [*selected, *deferred]
@@ -777,6 +825,36 @@ def _product_family_matches_query(family: str, tokens: list[str]) -> bool:
     if not family or not tokens:
         return False
     return any(token in family for token in tokens)
+
+
+def _product_broad_vibe_key(item: dict[str, Any]) -> str:
+    text = _normalize_search_text(
+        " ".join(
+            str(value or "")
+            for value in (
+                item.get("category_slug"),
+                item.get("categorySlug"),
+                item.get("slug"),
+                item.get("title"),
+                item.get("name"),
+            )
+        )
+    )
+    if any(signal in text for signal in ("атв", "offroad", "офроуд", "мотор", "джет", "бъги")):
+        return "active-drive"
+    if any(signal in text for signal in ("парашут", "бънджи", "стрелба", "рафтинг")):
+        return "adrenaline"
+    if any(signal in text for signal in ("парапланер", "жирокоптер", "самолет", "балон", "полет")):
+        return "flight"
+    if any(signal in text for signal in ("спа", "spa", "масаж", "релакс", "уелнес", "флотация", "терапия")):
+        return "relax"
+    if any(signal in text for signal in ("вино", "винен", "дегустация", "гурме", "вечеря", "кулинар")):
+        return "gourmet"
+    if any(signal in text for signal in ("рисув", "арт", "творчес", "курс", "работилница")):
+        return "creative"
+    if any(signal in text for signal in ("нощув", "почивка", "уикенд", "хотел")):
+        return "stay"
+    return _product_family_key(item)
 
 
 def _query_traits(query: str) -> QueryTraits:
@@ -958,6 +1036,10 @@ def _product_relevance_score(
             score += 1.0
     score += _location_relevance_score(item, traits)
     score += _recipient_fit_score(title=title, slug=slug, detail=detail, traits=traits)
+    if traits.broad_discovery and not any(token in _ADRENALINE_QUERY_SIGNALS for token in tokens):
+        high_adrenaline_hits = sum(1 for signal in _HIGH_ADRENALINE_PRODUCT_SIGNALS if signal in combined)
+        if high_adrenaline_hits:
+            score -= min(10.0, high_adrenaline_hits * 5.0)
     if max_price_eur is not None:
         price_eur = _product_price_eur(item)
         if price_eur is not None:
@@ -1228,7 +1310,9 @@ def handle_skyai_campaign_knowledge(
             "skyvision_application": (
                 "Бонусният полет, безплатната доставка, опаковките, BookNow, rating/цена и ваучерът на стойност "
                 "са sales аргументи, които SkyAI избира по търговско усещане според разговора. "
-                "Не ги изреждай всички и не повтаряй един и същи коз, ако клиентът не проявява интерес към него."
+                "Не ги изреждай всички и не повтаряй един и същи коз, ако клиентът не проявява интерес към него. "
+                "При широко търсене целта е да дадеш различни усещания за подарък, не три активни варианти "
+                "с различни имена."
             ),
             "guardrail": "Това са общи поведенчески принципи, не keyword guard-и и не route правила.",
         },
@@ -1246,7 +1330,9 @@ def handle_skyai_campaign_knowledge(
                     "и като покана лично да усети магията на летенето. В sales разговор може да го споменеш "
                     "кратко още в първия полезен отговор, защото клиентът може да не зададе втори въпрос. "
                     "Не го повтаряй във всеки отговор и не го вкарвай, ако клиентът пита за чист support казус. "
-                    "Не добавяй terms/URL/legal детайли, освен ако клиентът сам пита за условия или eligibility."
+                    "Не добавяй terms/URL/legal детайли, освен ако клиентът сам пита за условия или eligibility. "
+                    "Звучи като човек от екипа: SkyVision започва от любовта към летенето и бонусът е начин "
+                    "да споделим тази емоция с хората, които ни избират."
                 ),
                 "bonus_owner": {
                     "default": "човекът, който прави успешната поръчка или BookNow резервация",
@@ -1322,7 +1408,8 @@ def handle_skyai_campaign_knowledge(
                 "такива случаи. Default-ът остава: бонусът е благодарност към купувача. Ако клиентът "
                 "изрично поиска получателят на подаръка да използва бонуса, SkyAI може топло да каже, "
                 "че Емил лично разглежда такива молби, защото мисията на SkyVision е да прави хората "
-                "щастливи и да споделя любовта към летенето."
+                "щастливи и да споделя любовта към летенето. Това не е сухо изключение, а човешки жест "
+                "от основателя към клиент, който иска да зарадва близък човек."
             ),
             "public_founder_contact": "+359 886 417 142",
         },
@@ -1410,12 +1497,25 @@ def handle_skyai_support_knowledge(
                 "След това избира конкретния офис или автомат от падащото меню.",
                 "Не е добре просто да се изпише адресът на офис на Speedy като обикновен адрес, защото пратката може да не бъде разпозната като офис/автомат и да се забави.",
             ],
+            "dispatch_cutoff": (
+                "Физически ваучери, поръчани в работен ден до 15:00, обичайно се обработват и предават "
+                "на куриер същия ден; след 15:00 или през уикенд/празник - на първия следващ работен ден."
+            ),
             "working_hours_guidance": (
-                "Работното време зависи от конкретния офис/автомат и трябва да се провери в Speedy локатора."
+                "Работното време зависи от конкретния офис/автомат и трябва да се провери в Speedy локатора. "
+                "Когато клиентът пита за офис/автомат, дай locator URL за удобство."
             ),
         },
         "payment_methods": {
             "online_checkout_options": ["Карта", "EasyPay", "Наложен платеж"],
+            "cash_on_delivery": {
+                "available_for": "печатен/хартиен ваучер с доставка, когато checkout-ът показва опцията",
+                "not_for": "електронен ваучер и директна BookNow резервация",
+                "guidance": (
+                    "Ако клиентът пита общо как се плаща, кажи карта, EasyPay и наложен платеж при доставка, "
+                    "ако е наличен за конкретната поръчка."
+                ),
+            },
             "bank_transfer": {
                 "available_in_online_checkout": False,
                 "answer_only_if_asked": True,

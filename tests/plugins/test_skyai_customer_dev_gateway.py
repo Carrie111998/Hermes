@@ -195,9 +195,12 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "работи консултативно, не като каталог с реплики" in prompt
     assert "ако клиентът уточни нещо" in prompt
     assert "1-3 релевантни посоки" in prompt
+    assert "различно усещане за подаръка" in prompt
+    assert "не две близки версии на offroad/мотор/адреналин" in prompt
     assert "Персонализирай само по това, което клиентът доброволно казва" in prompt
     assert "Всяка препоръка трябва да има причина" in prompt
     assert "един релевантен търговски коз" in prompt
+    assert "благодарност от хората зад SkyVision" in prompt
     assert "не ги изреждай всички" in prompt
     assert "бонуси, безплатна доставка, безплатна опаковка" in prompt
     assert "рейтинг, популярност" in prompt
@@ -214,6 +217,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "не изписва конкретна услуга" in prompt
     assert "включи public_url от value_voucher_option" in prompt
     assert "избирай различни category_key" in prompt
+    assert "Не давай две близки версии на offroad/мотор/ATV" in prompt
     assert "не можеш да го покажеш и като card/link" in prompt
     assert "без суха опашка с terms/URL dump" in prompt
     assert "обикновено представи конкретния бонус само веднъж" in prompt
@@ -229,12 +233,15 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "без първо да купува ваучер" in prompt
     assert "парите могат да бъдат възстановени" in prompt
     assert "резервацията може да бъде възстановена" in prompt
+    assert "кратко и човешки" in prompt
     assert "founder_transfer_guidance" in prompt
     assert "Емил Ломлиев" in prompt
     assert "бонусният полет" in prompt
     assert "по правило това е благодарност" in prompt
     assert "към човека, който купува или резервира" in prompt
     assert "не автоматично подарък за получателя" in prompt
+    assert "покажи само най-точните 1-2 варианта" in prompt
+    assert "не решавай учебни задачи" in prompt
 
 
 def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> None:
