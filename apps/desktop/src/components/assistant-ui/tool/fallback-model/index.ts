@@ -1,5 +1,6 @@
 import { type ToolTitleKey, translateNow } from '@/i18n'
 import { normalizeExternalUrl } from '@/lib/external-link'
+import { redactSensitiveValue } from '@/lib/secret-redaction'
 import { summarizeShellCommand } from '@/lib/summarize-command'
 import { capitalize, normalize } from '@/lib/text'
 import { extractToolErrorMessage, formatToolResultSummary } from '@/lib/tool-result-summary'
@@ -1182,8 +1183,8 @@ export function toolCopyPayload(part: ToolPart, view: ToolView): { label: string
     generic: translateNow('common.copy')
   }
 
-  const args = parseMaybeObject(part.args)
-  const result = parseMaybeObject(part.result)
+  const args = parseMaybeObject(redactSensitiveValue(part.args))
+  const result = parseMaybeObject(redactSensitiveValue(part.result))
   const detail = view.detail.trim()
   const hasSubstantialOutput = detail.length > 16
 
@@ -1391,23 +1392,29 @@ function dynamicTitle(
 }
 
 export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
-  const argsRecord = parseMaybeObject(part.args)
-  const resultRecord = parseMaybeObject(part.result)
+  const safePart: ToolPart = {
+    ...part,
+    args: redactSensitiveValue(part.args),
+    result: redactSensitiveValue(part.result)
+  }
+
+  const argsRecord = parseMaybeObject(safePart.args)
+  const resultRecord = parseMaybeObject(safePart.result)
   const meta = toolMeta(part.toolName)
-  const status = toolStatus(part, resultRecord)
-  const error = toolErrorText(part, resultRecord)
-  const baseTitle = part.result === undefined ? meta.pending : meta.done
+  const status = toolStatus(safePart, resultRecord)
+  const error = toolErrorText(safePart, resultRecord)
+  const baseTitle = safePart.result === undefined ? meta.pending : meta.done
 
   const titleParts = dynamicTitle(
-    part,
+    safePart,
     argsRecord,
     resultRecord,
-    titlePartsFromAction(baseTitle, part.result === undefined ? meta.pendingAction : undefined)
+    titlePartsFromAction(baseTitle, safePart.result === undefined ? meta.pendingAction : undefined)
   )
 
   const title = titleParts.title
   const titleEnriched = title !== baseTitle
-  const baseSubtitle = error || toolSubtitle(part, argsRecord, resultRecord)
+  const baseSubtitle = error || toolSubtitle(safePart, argsRecord, resultRecord)
 
   const keepSubtitleWithTitle =
     part.toolName === 'terminal' ||
@@ -1415,7 +1422,7 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
     (isFileEditTool(part.toolName) && Boolean(baseSubtitle.trim()))
 
   const subtitle = titleEnriched && !error && !keepSubtitleWithTitle ? '' : baseSubtitle
-  const detailBody = stripDividerLines(toolDetailText(part, argsRecord, resultRecord))
+  const detailBody = stripDividerLines(toolDetailText(safePart, argsRecord, resultRecord))
 
   const detail = error
     ? [error, detailBody]
@@ -1425,14 +1432,14 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
     : detailBody
 
   const searchHits =
-    part.toolName === 'web_search' && status !== 'error' ? extractSearchResults(part.result) : undefined
+    safePart.toolName === 'web_search' && status !== 'error' ? extractSearchResults(safePart.result) : undefined
 
   const searchQuery =
     part.toolName === 'web_search'
       ? firstStringField(argsRecord, ['search_term', 'query']) || contextValue(argsRecord)
       : ''
 
-  const resultCount = status === 'error' ? null : toolResultCount(part, argsRecord, resultRecord)
+  const resultCount = status === 'error' ? null : toolResultCount(safePart, argsRecord, resultRecord)
 
   // For shell/code tools we surface stdout and stderr as separate labeled
   // streams in the renderer. Many CLIs use stderr for informational
