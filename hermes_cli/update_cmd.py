@@ -3871,6 +3871,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 (result for result in runtime_repairs if result.repaired),
                 None,
             )
+            runtime_restart_required = (
+                runtime_repaired is not None and not _m()._is_windows()
+            )
 
             # A current checkout does NOT imply a healthy install: a previous
             # dependency sync may have failed partway (classic on Windows,
@@ -3921,7 +3924,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
             else:
                 print("✓ Already up to date!")
-            if runtime_repaired is not None and not _m()._is_windows():
+                if not runtime_restart_required:
+                    print("✓ Update complete!")
+            if runtime_restart_required:
                 print()
                 print(
                     "⚠ Restart required to finish the managed Python runtime repair."
