@@ -292,6 +292,69 @@ def test_catalog_ranking_diversifies_broad_discovery_without_hurting_specific_qu
     assert [item["id"] for item in specific[:2]] == [1, 2]
 
 
+def test_catalog_search_caps_narrow_specific_queries(monkeypatch) -> None:
+    public_tools._CATALOG_INDEX_CACHE["items"] = None
+    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
+
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        if "скок" in url or url.endswith("search="):
+            return {
+                "data": [
+                    {
+                        "id": 10,
+                        "name": "Самостоятелен бънджи скок от балон - Проходна",
+                        "price": "136.91",
+                        "slug": "скок-с-бънджи/от-балон-за-един-проходна",
+                        "locationName": "Проходна",
+                    },
+                    {
+                        "id": 11,
+                        "name": "Тандемен бънджи скок от балон - Проходна",
+                        "price": "234.70",
+                        "slug": "скок-с-бънджи/на-проходна-от-балон-в-тандем",
+                        "locationName": "Проходна",
+                    },
+                    {
+                        "id": 1,
+                        "name": "Тандемен скок с парашут от 3000 м – София",
+                        "price": "389.21",
+                        "slug": "тандем-скок-с-парашут/тандемен-скок-с-парашут-софия",
+                        "locationName": "Сапарева баня",
+                    },
+                    {
+                        "id": 2,
+                        "name": "Тандемен скок с парашут - София",
+                        "price": "449",
+                        "slug": "тандем-скок-с-парашут/скок-с-парашут-софия",
+                        "locationName": "Сапарева баня",
+                    },
+                    {
+                        "id": 3,
+                        "name": "Любов на висота: 2 тандемни скока с парашут - София",
+                        "price": "760.75",
+                        "slug": "тандем-скок-с-парашут/любов-на-висота-2-скока-с-парашут",
+                        "locationName": "Сапарева баня",
+                    },
+                ]
+            }
+        return {"data": []}
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_catalog_search(
+        query="Не, държа да е точно скок с парашут, не балон или друго летене.",
+        limit=3,
+    )
+
+    assert [item["title"] for item in result["items"]] == [
+        "Тандемен скок с парашут от 3000 м – София",
+        "Тандемен скок с парашут - София",
+    ]
+    assert "балон" not in public_tools._query_traits(
+        "Не, държа да е точно скок с парашут, не балон или друго летене."
+    ).tokens
+
+
 def test_query_traits_detects_50_plus_recipient() -> None:
     traits = public_tools._query_traits(
         "Подаръкът е за спокойна и позитивна приятелка, 50+."

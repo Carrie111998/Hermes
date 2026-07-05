@@ -195,6 +195,8 @@ _MULTI_RECIPIENT_GIFT_SIGNALS = frozenset(
 )
 _TWO_PERSON_PRODUCT_SIGNALS = frozenset(
     {
+        "2 скока",
+        "2 тандемни",
         "за двама",
         "двама",
         "двойка",
@@ -255,6 +257,43 @@ _ADRENALINE_QUERY_SIGNALS = frozenset(
         "приключение",
         "приключенски",
         "скок",
+    }
+)
+_NARROW_SPECIFIC_QUERY_SIGNALS = frozenset(
+    {
+        "атв",
+        "бъги",
+        "бънджи",
+        "джет",
+        "жирокоптер",
+        "парапланер",
+        "парашут",
+        "самолет",
+        "скок",
+    }
+)
+_REQUIRED_NARROW_PRODUCT_SIGNALS = frozenset(
+    {
+        "атв",
+        "бъги",
+        "бънджи",
+        "джет",
+        "жирокоптер",
+        "парапланер",
+        "парашут",
+        "самолет",
+    }
+)
+_NEGATABLE_PRODUCT_TOKENS = frozenset(
+    {
+        *_NARROW_SPECIFIC_QUERY_SIGNALS,
+        "балон",
+        "летене",
+        "полет",
+        "офроуд",
+        "масаж",
+        "релакс",
+        "спа",
     }
 )
 
@@ -596,6 +635,8 @@ def _catalog_search_candidates(
     max_price_eur: float | None,
     limit: int,
 ) -> list[dict[str, Any]]:
+    traits = _query_traits(query)
+    effective_limit = _effective_catalog_result_limit(traits, requested_limit=limit)
     merged = _dedupe_products(direct_items)
     if query.strip():
         try:
@@ -603,14 +644,26 @@ def _catalog_search_candidates(
         except Exception:
             pass
     if not query.strip():
-        return _filter_products_by_budget(merged, min_price_eur, max_price_eur)[:limit]
+        return _filter_products_by_budget(merged, min_price_eur, max_price_eur)[:effective_limit]
     ranked = _rank_products(
         merged,
         query=query,
         min_price_eur=min_price_eur,
         max_price_eur=max_price_eur,
     )
-    return ranked[:limit]
+    return ranked[:effective_limit]
+
+
+def _effective_catalog_result_limit(traits: QueryTraits, *, requested_limit: int) -> int:
+    if requested_limit <= 2:
+        return requested_limit
+    if traits.broad_discovery:
+        return requested_limit
+    if any(token in _MULTI_RECIPIENT_GIFT_SIGNALS for token in traits.tokens):
+        return requested_limit
+    if any(token in _NARROW_SPECIFIC_QUERY_SIGNALS for token in traits.tokens):
+        return 2
+    return requested_limit
 
 
 def _catalog_location_context(items: list[dict[str, Any]], traits: QueryTraits) -> dict[str, Any] | None:
@@ -1021,6 +1074,15 @@ def _product_relevance_score(
     )
     combined = f"{title} {slug} {location} {provider} {detail}"
     score = 0.0
+    required_narrow_tokens = [token for token in tokens if token in _REQUIRED_NARROW_PRODUCT_SIGNALS]
+    if required_narrow_tokens and not any(token in combined for token in required_narrow_tokens):
+        score -= 80.0
+    if (
+        required_narrow_tokens
+        and not any(token in _MULTI_RECIPIENT_GIFT_SIGNALS for token in tokens)
+        and any(signal in combined for signal in _TWO_PERSON_PRODUCT_SIGNALS)
+    ):
+        score -= 14.0
     for token in tokens:
         if token in title:
             score += 8.0
@@ -1128,7 +1190,12 @@ def _query_tokens(query: str) -> list[str]:
     normalized = _normalize_search_text(query)
     raw_tokens = re.findall(r"[a-zа-я0-9]+", normalized, flags=re.IGNORECASE)
     tokens: list[str] = []
+    previous_token = ""
     for token in raw_tokens:
+        if previous_token in {"не", "без"} and token in _NEGATABLE_PRODUCT_TOKENS:
+            previous_token = token
+            continue
+        previous_token = token
         if token.isdigit() or token in _QUERY_STOPWORDS:
             continue
         if len(token) <= 2 and token not in {"atv", "спа", "spa"}:

@@ -46,6 +46,7 @@ MAX_HISTORY_TURNS = 12
 DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 DISCORD_MESSAGE_LIMIT = 1900
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
+MAX_VISIBLE_PRODUCT_CARDS = 3
 SKYAI_SALES_PLAYBOOK = (
     "SkyAI sales playbook: работи консултативно, не като каталог с реплики. "
     "Започни от нуждата на клиента, повода, човека, бюджета, локацията и емоцията, "
@@ -1314,7 +1315,7 @@ async def build_chat_response(
         settings,
     )
     reply, runner_cards = _coerce_runner_result(runner_result)
-    cards = runner_cards or await asyncio.to_thread(build_cards_from_reply, reply)
+    cards = (runner_cards or await asyncio.to_thread(build_cards_from_reply, reply))[:MAX_VISIBLE_PRODUCT_CARDS]
     latency_ms = int((time.monotonic() - started) * 1000)
 
     return {
@@ -1347,7 +1348,7 @@ def _coerce_runner_result(result: Any) -> tuple[str, list[dict[str, Any]]]:
     return str(result or "").strip(), []
 
 
-def build_cards_from_reply(reply: str, *, limit: int = 4) -> list[dict[str, Any]]:
+def build_cards_from_reply(reply: str, *, limit: int = MAX_VISIBLE_PRODUCT_CARDS) -> list[dict[str, Any]]:
     cards: list[dict[str, Any]] = []
     seen: set[str] = set()
     for url in _extract_product_urls(reply):
