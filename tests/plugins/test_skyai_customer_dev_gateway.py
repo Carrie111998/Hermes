@@ -205,8 +205,10 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "не е заповед какво да кажеш" in prompt
     assert "балансирай релевантност и дистанция" in prompt
     assert "започни направо с желаната посока" in prompt
-    assert "не прави disclaimer списък" in prompt
+    assert "positive-only" in prompt
+    assert "не използвай конструкции от типа 'без X/Y'" in prompt
     assert "бонусът е благодарност към купувача/резервиращия" in prompt
+    assert "първо обясни правилото с думите купувачът/резервиращият" in prompt
     assert "бонусът е за купувача/резервиращия" in prompt
     assert "Не започвай с директно 'да'" in prompt
     assert "Не представяй бонуса като автоматичен подарък" in prompt
