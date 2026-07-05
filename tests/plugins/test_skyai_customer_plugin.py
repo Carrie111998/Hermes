@@ -560,6 +560,8 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "благодарност от SkyVision към купувача" in campaign["sales_tone"]
     assert "Не добавяй terms/URL/legal детайли" in campaign["sales_tone"]
     assert "любовта към летенето" in campaign["sales_tone"]
+    assert "Емил и Малина" in campaign["brand_story_tone"]
+    assert "ДНК-то на бранда" in campaign["brand_story_tone"]
     assert campaign["bonus_owner"]["default"].startswith("човекът")
     assert "Не казвай, че бонусът автоматично е за получателя" in campaign["bonus_owner"]["do_not_say"]
     assert campaign["campaign_2026_facts"]["public_page"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
@@ -583,6 +585,11 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "пилот-инструктор" in founder_summary
     assert "Default-ът остава: бонусът е благодарност към купувача" in founder_summary
     assert "човешки жест" in founder_summary
+    flow = result["founder_transfer_guidance"]["customer_facing_flow"]
+    assert any("Първо потвърди ясно default-а" in item for item in flow)
+    assert any("Емил Ломлиев, съосновател" in item for item in flow)
+    assert any("Не казвай само „Емо“" in item for item in flow)
+    assert "летенето е нашето ДНК" in result["founder_transfer_guidance"]["tone_anchors"]
     assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
 
 

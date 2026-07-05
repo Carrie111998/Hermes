@@ -236,6 +236,9 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "кратко и човешки" in prompt
     assert "founder_transfer_guidance" in prompt
     assert "Емил Ломлиев" in prompt
+    assert "летенето е лично за SkyVision" in prompt
+    assert "човешки жест" in prompt
+    assert "Не казвай само „Емо“" in prompt
     assert "бонусният полет" in prompt
     assert "по правило това е благодарност" in prompt
     assert "към човека, който купува или резервира" in prompt
