@@ -204,10 +204,15 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "Catalog tool-ът връща кандидати" in prompt
     assert "не е заповед какво да кажеш" in prompt
     assert "балансирай релевантност и дистанция" in prompt
+    assert "не продължавай да продаваш вече отхвърлената идея" in prompt
     assert "бонусът е благодарност към купувача/резервиращия" in prompt
+    assert "бонусът е за купувача/резервиращия" in prompt
+    assert "Не започвай с директно 'да'" in prompt
     assert "Не представяй бонуса като автоматичен подарък" in prompt
     assert "BookNow е директна резервация" in prompt
     assert "парите ще бъдат възстановени" in prompt
+    assert "не като несигурна възможност" in prompt
+    assert "представи се само като SkyAI" in prompt
     assert "не решавай учебни задачи" in prompt
     assert len(prompt) < 5000
     assert "силно попадение" not in prompt
