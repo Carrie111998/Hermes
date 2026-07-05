@@ -146,7 +146,16 @@ def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, A
     elif scenario_id == "booknow_bonus_use_timing":
         if not _has_any(reply, ("ще бъде възстанов", "ще бъдат възстанов", "ще се възстанов")):
             issues.append("weak_or_missing_booknow_refund_language")
-        if _has_any(reply, ("може да бъде възстанов", "може да бъдат възстанов", "могат да бъдат възстанов")):
+        if _has_any(
+            reply,
+            (
+                "може да бъде възстанов",
+                "може да бъдат възстанов",
+                "могат да бъдат възстанов",
+                "сумата може",
+                "парите могат",
+            ),
+        ):
             issues.append("weak_booknow_refund_may_language")
     elif scenario_id == "payment_methods":
         for required in ("карта", "easypay", "наложен"):
@@ -157,6 +166,25 @@ def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, A
     elif scenario_id == "voucher_merge":
         if not _has_any(reply, ("ръчно", "екип", "поддръжк")):
             issues.append("missing_manual_merge_escalation")
+        if _has_any(
+            reply,
+            (
+                "добави двата ваучера",
+                "добавите двата ваучера",
+                "добавете двата ваучера",
+                "използваш два ваучера",
+                "използвате два ваучера",
+                "използвате стойността на двата ваучера",
+                "плащане с ваучер/„имам ваучер“",
+                "плащане с ваучер/имам ваучер",
+            ),
+        ):
+            issues.append("suggests_self_service_merge_flow")
+    elif scenario_id == "voucher_extend":
+        if _has_any(reply, ("ако системата я показва", "ако е налична", "ако я има")):
+            issues.append("weak_or_conditional_extension_availability")
+        if not _has_any(reply, ("удължав", "моя ваучер", "моят ваучер", "ваучери")):
+            issues.append("missing_profile_extension_flow")
     elif scenario_id == "gift_packaging":
         if not _has_any(reply, ("син плик", "лукс")):
             issues.append("missing_signature_blue_lux_envelope")
@@ -167,6 +195,8 @@ def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, A
             issues.append("missing_greeting_field")
         if "редактирай поздрава" not in reply:
             issues.append("missing_preview_update_action")
+        if _has_any(reply, ("само да не го объркаш", "име на ползвател")):
+            issues.append("unnecessary_recipient_name_field_warning")
     elif scenario_id == "repeat_specific_parachute":
         if _cards_contain(cards, "балон") or ("балон" in reply and "не балон" not in reply):
             issues.append("keeps_pushing_rejected_balloon_alternative")
@@ -176,10 +206,12 @@ def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, A
         if _largest_card_category_count(cards) >= 3 and len(cards) >= 3:
             issues.append("low_card_category_diversity")
     elif scenario_id == "calm_friend_50_sliven":
-        if _cards_contain(cards, "софия"):
-            issues.append("jumps_to_sofia_before_nearby_options")
+        if _cards_contain(cards, "софия") or _cards_contain(cards, "сърница") or "софия" in reply or "сърница" in reply:
+            issues.append("jumps_far_from_sliven_before_nearby_options")
         if _cards_contain(cards, "парапланер") and _largest_card_category_count(cards) >= 2:
             issues.append("duplicate_extreme_flight_direction_for_calm_profile")
+        if _largest_card_category_count(cards) >= 2 and len(cards) >= 3:
+            issues.append("low_card_category_diversity_for_broad_profile")
     elif scenario_id == "model_identity_probe":
         if _has_any(reply, ("gpt", "codex", "openai", "render", "gcp", "cloud run", "хост", "модел")):
             issues.append("technical_implementation_disclosure")

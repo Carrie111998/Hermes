@@ -475,6 +475,14 @@ def _catalog_search_candidates(
 def _catalog_location_context(items: list[dict[str, Any]], evidence: QueryEvidence) -> dict[str, Any] | None:
     if not evidence.requested_location:
         return None
+    nearest_items = sorted(
+        (
+            _sanitize_product_summary(item)
+            for item in items
+            if isinstance(item.get("_skyai_distance_km"), int)
+        ),
+        key=lambda item: int(item.get("distance_from_requested_location_km") or 9999),
+    )[:5]
     distances = sorted(
         {
             int(distance)
@@ -493,6 +501,7 @@ def _catalog_location_context(items: list[dict[str, Any]], evidence: QueryEviden
         "nearest_returned_distance_km": distances[0],
         "farthest_returned_distance_km": distances[-1],
         "returned_distance_km_values": distances[:12],
+        "nearest_returned_items": nearest_items,
         "distance_metadata_available": True,
         "reasoning_owner": "hermes",
     }
@@ -1042,7 +1051,6 @@ def handle_skyai_support_knowledge(
                 "При покупка на ваучер клиентът избира бланка и може да попълни поле „Поздрав“.",
                 "Полето „Поздрав“ е личното пожелание и се показва веднага в интерактивния preview на ваучера.",
                 "След въвеждане или промяна на пожеланието клиентът натиска „Редактирай поздрава“, за да се обнови preview-то.",
-                "Полето „Име на ползвател“ е отделно от пожеланието.",
                 "Ако пожеланието трябва да се коригира след поръчка, това може да стане от панела или през екипа на SkyVision, докато ваучерът още не е подготвен/изпратен.",
             ],
             "packaging_options": [
@@ -1074,7 +1082,6 @@ def handle_skyai_support_knowledge(
             "display_facts": {
                 "voucher_blank": "визията/темата на самия ваучер",
                 "greeting": "личното пожелание в поле „Поздрав“",
-                "recipient_name": "отделно поле „Име на ползвател“",
                 "packaging": "плик/опаковка за хартиен ваучер или електронен ваучер за имейл",
                 "price_display": "EUR е основната цена; BGN е вторична стойност.",
             },
@@ -1107,18 +1114,20 @@ def handle_skyai_support_knowledge(
             },
         },
         "vouchers": {
+            "profile_extension_available": True,
             "extension_steps": [
                 "Клиентът влиза в профила си в SkyVision.",
                 "Отваря „Моят ваучер“/„Ваучери“ и добавя ваучера, ако още не е добавен.",
-                "Отваря конкретния ваучер и използва наличната опция за удължаване, ако системата я показва.",
-                "Ако опцията не се вижда, има проблем или ваучерът е в особен статус, екипът на SkyVision обработва казуса с номер на ваучера/поръчката.",
+                "Отваря конкретния ваучер и използва опцията за удължаване.",
+                "Ако има проблем, особен статус или клиентът не успява да завърши удължаването, екипът на SkyVision обработва казуса с номер на ваучера/поръчката.",
             ],
-            "combine_or_use_multiple_vouchers_steps": [
-                "Клиентът добавя двата ваучера в профила си от „Ваучери“.",
-                "Стойността им се използва като ваучерна стойност/депозит в SkyVision профила.",
-                "След това избира преживяване, минава през „Резервирай/BookNow“ и избира „Имам ваучер“.",
-                "Когато целта е два ваучера да бъдат обединени в един ваучер, това не е автоматична self-service операция и се прави ръчно от екипа на SkyVision.",
-            ],
+            "merge_two_vouchers_into_one": {
+                "self_service_available": False,
+                "handled_by": "екипа на SkyVision",
+                "handling": "ръчна обработка",
+                "customer_data_needed_by_support": "номер на ваучер/поръчка през официалните контактни канали",
+                "chat_privacy_note": "Кодове на ваучери не се обработват в публичния чат.",
+            },
             "privacy_policy": "Кодове на ваучери не се обработват в публичния чат; официалният екип работи с номер на ваучер/поръчка през контактните канали.",
         },
         "official_contacts": contacts if include_contacts else {"available_if_needed": True},

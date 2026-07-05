@@ -158,6 +158,75 @@ def test_evaluate_booknow_refund_language_prefers_will_be_refunded() -> None:
     assert "weak_booknow_refund_may_language" in result["issues"]
 
 
+def test_evaluate_voucher_merge_rejects_self_service_merge_flow() -> None:
+    scenario = {"id": "voucher_merge"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": (
+                "Можете да използвате два ваучера за едно преживяване, като добавите "
+                "двата ваучера в профила и после изберете Имам ваучер. Ако не стане, екипът помага ръчно."
+            ),
+            "cards": [],
+        },
+    )
+
+    assert "suggests_self_service_merge_flow" in result["issues"]
+
+
+def test_evaluate_voucher_extend_rejects_conditional_availability() -> None:
+    scenario = {"id": "voucher_extend"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "Отвори ваучера и използвай опцията за удължаване, ако системата я показва.",
+            "cards": [],
+        },
+    )
+
+    assert "weak_or_conditional_extension_availability" in result["issues"]
+
+
+def test_evaluate_gift_wish_rejects_recipient_name_warning_template() -> None:
+    scenario = {"id": "gift_wish_text"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": (
+                "Пожеланието се пише в Поздрав и после натискаш Редактирай поздрава. "
+                "Само да не го объркаш с Име на ползвател."
+            ),
+            "cards": [],
+        },
+    )
+
+    assert "unnecessary_recipient_name_field_warning" in result["issues"]
+
+
+def test_evaluate_calm_sliven_rejects_far_locations_before_nearby() -> None:
+    scenario = {"id": "calm_friend_50_sliven"}
+
+    result = matrix.evaluate_side(
+        scenario,
+        {
+            "status": "ok",
+            "reply": "Бих предложил вариант в Сърница и София.",
+            "cards": [
+                {"title": "СПА в Сърница", "location": "Сърница", "public_url": "https://skyvision.bg/подарък/spa/a/"},
+                {"title": "Арт преживяване", "location": "София", "public_url": "https://skyvision.bg/подарък/art/b/"},
+            ],
+        },
+    )
+
+    assert "jumps_far_from_sliven_before_nearby_options" in result["issues"]
+
+
 def test_evaluate_broad_gift_diversity_uses_cards_only_in_qa_script() -> None:
     scenario = {"id": "broad_gift_diverse"}
 

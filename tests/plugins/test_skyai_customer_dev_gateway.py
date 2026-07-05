@@ -203,7 +203,9 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "EUR е основната цена" in prompt
     assert "Catalog tool-ът връща кандидати" in prompt
     assert "не е заповед какво да кажеш" in prompt
-    assert "балансирай релевантност и дистанция" in prompt
+    assert "приеми, че близостта е важна" in prompt
+    assert "nearest_returned_items" in prompt
+    assert "чак след това попитай дали може да разшириш" in prompt
     assert "започни направо с желаната посока" in prompt
     assert "positive-only" in prompt
     assert "не използвай конструкции от типа 'без X/Y'" in prompt
@@ -215,6 +217,8 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "BookNow е директна резервация" in prompt
     assert "парите ще бъдат възстановени" in prompt
     assert "не като несигурна възможност" in prompt
+    assert "Два ваучера не се обединяват автоматично" in prompt
+    assert "Опцията за удължаване е налична" in prompt
     assert "не коментирай самото ограничение" in prompt
     assert "представи се кратко като SkyAI" in prompt
     assert "не решавай учебни задачи" in prompt

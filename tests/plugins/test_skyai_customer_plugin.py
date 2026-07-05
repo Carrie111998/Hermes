@@ -425,6 +425,8 @@ def test_catalog_search_returns_evidence_metadata_without_recipient_policy(monke
     assert result["query_evidence"]["reasoning_owner"] == "hermes"
     assert result["location_context"]["requested_location"] == "сливен"
     assert result["location_context"]["reasoning_owner"] == "hermes"
+    assert result["location_context"]["nearest_returned_items"]
+    assert result["location_context"]["nearest_returned_items"][0]["distance_from_requested_location_km"] is not None
     assert result["value_voucher_option"]["public_url"] == (
         "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/"
     )
@@ -552,6 +554,7 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert result["source"] == "skyvision_curated_public_support_knowledge"
     assert "Честитка" in result["gift_voucher_presentation"]["voucher_blanks"]
     assert "Редактирай поздрава" in " ".join(result["gift_voucher_presentation"]["wish_flow"])
+    assert "Име на ползвател" not in " ".join(result["gift_voucher_presentation"]["wish_flow"])
     assert result["gift_voucher_presentation"]["packaging_options"] == [
         {
             "name": "Безплатна опаковка",
@@ -594,8 +597,11 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert result["payment_methods"]["bank_transfer"]["available_in_online_checkout"] is False
     assert result["payment_methods"]["bank_transfer"]["online_checkout_label"] is None
     assert "удължаване" in " ".join(result["vouchers"]["extension_steps"])
-    assert "двата ваучера" in " ".join(result["vouchers"]["combine_or_use_multiple_vouchers_steps"])
-    assert "ръчно от екипа" in " ".join(result["vouchers"]["combine_or_use_multiple_vouchers_steps"])
+    assert "ако системата я показва" not in " ".join(result["vouchers"]["extension_steps"])
+    assert result["vouchers"]["profile_extension_available"] is True
+    assert result["vouchers"]["merge_two_vouchers_into_one"]["self_service_available"] is False
+    assert result["vouchers"]["merge_two_vouchers_into_one"]["handling"] == "ръчна обработка"
+    assert "ръчна" in result["vouchers"]["merge_two_vouchers_into_one"]["handling"]
     assert result["official_contacts"]["contacts_page"] == "https://skyvision.bg/контакти/"
     assert result["official_contacts"]["email"] == "info@skyvision.bg"
     assert "+359 (0) 700 20 200" in result["official_contacts"]["phones"]
