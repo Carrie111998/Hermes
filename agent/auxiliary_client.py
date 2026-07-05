@@ -4316,25 +4316,29 @@ def resolve_provider_client(
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = os.getenv(custom_key_env, "").strip()
-            # Fall back to credential pool when config/env has no key.
-            # The pool holds per-provider secrets (manual, env-seeded, etc.)
-            # and is the authoritative source in profile-inheritance mode.
-            if not custom_key:
-                try:
-                    from agent.credential_pool import load_pool as _pool_load
-                    # Provider name may have been normalized (custom: prefix
-                    # stripped). The pool indexes on the custom: name, so try
-                    # both the normalized and original forms.
-                    for _pool_name in {provider, original_provider}:
-                        _pool = _pool_load(_pool_name)
-                        if _pool and _pool.has_credentials():
-                            _pool_entry = _pool.select()
-                            if _pool_entry:
-                                custom_key = str(getattr(_pool_entry, "runtime_api_key", "") or "").strip()
-                                if custom_key:
-                                    break
-                except Exception:
-                    pass
+            # Prefer credential pool over config/env when a pool exists.
+            # The pool is the authoritative source for multi-key rotation,
+            # exhaustion tracking, and same-provider failover.  A single
+            # env var (one pool entry) should not override the pool's
+            # selection when the pool has multiple entries — the pool
+            # may have already rotated to a different key after the env
+            # entry was exhausted.
+            try:
+                from agent.credential_pool import load_pool as _pool_load
+                # Provider name may have been normalized (custom: prefix
+                # stripped). The pool indexes on the custom: name, so try
+                # both the normalized and original forms.
+                for _pool_name in {provider, original_provider}:
+                    _pool = _pool_load(_pool_name)
+                    if _pool and _pool.has_credentials():
+                        _pool_entry = _pool.select()
+                        if _pool_entry:
+                            _pool_key = str(getattr(_pool_entry, "runtime_api_key", "") or "").strip()
+                            if _pool_key:
+                                custom_key = _pool_key
+                                break
+            except Exception:
+                pass
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
