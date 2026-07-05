@@ -14,8 +14,12 @@ import {
   applyConfiguredDefaultProjectDir,
   getRememberedSessionId,
   mergeSessionPage,
+<<<<<<< HEAD
   rememberedSessionProfile,
   resolveComposerSessionKey,
+=======
+  sessionAliasIds,
+>>>>>>> 6c95fe27d (Refresh on upstream/main: resolve conflicts (no behavior change))
   sessionPinId,
   setCurrentCwd,
   setRememberedSessionId,
@@ -89,6 +93,12 @@ describe('sessionPinId', () => {
     // After auto-compression the entry surfaces under a fresh tip id but keeps
     // the original root — pinning on the root keeps the pin stable.
     expect(sessionPinId(session({ id: 'tip', _lineage_root_id: 'root' }))).toBe('root')
+  })
+
+  it('collects every compression segment as an alias', () => {
+    expect(
+      sessionAliasIds(session({ id: 'tip', _lineage_root_id: 'root', _lineage_ids: ['root', 'mid', 'tip'] }))
+    ).toEqual(['tip', 'root', 'mid'])
   })
 })
 
@@ -209,6 +219,7 @@ describe('mergeSessionPage', () => {
     expect(merged.map(s => s.id)).toEqual(['b', 'a-new'])
   })
 
+<<<<<<< HEAD
   it('never regresses last_active behind an optimistic user-send bump', () => {
     const previous = [session({ id: 'old', last_active: 9_000 })]
     const incoming = [session({ id: 'old', last_active: 100, message_count: 4 })]
@@ -267,6 +278,37 @@ describe('touchSessionActivity', () => {
     touchSessionActivity('missing', { at: 99 })
 
     expect($sessions.get()).toBe(prev)
+=======
+  it('replaces a stale pinned intermediate segment with the live tip', () => {
+    const previous = [session({ id: 'mid', _lineage_root_id: 'root' })]
+    const incoming = [session({ id: 'tip', _lineage_root_id: 'root', _lineage_ids: ['root', 'mid', 'tip'] })]
+
+    const merged = mergeSessionPage(previous, incoming, ['mid'])
+
+    expect(merged.map(s => s.id)).toEqual(['tip'])
+  })
+
+  it('dedupes incoming rows that describe the same lineage', () => {
+    const incoming = [
+      session({ id: 'tip', _lineage_root_id: 'root', _lineage_ids: ['root', 'mid', 'tip'] }),
+      session({ id: 'mid', _lineage_root_id: 'root' })
+    ]
+
+    const merged = mergeSessionPage([], incoming, ['mid'])
+
+    expect(merged.map(s => s.id)).toEqual(['tip'])
+  })
+
+  it('prefers the live lineage row when a stale incoming segment arrives first', () => {
+    const incoming = [
+      session({ id: 'mid', _lineage_root_id: 'root', last_active: 100 }),
+      session({ id: 'tip', _lineage_root_id: 'root', _lineage_ids: ['root', 'mid', 'tip'], last_active: 200 })
+    ]
+
+    const merged = mergeSessionPage([], incoming, ['mid'])
+
+    expect(merged.map(s => s.id)).toEqual(['tip'])
+>>>>>>> 6c95fe27d (Refresh on upstream/main: resolve conflicts (no behavior change))
   })
 })
 

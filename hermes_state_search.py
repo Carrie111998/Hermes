@@ -1740,6 +1740,7 @@ class SessionSearchMixin:
 
         def score(row: Dict[str, Any]) -> int:
             ids = [str(row.get("id") or ""), str(row.get("_lineage_root_id") or "")]
+            ids.extend(str(value or "") for value in row.get("_lineage_ids") or [])
             normalized = [value.lower() for value in ids if value]
             if any(value == needle for value in normalized):
                 return 0
