@@ -736,8 +736,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Check event type filter
         event_type = (
-            request.headers.get("X-GitHub-Event", "")
+            request.headers.get("Linear-Event", "")
+            or request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
+            or request.headers.get("X-Event-Type", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
             or "unknown"
@@ -1119,23 +1121,11 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Generic V2: X-Webhook-Signature-V2 = <hex HMAC-SHA256 of "<timestamp>.<body>">
         #             X-Webhook-Timestamp = <unix seconds> (required for V2)
-        # Checked independently of (and before) legacy V1 below — a sender
-        # that only ever sends V2 headers must still validate here; nesting
-        # this inside `if generic_sig:` would silently skip V2-only senders.
-        #
-        # The presence of X-Webhook-Signature-V2 alone selects V2 mode and
-        # commits to it — it must NOT fall through to the V1 branch just
-        # because the timestamp is missing/malformed/expired. A sender
-        # migrating to V2 typically sends both V1 and V2 headers together
-        # for compatibility; if incomplete V2 fell through to V1, an
-        # attacker who captured one such mixed request could strip the
-        # X-Webhook-Timestamp header from a replay and have it validate
-        # against the still-present, still-unprotected V1 signature instead
-        # — silently downgrading a V2-protected request back to the replay
-        # hole V2 exists to close.
-        v2_sig = request.headers.get("X-Webhook-Signature-V2", "")
+        # Checked before legacy/provider body-only signatures; the presence of
+        # V2 commits to V2 validation and must not downgrade to V1 if malformed.
+        v2_sig = _header("X-Webhook-Signature-V2")
         if v2_sig:
-            v2_timestamp = request.headers.get("X-Webhook-Timestamp", "")
+            v2_timestamp = _header("X-Webhook-Timestamp")
             if not v2_timestamp:
                 logger.warning(
                     "[webhook] Route '%s' sent X-Webhook-Signature-V2 with "
@@ -1158,21 +1148,24 @@ class WebhookAdapter(BasePlatformAdapter):
             expected_v2 = hmac.new(
                 secret.encode(), signed_content, hashlib.sha256
             ).hexdigest()
-            return _hmac_str_equal(v2_sig, expected_v2)
+            return _hmac_str_equal(v2_sig.removeprefix("sha256="), expected_v2)
 
-        # Generic V1 (legacy): X-Webhook-Signature = <hex HMAC-SHA256 of body>
-        # (deprecated — no replay protection, since the signature only
-        # covers the body: a captured (body, signature) pair replays
-        # indefinitely with no timestamp binding it to a specific delivery.)
-        # Only reachable when X-Webhook-Signature-V2 was not sent at all —
-        # see the guard above.
-        generic_sig = request.headers.get("X-Webhook-Signature", "")
-        if generic_sig:
-            expected = hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
+        # Generic/provider HMAC-SHA256 signatures (legacy body-only; no replay
+        # protection). Providers differ mostly by header name and whether they
+        # prefix the hex digest with "sha256=".
+        expected_hex = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        for header_name in (
+            "X-Webhook-Signature",
+            "Linear-Signature",
+            "Attio-Signature",
+            "X-Attio-Signature",
+            "X-Signature",
+        ):
+            signature = _header(header_name)
+            if not signature:
+                continue
             route_name = request.match_info.get("route_name", "")
-            if route_name not in self._v1_signature_warned:
+            if header_name == "X-Webhook-Signature" and route_name not in self._v1_signature_warned:
                 self._v1_signature_warned.add(route_name)
                 logger.warning(
                     "[webhook] Route '%s' uses legacy body-only HMAC (no "
@@ -1182,7 +1175,8 @@ class WebhookAdapter(BasePlatformAdapter):
                     "'<timestamp>.<body>').",
                     route_name,
                 )
-            return _hmac_str_equal(generic_sig, expected)
+            normalized = signature.removeprefix("sha256=")
+            return _hmac_str_equal(normalized, expected_hex)
 
         # No recognised signature header but secret is configured → reject
         logger.debug(
