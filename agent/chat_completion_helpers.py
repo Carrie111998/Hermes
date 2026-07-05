@@ -1280,6 +1280,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
             fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+        # Prefer credential pool key over env var when a pool exists.
+        # The pool is the authoritative source for multi-key rotation
+        # and exhaustion tracking.  A single env var (one pool entry)
+        # should not override the pool's selection when the pool has
+        # multiple entries — the pool may have already rotated to a
+        # different key after the env entry was exhausted.
+        try:
+            from agent.credential_pool import load_pool as _fb_pool_load
+            _fb_pool = _fb_pool_load(fb_provider)
+            if _fb_pool and _fb_pool.has_credentials():
+                _fb_pool_entry = _fb_pool.select()
+                if _fb_pool_entry:
+                    _fb_pool_key = str(getattr(_fb_pool_entry, "runtime_api_key", "") or "").strip()
+                    if _fb_pool_key:
+                        fb_api_key_hint = _fb_pool_key
+        except Exception:
+            pass
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
