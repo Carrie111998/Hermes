@@ -589,6 +589,11 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert any("Първо потвърди ясно default-а" in item for item in flow)
     assert any("Емил Ломлиев, съосновател" in item for item in flow)
     assert any("Не казвай само „Емо“" in item for item in flow)
+    assert any("благодарност, че клиентът избира SkyVision" in item for item in flow)
+    assert any(
+        "това е нашето благодаря" in item
+        for item in result["founder_transfer_guidance"]["tone_anchors"]
+    )
     assert "летенето е нашето ДНК" in result["founder_transfer_guidance"]["tone_anchors"]
     assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
 
