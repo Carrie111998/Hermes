@@ -25,6 +25,8 @@ export type ChatMessage = {
   interim?: boolean
   /** Composer attachment ref strings (`@file:...`, `@image:...`) sent with this user message. */
   attachmentRefs?: string[]
+  /** Device a user message was typed on. */
+  senderDevice?: string
 }
 
 export type GatewayEventPayload = {
@@ -1044,12 +1046,18 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       flushPendingTools(index)
     }
 
+    const senderDevice =
+      message.role === 'user' && typeof message.sender_device === 'string' && message.sender_device.trim()
+        ? message.sender_device.trim()
+        : undefined
+
     result.push({
       id: `${message.timestamp || Date.now()}-${index}-${displayRole}`,
       role: displayRole,
       parts,
       timestamp: message.timestamp,
-      ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {})
+      ...(extractedAttachmentRefs ? { attachmentRefs: extractedAttachmentRefs } : {}),
+      ...(senderDevice ? { senderDevice } : {})
     })
 
     activeAssistantIndex = message.role === 'assistant' ? result.length - 1 : null
