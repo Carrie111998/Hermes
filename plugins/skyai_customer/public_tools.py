@@ -117,185 +117,7 @@ _TOKEN_EXPANSIONS = {
     "спа": ("spa", "уелнес", "релакс"),
     "spa": ("спа", "уелнес", "релакс"),
     "уелнес": ("спа", "spa", "релакс"),
-    "приятелка": ("жена", "дама"),
-    "майка": ("жена", "дама"),
-    "съпруга": ("жена", "дама"),
-    "дама": ("жена", "приятелка"),
 }
-
-_CALM_QUERY_TOKENS = frozenset(
-    {
-        "спокоен",
-        "спокойна",
-        "спокойно",
-        "позитивен",
-        "позитивна",
-        "позитивно",
-        "релакс",
-        "лежерен",
-        "лежерна",
-        "нежен",
-        "нежна",
-    }
-)
-_CALM_PRODUCT_SIGNALS = frozenset(
-    {
-        "арт",
-        "бюти",
-        "вечеря",
-        "винен",
-        "вино",
-        "визия",
-        "гурме",
-        "дегустация",
-        "йога",
-        "козметика",
-        "кулинар",
-        "масаж",
-        "музикален",
-        "нощувка",
-        "почивка",
-        "релакс",
-        "рисуване",
-        "романтика",
-        "солна",
-        "спа",
-        "стил",
-        "творчески",
-        "терапия",
-        "уелнес",
-        "флотация",
-    }
-)
-_SINGLE_RECIPIENT_GIFT_SIGNALS = frozenset(
-    {
-        "баща",
-        "брат",
-        "дама",
-        "жена",
-        "майка",
-        "мъж",
-        "приятел",
-        "приятелка",
-        "съпруг",
-        "съпруга",
-    }
-)
-_MULTI_RECIPIENT_GIFT_SIGNALS = frozenset(
-    {
-        "двама",
-        "двойка",
-        "двойки",
-        "семейство",
-        "семеен",
-        "семейна",
-        "група",
-        "компания",
-    }
-)
-_TWO_PERSON_PRODUCT_SIGNALS = frozenset(
-    {
-        "2 скока",
-        "2 тандемни",
-        "за двама",
-        "двама",
-        "двойка",
-        "двойки",
-        "романтика",
-    }
-)
-_EXTREME_PRODUCT_SIGNALS = frozenset(
-    {
-        "адреналин",
-        "акваланг",
-        "атв",
-        "бъги",
-        "бънджи",
-        "гмуркане",
-        "джет",
-        "екстрем",
-        "жирокоптер",
-        "каньон",
-        "катерене",
-        "каяк",
-        "мотор",
-        "офроуд",
-        "парапланер",
-        "парашут",
-        "полет",
-        "рафтинг",
-        "самолет",
-        "скок",
-        "sup",
-        "стрелба",
-        "трактор",
-        "уиндсърф",
-        "шофиране",
-        "виа ферат",
-        "водни спортове",
-    }
-)
-_HIGH_ADRENALINE_PRODUCT_SIGNALS = frozenset(
-    {
-        "акваланг",
-        "бънджи",
-        "гмуркане",
-        "джет",
-        "екстрем",
-        "парашут",
-        "рафтинг",
-        "скок",
-        "стрелба",
-    }
-)
-_ADRENALINE_QUERY_SIGNALS = frozenset(
-    {
-        "адреналин",
-        "екстрем",
-        "силно",
-        "силна",
-        "приключение",
-        "приключенски",
-        "скок",
-    }
-)
-_NARROW_SPECIFIC_QUERY_SIGNALS = frozenset(
-    {
-        "атв",
-        "бъги",
-        "бънджи",
-        "джет",
-        "жирокоптер",
-        "парапланер",
-        "парашут",
-        "самолет",
-        "скок",
-    }
-)
-_REQUIRED_NARROW_PRODUCT_SIGNALS = frozenset(
-    {
-        "атв",
-        "бъги",
-        "бънджи",
-        "джет",
-        "жирокоптер",
-        "парапланер",
-        "парашут",
-        "самолет",
-    }
-)
-_NEGATABLE_PRODUCT_TOKENS = frozenset(
-    {
-        *_NARROW_SPECIFIC_QUERY_SIGNALS,
-        "балон",
-        "летене",
-        "полет",
-        "офроуд",
-        "масаж",
-        "релакс",
-        "спа",
-    }
-)
 
 _KNOWN_LOCATION_COORDS = {
     "сливен": (42.6817, 26.3229),
@@ -353,15 +175,11 @@ _LOCATION_ALIASES = {
 
 
 @dataclass(frozen=True)
-class QueryTraits:
+class QueryEvidence:
     tokens: list[str]
     normalized: str
     requested_location: str | None = None
     requested_coordinates: tuple[float, float] | None = None
-    calm_recipient: bool = False
-    mature_recipient: bool = False
-    broad_discovery: bool = False
-    single_recipient_gift: bool = False
 
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -635,39 +453,27 @@ def _catalog_search_candidates(
     max_price_eur: float | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    traits = _query_traits(query)
-    effective_limit = _effective_catalog_result_limit(traits, requested_limit=limit)
+    evidence = _query_evidence(query)
+    candidate_limit = min(MAX_RETURN_ITEMS, limit)
     merged = _dedupe_products(direct_items)
     if query.strip():
         try:
             merged = _dedupe_products([*merged, *_catalog_index_items()])
         except Exception:
             pass
+    filtered = _filter_products_by_budget(merged, min_price_eur, max_price_eur)
     if not query.strip():
-        return _filter_products_by_budget(merged, min_price_eur, max_price_eur)[:effective_limit]
-    ranked = _rank_products(
-        merged,
-        query=query,
-        min_price_eur=min_price_eur,
+        return _annotate_catalog_evidence(filtered[:candidate_limit], evidence)
+    ordered = _order_products_by_catalog_evidence(
+        filtered,
+        evidence=evidence,
         max_price_eur=max_price_eur,
     )
-    return ranked[:effective_limit]
+    return ordered[:candidate_limit]
 
 
-def _effective_catalog_result_limit(traits: QueryTraits, *, requested_limit: int) -> int:
-    if requested_limit <= 2:
-        return requested_limit
-    if traits.broad_discovery:
-        return requested_limit
-    if any(token in _MULTI_RECIPIENT_GIFT_SIGNALS for token in traits.tokens):
-        return requested_limit
-    if any(token in _NARROW_SPECIFIC_QUERY_SIGNALS for token in traits.tokens):
-        return 2
-    return requested_limit
-
-
-def _catalog_location_context(items: list[dict[str, Any]], traits: QueryTraits) -> dict[str, Any] | None:
-    if not traits.requested_location:
+def _catalog_location_context(items: list[dict[str, Any]], evidence: QueryEvidence) -> dict[str, Any] | None:
+    if not evidence.requested_location:
         return None
     distances = sorted(
         {
@@ -678,62 +484,34 @@ def _catalog_location_context(items: list[dict[str, Any]], traits: QueryTraits) 
     )
     if not distances:
         return {
-            "requested_location": traits.requested_location,
-            "guidance": (
-                "Клиентът е дал локация, но върнатите кандидати нямат надеждна дистанция. "
-                "Кажи това внимателно и не се преструвай, че са близо."
-            ),
+            "requested_location": evidence.requested_location,
+            "distance_metadata_available": False,
+            "reasoning_owner": "hermes",
         }
-    nearest = distances[0]
-    farthest = distances[-1]
-    if nearest <= 120:
-        guidance = (
-            "Има географски близки кандидати. Дръж отговора около най-близките релевантни "
-            "варианти и не прескачай към далечни градове, освен ако клиентът поиска повече "
-            "лукс, море или по-различна посока."
-        )
-    else:
-        guidance = (
-            "Няма силен близък кандидат. Обясни, че разширяваш радиуса, и попитай дали "
-            "за клиента е по-важна близостта или най-точното преживяване."
-        )
     return {
-        "requested_location": traits.requested_location,
-        "nearest_returned_distance_km": nearest,
-        "farthest_returned_distance_km": farthest,
-        "guidance": guidance,
+        "requested_location": evidence.requested_location,
+        "nearest_returned_distance_km": distances[0],
+        "farthest_returned_distance_km": distances[-1],
+        "returned_distance_km_values": distances[:12],
+        "distance_metadata_available": True,
+        "reasoning_owner": "hermes",
     }
 
 
-def _catalog_recipient_context(traits: QueryTraits) -> dict[str, Any] | None:
-    if not traits.single_recipient_gift:
-        return None
+def _catalog_query_evidence(evidence: QueryEvidence) -> dict[str, Any]:
     return {
-        "gift_recipient_scope": "single_recipient",
-        "guidance": (
-            "Клиентът изглежда избира подарък за един конкретен човек. Предпочитай индивидуални "
-            "преживявания. Ако вариант за двама остава най-подходящ, рамкирай го като възможност "
-            "получателят да сподели преживяването с близък човек, не като подарък за двама по default."
-        ),
+        "tokens": evidence.tokens[:20],
+        "requested_location": evidence.requested_location,
+        "requested_coordinates_available": evidence.requested_coordinates is not None,
+        "reasoning_owner": "hermes",
     }
 
 
-def _catalog_value_voucher_option(items: list[dict[str, Any]], traits: QueryTraits) -> dict[str, Any] | None:
-    if not traits.requested_location or not traits.broad_discovery:
-        return None
-    has_exact_location_match = any(_product_known_location(item) == traits.requested_location for item in items)
-    if has_exact_location_match:
-        return None
+def _catalog_value_voucher_option() -> dict[str, Any]:
     return {
         **VALUE_VOUCHER_OPTION,
-        "when_to_use": (
-            "Добра алтернатива, когато няма достатъчно релевантно предложение в точната локация, "
-            "или когато клиентът иска подарък, но не е сигурен кое преживяване ще зарадва получателя."
-        ),
-        "answer_guidance": (
-            "Предложи го човешки като четвърта, универсална опция след най-близките релевантни cards. "
-            "Не го представяй като отказ от търсене, а като елегантен начин подареният човек сам да избере."
-        ),
+        "availability": "public_universal_gift_option",
+        "reasoning_owner": "hermes",
     }
 
 
@@ -761,106 +539,19 @@ def _dedupe_products(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped
 
 
-def _rank_products(
+def _order_products_by_catalog_evidence(
     items: list[dict[str, Any]],
     *,
-    query: str,
-    min_price_eur: float | None,
+    evidence: QueryEvidence,
     max_price_eur: float | None,
 ) -> list[dict[str, Any]]:
-    traits = _query_traits(query)
-    tokens = traits.tokens
-    filtered = _filter_products_by_budget(items, min_price_eur, max_price_eur)
     scored: list[tuple[float, dict[str, Any]]] = []
-    for index, item in enumerate(filtered):
-        score = _product_relevance_score(item, traits=traits, max_price_eur=max_price_eur)
-        if score <= 0:
-            continue
-        item = {**item}
-        if traits.requested_location:
-            item["_skyai_requested_location"] = traits.requested_location
-        distance_km = _product_distance_km(item, traits)
-        if distance_km is not None:
-            item["_skyai_distance_km"] = round(distance_km)
-        item["_skyai_category_key"] = _product_family_key(item)
-        # Stable tie-breaker preserves catalog popularity/order when evidence is equal.
-        scored.append((score - (index * 0.0001), item))
+    for index, item in enumerate(items):
+        annotated = _annotate_product_evidence(item, evidence)
+        score = _catalog_evidence_score(annotated, evidence=evidence, max_price_eur=max_price_eur)
+        scored.append((score - (index * 0.0001), annotated))
     scored.sort(key=lambda pair: pair[0], reverse=True)
-    if scored:
-        diversified = _diversify_ranked_products([item for _score, item in scored], traits=traits)
-        return _prefer_nearby_results_when_available(diversified, traits=traits)
-    return filtered
-
-
-def _diversify_ranked_products(
-    ranked: list[dict[str, Any]],
-    *,
-    tokens: list[str] | None = None,
-    traits: QueryTraits | None = None,
-) -> list[dict[str, Any]]:
-    if traits is None:
-        traits = QueryTraits(tokens=tokens or [], normalized="")
-    selected: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    seen_generic_families: set[str] = set()
-    seen_broad_vibes: set[str] = set()
-    for item in ranked:
-        family = _product_family_key(item)
-        vibe = _product_broad_vibe_key(item)
-        family_matches_query = _product_family_matches_query(family, traits.tokens)
-        if (
-            traits.broad_discovery
-            and not family_matches_query
-            and vibe
-            and vibe in seen_broad_vibes
-            and len(selected) < 4
-        ):
-            deferred.append(item)
-            continue
-        if not family or _product_family_matches_query(family, traits.tokens) or family not in seen_generic_families:
-            selected.append(item)
-            if family and not family_matches_query:
-                seen_generic_families.add(family)
-            if traits.broad_discovery and vibe and not family_matches_query:
-                seen_broad_vibes.add(vibe)
-            continue
-        deferred.append(item)
-    return [*selected, *deferred]
-
-
-def _prefer_nearby_results_when_available(
-    ranked: list[dict[str, Any]],
-    *,
-    traits: QueryTraits,
-) -> list[dict[str, Any]]:
-    if not traits.broad_discovery or not traits.requested_location:
-        return ranked
-
-    with_distance = [
-        item
-        for item in ranked
-        if isinstance(item.get("_skyai_distance_km"), (int, float))
-    ]
-    if not with_distance:
-        return ranked
-
-    within_140 = [item for item in ranked if _ranked_distance(item) is not None and _ranked_distance(item) <= 140]
-    within_180 = [item for item in ranked if _ranked_distance(item) is not None and _ranked_distance(item) <= 180]
-
-    if len(within_140) >= 3:
-        return [*within_140, *[item for item in ranked if item not in within_140]]
-    if len(within_140) >= 2 and len(within_180) >= 3:
-        return [*within_180, *[item for item in ranked if item not in within_180]]
-    if len(within_140) >= 2:
-        return [*within_140, *[item for item in ranked if item not in within_140]]
-    return ranked
-
-
-def _ranked_distance(item: dict[str, Any]) -> float | None:
-    value = item.get("_skyai_distance_km")
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+    return [item for _score, item in scored]
 
 
 def _product_family_key(item: dict[str, Any]) -> str:
@@ -874,89 +565,17 @@ def _product_family_key(item: dict[str, Any]) -> str:
     return " ".join(title.split()[:3])
 
 
-def _product_family_matches_query(family: str, tokens: list[str]) -> bool:
-    if not family or not tokens:
-        return False
-    return any(token in family for token in tokens)
-
-
-def _product_broad_vibe_key(item: dict[str, Any]) -> str:
-    text = _normalize_search_text(
-        " ".join(
-            str(value or "")
-            for value in (
-                item.get("category_slug"),
-                item.get("categorySlug"),
-                item.get("slug"),
-                item.get("title"),
-                item.get("name"),
-            )
-        )
-    )
-    if any(signal in text for signal in ("атв", "offroad", "офроуд", "мотор", "джет", "бъги")):
-        return "active-drive"
-    if any(signal in text for signal in ("парашут", "бънджи", "стрелба", "рафтинг")):
-        return "adrenaline"
-    if any(signal in text for signal in ("парапланер", "жирокоптер", "самолет", "балон", "полет")):
-        return "flight"
-    if any(signal in text for signal in ("спа", "spa", "масаж", "релакс", "уелнес", "флотация", "терапия")):
-        return "relax"
-    if any(signal in text for signal in ("вино", "винен", "дегустация", "гурме", "вечеря", "кулинар")):
-        return "gourmet"
-    if any(signal in text for signal in ("рисув", "арт", "творчес", "курс", "работилница")):
-        return "creative"
-    if any(signal in text for signal in ("нощув", "почивка", "уикенд", "хотел")):
-        return "stay"
-    return _product_family_key(item)
-
-
-def _query_traits(query: str) -> QueryTraits:
+def _query_evidence(query: str) -> QueryEvidence:
     normalized = _normalize_search_text(query)
     tokens = _query_tokens(query)
     requested_location = _find_known_location(normalized)
     requested_coordinates = _KNOWN_LOCATION_COORDS.get(requested_location or "")
-    mature_recipient = bool(
-        re.search(r"(?:^|\s)(?:50\s*\+|над\s+50|около\s+50)(?:\s|$|[.,!?])", normalized)
-    )
-    calm_recipient = bool(
-        any(token in _CALM_QUERY_TOKENS for token in tokens)
-        or mature_recipient
-        or "не екстрем" in normalized
-    )
-    broad_discovery = bool(
-        _query_suggests_gift_discovery(tokens)
-        and not any(_product_family_matches_query(family, tokens) for family in _SPECIFIC_PRODUCT_FAMILIES)
-    )
-    single_recipient_gift = bool(
-        broad_discovery
-        and any(token in _SINGLE_RECIPIENT_GIFT_SIGNALS for token in tokens)
-        and not any(token in _MULTI_RECIPIENT_GIFT_SIGNALS for token in tokens)
-    )
-    return QueryTraits(
+    return QueryEvidence(
         tokens=tokens,
         normalized=normalized,
         requested_location=requested_location,
         requested_coordinates=requested_coordinates,
-        calm_recipient=calm_recipient,
-        mature_recipient=mature_recipient,
-        broad_discovery=broad_discovery,
-        single_recipient_gift=single_recipient_gift,
     )
-
-
-_SPECIFIC_PRODUCT_FAMILIES = frozenset(
-    {
-        "атв",
-        "бънджи",
-        "жирокоптер",
-        "масаж",
-        "парапланер",
-        "парашут",
-        "самолет",
-        "спа",
-        "флотация",
-    }
-)
 
 
 def _find_known_location(text: str) -> str | None:
@@ -968,14 +587,6 @@ def _find_known_location(text: str) -> str | None:
         if location in normalized:
             return location
     return None
-
-
-def _query_suggests_gift_discovery(tokens: list[str]) -> bool:
-    return any(
-        token.startswith("подар")
-        or token in {"идея", "идеи", "вариант", "варианти"}
-        for token in tokens
-    )
 
 
 def _product_location_text(item: dict[str, Any]) -> str:
@@ -1005,14 +616,14 @@ def _product_known_location(item: dict[str, Any]) -> str | None:
     return _find_known_location(_product_location_text(item))
 
 
-def _product_distance_km(item: dict[str, Any], traits: QueryTraits) -> float | None:
-    if not traits.requested_coordinates:
+def _product_distance_km(item: dict[str, Any], evidence: QueryEvidence) -> float | None:
+    if not evidence.requested_coordinates:
         return None
     product_location = _product_known_location(item)
     coordinates = _KNOWN_LOCATION_COORDS.get(product_location or "")
     if not coordinates:
         return None
-    return _haversine_km(traits.requested_coordinates, coordinates)
+    return _haversine_km(evidence.requested_coordinates, coordinates)
 
 
 def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -1046,13 +657,28 @@ def _filter_products_by_budget(
     return filtered
 
 
-def _product_relevance_score(
+def _annotate_catalog_evidence(items: list[dict[str, Any]], evidence: QueryEvidence) -> list[dict[str, Any]]:
+    return [_annotate_product_evidence(item, evidence) for item in items]
+
+
+def _annotate_product_evidence(item: dict[str, Any], evidence: QueryEvidence) -> dict[str, Any]:
+    annotated = {**item}
+    if evidence.requested_location:
+        annotated["_skyai_requested_location"] = evidence.requested_location
+    distance_km = _product_distance_km(annotated, evidence)
+    if distance_km is not None:
+        annotated["_skyai_distance_km"] = round(distance_km)
+    annotated["_skyai_category_key"] = _product_family_key(annotated)
+    return annotated
+
+
+def _catalog_evidence_score(
     item: dict[str, Any],
     *,
-    traits: QueryTraits,
+    evidence: QueryEvidence,
     max_price_eur: float | None,
 ) -> float:
-    tokens = traits.tokens
+    tokens = evidence.tokens
     if not tokens:
         return 1.0
     title = _normalize_search_text(item.get("title") or item.get("name"))
@@ -1074,15 +700,6 @@ def _product_relevance_score(
     )
     combined = f"{title} {slug} {location} {provider} {detail}"
     score = 0.0
-    required_narrow_tokens = [token for token in tokens if token in _REQUIRED_NARROW_PRODUCT_SIGNALS]
-    if required_narrow_tokens and not any(token in combined for token in required_narrow_tokens):
-        score -= 80.0
-    if (
-        required_narrow_tokens
-        and not any(token in _MULTI_RECIPIENT_GIFT_SIGNALS for token in tokens)
-        and any(signal in combined for signal in _TWO_PERSON_PRODUCT_SIGNALS)
-    ):
-        score -= 14.0
     for token in tokens:
         if token in title:
             score += 8.0
@@ -1096,23 +713,18 @@ def _product_relevance_score(
             score += 1.0
         if token in combined:
             score += 1.0
-    score += _location_relevance_score(item, traits)
-    score += _recipient_fit_score(title=title, slug=slug, detail=detail, traits=traits)
-    if traits.broad_discovery and not any(token in _ADRENALINE_QUERY_SIGNALS for token in tokens):
-        high_adrenaline_hits = sum(1 for signal in _HIGH_ADRENALINE_PRODUCT_SIGNALS if signal in combined)
-        if high_adrenaline_hits:
-            score -= min(10.0, high_adrenaline_hits * 5.0)
+    if evidence.requested_location:
+        product_location = _product_known_location(item)
+        if product_location == evidence.requested_location:
+            score += 6.0
+        distance = item.get("_skyai_distance_km")
+        if isinstance(distance, (int, float)):
+            score += max(0.0, 5.0 - min(float(distance), 250.0) / 50.0)
     if max_price_eur is not None:
         price_eur = _product_price_eur(item)
         if price_eur is not None:
             closeness = max(0.0, 1.0 - min(abs(price_eur - max_price_eur) / max(max_price_eur, 1.0), 1.0))
-            score += closeness * 8.0
-            if price_eur < max_price_eur * 0.35:
-                score -= 2.0
-            elif price_eur < max_price_eur * 0.55:
-                score -= 0.8
-            elif price_eur >= max_price_eur * 0.55:
-                score += 1.5
+            score += closeness * 3.0
     orders_count = item.get("ordersCount")
     if isinstance(orders_count, int) and orders_count > 0:
         score += min(2.0, orders_count / 100.0)
@@ -1122,80 +734,11 @@ def _product_relevance_score(
     return score
 
 
-def _location_relevance_score(item: dict[str, Any], traits: QueryTraits) -> float:
-    if not traits.requested_location:
-        return 0.0
-    product_location = _product_known_location(item)
-    if not product_location:
-        text = _product_location_text(item)
-        return 1.5 if "онлайн" in text or "цяла българия" in text else -3.0
-    if product_location == traits.requested_location:
-        return 14.0
-    distance = _product_distance_km(item, traits)
-    if distance is None:
-        return 0.0
-    if traits.broad_discovery:
-        if distance <= 45:
-            return 24.0
-        if distance <= 90:
-            return 21.0
-        if distance <= 120:
-            return 15.0
-        if distance <= 150:
-            return -12.0
-        if distance <= 200:
-            return -28.0
-        return -44.0
-    if distance <= 45:
-        return 16.0
-    if distance <= 90:
-        return 14.0
-    if distance <= 130:
-        return 10.0
-    if distance <= 180:
-        return -10.0
-    if distance <= 240:
-        return -12.0
-    return -14.0
-
-
-def _recipient_fit_score(
-    *,
-    title: str,
-    slug: str,
-    detail: str,
-    traits: QueryTraits,
-) -> float:
-    if not traits.calm_recipient:
-        return 0.0
-    combined = f"{title} {slug} {detail}"
-    calm_hits = sum(1 for signal in _CALM_PRODUCT_SIGNALS if signal in combined)
-    extreme_hits = sum(1 for signal in _EXTREME_PRODUCT_SIGNALS if signal in combined)
-    score = min(14.0, calm_hits * 4.0)
-    if extreme_hits:
-        score -= min(16.0, extreme_hits * 4.0)
-    if traits.mature_recipient and any(
-        signal in combined
-        for signal in ("детски", "детско", "дете", "деца", "ученик", "тийн", "юнош")
-    ):
-        score -= 120.0
-    if "жена" in traits.tokens and any(signal in combined for signal in ("козметика", "визия", "стил", "терапия", "релакс")):
-        score += 3.0
-    if traits.single_recipient_gift and any(signal in combined for signal in _TWO_PERSON_PRODUCT_SIGNALS):
-        score -= 7.0
-    return score
-
-
 def _query_tokens(query: str) -> list[str]:
     normalized = _normalize_search_text(query)
     raw_tokens = re.findall(r"[a-zа-я0-9]+", normalized, flags=re.IGNORECASE)
     tokens: list[str] = []
-    previous_token = ""
     for token in raw_tokens:
-        if previous_token in {"не", "без"} and token in _NEGATABLE_PRODUCT_TOKENS:
-            previous_token = token
-            continue
-        previous_token = token
         if token.isdigit() or token in _QUERY_STOPWORDS:
             continue
         if len(token) <= 2 and token not in {"atv", "спа", "spa"}:
@@ -1265,7 +808,7 @@ def handle_skyai_catalog_search(
         max_price_eur=inferred_max_price_eur,
         limit=safe_limit,
     )
-    traits = _query_traits(query)
+    evidence = _query_evidence(query)
     return {
         "status": "ok",
         "source": "skyvision_public_cache",
@@ -1281,9 +824,9 @@ def handle_skyai_catalog_search(
             },
         },
         "count": len(items),
-        "location_context": _catalog_location_context(items, traits),
-        "recipient_context": _catalog_recipient_context(traits),
-        "value_voucher_option": _catalog_value_voucher_option(items, traits),
+        "query_evidence": _catalog_query_evidence(evidence),
+        "location_context": _catalog_location_context(items, evidence),
+        "value_voucher_option": _catalog_value_voucher_option(),
         "items": [_sanitize_product_summary(item) for item in items],
     }
 

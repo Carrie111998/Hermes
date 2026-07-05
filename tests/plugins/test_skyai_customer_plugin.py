@@ -270,29 +270,7 @@ def test_catalog_search_falls_back_to_daily_index_and_reranks(monkeypatch) -> No
     assert all("/подарък/" in item["public_url"] for item in result["items"])
 
 
-def test_catalog_ranking_diversifies_broad_discovery_without_hurting_specific_queries() -> None:
-    ranked = [
-        {"id": 1, "title": "Офроуд разходка с АТВ до Пловдив", "category_slug": "офроуд-атв-под-наем"},
-        {"id": 2, "title": "Офроуд с АТВ 200 CC в района на Пловдив", "category_slug": "офроуд-атв-под-наем"},
-        {"id": 3, "title": "ОФРОУД ТУР С ЕЛЕКТРИЧЕСКИ МОТОР КРАЙ ПЛОВДИВ", "category_slug": "приключения-с-мотор"},
-        {"id": 4, "title": "Дегустация на вино за двама в Пловдив", "category_slug": "винени-турове-дегустации"},
-        {"id": 5, "title": "Панорамно издигане с балон в Пловдив", "category_slug": "издигане-с-балон"},
-    ]
-
-    broad = public_tools._diversify_ranked_products(
-        ranked,
-        traits=public_tools._query_traits("Търся подарък за мъж в Пловдив"),
-    )
-    specific = public_tools._diversify_ranked_products(
-        ranked,
-        tokens=["атв", "пловдив"],
-    )
-
-    assert [item["id"] for item in broad[:3]] == [1, 4, 5]
-    assert [item["id"] for item in specific[:2]] == [1, 2]
-
-
-def test_catalog_search_caps_narrow_specific_queries(monkeypatch) -> None:
+def test_catalog_search_keeps_negated_terms_as_evidence_for_hermes(monkeypatch) -> None:
     public_tools._CATALOG_INDEX_CACHE["items"] = None
     public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
 
@@ -346,27 +324,14 @@ def test_catalog_search_caps_narrow_specific_queries(monkeypatch) -> None:
         limit=3,
     )
 
-    assert [item["title"] for item in result["items"]] == [
-        "Тандемен скок с парашут от 3000 м – София",
-        "Тандемен скок с парашут - София",
-    ]
-    assert "балон" not in public_tools._query_traits(
+    assert result["count"] == 3
+    assert "балон" in public_tools._query_evidence(
         "Не, държа да е точно скок с парашут, не балон или друго летене."
     ).tokens
+    assert result["query_evidence"]["reasoning_owner"] == "hermes"
 
 
-def test_query_traits_detects_50_plus_recipient() -> None:
-    traits = public_tools._query_traits(
-        "Подаръкът е за спокойна и позитивна приятелка, 50+."
-    )
-
-    assert traits.mature_recipient is True
-    assert traits.calm_recipient is True
-    assert traits.broad_discovery is True
-    assert traits.single_recipient_gift is True
-
-
-def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeypatch) -> None:
+def test_catalog_search_returns_evidence_metadata_without_recipient_policy(monkeypatch) -> None:
     public_tools._CATALOG_INDEX_CACHE["items"] = None
     public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
 
@@ -452,31 +417,25 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
             "Подаръкът е за близка приятелка от Сливен. "
             "Тя е спокоен и позитивен човек, 50+."
         ),
-        limit=3,
+        limit=5,
     )
 
-    titles = [item["title"] for item in result["items"]]
-    assert titles[0] == "Флотация и релаксиращ масаж"
-    assert "Панорамен полет с парапланер в Сопот" not in titles
-    assert "Нощувка и преживяване за двама в района на Пловдив" not in titles
-    assert "Романтика за двама: делнична почивка с вино и плодове" not in titles[:3]
-    assert result["items"][0]["requested_location"] == "сливен"
-    assert result["items"][0]["distance_from_requested_location_km"] is not None
-    assert max(item["distance_from_requested_location_km"] for item in result["items"]) <= 120
+    assert "recipient_context" not in result
+    assert result["query_evidence"]["requested_location"] == "сливен"
+    assert result["query_evidence"]["reasoning_owner"] == "hermes"
     assert result["location_context"]["requested_location"] == "сливен"
-    assert result["location_context"]["nearest_returned_distance_km"] <= 120
-    assert "Има географски близки кандидати" in result["location_context"]["guidance"]
-    assert result["recipient_context"]["gift_recipient_scope"] == "single_recipient"
-    assert "един конкретен човек" in result["recipient_context"]["guidance"]
+    assert result["location_context"]["reasoning_owner"] == "hermes"
     assert result["value_voucher_option"]["public_url"] == (
         "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/"
     )
     assert "не изписва конкретна услуга" in result["value_voucher_option"]["important_note"]
-    assert "четвърта, универсална опция" in result["value_voucher_option"]["answer_guidance"]
+    assert result["value_voucher_option"]["availability"] == "public_universal_gift_option"
+    assert "answer_guidance" not in result["value_voucher_option"]
     assert all(item["category_key"] for item in result["items"])
+    assert any(item["distance_from_requested_location_km"] is not None for item in result["items"])
 
 
-def test_catalog_search_prunes_far_options_when_enough_nearby_gift_matches(monkeypatch) -> None:
+def test_catalog_search_does_not_prune_far_or_childlike_options_in_backend(monkeypatch) -> None:
     public_tools._CATALOG_INDEX_CACHE["items"] = None
     public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
 
@@ -530,13 +489,14 @@ def test_catalog_search_prunes_far_options_when_enough_nearby_gift_matches(monke
             "Моля за помощ. Близка приятелка има рожден ден. "
             "Подаръкът да е красив. Тя е спокоен и позитивен човек, 50+, от Сливен."
         ),
-        limit=3,
+        limit=5,
     )
 
     titles = [item["title"] for item in result["items"]]
-    assert "Луксозен СПА ритуал в Сърница" not in titles
-    assert "Детско-юношеско офроуд училище край Сливен" not in titles
-    assert all(item["distance_from_requested_location_km"] <= 140 for item in result["items"])
+    assert "Луксозен СПА ритуал в Сърница" in titles
+    assert "Детско-юношеско офроуд училище край Сливен" in titles
+    assert "recipient_context" not in result
+    assert result["location_context"]["returned_distance_km_values"]
 
 
 def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:

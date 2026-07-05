@@ -44,6 +44,31 @@ def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     assert "sales_tone" not in serialized
 
 
+def test_catalog_tool_has_no_backend_persona_or_keyword_policy() -> None:
+    source = Path("plugins/skyai_customer/public_tools.py").read_text(encoding="utf-8")
+
+    forbidden_symbols = {
+        "_CALM_QUERY_TOKENS",
+        "_CALM_PRODUCT_SIGNALS",
+        "_EXTREME_PRODUCT_SIGNALS",
+        "_HIGH_ADRENALINE_PRODUCT_SIGNALS",
+        "_NARROW_SPECIFIC_QUERY_SIGNALS",
+        "_NEGATABLE_PRODUCT_TOKENS",
+        "_query_traits",
+        "_product_relevance_score",
+        "_location_relevance_score",
+        "_recipient_fit_score",
+        "_diversify_ranked_products",
+        "_prefer_nearby_results_when_available",
+        "_catalog_recipient_context",
+        "recipient_context",
+        "broad_discovery",
+        "single_recipient_gift",
+    }
+    for symbol in forbidden_symbols:
+        assert symbol not in source
+
+
 def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
     cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
 
