@@ -26,6 +26,7 @@ client-level limits when a custom transport is supplied.
 """
 
 import asyncio
+import logging
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -185,3 +186,14 @@ def test_fallback_branch_forwards_tuned_limits_to_inner_transports(monkeypatch):
 
     for instance in instances:
         asyncio.run(instance.kwargs["httpx_kwargs"]["transport"].aclose())
+
+
+def test_proxy_branch_redacts_proxy_credentials_from_log(monkeypatch, caplog):
+    proxy_url = "http://agent-vault-token:hermes@proxy.example:14322"
+
+    caplog.set_level(logging.INFO, logger=tg_adapter.__name__)
+    instances = _drive_connect(monkeypatch, proxy_url=proxy_url)
+
+    assert any(inst.kwargs.get("proxy") == proxy_url for inst in instances)
+    assert "agent-vault-token" not in caplog.text
+    assert "http://***@proxy.example:14322" in caplog.text
