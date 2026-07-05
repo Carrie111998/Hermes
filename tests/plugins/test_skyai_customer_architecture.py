@@ -44,6 +44,35 @@ def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     assert "sales_tone" not in serialized
 
 
+def _payload_keys(value) -> set[str]:
+    if isinstance(value, dict):
+        keys = set(value)
+        for child in value.values():
+            keys.update(_payload_keys(child))
+        return keys
+    if isinstance(value, list):
+        keys: set[str] = set()
+        for child in value:
+            keys.update(_payload_keys(child))
+        return keys
+    return set()
+
+
+def test_customer_tools_return_facts_not_instruction_keys() -> None:
+    payloads = [
+        public_tools.handle_skyai_campaign_knowledge(),
+        public_tools.handle_skyai_support_knowledge(include_contacts=True),
+    ]
+
+    for payload in payloads:
+        keys = _payload_keys(payload)
+        assert "answer_guidance" not in keys
+        assert "guidance" not in keys
+        assert not any(key.endswith("_guidance") for key in keys)
+        assert "when_to_use" not in keys
+        assert "customer_facing_flow" not in keys
+
+
 def test_catalog_tool_has_no_backend_persona_or_keyword_policy() -> None:
     source = Path("plugins/skyai_customer/public_tools.py").read_text(encoding="utf-8")
 

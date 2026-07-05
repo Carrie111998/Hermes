@@ -499,7 +499,7 @@ def test_catalog_search_does_not_prune_far_or_childlike_options_in_backend(monke
     assert result["location_context"]["returned_distance_km_values"]
 
 
-def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
+def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     result = public_tools.handle_skyai_campaign_knowledge(
         topic="Клиент пита дали бонусният полет може да е за подарения човек",
         include_terms=True,
@@ -527,21 +527,22 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     assert "парите ще бъдат възстановени" in campaign["booknow_nuance"]
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
+    assert campaign["bonus_product"]["availability_facts"]["slots_tool_product_id"] == 95435
     assert campaign["bonus_product"]["public_url"] == (
         "https://skyvision.bg/подарък/полет-с-жирокоптер/панорамен-полет-над-морето/"
     )
     assert campaign["bonus_product"]["duration"] == "10 мин."
     assert campaign["bonus_product"]["location"] == "Летище Приморско"
-    assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
-    founder_facts = result["founder_transfer_guidance"]["facts"]
+    assert "клиентът пита" in result["founder_transfer_facts"]["context"]
+    founder_facts = result["founder_transfer_facts"]["facts"]
     assert founder_facts["default_owner"].startswith("купувачът")
     assert founder_facts["founder_name"] == "Емил Ломлиев"
     assert "пилот-инструктор" in founder_facts["founder_role"]
     assert "не е автоматично право" in founder_facts["recipient_transfer"]
-    assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
+    assert result["founder_transfer_facts"]["public_founder_contact"] == "+359 886 417 142"
 
 
-def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> None:
+def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     result = public_tools.handle_skyai_support_knowledge(
         topic="Клиент пита как да напише пожелание, как се доставя и как да удължи ваучер",
         include_contacts=True,
@@ -584,16 +585,17 @@ def test_support_knowledge_returns_public_commerce_and_voucher_guidance() -> Non
     assert result["delivery"]["current_fee"] == "безплатна доставка"
     assert result["delivery"]["office_locator_url"] == "https://www.speedy.bg/bg/speedy-offices-automats"
     assert "15:00" in result["delivery"]["dispatch_cutoff"]
-    assert "locator URL" in result["delivery"]["working_hours_guidance"]
-    assert "EUR първо" in result["gift_voucher_presentation"]["answer_guidance"]
+    assert "Speedy локатора" in result["delivery"]["speedy_working_hours_fact"]
+    assert "EUR е основната цена" in result["gift_voucher_presentation"]["display_facts"]["price_display"]
     assert result["payment_methods"]["online_checkout_options"] == ["Карта", "EasyPay", "Наложен платеж"]
     assert result["payment_methods"]["cash_on_delivery"]["not_for"] == (
         "електронен ваучер и директна BookNow резервация"
     )
     assert result["payment_methods"]["bank_transfer"]["available_in_online_checkout"] is False
-    assert result["payment_methods"]["bank_transfer"]["answer_only_if_asked"] is True
-    assert "удължаване" in " ".join(result["vouchers"]["extension_flow"])
-    assert "двата ваучера" in " ".join(result["vouchers"]["combine_or_use_multiple_vouchers_flow"])
+    assert result["payment_methods"]["bank_transfer"]["online_checkout_label"] is None
+    assert "удължаване" in " ".join(result["vouchers"]["extension_steps"])
+    assert "двата ваучера" in " ".join(result["vouchers"]["combine_or_use_multiple_vouchers_steps"])
+    assert "ръчно от екипа" in " ".join(result["vouchers"]["combine_or_use_multiple_vouchers_steps"])
     assert result["official_contacts"]["contacts_page"] == "https://skyvision.bg/контакти/"
     assert result["official_contacts"]["email"] == "info@skyvision.bg"
     assert "+359 (0) 700 20 200" in result["official_contacts"]["phones"]
