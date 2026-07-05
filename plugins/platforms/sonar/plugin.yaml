@@ -1,0 +1,39 @@
+name: sonar-platform
+label: Sonar
+kind: platform
+version: 1.0.0
+description: >
+  Sonar / Marmot NIP-44 encrypted DM gateway for Hermes Agent.
+  Uses the official sonar-cli (listen/send) for transport; full agent
+  parity (tools, memory, MCP) inside the Hermes gateway process.
+author: Hedwig / Hermes users
+requires_env: []
+optional_env:
+  - name: SONAR_CLI_HOME
+    description: "Sonar identity directory (default ~/.sonar-agent)"
+    prompt: "SONAR_CLI_HOME path"
+    password: false
+  - name: SONAR_CLI_PATH
+    description: "Path to sonar-cli binary (default: search PATH)"
+    prompt: "sonar-cli path"
+    password: false
+  - name: SONAR_ALLOWED_SENDERS
+    description: "Comma-separated npubs allowed to DM the agent"
+    prompt: "Authorized sender npubs"
+    password: false
+  - name: SONAR_ALLOW_ALL_USERS
+    description: "Accept DMs from any npub (dev only)"
+    prompt: "Allow all senders? (true/false)"
+    password: false
+  - name: SONAR_HOME_CHANNEL
+    description: "Default npub for cron deliver=sonar (usually your personal npub)"
+    prompt: "Home channel npub"
+    password: false
+  - name: SONAR_DISPLAY_NAME
+    description: "Agent display name on Sonar (default Hermes Agent · Sonar)"
+    prompt: "Display name"
+    password: false
+  - name: SONAR_MAX_CHUNK_CHARS
+    description: "Max chars per DM before splitting (default 3200)"
+    prompt: "Chunk size"
+    password: false
