@@ -13,6 +13,13 @@ It does **not** include DevOps, Git, Render, GCP admin, Shopify admin, Muncho
 brain, raw customer database, payments, voucher lookup, order lookup, or write
 actions.
 
+## Architecture Contract
+
+Read `ARCHITECTURE.md` before changing this plugin. The top-level rule is:
+Hermes reasons; this backend provides public facts, structured evidence,
+transport, cards, and safety boundaries. Do not add keyword routers,
+customer-visible template logic, or one-off phrase guards around Hermes.
+
 ## Intended Runtime Boundary
 
 Customer-facing Hermes may call this plugin. Muncho remains the internal

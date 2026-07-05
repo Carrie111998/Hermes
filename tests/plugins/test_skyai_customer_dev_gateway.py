@@ -170,82 +170,25 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
 def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     prompt = dev_gateway.build_skyai_system_prompt()
 
-    assert "bonus_product.product_id" in prompt
+    assert "Hermes мисли" in prompt
+    assert "не вземат customer-visible семантични решения" in prompt
+    assert "никакъв tool output като готова реплика" in prompt
+    assert "скрита класификация" in prompt
     assert "skyai_product_slots" in prompt
     assert "skyai_support_knowledge" in prompt
-    assert "подаръчен ефект" in prompt
-    assert "EUR е първа цена" in prompt
-    assert "съобрази temperament, възраст" in prompt
-    assert "спокоен/по-зрял профил" in prompt
-    assert "подарък за един конкретен човек" in prompt
-    assert "не започвай с" in prompt
-    assert "получателят може да сподели преживяването" in prompt
-    assert "търговец психолог" in prompt
-    assert "адаптирай се към поколението" in prompt
-    assert "С по-млад, неформален клиент" in prompt
-    assert "с по-улегнал клиент" in prompt
-    assert "емотикони като човешки акцент" in prompt
-    assert "силно попадение" in prompt
-    assert "силни попадения" in prompt
-    assert "„попадение“" in prompt
-    assert "ще й легне" in prompt
-    assert "риск да е прекалено екстремно" in prompt
-    assert "консултативен sales подход" in prompt
-    assert "SkyAI sales playbook" in prompt
-    assert "работи консултативно, не като каталог с реплики" in prompt
-    assert "ако клиентът уточни нещо" in prompt
-    assert "1-3 релевантни посоки" in prompt
-    assert "различно усещане за подаръка" in prompt
-    assert "не две близки версии на offroad/мотор/адреналин" in prompt
-    assert "Персонализирай само по това, което клиентът доброволно казва" in prompt
-    assert "Всяка препоръка трябва да има причина" in prompt
-    assert "един релевантен търговски коз" in prompt
-    assert "благодарност от хората зад SkyVision" in prompt
-    assert "не ги изреждай всички" in prompt
-    assert "бонуси, безплатна доставка, безплатна опаковка" in prompt
-    assert "рейтинг, популярност" in prompt
-    assert "не повтаряй един и същи коз механично" in prompt
-    assert "При първия ясен sales отговор" in prompt
-    assert "бонусния полет като благодарност към човека, който купува" in prompt
-    assert "най-близките географски смислени места" in prompt
-    assert "има добри варианти в близък радиус" in prompt
-    assert "не прескачай към далечни предложения" in prompt
-    assert "по-важна близостта или най-точното преживяване" in prompt
-    assert "максимум 3 различни посоки" in prompt
-    assert "Не добавяй четвърти конкретен продукт" in prompt
-    assert "value_voucher_option" in prompt
-    assert "не изписва конкретна услуга" in prompt
-    assert "включи public_url от value_voucher_option" in prompt
-    assert "избирай различни category_key" in prompt
-    assert "Не давай две близки версии на offroad/мотор/ATV" in prompt
-    assert "не можеш да го покажеш и като card/link" in prompt
-    assert "без суха опашка с terms/URL dump" in prompt
-    assert "обикновено представи конкретния бонус само веднъж" in prompt
-    assert "Не го повтаряй в следващия си отговор" in prompt
-    assert "клиентът реално се колебае около покупка" in prompt
-    assert "Ако клиентът каже, че вече е разбрал бонуса" in prompt
-    assert "според условията" in prompt
-    assert "не го повтаряй в следващия sales отговор" in prompt
-    assert "не казвай „физическа опаковка“" in prompt
-    assert "Син плик „Лукс“" in prompt
-    assert "червен восъчен печат" in prompt
-    assert "BookNow е собствената директна резервационна система" in prompt
-    assert "без първо да купува ваучер" in prompt
-    assert "парите могат да бъдат възстановени" in prompt
-    assert "резервацията може да бъде възстановена" in prompt
-    assert "кратко и човешки" in prompt
-    assert "founder_transfer_guidance" in prompt
-    assert "Емил Ломлиев" in prompt
-    assert "летенето е лично за SkyVision" in prompt
-    assert "човешки жест" in prompt
-    assert "клиентът избира SkyVision" in prompt
-    assert "Не казвай само „Емо“" in prompt
-    assert "бонусният полет" in prompt
-    assert "по правило това е благодарност" in prompt
-    assert "към човека, който купува или резервира" in prompt
-    assert "не автоматично подарък за получателя" in prompt
-    assert "покажи само най-точните 1-2 варианта" in prompt
+    assert "EUR е основната цена" in prompt
+    assert "Catalog tool-ът връща кандидати" in prompt
+    assert "не е заповед какво да кажеш" in prompt
+    assert "балансирай релевантност и дистанция" in prompt
+    assert "бонусът е благодарност към купувача/резервиращия" in prompt
+    assert "Не представяй бонуса като автоматичен подарък" in prompt
+    assert "BookNow е директна резервация" in prompt
+    assert "парите ще бъдат възстановени" in prompt
     assert "не решавай учебни задачи" in prompt
+    assert len(prompt) < 5000
+    assert "силно попадение" not in prompt
+    assert "ще й легне" not in prompt
+    assert "ако клиентът уточни нещо" not in prompt
 
 
 def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> None:

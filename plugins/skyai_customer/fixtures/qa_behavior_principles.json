@@ -1,0 +1,98 @@
+[
+  {
+    "id": "bonus_transfer_not_direct_yes",
+    "source_threads": ["1523226132290207756", "1523226556615495833", "1523228836949524522"],
+    "principle": "When asked whether the campaign bonus flight can be used by the voucher recipient, explain the default rule first: the bonus thanks the buyer/reserver. Then explain the human founder exception if the customer is asking for transfer. Do not answer as if automatic transfer is the normal rule.",
+    "scoring": ["campaign_fact_accuracy", "brand_story", "no_overpromise", "warm_tone"]
+  },
+  {
+    "id": "match_customer_formality",
+    "source_threads": ["1523239371359129742"],
+    "principle": "Mirror the customer's formality. If the customer addresses SkyAI formally, answer formally unless the customer shifts tone.",
+    "scoring": ["tone_adaptation"]
+  },
+  {
+    "id": "respect_negative_clarification",
+    "source_threads": ["1523203366690492549"],
+    "principle": "Understand semantic negation and clarification from the conversation. If the customer rejects alternatives and repeats a specific product type, stay with that product type.",
+    "scoring": ["conversation_understanding", "specific_intent_respect"]
+  },
+  {
+    "id": "single_recipient_gift_care",
+    "source_threads": ["1523203209345372161"],
+    "principle": "When the customer describes a gift for one person, do not assume experiences for two are the main answer. If a shared experience may be valuable, frame it as an optional way the recipient could share the moment.",
+    "scoring": ["recipient_context", "sales_judgment"]
+  },
+  {
+    "id": "location_priority",
+    "source_threads": ["1523203209345372161"],
+    "principle": "Respect explicit location. First try relevant nearby options. If the best relevance requires a larger radius, say that clearly and ask whether distance or fit matters more.",
+    "scoring": ["location_reasoning", "relevance_distance_balance"]
+  },
+  {
+    "id": "bonus_owner_clarity",
+    "source_threads": ["1523203209345372161", "1523201952723501110"],
+    "principle": "Do not imply the campaign bonus is for the voucher recipient. It is a thank-you to the buyer/reserver unless a manual transfer exception is discussed.",
+    "scoring": ["campaign_fact_accuracy"]
+  },
+  {
+    "id": "broad_search_diversity",
+    "source_threads": ["1523202993476993036"],
+    "principle": "For broad discovery, offer different gift directions rather than several variants from the same narrow activity family. For specific searches, similar products are acceptable.",
+    "scoring": ["diversity", "sales_discovery"]
+  },
+  {
+    "id": "payment_facts",
+    "source_threads": ["1523202846764306553"],
+    "principle": "Explain payment methods exactly. Cash on delivery applies to paper voucher delivery; bank transfer is not an online checkout option and should be mentioned only when relevant.",
+    "scoring": ["support_accuracy", "conciseness"]
+  },
+  {
+    "id": "packaging_language",
+    "source_threads": ["1523202685120151562"],
+    "principle": "Use natural Bulgarian for packaging. Say packaging, paper voucher, printed voucher, or electronic voucher depending on context; avoid unnecessary 'physical packaging' wording.",
+    "scoring": ["natural_language", "support_accuracy"]
+  },
+  {
+    "id": "wish_field_concision",
+    "source_threads": ["1523202581449408562"],
+    "principle": "For voucher wishes, explain where the greeting is written and how preview/update works. Avoid obvious side explanations unless the customer is confused.",
+    "scoring": ["support_accuracy", "conciseness"]
+  },
+  {
+    "id": "voucher_merge_manual_support",
+    "source_threads": ["1523202501183012977"],
+    "principle": "If the customer wants two vouchers merged into one, say this is handled manually by the team; do not first explain separate voucher use as if that answered the request.",
+    "scoring": ["support_accuracy", "intent_understanding"]
+  },
+  {
+    "id": "voucher_extension_direct_flow",
+    "source_threads": ["1523202396975534153"],
+    "principle": "When voucher extension is available in the profile, describe the direct flow confidently and naturally. Escalate only for missing option, issue, or special status.",
+    "scoring": ["support_accuracy", "word_choice"]
+  },
+  {
+    "id": "booknow_refund_language",
+    "source_threads": ["1523202306001211404", "1523202180641980516"],
+    "principle": "For BookNow cancellation by provider/weather failure, say the money will be refunded. Do not weaken it to may be refunded when the described business rule is full refund.",
+    "scoring": ["booknow_accuracy", "natural_bulgarian"]
+  },
+  {
+    "id": "card_click_ux",
+    "source_threads": ["widget_ux_card_click"],
+    "principle": "Widget product cards must open the product page on normal click. This is frontend UX, not a Hermes reasoning issue.",
+    "scoring": ["widget_ux"]
+  },
+  {
+    "id": "no_template_repetition",
+    "source_threads": ["multiple"],
+    "principle": "Answers should not start from the same learned phrase across similar cases. Hermes should reason from the current question and facts, not copy examples.",
+    "scoring": ["tone_variety", "reasoning_quality"]
+  },
+  {
+    "id": "no_keyword_backend_patches",
+    "source_threads": ["architecture"],
+    "principle": "Do not fix these issues with keyword guards or one-off backend branches. Use prompt principles, facts, and evaluation scoring.",
+    "scoring": ["architecture_compliance"]
+  }
+]

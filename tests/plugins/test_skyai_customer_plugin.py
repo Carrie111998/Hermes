@@ -546,31 +546,25 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     )
 
     assert result["status"] == "ok"
-    sales_playbook = result["sales_playbook"]
-    assert "Работи консултативно" in sales_playbook["principles"][0]
-    assert "1-3 релевантни посоки" in sales_playbook["principles"][1]
-    assert "public tool evidence" in sales_playbook["principles"][4]
-    assert "Бонусният полет" in sales_playbook["skyvision_application"]
-    assert "различни усещания" in sales_playbook["skyvision_application"]
-    assert "не keyword guard-и" in sales_playbook["guardrail"]
+    assert result["tool_contract"]["purpose"] == "public_facts_only"
+    assert result["tool_contract"]["reasoning_owner"] == "hermes"
+    assert "готови customer-visible реплики" in result["tool_contract"]["notes"]
     campaign = result["active_campaigns"][0]
     assert campaign["public_url"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert "panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto" in campaign["terms_url"]
     assert "човека, който купува или резервира" in campaign["customer_summary"]
-    assert "благодарност от SkyVision към купувача" in campaign["sales_tone"]
-    assert "Не добавяй terms/URL/legal детайли" in campaign["sales_tone"]
-    assert "любовта към летенето" in campaign["sales_tone"]
-    assert "Емил и Малина" in campaign["brand_story_tone"]
-    assert "ДНК-то на бранда" in campaign["brand_story_tone"]
+    assert "SkyVision е създаден през 2007 от Емил и Малина." in campaign["brand_story_facts"]
+    assert "Летенето остава част от ДНК-то на бранда." in campaign["brand_story_facts"]
     assert campaign["bonus_owner"]["default"].startswith("човекът")
-    assert "Не казвай, че бонусът автоматично е за получателя" in campaign["bonus_owner"]["do_not_say"]
+    assert campaign["bonus_owner"]["is_automatic_for_voucher_recipient"] is False
+    assert campaign["bonus_owner"]["transfer_is_manual_exception"] is True
     assert campaign["campaign_2026_facts"]["public_page"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert campaign["campaign_2026_facts"]["archive_2025_url"] == (
         "https://skyvision.bg/campaign/free-panoramic-flight-2025/"
     )
     assert campaign["campaign_2026_facts"]["validity"] == "12 месеца от датата на покупката"
     assert "без предварително купуване на ваучер" in campaign["booknow_nuance"]
-    assert "парите могат да бъдат възстановени" in campaign["booknow_nuance"]
+    assert "парите ще бъдат възстановени" in campaign["booknow_nuance"]
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
     assert campaign["bonus_product"]["public_url"] == (
@@ -578,23 +572,12 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
     )
     assert campaign["bonus_product"]["duration"] == "10 мин."
     assert campaign["bonus_product"]["location"] == "Летище Приморско"
-    assert "Не го повтаряй във всеки отговор" in campaign["sales_tone"]
     assert result["founder_transfer_guidance"]["use_only_when_customer_asks_to_transfer_bonus_flight"] is True
-    founder_summary = result["founder_transfer_guidance"]["summary"]
-    assert "съосновател" in founder_summary
-    assert "пилот-инструктор" in founder_summary
-    assert "Default-ът остава: бонусът е благодарност към купувача" in founder_summary
-    assert "човешки жест" in founder_summary
-    flow = result["founder_transfer_guidance"]["customer_facing_flow"]
-    assert any("Първо потвърди ясно default-а" in item for item in flow)
-    assert any("Емил Ломлиев, съосновател" in item for item in flow)
-    assert any("Не казвай само „Емо“" in item for item in flow)
-    assert any("благодарност, че клиентът избира SkyVision" in item for item in flow)
-    assert any(
-        "това е нашето благодаря" in item
-        for item in result["founder_transfer_guidance"]["tone_anchors"]
-    )
-    assert "летенето е нашето ДНК" in result["founder_transfer_guidance"]["tone_anchors"]
+    founder_facts = result["founder_transfer_guidance"]["facts"]
+    assert founder_facts["default_owner"].startswith("купувачът")
+    assert founder_facts["founder_name"] == "Емил Ломлиев"
+    assert "пилот-инструктор" in founder_facts["founder_role"]
+    assert "не е автоматично право" in founder_facts["recipient_transfer"]
     assert result["founder_transfer_guidance"]["public_founder_contact"] == "+359 886 417 142"
 
 
