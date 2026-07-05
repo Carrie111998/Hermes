@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 import json
 import ipaddress
 import os
@@ -176,6 +177,22 @@ def conversation_id_from_payload(payload: dict[str, Any]) -> str:
     return f"skyai-v2-canary-{uuid.uuid4().hex[:12]}"
 
 
+def runtime_conversation_id(conversation_id: str) -> str:
+    """Compact external conversation ids before passing them into Hermes runtime.
+
+    The public FAB/Discord id can be long and human-readable. The internal
+    Codex/Hermes runtime only needs a stable session key, so keep it short and
+    path/header-safe while preserving traceability through a hash suffix.
+    """
+
+    raw = str(conversation_id or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-") or "skyai-v2"
+    if len(safe) <= 64:
+        return safe
+    digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+    return f"{safe[:51].rstrip('-')}-{digest}"[:64]
+
+
 def build_skyai_system_prompt() -> str:
     return (
         "Ти си SkyAI, клиентският асистент на SkyVision. "
@@ -267,6 +284,9 @@ def build_skyai_system_prompt() -> str:
         "BookNow е собствената директна резервационна система на SkyVision и силно "
         "конкурентно предимство: подходяща е, когато клиентът иска преживяване за себе "
         "си или за близки хора на конкретна дата/час, без първо да купува ваучер. "
+        "Обяснявай ясно на български: ако изпълнителят не може да проведе BookNow "
+        "резервацията, парите могат да бъдат възстановени; не казвай неясното "
+        "„резервацията може да бъде възстановена“. "
         "Ако campaign tool-ът върне bonus_product.product_id "
         "и клиентът пита за свободни часове или резервация на този бонус, използвай "
         "skyai_product_slots с този product_id, преди да отговориш. Когато разговорът естествено е "
@@ -1273,7 +1293,12 @@ async def build_chat_response(
     history = extract_history(payload)
     conversation_id = conversation_id_from_payload(payload)
     started = time.monotonic()
-    runner_result = await agent_runner(message, history, conversation_id, settings)
+    runner_result = await agent_runner(
+        message,
+        history,
+        runtime_conversation_id(conversation_id),
+        settings,
+    )
     reply, runner_cards = _coerce_runner_result(runner_result)
     cards = runner_cards or await asyncio.to_thread(build_cards_from_reply, reply)
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -1386,6 +1411,7 @@ def _normalize_card(card: dict[str, Any]) -> dict[str, Any]:
     normalized = {
         "title": _clean_card_text(title),
         "public_url": str(public_url).strip() if public_url else None,
+        "url": str(public_url).strip() if public_url else None,
         "price_eur": _clean_card_text(card.get("price_eur") or card.get("priceEur")),
         "price_bgn": _clean_card_text(card.get("price_bgn") or card.get("priceBgn")),
         "price_text": _clean_card_text(card.get("price") or card.get("price_text")),
@@ -1666,7 +1692,7 @@ def _compare_card_sets(dev_cards_raw: Any, prod_cards_raw: Any) -> dict[str, Any
 
 
 def _canonical_card_url(card: dict[str, Any]) -> str:
-    value = str(card.get("public_url") or "").strip()
+    value = str(card.get("public_url") or card.get("url") or "").strip()
     return value.rstrip("/")
 
 

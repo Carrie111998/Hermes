@@ -291,6 +291,17 @@ def test_catalog_ranking_diversifies_broad_discovery_without_hurting_specific_qu
     assert [item["id"] for item in specific[:2]] == [1, 2]
 
 
+def test_query_traits_detects_50_plus_recipient() -> None:
+    traits = public_tools._query_traits(
+        "Подаръкът е за спокойна и позитивна приятелка, 50+."
+    )
+
+    assert traits.mature_recipient is True
+    assert traits.calm_recipient is True
+    assert traits.broad_discovery is True
+    assert traits.single_recipient_gift is True
+
+
 def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeypatch) -> None:
     public_tools._CATALOG_INDEX_CACHE["items"] = None
     public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
@@ -374,7 +385,7 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
 
     result = public_tools.handle_skyai_catalog_search(
         query=(
-            "Подарък за близка приятелка от Сливен. "
+            "Подаръкът е за близка приятелка от Сливен. "
             "Тя е спокоен и позитивен човек, 50+."
         ),
         limit=3,
@@ -399,6 +410,69 @@ def test_catalog_search_prefers_calm_nearby_options_for_sliven_recipient(monkeyp
     assert "не изписва конкретна услуга" in result["value_voucher_option"]["important_note"]
     assert "четвърта, универсална опция" in result["value_voucher_option"]["answer_guidance"]
     assert all(item["category_key"] for item in result["items"])
+
+
+def test_catalog_search_prunes_far_options_when_enough_nearby_gift_matches(monkeypatch) -> None:
+    public_tools._CATALOG_INDEX_CACHE["items"] = None
+    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
+
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        if url.endswith("search="):
+            return {
+                "data": [
+                    {
+                        "id": 1,
+                        "name": "СПА уикенд край Сливен",
+                        "price": "260",
+                        "slug": "спа-и-релакс/spa-uikend-sliven",
+                        "locationName": "Сливен",
+                    },
+                    {
+                        "id": 2,
+                        "name": "Винен релакс в Стара Загора",
+                        "price": "180",
+                        "slug": "винени-турове-дегустации/vinen-relaks-stara-zagora",
+                        "locationName": "Стара Загора",
+                    },
+                    {
+                        "id": 3,
+                        "name": "Флотация и релаксиращ масаж в Бургас",
+                        "price": "190",
+                        "slug": "флотация/flotacia-masaj-burgas",
+                        "locationName": "Бургас",
+                    },
+                    {
+                        "id": 4,
+                        "name": "Луксозен СПА ритуал в Сърница",
+                        "price": "160",
+                        "slug": "спа-и-релакс/luksozen-spa-ritual-sarnitsa",
+                        "locationName": "Сърница",
+                    },
+                    {
+                        "id": 5,
+                        "name": "Детско-юношеско офроуд училище край Сливен",
+                        "price": "90",
+                        "slug": "шофиране-за-деца/detsko-yunoshesko-ofroud-uchilishte",
+                        "locationName": "Сливен",
+                    },
+                ]
+            }
+        return {"data": []}
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_catalog_search(
+        query=(
+            "Моля за помощ. Близка приятелка има рожден ден. "
+            "Подаръкът да е красив. Тя е спокоен и позитивен човек, 50+, от Сливен."
+        ),
+        limit=3,
+    )
+
+    titles = [item["title"] for item in result["items"]]
+    assert "Луксозен СПА ритуал в Сърница" not in titles
+    assert "Детско-юношеско офроуд училище край Сливен" not in titles
+    assert all(item["distance_from_requested_location_km"] <= 140 for item in result["items"])
 
 
 def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
@@ -427,6 +501,8 @@ def test_campaign_knowledge_returns_public_sales_and_terms_guidance() -> None:
         "https://skyvision.bg/campaign/free-panoramic-flight-2025/"
     )
     assert campaign["campaign_2026_facts"]["validity"] == "12 месеца от датата на покупката"
+    assert "без предварително купуване на ваучер" in campaign["booknow_nuance"]
+    assert "парите могат да бъдат възстановени" in campaign["booknow_nuance"]
     assert campaign["bonus_product"]["product_id"] == 95435
     assert campaign["bonus_product"]["availability_tool"] == "skyai_product_slots"
     assert campaign["bonus_product"]["public_url"] == (

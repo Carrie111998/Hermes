@@ -700,7 +700,8 @@ def _rank_products(
         scored.append((score - (index * 0.0001), item))
     scored.sort(key=lambda pair: pair[0], reverse=True)
     if scored:
-        return _diversify_ranked_products([item for _score, item in scored], traits=traits)
+        diversified = _diversify_ranked_products([item for _score, item in scored], traits=traits)
+        return _prefer_nearby_results_when_available(diversified, traits=traits)
     return filtered
 
 
@@ -726,6 +727,41 @@ def _diversify_ranked_products(
     return [*selected, *deferred]
 
 
+def _prefer_nearby_results_when_available(
+    ranked: list[dict[str, Any]],
+    *,
+    traits: QueryTraits,
+) -> list[dict[str, Any]]:
+    if not traits.broad_discovery or not traits.requested_location:
+        return ranked
+
+    with_distance = [
+        item
+        for item in ranked
+        if isinstance(item.get("_skyai_distance_km"), (int, float))
+    ]
+    if not with_distance:
+        return ranked
+
+    within_140 = [item for item in ranked if _ranked_distance(item) is not None and _ranked_distance(item) <= 140]
+    within_180 = [item for item in ranked if _ranked_distance(item) is not None and _ranked_distance(item) <= 180]
+
+    if len(within_140) >= 3:
+        return [*within_140, *[item for item in ranked if item not in within_140]]
+    if len(within_140) >= 2 and len(within_180) >= 3:
+        return [*within_180, *[item for item in ranked if item not in within_180]]
+    if len(within_140) >= 2:
+        return [*within_140, *[item for item in ranked if item not in within_140]]
+    return ranked
+
+
+def _ranked_distance(item: dict[str, Any]) -> float | None:
+    value = item.get("_skyai_distance_km")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def _product_family_key(item: dict[str, Any]) -> str:
     category = item.get("category_slug") or item.get("categorySlug")
     if category:
@@ -748,14 +784,16 @@ def _query_traits(query: str) -> QueryTraits:
     tokens = _query_tokens(query)
     requested_location = _find_known_location(normalized)
     requested_coordinates = _KNOWN_LOCATION_COORDS.get(requested_location or "")
-    mature_recipient = bool(re.search(r"\b(?:50\s*\+|над\s+50|около\s+50)\b", normalized))
+    mature_recipient = bool(
+        re.search(r"(?:^|\s)(?:50\s*\+|над\s+50|около\s+50)(?:\s|$|[.,!?])", normalized)
+    )
     calm_recipient = bool(
         any(token in _CALM_QUERY_TOKENS for token in tokens)
         or mature_recipient
         or "не екстрем" in normalized
     )
     broad_discovery = bool(
-        any(token in tokens for token in ("подарък", "подаръка", "идея", "идеи"))
+        _query_suggests_gift_discovery(tokens)
         and not any(_product_family_matches_query(family, tokens) for family in _SPECIFIC_PRODUCT_FAMILIES)
     )
     single_recipient_gift = bool(
@@ -799,6 +837,14 @@ def _find_known_location(text: str) -> str | None:
         if location in normalized:
             return location
     return None
+
+
+def _query_suggests_gift_discovery(tokens: list[str]) -> bool:
+    return any(
+        token.startswith("подар")
+        or token in {"идея", "идеи", "вариант", "варианти"}
+        for token in tokens
+    )
 
 
 def _product_location_text(item: dict[str, Any]) -> str:
@@ -984,8 +1030,11 @@ def _recipient_fit_score(
     score = min(14.0, calm_hits * 4.0)
     if extreme_hits:
         score -= min(16.0, extreme_hits * 4.0)
-    if traits.mature_recipient and any(signal in combined for signal in ("детски", "дете", "деца", "ученик", "тийн")):
-        score -= 14.0
+    if traits.mature_recipient and any(
+        signal in combined
+        for signal in ("детски", "детско", "дете", "деца", "ученик", "тийн", "юнош")
+    ):
+        score -= 120.0
     if "жена" in traits.tokens and any(signal in combined for signal in ("козметика", "визия", "стил", "терапия", "релакс")):
         score += 3.0
     if traits.single_recipient_gift and any(signal in combined for signal in _TWO_PERSON_PRODUCT_SIGNALS):
@@ -1228,8 +1277,8 @@ def handle_skyai_campaign_knowledge(
                 },
                 "booknow_nuance": (
                     "При BookNow бонусният полет се ползва след основното преживяване, защото BookNow "
-                    "е конкретна резервация със защита за клиента и възможно възстановяване на пари, "
-                    "ако изпълнителят не може да проведе резервацията."
+                    "е конкретна резервация без предварително купуване на ваучер, със защита за клиента: "
+                    "ако изпълнителят не може да проведе резервацията, парите могат да бъдат възстановени."
                 ),
                 "voucher_nuance": (
                     "При ваучер сделката е за период на валидност, не за конкретен слот; ако дата отпадне, "

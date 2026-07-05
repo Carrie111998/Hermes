@@ -73,6 +73,17 @@ def test_extract_history_normalizes_customer_role_and_limits() -> None:
     ]
 
 
+def test_runtime_conversation_id_compacts_long_external_ids() -> None:
+    external_id = "skyai-v2-compare-20260704T203902Z-gift-calm-50-sliven-" + ("x" * 120)
+
+    runtime_id = dev_gateway.runtime_conversation_id(external_id)
+
+    assert len(runtime_id) <= 64
+    assert runtime_id.startswith("skyai-v2-compare-")
+    assert runtime_id != external_id
+    assert dev_gateway.runtime_conversation_id("thread-1") == "thread-1"
+
+
 @pytest.mark.asyncio
 async def test_build_chat_response_dry_run_returns_fab_compatible_shape(tmp_path: Path) -> None:
     response = await dev_gateway.build_chat_response(
@@ -215,6 +226,9 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "Син плик „Лукс“" in prompt
     assert "червен восъчен печат" in prompt
     assert "BookNow е собствената директна резервационна система" in prompt
+    assert "без първо да купува ваучер" in prompt
+    assert "парите могат да бъдат възстановени" in prompt
+    assert "резервацията може да бъде възстановена" in prompt
     assert "founder_transfer_guidance" in prompt
     assert "Емил Ломлиев" in prompt
     assert "бонусният полет" in prompt
@@ -252,6 +266,7 @@ def test_build_cards_from_reply_enriches_visible_product_links(monkeypatch) -> N
         {
             "title": "Полет с жирокоптер MTO-Sport",
             "public_url": "https://skyvision.bg/подарък/полет-с-жирокоптер/полет-с-жирокоптер-mto-sport/",
+            "url": "https://skyvision.bg/подарък/полет-с-жирокоптер/полет-с-жирокоптер-mto-sport/",
             "price_eur": "101.75",
             "price_bgn": "199.00",
             "location": "Приморско",
@@ -269,6 +284,7 @@ def test_build_cards_from_reply_supports_value_voucher_special_url() -> None:
         {
             "title": "Ваучер за подарък на стойност",
             "public_url": "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/",
+            "url": "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/",
             "price_text": "стойност по избор",
             "location": "валиден за SkyVision каталога",
         }
@@ -446,6 +462,7 @@ async def test_build_compare_response_compares_card_links_prices_and_images(
         {
             "title": "Масаж за двама",
             "public_url": "https://skyvision.bg/подарък/масаж/масаж-за-двама/",
+            "url": "https://skyvision.bg/подарък/масаж/масаж-за-двама/",
             "price_eur": "90.00",
             "location": "София",
             "image": "https://cdn.example/massage.jpg",
