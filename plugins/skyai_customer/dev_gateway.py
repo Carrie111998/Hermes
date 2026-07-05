@@ -47,6 +47,8 @@ DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 DISCORD_MESSAGE_LIMIT = 1900
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
+BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
+BUILD_COMMIT_FILE = ".skyai-build-commit"
 SKYAI_REASONING_CONTRACT = (
     "Архитектурен договор: Hermes мисли. Backend-ът и tools дават публични факти, "
     "структурирани данни, линкове, цени, слотове, constraints и безопасни граници, "
@@ -97,6 +99,7 @@ class CanarySettings:
     compare_prod_base_url: str = ""
     compare_prod_path: str = DEFAULT_COMPARE_PROD_PATH
     compare_timeout_seconds: float = 45.0
+    build_commit: str = ""
 
 
 def is_loopback_host(host: str) -> bool:
@@ -125,6 +128,19 @@ def validate_settings(settings: CanarySettings) -> None:
         and not settings.auth_token
     ):
         raise ValueError("A bearer token is required for non-loopback canary binds")
+
+
+def resolve_build_commit(explicit: str = "") -> str:
+    value = explicit.strip()
+    if value:
+        return value
+    env_value = os.getenv(BUILD_COMMIT_ENV, "").strip()
+    if env_value:
+        return env_value
+    try:
+        return (Path.cwd() / BUILD_COMMIT_FILE).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def extract_message(payload: dict[str, Any]) -> str:
@@ -1638,6 +1654,7 @@ def create_app(
                 "status": "ok",
                 "service": "skyai-hermes-v2-canary",
                 "version": settings.version,
+                "build_commit": settings.build_commit,
                 "live_model": settings.live_model,
             }
         )
@@ -1650,6 +1667,7 @@ def create_app(
                 "profile_home": str(settings.profile_home),
                 "toolset": SKYAI_TOOLSET,
                 "live_model": settings.live_model,
+                "build_commit": settings.build_commit,
             }
         )
 
@@ -1767,6 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
         compare_prod_base_url=os.getenv("SKYAI_COMPARE_PROD_BASE_URL", "").strip().rstrip("/"),
         compare_prod_path=os.getenv("SKYAI_COMPARE_PROD_PATH", DEFAULT_COMPARE_PROD_PATH).strip()
         or DEFAULT_COMPARE_PROD_PATH,
+        build_commit=resolve_build_commit(),
     )
     app = create_app(settings)
     web.run_app(app, host=settings.host, port=settings.port)

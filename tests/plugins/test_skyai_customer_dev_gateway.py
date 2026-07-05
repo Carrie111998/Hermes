@@ -37,6 +37,30 @@ def test_validate_settings_allows_private_bind_with_explicit_gate_without_token(
     )
 
 
+def test_resolve_build_commit_prefers_explicit_value(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(dev_gateway.BUILD_COMMIT_ENV, "from-env")
+    (tmp_path / dev_gateway.BUILD_COMMIT_FILE).write_text("from-file\n", encoding="utf-8")
+
+    assert dev_gateway.resolve_build_commit("explicit") == "explicit"
+
+
+def test_resolve_build_commit_reads_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(dev_gateway.BUILD_COMMIT_ENV, "from-env")
+    (tmp_path / dev_gateway.BUILD_COMMIT_FILE).write_text("from-file\n", encoding="utf-8")
+
+    assert dev_gateway.resolve_build_commit() == "from-env"
+
+
+def test_resolve_build_commit_reads_runtime_file(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv(dev_gateway.BUILD_COMMIT_ENV, raising=False)
+    (tmp_path / dev_gateway.BUILD_COMMIT_FILE).write_text("from-file\n", encoding="utf-8")
+
+    assert dev_gateway.resolve_build_commit() == "from-file"
+
+
 def test_extract_message_accepts_fab_style_payload() -> None:
     payload = {
         "conversation_id": "abc",
