@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -183,5 +183,60 @@ describe('SidebarSessionRow', () => {
     const avatar = container.querySelector('span[aria-hidden="true"]')
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
+  })
+})
+
+describe('SidebarSessionRow reorder activation', () => {
+  function renderReorderableRow() {
+    const dragHandleProps = {
+      onKeyDown: vi.fn(),
+      onMouseDown: vi.fn(),
+      onPointerDown: vi.fn(),
+      onTouchStart: vi.fn()
+    }
+
+    const utils = render(
+      <SidebarSessionRow
+        dragHandleProps={dragHandleProps}
+        isPinned={false}
+        isSelected={false}
+        isWorking={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={noop}
+        reorderable
+        session={makeSession({ title: 'Reorderable session' })}
+      />
+    )
+
+    return { ...utils, dragHandleProps }
+  }
+
+  it('starts reorder from row chrome, not just the tiny grab handle', () => {
+    const { container, dragHandleProps } = renderReorderableRow()
+    const chrome = container.querySelector('[data-session-row-chrome]') as HTMLElement
+
+    fireEvent.mouseDown(chrome)
+
+    expect(dragHandleProps.onMouseDown).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the main row button wired without double-firing through row chrome', () => {
+    const { container, dragHandleProps } = renderReorderableRow()
+    const main = container.querySelector('[data-session-row-main]') as HTMLElement
+
+    fireEvent.mouseDown(main)
+
+    expect(dragHandleProps.onMouseDown).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not start reorder from the actions menu button', () => {
+    const { container, dragHandleProps } = renderReorderableRow()
+    const actions = container.querySelector('[data-session-row-actions]') as HTMLElement
+
+    fireEvent.mouseDown(actions)
+
+    expect(dragHandleProps.onMouseDown).not.toHaveBeenCalled()
   })
 })
