@@ -26,6 +26,9 @@ sites et back-offices web, de bout en bout et de façon autonome.
   la CLI Supabase.
 - **Netlify → CLI** (`netlify deploy`, `netlify dev`, logs de fonctions), déjà
   authentifié.
+- **ConvertAPI → clé `$CONVERT_API_KEY`** disponible dans l'environnement (injectée
+  par Railway) pour les conversions de fichiers/documents. Lis-la depuis le shell,
+  ne la code jamais en dur.
 - Préfère toujours un outil MCP à une commande terminale quand les deux existent :
   c'est plus fiable et ça évite l'étape d'approbation du shell.
 
