@@ -16,6 +16,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { modelOptionsQueryKey } from '@/lib/model-options'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
+import { usageFromTokenUsagePayload } from '@/lib/usage-events'
 import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgentNotice } from '@/store/agent-notices'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
@@ -489,6 +490,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             queryKey:
               explicitSid && sessionId ? modelOptionsQueryKey(activeGatewayProfile, sessionId) : ['model-options']
           })
+        }
+      } else if (event.type === 'token.usage') {
+        if (!explicitSid || isActiveEvent) {
+          const usage = usageFromTokenUsagePayload(payload)
+
+          if (usage) {
+            setCurrentUsage(current => ({ ...current, ...usage }))
+          }
         }
       } else if (event.type === 'message.start') {
         if (!sessionId) {

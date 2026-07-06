@@ -596,6 +596,15 @@ export interface SpawnTreeLoadResponse {
   subagents?: unknown[]
 }
 
+export interface TokenUsagePayload {
+  context_length?: number
+  context_pct?: number
+  context_tokens?: number
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
+}
+
 export type GatewayEvent =
   | { payload?: { skin?: GatewaySkin }; session_id?: string; type: 'gateway.ready' }
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
@@ -716,6 +725,7 @@ export type GatewayEvent =
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.progress' }
   | { payload: SubagentEventPayload; session_id?: string; type: 'subagent.complete' }
   | { payload: { rendered?: string; text?: string }; session_id?: string; type: 'message.delta' }
+  | { payload?: TokenUsagePayload; session_id?: string; type: 'token.usage' }
   | {
       payload: { already_streamed?: boolean; text: string }
       session_id?: string
