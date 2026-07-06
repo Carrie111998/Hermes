@@ -1,4 +1,11 @@
 name: Upstream Sync PR
+# Fork setup required for this workflow to create PRs:
+#   Settings → Actions → General → Workflow permissions:
+#     ✓ "Allow GitHub Actions to create and approve pull requests"
+#   Without this, gh pr create fails with:
+#     "GitHub Actions is not permitted to create or approve pull requests"
+#   The `pull-requests: write` permission below is necessary but not sufficient —
+#   the repository setting is a separate security gate.
 
 on:
   schedule:
@@ -85,40 +92,43 @@ jobs:
 
           git checkout -B "$BRANCH" origin/main
 
-          # Patch-stack model: replay the fork's PAI commits on top of the new
-          # upstream instead of merging upstream in. A `--no-ff` merge re-introduces
-          # the pre-rebase copies of every PAI patch on each run, which is exactly
-          # what produced the duplicated-commit history this workflow used to create.
-          # Rebasing keeps `main` linear (upstream/main + the PAI patch series, no
-          # merge commits) and surfaces any conflict once, per patch.
-          if ! git rebase upstream/main; then
-            git rebase --abort || true
+          # Reviewed upstream-merge model: preserve the current Scaffolde fork
+          # contract and merge Nous upstream into a PR branch. The fork has a large
+          # accumulated patch-stack history, so replaying every historical fork
+          # commit on every sync is no longer a reliable maintenance path.
+          if ! git merge --no-ff --no-edit upstream/main; then
+            git merge --abort || true
             {
-              echo "### Upstream sync needs manual rebase"
+              echo "### Upstream sync needs manual merge resolution"
               echo ""
-              echo "Rebasing the PAI patch stack onto upstream/main hit conflicts."
+              echo "Merging upstream/main into the Scaffolde fork hit conflicts."
               echo ""
-              echo "Resolve locally, then force-update main:"
+              echo "Resolve locally on a sync branch, preserving the Scaffolde fork contract, then open/update a reviewed PR:"
               echo ""
               echo '```bash'
-              echo "git fetch upstream && git checkout main && git rebase upstream/main"
+              echo "git fetch origin upstream"
+              echo "git checkout -B sync/nous-upstream-$(date +%Y%m%d) origin/main"
+              echo "git merge upstream/main"
               echo "# resolve conflicts, then:"
-              echo "git push --force-with-lease origin main"
+              echo "git push -u origin HEAD"
+              echo "gh pr create --base main --head <branch>"
               echo '```'
               echo ""
               echo "The existing $BRANCH branch was left untouched."
             } >> "$GITHUB_STEP_SUMMARY"
 
             if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
-              echo "::warning::Rebasing PAI patches onto upstream/main hit conflicts. Scheduled runs report this as manual sync required without failing repeatedly."
+              echo "::warning::Merging upstream/main into the Scaffolde fork hit conflicts. Scheduled runs report this as manual sync required without failing repeatedly."
               exit 0
             fi
 
-            echo "::error::Rebasing PAI patches onto upstream/main hit conflicts."
-            echo "Resolve locally, then force-update main:"
-            echo "  git fetch upstream && git checkout main && git rebase upstream/main"
+            echo "::error::Merging upstream/main into the Scaffolde fork hit conflicts."
+            echo "Resolve locally on a sync branch, preserving the Scaffolde fork contract, then open/update a reviewed PR:"
+            echo "  git fetch origin upstream"
+            echo "  git checkout -B sync/nous-upstream-$(date +%Y%m%d) origin/main"
+            echo "  git merge upstream/main"
             echo "  # resolve conflicts, then:"
-            echo "  git push --force-with-lease origin main"
+            echo "  git push -u origin HEAD"
             echo "Left the existing $BRANCH untouched for manual resolution."
             exit 1
           fi
@@ -128,26 +138,19 @@ jobs:
           cat > /tmp/upstream-sync-pr-body.md <<'EOF'
           Automated upstream sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
 
-          This branch is `upstream/main` with the PAI patch series **rebased** on top —
-          a linear patch stack, no merge commits. Review the diff and let CI run here.
+          This branch merges `upstream/main` into the current Scaffolde fork main while
+          preserving the fork contract. Review the diff and let CI run here.
 
           Policy:
           - This PR is review-gated. Do not auto-merge blindly.
           - Existing CI/checks must pass before landing.
-          - **Land by fast-forwarding `main` to this branch — do NOT use the green
-            "Merge" button** (a merge commit reintroduces the dual-history problem).
-            From a clean checkout:
-            ```
-            git fetch origin
-            git checkout main
-            git reset --hard origin/automation/upstream-sync
-            git push --force-with-lease origin main
-            ```
+          - Land with a normal reviewed merge commit. Do not squash; squashing hides
+            the upstream merge boundary and makes the next sync harder to inspect.
           - If the workflow used the GITHUB_TOKEN fallback, PR checks may need a
             manual rerun because workflow-created pushes do not always trigger
             downstream workflows.
-          - If the rebase conflicted, this PR was not updated; resolve locally per the
-            failed job log and force-update `main` directly.
+          - If the merge conflicted, this PR was not updated; resolve locally per the
+            failed job log and open/update a reviewed sync PR.
 
           Source:
           - upstream: NousResearch/hermes-agent main
