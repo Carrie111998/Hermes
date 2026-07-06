@@ -4,8 +4,9 @@
 # Netlify via CLI (installé dans l'image), auth NETLIFY_AUTH_TOKEN.
 # Les ${VAR} sont interpolées depuis l'environnement du process (injecté par Railway).
 
+# Modèle par défaut : Z.AI GLM 5.2 (via OpenRouter, OPENROUTER_API_KEY).
 model:
-  default: "qwen/qwen3.6-plus"
+  default: "z-ai/glm-5.2"
   provider: "openrouter"
 
 terminal:
@@ -43,4 +44,16 @@ mcp_servers:
     args: ["-y", "@supabase/mcp-server-supabase@latest", "--read-only"]
     env:
       SUPABASE_ACCESS_TOKEN: "${SUPABASE_ACCESS_TOKEN}"
+    enabled: true
+
+  # Vimeo — serveur MCP @mcp/vimeo (Node, stdio) : gestion vidéos, transcripts,
+  # stats (11 outils mcp_vimeo_*). Vendorisé sous docker/mcp-servers/vimeo-mcp et
+  # buildé DANS L'IMAGE (cf. Dockerfile) : aucun clone/réseau au boot, survit à un
+  # reset de volume. Auth : VIMEO_ACCESS_TOKEN interpolé depuis l'env du process
+  # (à définir dans les variables Railway, comme les autres tokens ci-dessus).
+  vimeo:
+    command: "node"
+    args: ["/opt/hermes/docker/mcp-servers/vimeo-mcp/dist/index.js"]
+    env:
+      VIMEO_ACCESS_TOKEN: "${VIMEO_ACCESS_TOKEN}"
     enabled: true
