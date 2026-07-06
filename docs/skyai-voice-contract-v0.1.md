@@ -243,6 +243,8 @@ Response:
   "display_reply": "Чудесно, нека го направим специален...",
   "cards": [],
   "transfer": null,
+  "transfer_reason": null,
+  "target": null,
   "end_call": false,
   "telemetry": {
     "skyai_latency_ms": 1200,
@@ -250,6 +252,10 @@ Response:
   }
 }
 ```
+
+For `transfer_to_human` responses, the gateway should prefer the structured
+`transfer` object when available, while `transfer_reason` and `target` duplicate
+`transfer.reason` and `transfer.target` for simpler compatibility clients.
 
 ### `POST /voice/event`
 

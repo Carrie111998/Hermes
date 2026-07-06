@@ -249,6 +249,9 @@ async def test_build_voice_turn_response_uses_v2_chat_adapter(tmp_path: Path) ->
     assert response["spoken_reply"] == "Разбира се, ето идея за подарък."
     assert response["display_reply"] == response["spoken_reply"]
     assert response["cards"] == [{"title": "Ваучер за подарък на стойност", "price_text": "стойност по избор"}]
+    assert response["transfer"] is None
+    assert response["transfer_reason"] is None
+    assert response["target"] is None
     assert response["trace"]["backend_target"] == "skyai_v2_chatkit"
     assert response["trace"]["voice_backend_target"] == "skyai_v2_chatkit"
     assert response["trace"]["stt_confidence"] == 0.91
@@ -295,6 +298,8 @@ async def test_build_voice_event_dtmf_zero_transfers_to_human(tmp_path: Path) ->
     assert response["status"] == "ok"
     assert response["action"] == "transfer_to_human"
     assert response["transfer"] == {"target": "operator_queue", "reason": "dtmf"}
+    assert response["target"] == "operator_queue"
+    assert response["transfer_reason"] == "dtmf"
     assert "човек" in response["spoken_reply"]
 
 
@@ -317,6 +322,8 @@ async def test_build_voice_turn_v1_target_requires_configured_backend(tmp_path: 
         "target": "operator_queue",
         "reason": "voice_v1_backend_not_configured",
     }
+    assert response["target"] == "operator_queue"
+    assert response["transfer_reason"] == "voice_v1_backend_not_configured"
     assert response["trace"]["backend_target"] == "skyai_v1_chatkit"
 
 

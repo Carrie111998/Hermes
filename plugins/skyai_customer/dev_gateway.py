@@ -1705,6 +1705,13 @@ def _voice_response(
     }
     if trace_extra:
         trace.update({key: value for key, value in trace_extra.items() if value is not None})
+    transfer_reason = None
+    transfer_target = None
+    if isinstance(transfer, dict):
+        raw_reason = transfer.get("reason")
+        raw_target = transfer.get("target")
+        transfer_reason = str(raw_reason).strip()[:120] if raw_reason not in ("", None) else None
+        transfer_target = str(raw_target).strip()[:120] if raw_target not in ("", None) else None
     return {
         "status": "ok",
         "version": settings.version,
@@ -1716,6 +1723,8 @@ def _voice_response(
         "display_reply": display_reply or spoken_reply,
         "cards": cards or [],
         "transfer": transfer,
+        "transfer_reason": transfer_reason,
+        "target": transfer_target,
         "end_call": end_call,
         "session_state": session_state or {"handoff_allowed": True},
         "trace": trace,
