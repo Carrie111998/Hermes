@@ -20,8 +20,6 @@ def test_service_path_includes_node_modules_when_present(tmp_path):
     assert str(nm_bin) in dirs
 
 
-<<<<<<< ours
-=======
 def test_service_path_includes_hermes_home_node_modules(tmp_path):
     """Service PATH should include ~/.hermes/node_modules/.bin when it exists."""
     hermes_nm = tmp_path / ".hermes" / "node_modules" / ".bin"
@@ -52,4 +50,3 @@ def test_user_local_paths_skips_home_bin_when_absent(tmp_path):
     from hermes_cli.gateway import _build_user_local_paths
     result = _build_user_local_paths(tmp_path, [])
     assert str(tmp_path / "bin") not in result
->>>>>>> theirs
