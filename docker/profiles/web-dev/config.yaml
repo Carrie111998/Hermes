@@ -45,3 +45,15 @@ mcp_servers:
     env:
       SUPABASE_ACCESS_TOKEN: "${SUPABASE_ACCESS_TOKEN}"
     enabled: true
+
+  # Vimeo — serveur MCP @mcp/vimeo (Node, stdio) : gestion vidéos, transcripts,
+  # stats (11 outils mcp_vimeo_*). Le binaire est buildé sur le VOLUME persistant
+  # (clone + npm run build), pas dans l'image ; ce chemin absolu doit donc rester
+  # présent sur /opt/data. Auth : VIMEO_ACCESS_TOKEN interpolé depuis l'env du
+  # process (à définir dans les variables Railway, comme les autres tokens ci-dessus).
+  vimeo:
+    command: "node"
+    args: ["/opt/data/.hermes/mcp-servers/vimeo-mcp/dist/index.js"]
+    env:
+      VIMEO_ACCESS_TOKEN: "${VIMEO_ACCESS_TOKEN}"
+    enabled: true
