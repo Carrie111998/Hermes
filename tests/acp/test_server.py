@@ -358,9 +358,36 @@ class TestListAndFork:
         assert resp.sessions[0].updated_at == "123.0"
 
 
+    @pytest.mark.asyncio
+    async def test_ext_method_set_archived_delegates_and_returns_ok(self, agent):
+        with patch.object(
+            agent.session_manager, "set_session_archived", return_value=True
+        ) as mock_set:
+            result = await agent.ext_method("setArchived", {"sessionId": "s1", "archived": True})
+        assert result == {"ok": True}
+        mock_set.assert_called_once_with("s1", True)
 
+    @pytest.mark.asyncio
+    async def test_ext_method_unknown_raises_method_not_found(self, agent):
+        from acp import RequestError
+        with pytest.raises(RequestError):
+            await agent.ext_method("nope", {})
 
-
+    @pytest.mark.asyncio
+    async def test_list_sessions_archived_only_forwards_and_stamps_meta(self, agent):
+        with patch.object(
+            agent.session_manager, "list_sessions",
+            return_value=[{
+                "session_id": "s1", "cwd": "/tmp", "title": "T",
+                "updated_at": 1.0, "archived": True,
+            }],
+        ) as mock_list:
+            resp = await agent.list_sessions(cwd="/tmp", hermes={"archivedOnly": True})
+        _, kwargs = mock_list.call_args
+        assert kwargs.get("archived_only") is True
+        assert kwargs.get("include_archived") is False
+        s = resp.sessions[0]
+        assert (s.field_meta or {}).get("hermes", {}).get("archived") is True
 
 # ---------------------------------------------------------------------------
 # session configuration / model routing
