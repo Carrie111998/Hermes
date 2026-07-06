@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
+<<<<<<< HEAD
   AUDIO_SPEAK_MAX_REQUEST_TIMEOUT_MS,
   AUDIO_SPEAK_MIN_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MAX_REQUEST_TIMEOUT_MS,
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+=======
+  bulkArchiveSessions,
+>>>>>>> 239cbaba6 (Refresh onto current upstream/main (no behavior change))
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -409,5 +413,52 @@ describe('Hermes REST helpers', () => {
         path: '/api/model/options?refresh=1&include_unconfigured=1'
       })
     )
+  })
+})
+
+describe('bulkArchiveSessions', () => {
+  const originalHermesDesktop = window.hermesDesktop
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: originalHermesDesktop,
+      writable: true
+    })
+  })
+
+  it('posts deduped preserve ids to the manual bulk archive endpoint', async () => {
+    const api = vi.fn().mockResolvedValue({ ok: true, archived: 12 })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { api },
+      writable: true
+    })
+
+    await expect(bulkArchiveSessions(['pin', '', 'current', 'pin'])).resolves.toEqual({ ok: true, archived: 12 })
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/sessions/bulk-archive',
+      method: 'POST',
+      body: { preserve_ids: ['pin', 'current'] }
+    })
+  })
+
+  it('passes the visible profile scope to the bulk archive endpoint', async () => {
+    const api = vi.fn().mockResolvedValue({ ok: true, archived: 3 })
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { api },
+      writable: true
+    })
+
+    await bulkArchiveSessions(['pin'], '__all__')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/sessions/bulk-archive',
+      method: 'POST',
+      body: { preserve_ids: ['pin'], profile: '__all__' }
+    })
   })
 })
