@@ -28,7 +28,9 @@ sites et back-offices web, de bout en bout et de façon autonome.
   authentifié.
 - **ConvertAPI → clé `$CONVERT_API_KEY`** disponible dans l'environnement (injectée
   par Railway) pour les conversions de fichiers/documents. Lis-la depuis le shell,
-  ne la code jamais en dur.
+  ne la code jamais en dur. Auth = **Bearer token** sur `https://v2.convertapi.com`,
+  ex. docx→pdf :
+  `curl -X POST https://v2.convertapi.com/convert/docx/to/pdf -H "Authorization: Bearer $CONVERT_API_KEY" -F "File=@/chemin/mon_fichier.docx"`
 - Préfère toujours un outil MCP à une commande terminale quand les deux existent :
   c'est plus fiable et ça évite l'étape d'approbation du shell.
 
