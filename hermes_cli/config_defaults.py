@@ -2347,6 +2347,11 @@ DEFAULT_CONFIG = {
                 "On it.",
             ],
         },
+        # Auto-join an allowed user's voice channel. OFF by default.
+        "voice": {
+            "auto_join_on_user_join": False,
+            "auto_join_users": [],
+        },
     },
 
     # WhatsApp platform settings (gateway mode)
