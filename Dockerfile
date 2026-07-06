@@ -254,6 +254,19 @@ RUN cd web && npm run build && \
 # write so the build steps below don't need chmod u+w dances.
 COPY --link --chmod=a+rX,go-w . .
 
+# ---------- Vimeo MCP server (web-dev profile) ----------
+# Vendored under docker/mcp-servers/vimeo-mcp (copied in by `COPY . .` above) and
+# built in place here so the web-dev `vimeo` MCP server is baked into the image:
+# no clone or network fetch at boot, and it survives a data-volume reset. The
+# profile launches `node /opt/hermes/docker/mcp-servers/vimeo-mcp/dist/index.js`
+# (see docker/profiles/web-dev/config.yaml). `npm prune --omit=dev` drops the
+# TypeScript toolchain after the build, keeping only the runtime deps.
+RUN cd /opt/hermes/docker/mcp-servers/vimeo-mcp && \
+    npm ci --no-audit --no-fund && \
+    npm run build && \
+    npm prune --omit=dev && \
+    npm cache clean --force
+
 # ---------- Permissions ----------
 # Link hermes-agent itself (editable). Deps are already installed in the
 # cached layer above; `--no-deps` makes this a fast egg-link creation with no
