@@ -55,6 +55,23 @@ BUILD_COMMIT_FILE = ".skyai-build-commit"
 DEFAULT_VOICE_BACKEND_TARGET = "skyai_v2_chatkit"
 DEFAULT_VOICE_V1_PATH = voice_contract.VOICE_BACKEND_TARGETS["skyai_v1_chatkit"]["path"]
 MIN_USABLE_STT_CONFIDENCE = 0.45
+MAX_SPOKEN_REPLY_CHARS = 700
+VOICE_HUMAN_HANDOFF_TERMS = (
+    "искам оператор",
+    "говоря с оператор",
+    "с оператор",
+    "към оператор",
+    "искам човек от екипа",
+    "говоря с човек от екипа",
+    "жив човек",
+    "искам консултант",
+    "говоря с консултант",
+    "искам служител",
+    "говоря със служител",
+    "говоря с представител",
+    "свържете ме",
+    "прехвърлете ме",
+)
 SKYAI_REASONING_CONTRACT = (
     "Архитектурен договор: Hermes мисли. Backend-ът и tools дават публични факти, "
     "структурирани данни, линкове, цени, слотове, constraints и безопасни граници, "
@@ -1459,8 +1476,22 @@ async def build_voice_turn_response(
     conversation_id = voice_conversation_id_from_payload(payload, call_id)
     transcript = extract_voice_transcript(payload)
     confidence = _optional_float(payload.get("stt_confidence"))
+    dtmf = _voice_dtmf(payload)
+
+    if dtmf == "0":
+        return _voice_transfer_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            spoken_reply="Разбира се, ще Ви прехвърля към човек от екипа.",
+            display_reply="Caller requested human handoff with DTMF 0.",
+            reason="dtmf_0",
+        )
 
     if not transcript:
+        silence_count = _optional_int(payload.get("silence_count"))
+        voice_reason = "silence_timeout" if silence_count is not None and silence_count >= 2 else "empty_transcript"
         return _voice_response(
             payload,
             settings,
@@ -1469,7 +1500,18 @@ async def build_voice_turn_response(
             action="clarify",
             spoken_reply="Извинете, не Ви чух добре. Може ли да повторите?",
             display_reply="STT produced an empty transcript.",
-            trace_extra={"voice_reason": "empty_transcript"},
+            trace_extra={"voice_reason": voice_reason, "silence_count": silence_count},
+        )
+
+    if _voice_handoff_requested(transcript):
+        return _voice_transfer_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            spoken_reply="Разбира се, ще Ви прехвърля към човек от екипа.",
+            display_reply="Caller requested human handoff in the transcript.",
+            reason="caller_requested_human",
         )
 
     if confidence is not None and confidence < MIN_USABLE_STT_CONFIDENCE:
@@ -1515,6 +1557,27 @@ async def build_voice_turn_response(
             "call_id": call_id,
             "conversation_id": conversation_id,
             "backend_target": target,
+            "action": "transfer_to_human",
+            "spoken_reply": (
+                "В момента имаме технически проблем с асистента. "
+                "Ще Ви прехвърля към човек от екипа."
+            ),
+            "display_reply": f"Invalid voice backend target: {target}",
+            "cards": [],
+            "transfer": {"target": "operator_queue", "reason": "invalid_voice_backend_target"},
+            "transfer_reason": "invalid_voice_backend_target",
+            "target": "operator_queue",
+            "end_call": False,
+            "session_state": {"handoff_allowed": True},
+            "trace": {
+                "runtime": "skyai_voice_adapter",
+                "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
+                "backend_target": target,
+                "raw_audio_stored": False,
+                "customer_mutations_allowed": False,
+            },
+            "notes": [],
+            "unavailable": True,
         }
 
     latency_ms = int((time.monotonic() - started) * 1000)
@@ -1541,7 +1604,7 @@ async def build_voice_turn_response(
         call_id=call_id,
         conversation_id=conversation_id,
         action="speak",
-        spoken_reply=reply,
+        spoken_reply=_voice_spoken_reply(reply),
         display_reply=reply,
         cards=_normalize_cards(chat_response.get("cards")),
         trace_extra={
@@ -1564,15 +1627,14 @@ async def build_voice_event_response(
     dtmf = _voice_dtmf(payload)
 
     if dtmf == "0" or event_type in {"caller_requested_human", "operator_requested", "human_requested"}:
-        return _voice_response(
+        return _voice_transfer_response(
             payload,
             settings,
             call_id=call_id,
             conversation_id=conversation_id,
-            action="transfer_to_human",
             spoken_reply="Разбира се, ще Ви прехвърля към човек от екипа.",
             display_reply="Caller requested human handoff.",
-            transfer={"target": "operator_queue", "reason": event_type or "dtmf_0"},
+            reason=event_type or "dtmf_0",
         )
 
     if event_type in {"silence_timeout", "low_stt_confidence"}:
@@ -1588,15 +1650,14 @@ async def build_voice_event_response(
         )
 
     if event_type in {"gateway_error", "stt_error", "tts_error"}:
-        return _voice_response(
+        return _voice_transfer_response(
             payload,
             settings,
             call_id=call_id,
             conversation_id=conversation_id,
-            action="transfer_to_human",
             spoken_reply="Имаме технически проблем с разговора. Ще Ви прехвърля към човек.",
             display_reply=f"Voice gateway error event: {event_type}",
-            transfer={"target": "operator_queue", "reason": event_type},
+            reason=event_type,
         )
 
     return _voice_response(
@@ -1660,7 +1721,7 @@ def _voice_chat_payload(
     metadata = dict(_payload_metadata(payload))
     metadata.update(
         {
-            "surface": "voice_gateway",
+            "surface": "pbx_voice",
             "voice_contract_version": voice_contract.VOICE_CONTRACT_VERSION,
             "voice_backend_target": backend_target,
             "caller_id": payload.get("caller_id"),
@@ -1728,7 +1789,32 @@ def _voice_response(
         "end_call": end_call,
         "session_state": session_state or {"handoff_allowed": True},
         "trace": trace,
+        "notes": [],
+        "unavailable": False,
     }
+
+
+def _voice_transfer_response(
+    payload: dict[str, Any],
+    settings: CanarySettings,
+    *,
+    call_id: str,
+    conversation_id: str,
+    spoken_reply: str,
+    display_reply: str,
+    reason: str,
+    target: str = "operator_queue",
+) -> dict[str, Any]:
+    return _voice_response(
+        payload,
+        settings,
+        call_id=call_id,
+        conversation_id=conversation_id,
+        action="transfer_to_human",
+        spoken_reply=spoken_reply,
+        display_reply=display_reply,
+        transfer={"target": target, "reason": reason},
+    )
 
 
 def _voice_event_type(payload: dict[str, Any]) -> str:
@@ -1738,8 +1824,55 @@ def _voice_event_type(payload: dict[str, Any]) -> str:
 
 def _voice_dtmf(payload: dict[str, Any]) -> str:
     metadata = _payload_metadata(payload)
-    value = payload.get("dtmf") or metadata.get("dtmf")
+    value = (
+        payload.get("dtmf")
+        or payload.get("dtmf_event")
+        or metadata.get("dtmf")
+        or metadata.get("dtmf_event")
+    )
     return str(value or "").strip()
+
+
+def _voice_handoff_requested(transcript: str) -> bool:
+    normalized = transcript.casefold()
+    return any(term in normalized for term in VOICE_HUMAN_HANDOFF_TERMS)
+
+
+def _voice_spoken_reply(reply: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", reply)
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"[*_`#>]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= MAX_SPOKEN_REPLY_CHARS:
+        return text
+
+    sentences = re.split(r"(?<=[.!?。！？])\s+", text)
+    selected: list[str] = []
+    current_length = 0
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        projected = current_length + len(sentence) + (1 if selected else 0)
+        if selected and projected > MAX_SPOKEN_REPLY_CHARS:
+            break
+        selected.append(sentence)
+        current_length = projected
+        if current_length >= MAX_SPOKEN_REPLY_CHARS:
+            break
+    spoken = " ".join(selected).strip()
+    if not spoken:
+        spoken = text[:MAX_SPOKEN_REPLY_CHARS].rsplit(" ", 1)[0].strip()
+    return f"{spoken} Мога да дам още детайли, ако желаете."
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in ("", None):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _optional_float(value: Any) -> float | None:

@@ -6,6 +6,7 @@ from plugins.skyai_customer import voice_contract
 
 
 VOICE_DOC_PATH = Path("docs/skyai-voice-contract-v0.1.md")
+JOINT_CONTRACT_REFERENCE_PATH = Path("docs/voice/skyai-voice-joint-contract-v0.1.md")
 README_PATH = Path("plugins/skyai_customer/README.md")
 ARCHITECTURE_PATH = Path("plugins/skyai_customer/ARCHITECTURE.md")
 DEV_GATEWAY_PATH = Path("plugins/skyai_customer/dev_gateway.py")
@@ -132,3 +133,10 @@ def test_voice_contract_is_referenced_from_plugin_docs() -> None:
 
     assert "docs/skyai-voice-contract-v0.1.md" in readme
     assert "SkyAI Voice Contract v0.1" in architecture
+
+
+def test_joint_voice_contract_reference_points_to_canonical_shared_doc() -> None:
+    text = JOINT_CONTRACT_REFERENCE_PATH.read_text(encoding="utf-8")
+
+    assert "/Users/emillomliev/.hermes/knowledge/skyai-voice/skyai-voice-joint-contract-v0.1.md" in text
+    assert "Do not fork endpoint names, action values, or field semantics" in text

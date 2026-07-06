@@ -201,6 +201,10 @@ async def test_build_voice_start_response_returns_contract_shape(tmp_path: Path)
     assert response["action"] == "speak"
     assert response["end_call"] is False
     assert response["transfer"] is None
+    assert response["transfer_reason"] is None
+    assert response["target"] is None
+    assert response["notes"] == []
+    assert response["unavailable"] is False
     assert response["trace"]["runtime"] == "skyai_voice_adapter"
     assert response["trace"]["raw_audio_stored"] is False
     assert response["trace"]["customer_mutations_allowed"] is False
@@ -261,6 +265,36 @@ async def test_build_voice_turn_response_uses_v2_chat_adapter(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_build_voice_turn_sanitizes_spoken_reply_for_tts(tmp_path: Path) -> None:
+    async def fake_runner(*args, **kwargs):
+        return {
+            "reply": (
+                "Ето подробности: [Полет](https://skyvision.bg/example) е чудесен избор. "
+                + ("Много красив подарък. " * 80)
+            ),
+            "cards": [],
+        }
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-tts",
+            "conversation_id": "voice-tts",
+            "transcript": "Разкажи ми повече за този подарък.",
+            "stt_confidence": 0.95,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert "https://skyvision.bg/example" in response["display_reply"]
+    assert "https://skyvision.bg/example" not in response["spoken_reply"]
+    assert "Полет" in response["spoken_reply"]
+    assert len(response["spoken_reply"]) < len(response["display_reply"])
+
+
+@pytest.mark.asyncio
 async def test_build_voice_turn_low_confidence_clarifies_without_model_call(tmp_path: Path) -> None:
     async def forbidden_runner(*args, **kwargs):
         raise AssertionError("low-confidence voice turns must not call Hermes")
@@ -281,6 +315,99 @@ async def test_build_voice_turn_low_confidence_clarifies_without_model_call(tmp_
     assert "повторите" in response["spoken_reply"]
     assert response["trace"]["voice_reason"] == "low_stt_confidence"
     assert response["trace"]["raw_audio_stored"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_dtmf_zero_transfers_without_model_call(tmp_path: Path) -> None:
+    async def forbidden_runner(*args, **kwargs):
+        raise AssertionError("DTMF 0 must transfer without calling Hermes")
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-dtmf",
+            "conversation_id": "voice-dtmf",
+            "dtmf_event": "0",
+            "transcript": "",
+            "stt_confidence": 0.99,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=forbidden_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "transfer_to_human"
+    assert response["transfer"] == {"target": "operator_queue", "reason": "dtmf_0"}
+    assert response["transfer_reason"] == "dtmf_0"
+    assert response["target"] == "operator_queue"
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_human_request_transfers_without_model_call(tmp_path: Path) -> None:
+    async def forbidden_runner(*args, **kwargs):
+        raise AssertionError("clear human handoff requests must not call Hermes")
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-human",
+            "conversation_id": "voice-human",
+            "transcript": "Моля, свържете ме с човек от екипа.",
+            "stt_confidence": 0.94,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=forbidden_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "transfer_to_human"
+    assert response["transfer_reason"] == "caller_requested_human"
+    assert response["target"] == "operator_queue"
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_does_not_transfer_for_ordinary_person_words(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        seen["message"] = message
+        return "Подходящ подарък за този човек може да е ваучер на стойност."
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-person",
+            "conversation_id": "voice-person",
+            "transcript": "Търся подарък за спокоен човек.",
+            "stt_confidence": 0.94,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert response["transfer"] is None
+    assert seen["message"] == "Търся подарък за спокоен човек."
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_repeated_silence_clarifies_without_model_call(tmp_path: Path) -> None:
+    async def forbidden_runner(*args, **kwargs):
+        raise AssertionError("silence turns must not call Hermes")
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-silence",
+            "conversation_id": "voice-silence",
+            "transcript": "",
+            "silence_count": 2,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=forbidden_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "clarify"
+    assert response["trace"]["voice_reason"] == "silence_timeout"
+    assert response["trace"]["silence_count"] == 2
 
 
 @pytest.mark.asyncio
@@ -325,6 +452,27 @@ async def test_build_voice_turn_v1_target_requires_configured_backend(tmp_path: 
     assert response["target"] == "operator_queue"
     assert response["transfer_reason"] == "voice_v1_backend_not_configured"
     assert response["trace"]["backend_target"] == "skyai_v1_chatkit"
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_invalid_backend_target_transfers_to_human(tmp_path: Path) -> None:
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-invalid",
+            "conversation_id": "voice-invalid",
+            "backend_target": "unknown",
+            "transcript": "Здравейте",
+            "stt_confidence": 0.9,
+        },
+        settings(tmp_path),
+    )
+
+    assert response["status"] == "error"
+    assert response["action"] == "transfer_to_human"
+    assert response["transfer"] == {"target": "operator_queue", "reason": "invalid_voice_backend_target"}
+    assert response["transfer_reason"] == "invalid_voice_backend_target"
+    assert response["target"] == "operator_queue"
+    assert response["unavailable"] is True
 
 
 @pytest.mark.asyncio
