@@ -46,6 +46,50 @@ class TestShouldCompress:
 
 
 
+class TestShouldWarn:
+    # Fixture: context 100_000, threshold_percent 0.85 → threshold_tokens 85_000,
+    # warn_at default 0.85 → warn_threshold_tokens 72_250.
+    def test_below_warn_band(self, compressor):
+        assert compressor.should_warn(70_000) is False
+
+    def test_at_warn_threshold(self, compressor):
+        assert compressor.warn_threshold_tokens == 72_250
+        assert compressor.should_warn(72_250) is True
+
+    def test_inside_warn_band(self, compressor):
+        assert compressor.should_warn(80_000) is True
+
+    def test_at_or_above_compaction_threshold_does_not_warn(self, compressor):
+        # should_compress owns this band.
+        assert compressor.should_warn(85_000) is False
+        assert compressor.should_warn(90_000) is False
+
+    def test_non_positive_tokens_never_warn(self, compressor):
+        assert compressor.should_warn(0) is False
+        assert compressor.should_warn(-1) is False  # post-compaction sentinel
+
+    def test_uses_last_prompt_tokens_when_unspecified(self, compressor):
+        compressor.last_prompt_tokens = 75_000
+        assert compressor.should_warn() is True
+        compressor.last_prompt_tokens = 60_000
+        assert compressor.should_warn() is False
+
+    def test_warn_threshold_tracks_threshold_changes(self, compressor):
+        # The property is derived, so lowering threshold_tokens (e.g. aux
+        # feasibility auto-lower) moves the warn band with it.
+        compressor.threshold_tokens = 50_000
+        assert compressor.warn_threshold_tokens == 42_500
+        assert compressor.should_warn(45_000) is True
+        assert compressor.should_warn(40_000) is False
+
+    def test_warn_at_is_clamped(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            hi = ContextCompressor(model="m", threshold_percent=0.85, warn_at=1.5, quiet_mode=True)
+            assert hi.warn_at == 1.0  # never warn only at/after compaction
+            lo = ContextCompressor(model="m", threshold_percent=0.85, warn_at=0.0, quiet_mode=True)
+            assert lo.warn_at == 0.01
+
+
 class TestUpdateFromResponse:
     def test_updates_fields(self, compressor):
         compressor.awaiting_real_usage_after_compression = True

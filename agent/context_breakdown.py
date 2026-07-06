@@ -28,6 +28,19 @@ _CATEGORY_COLORS = {
 }
 
 
+def _safe_int(value: Any) -> int:
+    """Coerce *value* to a non-negative int, tolerating Mocks/None/garbage.
+
+    ``getattr`` on a live compressor returns real ints, but tests pass a
+    ``MagicMock`` whose unset attributes are child mocks — ``int(mock)`` raises.
+    """
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return ivalue if ivalue > 0 else 0
+
+
 def _chars_to_tokens(text: str) -> int:
     if not text:
         return 0
@@ -128,12 +141,23 @@ def compute_session_context_breakdown(
     estimated_total = sum(tokens for _, _, tokens in categories)
 
     comp = getattr(agent, "context_compressor", None)
-    context_max = int(getattr(comp, "context_length", 0) or 0) if comp else 0
-    measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
+    context_max = _safe_int(getattr(comp, "context_length", 0)) if comp else 0
+    measured_used = _safe_int(getattr(comp, "last_prompt_tokens", 0)) if comp else 0
     context_used = measured_used if measured_used > 0 else estimated_total
     context_percent = (
         max(0, min(100, round(context_used / context_max * 100)))
         if context_max
+        else 0
+    )
+
+    # Compaction-relative usage: auto-compaction fires at threshold_tokens
+    # (~50% of the effective window), NOT at 100% of the window. This is the
+    # actionable meter — 100% here means "compaction fires now" — and it is the
+    # scale the reply-footer floor and pre-compaction warning are measured on.
+    compaction_threshold = _safe_int(getattr(comp, "threshold_tokens", 0)) if comp else 0
+    compaction_percent = (
+        max(0, round(context_used / compaction_threshold * 100))
+        if compaction_threshold
         else 0
     )
 
@@ -148,6 +172,8 @@ def compute_session_context_breakdown(
             for category_id, label, tokens in categories
             if tokens > 0
         ],
+        "compaction_percent": compaction_percent,
+        "compaction_threshold": compaction_threshold,
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,

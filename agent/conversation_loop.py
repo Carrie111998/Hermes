@@ -2100,6 +2100,11 @@ def run_conversation(
                     }
                     agent.context_compressor.update_from_response(usage_dict)
 
+                    # Pre-compaction heads-up: warn once as real usage nears the
+                    # compaction threshold, before it fires (4tp-2). Uses the
+                    # provider-reported prompt_tokens — the authoritative signal.
+                    agent._maybe_warn_precompaction(prompt_tokens)
+
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
                     # from the error message), not guessed probe tiers.

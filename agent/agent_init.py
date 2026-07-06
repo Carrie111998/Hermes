@@ -1455,6 +1455,9 @@ def init_agent(
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
+    # Fraction of the compaction threshold at which to surface a
+    # pre-compaction heads-up (before auto-compaction fires). Default 0.85.
+    compression_warn_at = float(_compression_cfg.get("warn_at", 0.85))
     # In-place compaction: when True, compress_context() rewrites the message
     # list + rebuilds the system prompt WITHOUT rotating the session id (no
     # parent_session_id chain, no `name #N` renumber). See #38763 and
@@ -1702,6 +1705,7 @@ def init_agent(
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
+            warn_at=compression_warn_at,
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
@@ -1711,6 +1715,11 @@ def init_agent(
             pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
+    # Once-shot guard for the pre-compaction warning (4tp-2). Set True after the
+    # heads-up fires; re-armed when usage drops back below the warn band or a
+    # compaction resets the budget. Lives on the agent (not the compressor) so
+    # plugin context engines without a warn band don't need to carry it.
+    agent._precompaction_warned = False
 
     # Reject models whose context window is below the minimum required
     # for reliable tool-calling workflows (64K tokens).

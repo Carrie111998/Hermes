@@ -8,11 +8,15 @@ import os
 import pytest
 
 from gateway.runtime_footer import (
+    _compaction_marker,
     _home_relative_cwd,
     _model_short,
     build_footer_line,
+    build_meter_footer,
+    compaction_percent,
     format_runtime_footer,
     resolve_footer_config,
+    resolve_meter_config,
 )
 
 
@@ -260,3 +264,173 @@ def test_build_footer_no_data_returns_empty_even_when_enabled():
     # With no TERMINAL_CWD env either
     if not os.environ.get("TERMINAL_CWD"):
         assert out == ""
+
+
+# ---------------------------------------------------------------------------
+# compaction_percent + _compaction_marker — the context-meter primitives
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "tokens,threshold,expected",
+    [
+        (3500, 5000, 70),     # 70% of the way to compaction
+        (5000, 5000, 100),    # compaction fires now
+        (6000, 5000, 120),    # overshoot allowed (checked after send)
+        (0, 5000, 0),
+    ],
+)
+def test_compaction_percent_basic(tokens, threshold, expected):
+    assert compaction_percent(tokens, threshold) == expected
+
+
+@pytest.mark.parametrize("threshold", [None, 0, -10])
+def test_compaction_percent_none_when_threshold_unknown(threshold):
+    assert compaction_percent(50_000, threshold) is None
+
+
+def test_compaction_percent_none_for_negative_tokens():
+    assert compaction_percent(-5, 5000) is None
+
+
+@pytest.mark.parametrize(
+    "pct,emoji",
+    [(70, "🟡"), (84, "🟡"), (85, "🟠"), (99, "🟠"), (100, "🔴"), (130, "🔴")],
+)
+def test_compaction_marker_emoji_tiers(pct, emoji):
+    marker = _compaction_marker(pct)
+    assert marker.startswith(emoji)
+    assert f"{pct}% to compaction" in marker
+
+
+# ---------------------------------------------------------------------------
+# format_runtime_footer — compaction field
+# ---------------------------------------------------------------------------
+
+def test_format_footer_compaction_field():
+    out = format_runtime_footer(
+        model="openai/gpt-5.4",
+        context_tokens=3500,
+        context_length=100_000,
+        cwd="",
+        fields=("model", "compaction"),
+        threshold_tokens=5000,
+    )
+    assert out == "gpt-5.4 · 🟡 70% to compaction"
+
+
+def test_format_footer_compaction_field_dropped_without_threshold():
+    out = format_runtime_footer(
+        model="openai/gpt-5.4",
+        context_tokens=3500,
+        context_length=100_000,
+        cwd="",
+        fields=("model", "compaction"),
+        threshold_tokens=None,
+    )
+    assert out == "gpt-5.4"
+
+
+# ---------------------------------------------------------------------------
+# resolve_meter_config
+# ---------------------------------------------------------------------------
+
+def test_resolve_meter_default_floor():
+    assert resolve_meter_config({})["footer_floor"] == 0.70
+    assert resolve_meter_config(None)["footer_floor"] == 0.70
+
+
+def test_resolve_meter_custom_floor():
+    user = {"display": {"context_meter": {"footer_floor": 0.5}}}
+    assert resolve_meter_config(user)["footer_floor"] == 0.5
+
+
+@pytest.mark.parametrize("bad", [0, -0.2, 1.5, "high", None])
+def test_resolve_meter_out_of_range_falls_back(bad):
+    user = {"display": {"context_meter": {"footer_floor": bad}}}
+    assert resolve_meter_config(user)["footer_floor"] == 0.70
+
+
+# ---------------------------------------------------------------------------
+# build_meter_footer — manual toggle + always-on-past-floor behavior
+# ---------------------------------------------------------------------------
+
+def _meter(**kw):
+    base = dict(
+        user_config={},
+        platform_key="telegram",
+        model="openai/gpt-5.4",
+        context_length=200_000,
+        cwd="",
+    )
+    base.update(kw)
+    return build_meter_footer(**base)
+
+
+def test_meter_footer_silent_below_floor(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    # 60% to compaction, floor is 70% → nothing
+    out = _meter(context_tokens=3000, threshold_tokens=5000)
+    assert out == ""
+
+
+def test_meter_footer_surfaces_past_floor(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    # 80% to compaction, manual footer OFF → always-on meter footer appears
+    out = _meter(context_tokens=4000, threshold_tokens=5000)
+    assert out == "gpt-5.4 · 🟡 80% to compaction"
+
+
+def test_meter_footer_escalates_emoji_past_compaction(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    out = _meter(context_tokens=5200, threshold_tokens=5000)
+    assert "🔴 104% to compaction" in out
+
+
+def test_meter_footer_manual_on_below_floor_shows_window_pct(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    # Manual footer on, below floor → configured footer (window %), no marker
+    out = _meter(
+        user_config={"display": {"runtime_footer": {"enabled": True}}},
+        context_tokens=40_000,      # 20% of 200k window
+        threshold_tokens=100_000,   # 40% to compaction → below 70 floor
+    )
+    assert out == "gpt-5.4 · 20%"
+    assert "to compaction" not in out
+
+
+def test_meter_footer_manual_on_past_floor_appends_marker(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    # Manual footer on AND past floor → window footer + compaction marker
+    out = _meter(
+        user_config={"display": {"runtime_footer": {"enabled": True}}},
+        context_tokens=80_000,      # 40% of 200k window
+        threshold_tokens=100_000,   # 80% to compaction → past floor
+    )
+    assert out == "gpt-5.4 · 40% · 🟡 80% to compaction"
+
+
+def test_meter_footer_manual_with_compaction_field_not_doubled(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    # Manual footer already includes the compaction field → don't append twice
+    out = _meter(
+        user_config={
+            "display": {
+                "runtime_footer": {"enabled": True, "fields": ["model", "compaction"]}
+            }
+        },
+        context_tokens=80_000,
+        threshold_tokens=100_000,
+    )
+    assert out == "gpt-5.4 · 🟡 80% to compaction"
+    assert out.count("to compaction") == 1
+
+
+def test_meter_footer_custom_floor_respected(monkeypatch):
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    # Lower the floor to 50% → a 60% reading now surfaces
+    out = _meter(
+        user_config={"display": {"context_meter": {"footer_floor": 0.5}}},
+        context_tokens=3000,
+        threshold_tokens=5000,
+    )
+    assert out == "gpt-5.4 · 🟡 60% to compaction"

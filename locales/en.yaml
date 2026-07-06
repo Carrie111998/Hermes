@@ -305,6 +305,18 @@ gateway:
     queued:                "**Queued follow-ups:** {count}"
     platforms:             "**Connected Platforms:** {platforms}"
 
+  context:
+    header:                "🧭 **Context** — `{model}`"
+    header_no_model:       "🧭 **Context**"
+    headline:              "{emoji} **{pct}% to auto-compaction**"
+    toward:                "{used} / {threshold} tok toward compaction"
+    window:                "_{window_pct}% of {max} window · compaction at ~{comp_at}%_"
+    breakdown_header:      "**Breakdown:**"
+    category_line:         "• {label} — {tokens}"
+    no_threshold:          "**Context:** {used} tokens used ({window_pct}% of {max} window)"
+    no_agent:              "🧭 No active agent in this session yet — send a message first, then /context shows the live breakdown."
+    unavailable:           "🧭 Context data isn't available for this session yet."
+
   stop:
     stopped_pending:       "⚡ Stopped. The agent hadn't started yet — you can continue this session."
     stopped:               "⚡ Stopped. You can continue this session."

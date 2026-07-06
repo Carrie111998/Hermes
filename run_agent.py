@@ -919,6 +919,45 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
 
+    def _maybe_warn_precompaction(self, prompt_tokens: int) -> None:
+        """Emit a one-shot heads-up as usage approaches the compaction point.
+
+        Fires once when real usage enters the pre-compaction band
+        (``warn_threshold_tokens <= tokens < threshold_tokens``), before
+        auto-compaction actually summarizes the middle of the session — so the
+        user can ``/handoff`` first if they're mid-something delicate.  The
+        one-shot re-arms when usage drops back under the band (compaction
+        resets ``_precompaction_warned`` directly).  (4tp-2)
+
+        Never raises: a warning must never break the turn loop.
+        """
+        try:
+            if not getattr(self, "compression_enabled", False):
+                return
+            comp = getattr(self, "context_compressor", None)
+            should_warn = getattr(comp, "should_warn", None)
+            if comp is None or not callable(should_warn):
+                return  # plugin context engine without a warn band
+            if not should_warn(prompt_tokens):
+                # Below the band → re-arm so a later approach warns again.
+                if prompt_tokens < getattr(comp, "warn_threshold_tokens", 0):
+                    self._precompaction_warned = False
+                return
+            if getattr(self, "_precompaction_warned", False):
+                return
+            self._precompaction_warned = True
+            threshold = getattr(comp, "threshold_tokens", 0) or 0
+            pct = int(prompt_tokens / threshold * 100) if threshold else 0
+            # _emit_warning (status_key "warn") keeps the heads-up in its own
+            # gateway bubble, separate from transient lifecycle progress lines.
+            self._emit_warning(
+                f"⚠️ Approaching compaction (~{pct}% of the compaction budget). "
+                "The next big turn may summarize-and-drop the middle of this "
+                "session. If you're mid-something delicate, /handoff first."
+            )
+        except Exception:
+            logger.debug("precompaction warning failed", exc_info=True)
+
     def _emit_notice(self, notice) -> None:
         """Fire a structured ``AgentNotice`` to the active driver (TUI / CLI).
 

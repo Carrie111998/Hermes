@@ -410,7 +410,13 @@ compression:
   # Trigger compression at this % of model's context limit (default: 0.50 = 50%)
   # Lower values = more aggressive compression, higher values = compress later
   threshold: 0.50
-  
+
+  # Surface a pre-compaction heads-up once usage reaches this fraction of the
+  # compaction threshold, before compaction fires (default: 0.85 = 85%).
+  # e.g. with threshold 0.50, the warning fires around 42.5% of the window.
+  # Gives you a chance to /handoff before the middle of the session is dropped.
+  warn_at: 0.85
+
   # Fraction of the threshold to preserve as recent tail (default: 0.20 = 20%)
   # e.g. 20% of 50% threshold = 10% of total context kept as recent messages.
   # Summary output is separately capped at 12K tokens (Gemini output limit).

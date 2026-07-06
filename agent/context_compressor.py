@@ -966,6 +966,7 @@ class ContextCompressor(ContextEngine):
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
         max_tokens: int | None = None,
+        warn_at: float = 0.85,
     ):
         self.model = model
         self.base_url = base_url
@@ -1004,6 +1005,13 @@ class ContextCompressor(ContextEngine):
         self.threshold_tokens = self._compute_threshold_tokens(
             self.context_length, threshold_percent, self.max_tokens,
         )
+        # Fraction of the compaction threshold at which we surface a
+        # pre-compaction heads-up (before auto-compaction actually fires).
+        # ``warn_threshold_tokens`` is a property so it tracks any later
+        # change to ``threshold_tokens`` (feasibility auto-lower, update_model)
+        # without a manual re-sync.  Clamp to (0, 1]: a value <=0 or >1 would
+        # disable the warning or make it fire only at/after compaction.
+        self.warn_at = max(0.01, min(float(warn_at), 1.0))
         self.compression_count = 0
 
         # Derive token budgets: ratio is relative to the threshold, not total context
@@ -1132,6 +1140,31 @@ class ContextCompressor(ContextEngine):
 
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
+
+    @property
+    def warn_threshold_tokens(self) -> int:
+        """Token count at which to emit the pre-compaction heads-up.
+
+        Derived (not stored) so it always reflects the current
+        ``threshold_tokens`` — which can change after construction via the
+        feasibility auto-lower path and ``update_model``.
+        """
+        return int(self.threshold_tokens * self.warn_at)
+
+    def should_warn(self, prompt_tokens: int = None) -> bool:
+        """True when usage has entered the pre-compaction warning band.
+
+        The band is ``[warn_threshold_tokens, threshold_tokens)`` — usage is
+        approaching compaction but has not yet crossed it, so a heads-up can
+        still be acted on (e.g. ``/handoff``) before the middle of the session
+        gets summarized away.  At/above ``threshold_tokens`` this returns False
+        (``should_compress`` owns that band); a non-positive count (unknown /
+        the post-compaction ``-1`` sentinel) also returns False.
+        """
+        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        if tokens <= 0:
+            return False
+        return self.warn_threshold_tokens <= tokens < self.threshold_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.

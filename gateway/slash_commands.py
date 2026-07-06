@@ -643,6 +643,119 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_context_command(self, event: MessageEvent) -> str:
+        """Handle /context — live context-window usage + per-category breakdown.
+
+        Headlines usage as a % of the auto-compaction point (compaction fires
+        at ~50% of the window, not 100%), the actionable number for seeing a
+        silent compaction coming. Falls back to the cached agent between turns.
+        """
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+        session_key = session_entry.session_key
+
+        # Prefer the live running agent; fall back to the cached one from the
+        # last turn (mirrors /status). The breakdown needs a real agent to read
+        # the system-prompt tiers, tools, and memory blocks.
+        agent = self._running_agents.get(session_key)
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            agent = None
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock is not None and cache is not None:
+                try:
+                    with cache_lock:
+                        cached = cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+                except Exception:
+                    agent = None
+
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return t("gateway.context.no_agent")
+
+        # Transcript for the conversation category. Prefer the live agent's
+        # message buffer, fall back to the persisted transcript. The headline %
+        # uses measured tokens regardless, so an empty history only zeroes the
+        # conversation line — never the top-line number.
+        history: list = []
+        try:
+            live_msgs = getattr(agent, "_session_messages", None)
+            if isinstance(live_msgs, list) and live_msgs:
+                history = live_msgs
+            else:
+                history = self.session_store.load_transcript(session_entry.session_id) or []
+        except Exception:
+            history = []
+
+        try:
+            from agent.context_breakdown import compute_session_context_breakdown
+
+            data = compute_session_context_breakdown(agent, history)
+        except Exception as exc:
+            logger.debug("context breakdown failed: %s", exc)
+            return t("gateway.context.unavailable")
+
+        model = data.get("model") or ""
+        used = int(data.get("context_used") or 0)
+        context_max = int(data.get("context_max") or 0)
+        threshold = int(data.get("compaction_threshold") or 0)
+        comp_pct = int(data.get("compaction_percent") or 0)
+        window_pct = int(data.get("context_percent") or 0)
+
+        lines = [
+            t("gateway.context.header", model=model)
+            if model
+            else t("gateway.context.header_no_model"),
+            "",
+        ]
+
+        if threshold > 0:
+            # Full gauge: green while healthy, escalating as compaction nears.
+            emoji = "🔴" if comp_pct >= 100 else ("🟠" if comp_pct >= 85 else "🟢")
+            lines.append(t("gateway.context.headline", emoji=emoji, pct=comp_pct))
+            lines.append(
+                t("gateway.context.toward", used=f"{used:,}", threshold=f"{threshold:,}")
+            )
+            if context_max > 0:
+                comp_at = max(1, round(threshold / context_max * 100))
+                lines.append(
+                    t(
+                        "gateway.context.window",
+                        window_pct=window_pct,
+                        max=f"{context_max:,}",
+                        comp_at=comp_at,
+                    )
+                )
+        elif context_max > 0:
+            lines.append(
+                t(
+                    "gateway.context.no_threshold",
+                    used=f"{used:,}",
+                    window_pct=window_pct,
+                    max=f"{context_max:,}",
+                )
+            )
+
+        categories = data.get("categories") or []
+        if categories:
+            lines.append("")
+            lines.append(t("gateway.context.breakdown_header"))
+            for cat in sorted(
+                categories, key=lambda c: c.get("tokens", 0), reverse=True
+            ):
+                lines.append(
+                    t(
+                        "gateway.context.category_line",
+                        label=cat.get("label", ""),
+                        tokens=f"{int(cat.get('tokens', 0)):,}",
+                    )
+                )
+
+        return "\n".join(lines)
+
     @staticmethod
     def _redact_matrix_session_key(session_key: str) -> str:
         """Return a stable Matrix session-key fingerprint for shared room status."""

@@ -897,20 +897,11 @@ def compress_context(
         except Exception as _me_err:
             logger.debug("memory manager on_session_switch (compression): %s", _me_err)
 
-        # Warn on repeated compressions (quality degrades with each pass).
-        # Route through _emit_status (like the other compression warnings above)
-        # so the warning reaches the TUI / Telegram / Discord via status_callback,
-        # not just CLI stdout. _emit_status still _vprints for the CLI, and
-        # storing it on _compression_warning lets replay_compression_warning
-        # re-deliver it once a late-bound gateway status_callback is wired (#36908).
+        # Repeated-compression escalation is folded into the delivered
+        # post-compaction caveat below (4tp-2), which reaches Telegram/Discord
+        # instead of being dropped by the gateway noise filter like the old
+        # "Session compressed N times" status was.
         _cc = agent.context_compressor.compression_count
-        if _cc >= 2:
-            _cc_msg = (
-                f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
-                f"accuracy may degrade. Consider /new to start fresh."
-            )
-            agent._compression_warning = _cc_msg
-            agent._emit_status(_cc_msg)
 
         # Emit session:compress event so hooks (e.g. MemPalace sync) can ingest
         # the completed old session before its details are lost. In in-place mode
@@ -946,6 +937,40 @@ def compress_context(
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
         agent.context_compressor.awaiting_real_usage_after_compression = True
+
+        # ── Delivered compaction notice + post-compaction caveat (4tp-2) ─────────
+        # The transient "Compacting context…" start line is filtered out of chat
+        # gateways by the noise regex (gateway/run.py). Once the summary lands,
+        # emit an explicit, delivered notice — worded so it passes that filter — so
+        # Sven actually sees on Telegram that context was dropped, plus a caveat on
+        # what may have been lost and how to recover. Escalates when the session has
+        # been compacted repeatedly (the silent-double-compaction failure mode).
+        def _fmt_k(n: Optional[int]) -> str:
+            if not n or n <= 0:
+                return ""
+            return f"{n / 1000:.0f}K" if n >= 1000 else str(int(n))
+
+        _pre_k, _post_k = _fmt_k(approx_tokens), _fmt_k(_compressed_est)
+        _size = f", ~{_pre_k}→{_post_k} tokens" if (_pre_k and _post_k) else ""
+        _caveat = (
+            f"🗜️ Compacted — summarized the earlier middle of this session "
+            f"({_pre_msg_count}→{len(compressed)} messages{_size}).\n"
+            "⚠️ I may have dropped fine detail from the middle (exact code, side "
+            "decisions). If I seem to forget something, paste it back — or run "
+            "/handoff before /new."
+        )
+        if _cc >= 2:
+            _caveat += (
+                f" This session has been compacted {_cc}× now; accuracy may be "
+                "degrading — consider /new for a fresh start."
+            )
+        # _emit_warning (status_key "warn"), not _emit_status ("lifecycle"): the
+        # caveat gets its own gateway bubble so transient lifecycle progress lines
+        # can't overwrite it — it stays visible ("delivered, non-transient").
+        agent._emit_warning(_caveat)
+        # Re-arm the pre-compaction heads-up: usage just dropped well below the
+        # warn band, so the next approach to the threshold should warn again.
+        agent._precompaction_warned = False
 
         # Clear the file-read dedup cache.  After compression the original
         # read content is summarised away — if the model re-reads the same

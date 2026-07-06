@@ -8997,6 +8997,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
+            # /context is read-only session info (like /status) — always answer
+            # it mid-run and pre-gate so users can see context pressure even
+            # while a turn is in flight.
+            if _cmd_def_inner and _cmd_def_inner.name == "context":
+                return await self._handle_context_command(event)
+
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
             # can't bypass gating just because an agent happens to be busy.
@@ -9495,6 +9501,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "context":
+            return await self._handle_context_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -11376,19 +11385,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
-            # Runtime-metadata footer — only on the FINAL message of the turn.
-            # Off by default (display.runtime_footer.enabled=false).  When
-            # streaming already delivered the body, we can't mutate the sent
-            # text, so we fire a separate trailing send below.
+            # Runtime-metadata / context-meter footer — only on the FINAL
+            # message of the turn. The manual footer is off by default
+            # (display.runtime_footer.enabled=false), but the meter footer
+            # surfaces on its own once context pressure crosses the floor
+            # (display.context_meter.footer_floor). When streaming already
+            # delivered the body, we can't mutate the sent text, so we fire a
+            # separate trailing send below.
             _footer_line = ""
             try:
-                from gateway.runtime_footer import build_footer_line as _bfl
-                _footer_line = _bfl(
+                from gateway.runtime_footer import build_meter_footer as _bmf
+                _footer_line = _bmf(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    threshold_tokens=agent_result.get("threshold_tokens") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                 )
             except Exception as _footer_err:
@@ -18340,12 +18353,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _input_toks = 0
             _output_toks = 0
             _context_length = 0
+            _threshold_toks = 0
             _agent = agent_holder[0]
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _threshold_toks = getattr(_agent.context_compressor, "threshold_tokens", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             # Sync session_id immediately after run_conversation(). Compression
@@ -18475,6 +18490,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
                     "context_length": _context_length,
+                    "threshold_tokens": _threshold_toks,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -18575,6 +18591,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "threshold_tokens": _threshold_toks,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
