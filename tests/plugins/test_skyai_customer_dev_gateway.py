@@ -393,6 +393,123 @@ def test_format_discord_mirror_message_uses_customer_visible_shape() -> None:
     assert "toolset=skyai_customer" in message
 
 
+def test_classify_discord_conversation_marks_skyvision1_as_test() -> None:
+    result = dev_gateway.classify_discord_conversation(
+        {
+            "conversation_id": "c1",
+            "metadata": {"page_referrer": "https://skyvision1.7s2go.com/?qa=1"},
+        },
+        "c1",
+    )
+
+    assert result["kind"] == "test"
+    assert result["badge"] == "🧪 TEST"
+
+
+def test_classify_discord_conversation_keeps_skyvision_prod_real() -> None:
+    result = dev_gateway.classify_discord_conversation(
+        {
+            "conversation_id": "skyai-prod-real",
+            "metadata": {
+                "surface": "widget_chatkit_dev",
+                "page_referrer": "https://skyvision.bg/подарък/масаж/",
+            },
+        },
+        "skyai-prod-real",
+    )
+
+    assert result["kind"] == "real"
+
+
+def test_format_discord_mirror_message_marks_test_conversations() -> None:
+    message = dev_gateway.format_discord_mirror_message(
+        {
+            "conversation_id": "skyai-v2-compare-run",
+            "message": "QA тест",
+            "metadata": {"page_referrer": "https://skyvision1.7s2go.com/"},
+        },
+        {
+            "status": "ok",
+            "version": "v-test",
+            "conversation_id": "skyai-v2-compare-run",
+            "reply": "Тестов отговор.",
+            "trace": {
+                "runtime": "hermes_agent",
+                "toolset": "skyai_customer",
+                "live_model": True,
+                "fallback": False,
+                "latency_ms": 12,
+            },
+        },
+    )
+
+    assert message.startswith("**🧪 TEST / QA разговор**")
+    assert "origin_class=test" in message
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_name_marks_test_threads(tmp_path: Path, monkeypatch) -> None:
+    created_names: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        assert content.startswith("🧪 TEST SkyAI v2 разговор")
+        return {"id": "starter-message"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        created_names.append(name)
+        return {"id": "thread-1"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+
+    thread_id = await dev_gateway._discord_target_channel_id(
+        settings=settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="channel",
+            discord_mirror_create_threads=True,
+            discord_mirror_thread_store=tmp_path / "threads.json",
+        ),
+        conversation_id="skyai-v2-compare-thread-123",
+        request_payload={"metadata": {"page_referrer": "https://skyvision1.7s2go.com/"}},
+    )
+
+    assert thread_id == "thread-1"
+    assert created_names == ["🧪 TEST · SkyAI v2 · skyai-v2-compare-thread-123"]
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_name_keeps_prod_threads_plain(tmp_path: Path, monkeypatch) -> None:
+    created_names: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        assert not content.startswith("🧪 TEST")
+        return {"id": "starter-message"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        created_names.append(name)
+        return {"id": "thread-1"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+
+    await dev_gateway._discord_target_channel_id(
+        settings=settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="channel",
+            discord_mirror_create_threads=True,
+            discord_mirror_thread_store=tmp_path / "threads.json",
+        ),
+        conversation_id="skyai-prod-real-thread",
+        request_payload={"metadata": {"page_referrer": "https://skyvision.bg/"}},
+    )
+
+    assert created_names == ["SkyAI v2 · skyai-prod-real-thread"]
+
+
 @pytest.mark.asyncio
 async def test_mirror_to_discord_skips_when_disabled(tmp_path: Path) -> None:
     result = await dev_gateway.mirror_to_discord(

@@ -22,6 +22,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Awaitable, Callable
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from plugins.skyai_customer import public_tools
@@ -45,6 +46,8 @@ MAX_MESSAGE_CHARS = 8000
 MAX_HISTORY_TURNS = 12
 DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 DISCORD_MESSAGE_LIMIT = 1900
+DISCORD_THREAD_NAME_LIMIT = 100
+DISCORD_TEST_THREAD_PREFIX = "🧪 TEST · "
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
 BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
@@ -204,6 +207,133 @@ def runtime_conversation_id(conversation_id: str) -> str:
         return safe
     digest = hashlib.sha256(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
     return f"{safe[:51].rstrip('-')}-{digest}"[:64]
+
+
+def classify_discord_conversation(
+    payload: dict[str, Any],
+    conversation_id: str = "",
+) -> dict[str, str]:
+    """Classify only the Discord mirror surface, not the model prompt.
+
+    The goal is operational visibility: QA/DEV/smoke conversations should be
+    obvious in Discord before a thread is opened. Customer-facing reasoning must
+    remain inside Hermes and must not be affected by this label.
+    """
+
+    metadata = _payload_metadata(payload)
+    explicit = _first_string_value(
+        payload,
+        metadata,
+        "origin_class",
+        "conversation_origin",
+        "conversation_kind",
+    ).lower()
+    if explicit in {"test", "qa", "smoke", "staff_test", "dev"}:
+        return {"kind": "test", "badge": "🧪 TEST", "reason": f"explicit:{explicit}"}
+    if explicit in {"real", "prod", "production", "customer"}:
+        return {"kind": "real", "badge": "", "reason": f"explicit:{explicit}"}
+
+    if _truthy_payload_flag(payload, metadata, "is_test", "skyai_test", "staff_test", "qa_test"):
+        return {"kind": "test", "badge": "🧪 TEST", "reason": "explicit_test_flag"}
+
+    ip_value = _first_string_value(payload, metadata, "ip", "client_ip", "forwarded_for", "x_forwarded_for")
+    if _is_known_test_ip(ip_value):
+        return {"kind": "test", "badge": "🧪 TEST", "reason": "test_ip"}
+
+    conversation = conversation_id or conversation_id_from_payload(payload)
+    if re.search(r"(^|[-_])(?:test|qa|smoke|compare|canary|preview|dev)(?:[-_]|$)", conversation, re.I):
+        return {"kind": "test", "badge": "🧪 TEST", "reason": "conversation_id"}
+
+    hosts = _payload_hosts(payload, metadata)
+    if any(_is_test_host(host) for host in hosts):
+        return {"kind": "test", "badge": "🧪 TEST", "reason": "dev_or_preview_host"}
+    if any(host in {"skyvision.bg", "www.skyvision.bg"} for host in hosts):
+        return {"kind": "real", "badge": "", "reason": "skyvision_prod_host"}
+
+    return {"kind": "unknown", "badge": "", "reason": "no_test_signal"}
+
+
+def discord_thread_name(conversation_id: str, origin: dict[str, str] | None = None) -> str:
+    base = f"SkyAI v2 · {conversation_id[:36]}"
+    if origin and origin.get("kind") == "test":
+        return _truncate_thread_name(f"{DISCORD_TEST_THREAD_PREFIX}{base}")
+    return _truncate_thread_name(base)
+
+
+def _truncate_thread_name(value: str) -> str:
+    if len(value) <= DISCORD_THREAD_NAME_LIMIT:
+        return value
+    return value[: DISCORD_THREAD_NAME_LIMIT - 1].rstrip() + "…"
+
+
+def _payload_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = payload.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _first_string_value(payload: dict[str, Any], metadata: dict[str, Any], *keys: str) -> str:
+    for source in (payload, metadata):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _truthy_payload_flag(payload: dict[str, Any], metadata: dict[str, Any], *keys: str) -> bool:
+    for source in (payload, metadata):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "y", "test"}:
+                return True
+    return False
+
+
+def _is_known_test_ip(value: str) -> bool:
+    if not value:
+        return False
+    allowed = {
+        item.strip()
+        for item in os.getenv("SKYAI_DISCORD_TEST_IPS", "").split(",")
+        if item.strip()
+    }
+    if not allowed:
+        return False
+    return any(part.strip() in allowed for part in value.split(","))
+
+
+def _payload_hosts(payload: dict[str, Any], metadata: dict[str, Any]) -> list[str]:
+    hosts: list[str] = []
+    for source in (payload, metadata):
+        for key in ("origin", "host", "page_referrer", "referer", "referrer"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if not isinstance(value, str) or not value.strip():
+                continue
+            text = value.strip()
+            parsed = urlparse(text if "://" in text else f"//{text}")
+            host = (parsed.hostname or text.split("/", 1)[0]).lower()
+            if host and host not in hosts:
+                hosts.append(host)
+    return hosts
+
+
+def _is_test_host(host: str) -> bool:
+    host = host.strip().lower()
+    return bool(
+        host in LOOPBACK_HOSTS
+        or host == "skyvision1.7s2go.com"
+        or host.endswith(".7s2go.com") and host.startswith("skyvision1")
+        or host.startswith("preview-")
+        or host.startswith("dev.")
+        or "skyai-v2-dev-ingress" in host
+        or "skyvision1-" in host
+    )
 
 
 def build_skyai_system_prompt() -> str:
@@ -1394,15 +1524,20 @@ def format_discord_mirror_message(
     *,
     label: str = "SkyAI v2 canary",
 ) -> str:
+    conversation_id = str(response.get("conversation_id") or conversation_id_from_payload(request_payload))
+    origin = classify_discord_conversation(request_payload, conversation_id)
     trace = response.get("trace") if isinstance(response.get("trace"), dict) else {}
     service_line = (
         f"status={response.get('status')} · version={response.get('version')} · "
         f"runtime={trace.get('runtime')} · toolset={trace.get('toolset')} · "
         f"live_model={trace.get('live_model')} · fallback={trace.get('fallback')} · "
-        f"latency_ms={trace.get('latency_ms')}"
+        f"latency_ms={trace.get('latency_ms')} · origin_class={origin.get('kind')} · "
+        f"origin_reason={origin.get('reason')}"
     )
+    origin_header = f"**{origin['badge']} / QA разговор**\n" if origin.get("kind") == "test" else ""
     content = (
-        f"**{label} · {response.get('conversation_id') or conversation_id_from_payload(request_payload)}**\n"
+        f"{origin_header}"
+        f"**{label} · {conversation_id}**\n"
         f"**Клиент**\n{extract_message(request_payload) or '(empty)'}\n\n"
         f"**SkyAI**\n{response.get('reply') or response.get('reason') or response.get('error') or ''}\n\n"
         f"**Служебно**\n`{service_line}`"
@@ -1430,6 +1565,7 @@ async def mirror_to_discord(
         target_channel_id = await _discord_target_channel_id(
             settings=settings,
             conversation_id=str(response.get("conversation_id") or conversation_id_from_payload(request_payload)),
+            request_payload=request_payload,
         )
         posted = await asyncio.to_thread(
             _discord_post_message,
@@ -1446,7 +1582,12 @@ async def mirror_to_discord(
     }
 
 
-async def _discord_target_channel_id(*, settings: CanarySettings, conversation_id: str) -> str:
+async def _discord_target_channel_id(
+    *,
+    settings: CanarySettings,
+    conversation_id: str,
+    request_payload: dict[str, Any] | None = None,
+) -> str:
     if not settings.discord_mirror_create_threads:
         return settings.discord_mirror_channel_id
     store_path = settings.discord_mirror_thread_store or (
@@ -1456,11 +1597,13 @@ async def _discord_target_channel_id(*, settings: CanarySettings, conversation_i
     if conversation_id in mapping:
         return mapping[conversation_id]
 
+    origin = classify_discord_conversation(request_payload or {}, conversation_id)
+    starter_prefix = f"{origin['badge']} " if origin.get("kind") == "test" else ""
     starter = await asyncio.to_thread(
         _discord_post_message,
         settings.discord_mirror_channel_id,
         settings.discord_mirror_bot_token,
-        f"SkyAI v2 разговор `{conversation_id}`",
+        f"{starter_prefix}SkyAI v2 разговор `{conversation_id}`",
     )
     message_id = str(starter.get("id") or "")
     if not message_id:
@@ -1470,7 +1613,7 @@ async def _discord_target_channel_id(*, settings: CanarySettings, conversation_i
         settings.discord_mirror_channel_id,
         message_id,
         settings.discord_mirror_bot_token,
-        f"SkyAI v2 · {conversation_id[:36]}",
+        discord_thread_name(conversation_id, origin),
     )
     thread_id = str(thread.get("id") or "")
     if thread_id:
