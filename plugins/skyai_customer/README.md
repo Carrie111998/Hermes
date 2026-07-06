@@ -20,6 +20,14 @@ Hermes reasons; this backend provides public facts, structured evidence,
 transport, cards, and safety boundaries. Do not add keyword routers,
 customer-visible template logic, or one-off phrase guards around Hermes.
 
+## Voice Contract
+
+Future PBX/voice work is documented in `docs/skyai-voice-contract-v0.1.md`.
+That contract keeps telephony concerns in a separate SkyAI Voice Gateway and
+keeps this plugin as the public-safe customer knowledge/tool layer. Voice MVP
+work must not add SIP, STT, TTS, or PBX runtime code to this plugin without a
+separate implementation gate.
+
 ## Intended Runtime Boundary
 
 Customer-facing Hermes may call this plugin. Muncho remains the internal

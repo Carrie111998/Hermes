@@ -172,3 +172,17 @@ Use QA issues as high-level feedback:
 
 Do not teach by adding phrase-level bans, keyword guards, or one-off branches.
 
+## SkyAI Voice Contract v0.1
+
+Voice integration is an edge adapter, not a Hermes core change. The source of
+truth for the first PBX/voice design gate is
+`docs/skyai-voice-contract-v0.1.md`.
+
+The contract keeps SIP/RTP, STT, TTS, barge-in, silence timeouts, call state,
+recording policy, and human transfer behavior inside a future SkyAI Voice
+Gateway. The gateway may target the current SkyAI v1 chat backend or the SkyAI
+v2 Hermes backend through the same adapter surface, so PBX work remains usable
+after v2 promotion.
+
+This repository change intentionally does not register `/voice/*` routes,
+create SIP extensions, deploy services, or alter PBX configuration.
