@@ -184,5 +184,7 @@ Gateway. The gateway may target the current SkyAI v1 chat backend or the SkyAI
 v2 Hermes backend through the same adapter surface, so PBX work remains usable
 after v2 promotion.
 
-This repository change intentionally does not register `/voice/*` routes,
-create SIP extensions, deploy services, or alter PBX configuration.
+The DEV gateway may register `/voice/*` HTTP transcript/event routes as the
+stable adapter surface. Those routes must remain transport-only: no SIP client,
+raw audio processing, STT/TTS provider, deployment action, PBX configuration,
+or customer-facing semantic routing belongs in this plugin layer.

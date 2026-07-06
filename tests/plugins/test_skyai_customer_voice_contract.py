@@ -78,9 +78,9 @@ def test_voice_contract_doc_records_current_architecture_and_mvp_scope() -> None
     text = VOICE_DOC_PATH.read_text(encoding="utf-8")
 
     required_phrases = [
-        "design and tests only",
+        "DEV HTTP adapter skeleton",
         "does not deploy",
-        "does not register them",
+        "registered on the DEV/canary HTTP gateway",
         "POST /chatkit/message",
         "POST /chatkit/dev-message",
         "POST /qa/compare",
@@ -112,15 +112,18 @@ def test_voice_contract_doc_documents_low_latency_and_oauth_tradeoffs() -> None:
     assert "MVP without OpenAI API billing" in text
 
 
-def test_voice_gate_is_docs_only_no_runtime_routes_registered() -> None:
+def test_voice_gate_registers_http_adapter_only_no_pbx_audio_stack() -> None:
     source = DEV_GATEWAY_PATH.read_text(encoding="utf-8")
 
-    assert 'add_post("/voice/start"' not in source
-    assert 'add_post("/voice/turn"' not in source
-    assert 'add_post("/voice/event"' not in source
-    assert 'add_post("/voice/end"' not in source
+    assert 'add_post("/voice/start"' in source
+    assert 'add_post("/voice/turn"' in source
+    assert 'add_post("/voice/event"' in source
+    assert 'add_post("/voice/end"' in source
     assert "SIP" not in source
     assert "PBX" not in source
+    assert "RTP" not in source
+    assert "pjsip" not in source.casefold()
+    assert "asterisk" not in source.casefold()
 
 
 def test_voice_contract_is_referenced_from_plugin_docs() -> None:

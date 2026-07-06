@@ -1,7 +1,8 @@
 # SkyAI Voice Contract v0.1
 
-Status: design and tests only. This gate does not deploy, restart services,
-create PBX routes, register SIP endpoints, or change production traffic.
+Status: DEV HTTP adapter skeleton with tests. This gate does not deploy,
+restart services, create PBX routes, register SIP endpoints, process audio, or
+change production traffic.
 
 ## TL;DR
 
@@ -66,9 +67,9 @@ use server-to-server auth only:
 ### Escalation today
 
 SkyAI can tell the customer how to reach the SkyVision team and should include
-official contacts when it does so. There is no current voice transfer API. The
-Voice Gateway must implement transfer/handoff as PBX/SIP behavior and report
-that action back to SkyAI operational logs.
+official contacts when it does so. The DEV voice adapter can return a
+`transfer_to_human` action. The future Voice Gateway must execute that action
+as PBX/SIP behavior and report it back to SkyAI operational logs.
 
 ## Voice Gaps
 
@@ -83,7 +84,7 @@ SkyAI chat does not currently provide:
 - silence timeout;
 - call recording policy;
 - verified caller identity;
-- transfer-to-human API;
+- PBX transfer execution;
 - per-call latency telemetry;
 - voice-specific transcript retention controls.
 
@@ -157,7 +158,9 @@ API auth path in the public OpenAI API contract. Therefore:
 ## Required API Contract
 
 The Voice Gateway talks to SkyAI through a stable adapter. These endpoints are
-contract names for the future adapter; this gate does not register them.
+registered on the DEV/canary HTTP gateway as transcript/event endpoints. They
+do not accept raw audio and do not implement SIP, STT, TTS, RTP, or PBX
+configuration.
 
 ### `POST /voice/start`
 

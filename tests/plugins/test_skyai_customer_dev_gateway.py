@@ -108,6 +108,13 @@ def test_runtime_conversation_id_compacts_long_external_ids() -> None:
     assert dev_gateway.runtime_conversation_id("thread-1") == "thread-1"
 
 
+def test_voice_generated_conversation_id_uses_same_call_id() -> None:
+    payload: dict[str, str] = {}
+    call_id = dev_gateway.voice_call_id_from_payload(payload)
+
+    assert dev_gateway.voice_conversation_id_from_payload(payload, call_id) == f"skyai-voice-{call_id}"
+
+
 @pytest.mark.asyncio
 async def test_build_chat_response_dry_run_returns_fab_compatible_shape(tmp_path: Path) -> None:
     response = await dev_gateway.build_chat_response(
@@ -168,6 +175,173 @@ def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
     assert ("POST", "/chatkit/dev-message") in routes
     assert ("POST", "/chatkit/message") in routes
     assert ("POST", "/qa/compare") in routes
+    assert ("POST", "/voice/start") in routes
+    assert ("POST", "/voice/turn") in routes
+    assert ("POST", "/voice/event") in routes
+    assert ("POST", "/voice/end") in routes
+
+
+@pytest.mark.asyncio
+async def test_build_voice_start_response_returns_contract_shape(tmp_path: Path) -> None:
+    response = await dev_gateway.build_voice_start_response(
+        {
+            "call_id": "call-1",
+            "conversation_id": "voice-c1",
+            "caller_id": "+35970020200",
+            "pbx_extension": "399",
+            "recording_notice_played": False,
+        },
+        settings(tmp_path),
+    )
+
+    assert response["status"] == "ok"
+    assert response["contract_version"] == "skyai-voice-contract.v0.1"
+    assert response["call_id"] == "call-1"
+    assert response["conversation_id"] == "voice-c1"
+    assert response["action"] == "speak"
+    assert response["end_call"] is False
+    assert response["transfer"] is None
+    assert response["trace"]["runtime"] == "skyai_voice_adapter"
+    assert response["trace"]["raw_audio_stored"] is False
+    assert response["trace"]["customer_mutations_allowed"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_response_uses_v2_chat_adapter(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        seen.update(
+            {
+                "message": message,
+                "history": history,
+                "conversation_id": conversation_id,
+                "profile_home": canary_settings.profile_home,
+            }
+        )
+        return {
+            "reply": "Разбира се, ето идея за подарък.",
+            "cards": [{"title": "Ваучер за подарък на стойност", "price_text": "стойност по избор"}],
+        }
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-2",
+            "conversation_id": "voice-c2",
+            "turn_index": 1,
+            "transcript": "Търся подарък за рожден ден.",
+            "is_final": True,
+            "stt_confidence": 0.91,
+            "caller_id": "+35970020200",
+            "did": "+35924259795",
+            "pbx_extension": "399",
+            "department": "sales",
+            "language": "bg-BG",
+            "source": "zycoo-coovox-u20",
+            "history": [{"role": "assistant", "content": "Здравейте"}],
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert response["spoken_reply"] == "Разбира се, ето идея за подарък."
+    assert response["display_reply"] == response["spoken_reply"]
+    assert response["cards"] == [{"title": "Ваучер за подарък на стойност", "price_text": "стойност по избор"}]
+    assert response["trace"]["backend_target"] == "skyai_v2_chatkit"
+    assert response["trace"]["voice_backend_target"] == "skyai_v2_chatkit"
+    assert response["trace"]["stt_confidence"] == 0.91
+    assert seen["message"] == "Търся подарък за рожден ден."
+    assert seen["history"] == [{"role": "assistant", "content": "Здравейте"}]
+    assert seen["conversation_id"] == "voice-c2"
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_low_confidence_clarifies_without_model_call(tmp_path: Path) -> None:
+    async def forbidden_runner(*args, **kwargs):
+        raise AssertionError("low-confidence voice turns must not call Hermes")
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-3",
+            "conversation_id": "voice-c3",
+            "transcript": "шшш",
+            "stt_confidence": 0.2,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=forbidden_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "clarify"
+    assert "повторите" in response["spoken_reply"]
+    assert response["trace"]["voice_reason"] == "low_stt_confidence"
+    assert response["trace"]["raw_audio_stored"] is False
+
+
+@pytest.mark.asyncio
+async def test_build_voice_event_dtmf_zero_transfers_to_human(tmp_path: Path) -> None:
+    response = await dev_gateway.build_voice_event_response(
+        {
+            "call_id": "call-4",
+            "conversation_id": "voice-c4",
+            "event_type": "dtmf",
+            "dtmf": "0",
+        },
+        settings(tmp_path),
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "transfer_to_human"
+    assert response["transfer"] == {"target": "operator_queue", "reason": "dtmf"}
+    assert "човек" in response["spoken_reply"]
+
+
+@pytest.mark.asyncio
+async def test_build_voice_turn_v1_target_requires_configured_backend(tmp_path: Path) -> None:
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-5",
+            "conversation_id": "voice-c5",
+            "backend_target": "skyai_v1_chatkit",
+            "transcript": "Искам ваучер.",
+            "stt_confidence": 0.9,
+        },
+        settings(tmp_path),
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "transfer_to_human"
+    assert response["transfer"] == {
+        "target": "operator_queue",
+        "reason": "voice_v1_backend_not_configured",
+    }
+    assert response["trace"]["backend_target"] == "skyai_v1_chatkit"
+
+
+@pytest.mark.asyncio
+async def test_build_voice_end_response_ends_call_without_mutations(tmp_path: Path) -> None:
+    response = await dev_gateway.build_voice_end_response(
+        {
+            "call_id": "call-6",
+            "conversation_id": "voice-c6",
+            "ended_by": "caller",
+            "duration_seconds": 42,
+            "recording_stored": False,
+            "transcript_stored": True,
+        },
+        settings(tmp_path),
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "end_call"
+    assert response["end_call"] is True
+    assert response["trace"]["ended_by"] == "caller"
+    assert response["trace"]["duration_seconds"] == 42
+    assert response["trace"]["recording_stored"] is False
+    assert response["trace"]["transcript_stored"] is True
+    assert response["trace"]["customer_mutations_allowed"] is False
 
 
 def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path) -> None:

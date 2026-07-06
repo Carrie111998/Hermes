@@ -25,7 +25,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from plugins.skyai_customer import public_tools
+from plugins.skyai_customer import public_tools, voice_contract
 
 try:
     from aiohttp import web
@@ -52,6 +52,9 @@ DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
 BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
 BUILD_COMMIT_FILE = ".skyai-build-commit"
+DEFAULT_VOICE_BACKEND_TARGET = "skyai_v2_chatkit"
+DEFAULT_VOICE_V1_PATH = voice_contract.VOICE_BACKEND_TARGETS["skyai_v1_chatkit"]["path"]
+MIN_USABLE_STT_CONFIDENCE = 0.45
 SKYAI_REASONING_CONTRACT = (
     "Архитектурен договор: Hermes мисли. Backend-ът и tools дават публични факти, "
     "структурирани данни, линкове, цени, слотове, constraints и безопасни граници, "
@@ -103,6 +106,9 @@ class CanarySettings:
     compare_prod_path: str = DEFAULT_COMPARE_PROD_PATH
     compare_timeout_seconds: float = 45.0
     build_commit: str = ""
+    voice_backend_target: str = DEFAULT_VOICE_BACKEND_TARGET
+    voice_v1_base_url: str = ""
+    voice_v1_path: str = DEFAULT_VOICE_V1_PATH
 
 
 def is_loopback_host(host: str) -> bool:
@@ -191,6 +197,21 @@ def conversation_id_from_payload(payload: dict[str, Any]) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()[:128]
     return f"skyai-v2-canary-{uuid.uuid4().hex[:12]}"
+
+
+def voice_call_id_from_payload(payload: dict[str, Any]) -> str:
+    value = payload.get("call_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:128]
+    return f"skyai-voice-call-{uuid.uuid4().hex[:12]}"
+
+
+def voice_conversation_id_from_payload(payload: dict[str, Any], call_id: str = "") -> str:
+    value = payload.get("conversation_id") or payload.get("session_id") or payload.get("thread_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:128]
+    call_id = call_id or voice_call_id_from_payload(payload)
+    return f"skyai-voice-{call_id}"[:128]
 
 
 def runtime_conversation_id(conversation_id: str) -> str:
@@ -1401,6 +1422,349 @@ async def build_chat_response(
     }
 
 
+async def build_voice_start_response(
+    payload: dict[str, Any],
+    settings: CanarySettings,
+) -> dict[str, Any]:
+    call_id = voice_call_id_from_payload(payload)
+    conversation_id = voice_conversation_id_from_payload(payload, call_id)
+    return _voice_response(
+        payload,
+        settings,
+        call_id=call_id,
+        conversation_id=conversation_id,
+        action="speak",
+        spoken_reply=(
+            "Здравейте, свързахте се със SkyVision. Аз съм SkyAI и мога да "
+            "помогна с преживявания, ваучери, свободни часове и резервации. "
+            "Какво търсите днес?"
+        ),
+        display_reply=(
+            "Здравейте, свързахте се със SkyVision. Аз съм SkyAI и мога да "
+            "помогна с преживявания, ваучери, свободни часове и резервации."
+        ),
+        session_state={
+            "handoff_allowed": True,
+            "recording_allowed": bool(payload.get("recording_notice_played") is True),
+        },
+    )
+
+
+async def build_voice_turn_response(
+    payload: dict[str, Any],
+    settings: CanarySettings,
+    agent_runner: AgentRunner = default_agent_runner,
+) -> dict[str, Any]:
+    call_id = voice_call_id_from_payload(payload)
+    conversation_id = voice_conversation_id_from_payload(payload, call_id)
+    transcript = extract_voice_transcript(payload)
+    confidence = _optional_float(payload.get("stt_confidence"))
+
+    if not transcript:
+        return _voice_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            action="clarify",
+            spoken_reply="Извинете, не Ви чух добре. Може ли да повторите?",
+            display_reply="STT produced an empty transcript.",
+            trace_extra={"voice_reason": "empty_transcript"},
+        )
+
+    if confidence is not None and confidence < MIN_USABLE_STT_CONFIDENCE:
+        return _voice_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            action="clarify",
+            spoken_reply="Извинете, звукът не беше достатъчно ясен. Може ли да повторите накратко?",
+            display_reply="Low-confidence STT transcript; asking the caller to repeat.",
+            trace_extra={"voice_reason": "low_stt_confidence", "stt_confidence": confidence},
+        )
+
+    target = _voice_backend_target(payload, settings)
+    chat_payload = _voice_chat_payload(payload, conversation_id, transcript, target)
+    started = time.monotonic()
+    if target == "skyai_v2_chatkit":
+        chat_response = await build_chat_response(chat_payload, settings, agent_runner)
+    elif target == "skyai_v1_chatkit":
+        if not settings.voice_v1_base_url:
+            return _voice_response(
+                payload,
+                settings,
+                call_id=call_id,
+                conversation_id=conversation_id,
+                action="transfer_to_human",
+                spoken_reply=(
+                    "В момента не успявам да се свържа с асистента. "
+                    "Ще Ви прехвърля към човек от екипа."
+                ),
+                display_reply="Voice v1 backend target is not configured.",
+                transfer={"target": "operator_queue", "reason": "voice_v1_backend_not_configured"},
+                trace_extra={"voice_backend_target": target},
+            )
+        chat_response = await asyncio.to_thread(_call_voice_v1_skyai, chat_payload, settings)
+    else:
+        return {
+            "status": "error",
+            "error": "invalid_voice_backend_target",
+            "version": settings.version,
+            "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
+            "call_id": call_id,
+            "conversation_id": conversation_id,
+            "backend_target": target,
+        }
+
+    latency_ms = int((time.monotonic() - started) * 1000)
+    if chat_response.get("status") != "ok":
+        return _voice_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            action="transfer_to_human",
+            spoken_reply=(
+                "В момента не успявам да върна сигурен отговор. "
+                "Ще Ви прехвърля към човек от екипа."
+            ),
+            display_reply=str(chat_response.get("reason") or chat_response.get("error") or "backend_error"),
+            transfer={"target": "operator_queue", "reason": "skyai_backend_error"},
+            trace_extra={"voice_backend_target": target, "voice_backend_latency_ms": latency_ms},
+        )
+
+    reply = str(chat_response.get("reply") or "").strip()
+    return _voice_response(
+        payload,
+        settings,
+        call_id=call_id,
+        conversation_id=conversation_id,
+        action="speak",
+        spoken_reply=reply,
+        display_reply=reply,
+        cards=_normalize_cards(chat_response.get("cards")),
+        trace_extra={
+            "voice_backend_target": target,
+            "voice_backend_latency_ms": latency_ms,
+            "stt_confidence": confidence,
+            "turn_index": payload.get("turn_index"),
+            "chat_trace": chat_response.get("trace") if isinstance(chat_response.get("trace"), dict) else {},
+        },
+    )
+
+
+async def build_voice_event_response(
+    payload: dict[str, Any],
+    settings: CanarySettings,
+) -> dict[str, Any]:
+    call_id = voice_call_id_from_payload(payload)
+    conversation_id = voice_conversation_id_from_payload(payload, call_id)
+    event_type = _voice_event_type(payload)
+    dtmf = _voice_dtmf(payload)
+
+    if dtmf == "0" or event_type in {"caller_requested_human", "operator_requested", "human_requested"}:
+        return _voice_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            action="transfer_to_human",
+            spoken_reply="Разбира се, ще Ви прехвърля към човек от екипа.",
+            display_reply="Caller requested human handoff.",
+            transfer={"target": "operator_queue", "reason": event_type or "dtmf_0"},
+        )
+
+    if event_type in {"silence_timeout", "low_stt_confidence"}:
+        return _voice_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            action="clarify",
+            spoken_reply="Извинете, не Ви чух добре. Може ли да повторите?",
+            display_reply=f"Voice event requires clarification: {event_type}",
+            trace_extra={"voice_event": event_type},
+        )
+
+    if event_type in {"gateway_error", "stt_error", "tts_error"}:
+        return _voice_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            action="transfer_to_human",
+            spoken_reply="Имаме технически проблем с разговора. Ще Ви прехвърля към човек.",
+            display_reply=f"Voice gateway error event: {event_type}",
+            transfer={"target": "operator_queue", "reason": event_type},
+        )
+
+    return _voice_response(
+        payload,
+        settings,
+        call_id=call_id,
+        conversation_id=conversation_id,
+        action="clarify",
+        spoken_reply="Слушам Ви.",
+        display_reply=f"Voice event acknowledged: {event_type or 'unknown'}",
+        trace_extra={"voice_event": event_type or "unknown"},
+    )
+
+
+async def build_voice_end_response(
+    payload: dict[str, Any],
+    settings: CanarySettings,
+) -> dict[str, Any]:
+    call_id = voice_call_id_from_payload(payload)
+    conversation_id = voice_conversation_id_from_payload(payload, call_id)
+    ended_by = str(payload.get("ended_by") or "unknown").strip()[:80]
+    return _voice_response(
+        payload,
+        settings,
+        call_id=call_id,
+        conversation_id=conversation_id,
+        action="end_call",
+        spoken_reply="Благодарим Ви, че се свързахте със SkyVision. Хубав ден!",
+        display_reply="Call ended.",
+        end_call=True,
+        trace_extra={
+            "ended_by": ended_by,
+            "duration_seconds": payload.get("duration_seconds"),
+            "recording_stored": bool(payload.get("recording_stored")),
+            "transcript_stored": bool(payload.get("transcript_stored")),
+        },
+    )
+
+
+def extract_voice_transcript(payload: dict[str, Any]) -> str:
+    value = payload.get("transcript")
+    if isinstance(value, str) and value.strip():
+        return value.strip()[:MAX_MESSAGE_CHARS]
+    return extract_message(payload)
+
+
+def _voice_backend_target(payload: dict[str, Any], settings: CanarySettings) -> str:
+    value = payload.get("backend_target")
+    if not isinstance(value, str) or not value.strip():
+        metadata = _payload_metadata(payload)
+        value = metadata.get("backend_target") if isinstance(metadata.get("backend_target"), str) else ""
+    return (value or settings.voice_backend_target or DEFAULT_VOICE_BACKEND_TARGET).strip()
+
+
+def _voice_chat_payload(
+    payload: dict[str, Any],
+    conversation_id: str,
+    transcript: str,
+    backend_target: str,
+) -> dict[str, Any]:
+    metadata = dict(_payload_metadata(payload))
+    metadata.update(
+        {
+            "surface": "voice_gateway",
+            "voice_contract_version": voice_contract.VOICE_CONTRACT_VERSION,
+            "voice_backend_target": backend_target,
+            "caller_id": payload.get("caller_id"),
+            "did": payload.get("did"),
+            "pbx_extension": payload.get("pbx_extension"),
+            "department": payload.get("department"),
+            "language": payload.get("language"),
+            "source": payload.get("source"),
+        }
+    )
+    return {
+        "conversation_id": conversation_id,
+        "message": transcript,
+        "history": extract_history(payload),
+        "metadata": {key: value for key, value in metadata.items() if value not in ("", None)},
+    }
+
+
+def _voice_response(
+    payload: dict[str, Any],
+    settings: CanarySettings,
+    *,
+    call_id: str,
+    conversation_id: str,
+    action: str,
+    spoken_reply: str,
+    display_reply: str = "",
+    cards: list[dict[str, Any]] | None = None,
+    transfer: dict[str, Any] | None = None,
+    end_call: bool = False,
+    session_state: dict[str, Any] | None = None,
+    trace_extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if action not in voice_contract.VOICE_ACTIONS:
+        raise ValueError(f"unsupported voice action: {action}")
+    trace = {
+        "runtime": "skyai_voice_adapter",
+        "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
+        "backend_target": _voice_backend_target(payload, settings),
+        "raw_audio_stored": False,
+        "customer_mutations_allowed": False,
+    }
+    if trace_extra:
+        trace.update({key: value for key, value in trace_extra.items() if value is not None})
+    return {
+        "status": "ok",
+        "version": settings.version,
+        "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
+        "call_id": call_id,
+        "conversation_id": conversation_id,
+        "action": action,
+        "spoken_reply": spoken_reply,
+        "display_reply": display_reply or spoken_reply,
+        "cards": cards or [],
+        "transfer": transfer,
+        "end_call": end_call,
+        "session_state": session_state or {"handoff_allowed": True},
+        "trace": trace,
+    }
+
+
+def _voice_event_type(payload: dict[str, Any]) -> str:
+    value = payload.get("event_type") or payload.get("event")
+    return str(value or "").strip().lower()[:80]
+
+
+def _voice_dtmf(payload: dict[str, Any]) -> str:
+    metadata = _payload_metadata(payload)
+    value = payload.get("dtmf") or metadata.get("dtmf")
+    return str(value or "").strip()
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in ("", None):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_voice_v1_skyai(payload: dict[str, Any], settings: CanarySettings) -> dict[str, Any]:
+    base = settings.voice_v1_base_url.rstrip("/")
+    path = settings.voice_v1_path if settings.voice_v1_path.startswith("/") else f"/{settings.voice_v1_path}"
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = Request(
+        f"{base}{path}",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "SkyAI-Voice-Gateway/0.1",
+        },
+    )
+    try:
+        with urlopen(request, timeout=settings.compare_timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        reason = exc.read().decode("utf-8", errors="replace")[:500]
+        return {"status": "error", "http_status": exc.code, "reason": reason}
+    except URLError as exc:
+        return {"status": "error", "reason": sanitize_runtime_error(exc)}
+
+
 def _coerce_runner_result(result: Any) -> tuple[str, list[dict[str, Any]]]:
     if isinstance(result, dict):
         reply = str(
@@ -1874,6 +2238,66 @@ def create_app(
         status = 200 if response.get("status") == "ok" else 503
         return web.json_response(response, status=status)
 
+    async def voice_start(request: "web.Request") -> "web.Response":
+        if not _authorize(request, settings):
+            return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        response = await build_voice_start_response(payload, settings)
+        return web.json_response(response)
+
+    async def voice_turn(request: "web.Request") -> "web.Response":
+        if not _authorize(request, settings):
+            return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        try:
+            response = await build_voice_turn_response(payload, settings, agent_runner)
+        except Exception as exc:
+            return web.json_response(
+                {
+                    "status": "error",
+                    "error": "voice_adapter_error",
+                    "version": settings.version,
+                    "reason": sanitize_runtime_error(exc),
+                },
+                status=502,
+            )
+        status = 200 if response.get("status") == "ok" else 503
+        return web.json_response(response, status=status)
+
+    async def voice_event(request: "web.Request") -> "web.Response":
+        if not _authorize(request, settings):
+            return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        response = await build_voice_event_response(payload, settings)
+        return web.json_response(response)
+
+    async def voice_end(request: "web.Request") -> "web.Response":
+        if not _authorize(request, settings):
+            return web.json_response({"status": "error", "error": "unauthorized"}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"status": "error", "error": "invalid_json"}, status=400)
+        if not isinstance(payload, dict):
+            return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
+        response = await build_voice_end_response(payload, settings)
+        return web.json_response(response)
+
     app = web.Application(client_max_size=1_000_000)
     app.router.add_get("/health", health)
     app.router.add_get("/ready", health)
@@ -1882,6 +2306,10 @@ def create_app(
     app.router.add_post("/chatkit/dev-message", chat)
     app.router.add_post("/chatkit/message", chat)
     app.router.add_post("/qa/compare", compare)
+    app.router.add_post("/voice/start", voice_start)
+    app.router.add_post("/voice/turn", voice_turn)
+    app.router.add_post("/voice/event", voice_event)
+    app.router.add_post("/voice/end", voice_end)
     return app
 
 
@@ -1943,6 +2371,11 @@ def main(argv: list[str] | None = None) -> int:
         compare_prod_path=os.getenv("SKYAI_COMPARE_PROD_PATH", DEFAULT_COMPARE_PROD_PATH).strip()
         or DEFAULT_COMPARE_PROD_PATH,
         build_commit=resolve_build_commit(),
+        voice_backend_target=os.getenv("SKYAI_VOICE_BACKEND_TARGET", DEFAULT_VOICE_BACKEND_TARGET).strip()
+        or DEFAULT_VOICE_BACKEND_TARGET,
+        voice_v1_base_url=os.getenv("SKYAI_VOICE_V1_BASE_URL", "").strip().rstrip("/"),
+        voice_v1_path=os.getenv("SKYAI_VOICE_V1_PATH", DEFAULT_VOICE_V1_PATH).strip()
+        or DEFAULT_VOICE_V1_PATH,
     )
     app = create_app(settings)
     web.run_app(app, host=settings.host, port=settings.port)

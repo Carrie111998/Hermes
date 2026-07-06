@@ -24,9 +24,9 @@ customer-visible template logic, or one-off phrase guards around Hermes.
 
 Future PBX/voice work is documented in `docs/skyai-voice-contract-v0.1.md`.
 That contract keeps telephony concerns in a separate SkyAI Voice Gateway and
-keeps this plugin as the public-safe customer knowledge/tool layer. Voice MVP
-work must not add SIP, STT, TTS, or PBX runtime code to this plugin without a
-separate implementation gate.
+keeps this plugin as the public-safe customer knowledge/tool layer. The DEV
+gateway exposes HTTP transcript/event adapter endpoints under `/voice/*`; it
+does not include SIP, STT, TTS, RTP, PBX configuration, or production routing.
 
 ## Intended Runtime Boundary
 
@@ -84,3 +84,11 @@ Dry-run is the default. Calling the live Hermes model requires the explicit
 `--live-model` flag. Private RFC1918 binds still require `--allow-public-bind`;
 public or wildcard binds also require a bearer token from
 `SKYAI_V2_CANARY_TOKEN`.
+
+Voice adapter smoke can be simulated without audio:
+
+```bash
+curl -X POST http://127.0.0.1:8787/voice/turn \
+  -H 'Content-Type: application/json' \
+  -d '{"call_id":"call-dev-1","conversation_id":"voice-dev-1","transcript":"Търся подарък за рожден ден.","is_final":true,"stt_confidence":0.95}'
+```
