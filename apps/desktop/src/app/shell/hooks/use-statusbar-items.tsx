@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useEffect, useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
@@ -23,7 +23,13 @@ import {
   $yoloActive,
   setYoloActive
 } from '@/store/session'
-import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
+import {
+  $subagentsBySession,
+  activeSubagentCount,
+  allSubagents,
+  failedSubagentCount,
+  syncActiveDelegationSubagents
+} from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
@@ -90,6 +96,47 @@ export function useStatusbarItems({
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
 
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      syncActiveDelegationSubagents([])
+
+      return
+    }
+
+    let cancelled = false
+    let inFlight = false
+
+    const refreshDelegationStatus = async () => {
+      if (inFlight) {
+        return
+      }
+
+      inFlight = true
+
+      try {
+        const response = await requestGateway<{ active?: Record<string, unknown>[] }>('delegation.status', {})
+
+        if (!cancelled) {
+          syncActiveDelegationSubagents(Array.isArray(response?.active) ? response.active : [])
+        }
+      } catch {
+        if (!cancelled) {
+          syncActiveDelegationSubagents([])
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    void refreshDelegationStatus()
+    const timer = window.setInterval(() => void refreshDelegationStatus(), 2500)
+
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [gatewayState, requestGateway])
+
   // Per-session approval bypass (same scope as the TUI's Shift+Tab). On a
   // new-chat draft (no runtime session yet) we arm locally; the session-create
   // path applies it once the backend session exists.
@@ -146,11 +193,11 @@ export function useStatusbarItems({
   // every session's subagents, never background system actions (gateway
   // restarts, toolset installs) which surface in their own panels.
   const { subagentsFailed, subagentsRunning } = useMemo(() => {
-    const lists = Object.values(subagentsBySession)
+    const subagents = allSubagents(subagentsBySession)
 
     return {
-      subagentsFailed: lists.reduce((sum, items) => sum + failedSubagentCount(items), 0),
-      subagentsRunning: lists.reduce((sum, items) => sum + activeSubagentCount(items), 0)
+      subagentsFailed: failedSubagentCount(subagents),
+      subagentsRunning: activeSubagentCount(subagents)
     }
   }, [subagentsBySession])
 
