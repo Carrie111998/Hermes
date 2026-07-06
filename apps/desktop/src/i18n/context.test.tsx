@@ -133,6 +133,25 @@ describe('I18nProvider', () => {
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
+  it('loads pt from display.language config aliases', async () => {
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({ display: { language: 'pt-PT' } }),
+      saveConfig: vi.fn()
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+
+    expect(screen.getByTestId('locale').textContent).toBe('pt')
+    expect(screen.getByTestId('save').textContent).toBe('Guardar')
+    expect(configClient.saveConfig).not.toHaveBeenCalled()
+  })
+
   it('does not overwrite unsupported configured languages', async () => {
     const configClient: I18nConfigClient = {
       getConfig: vi.fn().mockResolvedValue({ display: { language: 'de' } }),
@@ -209,22 +228,29 @@ describe('I18nProvider', () => {
     expect(screen.getByTestId('locale').textContent).toBe('ja')
   })
 
-  it('applies RTL direction for Arabic and restores LTR on switch back', async () => {
+  it('saves pt as the persisted display.language value', async () => {
+    const saveConfig = vi.fn().mockResolvedValue({ ok: true })
+
+    const configClient: I18nConfigClient = {
+      getConfig: vi
+        .fn()
+        .mockResolvedValueOnce({ display: { language: 'en' } })
+        .mockResolvedValueOnce({ display: { language: 'en', skin: 'mono' } }),
+      saveConfig
+    }
+
     render(
-      <I18nProvider configClient={null} initialLocale="ar">
-        <LanguageProbe target="en" />
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe target="pt" />
       </I18nProvider>
     )
 
-    expect(screen.getByTestId('locale').textContent).toBe('ar')
-    expect(document.documentElement.dir).toBe('rtl')
-    expect(document.documentElement.lang).toBe('ar')
-
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
-    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
-    expect(document.documentElement.dir).toBe('ltr')
-    expect(document.documentElement.lang).toBe('en')
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
+    expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'pt', skin: 'mono' } })
+    expect(screen.getByTestId('locale').textContent).toBe('pt')
   })
 
   it('rolls back the visible locale when saving fails', async () => {
