@@ -221,3 +221,26 @@ async def test_disconnect_cancels_pending_fffc_tasks(
     await adapter.disconnect()
 
     assert len(adapter._pending_fffc) == 0
+
+@pytest.mark.asyncio
+async def test_dispatch_reply_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    event = _dm_event("placeholder", msg_id="spc-reply-msg")
+    event["content"] = {
+        "type": "reply",
+        "content": {"type": "text", "text": "this can be archived"},
+        "targetMessageId": "bot-msg-123",
+        "targetDirection": "outbound",
+        "targetText": "DHL parcel notification",
+    }
+
+    await adapter._dispatch_inbound(event)
+
+    assert len(captured) == 1
+    message = captured[0]
+    assert message.text == "this can be archived"
+    assert message.reply_to_message_id == "bot-msg-123"
+    assert message.reply_to_text == "DHL parcel notification"
+    assert message.reply_to_is_own_message is True
