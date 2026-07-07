@@ -1037,23 +1037,6 @@ def render_widget_html(settings: CanarySettings) -> str:
                 ].some(name => params.has(name)) || hasTestMarkerInUrl(document.referrer || '');
               }
 
-              function openExternalLink(value) {
-                const href = safeUrl(value);
-                if (!href) return false;
-                try {
-                  const opened = window.open(href, '_blank', 'noopener,noreferrer');
-                  if (opened) return true;
-                } catch {}
-                try {
-                  if (window.top && window.top !== window) {
-                    window.top.location.href = href;
-                    return true;
-                  }
-                } catch {}
-                window.location.href = href;
-                return true;
-              }
-
               function renderInlineMarkdown(value) {
                 let html = escapeHtml(value);
                 const links = [];
@@ -1061,14 +1044,14 @@ def render_widget_html(settings: CanarySettings) -> str:
                   const href = safeUrl(url);
                   if (!href) return label;
                   const token = `@@SKYAI_LINK_${links.length}@@`;
-                  links.push([token, `<a href="${href}" target="_blank" rel="noopener noreferrer">${label}</a>`]);
+                  links.push([token, `<a href="${href}" target="_top" rel="noopener noreferrer">${label}</a>`]);
                   return token;
                 });
                 html = html.replace(/(^|\\s)(https:\\/\\/[^\\s<]+)(?=$|\\s)/g, (_match, prefix, url) => {
                   const href = safeUrl(url.replace(/[.,;:!?)]$/, ''));
                   if (!href) return `${prefix}${url}`;
                   const suffix = url.slice(href.length);
-                  return `${prefix}<a href="${href}" target="_blank" rel="noopener noreferrer">${href}</a>${suffix}`;
+                  return `${prefix}<a href="${href}" target="_top" rel="noopener noreferrer">${href}</a>${suffix}`;
                 });
                 html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
                 links.forEach(([token, link]) => {
@@ -1188,7 +1171,7 @@ def render_widget_html(settings: CanarySettings) -> str:
                   link.className = 'card';
                   if (card.url) {
                     link.href = card.url;
-                    link.target = '_blank';
+                    link.target = '_top';
                     link.rel = 'noopener noreferrer';
                   }
                   const image = document.createElement('img');
@@ -1241,8 +1224,8 @@ def render_widget_html(settings: CanarySettings) -> str:
                 if (!anchor) return;
                 const href = safeUrl(anchor.href);
                 if (!href) return;
-                event.preventDefault();
-                openExternalLink(href);
+                anchor.target = '_top';
+                anchor.rel = 'noopener noreferrer';
               });
 
               async function sendMessage(message) {

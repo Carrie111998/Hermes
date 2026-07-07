@@ -518,10 +518,10 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "escapeHtml" in html
     assert "message__heading" in html
     assert "line.match(/^#{1,4}" in html
-    assert "function openExternalLink" in html
     assert "document.addEventListener('click'" in html
-    assert "window.open(href, '_blank'" in html
-    assert "window.top.location.href = href" in html
+    assert 'target="_top"' in html
+    assert "anchor.target = '_top'" in html
+    assert "window.location.href = href" not in html
     assert "function isTestSession" in html
     assert "is_test: isTestSession() ? '1' : ''" in html
 
