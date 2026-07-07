@@ -7,6 +7,7 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  deleteSession,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -409,5 +410,17 @@ describe('Hermes REST helpers', () => {
         path: '/api/model/options?refresh=1&include_unconfigured=1'
       })
     )
+  })
+
+  it('tags session deletes for Electron routing and backend profile lookup', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await deleteSession('session-1', 'default')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/sessions/session-1?profile=default',
+      profile: 'default',
+      method: 'DELETE'
+    })
   })
 })
