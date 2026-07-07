@@ -22,7 +22,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Awaitable, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from plugins.skyai_customer import public_tools, voice_contract
@@ -282,6 +282,9 @@ def classify_discord_conversation(
     if re.search(r"(^|[-_])(?:test|qa|smoke|compare|canary|preview|dev)(?:[-_]|$)", conversation, re.I):
         return {"kind": "test", "badge": "🧪 TEST", "reason": "conversation_id"}
 
+    if _has_test_url_marker(payload, metadata):
+        return {"kind": "test", "badge": "🧪 TEST", "reason": "url_marker"}
+
     hosts = _payload_hosts(payload, metadata)
     if any(_is_test_host(host) for host in hosts):
         return {"kind": "test", "badge": "🧪 TEST", "reason": "dev_or_preview_host"}
@@ -359,6 +362,29 @@ def _payload_hosts(payload: dict[str, Any], metadata: dict[str, Any]) -> list[st
             if host and host not in hosts:
                 hosts.append(host)
     return hosts
+
+
+def _has_test_url_marker(payload: dict[str, Any], metadata: dict[str, Any]) -> bool:
+    marker_names = {
+        "codex_prod_v2_cutover",
+        "codex_smoke",
+        "skyai_qa",
+        "skyai_smoke",
+        "skyai_test",
+        "skyai_v2_test",
+    }
+    for source in (payload, metadata):
+        if not isinstance(source, dict):
+            continue
+        for key in ("origin", "host", "page_referrer", "referer", "referrer", "url"):
+            value = source.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            parsed = urlparse(value.strip() if "://" in value else f"//{value.strip()}")
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            if any(name in query for name in marker_names):
+                return True
+    return False
 
 
 def _is_test_host(host: str) -> bool:

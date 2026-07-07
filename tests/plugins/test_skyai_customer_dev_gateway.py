@@ -754,6 +754,23 @@ def test_classify_discord_conversation_keeps_skyvision_prod_real() -> None:
     assert result["kind"] == "real"
 
 
+def test_classify_discord_conversation_marks_prod_referrer_with_test_marker() -> None:
+    result = dev_gateway.classify_discord_conversation(
+        {
+            "conversation_id": "skyvision1-chat-mqzho5p8-g1zcay",
+            "metadata": {
+                "surface": "widget_chatkit_dev",
+                "page_referrer": "https://skyvision.bg/?codex_prod_v2_cutover=20260707",
+            },
+        },
+        "skyvision1-chat-mqzho5p8-g1zcay",
+    )
+
+    assert result["kind"] == "test"
+    assert result["badge"] == "🧪 TEST"
+    assert result["reason"] == "url_marker"
+
+
 def test_format_discord_mirror_message_marks_test_conversations() -> None:
     message = dev_gateway.format_discord_mirror_message(
         {
