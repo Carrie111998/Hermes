@@ -972,11 +972,14 @@ def render_widget_html(settings: CanarySettings) -> str:
             (() => {
               const params = new URLSearchParams(window.location.search);
               const metaVersion = document.querySelector('meta[name="skyvision-clean-dev-version"]').content;
+              const transcriptStoragePrefix = 'skyai-widget-transcript:';
+              const maxPersistedTranscriptItems = 40;
               const state = {
                 conversationId: params.get('conversation_id') || `skyvision-hermes-${Date.now().toString(36)}`,
                 busy: false,
                 listening: false,
                 turns: [],
+                transcriptItems: [],
                 voiceSupported: false,
                 voiceHadError: false,
               };
@@ -1007,6 +1010,66 @@ def render_widget_html(settings: CanarySettings) -> str:
               function safeUrl(value) {
                 const url = String(value || '').trim();
                 return /^https:\\/\\//i.test(url) ? url : '';
+              }
+
+              function transcriptStorageKey() {
+                return `${transcriptStoragePrefix}${state.conversationId}`;
+              }
+
+              function sanitizeCardForStorage(card) {
+                if (!card || !card.title) return null;
+                const sanitized = {
+                  title: String(card.title || '').slice(0, 220),
+                  url: safeUrl(card.url || ''),
+                  image_url: safeUrl(card.image_url || card.image || ''),
+                  location: String(card.location || '').slice(0, 180),
+                  duration: String(card.duration || '').slice(0, 120),
+                  price_text: String(card.price_text || '').slice(0, 80),
+                  price_eur: card.price_eur || '',
+                };
+                return sanitized.title ? sanitized : null;
+              }
+
+              function persistTranscript() {
+                try {
+                  const payload = {
+                    conversationId: state.conversationId,
+                    turns: state.turns.slice(-8),
+                    items: state.transcriptItems.slice(-maxPersistedTranscriptItems),
+                    savedAt: new Date().toISOString(),
+                  };
+                  window.localStorage.setItem(transcriptStorageKey(), JSON.stringify(payload));
+                } catch {
+                  // Storage may be blocked; the live chat should keep working.
+                }
+              }
+
+              function restoreTranscript() {
+                try {
+                  const raw = window.localStorage.getItem(transcriptStorageKey());
+                  if (!raw) return false;
+                  const payload = JSON.parse(raw);
+                  if (!payload || payload.conversationId !== state.conversationId) return false;
+                  if (Array.isArray(payload.turns)) {
+                    state.turns = payload.turns
+                      .filter(turn => turn && ['user', 'assistant'].includes(turn.role) && turn.content)
+                      .slice(-8)
+                      .map(turn => ({ role: turn.role, content: String(turn.content).slice(0, 900) }));
+                  }
+                  if (!Array.isArray(payload.items)) return false;
+                  state.transcriptItems = payload.items.slice(-maxPersistedTranscriptItems);
+                  state.transcriptItems.forEach(item => {
+                    if (!item || !item.type) return;
+                    if (item.type === 'message' && item.role && item.text) {
+                      appendMessage(item.role, item.text, { persist: false });
+                    } else if (item.type === 'cards' && Array.isArray(item.cards)) {
+                      appendCards(item.cards, { persist: false });
+                    }
+                  });
+                  return elements.messages.childElementCount > 0;
+                } catch {
+                  return false;
+                }
               }
 
               function hasTestMarkerInUrl(value) {
@@ -1106,7 +1169,7 @@ def render_widget_html(settings: CanarySettings) -> str:
                 return output.join('');
               }
 
-              function appendMessage(role, text) {
+              function appendMessage(role, text, options = {}) {
                 const node = document.createElement('div');
                 node.className = `message message--${role}`;
                 if (role === 'assistant') {
@@ -1117,6 +1180,15 @@ def render_widget_html(settings: CanarySettings) -> str:
                 }
                 elements.messages.appendChild(node);
                 elements.messages.scrollTop = elements.messages.scrollHeight;
+                if (options.persist !== false && ['user', 'assistant', 'error'].includes(role)) {
+                  state.transcriptItems.push({
+                    type: 'message',
+                    role,
+                    text: String(text || '').slice(0, 4000),
+                  });
+                  state.transcriptItems = state.transcriptItems.slice(-maxPersistedTranscriptItems);
+                  persistTranscript();
+                }
                 return node;
               }
 
@@ -1146,6 +1218,7 @@ def render_widget_html(settings: CanarySettings) -> str:
                 if (!text || !['user', 'assistant'].includes(role)) return;
                 state.turns.push({ role, content: text.slice(0, 900) });
                 state.turns = state.turns.slice(-8);
+                persistTranscript();
               }
 
               function appendTrace(response) {
@@ -1161,10 +1234,11 @@ def render_widget_html(settings: CanarySettings) -> str:
                 elements.messages.appendChild(node);
               }
 
-              function appendCards(cards) {
+              function appendCards(cards, options = {}) {
                 if (!Array.isArray(cards) || cards.length === 0) return;
                 const list = document.createElement('div');
                 list.className = 'cards';
+                const persistedCards = [];
                 cards.forEach(card => {
                   if (!card || !card.title) return;
                   const link = document.createElement(card.url ? 'a' : 'article');
@@ -1196,10 +1270,20 @@ def render_widget_html(settings: CanarySettings) -> str:
                   link.appendChild(image);
                   link.appendChild(body);
                   list.appendChild(link);
+                  const persistedCard = sanitizeCardForStorage(card);
+                  if (persistedCard) persistedCards.push(persistedCard);
                 });
                 if (list.childElementCount > 0) {
                   elements.messages.appendChild(list);
                   elements.messages.scrollTop = elements.messages.scrollHeight;
+                  if (options.persist !== false && persistedCards.length > 0) {
+                    state.transcriptItems.push({
+                      type: 'cards',
+                      cards: persistedCards.slice(0, 8),
+                    });
+                    state.transcriptItems = state.transcriptItems.slice(-maxPersistedTranscriptItems);
+                    persistTranscript();
+                  }
                 }
               }
 
@@ -1451,10 +1535,12 @@ def render_widget_html(settings: CanarySettings) -> str:
                 }
               });
 
-              appendMessage(
-                'assistant',
-                'Здравей! Аз съм SkyAI, асистентът на SkyVision. Мога да ти помогна да избереш преживяване, да проверим свободни часове, да се ориентираш с ваучер или резервация, или просто да намерим добър подарък. Какво търсиш днес?'
-              );
+              if (!restoreTranscript()) {
+                appendMessage(
+                  'assistant',
+                  'Здравей! Аз съм SkyAI, асистентът на SkyVision. Мога да ти помогна да избереш преживяване, да проверим свободни часове, да се ориентираш с ваучер или резервация, или просто да намерим добър подарък. Какво търсиш днес?'
+                );
+              }
               setupVoiceInput();
               void loadVersion();
               elements.input.focus();

@@ -512,6 +512,11 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "message--typing" in html
     assert "card__image" in html
     assert "appendCards(payload.cards)" in html
+    assert "skyai-widget-transcript:" in html
+    assert "function persistTranscript" in html
+    assert "function restoreTranscript" in html
+    assert "appendMessage(item.role, item.text, { persist: false })" in html
+    assert "appendCards(item.cards, { persist: false })" in html
     assert "renderAssistantMarkdown" in html
     assert "message--rich" in html
     assert "node.innerHTML = renderAssistantMarkdown(text)" in html
