@@ -1,16 +1,18 @@
 """Tests for GNU long-option abbreviation bypass in DANGEROUS_PATTERNS.
 
 GNU tools accept unique long-option prefix abbreviations at runtime
-(e.g. ``chown --recur`` resolves to ``chown --recursive``). Two approval
-patterns matched only the full flag name and could be evaded by passing a
-valid abbreviation:
+(e.g. ``chown --recur`` resolves to ``chown --recursive``). Several approval
+patterns matched only the full flag name or missed long-form force flags and
+could be evaded by passing a valid abbreviation:
 
-  chown    --recursive  →  --recur[a-z]*
-  git push --force      →  --forc[a-z]*
+  chown     --recursive  →  --recur[a-z]*
+  git push  --force      →  --forc[a-z]*
+  git reset --hard       →  --ha[a-z]*
+  git clean --force      →  --forc[a-z]*
 
 The other long-flag patterns (rm/chmod/sed) were already covered on every
 abbreviation by sibling short-flag / target patterns, so this file only
-asserts the two gaps that were genuinely open plus the relevant regression
+asserts the gaps that were genuinely open plus the relevant regression
 guards.
 """
 
@@ -63,6 +65,48 @@ class TestGitPushForceLongOptionAbbreviation:
         dangerous, _, _ = detect_dangerous_command(
             "git push --set-upstream origin feature"
         )
+        assert dangerous is False
+
+
+class TestGitResetHardLongOptionAbbreviation:
+    """git reset --ha* abbreviations must be caught."""
+
+    def test_git_reset_hard_full_still_detected(self):
+        dangerous, _, desc = detect_dangerous_command("git reset --hard HEAD")
+        assert dangerous is True
+        assert "reset" in desc.lower() or "hard" in desc.lower()
+
+    def test_git_reset_har_detected(self):
+        dangerous, _, _ = detect_dangerous_command("git reset --har HEAD~3")
+        assert dangerous is True
+
+    def test_git_reset_ha_detected(self):
+        dangerous, _, _ = detect_dangerous_command("git reset --ha HEAD")
+        assert dangerous is True
+
+    def test_git_reset_soft_not_flagged(self):
+        dangerous, _, _ = detect_dangerous_command("git reset --soft HEAD")
+        assert dangerous is False
+
+
+class TestGitCleanForceLongOptionAbbreviation:
+    """git clean --forc* abbreviations must be caught."""
+
+    def test_git_clean_short_f_still_detected(self):
+        dangerous, _, desc = detect_dangerous_command("git clean -f .")
+        assert dangerous is True
+        assert "clean" in desc.lower() or "force" in desc.lower()
+
+    def test_git_clean_force_long_detected(self):
+        dangerous, _, _ = detect_dangerous_command("git clean --force .")
+        assert dangerous is True
+
+    def test_git_clean_forc_abbrev_detected(self):
+        dangerous, _, _ = detect_dangerous_command("git clean --forc /repo")
+        assert dangerous is True
+
+    def test_git_clean_dry_run_not_flagged(self):
+        dangerous, _, _ = detect_dangerous_command("git clean -n .")
         assert dangerous is False
 
 
