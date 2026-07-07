@@ -884,6 +884,152 @@ async def test_mirror_to_discord_skips_when_disabled(tmp_path: Path) -> None:
     assert result == {"status": "skipped", "reason": "disabled"}
 
 
+def test_format_voice_discord_mirror_message_marks_dev_voice_as_test() -> None:
+    message = dev_gateway.format_voice_discord_mirror_message(
+        {
+            "call_id": "call-voice-1",
+            "conversation_id": "voice-c1",
+            "transcript": "Искам оператор.",
+            "caller_id": "+35970020200",
+            "did": "+35924259795",
+            "pbx_extension": "399",
+            "language": "bg-BG",
+            "source": "zycoo-coovox-u20",
+            "stt_confidence": 0.96,
+        },
+        {
+            "status": "ok",
+            "version": "v-test",
+            "contract_version": "skyai-voice-contract.v0.1",
+            "call_id": "call-voice-1",
+            "conversation_id": "voice-c1",
+            "action": "transfer_to_human",
+            "spoken_reply": "Свързвам Ви с оператор.",
+            "display_reply": "Caller requested handoff.",
+            "transfer": {"target": "operator_queue", "reason": "caller_requested_human"},
+            "end_call": False,
+            "trace": {
+                "runtime": "skyai_voice_adapter",
+                "backend_target": "skyai_v2_chatkit",
+                "raw_audio_stored": False,
+            },
+        },
+        stage="turn",
+    )
+
+    assert message.startswith("**🎙️ 🧪 TEST / QA Voice разговор**")
+    assert "**Клиент / STT**" in message
+    assert "Искам оператор." in message
+    assert "**SkyAI / spoken**" in message
+    assert "Свързвам Ви с оператор." in message
+    assert "pbx_extension=399" in message
+    assert "stage=turn" in message
+    assert "action=transfer_to_human" in message
+    assert "origin_class=test" in message
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_name_marks_voice_threads(tmp_path: Path, monkeypatch) -> None:
+    starter_messages: list[str] = []
+    created_names: list[str] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        starter_messages.append(content)
+        return {"id": "starter-message"}
+
+    def fake_start_thread(channel_id: str, message_id: str, token: str, name: str) -> dict[str, str]:
+        created_names.append(name)
+        return {"id": "voice-thread-1"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+    monkeypatch.setattr(dev_gateway, "_discord_start_thread_from_message", fake_start_thread)
+
+    thread_id = await dev_gateway._discord_target_channel_id(
+        settings=settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_create_threads=True,
+            discord_mirror_thread_store=tmp_path / "threads.json",
+        ),
+        conversation_id="voice-call-123",
+        request_payload={"pbx_extension": "399"},
+        surface="voice",
+    )
+
+    assert thread_id == "voice-thread-1"
+    assert starter_messages == ["🧪 TEST 🎙️ Voice SkyAI разговор `voice-call-123`"]
+    assert created_names == ["🧪 TEST · 🎙️ Voice SkyAI · voice-call-123"]
+
+
+@pytest.mark.asyncio
+async def test_mirror_voice_to_discord_skips_when_disabled(tmp_path: Path) -> None:
+    result = await dev_gateway.mirror_voice_to_discord(
+        {"call_id": "call-voice", "transcript": "Здравейте"},
+        {
+            "status": "ok",
+            "version": "v-test",
+            "call_id": "call-voice",
+            "conversation_id": "voice-call",
+            "action": "speak",
+            "spoken_reply": "Здравейте.",
+            "display_reply": "Здравейте.",
+            "trace": {},
+        },
+        settings(tmp_path),
+        stage="turn",
+    )
+
+    assert result == {"status": "skipped", "reason": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_mirror_voice_to_discord_posts_to_configured_channel(tmp_path: Path, monkeypatch) -> None:
+    posted: list[tuple[str, str]] = []
+
+    def fake_post_message(channel_id: str, token: str, content: str) -> dict[str, str]:
+        posted.append((channel_id, content))
+        return {"id": "voice-message-1"}
+
+    monkeypatch.setattr(dev_gateway, "_discord_post_message", fake_post_message)
+
+    result = await dev_gateway.mirror_voice_to_discord(
+        {
+            "call_id": "call-voice",
+            "conversation_id": "voice-call",
+            "transcript": "Имате ли свободни часове?",
+            "pbx_extension": "399",
+        },
+        {
+            "status": "ok",
+            "version": "v-test",
+            "call_id": "call-voice",
+            "conversation_id": "voice-call",
+            "action": "speak",
+            "spoken_reply": "Да, проверявам свободните часове.",
+            "display_reply": "Да, проверявам свободните часове.",
+            "trace": {"raw_audio_stored": False},
+        },
+        settings(
+            tmp_path,
+            discord_mirror_enabled=True,
+            discord_mirror_bot_token="token",
+            discord_mirror_channel_id="1510888721614901358",
+            discord_mirror_create_threads=False,
+        ),
+        stage="turn",
+    )
+
+    assert result == {
+        "status": "posted",
+        "channel_id": "1510888721614901358",
+        "message_id": "voice-message-1",
+    }
+    assert posted[0][0] == "1510888721614901358"
+    assert posted[0][1].startswith("**🎙️ 🧪 TEST / QA Voice разговор**")
+
+
 @pytest.mark.asyncio
 async def test_build_compare_response_runs_dev_and_prod_sides(tmp_path: Path) -> None:
     async def fake_runner(message, history, conversation_id, canary_settings):

@@ -48,6 +48,7 @@ DISCORD_API_BASE_URL = "https://discord.com/api/v10"
 DISCORD_MESSAGE_LIMIT = 1900
 DISCORD_THREAD_NAME_LIMIT = 100
 DISCORD_TEST_THREAD_PREFIX = "🧪 TEST · "
+DISCORD_VOICE_THREAD_PREFIX = "🎙️ Voice SkyAI · "
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
 BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
@@ -294,11 +295,52 @@ def classify_discord_conversation(
     return {"kind": "unknown", "badge": "", "reason": "no_test_signal"}
 
 
-def discord_thread_name(conversation_id: str, origin: dict[str, str] | None = None) -> str:
-    base = f"SkyAI v2 · {conversation_id[:36]}"
+def discord_thread_name(
+    conversation_id: str,
+    origin: dict[str, str] | None = None,
+    *,
+    surface: str = "chat",
+) -> str:
+    if surface == "voice":
+        base = f"{DISCORD_VOICE_THREAD_PREFIX}{conversation_id[:34]}"
+    else:
+        base = f"SkyAI v2 · {conversation_id[:36]}"
     if origin and origin.get("kind") == "test":
         return _truncate_thread_name(f"{DISCORD_TEST_THREAD_PREFIX}{base}")
     return _truncate_thread_name(base)
+
+
+def classify_voice_discord_conversation(
+    payload: dict[str, Any],
+    conversation_id: str = "",
+) -> dict[str, str]:
+    """Classify voice mirror visibility without affecting model reasoning.
+
+    Voice is still in DEV testing. Treat it as QA by default unless the
+    gateway explicitly marks the call as real/customer. This keeps test calls
+    obvious in Discord before the thread is opened, while leaving a clean
+    explicit escape hatch for a future production voice route.
+    """
+
+    origin = classify_discord_conversation(payload, conversation_id)
+    if origin.get("kind") in {"test", "real"}:
+        return origin
+
+    metadata = _payload_metadata(payload)
+    explicit = _first_string_value(
+        payload,
+        metadata,
+        "origin_class",
+        "conversation_origin",
+        "conversation_kind",
+    ).lower()
+    if explicit in {"real", "prod", "production", "customer"}:
+        return {"kind": "real", "badge": "", "reason": f"explicit:{explicit}"}
+
+    pbx_extension = _first_string_value(payload, metadata, "pbx_extension", "extension")
+    if pbx_extension == "399":
+        return {"kind": "test", "badge": "🧪 TEST", "reason": "dev_voice_extension_399"}
+    return {"kind": "test", "badge": "🧪 TEST", "reason": "voice_dev_default"}
 
 
 def _truncate_thread_name(value: str) -> str:
@@ -2207,6 +2249,69 @@ def format_discord_mirror_message(
     return _truncate_for_discord(content)
 
 
+def format_voice_discord_mirror_message(
+    request_payload: dict[str, Any],
+    response: dict[str, Any],
+    *,
+    stage: str = "turn",
+    label: str = "Voice SkyAI",
+) -> str:
+    conversation_id = str(
+        response.get("conversation_id") or voice_conversation_id_from_payload(request_payload)
+    )
+    call_id = str(response.get("call_id") or voice_call_id_from_payload(request_payload))
+    origin = classify_voice_discord_conversation(request_payload, conversation_id)
+    trace = response.get("trace") if isinstance(response.get("trace"), dict) else {}
+    transfer = response.get("transfer") if isinstance(response.get("transfer"), dict) else {}
+    transcript = extract_voice_transcript(request_payload)
+    spoken_reply = str(response.get("spoken_reply") or "").strip()
+    display_reply = str(response.get("display_reply") or spoken_reply or "").strip()
+    metadata_line = _voice_discord_metadata_line(request_payload, response, trace)
+    service_line = (
+        f"status={response.get('status')} · version={response.get('version')} · "
+        f"stage={stage} · action={response.get('action')} · "
+        f"transfer_target={transfer.get('target') or response.get('target')} · "
+        f"transfer_reason={transfer.get('reason') or response.get('transfer_reason')} · "
+        f"backend={trace.get('voice_backend_target') or trace.get('backend_target')} · "
+        f"stt_confidence={trace.get('stt_confidence') if trace.get('stt_confidence') is not None else request_payload.get('stt_confidence')} · "
+        f"latency_ms={trace.get('voice_backend_latency_ms')} · "
+        f"raw_audio_stored={trace.get('raw_audio_stored')} · origin_class={origin.get('kind')} · "
+        f"origin_reason={origin.get('reason')}"
+    )
+    origin_header = f"**🎙️ {origin['badge']} / QA Voice разговор**\n" if origin.get("kind") == "test" else "**🎙️ Voice SkyAI разговор**\n"
+    content = (
+        f"{origin_header}"
+        f"**{label} · {conversation_id}**\n"
+        f"**Call**\n`call_id={call_id} · {metadata_line}`\n\n"
+        f"**Клиент / STT**\n{transcript or '(няма transcript)'}\n\n"
+        f"**SkyAI / spoken**\n{spoken_reply or '(няма spoken reply)'}\n\n"
+        f"**SkyAI / display**\n{display_reply or '(няма display reply)'}\n\n"
+        f"**Служебно**\n`{service_line}`"
+    )
+    return _truncate_for_discord(content)
+
+
+def _voice_discord_metadata_line(
+    request_payload: dict[str, Any],
+    response: dict[str, Any],
+    trace: dict[str, Any],
+) -> str:
+    metadata = _payload_metadata(request_payload)
+    parts = {
+        "caller_id": _first_string_value(request_payload, metadata, "caller_id"),
+        "did": _first_string_value(request_payload, metadata, "did"),
+        "pbx_extension": _first_string_value(request_payload, metadata, "pbx_extension"),
+        "department": _first_string_value(request_payload, metadata, "department"),
+        "language": _first_string_value(request_payload, metadata, "language"),
+        "source": _first_string_value(request_payload, metadata, "source"),
+        "turn_index": str(request_payload.get("turn_index") or "").strip(),
+        "end_call": str(response.get("end_call")).lower(),
+        "contract": str(response.get("contract_version") or trace.get("contract_version") or "").strip(),
+    }
+    rendered = [f"{key}={value}" for key, value in parts.items() if value not in ("", "none")]
+    return " · ".join(rendered) or "metadata=empty"
+
+
 def _truncate_for_discord(value: str, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
     if len(value) <= limit:
         return value
@@ -2244,11 +2349,49 @@ async def mirror_to_discord(
     }
 
 
+async def mirror_voice_to_discord(
+    request_payload: dict[str, Any],
+    response: dict[str, Any],
+    settings: CanarySettings,
+    *,
+    stage: str,
+) -> dict[str, Any]:
+    if not settings.discord_mirror_enabled:
+        return {"status": "skipped", "reason": "disabled"}
+    if not settings.discord_mirror_bot_token or not settings.discord_mirror_channel_id:
+        return {"status": "skipped", "reason": "missing_token_or_channel"}
+    content = format_voice_discord_mirror_message(request_payload, response, stage=stage)
+    try:
+        target_channel_id = await _discord_target_channel_id(
+            settings=settings,
+            conversation_id=str(
+                response.get("conversation_id")
+                or voice_conversation_id_from_payload(request_payload)
+            ),
+            request_payload=request_payload,
+            surface="voice",
+        )
+        posted = await asyncio.to_thread(
+            _discord_post_message,
+            target_channel_id,
+            settings.discord_mirror_bot_token,
+            content,
+        )
+    except Exception as exc:  # pragma: no cover - defensive network guard
+        return {"status": "error", "reason": sanitize_runtime_error(exc)}
+    return {
+        "status": "posted",
+        "channel_id": target_channel_id,
+        "message_id": str(posted.get("id") or ""),
+    }
+
+
 async def _discord_target_channel_id(
     *,
     settings: CanarySettings,
     conversation_id: str,
     request_payload: dict[str, Any] | None = None,
+    surface: str = "chat",
 ) -> str:
     if not settings.discord_mirror_create_threads:
         return settings.discord_mirror_channel_id
@@ -2256,16 +2399,22 @@ async def _discord_target_channel_id(
         settings.profile_home / "skyai_v2" / "discord_threads.json"
     )
     mapping = _load_thread_mapping(store_path)
-    if conversation_id in mapping:
-        return mapping[conversation_id]
+    mapping_key = conversation_id if surface == "chat" else f"{surface}:{conversation_id}"
+    if mapping_key in mapping:
+        return mapping[mapping_key]
 
-    origin = classify_discord_conversation(request_payload or {}, conversation_id)
+    if surface == "voice":
+        origin = classify_voice_discord_conversation(request_payload or {}, conversation_id)
+        starter_label = "🎙️ Voice SkyAI разговор"
+    else:
+        origin = classify_discord_conversation(request_payload or {}, conversation_id)
+        starter_label = "SkyAI v2 разговор"
     starter_prefix = f"{origin['badge']} " if origin.get("kind") == "test" else ""
     starter = await asyncio.to_thread(
         _discord_post_message,
         settings.discord_mirror_channel_id,
         settings.discord_mirror_bot_token,
-        f"{starter_prefix}SkyAI v2 разговор `{conversation_id}`",
+        f"{starter_prefix}{starter_label} `{conversation_id}`",
     )
     message_id = str(starter.get("id") or "")
     if not message_id:
@@ -2275,11 +2424,11 @@ async def _discord_target_channel_id(
         settings.discord_mirror_channel_id,
         message_id,
         settings.discord_mirror_bot_token,
-        discord_thread_name(conversation_id, origin),
+        discord_thread_name(conversation_id, origin, surface=surface),
     )
     thread_id = str(thread.get("id") or "")
     if thread_id:
-        mapping[conversation_id] = thread_id
+        mapping[mapping_key] = thread_id
         _write_thread_mapping(store_path, mapping)
         return thread_id
     return settings.discord_mirror_channel_id
@@ -2546,6 +2695,9 @@ def create_app(
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
         response = await build_voice_start_response(payload, settings)
+        mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="start")
+        if isinstance(response.get("trace"), dict):
+            response["trace"]["discord_mirror"] = mirror_status
         return web.json_response(response)
 
     async def voice_turn(request: "web.Request") -> "web.Response":
@@ -2569,6 +2721,9 @@ def create_app(
                 },
                 status=502,
             )
+        mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="turn")
+        if isinstance(response.get("trace"), dict):
+            response["trace"]["discord_mirror"] = mirror_status
         status = 200 if response.get("status") == "ok" else 503
         return web.json_response(response, status=status)
 
@@ -2582,6 +2737,9 @@ def create_app(
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
         response = await build_voice_event_response(payload, settings)
+        mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="event")
+        if isinstance(response.get("trace"), dict):
+            response["trace"]["discord_mirror"] = mirror_status
         return web.json_response(response)
 
     async def voice_end(request: "web.Request") -> "web.Response":
@@ -2594,6 +2752,9 @@ def create_app(
         if not isinstance(payload, dict):
             return web.json_response({"status": "error", "error": "invalid_payload"}, status=400)
         response = await build_voice_end_response(payload, settings)
+        mirror_status = await mirror_voice_to_discord(payload, response, settings, stage="end")
+        if isinstance(response.get("trace"), dict):
+            response["trace"]["discord_mirror"] = mirror_status
         return web.json_response(response)
 
     app = web.Application(client_max_size=1_000_000)

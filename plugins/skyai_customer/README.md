@@ -133,3 +133,11 @@ Initial audio candidates are `gpt-4o-transcribe`,
 `gpt-4o-mini-transcribe`, `gpt-4o-mini-tts`, and the voice candidates
 documented in `docs/skyai-voice-contract-v0.1.md`. Realtime remains a later
 canary behind the same voice gateway contract.
+
+Voice calls are mirrored by the same DEV Discord sidecar when
+`SKYAI_DISCORD_MIRROR_ENABLED=true` and
+`SKYAI_DISCORD_MIRROR_CHANNEL_ID=1510888721614901358` are configured. The
+voice mirror is an operational side effect of `/voice/start`, `/voice/turn`,
+`/voice/event`, and `/voice/end`; it is not a model tool. DEV voice threads are
+marked with `🎙️` and `🧪 TEST` unless the gateway explicitly marks a future
+production call as real/customer.

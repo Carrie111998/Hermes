@@ -87,6 +87,11 @@ The Discord mirror and comparison endpoint are gateway sidecars, not model
 tools. The customer-facing Hermes model cannot call Discord, mutate PROD, or
 read internal reports.
 
+Voice sessions use the same Discord mirror sidecar and channel while the PBX
+MVP is in DEV. Voice threads are intentionally marked separately, for example
+`🧪 TEST · 🎙️ Voice SkyAI · <conversation_id>`, so web/FAB and voice evidence
+can live in `1510888721614901358` without being confused.
+
 ## Daily Upstream Sync Policy
 
 Run daily after fetching `NousResearch/hermes-agent`:

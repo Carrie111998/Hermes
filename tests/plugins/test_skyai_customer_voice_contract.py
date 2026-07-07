@@ -5,6 +5,7 @@ from pathlib import Path
 from plugins.skyai_customer import voice_audio, voice_contract
 from scripts import skyai_voice_contract_smoke
 from scripts import skyai_voice_openai_audio_preflight
+from scripts import skyai_voice_openai_audio_smoke
 
 
 VOICE_DOC_PATH = Path("docs/skyai-voice-contract-v0.1.md")
@@ -279,3 +280,65 @@ def test_openai_audio_preflight_cli_never_prints_secret(monkeypatch, capsys) -> 
     assert "api_key_configured=true" in output
     assert "VOICE_TOOLS_OPENAI_KEY" in output
     assert "sk-super-secret" not in output
+
+
+def test_openai_audio_live_smoke_blocks_without_key(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+
+    exit_code = skyai_voice_openai_audio_smoke.main(["--live-openai"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "SkyAI OpenAI audio live smoke: BLOCKED" in output
+    assert "missing_voice_tools_openai_key" in output
+
+
+def test_openai_audio_live_smoke_requires_explicit_live_flag(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-super-secret")
+
+    exit_code = skyai_voice_openai_audio_smoke.main([])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "live_openai_flag_required" in output
+    assert "sk-super-secret" not in output
+
+
+def test_openai_audio_live_smoke_calls_tts_then_stt_without_printing_secret(monkeypatch, capsys) -> None:
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, *, content: bytes = b"", payload: dict | None = None) -> None:
+            self.content = content
+            self._payload = payload or {}
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_post(url, **kwargs):
+        calls.append((url, kwargs))
+        if url.endswith("/audio/speech"):
+            return FakeResponse(content=b"fake-mp3-audio")
+        if url.endswith("/audio/transcriptions"):
+            return FakeResponse(payload={"text": "Здравейте, това е кратък тест на гласа на SkyAI."})
+        raise AssertionError(f"unexpected URL {url}")
+
+    monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-super-secret")
+    monkeypatch.setattr(skyai_voice_openai_audio_smoke.requests, "post", fake_post)
+
+    exit_code = skyai_voice_openai_audio_smoke.main(["--live-openai"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "SkyAI OpenAI audio live smoke: PASS" in output
+    assert "fake-mp3-audio" not in output
+    assert "sk-super-secret" not in output
+    assert calls[0][0].endswith("/audio/speech")
+    assert calls[0][1]["json"]["model"] == "gpt-4o-mini-tts"
+    assert calls[0][1]["json"]["voice"] == "marin"
+    assert calls[1][0].endswith("/audio/transcriptions")
+    assert calls[1][1]["data"]["model"] == "gpt-4o-transcribe"
+    assert calls[1][1]["data"]["language"] == "bg"

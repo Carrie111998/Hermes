@@ -186,6 +186,18 @@ python scripts/skyai_voice_openai_audio_preflight.py --require-key
 The preflight does not call OpenAI and never prints the key. It verifies that
 the audio layer is configured separately from the Hermes/OAuth reasoning lane.
 
+After the dedicated key is installed in the DEV gateway environment, run the
+billable live audio smoke explicitly:
+
+```bash
+python scripts/skyai_voice_openai_audio_smoke.py --live-openai --json
+```
+
+The live smoke sends one short Bulgarian text sample through TTS, feeds the
+generated audio back through STT, reports latency and transcript, and deletes
+the generated audio by default. It does not call SkyAI, PBX, SIP, RTP, Discord,
+Shopify, vouchers, orders, payments, or production traffic.
+
 ### OAuth through Pro account boundary
 
 Public OpenAI API docs describe API authentication through bearer API
@@ -462,5 +474,6 @@ python scripts/skyai_voice_openai_audio_preflight.py --require-key
 - Is call recording needed, and what consent text should be played?
 - What is the expected concurrent call target for MVP and for production?
 - Which operator queue should receive transfers outside office hours?
-- Should voice sessions be mirrored to the same SkyAI Discord channel, a
-  separate voice-monitor channel, or both?
+- Voice sessions mirror to the same SkyAI Discord channel for now:
+  `1510888721614901358`. Voice threads must be visibly marked with `🎙️`, and
+  DEV/QA calls must be visibly marked with `🧪 TEST`.
