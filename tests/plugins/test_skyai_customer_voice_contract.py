@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from plugins.skyai_customer import voice_contract
+from plugins.skyai_customer import voice_audio, voice_contract
 from scripts import skyai_voice_contract_smoke
+from scripts import skyai_voice_openai_audio_preflight
 
 
 VOICE_DOC_PATH = Path("docs/skyai-voice-contract-v0.1.md")
@@ -62,9 +63,72 @@ def test_voice_contract_documents_oauth_and_openai_api_boundary() -> None:
     assert lanes["mvp_codex_oauth_text"]["model_auth"] == "chatgpt_oauth_pro_via_codex"
     assert lanes["mvp_codex_oauth_text"]["audio_auth"] == "external_or_local_stt_tts_provider"
     assert "not assumed" in lanes["mvp_codex_oauth_text"]["note"]
+    assert (
+        lanes["hybrid_openai_api_audio_codex_oauth_reasoning"]["model_auth"]
+        == "chatgpt_oauth_pro_via_codex"
+    )
+    assert lanes["hybrid_openai_api_audio_codex_oauth_reasoning"]["audio_auth"] == "openai_api_key"
+    assert (
+        lanes["hybrid_openai_api_audio_codex_oauth_reasoning"]["key_env"]
+        == "VOICE_TOOLS_OPENAI_KEY"
+    )
     assert lanes["openai_realtime_api"]["model"] == "gpt-realtime-2"
     assert lanes["openai_realtime_api"]["transcription_model"] == "gpt-realtime-whisper"
     assert lanes["openai_realtime_api"]["auth"] == "openai_api_key_or_short_lived_access_token"
+
+
+def test_voice_audio_preflight_uses_dedicated_audio_key_without_printing_secret() -> None:
+    settings = voice_audio.load_voice_audio_settings(
+        {
+            "VOICE_TOOLS_OPENAI_KEY": "sk-secret-value",
+            "OPENAI_API_KEY": "sk-generic-should-not-be-used",
+        }
+    )
+
+    result = voice_audio.voice_audio_preflight(settings)
+
+    assert result["status"] == "pass"
+    assert result["reasoning_auth"] == "hermes_codex_oauth_pro"
+    assert result["audio_auth"] == "openai_api_key"
+    assert result["api_key"] == {
+        "configured": True,
+        "env": "VOICE_TOOLS_OPENAI_KEY",
+        "value_printed": False,
+    }
+    serialized = str(result)
+    assert "sk-secret-value" not in serialized
+    assert "sk-generic-should-not-be-used" not in serialized
+
+
+def test_voice_audio_preflight_blocks_without_audio_key() -> None:
+    settings = voice_audio.load_voice_audio_settings({"OPENAI_API_KEY": "sk-generic-only"})
+
+    result = voice_audio.voice_audio_preflight(settings)
+
+    assert result["status"] == "blocked"
+    assert result["api_key"]["configured"] is False
+    assert result["api_key"]["env"] == "VOICE_TOOLS_OPENAI_KEY"
+
+
+def test_voice_audio_preflight_declares_hybrid_models_and_gateway_latency_masking() -> None:
+    result = voice_audio.voice_audio_preflight(
+        voice_audio.load_voice_audio_settings(
+            {
+                "VOICE_TOOLS_OPENAI_KEY": "sk-test",
+                "SKYAI_VOICE_TTS_VOICE": "cedar",
+            }
+        )
+    )
+
+    assert result["provider_lane"] == "hybrid_openai_api_audio_codex_oauth_reasoning"
+    assert result["openai"]["stt_primary_model"] == "gpt-4o-transcribe"
+    assert result["openai"]["stt_fast_model"] == "gpt-4o-mini-transcribe"
+    assert result["openai"]["tts_model"] == "gpt-4o-mini-tts"
+    assert result["openai"]["tts_voice"] == "cedar"
+    assert result["openai"]["realtime_transcription_model"] == "gpt-realtime-whisper"
+    assert result["voice_gateway_contract"]["reasoning_path_unchanged"] is True
+    assert result["latency_masking"]["gateway_owned"] is True
+    assert result["latency_masking"]["first_filler_after_ms"] == 900
 
 
 def test_voice_privacy_defaults_are_safe_by_default() -> None:
@@ -111,7 +175,8 @@ def test_voice_contract_doc_documents_low_latency_and_oauth_tradeoffs() -> None:
     assert "ChatGPT Pro OAuth" in text
     assert "ChatGPT Pro OAuth is not a supported audio API auth path" in compact_text
     assert "OpenAI API billing" in text
-    assert "MVP without OpenAI API billing" in text
+    assert "Hybrid OpenAI API audio + Hermes/OAuth reasoning" in text
+    assert "VOICE_TOOLS_OPENAI_KEY" in text
 
 
 def test_voice_gate_registers_http_adapter_only_no_pbx_audio_stack() -> None:
@@ -201,3 +266,16 @@ def test_voice_contract_smoke_validates_canonical_response_shape() -> None:
     }
 
     assert skyai_voice_contract_smoke.validate_response(request, response) == []
+
+
+def test_openai_audio_preflight_cli_never_prints_secret(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-super-secret")
+
+    exit_code = skyai_voice_openai_audio_preflight.main([])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "SkyAI OpenAI audio preflight: PASS" in output
+    assert "api_key_configured=true" in output
+    assert "VOICE_TOOLS_OPENAI_KEY" in output
+    assert "sk-super-secret" not in output

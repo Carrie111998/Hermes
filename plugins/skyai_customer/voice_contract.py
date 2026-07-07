@@ -69,6 +69,15 @@ VOICE_PROVIDER_LANES: dict[str, dict[str, str]] = {
         "audio_auth": "external_or_local_stt_tts_provider",
         "note": "OpenAI public audio APIs are not assumed to accept ChatGPT Pro OAuth.",
     },
+    "hybrid_openai_api_audio_codex_oauth_reasoning": {
+        "purpose": "openai_api_stt_tts_with_existing_skyai_reasoning",
+        "model_auth": "chatgpt_oauth_pro_via_codex",
+        "audio_auth": "openai_api_key",
+        "stt_primary_model": "gpt-4o-transcribe",
+        "stt_fast_model": "gpt-4o-mini-transcribe",
+        "tts_model": "gpt-4o-mini-tts",
+        "key_env": "VOICE_TOOLS_OPENAI_KEY",
+    },
     "openai_realtime_api": {
         "purpose": "lowest_latency_speech_to_speech_candidate",
         "model": "gpt-realtime-2",

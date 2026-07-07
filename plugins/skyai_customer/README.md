@@ -112,3 +112,24 @@ python scripts/skyai_voice_contract_smoke.py \
   --token-env SKYAI_V2_CANARY_TOKEN \
   --backend-target skyai_v2_chatkit
 ```
+
+## DEV OpenAI Audio Preflight
+
+The approved voice MVP keeps SkyAI reasoning on the Hermes/Codex OAuth lane and
+uses OpenAI API only for STT/TTS in the media gateway. Configure the audio
+secret on the DEV gateway host only:
+
+```text
+VOICE_TOOLS_OPENAI_KEY
+```
+
+Then verify the non-secret setup without calling OpenAI or printing the key:
+
+```bash
+python scripts/skyai_voice_openai_audio_preflight.py --require-key
+```
+
+Initial audio candidates are `gpt-4o-transcribe`,
+`gpt-4o-mini-transcribe`, `gpt-4o-mini-tts`, and the voice candidates
+documented in `docs/skyai-voice-contract-v0.1.md`. Realtime remains a later
+canary behind the same voice gateway contract.

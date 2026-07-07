@@ -138,22 +138,67 @@ low latency, with `gpt-realtime-2` for low-latency voice agents and
 SIP as an option for telephony voice agents, but that path uses OpenAI API
 authentication and project/SIP configuration.
 
-### OAuth through Pro account
+### Hybrid OpenAI API audio + Hermes/OAuth reasoning
 
-Current SkyAI text generation can continue to use the existing Codex OAuth/Pro
-lane for MVP text replies.
+Approved MVP lane:
 
-However, public OpenAI API docs describe API authentication through bearer API
+```text
+PBX/SIP media gateway
+  -> OpenAI API STT
+  -> SkyAI /voice/turn
+  -> Hermes/Codex OAuth reasoning
+  -> OpenAI API TTS
+  -> RTP audio back to caller
+```
+
+SkyAI text generation continues to use the existing Codex OAuth/Pro lane for
+the business reply. STT/TTS use the OpenAI API through a dedicated DEV secret:
+
+```text
+VOICE_TOOLS_OPENAI_KEY
+```
+
+Do not reuse or print Codex OAuth material for audio. Do not commit this secret
+to the repo. Prefer storing it in GCP Secret Manager or the VM service
+environment for the DEV voice gateway only.
+
+Initial OpenAI audio model candidates:
+
+- STT primary: `gpt-4o-transcribe`;
+- STT fast/cost fallback: `gpt-4o-mini-transcribe`;
+- TTS: `gpt-4o-mini-tts`;
+- first voice candidates for Bulgarian QA: `marin`, with `alloy` as a known
+  compatibility fallback;
+- later realtime transcription: `gpt-realtime-whisper`.
+
+Run the DEV preflight before any live media call:
+
+```bash
+python scripts/skyai_voice_openai_audio_preflight.py --json
+```
+
+For deployment gates where the key must already be present:
+
+```bash
+python scripts/skyai_voice_openai_audio_preflight.py --require-key
+```
+
+The preflight does not call OpenAI and never prints the key. It verifies that
+the audio layer is configured separately from the Hermes/OAuth reasoning lane.
+
+### OAuth through Pro account boundary
+
+Public OpenAI API docs describe API authentication through bearer API
 keys or short-lived access tokens. ChatGPT Pro OAuth is not a supported audio
 API auth path in the public OpenAI API contract. Therefore:
 
-- MVP without OpenAI API billing can reuse Codex OAuth for the text reply only,
-  while STT/TTS must be local or from another provider;
+- Hybrid MVP can reuse Codex OAuth for the text reply only, while STT/TTS use
+  OpenAI API billing through the dedicated audio key;
 - the lowest-latency OpenAI Realtime/API path should be treated as a later
   explicit API-billing switch;
 - the Voice Gateway contract must keep provider choice pluggable so we can
-  switch from `mvp_codex_oauth_text` to `openai_realtime_api` without changing
-  PBX routing or SkyAI prompts.
+  switch from `hybrid_openai_api_audio_codex_oauth_reasoning` to
+  `openai_realtime_api` without changing PBX routing or SkyAI prompts.
 
 ## Required API Contract
 
@@ -327,6 +372,17 @@ Initial target to validate:
 This path is easier to build and can reuse the current SkyAI text lane, but it
 will not feel as fluid as a full realtime speech-to-speech model.
 
+To avoid dead air during slow model/tool turns, latency masking belongs to the
+media gateway, not the SkyAI reasoning prompt. The gateway may play short,
+non-semantic fillers after fixed timers, for example:
+
+- after ~900 ms: "Проверявам.";
+- after ~5500 ms: "Още секунда, почти съм готов.";
+- when a tool path is known: "Гледам свободните варианти."
+
+These fillers must not invent facts and must not replace the final SkyAI
+answer.
+
 ### Realtime lane
 
 For a more natural assistant, test a realtime lane:
@@ -392,6 +448,12 @@ with synthetic data and verifies canonical response fields, action values,
 flattened transfer compatibility fields, `raw_audio_stored=false`, and
 `end_call=true` on call end. It does not touch SIP, RTP, PBX, STT, TTS,
 customers, orders, vouchers, payments, Discord, or production traffic.
+
+Validate the OpenAI API audio setup separately:
+
+```bash
+python scripts/skyai_voice_openai_audio_preflight.py --require-key
+```
 
 ## Open Questions
 
