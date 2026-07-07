@@ -632,6 +632,28 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "1 месец" in result["vouchers"]["merge_two_vouchers_into_one"]["result"]
     assert "грешна опция" in result["vouchers"]["wrong_reservation_or_split_residual_repair"]
     assert "Сторно/рефънд" in result["vouchers"]["refund_and_cancellation"]
+    email_learning = result["email_case_learning"]
+    assert email_learning["source"] == "customer_safe_email_case_learning_2025-07-07_to_2026-07-07"
+    assert email_learning["scale"]["human_operational_case_records"] == 6979
+    assert email_learning["scale"]["grouped_cases"] == 3099
+    assert email_learning["privacy"].startswith("Обобщено обучение")
+    learned_intents = {item["intent"] for item in email_learning["frequent_customer_intents"]}
+    assert learned_intents == {
+        "checkout_payment_problem",
+        "courier_delivery_details",
+        "post_experience_media",
+        "provider_unreachable",
+        "refund_cancellation_return",
+        "reservation_status",
+        "voucher_help",
+    }
+    refund_intent = next(
+        item for item in email_learning["frequent_customer_intents"] if item["intent"] == "refund_cancellation_return"
+    )
+    assert "минимален контекст" in refund_intent["support_posture"]
+    assert "има/няма резервация" in email_learning["state_reasoning"][0]
+    assert "пълен ваучерен код" in email_learning["operator_handoff"]["do_not_request_in_public_chat"]
+    assert "номер на ваучер или поръчка" in email_learning["operator_handoff"]["minimum_safe_identifier"]
     assert result["official_contacts"]["contacts_page"] == "https://skyvision.bg/контакти/"
     assert result["official_contacts"]["email"] == "info@skyvision.bg"
     assert "+359 (0) 700 20 200" in result["official_contacts"]["phones"]

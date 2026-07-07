@@ -305,7 +305,8 @@ SKYAI_SUPPORT_KNOWLEDGE_SCHEMA = {
     "description": (
         "Return curated public SkyVision commerce/support facts for customer conversations: "
         "gift voucher blanks and packaging, Speedy delivery, checkout payment methods, official contacts, "
-        "voucher extension flow, and using/combining voucher value. Treat the result as evidence."
+        "voucher extension flow, using/combining voucher value, and customer-safe email support learning. "
+        "Treat the result as evidence."
     ),
     "parameters": {
         "type": "object",
@@ -1239,6 +1240,78 @@ def handle_skyai_support_knowledge(
                 "да бъде отказано."
             ),
             "privacy_policy": "Кодове на ваучери не се обработват в публичния чат; официалният екип работи с номер на ваучер/поръчка през контактните канали.",
+        },
+        "email_case_learning": {
+            "source": "customer_safe_email_case_learning_2025-07-07_to_2026-07-07",
+            "privacy": "Обобщено обучение от реални support казуси; без сурови имена, имейли, телефони, ваучерни кодове, order ids или вътрешна кореспонденция.",
+            "scale": {
+                "human_operational_case_records": 6979,
+                "grouped_cases": 3099,
+                "source_window": "2025-07-07..2026-07-07",
+            },
+            "frequent_customer_intents": [
+                {
+                    "intent": "voucher_help",
+                    "customer_safe_scope": (
+                        "активация в профил, регистрация, валидност, удължаване, липсващ PDF/имейл, "
+                        "остатъчен ваучер, прехвърляне на използване и повторно изпращане на инструкции"
+                    ),
+                    "support_posture": (
+                        "Разбери състоянието на ваучера и насочи клиента към точната self-service стъпка "
+                        "или към екипа с минималния нужен идентификатор през официален канал."
+                    ),
+                },
+                {
+                    "intent": "reservation_status",
+                    "customer_safe_scope": (
+                        "потвърдена резервация, чакащо одобрение от изпълнител, предложена друга дата, "
+                        "SMS/email потвърждение, резервация през „Моят ваучер“"
+                    ),
+                    "support_posture": (
+                        "Мисли в състояния: чака потвърждение, потвърдено, отказано, предложена нова дата, "
+                        "клиентът трябва да приеме, или е нужен екипът."
+                    ),
+                },
+                {
+                    "intent": "checkout_payment_problem",
+                    "customer_safe_scope": (
+                        "проблем с плащане, контактни данни, адрес/телефон, пожелание, бланка, доставка, "
+                        "фактура и объркано поле при поръчка"
+                    ),
+                    "support_posture": "Първо помогни на клиента да продължи покупката; не го пращай към екипа, ако има ясна self-service стъпка.",
+                },
+                {
+                    "intent": "courier_delivery_details",
+                    "customer_safe_scope": "доставка със Speedy, офис/автомат, грешен телефон/адрес, закъсняваща пратка, PDF ваучер като резервен вариант",
+                    "support_posture": "Дай практична стъпка за доставка и поддържай покупката спокойна; при нужда дай официалните контакти.",
+                },
+                {
+                    "intent": "refund_cancellation_return",
+                    "customer_safe_scope": "анулирана резервация/поръчка, невъзможност за присъствие, връщане, алтернативна дата",
+                    "support_posture": "Не обещавай ръчно решение без проверка; обясни логиката и събери минимален контекст за екипа.",
+                },
+                {
+                    "intent": "provider_unreachable",
+                    "customer_safe_scope": "забавяне или неяснота от страна на изпълнител",
+                    "support_posture": "Клиентът чува, че екипът проверява с изпълнителя и ще последва отговор; не разкривай вътрешни ескалации.",
+                },
+                {
+                    "intent": "post_experience_media",
+                    "customer_safe_scope": "липсващи снимки/видео след преживяване, очакване за получаване на медии",
+                    "support_posture": "Обясни очакването и насочи към екипа, когато е нужна проверка с изпълнителя или медийния доставчик.",
+                },
+            ],
+            "state_reasoning": [
+                "Не свеждай ваучерен казус до „има/няма резервация“; мисли за статус, валидност, депозит, остатък, профил, собственик и следваща безопасна стъпка.",
+                "При weather-sensitive услуги нормализирай, че дата може да се промени, и насочи към нова дата/наличност без драматизиране.",
+                "При изтекъл или почти изтекъл ваучер не обещавай автоматично удължаване; насочи към профила, а при особен статус към екипа.",
+                "Ако клиент пише към no-reply/system имейл или се е объркал къде да отговори, признай конкретния проблем и дай правилния официален канал.",
+            ],
+            "operator_handoff": {
+                "minimum_safe_identifier": "номер на ваучер или поръчка през официалните контакти, когато е нужен екипът",
+                "do_not_request_in_public_chat": ["пълен ваучерен код", "карта/плащане", "лични документи", "пароли"],
+                "tone": "човешки, полезно и уверено; клиентът трябва да усеща, че SkyVision знае тези казуси от практика.",
+            },
         },
         "official_contacts": contacts if include_contacts else {"available_if_needed": True},
     }

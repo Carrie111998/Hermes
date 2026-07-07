@@ -552,6 +552,8 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "не като несигурна възможност" in prompt
     assert "Два ваучера не се обединяват автоматично" in prompt
     assert "Опцията за удължаване е налична" in prompt
+    assert "customer-safe обучение от реални email/support казуси" in prompt
+    assert "intent/state reasoning, а не като шаблон" in prompt
     assert "не коментирай самото ограничение" in prompt
     assert "представи се кратко като SkyAI" in prompt
     assert "не решавай учебни задачи" in prompt
