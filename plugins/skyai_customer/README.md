@@ -92,3 +92,23 @@ curl -X POST http://127.0.0.1:8787/voice/turn \
   -H 'Content-Type: application/json' \
   -d '{"call_id":"call-dev-1","conversation_id":"voice-dev-1","transcript":"Търся подарък за рожден ден.","is_final":true,"stt_confidence":0.95}'
 ```
+
+For a fuller no-audio contract smoke across `/voice/start`, `/voice/turn`,
+`/voice/event`, and `/voice/end`, use the DEV helper:
+
+```bash
+python scripts/skyai_voice_contract_smoke.py \
+  --base-url http://127.0.0.1:8787 \
+  --backend-target skyai_v2_chatkit
+```
+
+Against a private/GCP DEV endpoint, pass the endpoint and keep the bearer token
+in the configured environment variable rather than on the command line:
+
+```bash
+SKYAI_V2_CANARY_TOKEN=... \
+python scripts/skyai_voice_contract_smoke.py \
+  --base-url https://<dev-skyai-endpoint> \
+  --token-env SKYAI_V2_CANARY_TOKEN \
+  --backend-target skyai_v2_chatkit
+```

@@ -378,6 +378,21 @@ Recommended first MVP:
    - silence timeout;
    - transfer request.
 
+Before any PBX write or SIP/RTP integration, validate the HTTP adapter with the
+DEV-only no-audio smoke:
+
+```bash
+python scripts/skyai_voice_contract_smoke.py \
+  --base-url http://127.0.0.1:8787 \
+  --backend-target skyai_v2_chatkit
+```
+
+The smoke calls `/voice/start`, `/voice/turn`, `/voice/event`, and `/voice/end`
+with synthetic data and verifies canonical response fields, action values,
+flattened transfer compatibility fields, `raw_audio_stored=false`, and
+`end_call=true` on call end. It does not touch SIP, RTP, PBX, STT, TTS,
+customers, orders, vouchers, payments, Discord, or production traffic.
+
 ## Open Questions
 
 - Which STT/TTS provider gives the best Bulgarian quality under office-phone

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from plugins.skyai_customer import voice_contract
+from scripts import skyai_voice_contract_smoke
 
 
 VOICE_DOC_PATH = Path("docs/skyai-voice-contract-v0.1.md")
@@ -140,3 +141,63 @@ def test_joint_voice_contract_reference_points_to_canonical_shared_doc() -> None
 
     assert "/Users/emillomliev/.hermes/knowledge/skyai-voice/skyai-voice-joint-contract-v0.1.md" in text
     assert "Do not fork endpoint names, action values, or field semantics" in text
+
+
+def test_voice_contract_smoke_builds_dev_safe_endpoint_sequence() -> None:
+    requests = skyai_voice_contract_smoke.build_smoke_requests(
+        call_id="call-test",
+        conversation_id="voice-test",
+        backend_target="skyai_v2_chatkit",
+    )
+
+    assert [item.path for item in requests] == [
+        "/voice/start",
+        "/voice/turn",
+        "/voice/turn",
+        "/voice/event",
+        "/voice/end",
+    ]
+    assert [item.expected_action for item in requests] == [
+        "speak",
+        "speak",
+        "clarify",
+        "transfer_to_human",
+        "end_call",
+    ]
+    serialized = "\n".join(
+        str(value)
+        for request in requests
+        for value in request.payload.values()
+    )
+    assert "password" not in serialized.casefold()
+    assert "token" not in serialized.casefold()
+    assert "raw_audio" not in serialized.casefold()
+
+
+def test_voice_contract_smoke_validates_canonical_response_shape() -> None:
+    request = skyai_voice_contract_smoke.SmokeRequest(
+        path="/voice/event",
+        payload={"call_id": "call-test", "conversation_id": "voice-test"},
+        expected_action="transfer_to_human",
+    )
+    response = {
+        "status": "ok",
+        "version": "skyai-v",
+        "contract_version": "skyai-voice-contract.v0.1",
+        "call_id": "call-test",
+        "conversation_id": "voice-test",
+        "action": "transfer_to_human",
+        "spoken_reply": "Ще Ви прехвърля.",
+        "display_reply": "Transfer.",
+        "cards": [],
+        "transfer": {"target": "operator_queue", "reason": "dtmf_0"},
+        "transfer_reason": "dtmf_0",
+        "target": "operator_queue",
+        "end_call": False,
+        "session_state": {"handoff_allowed": True},
+        "trace": {"raw_audio_stored": False},
+        "notes": [],
+        "unavailable": False,
+    }
+
+    assert skyai_voice_contract_smoke.validate_response(request, response) == []

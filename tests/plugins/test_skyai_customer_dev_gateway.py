@@ -424,9 +424,9 @@ async def test_build_voice_event_dtmf_zero_transfers_to_human(tmp_path: Path) ->
 
     assert response["status"] == "ok"
     assert response["action"] == "transfer_to_human"
-    assert response["transfer"] == {"target": "operator_queue", "reason": "dtmf"}
+    assert response["transfer"] == {"target": "operator_queue", "reason": "dtmf_0"}
     assert response["target"] == "operator_queue"
-    assert response["transfer_reason"] == "dtmf"
+    assert response["transfer_reason"] == "dtmf_0"
     assert "човек" in response["spoken_reply"]
 
 

@@ -1790,7 +1790,7 @@ async def build_voice_event_response(
             conversation_id=conversation_id,
             spoken_reply="Разбира се, ще Ви прехвърля към човек от екипа.",
             display_reply="Caller requested human handoff.",
-            reason=event_type or "dtmf_0",
+            reason="dtmf_0" if dtmf == "0" else event_type,
         )
 
     if event_type in {"silence_timeout", "low_stt_confidence"}:
