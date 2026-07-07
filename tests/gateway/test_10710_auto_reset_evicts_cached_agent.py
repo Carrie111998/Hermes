@@ -56,16 +56,16 @@ def test_auto_reset_cleanup_evicts_cached_agent():
     tree = ast.parse(inspect.getsource(gateway_run))
 
     # Fingerprint the cleanup branch: the `if <was_auto_reset>:` block that
-    # drops transient session state (calls the reasoning-override setter AND
-    # consumes the flag by setting was_auto_reset = False). The eviction must
-    # live in that same block.
+    # drops transient session state (delegates to the shared boundary-reset
+    # helper, #60312, AND consumes the flag by setting was_auto_reset =
+    # False). The eviction must live in that same block.
     found = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
             continue
         calls = _calls(node)
         if (
-            "_set_session_reasoning_override" in calls
+            "_apply_auto_reset_conversation_boundary" in calls
             and _assigns_false(node, "was_auto_reset")
         ):
             assert "_evict_cached_agent" in calls, (
@@ -79,8 +79,8 @@ def test_auto_reset_cleanup_evicts_cached_agent():
             break
     assert found, (
         "could not locate the auto-reset transient-state cleanup block in "
-        "gateway/run.py (fingerprint: _set_session_reasoning_override + "
-        "was_auto_reset = False)."
+        "gateway/run.py (fingerprint: _apply_auto_reset_conversation_boundary "
+        "+ was_auto_reset = False)."
     )
 
 
@@ -99,40 +99,77 @@ def _references_name(node: ast.AST, literal: str) -> bool:
     )
 
 
+def _make_runner_for_boundary_reset():
+    """Minimal GatewayRunner exposing just what
+    _apply_auto_reset_conversation_boundary touches."""
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._session_model_overrides = {}
+    runner._session_reasoning_overrides = {}
+    runner._pending_model_notes = {}
+    runner._last_resolved_model = {}
+    runner._pending_skills_reload_notes = {}
+    runner._pending_approvals = {}
+    runner._update_prompt_pending = {}
+    return runner
+
+
 def test_auto_reset_cleanup_clears_last_resolved_model():
-    """Regression test for #58403.
+    """Regression test for #58403 — behavioral, not AST (#60312 follow-up).
 
-    The auto-reset cleanup block (daily/idle/suspended, fingerprinted by
-    `_set_session_reasoning_override` + `was_auto_reset = False`) already
-    pops `_session_model_overrides` and `_pending_model_notes` — the same
-    "full conversation boundary" treatment /new and the compression-exhausted
-    auto-reset give `_last_resolved_model`. Without also popping
-    `_last_resolved_model` here, the fresh auto-reset session could serve a
-    model cached before the reset on a transient config-cache miss.
+    _apply_auto_reset_conversation_boundary() (the shared helper the
+    daily/idle/suspended and compression-exhausted auto-resets both call)
+    must pop the session's entry from `_last_resolved_model`, mirroring the
+    existing `_session_model_overrides`/`_pending_model_notes` pops it
+    performs. Without it, the fresh auto-reset session could serve a model
+    cached before the reset on a transient config-cache miss.
     """
-    tree = ast.parse(inspect.getsource(gateway_run))
+    runner = _make_runner_for_boundary_reset()
+    key = "telegram:1:chat-1"
+    runner._session_model_overrides[key] = {"model": "gpt-5"}
+    runner._pending_model_notes[key] = "switched to gpt-5"
+    runner._last_resolved_model[key] = "gpt-5"
 
-    found = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        calls = _calls(node)
-        if (
-            "_set_session_reasoning_override" in calls
-            and _assigns_false(node, "was_auto_reset")
-        ):
-            assert _references_name(node, "_last_resolved_model") and "pop" in _calls(
-                node
-            ), (
-                "gateway/run.py auto-reset cleanup block must also pop the "
-                "session's entry from `_last_resolved_model`, mirroring the "
-                "existing `_session_model_overrides`/`_pending_model_notes` "
-                "pops in the same block (#58403)."
-            )
-            found = True
-            break
-    assert found, (
-        "could not locate the auto-reset transient-state cleanup block in "
-        "gateway/run.py (fingerprint: _set_session_reasoning_override + "
-        "was_auto_reset = False)."
-    )
+    runner._apply_auto_reset_conversation_boundary(key)
+
+    assert key not in runner._session_model_overrides
+    assert key not in runner._pending_model_notes
+    assert key not in runner._last_resolved_model
+
+
+def test_auto_reset_cleanup_clears_approval_yolo_state():
+    """Regression test for #60312 — the same helper must also clear
+    approval/YOLO security state (#54878-class boundary), or a /yolo or
+    "/approve session" grant from before the reset silently survives into
+    the fresh conversation under the same session_key."""
+    from tools import approval as approval_mod
+
+    runner = _make_runner_for_boundary_reset()
+    target_key = "telegram:1:chat-target"
+    other_key = "telegram:1:chat-other"
+    approval_mod.enable_session_yolo(target_key)
+    approval_mod.enable_session_yolo(other_key)
+    try:
+        assert approval_mod.is_session_yolo_enabled(target_key) is True
+
+        runner._apply_auto_reset_conversation_boundary(target_key)
+
+        assert approval_mod.is_session_yolo_enabled(target_key) is False
+        # Unrelated session's grant must survive — this is a per-session
+        # boundary clear, not a global reset.
+        assert approval_mod.is_session_yolo_enabled(other_key) is True
+    finally:
+        approval_mod.disable_session_yolo(target_key)
+        approval_mod.disable_session_yolo(other_key)
+
+
+def test_auto_reset_cleanup_does_not_touch_unrelated_session():
+    """Only the target session_key's model-related state is cleared."""
+    runner = _make_runner_for_boundary_reset()
+    target_key, other_key = "chat-target", "chat-other"
+    runner._session_model_overrides[other_key] = {"model": "claude"}
+    runner._last_resolved_model[other_key] = "claude"
+
+    runner._apply_auto_reset_conversation_boundary(target_key)
+
+    assert runner._session_model_overrides[other_key] == {"model": "claude"}
+    assert runner._last_resolved_model[other_key] == "claude"

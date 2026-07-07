@@ -7593,24 +7593,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # agent-cache eviction must NOT prune these: the
                         # session is still alive and a resumed turn rebuilds
                         # its agent from these overrides. Only true session
-                        # finalization, /new, and /reset clear them.)
-                        self._session_model_overrides.pop(key, None)
-                        self._set_session_reasoning_override(key, None)
-                        if hasattr(self, "_pending_model_notes"):
-                            self._pending_model_notes.pop(key, None)
-                        # Clear per-session model cache so a resumed turn
-                        # resolves from current config, not a stale fallback
-                        # cached before the session went idle (mirrors /new
-                        # and the compression-exhausted auto-reset, #58403).
-                        _lrm = getattr(self, "_last_resolved_model", None)
-                        if _lrm is not None:
-                            _lrm.pop(key, None)
-                        _pending_approvals = getattr(self, "_pending_approvals", None)
-                        if isinstance(_pending_approvals, dict):
-                            _pending_approvals.pop(key, None)
-                        _update_prompt_pending = getattr(self, "_update_prompt_pending", None)
-                        if isinstance(_update_prompt_pending, dict):
-                            _update_prompt_pending.pop(key, None)
+                        # finalization, /new, and /reset clear them.) Full
+                        # conversation-boundary cleanup — model/reasoning
+                        # overrides, resolved-model cache, and approval/YOLO
+                        # security state (#58403, #60312) — mirrors /new and
+                        # /resume; without the security-state clear, a /yolo
+                        # or "/approve session" grant made before the session
+                        # went idle would still be live if a later message
+                        # resurrects this session_key.
+                        self._apply_auto_reset_conversation_boundary(key)
                         # Persist the finalized flag to sessions.json AND
                         # state.db (single write-path, #9006) — also drops
                         # the persisted /model override, since finalization
@@ -10618,20 +10609,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
             # Treat auto-reset as a full conversation boundary — drop every
-            # session-scoped transient state so the fresh session does not
-            # inherit the previous conversation's model/reasoning overrides
-            # or a queued "/model switched" note.
-            self._session_model_overrides.pop(session_key, None)
-            self._set_session_reasoning_override(session_key, None)
-            if hasattr(self, "_pending_model_notes"):
-                self._pending_model_notes.pop(session_key, None)
-            # Clear per-session model cache so the fresh session resolves
-            # from current config, not a stale fallback cached before the
-            # auto-reset (mirrors /new and the compression-exhausted
-            # auto-reset, #58403).
-            _lrm = getattr(self, "_last_resolved_model", None)
-            if _lrm is not None:
-                _lrm.pop(session_key, None)
+            # session-scoped transient state (model/reasoning overrides, a
+            # queued "/model switched" note, the resolved-model cache, and
+            # approval/YOLO security state — #58403, #60312) so the fresh
+            # session does not inherit the previous conversation's state.
+            self._apply_auto_reset_conversation_boundary(session_key)
             # Evict the cached agent so the fresh session does not inherit the
             # previous conversation's context_compressor._previous_summary —
             # the cache is keyed on the stable session_key, so an auto-reset
@@ -11620,15 +11602,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 new_entry = self.session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
-                self._session_model_overrides.pop(session_key, None)
-                self._set_session_reasoning_override(session_key, None)
-                if hasattr(self, "_pending_model_notes"):
-                    self._pending_model_notes.pop(session_key, None)
-                # Clear per-session model cache so the post-reset turn
-                # resolves from current config, not a stale fallback.
-                _lrm = getattr(self, "_last_resolved_model", None)
-                if _lrm is not None:
-                    _lrm.pop(session_key, None)
+                # Full conversation-boundary cleanup — model/reasoning
+                # overrides, resolved-model cache, and approval/YOLO
+                # security state (#60312) — mirrors /new and /resume.
+                self._apply_auto_reset_conversation_boundary(session_key)
                 if new_entry is not None:
                     # Drop the stale reference to the bloated compressed child and
                     # re-point the Telegram topic binding at the fresh session.
@@ -15756,6 +15733,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 e,
             )
+
+    def _apply_auto_reset_conversation_boundary(self, session_key: str) -> None:
+        """Full conversation-boundary cleanup shared by the daily/idle/
+        suspended auto-reset and the compression-exhausted auto-reset.
+
+        Both treat their reset as a full conversation boundary — the same
+        treatment /new, /resume, and /branch give: drop the session's
+        model/reasoning overrides, the pending "/model switched" note, the
+        per-session resolved-model cache, and (via
+        ``_clear_session_boundary_security_state``) pending approvals, YOLO/
+        session-approved dangerous-command grants, pending skill-reload
+        notes, and slash-confirm state. Without the security-state clear
+        specifically, a ``/yolo`` or "/approve session" grant made before
+        the reset would silently survive into the "fresh" conversation
+        under the same session_key (#60312).
+        """
+        self._session_model_overrides.pop(session_key, None)
+        self._set_session_reasoning_override(session_key, None)
+        if hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes.pop(session_key, None)
+        _lrm = getattr(self, "_last_resolved_model", None)
+        if _lrm is not None:
+            _lrm.pop(session_key, None)
+        self._clear_session_boundary_security_state(session_key)
 
     def _begin_session_run_generation(self, session_key: str) -> int:
         """Claim a fresh run generation token for ``session_key``.

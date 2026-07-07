@@ -66,9 +66,10 @@ def test_run_consumes_was_auto_reset_in_cleanup_block():
             for n in ast.walk(node)
             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
         }
-        # The cleanup block references the reasoning-override setter and pops
-        # pending model notes — fingerprint of the transient-state cleanup.
-        if "_set_session_reasoning_override" in calls and _assigns_false(node, "was_auto_reset"):
+        # The cleanup block delegates the model/reasoning/security-state
+        # reset to the shared helper (#60312) — fingerprint of the
+        # transient-state cleanup.
+        if "_apply_auto_reset_conversation_boundary" in calls and _assigns_false(node, "was_auto_reset"):
             found = True
             break
     assert found, (
