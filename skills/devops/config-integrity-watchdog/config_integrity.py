@@ -143,8 +143,14 @@ def log_has_uncommitted_changes(dotfiles_dir: Path, log_path: Path) -> bool:
 def seal(
     config_path: Optional[Path] = None,
     dotfiles_dir: Optional[Path] = None,
+    *,
+    quiet: bool = False,
 ) -> int:
     """Hash config.yaml and append a seal entry to the integrity log.
+
+    ``quiet`` suppresses the success/warning prints — used when this runs as
+    a side effect of an authorized ``save_config()`` write rather than an
+    explicit, interactive ``hermes config seal``.
 
     Returns 0 on success, 1 on error.
     """
@@ -153,7 +159,8 @@ def seal(
     log_path = _log_path(dotfiles_dir)
 
     if not config_path.exists():
-        print(f"ERROR: Config not found: {config_path}", file=sys.stderr)
+        if not quiet:
+            print(f"ERROR: Config not found: {config_path}", file=sys.stderr)
         return 1
 
     config_hash = hash_file(config_path)
@@ -168,7 +175,9 @@ def seal(
         dotfiles_dir, log_path,
         f"integrity: seal config.yaml [{config_hash[:12]}]",
     )
-    if not committed:
+    if quiet:
+        pass
+    elif not committed:
         print("WARNING: Integrity log written but not committed to git.")
         print("  Fingerprint stored as mutable fallback only.")
     else:

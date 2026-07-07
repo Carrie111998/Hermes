@@ -661,8 +661,13 @@ def restore_quick_snapshot(
     # Integrity Watchdog sees an authorized restore, not tampering.
     if restored > 0 and "config.yaml" in meta.get("files", {}):
         try:
-            from hermes_cli.config import seal_config
+            from hermes_cli.config import (
+                _reseal_git_backed_integrity_baseline,
+                get_config_path,
+                seal_config,
+            )
             seal_config()
+            _reseal_git_backed_integrity_baseline(get_config_path())
         except (OSError, ImportError):
             pass
 

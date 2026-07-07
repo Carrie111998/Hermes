@@ -4722,6 +4722,36 @@ def _write_config_to_disk(config: Dict[str, Any]) -> None:
         seal_config()
     except OSError:
         pass
+    _reseal_git_backed_integrity_baseline(config_path)
+
+
+def _reseal_git_backed_integrity_baseline(config_path: Path) -> None:
+    """Re-seal the external Config Integrity Watchdog baseline, if configured.
+
+    ``seal_config()`` above keeps the local ``.sha256`` sidecar in sync, but
+    the Config Integrity Watchdog cron job checks a *separate*, git-backed
+    baseline (``hermes config verify`` / config-integrity-watchdog skill) so
+    that the fingerprint itself can't be silently overwritten. Without this,
+    any authorized write through ``save_config()`` (model scanner, ``/model``
+    command, platform setup flows) desyncs that baseline and the watchdog
+    flags the legitimate change as tampering — the same class of false
+    positive the git-backed log was introduced to fix, just one layer over.
+    No-op when the watchdog's dotfiles repo isn't configured on this machine.
+    """
+    try:
+        from hermes_cli.config_integrity_cli import _find_core_module
+    except ImportError:
+        return
+    core = _find_core_module()
+    if core is None:
+        return
+    dotfiles_dir = core._default_dotfiles_dir()
+    if not dotfiles_dir.is_dir():
+        return
+    try:
+        core.seal(config_path=config_path, dotfiles_dir=dotfiles_dir, quiet=True)
+    except Exception:
+        pass
 
 
 def save_config(config: Dict[str, Any]):

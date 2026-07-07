@@ -420,6 +420,8 @@ PR #67 shipped a git-backed integrity system that supersedes the mutable `.sha25
 
 **Skill:** `skills/devops/config-integrity-watchdog/` — ships `scripts/seal.py`, `scripts/verify.py`, `scripts/restore.py` (auto-deployed to `~/.hermes/scripts/` on startup) and `config_integrity.py` (shared core module).
 
+**Auto-reseal:** `save_config()`/`restore_config()` (via `_write_config_to_disk()` → `_reseal_git_backed_integrity_baseline()`) automatically re-seal this git-backed baseline too, not just the local `.sha256` sidecar — whenever `$HERMES_DOTFILES_DIR` is a git repo on the machine. This closes the gap where an authorized write (model scanner, `/model` command, platform setup flows) desynced the git-backed baseline and the watchdog cron job flagged the legitimate change as tampering. A manual `hermes config seal` is only needed for out-of-band edits that bypass `save_config()` entirely (e.g. hand-editing `config.yaml` in an editor).
+
 **Env vars:**
 | Variable | Default | Purpose |
 |---|---|---|

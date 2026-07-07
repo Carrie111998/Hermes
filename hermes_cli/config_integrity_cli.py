@@ -55,8 +55,8 @@ def register_subcommands(config_subparsers: argparse.Action) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _import_core():
-    """Import the shared core module from the skill scripts directory.
+def _find_core_module():
+    """Import the shared core module from the skill scripts directory, if present.
 
     We add the skill directory to sys.path on first use rather than at
     module-import time so that the import stays lazy (fast startup) and
@@ -65,6 +65,11 @@ def _import_core():
     Search order:
     1. ``~/.hermes/skills/devops/config-integrity-watchdog`` (post-sync location)
     2. Repo-relative ``skills/devops/config-integrity-watchdog`` (pre-sync / dev)
+
+    Returns ``None`` (rather than raising/exiting) when the skill isn't
+    deployed, so callers that only want to *opportunistically* reseal the
+    git-backed baseline (e.g. ``save_config()``) can silently no-op on
+    machines that don't have the watchdog configured.
     """
     candidates = [
         Path.home() / ".hermes" / "skills" / "devops" / "config-integrity-watchdog",
@@ -79,6 +84,18 @@ def _import_core():
                 return config_integrity
             except ImportError:
                 continue
+    return None
+
+
+def _import_core():
+    """Like :func:`_find_core_module`, but exits with an error when not found.
+
+    Used by the interactive ``hermes config seal/verify/restore`` commands,
+    where a missing skill is a user-facing error rather than a silent no-op.
+    """
+    core = _find_core_module()
+    if core is not None:
+        return core
     print(
         "ERROR: config-integrity-watchdog skill not found. "
         "Run 'hermes skills sync' first."
