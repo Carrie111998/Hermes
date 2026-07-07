@@ -207,7 +207,9 @@ async def _read_url_image_with_redirect_guard(
                 current_url = next_url
                 continue
 
-            return status, await resp.read(), headers
+            return status, await _read_response_bytes_bounded(
+                resp, _DISCORD_IMAGE_DOWNLOAD_MAX_BYTES
+            ), headers
 
     raise ValueError("Too many image URL redirects")
 
@@ -8061,7 +8063,9 @@ class DiscordAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}")
-                return await resp.read()
+                return await _read_response_bytes_bounded(
+                    resp, _DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES
+                )
 
     async def _handle_message(
         self,
@@ -9868,10 +9872,23 @@ if DISCORD_AVAILABLE:
 _DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES = 1 * 1024 * 1024
 _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_DISCORD_IMAGE_DOWNLOAD_MAX_BYTES = 50 * 1024 * 1024  # generous limit for images/animations
+_DISCORD_ATTACHMENT_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024  # generous for file attachments
 
 
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
     _DISCORD_CHANNEL_TYPE_PROBE_CACHE[str(chat_id)] = bool(is_forum)
+
+
+async def _read_response_bytes_bounded(resp: Any, limit_bytes: int) -> bytes:
+    """Read at most *limit_bytes* from an aiohttp response, raising on overflow."""
+    data = await resp.content.read(limit_bytes + 1)
+    if len(data) > limit_bytes:
+        resp.close()
+        raise ValueError(
+            f"Response body exceeded {limit_bytes} bytes ({len(data)} bytes read)"
+        )
+    return data
 
 
 def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
