@@ -604,8 +604,15 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     )
     assert result["payment_methods"]["bank_transfer"]["available_in_online_checkout"] is False
     assert result["payment_methods"]["bank_transfer"]["online_checkout_label"] is None
+    assert "до 5 дни" in result["order_and_invoice_support"]["invoice_self_service"]
+    assert "потвърдителния имейл" in result["order_and_invoice_support"]["invoice_self_service"]
+    assert "15:00" in result["order_and_invoice_support"]["next_day_delivery_fact"]
+    assert "изтекъл" in result["reservation_support"]["expired_response_deadline"]
     assert "удължаване" in " ".join(result["vouchers"]["extension_steps"])
     assert "ако системата я показва" not in " ".join(result["vouchers"]["extension_steps"])
+    assert "изтрие ваучера" in result["vouchers"]["manual_extension_refresh"]
+    assert "добави отново" in result["vouchers"]["manual_extension_refresh"]
+    assert "друг потребител" in result["vouchers"]["ownership_conflict"]
     panel = result["vouchers"]["customer_panel"]
     assert panel["main_area"] == "Профил -> Ваучери / Моите ваучери"
     assert panel["left_navigation"] == ["Ваучери", "Резервации", "Запитвания", "Поръчки", "Настройки", "Изход"]
@@ -617,9 +624,14 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert panel["customer_remains_actor"] is True
     assert "не иска пълен код" in panel["chat_privacy_note"]
     assert result["vouchers"]["profile_extension_available"] is True
+    assert "остатъчен ваучер" in result["vouchers"]["residual_voucher"]["automatic_issue"]
+    assert result["vouchers"]["residual_voucher"]["email_subject"] == "Издаване на остатък за ваучер от SkyVision"
     assert result["vouchers"]["merge_two_vouchers_into_one"]["self_service_available"] is False
     assert result["vouchers"]["merge_two_vouchers_into_one"]["handling"] == "ръчна обработка"
     assert "ръчна" in result["vouchers"]["merge_two_vouchers_into_one"]["handling"]
+    assert "1 месец" in result["vouchers"]["merge_two_vouchers_into_one"]["result"]
+    assert "грешна опция" in result["vouchers"]["wrong_reservation_or_split_residual_repair"]
+    assert "Сторно/рефънд" in result["vouchers"]["refund_and_cancellation"]
     assert result["official_contacts"]["contacts_page"] == "https://skyvision.bg/контакти/"
     assert result["official_contacts"]["email"] == "info@skyvision.bg"
     assert "+359 (0) 700 20 200" in result["official_contacts"]["phones"]
