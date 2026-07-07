@@ -525,6 +525,13 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
         "https://skyvision.bg/campaign/free-panoramic-flight-2025/"
     )
     assert campaign["campaign_2026_facts"]["validity"] == "12 месеца от датата на покупката"
+    assert "независимо къде се изпълнява основната" in (
+        campaign["campaign_2026_facts"]["main_service_location_independent"]
+    )
+    assert "единствено от летище Приморско" in campaign["campaign_2026_facts"]["bonus_execution_location"]
+    assert "основната услуга и бонусният полет са различни преживявания" in (
+        campaign["campaign_2026_facts"]["location_confusion_answer"]
+    )
     assert "без предварително купуване на ваучер" in campaign["booknow_nuance"]
     assert "парите ще бъдат възстановени" in campaign["booknow_nuance"]
     assert campaign["bonus_product"]["product_id"] == 95435
@@ -535,6 +542,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     )
     assert campaign["bonus_product"]["duration"] == "10 мин."
     assert campaign["bonus_product"]["location"] == "Летище Приморско"
+    assert "винаги се изпълнява от летище Приморско" in campaign["bonus_product"]["location_note"]
     assert "клиентът пита" in result["founder_transfer_facts"]["context"]
     founder_facts = result["founder_transfer_facts"]["facts"]
     assert founder_facts["default_owner"].startswith("купувачът")

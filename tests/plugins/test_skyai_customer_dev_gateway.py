@@ -539,6 +539,8 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "positive-only" in prompt
     assert "не използвай конструкции от типа 'без X/Y'" in prompt
     assert "бонусът е благодарност към купувача/резервиращия" in prompt
+    assert "бонусният полет се изпълнява единствено от летище Приморско" in prompt
+    assert "независимо къде е основната закупена услуга" in prompt
     assert "първо обясни правилото с думите купувачът/резервиращият" in prompt
     assert "бонусът е за купувача/резервиращия" in prompt
     assert "Не започвай с директно 'да'" in prompt
