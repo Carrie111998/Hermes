@@ -518,6 +518,12 @@ def test_render_widget_html_contains_fab_compatible_chat_endpoint(tmp_path: Path
     assert "escapeHtml" in html
     assert "message__heading" in html
     assert "line.match(/^#{1,4}" in html
+    assert "function openExternalLink" in html
+    assert "document.addEventListener('click'" in html
+    assert "window.open(href, '_blank'" in html
+    assert "window.top.location.href = href" in html
+    assert "function isTestSession" in html
+    assert "is_test: isTestSession() ? '1' : ''" in html
 
 
 def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:

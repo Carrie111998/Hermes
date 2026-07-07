@@ -1009,6 +1009,51 @@ def render_widget_html(settings: CanarySettings) -> str:
                 return /^https:\\/\\//i.test(url) ? url : '';
               }
 
+              function hasTestMarkerInUrl(value) {
+                if (!value) return false;
+                try {
+                  const parsed = new URL(value, window.location.href);
+                  return [
+                    'codex_prod_v2_cutover',
+                    'codex_smoke',
+                    'skyai_qa',
+                    'skyai_smoke',
+                    'skyai_test',
+                    'skyai_v2_test',
+                  ].some(name => parsed.searchParams.has(name));
+                } catch {
+                  return false;
+                }
+              }
+
+              function isTestSession() {
+                return [
+                  'codex_prod_v2_cutover',
+                  'codex_smoke',
+                  'skyai_qa',
+                  'skyai_smoke',
+                  'skyai_test',
+                  'skyai_v2_test',
+                ].some(name => params.has(name)) || hasTestMarkerInUrl(document.referrer || '');
+              }
+
+              function openExternalLink(value) {
+                const href = safeUrl(value);
+                if (!href) return false;
+                try {
+                  const opened = window.open(href, '_blank', 'noopener,noreferrer');
+                  if (opened) return true;
+                } catch {}
+                try {
+                  if (window.top && window.top !== window) {
+                    window.top.location.href = href;
+                    return true;
+                  }
+                } catch {}
+                window.location.href = href;
+                return true;
+              }
+
               function renderInlineMarkdown(value) {
                 let html = escapeHtml(value);
                 const links = [];
@@ -1191,6 +1236,15 @@ def render_widget_html(settings: CanarySettings) -> str:
                 }
               }
 
+              document.addEventListener('click', event => {
+                const anchor = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+                if (!anchor) return;
+                const href = safeUrl(anchor.href);
+                if (!href) return;
+                event.preventDefault();
+                openExternalLink(href);
+              });
+
               async function sendMessage(message) {
                 state.busy = true;
                 elements.send.disabled = true;
@@ -1250,6 +1304,8 @@ def render_widget_html(settings: CanarySettings) -> str:
                   surface: 'widget_chatkit_dev',
                   widget_version: metaVersion,
                   page_referrer: document.referrer || '',
+                  widget_url: window.location.href,
+                  is_test: isTestSession() ? '1' : '',
                   browser_language: nav.language || '',
                   browser_languages: Array.isArray(nav.languages) ? nav.languages.join(',') : '',
                   timezone: resolvedTimeZone,
