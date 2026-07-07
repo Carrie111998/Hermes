@@ -486,6 +486,62 @@ class TestSensitiveInPlaceEditPattern:
             assert dangerous is True, command
             assert key is not None, command
 
+    def test_perl_in_place_system_config(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "perl -i -pe 's/foo/bar/' /etc/hosts"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "in-place" in desc.lower()
+
+    def test_ruby_in_place_system_config(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "ruby -i -pe 'gsub(/root/, \"admin\")' /etc/passwd"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "in-place" in desc.lower()
+
+    def test_perl_system_config_no_inplace_safe(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "perl -pe 's/foo/bar/' /etc/hosts"
+        )
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
+    def test_perl_in_place_system_config_combined_flags(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "perl -pi -e 's/foo/bar/' /etc/sudoers"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "in-place" in desc.lower()
+
+    def test_awk_in_place_system_config(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "awk -i inplace '{gsub(/foo/, \"bar\")}' /etc/hosts"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "system config" in desc.lower() or "awk" in desc.lower()
+
+    def test_awk_in_place_sensitive_path(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "awk -i inplace '{gsub(/key/, \"newkey\")}' ~/.ssh/authorized_keys"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "sensitive" in desc.lower() or "awk" in desc.lower()
+
+    def test_awk_without_inplace_safe(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "awk '{gsub(/foo/, \"bar\")}' /etc/hosts"
+        )
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
     def test_sed_in_place_regular_file_safe(self):
         dangerous, key, desc = detect_dangerous_command("sed -i 's/a/b/' notes.txt")
         assert dangerous is False
