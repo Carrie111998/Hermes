@@ -606,6 +606,16 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert result["payment_methods"]["bank_transfer"]["online_checkout_label"] is None
     assert "удължаване" in " ".join(result["vouchers"]["extension_steps"])
     assert "ако системата я показва" not in " ".join(result["vouchers"]["extension_steps"])
+    panel = result["vouchers"]["customer_panel"]
+    assert panel["main_area"] == "Профил -> Ваучери / Моите ваучери"
+    assert panel["left_navigation"] == ["Ваучери", "Резервации", "Запитвания", "Поръчки", "Настройки", "Изход"]
+    assert "Чакащо запитване" in panel["voucher_filters"]
+    assert "Добави ваучер" in panel["empty_state"]
+    assert "серийния номер на ваучера на латиница" in " ".join(panel["add_voucher_flow"])
+    assert panel["voucher_list_columns"] == ["Услуга", "Ваучер", "Депозит", "Статус", "Валидност", "Действия"]
+    assert "„Използвай“" in " ".join(panel["common_actions"])
+    assert panel["customer_remains_actor"] is True
+    assert "не иска пълен код" in panel["chat_privacy_note"]
     assert result["vouchers"]["profile_extension_available"] is True
     assert result["vouchers"]["merge_two_vouchers_into_one"]["self_service_available"] is False
     assert result["vouchers"]["merge_two_vouchers_into_one"]["handling"] == "ръчна обработка"

@@ -529,6 +529,8 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "скрита класификация" in prompt
     assert "skyai_product_slots" in prompt
     assert "skyai_support_knowledge" in prompt
+    assert "клиентския панел „Ваучери“" in prompt
+    assert "добавяне/управление на ваучери" in prompt
     assert "EUR е основната цена" in prompt
     assert "Catalog tool-ът връща кандидати" in prompt
     assert "не е заповед какво да кажеш" in prompt
