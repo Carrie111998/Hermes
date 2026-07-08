@@ -20,6 +20,21 @@ self-hosted Langfuse at http://localhost:3050/api/public/otel.
     LANGFUSE_SECRET_KEY      sk-lf-...
     HERMES_OTEL_DISABLE=1    (optional) hard-disable export; spans become no-ops
 
+## Infra-span head sampling (SR-535 / ADR-0029 decision 2)
+
+Infrastructure spans (default: names starting with ``subscriber.handle``) are
+head-sampled at the export boundary so the self-hosted Langfuse stops
+ingesting ~33k noise traces/day. Error spans are ALWAYS exported regardless
+of the ratio. LLM/agent/cron spans (non-matching names) are never sampled.
+
+    HERMES_OTEL_SUBSCRIBER_SAMPLE     keep ratio for infra spans, 0.0-1.0.
+                                      Default 0.02 (~1:50). 1.0 disables
+                                      sampling; 0.0 keeps only error spans.
+    HERMES_OTEL_INFRA_SPAN_PREFIXES   comma-separated span-name prefixes
+                                      counted as infra. Default
+                                      "subscriber.handle" (matches the
+                                      SR-534 retention sweep's definition).
+
 ## Why HTTP/protobuf and not gRPC
 
 Langfuse's OTLP endpoint only speaks HTTP. gRPC is 4318 territory; Langfuse
@@ -38,6 +53,117 @@ from typing import Optional
 _LOCK = threading.Lock()
 _INITIALIZED = False
 _PROVIDER = None  # TracerProvider | None
+
+# SR-535 defaults: infra spans head-sampled at ~1:50; prefix list matches
+# scripts/langfuse_retention_sweep.py's --infra-name-prefix default so the
+# source-side and retention-side definitions of "infrastructure" agree.
+_INFRA_SAMPLE_DEFAULT = 0.02
+_INFRA_PREFIXES_DEFAULT = "subscriber.handle"
+
+
+def _infra_sampling_config() -> "tuple[tuple[str, ...], float]":
+    """Read (prefixes, ratio) for infra-span sampling from the environment.
+
+    Bad/missing values fall back to defaults; ratio is clamped to [0, 1].
+    """
+    raw_prefixes = os.environ.get(
+        "HERMES_OTEL_INFRA_SPAN_PREFIXES", _INFRA_PREFIXES_DEFAULT
+    )
+    prefixes = tuple(p.strip() for p in raw_prefixes.split(",") if p.strip())
+    try:
+        ratio = float(
+            os.environ.get("HERMES_OTEL_SUBSCRIBER_SAMPLE", _INFRA_SAMPLE_DEFAULT)
+        )
+    except (TypeError, ValueError):
+        ratio = _INFRA_SAMPLE_DEFAULT
+    ratio = min(max(ratio, 0.0), 1.0)
+    return prefixes, ratio
+
+
+def _span_is_error(span) -> bool:
+    """True if the ended span recorded an error status or an exception event.
+
+    Duck-typed (no OTel imports) so it works on ReadableSpan and on test
+    fakes alike. opentelemetry Status.is_ok is True for UNSET and OK.
+    """
+    try:
+        status = getattr(span, "status", None)
+        if status is not None and not status.is_ok:
+            return True
+        for ev in getattr(span, "events", None) or ():
+            if getattr(ev, "name", "") == "exception":
+                return True
+    except Exception:
+        pass
+    return False
+
+
+class _InfraSamplingSpanProcessor:
+    """Head-samples infrastructure spans at the export boundary (SR-535).
+
+    Wraps the real export processor (BatchSpanProcessor). Spans whose name
+    starts with an infra prefix are forwarded only for a deterministic
+    trace-id ratio (same lower-64-bit scheme as OTel's TraceIdRatioBased,
+    so a whole trace is kept or dropped coherently) — EXCEPT spans that
+    recorded an error/exception, which are always forwarded. All other
+    spans pass through untouched.
+
+    Duck-typed rather than subclassing sdk.trace.SpanProcessor so this
+    module stays importable in envs without opentelemetry installed.
+    """
+
+    _TRACE_ID_MASK = (1 << 64) - 1
+
+    def __init__(self, wrapped, prefixes: "tuple[str, ...]", ratio: float):
+        self._wrapped = wrapped
+        self._prefixes = prefixes
+        self._bound = round(min(max(ratio, 0.0), 1.0) * (1 << 64))
+
+    def _should_export(self, span) -> bool:
+        name = getattr(span, "name", "") or ""
+        if not name.startswith(self._prefixes):
+            return True
+        if _span_is_error(span):
+            return True
+        try:
+            trace_id = span.context.trace_id
+        except Exception:
+            return True  # fail-open: never lose a span we can't inspect
+        return (trace_id & self._TRACE_ID_MASK) < self._bound
+
+    # --- SpanProcessor interface (delegation) ---
+    def on_start(self, span, parent_context=None):
+        self._wrapped.on_start(span, parent_context)
+
+    def _on_ending(self, span):
+        # Newer OTel SDKs (>=1.34) call a private _on_ending hook on every
+        # registered processor while the span is still mutable. Delegate if
+        # the wrapped processor has it; older SDKs never call this.
+        hook = getattr(self._wrapped, "_on_ending", None)
+        if hook is not None:
+            hook(span)
+
+    def on_end(self, span):
+        if self._should_export(span):
+            self._wrapped.on_end(span)
+
+    def shutdown(self):
+        self._wrapped.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000):
+        return self._wrapped.force_flush(timeout_millis)
+
+
+def _wrap_with_infra_sampling(processor):
+    """Wrap the export processor with SR-535 infra sampling if configured.
+
+    Returns the processor unchanged when sampling is effectively off
+    (ratio >= 1.0 or no prefixes configured).
+    """
+    prefixes, ratio = _infra_sampling_config()
+    if not prefixes or ratio >= 1.0:
+        return processor
+    return _InfraSamplingSpanProcessor(processor, prefixes, ratio)
 
 
 def _load_env_once() -> None:
@@ -104,7 +230,11 @@ def ensure_initialized(service_name: str = "hermes") -> None:
             }
         )
         provider = TracerProvider(resource=resource)
-        provider.add_span_processor(BatchSpanProcessor(exporter))
+        # SR-535: infra spans (subscriber.handle:*) are head-sampled at the
+        # export boundary; error spans always survive. See module docstring.
+        provider.add_span_processor(
+            _wrap_with_infra_sampling(BatchSpanProcessor(exporter))
+        )
         trace.set_tracer_provider(provider)
         _PROVIDER = provider
         _INITIALIZED = True
