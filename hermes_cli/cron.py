@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -14,6 +15,28 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli.colors import Colors, color
+
+# Gateway subcommands that affect the lifecycle of the gateway process.
+# Cron jobs that reference these commands can deadlock or kill the gateway
+# that is executing the job, so callers use _contains_gateway_lifecycle_command
+# to detect and warn about such prompts at creation/edit time.
+_GATEWAY_LIFECYCLE_SUBCOMMANDS = frozenset(
+    {"start", "stop", "restart", "install", "uninstall"}
+)
+
+
+def _contains_gateway_lifecycle_command(text: str) -> bool:
+    """Return True if *text* contains a hermes gateway lifecycle command.
+
+    Matches patterns such as ``hermes gateway stop`` or
+    ``hermes gateway restart`` (including ``start``, ``install``, and
+    ``uninstall``).  Used by the cron CLI to warn when a job prompt or
+    script references a command that would affect the gateway process that
+    is actually running the job — stopping or restarting the gateway from
+    inside a cron tick can deadlock or silently kill the job.
+    """
+    subcommands = "|".join(_GATEWAY_LIFECYCLE_SUBCOMMANDS)
+    return bool(re.search(rf"\bhermes\s+gateway\s+(?:{subcommands})\b", text))
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[List[str]]:
