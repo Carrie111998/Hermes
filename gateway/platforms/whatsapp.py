@@ -130,6 +130,42 @@ def _write_bridge_pidfile(session_path: Path, pid: int) -> None:
         pass
 
 
+def _rotate_bridge_log_if_large(log_path: "Path") -> None:
+    """Rotate bridge.log at (re)start if it has grown past a size cap.
+
+    This is the DURABLE reclaim point for bridge.log. The bridge (node) inherits
+    this file as its stdout/stderr, and on Windows the file pointer is per-handle:
+    once the old node has been killed (see _kill_stale_bridge_by_pidfile /
+    _kill_port_process just before the open() below), its handle is gone, so
+    renaming the old log here and letting the caller open() a fresh one makes the
+    new node write from offset 0. Live external truncation does NOT reclaim while
+    the bridge is running — node re-extends to its cached write offset with a
+    zero-fill — so rotating at open is the reliable lever. We keep exactly one
+    prior generation (bridge.log.1), bounding disk to ~2x the cap.
+
+    Cap is WHATSAPP_BRIDGE_LOG_MAX_BYTES (default 25 MiB). Never blocks startup.
+    """
+    try:
+        max_bytes = int(os.getenv("WHATSAPP_BRIDGE_LOG_MAX_BYTES", str(25 * 1024 * 1024)))
+    except ValueError:
+        max_bytes = 25 * 1024 * 1024
+    try:
+        if not log_path.exists() or log_path.stat().st_size <= max_bytes:
+            return
+    except OSError:
+        return
+    backup = log_path.with_name(log_path.name + ".1")
+    try:
+        os.replace(log_path, backup)  # atomic; drops any previous .1, frees the primary
+    except OSError:
+        # Fall back to in-place truncation if the rename cannot be done.
+        try:
+            with open(log_path, "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
+
+
 def _terminate_bridge_process(proc, *, force: bool = False) -> None:
     """Terminate the bridge process using process-tree semantics where possible."""
     if _IS_WINDOWS:
@@ -701,6 +737,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
             # messages are preserved for troubleshooting.
             whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
             self._bridge_log = self._session_path.parent / "bridge.log"
+            # Rotate the previous bridge.log here (the old node has just been
+            # killed above, so its file handle is released) before opening a
+            # fresh one. This is the durable size cap — see the helper docstring.
+            _rotate_bridge_log_if_large(self._bridge_log)
             bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")
             self._bridge_log_fh = bridge_log_fh
 

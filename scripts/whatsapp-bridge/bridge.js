@@ -43,6 +43,28 @@ const WHATSAPP_DEBUG =
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
+// --- Silence libsignal-node's verbose session-churn logs -------------------
+// libsignal (a Baileys dependency) calls console.info/console.warn with the
+// full SessionEntry object on every session open/close/remove/migrate
+// (node_modules/libsignal/src/session_record.js). During a WhatsApp reconnect
+// flap this dumps ~18MB/min into bridge.log — the gateway's inherited stdout —
+// and on Windows that space does NOT reclaim via live truncation (the running
+// node re-extends to its cached per-handle write offset with a zero-fill), so
+// the only real fix is to stop generating the noise. These logs bypass the pino
+// logger level (they use the global console directly), so we filter them here.
+// bridge.js's own output uses console.log (untouched) and its two console.warn
+// calls are prefixed "[bridge]" (won't match). Set WHATSAPP_DEBUG=1 to keep the
+// full firehose for troubleshooting. console.error is left intact.
+if (!WHATSAPP_DEBUG) {
+  const _SIGNAL_NOISE = /^(Closing session|Opening session|Removing old closed session|Session already (closed|open)|Migrating session to|Decrypted message with closed session|Closing (open|stale open) session)/;
+  const _filterSignalNoise = (orig) => (...a) => {
+    if (typeof a[0] === 'string' && _SIGNAL_NOISE.test(a[0])) return;
+    orig(...a);
+  };
+  console.info = _filterSignalNoise(console.info.bind(console));
+  console.warn = _filterSignalNoise(console.warn.bind(console));
+}
+
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
 const IMAGE_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'image_cache');
