@@ -623,6 +623,10 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "BookNow е директна резервация" in prompt
     assert "парите ще бъдат възстановени" in prompt
     assert "не като несигурна възможност" in prompt
+    assert "не загатвай, че можеш да завършиш заявка" in prompt
+    assert "Клиентът трябва сам да отвори" in prompt
+    assert "продуктовия public_url" in prompt
+    assert "не повтаряй целия flow" in prompt
     assert "Два ваучера не се обединяват автоматично" in prompt
     assert "Опцията за удължаване е налична" in prompt
     assert "customer-safe обучение от реални email/support казуси" in prompt
