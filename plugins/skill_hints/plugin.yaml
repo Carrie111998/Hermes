@@ -1,0 +1,6 @@
+name: skill_hints
+version: "0.1.0"
+description: "Proactive skill injection. Runs skill_retrieve on every turn, injects top-3 matching skill names as a hint. Zero-cost when no skills match."
+author: NousResearch
+hooks:
+  - pre_llm_call

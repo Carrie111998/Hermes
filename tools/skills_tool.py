@@ -676,20 +676,20 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
-
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
-    List all available skills (progressive disclosure tier 1 - minimal metadata).
+    List available skill categories and counts (progressive disclosure tier 1).
 
-    Returns only name + description to minimize token usage. Use skill_view() to
-    load full content, tags, related files, etc.
+    Returns categories with per-category skill counts. For finding specific
+    skills, use skill_retrieve(query) — it searches semantically. After
+    finding a skill, load it with skill_view(name).
 
     Args:
-        category: Optional category filter (e.g., "mlops")
+        category: Optional category filter — returns individual skills in that category
         task_id: Optional task identifier used to probe the active backend
 
     Returns:
-        JSON string with minimal skill info: name, description, category
+        JSON string with categories + counts, or skills in a specific category.
     """
     try:
         if not SKILLS_DIR.exists():
@@ -718,25 +718,39 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Filter by category if specified
+        # If a specific category is requested, return skills in that category
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
+            all_skills = _sort_skills(all_skills)
+            return json.dumps(
+                {
+                    "success": True,
+                    "skills": all_skills,
+                    "category": category,
+                    "count": len(all_skills),
+                    "hint": "Use skill_view(name) to see full content. Use skill_retrieve(query) for semantic search across all skills.",
+                },
+                ensure_ascii=False,
+            )
 
-        # Sort by category then name
-        all_skills = _sort_skills(all_skills)
-
-        # Extract unique categories
+        # No category: return categories + counts only (compact)
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}
         )
+        cat_counts = {}
+        for s in all_skills:
+            cat = s.get("category", "general")
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
 
         return json.dumps(
             {
                 "success": True,
-                "skills": all_skills,
-                "categories": categories,
-                "count": len(all_skills),
-                "hint": "Use skill_view(name) to see full content, tags, and linked files",
+                "categories": [
+                    {"name": cat, "count": cat_counts.get(cat, 0)}
+                    for cat in categories
+                ],
+                "total_skills": len(all_skills),
+                "hint": "Use skill_retrieve(query) to find skills by task description. Use skill_view(name) to load a skill.",
             },
             ensure_ascii=False,
         )
@@ -1535,7 +1549,11 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": (
+        "List available skill categories and counts. For finding specific skills, "
+        "use skill_retrieve(query) instead — it searches semantically. "
+        "After finding a skill, load it with skill_view(name)."
+    ),
     "parameters": {
         "type": "object",
         "properties": {

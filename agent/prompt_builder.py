@@ -1356,18 +1356,57 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        # ── Compact index: categories + top-N skills by usage ───────
+        # Show every category name (for recall) but only the top 8 most-used
+        # skills with descriptions. The rest are accessible via
+        # skill_retrieve(query). This cuts ~8K tokens vs listing all 264+
+        # skills with descriptions.
+        _TOP_N = 8
+
+        # Flatten all skills with their usage scores for global top-N
+        _all_flat: list[tuple[int, str, str, str]] = []  # (score, category, name, desc)
+        for cat, skills_list in skills_by_category.items():
+            if cat in demoted:
+                continue
+            for name, desc in skills_list:
+                _all_flat.append((_skill_scores.get(name, 0), cat, name, desc))
+        _all_flat.sort(key=lambda x: (-x[0], x[2]))
+
+        # Top-N skills with descriptions
+        _top_names: set[str] = {name for _, _, name, _ in _all_flat[:_TOP_N]}
+
         index_lines = []
+
+        # Merge single-skill categories into "Other" to reduce noise
+        _SINGLE_CAT_MERGE_THRESHOLD = 1  # categories with <=1 skill → merge
+        _merged_skills: list[tuple[str, str]] = []  # (name, desc) for merged
+        _merged_count = 0
+        _categories_to_render: list[str] = []
         for category in sorted(skills_by_category.keys()):
+            cat_len = len(skills_by_category[category])
+            if cat_len <= _SINGLE_CAT_MERGE_THRESHOLD and category not in demoted:
+                for name, desc in skills_by_category[category]:
+                    if name in _top_names:
+                        _merged_skills.append((name, desc))
+                    else:
+                        _merged_skills.append((name, desc))
+                _merged_count += cat_len
+            else:
+                _categories_to_render.append(category)
+
+        # Render multi-skill categories with top-N skills
+        for category in _categories_to_render:
             seen = set()
             if category in demoted:
                 names = sorted({name for name, _ in skills_by_category[category]})
                 index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                 continue
             cat_desc = category_descriptions.get(category, "")
+            cat_count = len(skills_by_category[category])
             if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
+                index_lines.append(f"  {category} ({cat_count}): {cat_desc}")
             else:
-                index_lines.append(f"  {category}:")
+                index_lines.append(f"  {category} ({cat_count}):")
             # Sort by usage score descending, then alphabetically
             cat_skills = sorted(
                 skills_by_category[category],
@@ -1377,12 +1416,29 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
-                if (category, name) in _overflow:
+                if name in _top_names and desc:
+                    index_lines.append(f"    - {name}: {desc}")
+                elif name in _top_names:
                     index_lines.append(f"    - {name}")
-                elif desc:
+                # Skip non-top skills — found via skill_retrieve
+
+        # Merged single-skill categories as a compact line
+        if _merged_count:
+            _merged_top = [(n, d) for n, d in _merged_skills if n in _top_names]
+            _merged_other = [n for n, _ in _merged_skills if n not in _top_names]
+            index_lines.append(f"  other ({_merged_count}):")
+            for name, desc in _merged_top:
+                if desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+            if _merged_other:
+                # Just names, comma-separated
+                _other_str = ", ".join(sorted(_merged_other))
+                # Wrap if too long
+                if len(_other_str) > 500:
+                    _other_str = _other_str[:500] + "..."
+                index_lines.append(f"    (also: {_other_str})")
 
         result = (
             "## Skills (mandatory)\n"
@@ -1410,10 +1466,10 @@ def build_skills_system_prompt(
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
             "\n"
-            "If none of the skills listed above match your task, use "
-            "skill_retrieve(\"what you are trying to do\") — it searches all "
-            "installed skills semantically and returns the best matches with "
-            "descriptions.  This is how you discover skills outside the index.\n"
+            "Only the most-used skills have descriptions above. To find a skill for your "
+            "specific task, use skill_retrieve(\"describe what you are trying to do\") — "
+            "it searches all installed skills semantically and returns the best matches. "
+            "This is how you discover skills not listed with descriptions above.\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
