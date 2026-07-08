@@ -1611,6 +1611,11 @@ class AIAgent:
         if "glm" not in model_lower and provider_lower != "zai":
             return False
         if "ollama" in self._base_url_lower or ":11434" in self._base_url_lower:
+            # ponytail: ollama.com is Ollama *Cloud* (hosted, reports
+            # finish_reason correctly) — must not trigger the local-Ollama
+            # stop-misreport workaround. #60928.
+            if "ollama.com" in self._base_url_lower:
+                return False
             return True
         return provider_lower == "ollama"
 
