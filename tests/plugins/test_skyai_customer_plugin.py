@@ -453,6 +453,76 @@ def test_catalog_search_returns_evidence_metadata_without_recipient_policy(monke
     assert any(item["distance_from_requested_location_km"] is not None for item in result["items"])
 
 
+def test_catalog_search_exposes_diverse_items_without_pruning_ranked_evidence(monkeypatch) -> None:
+    public_tools._CATALOG_INDEX_CACHE["items"] = None
+    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
+
+    def fake_http_json(url: str, *, timeout: float = 8.0):
+        if url.endswith("search="):
+            return {"data": []}
+        return {
+            "data": [
+                {
+                    "id": 1,
+                    "name": "Два дни с каяк на яз. Александър Стамболийски",
+                    "price": "176",
+                    "slug": "каяк/два-дни-с-каяк-яз-александър-стамболийски",
+                    "locationName": "с. Горско Косово",
+                },
+                {
+                    "id": 2,
+                    "name": "Два дни с каяк по Дунав от Никопол до Свищов",
+                    "price": "176",
+                    "slug": "каяк/два-дни-с-каяк-дунав-никопол-свищов",
+                    "locationName": "Свищов",
+                },
+                {
+                    "id": 3,
+                    "name": "Два дни с каяк по Дунав и Янтра",
+                    "price": "176",
+                    "slug": "каяк/два-дни-с-каяк-дунав-янтра",
+                    "locationName": "с. Вардим",
+                },
+                {
+                    "id": 4,
+                    "name": "Два дни ледено катерене на водопад",
+                    "price": "285",
+                    "slug": "ледено-катерене/два-дни-ледено-катерене",
+                    "locationName": "гара Бов",
+                },
+                {
+                    "id": 5,
+                    "name": "Два дни СПА почивка за двама",
+                    "price": "260",
+                    "slug": "спа-и-релакс/два-дни-спа-почивка-за-двама",
+                    "locationName": "Велинград",
+                },
+            ]
+        }
+
+    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+
+    result = public_tools.handle_skyai_catalog_search(
+        query="Искам да поръчаме един билет за два дни",
+        limit=5,
+    )
+
+    assert result["count"] == 5
+    assert [item["category_key"] for item in result["items"][:3]] == ["каяк", "каяк", "каяк"]
+    selection_context = result["selection_context"]
+    assert selection_context["reasoning_owner"] == "hermes"
+    assert "not a mandatory final-answer order" in selection_context["ranked_items_contract"]
+    assert selection_context["repeated_categories"][0]["category_key"] == "каяк"
+    assert selection_context["repeated_categories"][0]["count"] == 3
+    diverse_items = selection_context["diverse_items"]
+    assert [item["category_key"] for item in diverse_items[:3]] == [
+        "каяк",
+        "ледено катерене",
+        "спа и релакс",
+    ]
+    assert {item["title"] for item in diverse_items} == {item["title"] for item in result["items"]}
+
+
 def test_catalog_search_does_not_prune_far_or_childlike_options_in_backend(monkeypatch) -> None:
     public_tools._CATALOG_INDEX_CACHE["items"] = None
     public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0

@@ -534,6 +534,65 @@ def _catalog_location_context(items: list[dict[str, Any]], evidence: QueryEviden
     }
 
 
+def _catalog_selection_context(items: list[dict[str, Any]]) -> dict[str, Any]:
+    category_order: list[str] = []
+    category_counts: dict[str, int] = {}
+    category_examples: dict[str, list[str]] = {}
+    for item in items:
+        category_key = str(item.get("_skyai_category_key") or _product_family_key(item) or "uncategorized")
+        if category_key not in category_counts:
+            category_order.append(category_key)
+            category_counts[category_key] = 0
+            category_examples[category_key] = []
+        category_counts[category_key] += 1
+        title = str(item.get("title") or item.get("name") or "").strip()
+        if title and len(category_examples[category_key]) < 3:
+            category_examples[category_key].append(title)
+    repeated_categories = [
+        {"category_key": key, "count": category_counts[key], "examples": category_examples[key]}
+        for key in category_order
+        if category_counts[key] > 1
+    ]
+    return {
+        "reasoning_owner": "hermes",
+        "ranked_items_contract": (
+            "items are relevance-ranked evidence; they are not a mandatory final-answer order."
+        ),
+        "diverse_items_contract": (
+            "diverse_items keeps the same public evidence but interleaves activity families so Hermes can "
+            "avoid accidental same-family clusters when the customer's request is exploratory."
+        ),
+        "selection_guidance": (
+            "Use judgment. If the customer is still exploring, start with different gift/activity families "
+            "and ask a natural narrowing question. If the customer clearly wants one activity family, "
+            "similar options are fine."
+        ),
+        "category_mix": [
+            {"category_key": key, "count": category_counts[key]}
+            for key in category_order
+        ],
+        "repeated_categories": repeated_categories,
+        "diverse_items": [_sanitize_product_summary(item) for item in _diverse_catalog_items(items)],
+    }
+
+
+def _diverse_catalog_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    category_order: list[str] = []
+    for item in items:
+        category_key = str(item.get("_skyai_category_key") or _product_family_key(item) or "uncategorized")
+        if category_key not in buckets:
+            category_order.append(category_key)
+            buckets[category_key] = []
+        buckets[category_key].append(item)
+    diverse: list[dict[str, Any]] = []
+    while any(buckets[key] for key in category_order):
+        for key in category_order:
+            if buckets[key]:
+                diverse.append(buckets[key].pop(0))
+    return diverse
+
+
 def _catalog_query_evidence(evidence: QueryEvidence) -> dict[str, Any]:
     return {
         "tokens": evidence.tokens[:20],
@@ -862,6 +921,7 @@ def handle_skyai_catalog_search(
         "count": len(items),
         "query_evidence": _catalog_query_evidence(evidence),
         "location_context": _catalog_location_context(items, evidence),
+        "selection_context": _catalog_selection_context(items),
         "value_voucher_option": _catalog_value_voucher_option(),
         "items": [_sanitize_product_summary(item) for item in items],
     }
