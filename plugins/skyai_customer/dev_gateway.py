@@ -53,6 +53,33 @@ DISCORD_TEST_THREAD_PREFIX = "🧪 TEST · "
 DISCORD_VOICE_THREAD_PREFIX = "🎙️ Voice SkyAI · "
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
+MAX_CARD_CANDIDATE_LINKS = 8
+CARD_TOKEN_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "skyvision",
+        "com",
+        "https",
+        "подарък",
+        "или",
+        "като",
+        "висок",
+        "клас",
+        "край",
+        "над",
+        "под",
+        "през",
+        "със",
+        "за",
+        "на",
+        "в",
+        "с",
+        "и",
+        "до",
+        "от",
+    }
+)
 BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
 BUILD_COMMIT_FILE = ".skyai-build-commit"
 DEFAULT_VOICE_BACKEND_TARGET = "skyai_v2_chatkit"
@@ -2298,9 +2325,76 @@ def build_cards_from_reply(reply: str, *, limit: int = MAX_VISIBLE_PRODUCT_CARDS
         card = _card_from_product_url(url)
         if card:
             cards.append(card)
-        if len(cards) >= limit:
+        if len(cards) >= max(limit, MAX_CARD_CANDIDATE_LINKS):
             break
-    return cards
+    return _select_visible_cards(cards, limit)
+
+
+def _select_visible_cards(cards: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    if limit <= 0 or not cards:
+        return []
+    if len(cards) <= limit:
+        return cards[:limit]
+
+    selected: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    for index, card in enumerate(cards):
+        if len(selected) >= limit:
+            break
+        remaining_slots = limit - len(selected)
+        remaining_after = len(cards) - index - 1
+        similarity = _card_similarity_score(card, selected)
+        if selected and similarity >= 2 and remaining_after >= remaining_slots:
+            deferred.append(card)
+            continue
+        selected.append(card)
+
+    for card in deferred:
+        if len(selected) >= limit:
+            break
+        selected.append(card)
+    return selected
+
+
+def _card_similarity_score(card: dict[str, Any], selected: list[dict[str, Any]]) -> int:
+    tokens = _card_similarity_tokens(card)
+    family = _card_url_family(card)
+    primary_family = _card_primary_family(card)
+    score = 0
+    for existing in selected:
+        existing_tokens = _card_similarity_tokens(existing)
+        candidate = len(tokens & existing_tokens)
+        if family and family == _card_url_family(existing):
+            candidate += 3
+        elif primary_family and primary_family == _card_primary_family(existing):
+            candidate += 2
+        score = max(score, candidate)
+    return score
+
+
+def _card_similarity_tokens(card: dict[str, Any]) -> set[str]:
+    text = str(card.get("title") or "").casefold()
+    location_tokens = set(re.findall(r"[\wа-яА-ЯёЁ]+", str(card.get("location") or "").casefold()))
+    return {
+        token
+        for token in re.findall(r"[\wа-яА-ЯёЁ]+", text)
+        if len(token) > 2
+        and token not in CARD_TOKEN_STOPWORDS
+        and token not in location_tokens
+    }
+
+
+def _card_url_family(card: dict[str, Any]) -> str:
+    url = str(card.get("public_url") or card.get("url") or "").strip()
+    path = public_tools.normalize_product_path(product_url=url)
+    if not path:
+        return ""
+    return path.split("/", 1)[0]
+
+
+def _card_primary_family(card: dict[str, Any]) -> str:
+    family = _card_url_family(card)
+    return family.split("-", 1)[0] if family else ""
 
 
 def _extract_product_urls(reply: str) -> list[str]:

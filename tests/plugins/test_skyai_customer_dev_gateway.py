@@ -727,6 +727,35 @@ def test_build_cards_from_reply_caps_visible_product_cards(monkeypatch) -> None:
     assert [card["title"] for card in cards] == ["one", "two", "three"]
 
 
+def test_build_cards_from_reply_prefers_diverse_visible_cards_when_extra_links_exist(monkeypatch) -> None:
+    details = {
+        "https://skyvision.bg/подарък/офроуд-атв-под-наем/one/": "Офроуд разходка с АТВ до Пловдив",
+        "https://skyvision.bg/подарък/приключения-с-мотор/two/": "ОФРОУД ТУР С ЕЛЕКТРИЧЕСКИ МОТОР край Пловдив",
+        "https://skyvision.bg/подарък/ирисова-фотография/three/": "Ирисова фотография в Пловдив",
+        "https://skyvision.bg/подарък/терапия/four/": "Терапия за мъже в Пловдив",
+    }
+
+    def fake_detail(product_url="", product_path=""):
+        return {
+            "status": "ok",
+            "detail": {
+                "title": details[product_url],
+                "public_url": product_url,
+                "price_eur": "40.00",
+            },
+        }
+
+    monkeypatch.setattr(dev_gateway.public_tools, "handle_skyai_product_detail", fake_detail)
+
+    cards = dev_gateway.build_cards_from_reply(" ".join(details.keys()))
+
+    assert [card["title"] for card in cards] == [
+        "Офроуд разходка с АТВ до Пловдив",
+        "Ирисова фотография в Пловдив",
+        "Терапия за мъже в Пловдив",
+    ]
+
+
 def test_resolve_profile_runtime_reads_model_dict() -> None:
     runtime = dev_gateway._resolve_profile_runtime(
         {
