@@ -1297,26 +1297,60 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
-    # Posture-driven category demotion (e.g. non-coding skills while pairing
-    # on code). Demoted categories stay in the index as a single names-only
-    # line — descriptions are dropped to cut noise, but every skill name
-    # remains visible so memory-anchored recall ("load <name>") keeps working.
-    # NEVER remove entries entirely: agent-created skills are the model's
-    # project memory, and models don't reach for skills_list to rediscover
-    # what the index stops showing them. Match on the top-level category
-    # segment so nested categories ("social-media/twitter") are demoted with
-    # their parent.
+    # ── Usage-based skill scoring ──────────────────────────────────────
+    # Skills are sorted by activity count (use + view + patch) so the most
+    # frequently used skills appear first within each category.  When
+    # skills.max_index_entries is set, skills beyond the cap are demoted to
+    # name-only entries (still loadable, just no description).
+    _skill_scores: dict[str, int] = {}
+    _max_entries = 0
+    try:
+        from tools.skill_usage import load_usage, activity_count
+        _usage = load_usage()
+        _skill_scores = {name: activity_count(rec) for name, rec in _usage.items()}
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _skills_cfg = _cfg.get("skills", {}) if isinstance(_cfg, dict) else {}
+        _max_entries = int(_skills_cfg.get("max_index_entries", 0) or 0)
+    except Exception:
+        pass
+
+    # ── Posture-driven category demotion ───────────────────────────────
+    # Demoted categories (coding posture) render as a single names-only line.
+    # Overflow skills (usage cap) are tracked per (category, name) and render
+    # as individual name-only entries.  Both keep every skill name visible.
     demoted = frozenset(
         cat for cat in skills_by_category
         if cat.split("/", 1)[0] in (compact_categories or frozenset())
     )
 
+    # Build overflow set: skills beyond the cap (sorted by score desc)
+    _overflow: set[tuple[str, str]] = set()
+    if _max_entries > 0:
+        _flat: list[tuple[int, str, str]] = []
+        for cat, skills in skills_by_category.items():
+            if cat in demoted:
+                continue
+            for name, _desc in skills:
+                _flat.append((_skill_scores.get(name, 0), cat, name))
+        _flat.sort(key=lambda x: (-x[0], x[1], x[2]))
+        for _, cat, name in _flat[_max_entries:]:
+            _overflow.add((cat, name))
+
     hidden_note = ""
     if demoted:
-        hidden_note = (
+        hidden_note += (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
             "normally and load with skill_view(name) as usual.)"
+        )
+    if _overflow:
+        hidden_note += (
+            f"\n({len(_overflow)} skills beyond the {_max_entries}-entry cap "
+            f"are listed as name-only — load with skill_view(name) as usual.)"
         )
 
     if not skills_by_category:
@@ -1324,7 +1358,6 @@ def build_skills_system_prompt(
     else:
         index_lines = []
         for category in sorted(skills_by_category.keys()):
-            # Deduplicate and sort skills within each category
             seen = set()
             if category in demoted:
                 names = sorted({name for name, _ in skills_by_category[category]})
@@ -1335,11 +1368,18 @@ def build_skills_system_prompt(
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+            # Sort by usage score descending, then alphabetically
+            cat_skills = sorted(
+                skills_by_category[category],
+                key=lambda x: (-_skill_scores.get(x[0], 0), x[0])
+            )
+            for name, desc in cat_skills:
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
+                if (category, name) in _overflow:
+                    index_lines.append(f"    - {name}")
+                elif desc:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
@@ -1369,6 +1409,11 @@ def build_skills_system_prompt(
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
+            "\n"
+            "If none of the skills listed above match your task, use "
+            "skill_retrieve(\"what you are trying to do\") — it searches all "
+            "installed skills semantically and returns the best matches with "
+            "descriptions.  This is how you discover skills outside the index.\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note

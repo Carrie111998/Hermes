@@ -1610,3 +1610,58 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
+
+
+# ── skill_retrieve — semantic search over installed skills ────────────
+
+_skill_retrieve_handler = None  # type: ignore[assignment]
+
+
+def _skill_retrieve_loaded(args, **kw):
+    """Import skill_retrieve lazily — its deps (sentence-transformers, numpy)
+    are optional and may not be installed."""
+    global _skill_retrieve_handler
+    if _skill_retrieve_handler is None:
+        from tools.skill_retrieve_tool import skill_retrieve as _sr
+        _skill_retrieve_handler = _sr
+    return _skill_retrieve_handler(
+        query=args.get("query", ""),
+        top_k=args.get("top_k", 5),
+        _task_id=kw.get("task_id"),
+    )
+
+
+SKILL_RETRIEVE_SCHEMA = {
+    "name": "skill_retrieve",
+    "description": (
+        "Semantic skill search. Pass a natural language description of your task "
+        "(e.g. 'deploy a docker container', 'load a VRM model', 'humanize AI text') "
+        "and get the top matching skills with descriptions. "
+        "Use this instead of skills_list when you know what kind of skill you need "
+        "but don't know the exact name. After finding a skill, load it with skill_view(name)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural language description of what you're trying to do. Be specific about the task, domain, or problem.",
+            },
+            "top_k": {
+                "type": "integer",
+                "description": "Number of results (default: 5, max: 20)",
+                "default": 5,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+registry.register(
+    name="skill_retrieve",
+    toolset="skills",
+    schema=SKILL_RETRIEVE_SCHEMA,
+    handler=_skill_retrieve_loaded,
+    check_fn=check_skills_requirements,
+    emoji="🔍",
+)
