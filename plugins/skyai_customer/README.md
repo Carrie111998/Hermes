@@ -25,7 +25,7 @@ customer-visible template logic, or one-off phrase guards around Hermes.
 SkyAI has two version markers:
 
 - `version` is the technical runtime line, for example `skyai-hermes-v2.canary`.
-- `behavior_version` is the customer-facing behavior line, for example `v2.1`.
+- `behavior_version` is the customer-facing behavior line, for example `v2.2`.
 
 Increase `behavior_version` only for meaningful behavior changes: new customer
 knowledge domains, sales/support policy changes, prompt architecture changes,
@@ -38,6 +38,9 @@ Current line:
 - `v2.0` - initial SkyAI Hermes v2 canary baseline.
 - `v2.1` - BookNow/checkout completion boundary, voice handoff behavior, and
   recent customer-safe business knowledge refinements.
+- `v2.2` - catalog selection context for broad searches: Hermes receives
+  diverse evidence ordering, category mix, and repeated-category signals
+  without backend pruning or keyword routing.
 
 ## Voice Contract
 
