@@ -20,6 +20,25 @@ Hermes reasons; this backend provides public facts, structured evidence,
 transport, cards, and safety boundaries. Do not add keyword routers,
 customer-visible template logic, or one-off phrase guards around Hermes.
 
+## Behavior Versioning
+
+SkyAI has two version markers:
+
+- `version` is the technical runtime line, for example `skyai-hermes-v2.canary`.
+- `behavior_version` is the customer-facing behavior line, for example `v2.1`.
+
+Increase `behavior_version` only for meaningful behavior changes: new customer
+knowledge domains, sales/support policy changes, prompt architecture changes,
+voice behavior changes, or changes that affect what customers see/hear. Do not
+increase it for formatting-only fixes, tests, refactors, logging, deployment
+wiring, or typo-only patches.
+
+Current line:
+
+- `v2.0` - initial SkyAI Hermes v2 canary baseline.
+- `v2.1` - BookNow/checkout completion boundary, voice handoff behavior, and
+  recent customer-safe business knowledge refinements.
+
 ## Voice Contract
 
 Future PBX/voice work is documented in `docs/skyai-voice-contract-v0.1.md`.

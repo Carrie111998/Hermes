@@ -124,9 +124,12 @@ async def test_build_chat_response_dry_run_returns_fab_compatible_shape(tmp_path
     )
 
     assert response["status"] == "ok"
+    assert response["version"] == dev_gateway.VERSION
+    assert response["behavior_version"] == dev_gateway.SKYAI_BEHAVIOR_VERSION
     assert response["conversation_id"] == "c1"
     assert response["cards"] == []
     assert response["trace"]["runtime"] == "hermes_agent"
+    assert response["trace"]["behavior_version"] == dev_gateway.SKYAI_BEHAVIOR_VERSION
     assert response["trace"]["toolset"] == "skyai_customer"
     assert response["trace"]["live_model"] is False
     assert "dry-run" in response["reply"]
@@ -786,6 +789,7 @@ def test_format_discord_mirror_message_uses_customer_visible_shape() -> None:
         {
             "status": "ok",
             "version": "v-test",
+            "behavior_version": "v2.1",
             "conversation_id": "c1",
             "reply": "Имаме чудесни идеи.",
             "trace": {
@@ -802,6 +806,8 @@ def test_format_discord_mirror_message_uses_customer_visible_shape() -> None:
     assert "**SkyAI**" in message
     assert "Търся подарък" in message
     assert "Имаме чудесни идеи." in message
+    assert "version=v2.1" in message
+    assert "runtime_version=v-test" in message
     assert "toolset=skyai_customer" in message
 
 

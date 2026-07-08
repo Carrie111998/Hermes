@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - exercised by runtime health checks
 
 
 VERSION = "skyai-hermes-v2.canary"
+SKYAI_BEHAVIOR_VERSION = "v2.1"
 SKYAI_TOOLSET = "skyai_customer"
 SKYAI_PLUGIN_KEY = "skyai-customer"
 DEFAULT_HOST = "127.0.0.1"
@@ -116,6 +117,7 @@ class CanarySettings:
     allow_public_bind: bool = False
     auth_token: str = ""
     version: str = VERSION
+    behavior_version: str = SKYAI_BEHAVIOR_VERSION
     discord_mirror_enabled: bool = False
     discord_mirror_bot_token: str = ""
     discord_mirror_channel_id: str = ""
@@ -1647,6 +1649,7 @@ async def build_chat_response(
             "status": "error",
             "error": "empty_message",
             "version": settings.version,
+            "behavior_version": settings.behavior_version,
         }
 
     history = extract_history(payload)
@@ -1670,11 +1673,13 @@ async def build_chat_response(
     response = {
         "status": "ok",
         "version": settings.version,
+        "behavior_version": settings.behavior_version,
         "conversation_id": conversation_id,
         "reply": reply,
         "cards": cards,
         "trace": {
             "runtime": "hermes_agent",
+            "behavior_version": settings.behavior_version,
             "profile_home": str(settings.profile_home),
             "toolset": SKYAI_TOOLSET,
             "live_model": settings.live_model,
@@ -1808,6 +1813,7 @@ async def build_voice_turn_response(
             "status": "error",
             "error": "invalid_voice_backend_target",
             "version": settings.version,
+            "behavior_version": settings.behavior_version,
             "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
             "call_id": call_id,
             "conversation_id": conversation_id,
@@ -1826,6 +1832,7 @@ async def build_voice_turn_response(
             "session_state": {"handoff_allowed": True},
             "trace": {
                 "runtime": "skyai_voice_adapter",
+                "behavior_version": settings.behavior_version,
                 "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
                 "backend_target": target,
                 "raw_audio_stored": False,
@@ -2045,6 +2052,7 @@ def _voice_response(
         raise ValueError(f"unsupported voice action: {action}")
     trace = {
         "runtime": "skyai_voice_adapter",
+        "behavior_version": settings.behavior_version,
         "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
         "backend_target": _voice_backend_target(payload, settings),
         "raw_audio_stored": False,
@@ -2062,6 +2070,7 @@ def _voice_response(
     return {
         "status": "ok",
         "version": settings.version,
+        "behavior_version": settings.behavior_version,
         "contract_version": voice_contract.VOICE_CONTRACT_VERSION,
         "call_id": call_id,
         "conversation_id": conversation_id,
@@ -2390,8 +2399,9 @@ def format_discord_mirror_message(
     conversation_id = str(response.get("conversation_id") or conversation_id_from_payload(request_payload))
     origin = classify_discord_conversation(request_payload, conversation_id)
     trace = response.get("trace") if isinstance(response.get("trace"), dict) else {}
+    version_line = _discord_version_line(response, trace)
     service_line = (
-        f"status={response.get('status')} · version={response.get('version')} · "
+        f"status={response.get('status')} · {version_line} · "
         f"runtime={trace.get('runtime')} · toolset={trace.get('toolset')} · "
         f"live_model={trace.get('live_model')} · fallback={trace.get('fallback')} · "
         f"latency_ms={trace.get('latency_ms')} · origin_class={origin.get('kind')} · "
@@ -2422,12 +2432,13 @@ def format_voice_discord_mirror_message(
     origin = classify_voice_discord_conversation(request_payload, conversation_id)
     trace = response.get("trace") if isinstance(response.get("trace"), dict) else {}
     transfer = response.get("transfer") if isinstance(response.get("transfer"), dict) else {}
+    version_line = _discord_version_line(response, trace)
     transcript = extract_voice_transcript(request_payload)
     spoken_reply = str(response.get("spoken_reply") or "").strip()
     display_reply = str(response.get("display_reply") or spoken_reply or "").strip()
     metadata_line = _voice_discord_metadata_line(request_payload, response, trace)
     service_line = (
-        f"status={response.get('status')} · version={response.get('version')} · "
+        f"status={response.get('status')} · {version_line} · "
         f"stage={stage} · action={response.get('action')} · "
         f"transfer_target={transfer.get('target') or response.get('target')} · "
         f"transfer_reason={transfer.get('reason') or response.get('transfer_reason')} · "
@@ -2448,6 +2459,14 @@ def format_voice_discord_mirror_message(
         f"**Служебно**\n`{service_line}`"
     )
     return _truncate_for_discord(content)
+
+
+def _discord_version_line(response: dict[str, Any], trace: dict[str, Any]) -> str:
+    behavior_version = response.get("behavior_version") or trace.get("behavior_version")
+    runtime_version = response.get("version")
+    if behavior_version and runtime_version:
+        return f"version={behavior_version} · runtime_version={runtime_version}"
+    return f"version={behavior_version or runtime_version}"
 
 
 def _voice_discord_metadata_line(
@@ -2663,6 +2682,7 @@ async def build_compare_response(
             "status": "error",
             "error": "compare_prod_not_configured",
             "version": settings.version,
+            "behavior_version": settings.behavior_version,
         }
     dev_response = await build_chat_response(payload, settings, agent_runner)
     prod_caller = prod_caller or _call_prod_skyai
@@ -2673,6 +2693,7 @@ async def build_compare_response(
     return {
         "status": "ok",
         "version": settings.version,
+        "behavior_version": settings.behavior_version,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "question": extract_message(payload),
         "dev_v2": _compact_compare_side(dev_response),
@@ -2713,6 +2734,7 @@ def _compact_compare_side(response: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": response.get("status"),
         "version": response.get("version"),
+        "behavior_version": response.get("behavior_version") or trace.get("behavior_version"),
         "reply": response.get("reply") or response.get("reason") or response.get("error"),
         "cards_count": len(cards),
         "cards": cards,
@@ -2781,6 +2803,7 @@ def create_app(
                 "status": "ok",
                 "service": "skyai-hermes-v2-canary",
                 "version": settings.version,
+                "behavior_version": settings.behavior_version,
                 "build_commit": settings.build_commit,
                 "live_model": settings.live_model,
             }
@@ -2790,6 +2813,7 @@ def create_app(
         return web.json_response(
             {
                 "version": settings.version,
+                "behavior_version": settings.behavior_version,
                 "runtime": "hermes_agent",
                 "profile_home": str(settings.profile_home),
                 "toolset": SKYAI_TOOLSET,
@@ -2821,6 +2845,7 @@ def create_app(
                     "status": "error",
                     "error": "agent_runtime_error",
                     "version": settings.version,
+                    "behavior_version": settings.behavior_version,
                     "reason": sanitize_runtime_error(exc),
                 },
                 status=502,
@@ -2876,6 +2901,7 @@ def create_app(
                     "status": "error",
                     "error": "voice_adapter_error",
                     "version": settings.version,
+                    "behavior_version": settings.behavior_version,
                     "reason": sanitize_runtime_error(exc),
                 },
                 status=502,
