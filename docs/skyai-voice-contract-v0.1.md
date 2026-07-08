@@ -137,10 +137,12 @@ a realtime lane after the turn-based MVP:
 
 OpenAI's Realtime API is the strongest OpenAI-native candidate for this lane:
 official docs position realtime sessions as the path for live audio that needs
-low latency, with `gpt-realtime-2` for low-latency voice agents and
-`gpt-realtime-whisper` for streaming transcription. The same docs also expose
-SIP as an option for telephony voice agents, but that path uses OpenAI API
-authentication and project/SIP configuration.
+low latency. For SkyAI evaluation, the default candidate is
+`gpt-realtime-2.1`, with `gpt-realtime-2` kept as a configured fallback and
+`gpt-realtime-whisper` as the transcription candidate where a separate
+streaming transcription lane is useful. The same docs also expose SIP as an
+option for telephony voice agents, but that path uses OpenAI API authentication
+and project/SIP configuration.
 
 ### Hybrid OpenAI API audio + Hermes/OAuth reasoning
 
@@ -201,6 +203,52 @@ The live smoke sends one short Bulgarian text sample through TTS, feeds the
 generated audio back through STT, reports latency and transcript, and deletes
 the generated audio by default. It does not call SkyAI, PBX, SIP, RTP, Discord,
 Shopify, vouchers, orders, payments, or production traffic.
+
+### Realtime OpenAI API voice + SkyAI v2 brain
+
+Approved low-latency evaluation lane:
+
+```text
+PBX/SIP media gateway
+  -> OpenAI Realtime speech-to-speech session
+       - live audio turn-taking
+       - VAD/endpointing
+       - barge-in
+       - brief natural spoken preambles when needed
+  -> SkyAI v2 Hermes tool brain
+       - catalog/product/slot/campaign/support knowledge
+       - customer-safe voice behavior
+       - structured transfer_to_human action
+  -> OpenAI Realtime audio back to caller
+```
+
+This lane is meant to remove the robotic repeated filler loop from the
+turn-based MVP. In Realtime mode, gateway must not keep playing generic
+template phrases while waiting for SkyAI. If a short "проверявам" style bridge
+is needed, it is owned by the Realtime model and must be contextual, brief, and
+non-repetitive.
+
+SkyAI v2 remains the business/knowledge brain behind the voice layer. The
+Realtime gateway must not add keyword guards, keyword routers, or hidden
+business classifiers around Hermes. It should pass conversation state and tool
+results through the contract and let SkyAI v2 decide the business answer,
+including when a human transfer is needed through the structured voice action.
+
+Validate the non-secret Realtime setup separately:
+
+```bash
+python scripts/skyai_voice_openai_realtime_preflight.py --json
+```
+
+For deployment gates where the key must already be present:
+
+```bash
+python scripts/skyai_voice_openai_realtime_preflight.py --require-key
+```
+
+The preflight does not open a WebSocket, call OpenAI, process audio, touch PBX,
+or print the key. It verifies model, voice, audio formats, turn detection,
+barge-in requirement, and the SkyAI v2 brain target.
 
 ### OAuth through Pro account boundary
 
@@ -410,10 +458,10 @@ For a more natural assistant, test a realtime lane:
 - streaming transcript deltas;
 - no full-turn silence before the assistant starts preparing the response.
 
-OpenAI Realtime with `gpt-realtime-2` is the preferred OpenAI evaluation
-candidate once API billing is approved. If we need no OpenAI API billing during
-MVP, evaluate local or non-OpenAI STT/TTS providers behind the same gateway
-contract.
+OpenAI Realtime with `gpt-realtime-2.1` is the preferred OpenAI evaluation
+candidate once API billing is approved, with `gpt-realtime-2` kept as a
+configured fallback. If we need no OpenAI API billing during MVP, evaluate
+local or non-OpenAI STT/TTS providers behind the same gateway contract.
 
 ## Privacy And GDPR
 

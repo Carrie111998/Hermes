@@ -80,9 +80,12 @@ VOICE_PROVIDER_LANES: dict[str, dict[str, str]] = {
     },
     "openai_realtime_api": {
         "purpose": "lowest_latency_speech_to_speech_candidate",
-        "model": "gpt-realtime-2",
+        "model": "gpt-realtime-2.1",
+        "fallback_model": "gpt-realtime-2",
         "transcription_model": "gpt-realtime-whisper",
         "auth": "openai_api_key_or_short_lived_access_token",
+        "skyai_brain": "skyai_v2_hermes_tools",
+        "gateway_repeated_filler_phrases_allowed": "false",
     },
 }
 

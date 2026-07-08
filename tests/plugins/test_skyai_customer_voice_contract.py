@@ -6,6 +6,7 @@ from plugins.skyai_customer import voice_audio, voice_contract
 from scripts import skyai_voice_contract_smoke
 from scripts import skyai_voice_openai_audio_preflight
 from scripts import skyai_voice_openai_audio_smoke
+from scripts import skyai_voice_openai_realtime_preflight
 
 
 VOICE_DOC_PATH = Path("docs/skyai-voice-contract-v0.1.md")
@@ -73,9 +74,12 @@ def test_voice_contract_documents_oauth_and_openai_api_boundary() -> None:
         lanes["hybrid_openai_api_audio_codex_oauth_reasoning"]["key_env"]
         == "VOICE_TOOLS_OPENAI_KEY"
     )
-    assert lanes["openai_realtime_api"]["model"] == "gpt-realtime-2"
+    assert lanes["openai_realtime_api"]["model"] == "gpt-realtime-2.1"
+    assert lanes["openai_realtime_api"]["fallback_model"] == "gpt-realtime-2"
     assert lanes["openai_realtime_api"]["transcription_model"] == "gpt-realtime-whisper"
     assert lanes["openai_realtime_api"]["auth"] == "openai_api_key_or_short_lived_access_token"
+    assert lanes["openai_realtime_api"]["skyai_brain"] == "skyai_v2_hermes_tools"
+    assert lanes["openai_realtime_api"]["gateway_repeated_filler_phrases_allowed"] == "false"
 
 
 def test_voice_audio_preflight_uses_dedicated_audio_key_without_printing_secret() -> None:
@@ -126,10 +130,46 @@ def test_voice_audio_preflight_declares_hybrid_models_and_gateway_latency_maskin
     assert result["openai"]["stt_fast_model"] == "gpt-4o-mini-transcribe"
     assert result["openai"]["tts_model"] == "gpt-4o-mini-tts"
     assert result["openai"]["tts_voice"] == "cedar"
+    assert result["openai"]["realtime_model"] == "gpt-realtime-2.1"
+    assert result["openai"]["realtime_fallback_model"] == "gpt-realtime-2"
+    assert result["openai"]["realtime_voice"] == "marin"
     assert result["openai"]["realtime_transcription_model"] == "gpt-realtime-whisper"
     assert result["voice_gateway_contract"]["reasoning_path_unchanged"] is True
+    assert result["realtime_layer"]["skyai_brain"] == "skyai_v2_hermes_tools"
+    assert result["realtime_layer"]["keyword_guards_allowed"] is False
+    assert result["realtime_layer"]["gateway_repeated_filler_phrases_allowed"] is False
     assert result["latency_masking"]["gateway_owned"] is True
+    assert result["latency_masking"]["deprecated_for_realtime"] is True
     assert result["latency_masking"]["first_filler_after_ms"] == 900
+
+
+def test_voice_realtime_preflight_declares_live_voice_layer_without_secret_leak() -> None:
+    result = voice_audio.voice_realtime_preflight(
+        voice_audio.load_voice_audio_settings(
+            {
+                "VOICE_TOOLS_OPENAI_KEY": "sk-realtime-secret",
+                "SKYAI_VOICE_REALTIME_VOICE": "cedar",
+                "SKYAI_VOICE_REALTIME_BACKEND_TARGET": "skyai_v2_chatkit",
+            }
+        )
+    )
+
+    assert result["status"] == "pass"
+    assert result["provider_lane"] == "openai_realtime_speech_to_speech_skyai_v2_tools"
+    assert result["api_key"] == {
+        "configured": True,
+        "env": "VOICE_TOOLS_OPENAI_KEY",
+        "value_printed": False,
+    }
+    assert result["openai_realtime"]["model"] == "gpt-realtime-2.1"
+    assert result["openai_realtime"]["fallback_model"] == "gpt-realtime-2"
+    assert result["openai_realtime"]["voice"] == "cedar"
+    assert result["skyai_brain"]["runtime"] == "skyai_v2_hermes"
+    assert result["skyai_brain"]["keyword_guards_allowed"] is False
+    assert result["conversation_behavior"]["live_speech_to_speech"] is True
+    assert result["conversation_behavior"]["barge_in_required"] is True
+    assert result["conversation_behavior"]["gateway_repeated_filler_phrases_allowed"] is False
+    assert "sk-realtime-secret" not in str(result)
 
 
 def test_voice_privacy_defaults_are_safe_by_default() -> None:
@@ -171,6 +211,7 @@ def test_voice_contract_doc_documents_low_latency_and_oauth_tradeoffs() -> None:
     compact_text = " ".join(text.split())
 
     assert "lowest latency" in text
+    assert "gpt-realtime-2.1" in text
     assert "gpt-realtime-2" in text
     assert "gpt-realtime-whisper" in text
     assert "ChatGPT Pro OAuth" in text
@@ -178,6 +219,9 @@ def test_voice_contract_doc_documents_low_latency_and_oauth_tradeoffs() -> None:
     assert "OpenAI API billing" in text
     assert "Hybrid OpenAI API audio + Hermes/OAuth reasoning" in text
     assert "VOICE_TOOLS_OPENAI_KEY" in text
+    assert "Realtime OpenAI API voice + SkyAI v2 brain" in text
+    assert "gateway must not keep playing generic template phrases" in compact_text
+    assert "must not add keyword guards" in compact_text
 
 
 def test_voice_gate_registers_http_adapter_only_no_pbx_audio_stack() -> None:
@@ -280,6 +324,33 @@ def test_openai_audio_preflight_cli_never_prints_secret(monkeypatch, capsys) -> 
     assert "api_key_configured=true" in output
     assert "VOICE_TOOLS_OPENAI_KEY" in output
     assert "sk-super-secret" not in output
+
+
+def test_openai_realtime_preflight_cli_never_prints_secret(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("VOICE_TOOLS_OPENAI_KEY", "sk-realtime-secret")
+
+    exit_code = skyai_voice_openai_realtime_preflight.main([])
+
+    output = capsys.readouterr().out
+    assert exit_code == 0
+    assert "SkyAI OpenAI Realtime voice preflight: PASS" in output
+    assert "api_key_configured=true" in output
+    assert "VOICE_TOOLS_OPENAI_KEY" in output
+    assert "model:gpt-realtime-2.1" in output
+    assert "keyword_guards_allowed:false" in output
+    assert "gateway_repeated_filler_phrases_allowed:false" in output
+    assert "sk-realtime-secret" not in output
+
+
+def test_openai_realtime_preflight_blocks_without_key(monkeypatch, capsys) -> None:
+    monkeypatch.delenv("VOICE_TOOLS_OPENAI_KEY", raising=False)
+
+    exit_code = skyai_voice_openai_realtime_preflight.main(["--require-key"])
+
+    output = capsys.readouterr().out
+    assert exit_code == 2
+    assert "SkyAI OpenAI Realtime voice preflight: BLOCKED" in output
+    assert "api_key_configured=false" in output
 
 
 def test_openai_audio_live_smoke_blocks_without_key(monkeypatch, capsys) -> None:

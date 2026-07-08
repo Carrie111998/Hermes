@@ -150,8 +150,20 @@ python scripts/skyai_voice_openai_audio_preflight.py --require-key
 
 Initial audio candidates are `gpt-4o-transcribe`,
 `gpt-4o-mini-transcribe`, `gpt-4o-mini-tts`, and the voice candidates
-documented in `docs/skyai-voice-contract-v0.1.md`. Realtime remains a later
-canary behind the same voice gateway contract.
+documented in `docs/skyai-voice-contract-v0.1.md`.
+
+For the approved low-latency canary, validate the Realtime configuration
+separately. This does not call OpenAI, open a WebSocket, process audio, touch
+PBX/SIP/RTP, or print secrets:
+
+```bash
+python scripts/skyai_voice_openai_realtime_preflight.py --require-key
+```
+
+Realtime voice uses OpenAI for the live audio loop and keeps SkyAI v2 as the
+Hermes knowledge/tool brain. Gateway-owned repeated filler phrases are not
+allowed in this lane; any short spoken bridge while tools run must be
+contextual and model-owned.
 
 Voice calls are mirrored by the same DEV Discord sidecar when
 `SKYAI_DISCORD_MIRROR_ENABLED=true` and
