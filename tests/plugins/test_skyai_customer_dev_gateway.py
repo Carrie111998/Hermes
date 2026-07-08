@@ -610,6 +610,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "EUR е основната цена" in prompt
     assert "Catalog tool-ът връща кандидати" in prompt
     assert "не е заповед какво да кажеш" in prompt
+    assert "първите 3 видими links/cards" in prompt
     assert "приеми, че близостта е важна" in prompt
     assert "nearest_returned_items" in prompt
     assert "чак след това попитай дали може да разшириш" in prompt
@@ -621,6 +622,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "независимо къде е основната закупена услуга" in prompt
     assert "първо обясни правилото с думите купувачът/резервиращият" in prompt
     assert "бонусът е за купувача/резервиращия" in prompt
+    assert "Емил/Малина" in prompt
     assert "Не започвай с директно 'да'" in prompt
     assert "Не представяй бонуса като автоматичен подарък" in prompt
     assert "BookNow е директна резервация" in prompt
