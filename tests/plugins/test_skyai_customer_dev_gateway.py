@@ -609,8 +609,13 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "добавяне/управление на ваучери" in prompt
     assert "EUR е основната цена" in prompt
     assert "Catalog tool-ът връща кандидати" in prompt
-    assert "не е заповед какво да кажеш" in prompt
-    assert "първите 3 видими links/cards" in prompt
+    assert "не заповед" in prompt
+    assert "Hermes сам носи отговорност" in prompt
+    assert "няма display-level card adapter" in prompt
+    assert "selection_context/category_mix" in prompt
+    assert "не пълни" in prompt
+    assert "не приемай автоматично" in prompt
+    assert "първо мисли близко" in prompt
     assert "приеми, че близостта е важна" in prompt
     assert "nearest_returned_items" in prompt
     assert "чак след това попитай дали може да разшириш" in prompt
@@ -727,7 +732,7 @@ def test_build_cards_from_reply_caps_visible_product_cards(monkeypatch) -> None:
     assert [card["title"] for card in cards] == ["one", "two", "three"]
 
 
-def test_build_cards_from_reply_prefers_diverse_visible_cards_when_extra_links_exist(monkeypatch) -> None:
+def test_build_cards_from_reply_preserves_hermes_link_order(monkeypatch) -> None:
     details = {
         "https://skyvision.bg/подарък/офроуд-атв-под-наем/one/": "Офроуд разходка с АТВ до Пловдив",
         "https://skyvision.bg/подарък/приключения-с-мотор/two/": "ОФРОУД ТУР С ЕЛЕКТРИЧЕСКИ МОТОР край Пловдив",
@@ -751,9 +756,17 @@ def test_build_cards_from_reply_prefers_diverse_visible_cards_when_extra_links_e
 
     assert [card["title"] for card in cards] == [
         "Офроуд разходка с АТВ до Пловдив",
+        "ОФРОУД ТУР С ЕЛЕКТРИЧЕСКИ МОТОР край Пловдив",
         "Ирисова фотография в Пловдив",
-        "Терапия за мъже в Пловдив",
     ]
+
+
+def test_dev_gateway_has_no_display_level_card_adapter() -> None:
+    source = Path(dev_gateway.__file__).read_text(encoding="utf-8")
+
+    assert "_select_visible_cards" not in source
+    assert "_card_similarity_score" not in source
+    assert "MAX_CARD_CANDIDATE_LINKS" not in source
 
 
 def test_resolve_profile_runtime_reads_model_dict() -> None:

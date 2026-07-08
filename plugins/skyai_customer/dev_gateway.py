@@ -53,33 +53,6 @@ DISCORD_TEST_THREAD_PREFIX = "🧪 TEST · "
 DISCORD_VOICE_THREAD_PREFIX = "🎙️ Voice SkyAI · "
 DEFAULT_COMPARE_PROD_PATH = "/chatkit/dev-message"
 MAX_VISIBLE_PRODUCT_CARDS = 3
-MAX_CARD_CANDIDATE_LINKS = 8
-CARD_TOKEN_STOPWORDS = frozenset(
-    {
-        "the",
-        "and",
-        "skyvision",
-        "com",
-        "https",
-        "подарък",
-        "или",
-        "като",
-        "висок",
-        "клас",
-        "край",
-        "над",
-        "под",
-        "през",
-        "със",
-        "за",
-        "на",
-        "в",
-        "с",
-        "и",
-        "до",
-        "от",
-    }
-)
 BUILD_COMMIT_ENV = "SKYAI_V2_BUILD_COMMIT"
 BUILD_COMMIT_FILE = ".skyai-build-commit"
 DEFAULT_VOICE_BACKEND_TARGET = "skyai_v2_chatkit"
@@ -96,14 +69,18 @@ SKYAI_REASONING_CONTRACT = (
 )
 SKYAI_SALES_PRINCIPLES = (
     "Работи консултативно: разбери повод, човек, бюджет, локация, усещане и тон. "
-    "При широко търсене предложи малко, разнообразно и задай естествен въпрос. "
-    "Ако ranked evidence се струпва около една фамилия, вземи най-силния представител "
-    "и ползвай selection_context/category_mix; първите 3 видими links/cards да показват "
-    "различни посоки, освен ако клиентът е поискал тази фамилия. При конкретно търсене "
-    "уважи уточнението. За спокойни подаръци описвай positive-only, не чрез контраст "
-    "с адреналин. Използвай предимства на SkyVision - бонус, BookNow, безплатна доставка, "
-    "опаковка, рейтинг, цена, ваучер на стойност - само когато помагат. Бъди топъл, "
-    "вдъхновяващ, честен и полезен; целта е доверие към бранда."
+    "При широко търсене предложи малко, разнообразно и задай естествен въпрос; не пълни "
+    "отговора с еднотипни идеи. "
+    "Hermes сам носи отговорност кои предложения и линкове да изведе първи; няма "
+    "display-level card adapter, който да поправя или пренарежда избора след теб. "
+    "Ползвай selection_context/category_mix само като evidence за собствената си преценка. "
+    "При конкретно търсене уважи уточнението. Ако поводът звучи индивидуален, не приемай "
+    "автоматично, че подаръкът е за двама; ако е уместно, попитай. Локацията е част от "
+    "желанието на клиента: първо мисли близко и релевантно, после разширявай деликатно. "
+    "За спокойни подаръци описвай positive-only, не чрез контраст с адреналин. Използвай "
+    "SkyVision предимства - бонус, BookNow, безплатна доставка, опаковка, рейтинг, цена, "
+    "ваучер на стойност - когато помагат за доверие и продажба. Бъди топъл, вдъхновяващ, "
+    "адаптивен и полезен."
 )
 SKYAI_VOICE_PRINCIPLES = (
     "Voice режим: говориш по телефон, не пишеш в чат. Клиентът вече се е свързал "
@@ -485,18 +462,15 @@ def build_skyai_system_prompt(surface: str = "chat") -> str:
         "или слотове, използвай публичните SkyAI tools. Не измисляй факти, цени "
         "или наличности; за продуктови линкове използвай public_url. "
         "EUR е основната цена; BGN може да е вторично уточнение. "
-        "Catalog tool-ът връща кандидати, детайли, location_context/selection_context, "
-        "category_key и value voucher алтернатива. Това не е заповед какво да кажеш; "
-        "ти сам избираш какво е най-полезно за клиента. Когато клиентът изрично посочи локация, "
-        "приеми, че близостта е важна. Първо разгледай най-близките релевантни варианти от "
-        "location_context/nearest_returned_items и чак след това попитай дали може да разшириш "
-        "периметъра за по-силни, но по-далечни предложения. Ако клиентът изрично стесни избора или отхвърли алтернатива, започни "
-        "направо с желаната посока и наличните подходящи предложения; говори positive-only "
-        "за желаната категория и не използвай конструкции от типа 'без X/Y' за отхвърлени "
-        "алтернативи. "
+        "Catalog tool-ът връща кандидати, детайли, location_context/selection_context, category_key "
+        "и value voucher алтернатива; това е evidence, не заповед. Когато клиентът посочи локация, "
+        "приеми, че близостта е важна: първо мисли през location_context/nearest_returned_items, "
+        "и чак след това попитай дали може да разшириш периметъра. Ако клиентът стесни избора "
+        "или отхвърли алтернатива, започни направо с желаната посока; говори positive-only "
+        "и не използвай конструкции от типа 'без X/Y'. "
         "Campaign tool-ът съдържа публичната кампания, историята на SkyVision, че бонусът е благодарност към купувача/резервиращия, "
         "че бонусният полет се изпълнява единствено от летище Приморско независимо къде е основната закупена услуга, "
-        "и преотстъпване само когато клиентът сам пита за това. "
+        "и преотстъпване само когато клиентът сам пита. "
         "При въпрос за преотстъпване първо обясни правилото с думите купувачът/резервиращият: "
         "бонусът е за купувача/резервиращия; "
         "после човешки обясни кратката история на Емил/Малина, любовта към летенето и личния жест. "
@@ -508,8 +482,8 @@ def build_skyai_system_prompt(surface: str = "chat") -> str:
         "клиентския панел „Ваучери“, добавяне/управление на ваучери, остатъчни ваучери, ownership conflicts, "
         "запитвания, удължаване, ръчно обединяване на ваучери и грешна резервационна опция. "
         "То съдържа и customer-safe обучение от реални email/support казуси; използвай го за intent/state reasoning, а не като шаблон. "
-        "Това са клиентски next-step факти; не разкривай вътрешни tool URL-и, CRM/Bitrix полета или админ операции. Два ваучера не се "
-        "обединяват автоматично от потребителския панел; това е ръчна support операция. "
+        "Това са клиентски next-step факти; не разкривай вътрешни tool URL-и, CRM/Bitrix полета или админ операции. "
+        "Два ваучера не се обединяват автоматично от потребителския панел; това е ръчна support операция. "
         "Опцията за удължаване е налична в профила; към екипа се насочва при проблем или особен статус. Давай официалните "
         "контакти, когато насочваш към екипа. "
         "BookNow е директна резервация за конкретен ден/час без предварителен ваучер. Ако "
@@ -2325,76 +2299,9 @@ def build_cards_from_reply(reply: str, *, limit: int = MAX_VISIBLE_PRODUCT_CARDS
         card = _card_from_product_url(url)
         if card:
             cards.append(card)
-        if len(cards) >= max(limit, MAX_CARD_CANDIDATE_LINKS):
+        if len(cards) >= limit:
             break
-    return _select_visible_cards(cards, limit)
-
-
-def _select_visible_cards(cards: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    if limit <= 0 or not cards:
-        return []
-    if len(cards) <= limit:
-        return cards[:limit]
-
-    selected: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    for index, card in enumerate(cards):
-        if len(selected) >= limit:
-            break
-        remaining_slots = limit - len(selected)
-        remaining_after = len(cards) - index - 1
-        similarity = _card_similarity_score(card, selected)
-        if selected and similarity >= 2 and remaining_after >= remaining_slots:
-            deferred.append(card)
-            continue
-        selected.append(card)
-
-    for card in deferred:
-        if len(selected) >= limit:
-            break
-        selected.append(card)
-    return selected
-
-
-def _card_similarity_score(card: dict[str, Any], selected: list[dict[str, Any]]) -> int:
-    tokens = _card_similarity_tokens(card)
-    family = _card_url_family(card)
-    primary_family = _card_primary_family(card)
-    score = 0
-    for existing in selected:
-        existing_tokens = _card_similarity_tokens(existing)
-        candidate = len(tokens & existing_tokens)
-        if family and family == _card_url_family(existing):
-            candidate += 3
-        elif primary_family and primary_family == _card_primary_family(existing):
-            candidate += 2
-        score = max(score, candidate)
-    return score
-
-
-def _card_similarity_tokens(card: dict[str, Any]) -> set[str]:
-    text = str(card.get("title") or "").casefold()
-    location_tokens = set(re.findall(r"[\wа-яА-ЯёЁ]+", str(card.get("location") or "").casefold()))
-    return {
-        token
-        for token in re.findall(r"[\wа-яА-ЯёЁ]+", text)
-        if len(token) > 2
-        and token not in CARD_TOKEN_STOPWORDS
-        and token not in location_tokens
-    }
-
-
-def _card_url_family(card: dict[str, Any]) -> str:
-    url = str(card.get("public_url") or card.get("url") or "").strip()
-    path = public_tools.normalize_product_path(product_url=url)
-    if not path:
-        return ""
-    return path.split("/", 1)[0]
-
-
-def _card_primary_family(card: dict[str, Any]) -> str:
-    family = _card_url_family(card)
-    return family.split("-", 1)[0] if family else ""
+    return cards
 
 
 def _extract_product_urls(reply: str) -> list[str]:
