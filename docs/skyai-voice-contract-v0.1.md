@@ -360,7 +360,8 @@ Allowed response actions:
 Transfer must be available by:
 
 - DTMF `0`;
-- explicit caller request for operator/person;
+- structured Hermes action `skyai_voice_transfer_to_human` when Hermes decides
+  the caller should be handed to a person;
 - repeated STT/TTS failures;
 - protected cases that need authenticated customer/order/voucher handling;
 - repeated low-confidence turns.
@@ -439,7 +440,8 @@ Recommended first MVP:
 5. SkyAI text backend target is configurable:
    - `skyai_v1_chatkit`;
    - `skyai_v2_chatkit`.
-6. DTMF `0` or "оператор" transfers to a human route.
+6. DTMF `0` transfers directly; natural-language handoff requests are decided
+   by Hermes and returned as a structured `skyai_voice_transfer_to_human` action.
 7. End-to-end test matrix:
    - greeting;
    - gift recommendation;

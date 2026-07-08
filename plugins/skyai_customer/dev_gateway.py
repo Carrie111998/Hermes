@@ -58,22 +58,7 @@ DEFAULT_VOICE_BACKEND_TARGET = "skyai_v2_chatkit"
 DEFAULT_VOICE_V1_PATH = voice_contract.VOICE_BACKEND_TARGETS["skyai_v1_chatkit"]["path"]
 MIN_USABLE_STT_CONFIDENCE = 0.45
 MAX_SPOKEN_REPLY_CHARS = 700
-VOICE_HUMAN_HANDOFF_TERMS = (
-    "искам оператор",
-    "говоря с оператор",
-    "с оператор",
-    "към оператор",
-    "искам човек от екипа",
-    "говоря с човек от екипа",
-    "жив човек",
-    "искам консултант",
-    "говоря с консултант",
-    "искам служител",
-    "говоря със служител",
-    "говоря с представител",
-    "свържете ме",
-    "прехвърлете ме",
-)
+VOICE_TRANSFER_TOOL_NAME = "skyai_voice_transfer_to_human"
 SKYAI_REASONING_CONTRACT = (
     "Архитектурен договор: Hermes мисли. Backend-ът и tools дават публични факти, "
     "структурирани данни, линкове, цени, слотове, constraints и безопасни граници, "
@@ -99,8 +84,11 @@ SKYAI_VOICE_PRINCIPLES = (
     "и лесни за слушане: без markdown, сурови URL-и, дълги списъци, технически "
     "детайли или формулировки тип 'пишете ни'. Ако трябва да се изпрати линк или "
     "писмена информация, кажи го човешки, например че колега може да помогне след "
-    "разговора. Мисли като Voice SkyAI: чуваш клиента, говориш с него и адаптираш "
-    "тона към телефонен разговор."
+    "разговора. Ако сам прецениш, че клиентът трябва да бъде прехвърлен към човек, "
+    "извикай structured tool-а skyai_voice_transfer_to_human с кратка причина и кратка "
+    "реплика за изговаряне. Това е единственият семантичен начин за human handoff: "
+    "backend-ът няма phrase list и не класифицира transcript-а вместо теб. Мисли като "
+    "Voice SkyAI: чуваш клиента, говориш с него и адаптираш тона към телефонен разговор."
 )
 SKYVISION_PRODUCT_URL_RE = re.compile(
     r"https://(?:www\.)?skyvision\.bg/[^\s<>\]\)\"']+",
@@ -561,7 +549,7 @@ async def default_agent_runner(
     conversation_id: str,
     settings: CanarySettings,
     system_prompt: str = "",
-) -> str:
+) -> Any:
     if not settings.live_model:
         return build_dry_run_reply(message)
 
@@ -581,7 +569,7 @@ def _run_agent_turn(
     conversation_id: str,
     profile_home: Path,
     system_prompt: str = "",
-) -> str:
+) -> dict[str, Any]:
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     token = set_hermes_home_override(profile_home)
@@ -621,7 +609,7 @@ def _run_agent_turn(
             system_message=system_prompt or build_skyai_system_prompt(),
             conversation_history=history,
         )
-        return str(result.get("final_response") or "").strip()
+        return result
     finally:
         reset_hermes_home_override(token)
 
@@ -1673,10 +1661,11 @@ async def build_chat_response(
         system_prompt,
     )
     reply, runner_cards = _coerce_runner_result(runner_result)
+    voice_action = _extract_voice_action_from_runner_result(runner_result) if surface == "voice" else None
     cards = (runner_cards or await asyncio.to_thread(build_cards_from_reply, reply))[:MAX_VISIBLE_PRODUCT_CARDS]
     latency_ms = int((time.monotonic() - started) * 1000)
 
-    return {
+    response = {
         "status": "ok",
         "version": settings.version,
         "conversation_id": conversation_id,
@@ -1692,6 +1681,11 @@ async def build_chat_response(
             "surface": surface,
         },
     }
+    if voice_action:
+        response["voice_action"] = voice_action
+        response["trace"]["voice_action"] = voice_action.get("voice_action")
+        response["trace"]["voice_action_source"] = "hermes_tool"
+    return response
 
 
 def _chat_surface_from_payload(payload: dict[str, Any]) -> str:
@@ -1771,17 +1765,6 @@ async def build_voice_turn_response(
             spoken_reply="Извинете, не Ви чух добре. Може ли да повторите?",
             display_reply="STT produced an empty transcript.",
             trace_extra={"voice_reason": voice_reason, "silence_count": silence_count},
-        )
-
-    if _voice_handoff_requested(transcript):
-        return _voice_transfer_response(
-            payload,
-            settings,
-            call_id=call_id,
-            conversation_id=conversation_id,
-            spoken_reply="Разбира се, ще Ви прехвърля към човек от екипа.",
-            display_reply="Caller requested human handoff in the transcript.",
-            reason="caller_requested_human",
         )
 
     if confidence is not None and confidence < MIN_USABLE_STT_CONFIDENCE:
@@ -1865,6 +1848,37 @@ async def build_voice_turn_response(
             display_reply=str(chat_response.get("reason") or chat_response.get("error") or "backend_error"),
             transfer={"target": "operator_queue", "reason": "skyai_backend_error"},
             trace_extra={"voice_backend_target": target, "voice_backend_latency_ms": latency_ms},
+        )
+
+    voice_action = chat_response.get("voice_action")
+    if _is_transfer_voice_action(voice_action):
+        transfer = voice_action.get("transfer") if isinstance(voice_action.get("transfer"), dict) else {}
+        reason = _bounded_text(
+            transfer.get("reason") or voice_action.get("reason") or "hermes_requested_handoff",
+            max_length=120,
+        )
+        transfer_target = _bounded_text(transfer.get("target") or "operator_queue", max_length=120)
+        reply = str(chat_response.get("reply") or "").strip()
+        spoken_reply = _voice_spoken_reply(
+            str(voice_action.get("spoken_reply") or reply or "Разбира се, ще Ви прехвърля към човек от екипа.")
+        )
+        return _voice_transfer_response(
+            payload,
+            settings,
+            call_id=call_id,
+            conversation_id=conversation_id,
+            spoken_reply=spoken_reply,
+            display_reply=str(voice_action.get("display_reply") or reply or "Hermes requested human handoff."),
+            reason=reason,
+            target=transfer_target,
+            trace_extra={
+                "voice_backend_target": target,
+                "voice_backend_latency_ms": latency_ms,
+                "stt_confidence": confidence,
+                "turn_index": payload.get("turn_index"),
+                "voice_action_source": "hermes_tool",
+                "chat_trace": chat_response.get("trace") if isinstance(chat_response.get("trace"), dict) else {},
+            },
         )
 
     reply = str(chat_response.get("reply") or "").strip()
@@ -2074,6 +2088,7 @@ def _voice_transfer_response(
     display_reply: str,
     reason: str,
     target: str = "operator_queue",
+    trace_extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _voice_response(
         payload,
@@ -2084,6 +2099,7 @@ def _voice_transfer_response(
         spoken_reply=spoken_reply,
         display_reply=display_reply,
         transfer={"target": target, "reason": reason},
+        trace_extra=trace_extra,
     )
 
 
@@ -2101,11 +2117,6 @@ def _voice_dtmf(payload: dict[str, Any]) -> str:
         or metadata.get("dtmf_event")
     )
     return str(value or "").strip()
-
-
-def _voice_handoff_requested(transcript: str) -> bool:
-    normalized = transcript.casefold()
-    return any(term in normalized for term in VOICE_HUMAN_HANDOFF_TERMS)
 
 
 def _voice_spoken_reply(reply: str) -> str:
@@ -2175,6 +2186,80 @@ def _call_voice_v1_skyai(payload: dict[str, Any], settings: CanarySettings) -> d
         return {"status": "error", "http_status": exc.code, "reason": reason}
     except URLError as exc:
         return {"status": "error", "reason": sanitize_runtime_error(exc)}
+
+
+def _extract_voice_action_from_runner_result(result: Any) -> dict[str, Any] | None:
+    direct = _coerce_voice_action_payload(result)
+    if direct:
+        return direct
+    if not isinstance(result, dict):
+        return None
+
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        payload = _tool_message_payload(message.get("content"))
+        action = _coerce_voice_action_payload(payload)
+        if action:
+            return action
+    return None
+
+
+def _tool_message_payload(content: Any) -> Any:
+    if isinstance(content, dict):
+        return content
+    if isinstance(content, str):
+        text = content.strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            candidate = item.get("text") or item.get("content")
+            payload = _tool_message_payload(candidate)
+            if payload is not None:
+                return payload
+    return None
+
+
+def _coerce_voice_action_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("voice_action") != "transfer_to_human":
+        return None
+    transfer = payload.get("transfer") if isinstance(payload.get("transfer"), dict) else {}
+    return {
+        "voice_action": "transfer_to_human",
+        "transfer": {
+            "target": _bounded_text(transfer.get("target") or "operator_queue", max_length=120),
+            "reason": _bounded_text(
+                transfer.get("reason") or payload.get("reason") or "hermes_requested_handoff",
+                max_length=120,
+            ),
+        },
+        "spoken_reply": _bounded_text(payload.get("spoken_reply") or "", max_length=260),
+        "display_reply": _bounded_text(payload.get("display_reply") or "", max_length=500),
+    }
+
+
+def _is_transfer_voice_action(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("voice_action") == "transfer_to_human"
+
+
+def _bounded_text(value: Any, *, max_length: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= max_length:
+        return text
+    return text[:max_length].rsplit(" ", 1)[0].strip()
 
 
 def _coerce_runner_result(result: Any) -> tuple[str, list[dict[str, Any]]]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -377,9 +378,32 @@ async def test_build_voice_turn_dtmf_zero_transfers_without_model_call(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_build_voice_turn_human_request_transfers_without_model_call(tmp_path: Path) -> None:
-    async def forbidden_runner(*args, **kwargs):
-        raise AssertionError("clear human handoff requests must not call Hermes")
+async def test_build_voice_turn_human_request_transfers_from_structured_hermes_action(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        seen["message"] = message
+        return {
+            "final_response": "Разбира се, ще Ви прехвърля към колега.",
+            "messages": [
+                {
+                    "role": "tool",
+                    "content": json.dumps(
+                        {
+                            "status": "ok",
+                            "voice_action": "transfer_to_human",
+                            "transfer": {
+                                "target": "operator_queue",
+                                "reason": "hermes_requested_handoff",
+                            },
+                            "spoken_reply": "Разбира се, ще Ви прехвърля към колега.",
+                            "display_reply": "Hermes requested human handoff.",
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+            ],
+        }
 
     response = await dev_gateway.build_voice_turn_response(
         {
@@ -389,13 +413,16 @@ async def test_build_voice_turn_human_request_transfers_without_model_call(tmp_p
             "stt_confidence": 0.94,
         },
         settings(tmp_path, live_model=True),
-        agent_runner=forbidden_runner,
+        agent_runner=fake_runner,
     )
 
     assert response["status"] == "ok"
     assert response["action"] == "transfer_to_human"
-    assert response["transfer_reason"] == "caller_requested_human"
+    assert response["spoken_reply"] == "Разбира се, ще Ви прехвърля към колега."
+    assert response["transfer_reason"] == "hermes_requested_handoff"
     assert response["target"] == "operator_queue"
+    assert response["trace"]["voice_action_source"] == "hermes_tool"
+    assert seen["message"] == "Моля, свържете ме с човек от екипа."
 
 
 @pytest.mark.asyncio

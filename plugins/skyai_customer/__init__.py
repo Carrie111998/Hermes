@@ -17,12 +17,14 @@ from plugins.skyai_customer.public_tools import (
     SKYAI_PRODUCT_DETAIL_SCHEMA,
     SKYAI_PRODUCT_SLOTS_SCHEMA,
     SKYAI_SUPPORT_KNOWLEDGE_SCHEMA,
+    SKYAI_VOICE_TRANSFER_TO_HUMAN_SCHEMA,
     handle_skyai_catalog_search,
     handle_skyai_campaign_knowledge,
     handle_skyai_event_log_append,
     handle_skyai_product_detail,
     handle_skyai_product_slots,
     handle_skyai_support_knowledge,
+    handle_skyai_voice_transfer_to_human,
 )
 
 
@@ -56,6 +58,11 @@ _TOOLS = (
         "skyai_event_log_append",
         SKYAI_EVENT_LOG_APPEND_SCHEMA,
         handle_skyai_event_log_append,
+    ),
+    (
+        "skyai_voice_transfer_to_human",
+        SKYAI_VOICE_TRANSFER_TO_HUMAN_SCHEMA,
+        handle_skyai_voice_transfer_to_human,
     ),
 )
 

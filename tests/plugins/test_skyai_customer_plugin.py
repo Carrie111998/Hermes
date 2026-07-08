@@ -16,6 +16,7 @@ SKYAI_TOOL_NAMES = {
     "skyai_campaign_knowledge",
     "skyai_support_knowledge",
     "skyai_event_log_append",
+    "skyai_voice_transfer_to_human",
 }
 
 
@@ -103,6 +104,21 @@ def test_registered_tool_handlers_accept_hermes_dispatch_context(monkeypatch, tm
     finally:
         for tool_name in SKYAI_TOOL_NAMES:
             registry._tools.pop(tool_name, None)
+
+
+def test_voice_transfer_tool_returns_structured_action() -> None:
+    result = public_tools.handle_skyai_voice_transfer_to_human(
+        reason="caller prefers a teammate",
+        spoken_reply="Разбира се, ще Ви прехвърля към колега.",
+    )
+
+    assert result["status"] == "ok"
+    assert result["voice_action"] == "transfer_to_human"
+    assert result["transfer"] == {
+        "target": "operator_queue",
+        "reason": "caller prefers a teammate",
+    }
+    assert result["spoken_reply"] == "Разбира се, ще Ви прехвърля към колега."
 
 
 def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:

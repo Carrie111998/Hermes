@@ -10,3 +10,4 @@ provides_tools:
   - skyai_campaign_knowledge
   - skyai_support_knowledge
   - skyai_event_log_append
+  - skyai_voice_transfer_to_human

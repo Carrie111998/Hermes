@@ -342,6 +342,32 @@ SKYAI_EVENT_LOG_APPEND_SCHEMA = {
     },
 }
 
+SKYAI_VOICE_TRANSFER_TO_HUMAN_SCHEMA = {
+    "name": "skyai_voice_transfer_to_human",
+    "description": (
+        "Voice-only structured action tool. Use when Hermes independently decides that a "
+        "phone call should be handed to a human SkyVision teammate. This tool does not "
+        "perform PBX/SIP actions; it returns a canonical voice action request for the "
+        "voice gateway. Do not use it for normal chat answers or questions SkyAI can answer."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Short customer-safe reason for the handoff decision.",
+            },
+            "spoken_reply": {
+                "type": "string",
+                "description": (
+                    "Short Bulgarian phrase to say before transfer. Keep it natural for TTS; "
+                    "do not include phone numbers, email addresses, URLs, or markdown."
+                ),
+            },
+        },
+    },
+}
+
 
 def _http_json(url: str, *, timeout: float = DEFAULT_HTTP_TIMEOUT_SECONDS) -> Any:
     request = Request(url, headers={"User-Agent": "SkyAI-Hermes-v2/0.1"})
@@ -1349,6 +1375,32 @@ def handle_skyai_event_log_append(
         "path": str(path),
         "schema": event["schema"],
     }
+
+
+def handle_skyai_voice_transfer_to_human(
+    reason: str = "",
+    spoken_reply: str = "",
+) -> dict[str, Any]:
+    reason_text = _voice_tool_text(reason, max_length=120) or "hermes_requested_handoff"
+    spoken_text = _voice_tool_text(spoken_reply, max_length=220) or (
+        "Разбира се, ще Ви прехвърля към човек от екипа."
+    )
+    return {
+        "status": "ok",
+        "voice_action": "transfer_to_human",
+        "transfer": {"target": "operator_queue", "reason": reason_text},
+        "spoken_reply": spoken_text,
+        "display_reply": "Hermes requested human handoff through a structured voice action.",
+    }
+
+
+def _voice_tool_text(value: Any, *, max_length: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = SENSITIVE_VALUE_RE.sub("[redacted]", text)
+    text = re.sub(r"https?://\S+", "", text).strip()
+    if len(text) <= max_length:
+        return text
+    return text[:max_length].rsplit(" ", 1)[0].strip()
 
 
 def normalize_product_path(*, product_url: str = "", product_path: str = "") -> str:

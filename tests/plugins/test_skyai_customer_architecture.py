@@ -98,6 +98,15 @@ def test_catalog_tool_has_no_backend_persona_or_keyword_policy() -> None:
         assert symbol not in source
 
 
+def test_voice_handoff_has_no_transcript_phrase_list() -> None:
+    source = Path("plugins/skyai_customer/dev_gateway.py").read_text(encoding="utf-8")
+
+    assert "VOICE_HUMAN_HANDOFF_TERMS" not in source
+    assert "_voice_handoff_requested" not in source
+    assert "skyai_voice_transfer_to_human" in source
+    assert "voice_action_source" in source
+
+
 def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
     cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
 
