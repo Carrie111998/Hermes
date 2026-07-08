@@ -166,6 +166,44 @@ def _wrap_with_infra_sampling(processor):
     return _InfraSamplingSpanProcessor(processor, prefixes, ratio)
 
 
+# ---------------------------------------------------------------------------
+# Langfuse-semantic span attributes (SR-535 remainder / ADR-0029)
+#
+# Langfuse's OTLP ingest maps these OTel span attributes onto trace-level
+# fields (langfuse.com/docs/opentelemetry/get-started, verified 2026-07-08
+# against the self-hosted v3 line):
+#     langfuse.session.id  -> trace sessionId  (groups traces as a session)
+#     langfuse.user.id     -> trace userId
+#     langfuse.trace.tags  -> trace tags       (expects string[])
+# They may be set on any span in the trace. We stamp them at span creation
+# on the emitters whose spans survive the infra sampler above, so the lean
+# trace stream stays groupable/filterable in the Langfuse UI.
+# ---------------------------------------------------------------------------
+LANGFUSE_SESSION_ID_ATTR = "langfuse.session.id"
+LANGFUSE_USER_ID_ATTR = "langfuse.user.id"
+LANGFUSE_TAGS_ATTR = "langfuse.trace.tags"
+
+
+def stamp_langfuse_attributes(span, *, session_id=None, user_id=None, tags=None) -> None:
+    """Best-effort: set Langfuse grouping attributes on ``span``.
+
+    Never raises — safe for real OTel spans and for the emitters' no-op
+    span fakes alike. Falsy values are skipped; ``tags`` is coerced to a
+    list of non-empty strings (Langfuse expects ``string[]``).
+    """
+    try:
+        if session_id:
+            span.set_attribute(LANGFUSE_SESSION_ID_ATTR, str(session_id))
+        if user_id:
+            span.set_attribute(LANGFUSE_USER_ID_ATTR, str(user_id))
+        if tags:
+            clean = [str(t) for t in tags if t is not None and str(t)]
+            if clean:
+                span.set_attribute(LANGFUSE_TAGS_ATTR, clean)
+    except Exception:
+        pass
+
+
 def _load_env_once() -> None:
     """Best-effort: if LANGFUSE_* not in os.environ, read ~/.hermes/.env."""
     if os.environ.get("LANGFUSE_HOST") and os.environ.get("LANGFUSE_PUBLIC_KEY"):

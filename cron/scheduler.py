@@ -54,6 +54,14 @@ try:
 except Exception:  # pragma: no cover
     _CRON_TRACER = None
 
+# SR-535 remainder: Langfuse grouping attributes. Imported separately from
+# the tracer so version skew degrades to a no-op stamp, not lost tracing.
+try:
+    from obs.otel_tracing import stamp_langfuse_attributes as _stamp_langfuse  # noqa: E402
+except Exception:  # pragma: no cover
+    def _stamp_langfuse(span, **kwargs):  # type: ignore[misc]
+        pass
+
 
 class _NoopCronSpan:
     def __enter__(self): return self
@@ -71,6 +79,35 @@ def _start_cron_span(name: str):
         return _CRON_TRACER.start_as_current_span(name)
     except Exception:
         return _NoopCronSpan()
+
+
+def _stamp_cron_langfuse(span, job: dict, job_name: str) -> None:
+    """SR-535 remainder: Langfuse grouping attributes for a cron fire span.
+
+    session.id = ``<job name>:<YYYY-MM-DD>`` so every fire of one job on
+    one day groups as a single Langfuse session; user.id = the job's
+    runtime profile (per-job override, else the scheduler's active
+    profile); tags = [subsystem, profile] for UI filtering. Best-effort —
+    never raises.
+    """
+    profile = str(job.get("profile") or "").strip()
+    if not profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name()
+        except Exception:
+            profile = "default"
+    try:
+        date_str = _hermes_now().date().isoformat()
+        session_id = f"{job_name}:{date_str}"
+    except Exception:
+        session_id = job_name
+    _stamp_langfuse(
+        span,
+        session_id=session_id,
+        user_id=profile,
+        tags=["cron", profile],
+    )
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -3014,6 +3051,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 _cron_span.set_attribute("cron.job_id", job["id"])
                 _cron_span.set_attribute("cron.job_name", _cron_job_name)
                 _cron_span.set_attribute("cron.schedule", str(job.get("schedule_display", "")))
+                # SR-535 remainder: Langfuse session/user/tags grouping.
+                _stamp_cron_langfuse(_cron_span, job, _cron_job_name)
             except Exception:
                 pass
             _job_start = _time.monotonic()

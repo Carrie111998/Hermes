@@ -38,6 +38,15 @@ try:
 except Exception:  # pragma: no cover
     _TRACER = None
 
+# SR-535 remainder: Langfuse grouping attributes. Imported separately from
+# the tracer so version skew (an obs/ without the helper) degrades to a
+# no-op stamp instead of killing tracing outright.
+try:
+    from obs.otel_tracing import stamp_langfuse_attributes as _stamp_langfuse  # noqa: E402
+except Exception:  # pragma: no cover
+    def _stamp_langfuse(span, **kwargs):  # type: ignore[misc]
+        pass
+
 
 class _NoopSpan:
     def __enter__(self): return self
@@ -236,6 +245,9 @@ class BaseSubscriber(ABC):
             with _start_span(f"subscriber.handle:{self.subscriber_id}") as _span:
                 _span.set_attribute("subscriber.id", self.subscriber_id)
                 _span.set_attribute("event.id", event.event_id)
+                # SR-535 remainder: the sampled survivors carry a Langfuse
+                # tag so the lean stream stays filterable by subscriber.
+                _stamp_langfuse(_span, tags=[self.subscriber_id])
                 try:
                     _span.set_attribute(
                         "event.type",

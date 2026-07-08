@@ -759,3 +759,56 @@ class TestAtLeastOnceDedup:
         assert "oldest" in s
         assert "newest" in s
         assert "middle" not in s
+
+
+class TestLangfuseSpanStamping:
+    """SR-535 remainder: subscriber.handle spans carry Langfuse tags."""
+
+    class _RecordingSpan:
+        def __init__(self, name):
+            self.name = name
+            self.attrs = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def set_attribute(self, key, value):
+            self.attrs[key] = value
+
+        def record_exception(self, *a, **kw):
+            pass
+
+        def set_status(self, *a, **kw):
+            pass
+
+    class _RecordingTracer:
+        def __init__(self):
+            self.spans = []
+
+        def start_as_current_span(self, name):
+            span = TestLangfuseSpanStamping._RecordingSpan(name)
+            self.spans.append(span)
+            return span
+
+    def test_handle_span_gets_langfuse_subscriber_tag(self, tmp_path, monkeypatch):
+        import events.subscribers.base as base_mod
+
+        tracer = self._RecordingTracer()
+        monkeypatch.setattr(base_mod, "_TRACER", tracer)
+
+        bus = EventBus(db_path=tmp_path / "events" / "test.db")
+        sub = StubSubscriber(bus)
+        bus.emit(EventType.CRON_COMPLETED, "scout", {"a": 1})
+
+        assert sub.poll() == 1
+        assert len(tracer.spans) == 1
+        span = tracer.spans[0]
+        assert span.name == "subscriber.handle:stub"
+        # Langfuse OTel property mapping: tags land under langfuse.trace.tags
+        # (langfuse.com/docs/opentelemetry/get-started).
+        assert span.attrs["langfuse.trace.tags"] == ["stub"]
+        # Pre-existing plain attrs must be untouched by the stamping.
+        assert span.attrs["subscriber.id"] == "stub"
