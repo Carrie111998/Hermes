@@ -164,6 +164,41 @@ async def test_build_chat_response_allows_injected_runner(tmp_path: Path) -> Non
     assert seen["profile_home"] == tmp_path / "profiles" / "skyai-v2-dev"
 
 
+@pytest.mark.asyncio
+async def test_build_chat_response_passes_voice_system_prompt_to_hermes_runner(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings, system_prompt):
+        seen.update(
+            {
+                "message": message,
+                "conversation_id": conversation_id,
+                "system_prompt": system_prompt,
+            }
+        )
+        return "Говоря кратко, защото това е телефонен разговор."
+
+    response = await dev_gateway.build_chat_response(
+        {
+            "conversation_id": "voice-c1",
+            "message": "Как мога да се свържа с екипа?",
+            "metadata": {"surface": "pbx_voice", "source": "zycoo-coovox-u20"},
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["trace"]["surface"] == "voice"
+    assert seen["message"] == "Как мога да се свържа с екипа?"
+    assert seen["conversation_id"] == "voice-c1"
+    assert "Voice режим" in seen["system_prompt"]
+    assert "Клиентът вече се е свързал с официалната линия" in seen["system_prompt"]
+    assert "не го връщай към 'официален канал'" in seen["system_prompt"]
+    assert "не изброявай телефона, имейла или работното време" in seen["system_prompt"]
+    assert "без markdown, сурови URL-и, дълги списъци" in seen["system_prompt"]
+
+
 def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
     app = dev_gateway.create_app(settings(tmp_path))
     routes = {(route.method, route.resource.canonical) for route in app.router.routes()}

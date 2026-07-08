@@ -11,6 +11,7 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import ipaddress
 import os
@@ -89,6 +90,18 @@ SKYAI_SALES_PRINCIPLES = (
     "ваучер на стойност - само когато помагат на конкретния разговор. Бъди топъл, "
     "вдъхновяващ, честен и полезен; целта е клиентът да почувства доверие към бранда."
 )
+SKYAI_VOICE_PRINCIPLES = (
+    "Voice режим: говориш по телефон, не пишеш в чат. Клиентът вече се е свързал "
+    "с официалната линия на SkyVision, затова не го връщай към 'официален канал' "
+    "и не изброявай телефона, имейла или работното време като основен next step. "
+    "Ако случаят трябва да мине към човек от екипа, кажи кратко и естествено, че "
+    "ще го прехвърлиш към колега. Отговорите за TTS трябва да са кратки, разговорни "
+    "и лесни за слушане: без markdown, сурови URL-и, дълги списъци, технически "
+    "детайли или формулировки тип 'пишете ни'. Ако трябва да се изпрати линк или "
+    "писмена информация, кажи го човешки, например че колега може да помогне след "
+    "разговора. Мисли като Voice SkyAI: чуваш клиента, говориш с него и адаптираш "
+    "тона към телефонен разговор."
+)
 SKYVISION_PRODUCT_URL_RE = re.compile(
     r"https://(?:www\.)?skyvision\.bg/[^\s<>\]\)\"']+",
     re.IGNORECASE,
@@ -103,7 +116,7 @@ NON_PRODUCT_PATH_PREFIXES = frozenset(
     }
 )
 
-AgentRunner = Callable[[str, list[dict[str, str]], str, "CanarySettings"], Awaitable[Any]]
+AgentRunner = Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True)
@@ -442,8 +455,8 @@ def _is_test_host(host: str) -> bool:
     )
 
 
-def build_skyai_system_prompt() -> str:
-    return (
+def build_skyai_system_prompt(surface: str = "chat") -> str:
+    prompt = (
         "Ти си SkyAI, клиентският асистент на SkyVision. "
         "Помагаш само за SkyVision: преживявания, подаръци, ваучери, BookNow, "
         "резервации, слотове, доставка, опаковки, кампании и официални условия. "
@@ -494,6 +507,9 @@ def build_skyai_system_prompt() -> str:
         "самото ограничение; представи се кратко като SkyAI - асистентът на SkyVision - "
         "и веднага предложи помощ с преживяване, ваучер или резервация."
     )
+    if surface == "voice":
+        return f"{prompt} {SKYAI_VOICE_PRINCIPLES}"
+    return prompt
 
 
 def build_dry_run_reply(message: str) -> str:
@@ -506,11 +522,45 @@ def build_dry_run_reply(message: str) -> str:
     return "SkyAI v2 Hermes canary е жив в dry-run режим."
 
 
+async def _call_agent_runner(
+    agent_runner: AgentRunner,
+    message: str,
+    history: list[dict[str, str]],
+    conversation_id: str,
+    settings: CanarySettings,
+    system_prompt: str,
+) -> Any:
+    if _agent_runner_accepts_system_prompt(agent_runner):
+        return await agent_runner(message, history, conversation_id, settings, system_prompt)
+    return await agent_runner(message, history, conversation_id, settings)
+
+
+def _agent_runner_accepts_system_prompt(agent_runner: AgentRunner) -> bool:
+    try:
+        signature = inspect.signature(agent_runner)
+    except (TypeError, ValueError):
+        return False
+
+    positional_capacity = 0
+    for parameter in signature.parameters.values():
+        if parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            positional_capacity += 1
+        if parameter.kind == inspect.Parameter.KEYWORD_ONLY and parameter.name == "system_prompt":
+            return True
+    return positional_capacity >= 5
+
+
 async def default_agent_runner(
     message: str,
     history: list[dict[str, str]],
     conversation_id: str,
     settings: CanarySettings,
+    system_prompt: str = "",
 ) -> str:
     if not settings.live_model:
         return build_dry_run_reply(message)
@@ -521,6 +571,7 @@ async def default_agent_runner(
         history,
         conversation_id,
         settings.profile_home,
+        system_prompt,
     )
 
 
@@ -529,6 +580,7 @@ def _run_agent_turn(
     history: list[dict[str, str]],
     conversation_id: str,
     profile_home: Path,
+    system_prompt: str = "",
 ) -> str:
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -566,7 +618,7 @@ def _run_agent_turn(
         )
         result = agent.run_conversation(
             message,
-            system_message=build_skyai_system_prompt(),
+            system_message=system_prompt or build_skyai_system_prompt(),
             conversation_history=history,
         )
         return str(result.get("final_response") or "").strip()
@@ -1609,12 +1661,16 @@ async def build_chat_response(
 
     history = extract_history(payload)
     conversation_id = conversation_id_from_payload(payload)
+    surface = _chat_surface_from_payload(payload)
+    system_prompt = build_skyai_system_prompt(surface=surface)
     started = time.monotonic()
-    runner_result = await agent_runner(
+    runner_result = await _call_agent_runner(
+        agent_runner,
         message,
         history,
         runtime_conversation_id(conversation_id),
         settings,
+        system_prompt,
     )
     reply, runner_cards = _coerce_runner_result(runner_result)
     cards = (runner_cards or await asyncio.to_thread(build_cards_from_reply, reply))[:MAX_VISIBLE_PRODUCT_CARDS]
@@ -1633,8 +1689,24 @@ async def build_chat_response(
             "live_model": settings.live_model,
             "fallback": False,
             "latency_ms": latency_ms,
+            "surface": surface,
         },
     }
+
+
+def _chat_surface_from_payload(payload: dict[str, Any]) -> str:
+    metadata = _payload_metadata(payload)
+    candidates = (
+        payload.get("surface"),
+        metadata.get("surface"),
+        payload.get("source"),
+        metadata.get("source"),
+    )
+    if any(str(value or "").strip() == "pbx_voice" for value in candidates):
+        return "voice"
+    if any(key in payload for key in ("call_id", "pbx_extension", "did", "stt_confidence")):
+        return "voice"
+    return "chat"
 
 
 async def build_voice_start_response(

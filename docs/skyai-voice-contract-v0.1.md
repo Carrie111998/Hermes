@@ -66,10 +66,14 @@ use server-to-server auth only:
 
 ### Escalation today
 
-SkyAI can tell the customer how to reach the SkyVision team and should include
-official contacts when it does so. The DEV voice adapter can return a
-`transfer_to_human` action. The future Voice Gateway must execute that action
-as PBX/SIP behavior and report it back to SkyAI operational logs.
+For chat, SkyAI can tell the customer how to reach the SkyVision team and
+should include official contacts when it does so. For voice, the caller is
+already on the official SkyVision phone line, so SkyAI must not loop the caller
+back to the same phone/email/contact block as the primary next step. In voice
+mode, escalation should be phrased as a short spoken handoff such as
+"ще Ви прехвърля към колега" and returned as `transfer_to_human` when a human
+is needed. The future Voice Gateway must execute that action as PBX/SIP
+behavior and report it back to SkyAI operational logs.
 
 ## Voice Gaps
 
