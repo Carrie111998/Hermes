@@ -1185,6 +1185,19 @@ class SessionDB:
         table_name: str,
         ddl: str,
     ) -> bool:
+        if table_name == "messages_fts_trigram" and _message_trigram_disabled():
+            # Opted out of the trigram FTS (HERMES_DISABLE_MESSAGE_TRIGRAM). This
+            # is the single choke point every trigram-creation path routes
+            # through — main setup AND the v10 / #16751 backfill migrations — so
+            # dropping here (and returning "unavailable") stops all of them, and
+            # the migrations skip their backfills because they gate on this
+            # return value.
+            self._drop_trigram_fts(cursor)
+            logger.info(
+                "messages_fts_trigram disabled via HERMES_DISABLE_MESSAGE_TRIGRAM "
+                "— dropped if present; CJK search uses LIKE fallback"
+            )
+            return False
         status = self._fts_table_probe(cursor, table_name)
         if status is None:
             return False
