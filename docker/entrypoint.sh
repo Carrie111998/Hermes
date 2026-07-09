@@ -51,6 +51,21 @@ if [ "$(id -u)" = "0" ]; then
             echo "Warning: chown .venv failed (rootless container?) — continuing anyway"
     fi
 
+    # Always reset ownership of pairing data on every boot (mirrors upstream
+    # stage2-hook.sh). `railway ssh` runs as root, so a `hermes pairing
+    # approve …` from an SSH session writes 0600 root-owned approval files the
+    # unprivileged gateway cannot read, silently leaving the approved user
+    # unauthorized. The targeted chown above only runs when the top-level
+    # $HERMES_HOME is mis-owned, so warm boots skip it — this makes a restart
+    # self-heal. Tiny directory, negligible cost.
+    if [ -d "$HERMES_HOME/platforms/pairing" ]; then
+        chown -R hermes:hermes "$HERMES_HOME/platforms/pairing" 2>/dev/null || true
+    fi
+    # Legacy location (pre-consolidated layout).
+    if [ -d "$HERMES_HOME/pairing" ]; then
+        chown -R hermes:hermes "$HERMES_HOME/pairing" 2>/dev/null || true
+    fi
+
     # Ensure config.yaml is readable by the hermes runtime user even if it was
     # edited on the host after initial ownership setup. Must run here (as root)
     # rather than after the privilege drop, otherwise a non-root caller like
@@ -203,6 +218,21 @@ done
 if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "$HERMES_AUTH_JSON_BOOTSTRAP" ]; then
     printf '%s' "$HERMES_AUTH_JSON_BOOTSTRAP" > "$HERMES_HOME/auth.json"
     chmod 600 "$HERMES_HOME/auth.json"
+fi
+
+# auth.json: re-seed a TERMINALLY-DEAD Nous bootstrap session (self-heal,
+# mirrors upstream stage2-hook.sh). The create-only guard above refuses to
+# clobber an existing auth.json, so a terminal invalid_grant leaves the
+# container unauthenticated across restarts. HERMES_AUTH_JSON_REBOOTSTRAP
+# (distinct from *_BOOTSTRAP) swaps ONLY the providers.nous entry, and ONLY
+# when the on-disk entry is provably terminal — safe to leave set. We are
+# already running as hermes here (past the privilege drop), so no setuidgid.
+if [ -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_REBOOTSTRAP:-}" ] \
+    && [ ! -L "$HERMES_HOME/auth.json" ]; then
+    "$INSTALL_DIR/.venv/bin/python" \
+        "$INSTALL_DIR/scripts/docker_rebootstrap_nous_session.py" \
+        "$HERMES_HOME/auth.json" \
+        || echo "[entrypoint] Warning: docker_rebootstrap_nous_session.py failed; continuing"
 fi
 
 # Sync bundled skills (manifest-based so user edits are preserved)
