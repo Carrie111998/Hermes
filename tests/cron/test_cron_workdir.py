@@ -13,7 +13,6 @@ Covers:
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -210,23 +209,30 @@ class TestTickWorkdirPartition:
     def test_workdir_jobs_run_sequentially(self, tmp_path, monkeypatch):
         import cron.scheduler as sched
 
-        # Two "jobs" — one with workdir, one without.
-        workdir_job = {"id": "a", "name": "A", "workdir": str(tmp_path)}
-        parallel_job = {"id": "b", "name": "B", "workdir": None}
+        # Two workdir jobs (both sequential) + one parallel job.
+        workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
+        workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
+        parallel_job = {"id": "c", "name": "C", "workdir": None}
 
-        # v0.15.1 catch-up: the fork's tick() consumes get_due_and_skipped_jobs()
-        # (it emits skipped-job events), so patch that — patching get_due_jobs
-        # (what pure-upstream tick used) leaves tick reading the real empty list.
-        monkeypatch.setattr(sched, "get_due_and_skipped_jobs", lambda: ([workdir_job, parallel_job], []))
+        # Merge (0.16.0 catch-up): the fork's tick() consumes
+        # get_due_and_skipped_jobs() (it emits skipped-job events), so patch
+        # that — patching get_due_jobs (pure-upstream tick) would leave tick
+        # reading the real empty list.
+        monkeypatch.setattr(
+            sched, "get_due_and_skipped_jobs",
+            lambda: ([workdir_a, workdir_b, parallel_job], []),
+        )
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
         # Record call order / thread context.
         import threading
-        calls: list[tuple[str, bool]] = []
+        calls: list[tuple[str, str]] = []
+        order_lock = threading.Lock()
 
         def fake_run_job(job):
             # Return a minimal tuple matching run_job's signature.
-            calls.append((job["id"], threading.current_thread().name))
+            with order_lock:
+                calls.append((job["id"], threading.current_thread().name))
             return True, "output", "response", None
 
         monkeypatch.setattr(sched, "run_job", fake_run_job)
@@ -237,19 +243,24 @@ class TestTickWorkdirPartition:
         )
 
         n = sched.tick(verbose=False)
-        assert n == 2
+        assert n == 3
 
         ids = [c[0] for c in calls]
-        # Workdir jobs always come before parallel jobs.
+        # Sequential workdir jobs preserve submission order relative to each
+        # other (single-thread pool).
         assert ids.index("a") < ids.index("b")
 
-        # Since the per-job soft deadline (2026-06-10), the sequential pass
-        # runs each job on a dedicated "cron-job-<id>" worker thread that
-        # the ticker JOINS before starting the next — serialization is
-        # guaranteed by the join (the ordering assertion above), not by
-        # main-thread affinity.
-        workdir_thread_name = next(t for jid, t in calls if jid == "a")
-        assert workdir_thread_name.startswith("cron-job-")
+        # Merge (0.16.0 catch-up): sequential (workdir) jobs dispatch to the
+        # persistent single-thread cron-seq pool and parallel jobs to
+        # cron-parallel (so the ticker never blocks), but each job BODY executes
+        # under the fork's per-job soft-deadline wrapper on a dedicated
+        # "cron-job-<id>" worker thread. The thread run_job observes is
+        # therefore "cron-job-<id>", never the main/ticker thread.
+        main_thread_name = threading.current_thread().name
+        for jid in ("a", "b", "c"):
+            job_thread_name = next(t for j, t in calls if j == jid)
+            assert job_thread_name != main_thread_name
+            assert job_thread_name.startswith("cron-job-"), job_thread_name
 
 
 # ---------------------------------------------------------------------------

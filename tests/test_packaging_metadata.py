@@ -1,8 +1,64 @@
 from pathlib import Path
 import tomllib
 
+import pytest
+
+# setuptools is declared in the [dev] extra and is the build backend, but
+# guard the import so a runner without it skips these packaging checks
+# instead of erroring out collection for the whole shard (it used to be
+# picked up ambiently from the CI image; newer ubuntu-latest images don't
+# ship it in the test venv).
+find_packages = pytest.importorskip("setuptools", exc_type=ImportError).find_packages
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _packages_find_include():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return data["tool"]["setuptools"]["packages"]["find"]["include"]
+
+
+def test_every_on_disk_subpackage_is_covered_by_packages_find():
+    """Regression test for #34701 (and the bug class behind #34034 / #28149).
+
+    ``[tool.setuptools.packages.find]`` ``include`` is hand-maintained. Every
+    top-level package is listed twice — bare (``hermes_cli``) for the package
+    itself and ``hermes_cli.*`` for its subpackages — EXCEPT when someone
+    forgets the wildcard. v0.15.x listed ``hermes_cli`` without ``hermes_cli.*``,
+    so the wheel shipped ``hermes_cli/*.py`` but dropped the ``dashboard_auth``
+    and ``proxy`` subpackages. The dashboard then died on every install with
+    ``ModuleNotFoundError: No module named 'hermes_cli.dashboard_auth'``.
+
+    This drives setuptools' own discovery against the live tree: every package
+    that exists on disk and would be found by a permissive ``<name>.*`` scan
+    must also be found by the actual ``include`` list. A subpackage added under
+    any listed package without the matching wildcard fails here instead of in a
+    user's container.
+    """
+    include = _packages_find_include()
+
+    # What the real include list actually selects.
+    selected = set(find_packages(where=str(REPO_ROOT), include=include))
+
+    # Top-level packages we ship (bare names in the include list, no wildcard).
+    top_level = sorted({name for name in include if "." not in name})
+
+    # For each shipped top-level package, every on-disk subpackage must be
+    # covered by the include list.
+    expected = set(
+        find_packages(
+            where=str(REPO_ROOT),
+            include=[pattern for name in top_level for pattern in (name, f"{name}.*")],
+        )
+    )
+
+    missing = sorted(expected - selected)
+    assert not missing, (
+        "These packages exist on disk but are dropped from the wheel because "
+        "[tool.setuptools.packages.find] include is missing a wildcard. Add the "
+        f"matching '<name>.*' entry in pyproject.toml: {missing}"
+    )
 
 
 def test_faster_whisper_is_not_a_base_dependency():
@@ -144,3 +200,29 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
             f"floor {'.'.join(map(str, _STARLETTE_CVE_FLOOR))} — regenerate the "
             f"lockfile after bumping the pin"
         )
+
+
+def test_locale_catalogs_ship_in_both_wheel_and_sdist():
+    """Regression test for #27632 / #35374 / #23943.
+
+    locales/ is a bare data directory (no __init__.py), so it is invisible to
+    packages.find and to package-data (which attaches to a package). It must be
+    declared as setuptools data-files (wheel) AND grafted in MANIFEST.in
+    (sdist). Without both, sealed installs drop the catalogs and gateway/CLI
+    commands surface raw i18n keys like `gateway.reset.header_default`.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    data_files = data["tool"]["setuptools"].get("data-files", {})
+    assert data_files.get("locales") == ["locales/*.yaml"], (
+        "pyproject [tool.setuptools.data-files] must declare "
+        'locales = ["locales/*.yaml"] so the wheel ships i18n catalogs'
+    )
+
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "graft locales" in manifest, (
+        "MANIFEST.in must `graft locales` so the sdist ships i18n catalogs"
+    )
+
+    # Every on-disk catalog has the .yaml extension the globs above match.
+    on_disk = list((REPO_ROOT / "locales").glob("*.yaml"))
+    assert on_disk, "expected locales/*.yaml catalogs on disk"

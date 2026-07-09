@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import pytest
 
@@ -411,19 +410,27 @@ class TestTickProfilePartition:
         import threading
         import cron.scheduler as sched
 
-        profile_job = {"id": "a", "name": "A", "profile": "default"}
-        parallel_job = {"id": "b", "name": "B", "profile": None}
+        # Two profile jobs (both sequential) + one parallel job.
+        profile_a = {"id": "a", "name": "A", "profile": "default"}
+        profile_b = {"id": "b", "name": "B", "profile": "default"}
+        parallel_job = {"id": "c", "name": "C", "profile": None}
 
-        # v0.15.1 catch-up: the fork's tick() consumes get_due_and_skipped_jobs()
-        # (it emits skipped-job events), so patch that — patching get_due_jobs
-        # (what pure-upstream tick used) leaves tick reading the real empty list.
-        monkeypatch.setattr(sched, "get_due_and_skipped_jobs", lambda: ([profile_job, parallel_job], []))
+        # Merge (0.16.0 catch-up): the fork's tick() consumes
+        # get_due_and_skipped_jobs() (it emits skipped-job events), so patch
+        # that — patching get_due_jobs (pure-upstream tick) would leave tick
+        # reading the real empty list.
+        monkeypatch.setattr(
+            sched, "get_due_and_skipped_jobs",
+            lambda: ([profile_a, profile_b, parallel_job], []),
+        )
         monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
 
         calls: list[tuple[str, str]] = []
+        order_lock = threading.Lock()
 
         def fake_run_job(job):
-            calls.append((job["id"], threading.current_thread().name))
+            with order_lock:
+                calls.append((job["id"], threading.current_thread().name))
             return True, "output", "response", None
 
         monkeypatch.setattr(sched, "run_job", fake_run_job)
@@ -433,12 +440,21 @@ class TestTickProfilePartition:
 
         n = sched.tick(verbose=False)
 
-        assert n == 2
+        assert n == 3
         ids = [job_id for job_id, _thread_name in calls]
+        # Sequential profile jobs preserve submission order relative to each
+        # other (single-thread pool).
         assert ids.index("a") < ids.index("b")
-        # Since the per-job soft deadline (2026-06-10), every job runs on a
-        # dedicated "cron-job-<id>" worker thread; sequential jobs are still
-        # serialized because the ticker JOINS each worker before starting
-        # the next (the ordering assertion above is the real invariant).
-        profile_thread_name = next(thread for job_id, thread in calls if job_id == "a")
-        assert profile_thread_name.startswith("cron-job-")
+        # Merge (0.16.0 catch-up): sequential jobs dispatch to the persistent
+        # single-thread cron-seq pool and parallel jobs to cron-parallel (so
+        # the ticker never blocks), but each job BODY executes under the fork's
+        # per-job soft-deadline wrapper (_run_callable_with_deadline) on a
+        # dedicated "cron-job-<id>" worker thread. The thread run_job observes
+        # is therefore "cron-job-<id>", never the main/ticker thread.
+        # Serialization of a,b is guaranteed by the single-thread seq pool plus
+        # the wrapper's join (the ordering assertion above is the real invariant).
+        main_name = threading.current_thread().name
+        for jid in ("a", "b", "c"):
+            job_thread = next(t for job_id, t in calls if job_id == jid)
+            assert job_thread != main_name
+            assert job_thread.startswith("cron-job-"), job_thread

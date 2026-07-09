@@ -11,9 +11,8 @@ clamps with ``min(8, curses.COLORS - 1)``.
 
 import re
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
-import pytest
 
 # ``_curses`` is unavailable on Windows stock Python.  Import-or-skip the whole
 # module so a missing curses is reported as a clean skip rather than raising

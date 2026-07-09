@@ -14,6 +14,8 @@ Log files produced:
                              overridable via ``HERMES_GATEWAY_LOG_FILE``
                              (read from ``~/.hermes/.env`` — root, NOT
                              profile-scoped — see hermes_cli/env_loader.py).
+    gui.log                — INFO+, dashboard/websocket/TUI-gateway events
+                             (created when mode="gui").
 
 All files use ``RotatingFileHandler`` with ``RedactingFormatter`` so
 secrets are never written to disk.
@@ -21,6 +23,8 @@ secrets are never written to disk.
 Component separation:
     gateway.log only receives records from ``gateway.*`` loggers —
     platform adapters, session management, slash commands, delivery.
+    gui.log receives dashboard-side records from ``hermes_cli.web_server``,
+    ``hermes_cli.pty_bridge``, ``tui_gateway.*``, and ``uvicorn.*``.
     agent.log remains the catch-all (everything goes there).
     gateway-forensics.log is also unfiltered but only attached when
     mode="gateway" — gives forensics consumers a stable, gateway-process-
@@ -157,6 +161,12 @@ COMPONENT_PREFIXES = {
     "tools": ("tools",),
     "cli": ("hermes_cli", "cli"),
     "cron": ("cron",),
+    "gui": (
+        "hermes_cli.web_server",
+        "hermes_cli.pty_bridge",
+        "tui_gateway",
+        "uvicorn",
+    ),
 }
 
 
@@ -246,9 +256,11 @@ def setup_logging(
         Number of rotated backup files to keep.
         Defaults to 3 or the value from config.yaml ``logging.backup_count``.
     mode
-        Caller context: ``"cli"``, ``"gateway"``, ``"cron"``.
+        Caller context: ``"cli"``, ``"gateway"``, ``"gui"``, ``"cron"``.
         When ``"gateway"``, an additional ``gateway.log`` file is created
         that receives only gateway-component records.
+        When ``"gui"``, an additional ``gui.log`` file is created that
+        receives dashboard and TUI-gateway component records.
     role
         Per-role catch-all routing. When set, ``agent.log``/``errors.log``
         become ``agent-<role>.log``/``errors-<role>.log`` so a long-lived
@@ -378,6 +390,18 @@ def setup_logging(
                 exc,
             )
 
+    # --- gui.log (INFO+, dashboard/tui-gateway components) -----------------
+    if mode == "gui":
+        _add_rotating_handler(
+            root,
+            log_dir / "gui.log",
+            level=logging.INFO,
+            max_bytes=10 * 1024 * 1024,
+            backup_count=5,
+            formatter=RedactingFormatter(_LOG_FORMAT),
+            log_filter=_ComponentFilter(COMPONENT_PREFIXES["gui"]),
+        )
+
     return log_dir
 
 
@@ -444,9 +468,11 @@ _ROLLOVER_COOLDOWN_SEC = 30.0
 
 
 class _ManagedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler hardened for managed perms AND Windows log sharing.
+    """RotatingFileHandler hardened for managed perms, Windows log sharing,
+    AND external rotation.
 
-    Two behaviours layered on the stdlib handler:
+    Three behaviours layered on the stdlib handler (merge of the fork's
+    Windows-safe rotation with upstream 0.16.0's external-rotation reopen):
 
     1. **Managed-mode perms.** In managed mode (NixOS), the stateDir uses
        setgid (2770) so new files inherit the hermes group. However both
@@ -455,7 +481,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
        subclass applies chmod 0660 after both operations so the gateway and
        interactive users can share log files.
 
-    2. **Windows-safe rotation.** The stdlib ``doRollover`` shuffles and
+    2. **Windows-safe rotation (fork).** The stdlib ``doRollover`` shuffles and
        removes the backup chain (``.2``→``.3``, ``.1``→``.2``, ``rm .1``)
        *before* the ``base``→``.1`` rename. On Windows that rename fails with
        PermissionError [WinError 32] whenever another process/reader holds
@@ -472,6 +498,16 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
        untouched, defers further attempts for a cooldown, and logs ONE
        concise warning rather than a traceback storm. Rotation simply resumes
        the next time the lock clears.
+
+    3. **External-rotation reopen (upstream 0.16.0).** ``RotatingFileHandler``
+       keeps an open file descriptor. If anything rotates the file *externally*
+       (``logrotate``, manual ``mv``, another process rotating under us, a
+       transient unlink), our fd keeps pointing at the renamed/unlinked inode
+       and every subsequent write goes to ``gateway.log.1`` instead of
+       ``gateway.log`` — silent log loss. Before each emit we ``stat``
+       ``baseFilename`` and compare it against the open stream's inode; on
+       mismatch we reopen (same pattern as stdlib
+       ``WatchedFileHandler.reopenIfNeeded()``, adapted for rotating handlers).
     """
 
     def __init__(self, *args, **kwargs):
@@ -484,6 +520,11 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._rollover_warned = False
         self._last_rollover_error: Optional[BaseException] = None
         super().__init__(*args, **kwargs)
+        # Snapshot the inode of the currently open stream so emit() can
+        # detect external rotation without an extra fstat per write.
+        self._stat_dev: Optional[int] = None
+        self._stat_ino: Optional[int] = None
+        self._record_stream_stat()
 
     def _chmod_if_managed(self):
         if self._managed:
@@ -491,6 +532,70 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
                 os.chmod(self.baseFilename, 0o660)
             except OSError:
                 pass
+
+    def _record_stream_stat(self) -> None:
+        """Snapshot dev/ino of ``baseFilename`` so we can detect external rotation."""
+        try:
+            st = os.stat(self.baseFilename)
+            self._stat_dev, self._stat_ino = st.st_dev, st.st_ino
+        except OSError:
+            self._stat_dev, self._stat_ino = None, None
+
+    def _reopen_if_externally_rotated(self) -> None:
+        """Reopen the stream when ``baseFilename`` no longer matches our fd.
+
+        Triggered when ``baseFilename`` was renamed (logrotate), unlinked,
+        or replaced by a different inode.  Silent + best-effort: any error
+        falls back to the existing (possibly stale) stream so logging keeps
+        working instead of dying on a stat failure.
+        """
+        try:
+            st = os.stat(self.baseFilename)
+        except FileNotFoundError:
+            # File was rotated/unlinked underneath us.  Close + reopen so a
+            # fresh inode is created at the expected path.
+            try:
+                if self.stream is not None:
+                    self.stream.close()
+            except Exception:
+                pass
+            self.stream = None  # type: ignore[assignment]
+            try:
+                self.stream = self._open()
+                self._record_stream_stat()
+            except Exception:
+                # Couldn't reopen — leave stream=None; next emit will
+                # bail rather than write to a stale inode.
+                pass
+            return
+        except OSError:
+            return  # transient — try again on the next emit
+
+        if self._stat_dev is None or self._stat_ino is None:
+            self._stat_dev, self._stat_ino = st.st_dev, st.st_ino
+            return
+
+        if (st.st_dev, st.st_ino) != (self._stat_dev, self._stat_ino):
+            # baseFilename now points at a DIFFERENT inode than the one we
+            # hold open.  Close the old stream and open the new file.
+            try:
+                if self.stream is not None:
+                    self.stream.close()
+            except Exception:
+                pass
+            self.stream = None  # type: ignore[assignment]
+            try:
+                self.stream = self._open()
+                self._stat_dev, self._stat_ino = st.st_dev, st.st_ino
+            except Exception:
+                pass
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Cheap-ish stat-per-record check; the kernel caches inode metadata
+        # so the syscall is sub-microsecond on a hot file.
+        if self.stream is not None or os.path.exists(self.baseFilename):
+            self._reopen_if_externally_rotated()
+        super().emit(record)
 
     def _open(self):
         stream = super()._open()
@@ -525,6 +630,9 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             except OSError:
                 self.stream = None
         self._chmod_if_managed()
+        # Our own rollover writes a new baseFilename; refresh the snapshot
+        # so the next emit doesn't mistake it for external rotation.
+        self._record_stream_stat()
 
         if rotated:
             self._rollover_blocked_until = 0.0
