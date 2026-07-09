@@ -1,7 +1,7 @@
 # Hermes Agent — Railway Configuration
-# Pre-configured for Discord gateway with direct Anthropic API.
-# Environment variables (ANTHROPIC_API_KEY, DISCORD_BOT_TOKEN) are
-# injected by Railway and loaded from the container's .env file.
+# Pre-configured for the Discord + WhatsApp gateway with models served via
+# OpenRouter. Environment variables (OPENROUTER_API_KEY, DISCORD_BOT_TOKEN,
+# etc.) are injected by Railway and loaded from the container's .env file.
 
 model:
   # Orchestrateur (profil défaut) : Claude Haiku 4.5 — modèle frontier discipliné en
