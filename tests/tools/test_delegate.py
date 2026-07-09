@@ -1007,7 +1007,6 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
     # --- Custom-endpoint identity resolution (issue #7833) ---
 
-
     @patch(
         "tools.delegate_tool._load_config",
         return_value={"inherit_mcp_toolsets": False},
@@ -1033,7 +1032,7 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
         self.assertEqual(
             MockAgent.call_args[1]["enabled_toolsets"],
-            ["web", "browser"],
+            ["web", "browser", "delegation_reply"],
         )
 
 
