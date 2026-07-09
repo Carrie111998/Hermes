@@ -41,6 +41,9 @@ Current line:
 - `v2.2` - catalog selection context for broad searches: Hermes receives
   diverse evidence ordering, category mix, and repeated-category signals
   without backend pruning or keyword routing.
+- `v2.3` - campaign gift entitlement knowledge: gifts/bonuses are not manual
+  voucher-code entries; they link automatically through logged-in orders or the
+  order email.
 
 ## Voice Contract
 

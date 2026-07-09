@@ -787,6 +787,12 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "независимо къде е основната закупена услуга" in prompt
     assert "първо обясни правилото с думите купувачът/резервиращият" in prompt
     assert "бонусът е за купувача/резервиращия" in prompt
+    assert "Подаръчните бонуси нямат ваучерен/сериен номер" in prompt
+    assert "не се добавят ръчно" in prompt
+    assert "ако купувачът е логнат" in prompt
+    assert "автоматично в профила" in prompt
+    assert "се обвързва с имейла от поръчката" in prompt
+    assert "профил със същия имейл" in prompt
     assert "Емил/Малина" in prompt
     assert "Не започвай с директно 'да'" in prompt
     assert "Не представяй бонуса като автоматичен подарък" in prompt

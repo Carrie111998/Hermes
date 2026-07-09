@@ -618,6 +618,13 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     assert "основната услуга и бонусният полет са различни преживявания" in (
         campaign["campaign_2026_facts"]["location_confusion_answer"]
     )
+    gift_linking = campaign["campaign_2026_facts"]["gift_entitlement_profile_linking"]
+    assert gift_linking["has_voucher_or_serial_number"] is False
+    assert gift_linking["manual_add_by_customer"] is False
+    assert "автоматично в профила" in gift_linking["logged_in_order"]
+    assert "имейла от поръчката" in gift_linking["guest_or_no_profile_order"]
+    assert "същия имейл" in gift_linking["later_profile_with_same_email"]
+    assert "Не насочвай клиента да добавя" in gift_linking["customer_guidance"]
     assert "без предварително купуване на ваучер" in campaign["booknow_nuance"]
     assert "парите ще бъдат възстановени" in campaign["booknow_nuance"]
     assert campaign["bonus_product"]["product_id"] == 95435
@@ -709,6 +716,13 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "„Използвай“" in " ".join(panel["common_actions"])
     assert panel["customer_remains_actor"] is True
     assert "не иска пълен код" in panel["chat_privacy_note"]
+    campaign_gifts = result["vouchers"]["campaign_gifts"]
+    assert "нямат ваучерен/сериен номер" in campaign_gifts["not_regular_vouchers"]
+    assert campaign_gifts["manual_add_available"] is False
+    assert "автоматично в профила" in campaign_gifts["profile_linking"]["logged_in_order"]
+    assert "имейла от поръчката" in campaign_gifts["profile_linking"]["guest_or_no_profile_order"]
+    assert "същия имейл" in campaign_gifts["profile_linking"]["later_profile_with_same_email"]
+    assert "не го карай да въвежда сериен номер" in campaign_gifts["customer_next_step"]
     assert result["vouchers"]["profile_extension_available"] is True
     assert "остатъчен ваучер" in result["vouchers"]["residual_voucher"]["automatic_issue"]
     assert result["vouchers"]["residual_voucher"]["email_subject"] == "Издаване на остатък за ваучер от SkyVision"
