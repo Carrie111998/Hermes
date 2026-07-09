@@ -3,6 +3,7 @@ name: manim-video
 description: "Manim CE animations: 3Blue1Brown math/algo videos."
 version: 1.0.0
 platforms: [linux, macos, windows]
+related_skills: [html-slide-deck, productivity-powerpoint, d3-interactive-chart]
 ---
 
 # Manim Video Production Pipeline
@@ -225,6 +226,12 @@ self.play(circle.animate.set_color(RED))  # then animate
 | `-qh` (production) | 1920x1080 | 60 | 30-120s/scene |
 
 Always iterate at `-ql`. Only render `-qh` for final output.
+
+## See Also — Alternative Presentation Formats
+
+- `html-slide-deck` — HTML slide decks; prefer when "presentation" means slides rather than video
+- `productivity-powerpoint` — PPTX creation/editing; use when user needs an editable .pptx file
+- `d3-interactive-chart` — interactive data visualizations; consider when the user needs exploratory rather than linear presentation
 
 ## References
 
