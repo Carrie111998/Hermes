@@ -50,7 +50,8 @@ RUN apt-get update && \
 # package resolves regardless of the base Debian release. Authenticates at
 # runtime via GITHUB_PERSONAL_ACCESS_TOKEN (gh reads GH_TOKEN/GITHUB_TOKEN).
 # hadolint ignore=DL3008,DL4006
-RUN mkdir -p -m 755 /etc/apt/keyrings && \
+RUN mkdir -p /etc/apt/keyrings && \
+    chmod 755 /etc/apt/keyrings && \
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
     chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
