@@ -111,6 +111,12 @@ VALID_HOOKS: Set[str] = {
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     "pre_approval_request",
     "post_approval_response",
+    # Outbound transform for an AGENT cron-turn reply, fired by the cron
+    # scheduler just before delivery (no_agent jobs are NOT passed through this).
+    # A plugin may return a rewritten string to reshape the reply (e.g. enforce a
+    # concise report contract); the first non-empty string returned wins.
+    # Observers return None. Kwargs: text: str, job_id: str.
+    "transform_cron_reply",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
@@ -1236,6 +1242,24 @@ def get_pre_tool_call_block_message(
             return message
 
     return None
+
+
+def get_transformed_cron_reply(text: str, job_id: str = "") -> str:
+    """Return a plugin-rewritten cron-turn reply, or the original ``text``.
+
+    Invokes the ``transform_cron_reply`` hook and returns the first non-empty
+    string a plugin produced; if no plugin transforms it, returns ``text``
+    unchanged. Never raises — cron delivery must not be broken by a plugin.
+    """
+    try:
+        results = invoke_hook("transform_cron_reply", text=text, job_id=job_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("transform_cron_reply hook failed: %s", exc)
+        return text
+    for result in results:
+        if isinstance(result, str) and result.strip():
+            return result
+    return text
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:

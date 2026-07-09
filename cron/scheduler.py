@@ -1516,6 +1516,15 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
+                # Deterministically reshape AGENT cron-turn replies (e.g. enforce a
+                # concise report contract) before delivery. no_agent jobs (briefs.py
+                # etc.) ship their stdout verbatim and are deliberately skipped.
+                if success and deliver_content and not job.get("no_agent"):
+                    try:
+                        from hermes_cli.plugins import get_transformed_cron_reply
+                        deliver_content = get_transformed_cron_reply(deliver_content, job.get("id", ""))
+                    except Exception as _xexc:
+                        logger.debug("cron reply transform skipped: %s", _xexc)
                 should_deliver = bool(deliver_content)
                 if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
