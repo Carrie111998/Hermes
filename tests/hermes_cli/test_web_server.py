@@ -5092,6 +5092,94 @@ class TestStatusRemoteGateway:
         assert data["gateway_pid"] is None
         assert data["gateway_state"] == "running"
 
+    def test_status_retargets_headline_to_active_profile_gateway(
+        self, monkeypatch, tmp_path
+    ):
+        """Plain /api/status must reflect the ACTIVE profile's gateway.
+
+        The gateway pins its identity files (gateway.pid / gateway_state.json) to
+        its launch dir, and _get_process_hermes_home() ignores the config
+        contextvar (issue #56986). So when the dashboard runs under the root home
+        but the gateway runs under a non-default active profile, the headline
+        liveness probe must be pointed at ``profiles/<active>/`` by EXPLICIT path —
+        otherwise a healthy gateway reads as "not running". Assert the probe is
+        retargeted (receives that explicit path) and the badge goes True.
+        """
+        import hermes_cli.web_server as ws
+        import hermes_constants
+
+        root = tmp_path
+        (root / "active_profile").write_text("main", encoding="utf-8")
+        pdir = root / "profiles" / "main"
+        pdir.mkdir(parents=True)
+        (pdir / "gateway.pid").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(
+            hermes_constants, "get_default_hermes_root", lambda: root
+        )
+
+        seen: dict = {}
+
+        def fake_pid(pid_path=None):
+            seen["pid_path"] = pid_path
+            return 4242 if pid_path is not None else None
+
+        def fake_rt(path=None):
+            seen["state_path"] = path
+            return (
+                {"gateway_state": "running", "platforms": {}}
+                if path is not None
+                else None
+            )
+
+        monkeypatch.setattr(ws, "get_running_pid", fake_pid)
+        monkeypatch.setattr(ws, "read_runtime_status", fake_rt)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
+
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["gateway_running"] is True
+        assert data["gateway_pid"] == 4242
+        assert seen["pid_path"] == pdir / "gateway.pid"
+        assert seen["state_path"] == pdir / "gateway_state.json"
+
+    def test_status_headline_unretargeted_when_active_profile_default(
+        self, monkeypatch, tmp_path
+    ):
+        """No active profile (default) keeps the root, no-arg probe unchanged.
+
+        Backward-compat guard: when active_profile is absent/"default", the
+        helpers must be called with NO arguments (the root behavior every
+        existing status test relies on), never an explicit path.
+        """
+        import hermes_cli.web_server as ws
+        import hermes_constants
+
+        root = tmp_path  # no active_profile file written
+        monkeypatch.setattr(
+            hermes_constants, "get_default_hermes_root", lambda: root
+        )
+
+        seen: dict = {}
+
+        def fake_pid(pid_path=None):
+            seen["pid_path"] = pid_path
+            return None
+
+        def fake_rt(path=None):
+            seen["state_path"] = path
+            return None
+
+        monkeypatch.setattr(ws, "get_running_pid", fake_pid)
+        monkeypatch.setattr(ws, "read_runtime_status", fake_rt)
+        monkeypatch.setattr(ws, "_GATEWAY_HEALTH_URL", None)
+
+        resp = self.client.get("/api/status")
+        assert resp.status_code == 200
+        assert resp.json()["gateway_running"] is False
+        assert seen["pid_path"] is None
+        assert seen["state_path"] is None
+
 
 class TestGatewayBusyReadout:
     """Tests for the NAS busy/drainable readout on /api/status.

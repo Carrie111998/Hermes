@@ -2406,13 +2406,59 @@ async def get_status(profile: Optional[str] = None):
         status_scope = _config_profile_scope(requested_profile)
         status_scope.__enter__()
 
+    # Resolve which profile's gateway the liveness badge should reflect. The
+    # gateway writes its identity files (gateway.pid / gateway_state.json) into
+    # the directory it was LAUNCHED with, and _get_process_hermes_home()
+    # deliberately pins those reads to that dir, ignoring the config contextvar
+    # (issue #56986). So scoping config to a profile does NOT retarget
+    # get_running_pid()/read_runtime_status() — they always resolve the
+    # dashboard process's own HERMES_HOME. This dashboard runs under the root
+    # home, but the real gateway runs under the ACTIVE profile (active_profile
+    # file -> profiles/<active>/), so a no-arg get_running_pid() checks the empty
+    # root and reports "gateway not running" even though a healthy gateway
+    # exists (the per-profile gateways[] topology already detects it). Mirror the
+    # topology enumerator: point the liveness probe at the target profile's
+    # identity files by EXPLICIT path. Only retarget when that profile actually
+    # owns its own gateway.pid — in multiplex mode one root gateway serves many
+    # profiles and the no-arg root path is already correct, so leave it be.
+    _gateway_pid_path = None
+    _gateway_state_path = None
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        if requested_profile and requested_profile.lower() != "current":
+            _target_dir = _resolve_profile_dir(requested_profile)
+        else:
+            _root = get_default_hermes_root()
+            _active_path = _root / "active_profile"
+            _active_profile = (
+                _active_path.read_text(encoding="utf-8").strip()
+                if _active_path.exists()
+                else ""
+            )
+            _target_dir = (
+                _root / "profiles" / _active_profile
+                if _active_profile and _active_profile.lower() != "default"
+                else None
+            )
+        if _target_dir is not None and (_target_dir / "gateway.pid").exists():
+            _gateway_pid_path = _target_dir / "gateway.pid"
+            _gateway_state_path = _target_dir / "gateway_state.json"
+    except Exception:
+        _gateway_pid_path = None
+        _gateway_state_path = None
+
     try:
         current_ver, latest_ver = check_config_version()
         # --- Gateway liveness detection ---
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = get_running_pid()
+        gateway_pid = (
+            get_running_pid(_gateway_pid_path)
+            if _gateway_pid_path is not None
+            else get_running_pid()
+        )
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 
@@ -2444,7 +2490,11 @@ async def get_status(profile: Optional[str] = None):
 
         # Prefer the detailed health endpoint response (has full state) when the
         # local runtime status file is absent or stale (cross-container).
-        local_runtime = read_runtime_status()
+        local_runtime = (
+            read_runtime_status(_gateway_state_path)
+            if _gateway_state_path is not None
+            else read_runtime_status()
+        )
         runtime = local_runtime
         if runtime is None and remote_health_body and remote_health_body.get("gateway_state"):
             runtime = remote_health_body
