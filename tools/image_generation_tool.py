@@ -429,6 +429,10 @@ class _ManagedFalSyncClient:
                 raise RuntimeError("fal_client.client.add_timeout_header is required for timeout requests")
             self._add_timeout_header(start_timeout, request_headers)
 
+        assert self._maybe_retry_request is not None
+        assert self._raise_for_status is not None
+        assert self._http_client is not None
+
         response = self._maybe_retry_request(
             self._http_client,
             "POST",

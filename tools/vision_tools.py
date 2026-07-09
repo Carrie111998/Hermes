@@ -322,7 +322,7 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 
     # Attempt auto-resize with Pillow (soft dependency)
     try:
-        from PIL import Image  # type: ignore[import-unresolved]
+        from PIL import Image
         import io as _io
     except ImportError:
         logger.info("Pillow not installed — cannot auto-resize oversized image")
@@ -375,7 +375,11 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
             # Stop if dimensions can't shrink further
             if (new_w, new_h) == prev_dims:
                 break
-            img = img.resize((new_w, new_h), Image.LANCZOS)
+            # Try Resampling.LANCZOS (Pillow 10+) first, fall back to Image.LANCZOS
+            resampling = getattr(Image, "Resampling", Image)
+            # Use getattr for NEAREST too to satisfy ty if Image.NEAREST is also problematic
+            filter_type = getattr(resampling, "LANCZOS", getattr(Image, "NEAREST", 0))
+            img = img.resize((new_w, new_h), filter_type)
             prev_dims = (new_w, new_h)
             logger.info("Resized to %dx%d (attempt %d)", new_w, new_h, attempt)
 

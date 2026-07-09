@@ -479,7 +479,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     try:
         import importlib.metadata as _md
         if hasattr(_md, "_cache_clear"):
-            _md._cache_clear()  # type: ignore[attr-defined]
+            _md._cache_clear()
     except Exception:
         pass
 

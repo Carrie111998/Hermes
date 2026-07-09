@@ -73,7 +73,7 @@ def main():
 
     # Import and run NeuTTS
     try:
-        from neutts import NeuTTS
+        from neutts import NeuTTS  # type: ignore
     except ImportError:
         print("Error: neutts not installed. Run: python -m pip install -U neutts[all]", file=sys.stderr)
         sys.exit(1)
@@ -92,7 +92,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        import soundfile as sf
+        import soundfile as sf  # type: ignore
         sf.write(str(out_path), wav, 24000)
     except ImportError:
         _write_wav(str(out_path), wav, 24000)

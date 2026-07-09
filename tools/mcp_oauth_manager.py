@@ -284,7 +284,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             ):
                 storage.save_oauth_metadata(meta)
 
-        async def async_auth_flow(self, request):  # type: ignore[override]
+        async def async_auth_flow(self, request):
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
             # whatever state the SDK already has.
