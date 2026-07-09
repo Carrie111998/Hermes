@@ -170,7 +170,7 @@ def build_swatch_svg(top_colors, out_path: Path):
         svg.append(f'<rect x="{x}" y="0" width="{w}" height="{h}" fill="{hexval}" stroke="#ccc"/>')
         svg.append(f'<text x="{x+8}" y="{h+18}" font-size="12" font-family="monospace">{hexval} ({count})</text>')
     svg.append("</svg>")
-    out_path.write_text("\n".join(svg))
+    out_path.write_text("\n".join(svg), encoding="utf-8")
 
 
 def main():
@@ -247,7 +247,7 @@ def main():
         },
     }
 
-    (out_dir / "design-tokens.json").write_text(json.dumps(design_tokens, indent=2, ensure_ascii=False))
+    (out_dir / "design-tokens.json").write_text(json.dumps(design_tokens, indent=2, ensure_ascii=False), encoding="utf-8")
     build_swatch_svg(top_colors, out_dir / "palette.svg")
 
     charte_lines = [
@@ -315,7 +315,7 @@ def main():
         "verite pour toute generation \"a la charte\" de ce client.",
     ]
 
-    (out_dir / "CHARTE.md").write_text("\n".join(charte_lines))
+    (out_dir / "CHARTE.md").write_text("\n".join(charte_lines), encoding="utf-8")
     print(f"\n✓ Ecrit dans {out_dir}/ : CHARTE.md, design-tokens.json, palette.svg")
 
 
