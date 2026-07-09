@@ -20662,6 +20662,30 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+    # ── Early-boot heartbeat ─────────────────────────────────────────
+    # The normal heartbeat writer (the EventBus subscriber poll loop) does not
+    # start until the very end of startup — after every platform connects and
+    # the api_server binds. On a slow cold boot (MCP swarm, many platforms,
+    # overdue-cron backlog) that phase can exceed the external watchdog's
+    # staleness threshold (scripts/gateway_watchdog.py STALE_SECONDS=180), so
+    # the watchdog restarts a still-booting gateway; a second spawn racing the
+    # first over the PID file and port 8642 is the "boot wedge" that sank the
+    # 0.18.2 cutover on 2026-07-09. Write a heartbeat immediately and keep it
+    # fresh on a daemon thread until runner.start() brings up the real writer,
+    # so the watchdog sees liveness throughout the boot. _write_heartbeat is
+    # None-safe before EventBus startup (_registry/_startup_monotonic default).
+    _early_hb_stop = threading.Event()
+    def _early_boot_heartbeat() -> None:
+        from events.gateway_integration import _write_heartbeat
+        while not _early_hb_stop.is_set():
+            try:
+                _write_heartbeat(0)
+            except Exception:
+                pass
+            _early_hb_stop.wait(30)
+    threading.Thread(
+        target=_early_boot_heartbeat, name="early-boot-heartbeat", daemon=True
+    ).start()
     # GATEWAY_STOPPED defense-in-depth — added 2026-04-30 (M1). Three
     # independent paths can leave the gateway: graceful _stop_impl (most
     # informed), atexit fall-through, signal handlers. emit_gateway_stopped
@@ -20700,6 +20724,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Start the gateway
     success = await runner.start()
+    # runner.start() brings up the EventBus subscriber loop (the normal
+    # heartbeat writer), so retire the early-boot heartbeat thread now.
+    _early_hb_stop.set()
     if not success:
         return False
     if runner.should_exit_cleanly:
