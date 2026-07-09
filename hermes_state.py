@@ -17,6 +17,7 @@ Key design decisions:
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -190,6 +191,30 @@ _FTS_TRIGGERS = (
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+# Trigram trigger names only (used when dropping the trigram FTS on opt-out).
+_FTS_TRIGRAM_TRIGGERS = (
+    "messages_fts_trigram_insert",
+    "messages_fts_trigram_delete",
+    "messages_fts_trigram_update",
+)
+
+
+def _message_trigram_disabled() -> bool:
+    """True when HERMES_DISABLE_MESSAGE_TRIGRAM opts out of the trigram FTS.
+
+    The ``messages_fts_trigram`` index exists only for CJK/substring message
+    search — ``search_messages`` routes to it only for queries with 3+ CJK
+    characters; all other search uses the standard ``messages_fts``. On a
+    long-lived gateway the trigram index and its duplicated content copy are a
+    large on-disk cost (multiple GB). Operators who never search CJK text can
+    set this flag to drop it and reclaim that space; CJK search degrades to a
+    LIKE scan (``_trigram_available`` is left False, which search_messages
+    already handles).
+    """
+    return os.getenv("HERMES_DISABLE_MESSAGE_TRIGRAM", "").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -1116,6 +1141,27 @@ class SessionDB:
             "FROM messages"
         )
 
+    def _drop_trigram_fts(self, cursor: sqlite3.Cursor) -> None:
+        """Drop the trigram FTS5 table + its triggers if present (opt-out path).
+
+        Dropping the FTS5 virtual table also drops its shadow tables
+        (messages_fts_trigram_data / _idx / _docsize / _content / _config), so
+        this reclaims the full trigram footprint. The triggers reference the
+        table, so they must be dropped too — otherwise a message INSERT/UPDATE
+        would fail with "no such table". Freed pages are returned to the OS by a
+        subsequent VACUUM; without VACUUM the file keeps its size but won't grow
+        (the pages get reused).
+        """
+        for trig in _FTS_TRIGRAM_TRIGGERS:
+            try:
+                cursor.execute(f"DROP TRIGGER IF EXISTS {trig}")
+            except sqlite3.OperationalError:
+                pass
+        try:
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+        except sqlite3.OperationalError:
+            pass
+
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
             cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
@@ -1593,17 +1639,30 @@ class SessionDB:
             # FTS5 setup. Run the DDL even when the virtual table exists so
             # CREATE TRIGGER IF NOT EXISTS repairs trigger-only degradation from
             # an earlier no-FTS5 runtime.
-            triggers_need_repair = self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+            # Expected trigger count drops by the 3 trigram triggers when the
+            # trigram index is opted out — otherwise triggers_need_repair would
+            # be permanently True and force a full FTS rebuild on every boot.
+            _expected_triggers = len(_FTS_TRIGGERS)
+            if _message_trigram_disabled():
+                _expected_triggers -= len(_FTS_TRIGRAM_TRIGGERS)
+            triggers_need_repair = self._fts_trigger_count(cursor) < _expected_triggers
             self._fts_enabled = self._ensure_fts_schema(cursor, "messages_fts", FTS_SQL)
 
             # Trigram FTS5 for CJK/substring search. This is optional relative
             # to the main FTS table; if it cannot be created, CJK search falls
-            # back to LIKE.
+            # back to LIKE. It can also be opted out of via
+            # HERMES_DISABLE_MESSAGE_TRIGRAM (large on-disk cost, CJK-only) — in
+            # which case we drop it if present so the pages are freed.
             if self._fts_enabled:
-                trigram_enabled = self._ensure_fts_schema(
-                    cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = trigram_enabled
+                if _message_trigram_disabled():
+                    self._drop_trigram_fts(cursor)
+                    self._trigram_available = False
+                    trigram_enabled = False
+                else:
+                    trigram_enabled = self._ensure_fts_schema(
+                        cursor, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    )
+                    self._trigram_available = trigram_enabled
                 if triggers_need_repair:
                     self._rebuild_fts_indexes(
                         cursor,
