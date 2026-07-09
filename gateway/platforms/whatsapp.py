@@ -16,11 +16,9 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
-import json
 import logging
 import os
 import platform
-import re
 import shutil
 import signal
 import subprocess
@@ -216,6 +214,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.whatsapp_common import WhatsAppBehaviorMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -230,6 +229,22 @@ from reply_handlers import (
     execute as execute_reply_command,
     ParseError,
 )
+
+
+def _file_content_hash(path: Path) -> str:
+    """Return the first 16 hex chars of the SHA-256 of *path*'s contents.
+
+    Used for the bridge staleness handshake: bridge.js reports its own
+    source hash in ``/health`` (``scriptHash``), and the adapter compares
+    it against the hash of bridge.js currently on disk.  A mismatch means
+    a long-lived bridge process is serving code from before an update.
+    Returns ``""`` when the file can't be read.
+    """
+    import hashlib
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
 
 
 def check_whatsapp_requirements() -> bool:
@@ -256,7 +271,7 @@ def check_whatsapp_requirements() -> bool:
         return False
 
 
-class WhatsAppAdapter(BasePlatformAdapter):
+class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     """
     WhatsApp adapter.
     
@@ -278,13 +293,12 @@ class WhatsAppAdapter(BasePlatformAdapter):
     - allow_from: List of sender IDs allowed in DMs (when dm_policy="allowlist")
     - group_policy: "open" | "allowlist" | "disabled" — which groups are processed (default: "open")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
+
+    Behavior (gating, mention parsing, markdown conversion, chunking) is
+    provided by ``WhatsAppBehaviorMixin`` so the Cloud API adapter can
+    share it. Only transport-specific code lives here.
     """
-    
-    # WhatsApp message limits — practical UX limit, not protocol max.
-    # WhatsApp allows ~65K but long messages are unreadable on mobile.
-    MAX_MESSAGE_LENGTH = 4096
-    DEFAULT_REPLY_PREFIX = "⚕ *Hermes Agent*\n────────────\n"
-    
+
     # Default bridge location relative to the hermes-agent install
     _DEFAULT_BRIDGE_DIR = Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge"
 
@@ -656,7 +670,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 data.get("senderName"),
             )
         return True
-    
+
     async def connect(self) -> bool:
         """
         Start the WhatsApp bridge.
@@ -716,9 +730,21 @@ class WhatsAppAdapter(BasePlatformAdapter):
             logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
 
         try:
-            # Auto-install npm dependencies if node_modules doesn't exist
+            # Auto-install npm dependencies when node_modules is missing OR
+            # package.json changed since the last install (e.g. after
+            # `hermes update` bumps the Baileys pin).  The stamp file records
+            # the package.json hash of the last successful install.
             bridge_dir = bridge_path.parent
-            if not (bridge_dir / "node_modules").exists():
+            _pkg_json = bridge_dir / "package.json"
+            _dep_stamp = bridge_dir / "node_modules" / ".hermes-pkg-hash"
+            _pkg_hash = _file_content_hash(_pkg_json)
+            _deps_fresh = False
+            if (bridge_dir / "node_modules").exists():
+                try:
+                    _deps_fresh = (_dep_stamp.read_text().strip() == _pkg_hash) and bool(_pkg_hash)
+                except OSError:
+                    _deps_fresh = False
+            if not _deps_fresh:
                 print(f"[{self.name}] Installing WhatsApp bridge dependencies...")
                 # Resolve npm path so Windows can execute the .cmd shim.
                 # shutil.which honours PATHEXT; on POSIX it returns the
@@ -739,6 +765,11 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         print(f"[{self.name}] npm install failed: {install_result.stderr}")
                         return False
                     print(f"[{self.name}] Dependencies installed")
+                    if _pkg_hash:
+                        try:
+                            _dep_stamp.write_text(_pkg_hash)
+                        except OSError:
+                            pass  # Stamp is an optimization; install still succeeded
                 except Exception as e:
                     print(f"[{self.name}] Failed to install dependencies: {e}")
                     return False
@@ -758,12 +789,28 @@ class WhatsAppAdapter(BasePlatformAdapter):
                             data = await resp.json()
                             bridge_status = data.get("status", "unknown")
                             if bridge_status == "connected":
-                                print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
-                                self._mark_connected()
-                                self._bridge_process = None  # Not managed by us
-                                self._http_session = aiohttp.ClientSession()
-                                self._poll_task = asyncio.create_task(self._poll_messages())
-                                return True
+                                # Staleness handshake: only reuse a running
+                                # bridge if it is serving the same bridge.js
+                                # that is on disk right now.  A long-lived
+                                # bridge survives gateway restarts AND
+                                # `hermes update`, so without this check it
+                                # keeps serving pre-update code forever
+                                # (e.g. no inbound media download).  Old
+                                # bridges that don't report scriptHash are
+                                # treated as stale by definition.
+                                running_hash = data.get("scriptHash", "")
+                                disk_hash = _file_content_hash(bridge_path)
+                                if running_hash and disk_hash and running_hash == disk_hash:
+                                    print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
+                                    self._mark_connected()
+                                    self._bridge_process = None  # Not managed by us
+                                    self._http_session = aiohttp.ClientSession()
+                                    self._poll_task = asyncio.create_task(self._poll_messages())
+                                    return True
+                                print(
+                                    f"[{self.name}] Running bridge is stale "
+                                    f"(running={running_hash or 'unversioned'}, disk={disk_hash}), restarting"
+                                )
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
             except Exception:
@@ -792,6 +839,18 @@ class WhatsAppAdapter(BasePlatformAdapter):
             bridge_env = os.environ.copy()
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
+            # Pass the profile-aware cache directories so the bridge writes
+            # media where the Python side reads it.  Without these the bridge
+            # hardcodes ~/.hermes/{image,audio,document}_cache, which diverges
+            # under HERMES_HOME overrides, profiles, and the new cache/ layout.
+            from gateway.platforms.base import (
+                get_audio_cache_dir as _get_audio_dir,
+                get_document_cache_dir as _get_doc_dir,
+                get_image_cache_dir as _get_img_dir,
+            )
+            bridge_env["HERMES_IMAGE_CACHE_DIR"] = str(_get_img_dir())
+            bridge_env["HERMES_AUDIO_CACHE_DIR"] = str(_get_audio_dir())
+            bridge_env["HERMES_DOCUMENT_CACHE_DIR"] = str(_get_doc_dir())
 
             self._bridge_process = subprocess.Popen(
                 [
@@ -984,63 +1043,6 @@ class WhatsAppAdapter(BasePlatformAdapter):
         self._close_bridge_log()
         print(f"[{self.name}] Disconnected")
     
-    def format_message(self, content: str) -> str:
-        """Convert standard markdown to WhatsApp-compatible formatting.
-
-        WhatsApp supports: *bold*, _italic_, ~strikethrough~, ```code```,
-        and monospaced `inline`. Standard markdown uses different syntax
-        for bold/italic/strikethrough, so we convert here.
-
-        Code blocks (``` fenced) and inline code (`) are protected from
-        conversion via placeholder substitution.
-        """
-        if not content:
-            return content
-
-        # --- 1. Protect fenced code blocks from formatting changes ---
-        _FENCE_PH = "\x00FENCE"
-        fences: list[str] = []
-
-        def _save_fence(m: re.Match) -> str:
-            fences.append(m.group(0))
-            return f"{_FENCE_PH}{len(fences) - 1}\x00"
-
-        result = re.sub(r"```[\s\S]*?```", _save_fence, content)
-
-        # --- 2. Protect inline code ---
-        _CODE_PH = "\x00CODE"
-        codes: list[str] = []
-
-        def _save_code(m: re.Match) -> str:
-            codes.append(m.group(0))
-            return f"{_CODE_PH}{len(codes) - 1}\x00"
-
-        result = re.sub(r"`[^`\n]+`", _save_code, result)
-
-        # --- 3. Convert markdown formatting to WhatsApp syntax ---
-        # Bold: **text** or __text__ → *text*
-        result = re.sub(r"\*\*(.+?)\*\*", r"*\1*", result)
-        result = re.sub(r"__(.+?)__", r"*\1*", result)
-        # Strikethrough: ~~text~~ → ~text~
-        result = re.sub(r"~~(.+?)~~", r"~\1~", result)
-        # Italic: *text* is already WhatsApp italic — leave as-is
-        # _text_ is already WhatsApp italic — leave as-is
-
-        # --- 4. Convert markdown headers to bold text ---
-        # # Header → *Header*
-        result = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", result, flags=re.MULTILINE)
-
-        # --- 5. Convert markdown links: [text](url) → text (url) ---
-        result = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", result)
-
-        # --- 6. Restore protected sections ---
-        for i, fence in enumerate(fences):
-            result = result.replace(f"{_FENCE_PH}{i}\x00", fence)
-        for i, code in enumerate(codes):
-            result = result.replace(f"{_CODE_PH}{i}\x00", code)
-
-        return result
-
     async def send(
         self,
         chat_id: str,
@@ -1190,13 +1192,20 @@ class WhatsAppAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Download image URL to cache, send natively via bridge."""
+        """Download image URL to cache, send natively via bridge.
+
+        ``metadata`` is accepted to honor the base-class contract — the
+        batch sender ``send_multiple_images`` passes it through to every
+        send path. The bridge media call doesn't use it, matching the
+        sibling overrides (send_video / send_voice / send_document).
+        """
         try:
             local_path = await cache_image_from_url(image_url)
             return await self._send_media_to_bridge(chat_id, local_path, "image", caption)
         except Exception:
-            return await super().send_image(chat_id, image_url, caption, reply_to)
+            return await super().send_image(chat_id, image_url, caption, reply_to, metadata)
 
     async def send_image_file(
         self,
@@ -1602,6 +1611,15 @@ class WhatsAppAdapter(BasePlatformAdapter):
             body = data.get("body", "")
             if data.get("isGroup"):
                 body = self._clean_bot_mention_text(body, data)
+
+            # If this is a reply, include the quoted message text so the agent
+            # knows exactly what the user is responding to (fixes "approve" context issue)
+            quoted_text = str(data.get("quotedText") or "").strip()
+            if quoted_text and data.get("hasQuotedMessage"):
+                # Truncate long quoted text to keep prompts reasonable
+                if len(quoted_text) > 300:
+                    quoted_text = quoted_text[:297] + "..."
+                body = f"[Replying to: \"{quoted_text}\"]\n{body}"
             MAX_TEXT_INJECT_BYTES = 100 * 1024
             if msg_type == MessageType.DOCUMENT and cached_urls:
                 for doc_path in cached_urls:
