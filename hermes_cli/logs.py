@@ -42,6 +42,9 @@ LOG_FILES = {
     "agent-devflow-bridge": "agent-devflow-bridge.log",
     "gui": "gui.log",
     "desktop": "desktop.log",
+    # Every stdio MCP subprocess's stderr (tools/mcp_tool.py redirects it
+    # here, with per-server session markers) — the "MCP output channel".
+    "mcp": "mcp-stderr.log",
 }
 
 # Log line timestamp regex — matches "2026-04-05 22:35:00,123" or
@@ -183,7 +186,7 @@ def tail_log(
     log_path = get_hermes_home() / "logs" / filename
     if not log_path.exists():
         print(f"Log file not found: {log_path}")
-        print(f"(Logs are created when Hermes runs — try 'hermes chat' first)")
+        print("(Logs are created when Hermes runs — try 'hermes chat' first)")
         sys.exit(1)
 
     # Parse --since into a datetime cutoff
