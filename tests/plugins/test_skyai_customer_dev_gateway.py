@@ -201,6 +201,9 @@ async def test_build_chat_response_passes_voice_system_prompt_to_hermes_runner(t
     assert "не го връщай към 'официален канал'" in seen["system_prompt"]
     assert "не изброявай телефона, имейла или работното време" in seen["system_prompt"]
     assert "без markdown, сурови URL-и, дълги списъци" in seen["system_prompt"]
+    assert "spoken_reply е авторитетният отговор" in seen["system_prompt"]
+    assert "Скъсявай за телефон, но не променяй бизнес фактите" in seen["system_prompt"]
+    assert "не казвай 'нека проверя'" in seen["system_prompt"]
 
 
 def test_create_app_registers_dev_routes(tmp_path: Path) -> None:
@@ -290,6 +293,7 @@ async def test_build_voice_turn_response_uses_v2_chat_adapter(tmp_path: Path) ->
     assert response["status"] == "ok"
     assert response["action"] == "speak"
     assert response["spoken_reply"] == "Разбира се, ето идея за подарък."
+    assert not response["spoken_reply"].startswith("Извинете")
     assert response["display_reply"] == response["spoken_reply"]
     assert response["cards"] == [{"title": "Ваучер за подарък на стойност", "price_text": "стойност по избор"}]
     assert response["transfer"] is None
@@ -301,6 +305,162 @@ async def test_build_voice_turn_response_uses_v2_chat_adapter(tmp_path: Path) ->
     assert seen["message"] == "Търся подарък за рожден ден."
     assert seen["history"] == [{"role": "assistant", "content": "Здравейте"}]
     assert seen["conversation_id"] == "voice-c2"
+
+
+@pytest.mark.asyncio
+async def test_voice_first_clear_turn_after_greeting_goes_to_hermes(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings, system_prompt):
+        seen.update(
+            {
+                "message": message,
+                "history": history,
+                "system_prompt": system_prompt,
+            }
+        )
+        return "За спокоен рожден ден бих започнал с красив релакс подарък близо до Вас."
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-clear-first-turn",
+            "conversation_id": "voice-clear-first-turn",
+            "turn_index": 1,
+            "transcript": "Търся подарък за рожден ден на приятелка, нещо спокойно.",
+            "stt_confidence": 0.92,
+            "history": [{"role": "assistant", "content": "Здравейте, свързахте се със SkyVision."}],
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert "Извинете, не Ви" not in response["spoken_reply"]
+    assert "voice_reason" not in response["trace"]
+    assert seen["message"] == "Търся подарък за рожден ден на приятелка, нещо спокойно."
+    assert seen["history"] == [{"role": "assistant", "content": "Здравейте, свързахте се със SkyVision."}]
+    assert "Voice режим" in seen["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_voice_business_metadata_does_not_replace_semantic_reasoning(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings, system_prompt):
+        seen.update({"message": message, "system_prompt": system_prompt})
+        return "Ще го подходим консултативно: повод, човек, локация и усещане."
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-domain-intent",
+            "conversation_id": "voice-domain-intent",
+            "transcript": "Моля за идея за подарък за рожден ден около Сливен.",
+            "stt_confidence": 0.9,
+            "metadata": {
+                "surface": "pbx_voice",
+                "domain_intent": "birthday_gift",
+                "gift_intent": "true",
+                "support_intent": "false",
+            },
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert seen["message"] == "Моля за идея за подарък за рожден ден около Сливен."
+    assert "domain_intent" not in seen["message"]
+    assert "birthday_gift" not in seen["system_prompt"]
+    assert "backend-ът няма phrase list" in seen["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_voice_cheaper_than_voucher_value_keeps_residual_policy(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings, system_prompt):
+        seen.update({"message": message, "system_prompt": system_prompt})
+        return (
+            "Ако избраното преживяване е по-евтино от стойността на ваучера, "
+            "остатъкът остава като ваучерна стойност за следващо преживяване. "
+            "Ако е по-скъпо, тогава се доплаща разликата."
+        )
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-residual-voucher",
+            "conversation_id": "voice-residual-voucher",
+            "transcript": "Какво става ако избраното преживяване е по-евтино от стойността на ваучера?",
+            "stt_confidence": 0.93,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert "остатъкът остава" in response["spoken_reply"]
+    assert "ваучерна стойност" in response["spoken_reply"]
+    assert seen["message"].startswith("Какво става ако избраното преживяване е по-евтино")
+    assert "остатъкът остава като ваучерна стойност" in seen["system_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_voice_follow_up_gets_history_instead_of_repeating_wrong_answer(tmp_path: Path) -> None:
+    seen = {}
+
+    async def fake_runner(message, history, conversation_id, canary_settings, system_prompt):
+        seen.update({"message": message, "history": history})
+        return "Точно така, при по-евтино преживяване остатъкът не се губи, а остава като ваучерна стойност."
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-follow-up",
+            "conversation_id": "voice-follow-up",
+            "transcript": "Не, имах предвид ако е по-евтино, не по-скъпо.",
+            "stt_confidence": 0.96,
+            "history": [
+                {"role": "user", "content": "Какво ако е по-евтино?"},
+                {"role": "assistant", "content": "Ще доплатите разликата."},
+            ],
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert "остатъкът не се губи" in response["spoken_reply"]
+    assert seen["message"] == "Не, имах предвид ако е по-евтино, не по-скъпо."
+    assert seen["history"] == [
+        {"role": "user", "content": "Какво ако е по-евтино?"},
+        {"role": "assistant", "content": "Ще доплатите разликата."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_voice_basic_policy_answer_does_not_force_checking_phrase(tmp_path: Path) -> None:
+    async def fake_runner(message, history, conversation_id, canary_settings, system_prompt):
+        return "При BookNow, ако изпълнителят не може да проведе резервацията, парите ще бъдат възстановени."
+
+    response = await dev_gateway.build_voice_turn_response(
+        {
+            "call_id": "call-basic-policy",
+            "conversation_id": "voice-basic-policy",
+            "transcript": "Какво става, ако времето е лошо и BookNow резервацията отпадне?",
+            "stt_confidence": 0.94,
+        },
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["status"] == "ok"
+    assert response["action"] == "speak"
+    assert "парите ще бъдат възстановени" in response["spoken_reply"]
+    assert "нека проверя" not in response["spoken_reply"].casefold()
+    assert "проверявам" not in response["spoken_reply"].casefold()
 
 
 @pytest.mark.asyncio
@@ -638,6 +798,7 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "продуктовия public_url" in prompt
     assert "не повтаряй целия flow" in prompt
     assert "Два ваучера не се обединяват автоматично" in prompt
+    assert "остатъкът остава като ваучерна стойност" in prompt
     assert "Опцията за удължаване е налична" in prompt
     assert "customer-safe обучение от реални email/support казуси" in prompt
     assert "intent/state reasoning, а не като шаблон" in prompt
