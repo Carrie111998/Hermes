@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-agent"
-version = "0.17.0"
+version = "0.18.0"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -184,6 +184,13 @@ pty = [
   # without pulling in extra packages.
 ]
 honcho = ["honcho-ai==2.0.1"]
+# Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
+# (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
+# LAZY_DEPS pins (enforced by tests/test_project_metadata.py). Deliberately
+# excluded from [all] like honcho/hindsight so a quarantined upstream release
+# can't break fresh installs.
+supermemory = ["supermemory==3.50.0"]
+mem0 = ["mem0ai==2.0.10"]
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
 # (see the main `dependencies` list) since the byte/pixel shrink paths are on
 # the default vision-embed path and the mid-session lazy install deadlocked the
@@ -201,7 +208,7 @@ mcp = ["mcp==1.26.0", "starlette==1.0.1"]  # starlette: CVE-2026-48710
 nemo-relay = ["nemo-relay==0.3"]
 homeassistant = ["aiohttp==3.14.1"]
 sms = ["aiohttp==3.14.1"]
-teams = ["microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"]  # aiohttp bumped to fork security floor (RCE fix); upstream shipped 3.13.4
+teams = ["microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"]  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
 # Computer use — macOS background desktop control via cua-driver (MCP stdio).
 # The cua-driver binary itself is installed via `hermes tools` post-setup
 # (curl install script); this extra just pins the MCP client used to talk
@@ -218,6 +225,7 @@ acp = ["agent-client-protocol==0.9.0"]
 # installs (see [all] policy comment below).
 mistral = ["mistralai==2.4.8"]
 bedrock = ["boto3==1.42.89"]
+vertex = ["google-auth==2.55.1"]
 azure-identity = ["azure-identity==1.25.3"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
