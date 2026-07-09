@@ -222,13 +222,19 @@ class TestRunJobProfileContext:
         monkeypatch.setattr(sched, "_hermes_home", None)
         monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
 
-        import dotenv
+        # The merged run_job re-reads .env through hermes_cli.env_loader.
+        # load_hermes_dotenv() (not a bare dotenv.load_dotenv), which binds
+        # ``load_dotenv`` at import time and only fires when the target .env
+        # actually exists. Patch that real binding so the stub intercepts the
+        # merged path; tests that need the load to fire create a profile .env.
+        from hermes_cli import env_loader as _env_loader
 
-        def fake_load_dotenv(path, *_a, **_kw):
+        def fake_load_dotenv(*_a, **_kw):
+            path = _kw.get("dotenv_path", _a[0] if _a else None)
             observed.setdefault("dotenv_paths", []).append(str(path))
             return True
 
-        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
+        monkeypatch.setattr(_env_loader, "load_dotenv", fake_load_dotenv)
 
     def test_run_job_sets_and_restores_profile_home(
         self, isolated_cron_profile_home, monkeypatch
@@ -238,6 +244,9 @@ class TestRunJobProfileContext:
         root, profile_home = isolated_cron_profile_home
         observed: dict = {}
         self._install_agent_stubs(monkeypatch, observed)
+        # load_hermes_dotenv only loads a .env that exists on disk, so create
+        # the profile's .env to prove the load resolves under the profile home.
+        (profile_home / ".env").write_text("", encoding="utf-8")
 
         job = {
             "id": "abc",
@@ -263,7 +272,7 @@ class TestRunJobProfileContext:
     def test_profile_dotenv_environment_is_restored(
         self, isolated_cron_profile_home, monkeypatch
     ):
-        import dotenv
+        from hermes_cli import env_loader as _env_loader
         import cron.scheduler as sched
 
         root, profile_home = isolated_cron_profile_home
@@ -271,15 +280,21 @@ class TestRunJobProfileContext:
         self._install_agent_stubs(monkeypatch, observed)
         monkeypatch.setenv("HERMES_PROFILE_TEST_SHARED", "outer")
         monkeypatch.delenv("HERMES_PROFILE_TEST_ONLY", raising=False)
+        # load_hermes_dotenv only loads a .env that exists on disk.
+        (profile_home / ".env").write_text("", encoding="utf-8")
 
-        def fake_load_dotenv(path, *_a, **_kw):
+        # Patch the merged binding (env_loader.load_dotenv) so the profile .env
+        # load applies the profile's environment. The subsequent restore is the
+        # scheduler's _job_profile_context snapshot/restore under test.
+        def fake_load_dotenv(*_a, **_kw):
+            path = _kw.get("dotenv_path", _a[0] if _a else None)
             observed.setdefault("dotenv_paths", []).append(str(path))
             os.environ["HERMES_PROFILE_TEST_SHARED"] = "profile-value"
             os.environ["HERMES_PROFILE_TEST_ONLY"] = "profile-only"
             os.environ["HERMES_CRON_TIMEOUT"] = "123"
             return True
 
-        monkeypatch.setattr(dotenv, "load_dotenv", fake_load_dotenv)
+        monkeypatch.setattr(_env_loader, "load_dotenv", fake_load_dotenv)
 
         job = {
             "id": "env-profile",

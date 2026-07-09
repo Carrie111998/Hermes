@@ -3315,6 +3315,22 @@ def _guard_job_credential_exfil(job: dict) -> None:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
+    """Execute a single cron job, applying any per-job profile override.
+
+    Thin wrapper: resolves the job's optional ``profile`` into a context-local
+    Hermes-home override (via ``_job_profile_context``) so the entire run —
+    no_agent script path included — executes under the profile's HERMES_HOME,
+    then delegates to ``_run_job_impl``. Keeping the profile scope here (not
+    inside the impl) guarantees the no_agent short-circuit is also profile-scoped.
+    """
+    job_id = job["id"]
+    with _job_profile_context(job_id, job.get("profile")):
+        return _run_job_impl(job, defer_agent_teardown=defer_agent_teardown)
+
+
+def _run_job_impl(
+    job: dict, *, defer_agent_teardown: Optional[list] = None
+) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
 

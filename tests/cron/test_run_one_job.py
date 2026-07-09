@@ -45,7 +45,12 @@ def test_tick_process_job_sequence(monkeypatch):
     """Characterization: a single due job driven through tick() runs the
     sequence run_job → save → deliver → mark, in that order."""
     calls = _patch_pipeline(monkeypatch)
-    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j1", "name": "t"}])
+    # The fork's tick() fetches work through get_due_and_skipped_jobs() (tuple
+    # API: (due, skipped)), NOT the upstream get_due_jobs() wrapper. Patch the
+    # real merged entry point so this characterization drives tick's pipeline.
+    monkeypatch.setattr(
+        s, "get_due_and_skipped_jobs", lambda: ([{"id": "j1", "name": "t"}], [])
+    )
     monkeypatch.setattr(s, "advance_next_run", lambda jid: True)
 
     s.tick(verbose=False, sync=True)
