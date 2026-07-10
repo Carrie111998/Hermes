@@ -456,7 +456,7 @@ def _normalize_deliver_value(deliver) -> str:
 # job created before Telegram was wired up will pick up Telegram once it
 # comes online.  ``all`` expands into the set of connected platforms
 # (those with a configured home chat_id) in _expand_routing_tokens.
-_ROUTING_TOKENS = frozenset({"all"})
+_ROUTING_TOKENS: frozenset[str] = frozenset({"all"})
 
 
 def _expand_routing_tokens(part: str) -> List[str]:

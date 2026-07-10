@@ -255,6 +255,7 @@ spec:
   deploy:
     controller: pcl pa-agent
     manifestRef: deploy/tgg/christopher/pa-agent.hermes.manifest.json
+    runtimeFileSetBuilder: deploy/tgg/christopher/scripts/build_pa_agent_manifest.py
     transport: ssh-rsync
     immutableBundles: true
     remoteBoxEditingAllowed: false

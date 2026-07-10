@@ -241,6 +241,26 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
 
     manifest_path = _resolve(app_root, spec["deploy"]["manifestRef"])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    included = set(manifest.get("include", []))
+    required_runtime_files = {
+        "gateway/durable_jsonl_consumer.py",
+        "gateway/platforms/base.py",
+        "gateway/platforms/helpers.py",
+        "gateway/platforms/whatsapp.py",
+        "run_agent.py",
+        "model_tools.py",
+        "deploy/tgg/christopher/client-agent-deployment.yaml",
+        "deploy/tgg/christopher/scripts/build_pa_agent_manifest.py",
+        "deploy/tgg/christopher/scripts/validate_deployment_spec.py",
+        "deploy/tgg/christopher/scripts/verify_runtime.sh",
+    }
+    missing_runtime_files = sorted(required_runtime_files - included)
+    if missing_runtime_files:
+        raise RuntimeError(
+            f"deploy manifest omitted required runtime files: {missing_runtime_files}"
+        )
+    for relative in included:
+        _resolve(app_root, relative)
     manifest_services = {entry["name"] for entry in manifest.get("services", [])}
     if manifest_services != {"christopher-tgg-hermes.service"}:
         raise RuntimeError(

@@ -131,7 +131,7 @@ _TELEGRAM_RE = re.compile(
 )
 
 # Private key blocks: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----
-_PRIVATE_KEY_RE = re.compile(
+_PRIVATE_KEY_RE: re.Pattern[str] = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
 )
 

@@ -47,11 +47,11 @@ _VOICE_EXTS = {".ogg", ".opus"}
 # formats either route through sendVoice (Opus/OGG) or fall back to
 # document delivery.
 _TELEGRAM_SEND_AUDIO_EXTS = {".mp3", ".m4a"}
-_URL_SECRET_QUERY_RE = re.compile(
+_URL_SECRET_QUERY_RE: re.Pattern[str] = re.compile(
     r"([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)",
     re.IGNORECASE,
 )
-_GENERIC_SECRET_ASSIGN_RE = re.compile(
+_GENERIC_SECRET_ASSIGN_RE: re.Pattern[str] = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )

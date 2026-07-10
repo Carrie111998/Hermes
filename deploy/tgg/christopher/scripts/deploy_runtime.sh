@@ -5,6 +5,7 @@ APP_ROOT="$(git rev-parse --show-toplevel)"
 SPEC_REL="deploy/tgg/christopher/client-agent-deployment.yaml"
 SPEC_PATH="$APP_ROOT/$SPEC_REL"
 VALIDATOR="$APP_ROOT/deploy/tgg/christopher/scripts/validate_deployment_spec.py"
+MANIFEST_BUILDER="$APP_ROOT/deploy/tgg/christopher/scripts/build_pa_agent_manifest.py"
 
 read -r client agent system domain expected_target manifest_rel < <(
   python3 - "$SPEC_PATH" <<'PY'
@@ -22,6 +23,10 @@ PY
 )
 manifest_path="$APP_ROOT/$manifest_rel"
 
+python3 "$MANIFEST_BUILDER" \
+  --app-root "$APP_ROOT" \
+  --manifest "$manifest_path" \
+  --check
 python3 "$VALIDATOR" --app-root "$APP_ROOT" --spec "$SPEC_PATH"
 
 if [[ -n "$(git -C "$APP_ROOT" status --porcelain)" ]]; then

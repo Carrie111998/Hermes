@@ -10,8 +10,8 @@ from typing import Any, Iterable, Mapping
 
 DEFAULT_PAIR_WINDOW_SECONDS = 5 * 60
 _MEDIA_KEYS = ("file_id", "file_url", "getFile_url", "url")
-_JOB_TOKEN_RE = re.compile(r"\b[A-Z]{1,8}/JOB/\d{4}/\d{2,8}\b", re.IGNORECASE)
-_LABELLED_TOKEN_RE = re.compile(
+_JOB_TOKEN_RE: re.Pattern[str] = re.compile(r"\b[A-Z]{1,8}/JOB/\d{4}/\d{2,8}\b", re.IGNORECASE)
+_LABELLED_TOKEN_RE: re.Pattern[str] = re.compile(
     r"\b(?:job(?:\s*(?:no|number|id))?|case(?:\s*(?:id|no|number))?)"
     r"\s*[:#-]?\s*([A-Z0-9][A-Z0-9/_-]{2,})",
     re.IGNORECASE,
