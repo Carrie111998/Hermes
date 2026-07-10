@@ -41,9 +41,12 @@ chown pclaw:pclaw "$HERMES_HOME/.env"
 if [[ ! -x "$APP_ROOT/.venv/bin/python" ]]; then
   python3 -m venv "$APP_ROOT/.venv"
 fi
-chown -R pclaw:pclaw "$APP_ROOT/.venv"
-runuser -u pclaw -- "$APP_ROOT/.venv/bin/python" -m pip install \
+# The immutable app tree is root-owned by pcl pa-agent. Editable installation
+# writes its egg-info beside pyproject.toml, so bootstrap performs the install
+# as root and leaves both source and venv non-writable to the runtime user.
+"$APP_ROOT/.venv/bin/python" -m pip install \
   --disable-pip-version-check --no-input --editable "$APP_ROOT"
+chown -R root:root "$APP_ROOT/.venv"
 
 "$APP_ROOT/.venv/bin/python" \
   "$DEPLOY_ROOT/scripts/validate_deployment_spec.py" \
