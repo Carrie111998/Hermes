@@ -2800,6 +2800,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
+    # Platforms whose boot-time connect is fired in the background instead of
+    # awaited inline in the startup loop. WhatsApp's bridge (localhost:3000) is
+    # frequently down, and its connect blocks for the full platform-connect
+    # timeout (30s) on every boot. Awaiting it inline gated the api_server
+    # :8642 bind — and thus every gateway restart and watchdog recovery — on
+    # that 30s (boot forensics 2026-07-10). Firing it as a background task lets
+    # the loop bind api_server immediately; failures fall into the existing
+    # reconnect watcher, which keeps retrying at its 60-300s backoff.
+    _BACKGROUND_CONNECT_PLATFORMS: frozenset = frozenset({Platform.WHATSAPP})
+
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
@@ -3464,6 +3474,112 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raise TimeoutError(
                 f"{platform.value} connect timed out after {timeout:g}s"
             ) from exc
+
+    def _should_connect_in_background(self, platform) -> bool:
+        """Whether ``platform``'s boot-time connect should be backgrounded.
+
+        See ``_BACKGROUND_CONNECT_PLATFORMS`` for the rationale (WhatsApp's
+        30s connect timeout gating the api_server :8642 bind on every boot).
+        """
+        return platform in self._BACKGROUND_CONNECT_PLATFORMS
+
+    def _queue_platform_for_retry(self, platform, platform_config) -> None:
+        """Enqueue a platform for the reconnect watcher (no-op if already queued)."""
+        self._failed_platforms.setdefault(
+            platform,
+            {
+                "config": platform_config,
+                "attempts": 1,
+                "next_retry": time.monotonic() + 30,
+            },
+        )
+
+    async def _connect_platform_in_background(
+        self, adapter, platform, platform_config
+    ) -> None:
+        """Connect a platform without gating the rest of gateway startup.
+
+        Fired as a background task for platforms in
+        ``_BACKGROUND_CONNECT_PLATFORMS`` (WhatsApp) so the startup loop
+        proceeds to bind the api_server (:8642) immediately instead of blocking
+        on a 30s connect timeout when the bridge is down. On success the
+        adapter is wired in exactly like a reconnect-watcher recovery (delivery
+        router, channel directory, pending-session resume). On failure it is
+        queued into ``_failed_platforms`` so the existing reconnect watcher
+        keeps retrying at its normal backoff cadence.
+        """
+        try:
+            success = await self._connect_adapter_with_timeout(adapter, platform)
+        except Exception as e:
+            logger.info(
+                "✗ %s background connect failed: %s — queued for retry",
+                platform.value, e,
+            )
+            await self._safe_adapter_disconnect(adapter, platform)
+            self._update_platform_runtime_status(
+                platform.value,
+                platform_state="retrying",
+                error_code=None,
+                error_message=str(e),
+            )
+            self._queue_platform_for_retry(platform, platform_config)
+            return
+
+        if not success:
+            logger.warning("✗ %s failed to connect (background)", platform.value)
+            await self._safe_adapter_disconnect(adapter, platform)
+            if adapter.has_fatal_error:
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+                    error_code=adapter.fatal_error_code,
+                    error_message=adapter.fatal_error_message,
+                )
+                # Non-retryable errors (bad auth, etc.) are left out of the
+                # retry queue — same policy as the inline startup path.
+                if adapter.fatal_error_retryable:
+                    self._queue_platform_for_retry(platform, platform_config)
+            else:
+                self._update_platform_runtime_status(
+                    platform.value,
+                    platform_state="retrying",
+                    error_code=None,
+                    error_message="failed to connect",
+                )
+                self._queue_platform_for_retry(platform, platform_config)
+            return
+
+        # Connected — wire it in exactly like a late reconnect recovery.
+        self.adapters[platform] = adapter
+        self._sync_voice_mode_state_to_adapter(adapter)
+        self.delivery_router.adapters = self.adapters
+        self._update_platform_runtime_status(
+            platform.value,
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+        )
+        logger.info("✓ %s connected (background)", platform.value)
+
+        # Rebuild channel directory so send_message name resolution sees the
+        # freshly connected adapter.
+        try:
+            from gateway.channel_directory import build_channel_directory
+            await build_channel_directory(self.adapters)
+        except Exception:
+            pass
+
+        # If startup's own resume pass hasn't run yet it will cover this
+        # platform (it resumes every connected adapter); only self-schedule once
+        # startup is done, to avoid a premature or duplicate resume.
+        if not getattr(self, "_startup_restore_in_progress", False):
+            try:
+                self._schedule_resume_pending_sessions(platform=platform)
+            except Exception:
+                logger.debug(
+                    "resume-pending reschedule after %s background connect failed",
+                    platform.value, exc_info=True,
+                )
 
     @property
     def should_exit_cleanly(self) -> bool:
@@ -7041,6 +7157,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_code=None,
                 error_message=None,
             )
+
+            # Fire-and-retry for platforms that must not gate startup (WhatsApp):
+            # kick the connect off as a background task and move straight on to
+            # the next platform so the api_server :8642 bind isn't held hostage
+            # by a 30s WhatsApp connect timeout. Failures fall into the
+            # reconnect watcher just like an inline failure would.
+            if self._should_connect_in_background(platform):
+                logger.info(
+                    "Connecting to %s in the background — not blocking startup",
+                    platform.value,
+                )
+                bg_task = asyncio.create_task(
+                    self._connect_platform_in_background(
+                        adapter, platform, platform_config
+                    )
+                )
+                self._background_tasks.add(bg_task)
+                bg_task.add_done_callback(self._background_tasks.discard)
+                if await self._abort_startup_if_shutdown_requested():
+                    return True
+                continue
+
             try:
                 success = await self._connect_adapter_with_timeout(adapter, platform)
                 if await self._abort_startup_if_shutdown_requested(adapter, platform):
