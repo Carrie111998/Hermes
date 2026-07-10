@@ -1469,10 +1469,47 @@ if _config_path.exists():
             _cfg = managed_scope.apply_managed_overlay(_cfg)
         except Exception:
             pass
-        # Top-level simple values (fallback only — don't override .env)
+        # Top-level simple values (fallback only — don't override .env).
+        #
+        # Env-var-shaped UPPERCASE keys (TELEGRAM_HOME_CHANNEL, WHATSAPP_HOME_CHANNEL,
+        # …) are the intentional config.yaml→env fallbacks. Two long-standing
+        # confusion sources get an explicit diagnostic here (see the 2026-07-10
+        # env-shadowing trace):
+        #   1. MASKED — .env already set the key, so this config.yaml scalar is
+        #      silently ignored (env wins). A user who ran `hermes config set
+        #      TELEGRAM_HOME_CHANNEL …` and saw no effect hit exactly this.
+        #   2. STALE-RESURFACE — a *_HOME_CHANNEL key is bridged in from config.yaml
+        #      because .env is silent; the home channel is then sourced from
+        #      config.yaml, and any stale value there resurfaces the instant .env
+        #      omits the key (the -1003925553573 Mission-Control-supergroup bug).
+        # The module-level `logger` is not defined yet at import time (it is created
+        # further down this module), so resolve one locally; file logging is already
+        # configured by this point, so these diagnostics land in agent.log.
+        _bridge_log = logging.getLogger(__name__)
         for _key, _val in _cfg.items():
-            if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
-                os.environ[_key] = str(_val)
+            if not isinstance(_val, (str, int, float, bool)):
+                continue
+            # UPPERCASE + [A-Z0-9_] only ⇒ "looks like an env var"; skips ordinary
+            # lowercase config scalars (fallback_model, timezone, …) to avoid noise.
+            _env_shaped = _key.isupper() and _key.replace("_", "").isalnum()
+            if _key in os.environ:
+                if _env_shaped and str(_val) != os.environ[_key]:
+                    _bridge_log.warning(
+                        "config.yaml top-level %s=%r is IGNORED — .env already set "
+                        "%s=%r (.env wins over the config.yaml→env bridge). Delete the "
+                        "stale config.yaml key or update .env to match.",
+                        _key, str(_val), _key, os.environ[_key],
+                    )
+                continue
+            os.environ[_key] = str(_val)
+            if _env_shaped and _key.endswith("_HOME_CHANNEL"):
+                _bridge_log.info(
+                    "%s=%r was bridged from config.yaml (no .env value) — this "
+                    "platform's home channel is sourced from config.yaml, not .env. "
+                    "Set it in .env or via /sethome so the source is explicit and "
+                    "stale config.yaml values can't resurface.",
+                    _key, str(_val),
+                )
         # Terminal config is nested — bridge to TERMINAL_* env vars.
         # config.yaml overrides .env for these since it's the documented config path.
         _terminal_cfg = _cfg.get("terminal", {})
