@@ -85,6 +85,7 @@ import {
   profileSshOverride,
   remoteRequestMatchesBaseUrl,
   resolveAuthMode,
+  resolveProfileApiRequest,
   resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
@@ -9480,7 +9481,7 @@ function primaryProfileKey() {
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
-function profileRouteOptions(profile) {
+function profileRouteOptions(profile, request?) {
   const config = readDesktopConnectionConfig()
   const sshOverride = profileSshOverride(config, profile)
   const key = connectionScopeKey(profile) || primaryProfileKey()
@@ -9498,7 +9499,9 @@ function profileRouteOptions(profile) {
     primaryRemoteActive: primaryBackendIsRemote(),
     // A stored per-profile entry (local or remote) — pins this profile to
     // its own backend; absent entries inherit the primary's remote.
-    ownEntry: Boolean((readDesktopConnectionConfig().profiles || {})[key])
+    ownEntry: Boolean((config.profiles || {})[key]),
+    requestMethod: request?.method,
+    requestPath: request?.path
   }
 }
 
@@ -13148,13 +13151,17 @@ async function handleHermesApiRequest(request) {
   // backend instead of spawning a fresh pool backend.  A freshly spawned
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
-  const routeProfile = resolveRouteProfile(tornDownProfile, profile)
+  //
+  // Safe local-profile REST calls also stay on the primary dashboard and carry
+  // ?profile=. Endpoints that cannot honor that scope retain their pooled
+  // backend so a destructive call can never fall through to the primary home.
+  const apiRoute = resolveProfileApiRequest(profile, request.path, profileRouteOptions(profile, request))
+  const routeProfile = resolveRouteProfile(tornDownProfile, apiRoute.backendProfile)
+
   const connection = await ensureBackend(routeProfile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
-
-  const url = `${connection.baseUrl}${requestPath}`
+  const url = `${connection.baseUrl}${apiRoute.requestPath}`
 
   // OAuth gateways authenticate REST via EITHER a native bearer token
   // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
