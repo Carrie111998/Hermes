@@ -1677,7 +1677,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 item["update_mode"] = update_mode
             logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
                          bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
-            self._run_hindsight_operation(
+            resp = self._run_hindsight_operation(
                 lambda client: client.aretain_batch(
                     bank_id=bank_id,
                     items=[item],
@@ -1685,7 +1685,14 @@ class HindsightMemoryProvider(MemoryProvider):
                     retain_async=retain_async_flag,
                 )
             )
-            logger.debug("Hindsight retain succeeded")
+            if not resp.success:
+                logger.warning(
+                    "Hindsight retain: API returned success=false (bank=%s, doc=%s, "
+                    "items_count=%d, async=%s)",
+                    bank_id, document_id, resp.items_count, retain_async_flag,
+                )
+            else:
+                logger.debug("Hindsight retain succeeded (items_count=%d)", resp.items_count)
 
         self._ensure_writer()
         self._register_atexit()
@@ -1717,10 +1724,17 @@ class HindsightMemoryProvider(MemoryProvider):
                 item.pop("retain_async", None)
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
-                self._run_hindsight_operation(
+                resp = self._run_hindsight_operation(
                     lambda client: client.aretain_batch(bank_id=self._bank_id, items=[item])
                 )
-                logger.debug("Tool hindsight_retain: success")
+                if not resp.success:
+                    logger.warning("hindsight_retain: API returned success=false (bank=%s, items_count=%d)",
+                                   self._bank_id, resp.items_count)
+                    return tool_error(
+                        f"Failed to store memory: API returned success=false "
+                        f"(items_count={resp.items_count})"
+                    )
+                logger.debug("Tool hindsight_retain: success (items_count=%d)", resp.items_count)
                 return json.dumps({"result": "Memory stored successfully."})
             except Exception as e:
                 logger.warning("hindsight_retain failed: %s", e, exc_info=True)
@@ -1858,7 +1872,7 @@ class HindsightMemoryProvider(MemoryProvider):
                         "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
                         self._bank_id, old_document_id, old_update_mode, len(old_turns),
                     )
-                    self._run_hindsight_operation(
+                    resp = self._run_hindsight_operation(
                         lambda client: client.aretain_batch(
                             bank_id=self._bank_id,
                             items=[item],
@@ -1866,6 +1880,13 @@ class HindsightMemoryProvider(MemoryProvider):
                             retain_async=self._retain_async,
                         )
                     )
+                    if not resp.success:
+                        logger.warning(
+                            "Hindsight flush-on-switch: API returned success=false "
+                            "(bank=%s, doc=%s, items_count=%d, async=%s)",
+                            self._bank_id, old_document_id, resp.items_count,
+                            self._retain_async,
+                        )
                 except Exception as e:
                     logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
 

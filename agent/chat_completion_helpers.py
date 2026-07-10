@@ -27,6 +27,10 @@ from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
+from agent.stream_circuit_breaker import (
+    record_stream_failure as _record_stream_failure,
+    record_stream_success as _record_stream_success,
+)
 from agent.error_classifier import FailoverReason
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -2666,6 +2670,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic()
                     else:
                         result["response"] = _call_chat_completions()
+                    # Circuit breaker: successful streaming call resets the
+                    # consecutive-failure counter for (provider, model).
+                    _record_stream_success(agent, agent.provider, agent.model)
                     return  # success
                 except Exception as e:
                     # If the main poll loop force-closed this request because
@@ -2749,6 +2756,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             logger.warning(
                                 "Streaming failed after partial delivery, not retrying: %s", e
                             )
+                            # Circuit breaker: count this as a streaming failure.
+                            _record_stream_failure(agent, agent.provider, agent.model, str(e))
                             result["error"] = e
                             return
                         # Tool call was in-flight AND error is transient:
@@ -2968,6 +2977,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # richer recovery: credential rotation, provider fallback,
                     # backoff, and — for "stream not supported" — will switch
                     # to non-streaming on the next attempt via _disable_streaming.
+                    # Circuit breaker: count as a streaming failure so repeated
+                    # connection drops trip the breaker and activate fallback.
+                    _record_stream_failure(agent, agent.provider, agent.model, str(e))
                     result["error"] = e
                     return
         except InterruptedError as e:
