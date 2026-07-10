@@ -603,9 +603,13 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     assert "човека, който купува или резервира" in campaign["customer_summary"]
     assert "SkyVision е създаден през 2007 от Емил и Малина." in campaign["brand_story_facts"]
     assert "Летенето остава част от ДНК-то на бранда." in campaign["brand_story_facts"]
+    assert any("Емил и Малина все още лично летят" in fact for fact in campaign["brand_story_facts"])
     assert campaign["bonus_owner"]["default"].startswith("човекът")
     assert campaign["bonus_owner"]["is_automatic_for_voucher_recipient"] is False
     assert campaign["bonus_owner"]["transfer_is_manual_exception"] is True
+    assert campaign["bonus_owner"]["customer_can_self_transfer"] is False
+    assert "акаунта, имейла и данните" in campaign["bonus_owner"]["default_use_scope"]
+    assert campaign["bonus_owner"]["manual_exception_approver"] == "Емил Ломлиев"
     assert campaign["campaign_2026_facts"]["public_page"] == "https://skyvision.bg/campaign/free-panoramic-flight/"
     assert campaign["campaign_2026_facts"]["archive_2025_url"] == (
         "https://skyvision.bg/campaign/free-panoramic-flight-2025/"
@@ -621,6 +625,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     gift_linking = campaign["campaign_2026_facts"]["gift_entitlement_profile_linking"]
     assert gift_linking["has_voucher_or_serial_number"] is False
     assert gift_linking["manual_add_by_customer"] is False
+    assert gift_linking["customer_can_self_transfer"] is False
     assert "автоматично в профила" in gift_linking["logged_in_order"]
     assert "имейла от поръчката" in gift_linking["guest_or_no_profile_order"]
     assert "същия имейл" in gift_linking["later_profile_with_same_email"]
@@ -639,9 +644,15 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     assert "клиентът пита" in result["founder_transfer_facts"]["context"]
     founder_facts = result["founder_transfer_facts"]["facts"]
     assert founder_facts["default_owner"].startswith("купувачът")
+    assert "акаунта/имейла/данните" in founder_facts["default_rule"]
     assert founder_facts["founder_name"] == "Емил Ломлиев"
+    assert founder_facts["cofounder_name"] == "Малина Ломлиева"
+    assert "през 2007 г." in founder_facts["founding_story"]
+    assert "над 1000 преживявания" in founder_facts["platform_scale"]
+    assert "все още лично летят" in founder_facts["personal_flight_fact"]
     assert "пилот-инструктор" in founder_facts["founder_role"]
-    assert "не е автоматично право" in founder_facts["recipient_transfer"]
+    assert "лично одобрение" in founder_facts["recipient_transfer"]
+    assert "публичния телефон на Емил" in founder_facts["approval_guidance"]
     assert result["founder_transfer_facts"]["public_founder_contact"] == "+359 886 417 142"
 
 

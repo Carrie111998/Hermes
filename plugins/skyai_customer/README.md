@@ -44,6 +44,9 @@ Current line:
 - `v2.3` - campaign gift entitlement knowledge: gifts/bonuses are not manual
   voucher-code entries; they link automatically through logged-in orders or the
   order email.
+- `v2.4` - campaign bonus transfer nuance: the bonus stays linked to the buyer
+  by default, while founder-approved human exceptions may use Emil's public
+  phone and SkyVision's founding flight story.
 
 ## Voice Contract
 

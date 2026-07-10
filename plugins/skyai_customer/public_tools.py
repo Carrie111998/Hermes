@@ -1030,12 +1030,16 @@ def handle_skyai_campaign_knowledge(
                     "Основателите споделят страстта си към летенето с клиенти и приятели на SkyVision.",
                     "SkyVision вече предлага над 1000 преживявания в много категории.",
                     "Летенето остава част от ДНК-то на бранда.",
+                    "Емил и Малина все още лично летят и изпълняват част от полетите.",
                     "Бонусният полет е начин SkyVision да благодари на хората, които избират платформата.",
                 ],
                 "bonus_owner": {
                     "default": "човекът, който прави успешната поръчка или BookNow резервация",
                     "is_automatic_for_voucher_recipient": False,
                     "transfer_is_manual_exception": True,
+                    "customer_can_self_transfer": False,
+                    "default_use_scope": "свързан е с акаунта, имейла и данните на купувача/резервиращия",
+                    "manual_exception_approver": "Емил Ломлиев",
                 },
                 "campaign_2026_facts": {
                     "public_page": "https://skyvision.bg/campaign/free-panoramic-flight/",
@@ -1050,6 +1054,7 @@ def handle_skyai_campaign_knowledge(
                     "gift_entitlement_profile_linking": {
                         "has_voucher_or_serial_number": False,
                         "manual_add_by_customer": False,
+                        "customer_can_self_transfer": False,
                         "logged_in_order": "ако клиентът е бил логнат при поръчката, подаръкът се добавя автоматично в профила",
                         "guest_or_no_profile_order": "ако клиентът не е бил логнат или няма профил, подаръкът се обвързва с имейла от поръчката",
                         "later_profile_with_same_email": (
@@ -1125,10 +1130,25 @@ def handle_skyai_campaign_knowledge(
             "context": "само когато клиентът пита дали бонусният полет може да се използва от друг човек",
             "facts": {
                 "default_owner": "купувачът или човекът, който прави директната BookNow резервация",
-                "recipient_transfer": "не е автоматично право; разглежда се като човешко изключение",
+                "default_rule": (
+                    "по условия и по системна логика бонусният полет не се ползва от друг човек автоматично; "
+                    "той е свързан с акаунта/имейла/данните на купувача или резервиращия"
+                ),
+                "recipient_transfer": "не е автоматично право; разглежда се като човешко изключение с лично одобрение",
                 "founder_name": "Емил Ломлиев",
+                "cofounder_name": "Малина Ломлиева",
                 "founder_role": "съосновател на SkyVision, пилот-инструктор и изпитващ",
+                "founding_story": (
+                    "Емил и Малина основават SkyVision през 2007 г., за да споделят страстта си към летенето "
+                    "с всеки, който иска да се докосне до небето"
+                ),
+                "platform_scale": "SkyVision вече предлага над 1000 преживявания, но летенето остава личната страст на основателите",
+                "personal_flight_fact": "Емил и Малина все още лично летят и изпълняват част от полетите",
                 "reason": "мисията на SkyVision е да споделя любовта към летенето и да радва хората",
+                "approval_guidance": (
+                    "ако клиентът иска човекът, за когото купува, да използва бонуса, SkyAI може директно "
+                    "да даде публичния телефон на Емил за лично одобрение"
+                ),
             },
             "public_founder_contact": "+359 886 417 142",
         },

@@ -785,17 +785,21 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "бонусът е благодарност към купувача/резервиращия" in prompt
     assert "бонусният полет се изпълнява единствено от летище Приморско" in prompt
     assert "независимо къде е основната закупена услуга" in prompt
-    assert "първо обясни правилото с думите купувачът/резервиращият" in prompt
-    assert "бонусът е за купувача/резервиращия" in prompt
+    assert "по правило бонусът е за купувача/резервиращия" in prompt
+    assert "акаунта/данните му" in prompt
+    assert "не се прехвърля автоматично" in prompt
+    assert "Емил Ломлиев" in prompt
+    assert "съосновател с Малина през 2007" in prompt
+    assert "пилот-инструктор" in prompt
+    assert "+359 886 417 142" in prompt
     assert "Подаръчните бонуси нямат ваучерен/сериен номер" in prompt
     assert "не се добавят ръчно" in prompt
     assert "ако купувачът е логнат" in prompt
     assert "автоматично в профила" in prompt
     assert "се обвързва с имейла от поръчката" in prompt
     assert "профил със същия имейл" in prompt
-    assert "Емил/Малина" in prompt
-    assert "Не започвай с директно 'да'" in prompt
-    assert "Не представяй бонуса като автоматичен подарък" in prompt
+    assert "не започвай с директно 'да'" in prompt
+    assert "не представяй бонуса като подарък за получателя" in prompt
     assert "BookNow е директна резервация" in prompt
     assert "парите ще бъдат възстановени" in prompt
     assert "не като несигурна възможност" in prompt
