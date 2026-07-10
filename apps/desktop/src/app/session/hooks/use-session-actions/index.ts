@@ -177,6 +177,7 @@ export function useSessionActions({
 
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
+          source: 'desktop',
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {}),
           ...(uiModel ? { model: uiModel, ...(uiProvider ? { provider: uiProvider } : {}) } : {}),
@@ -461,6 +462,7 @@ export function useSessionActions({
         const resumePromise = requestGateway<SessionResumeResponse>('session.resume', {
           session_id: storedSessionId,
           cols: 96,
+          source: 'desktop',
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
@@ -643,6 +645,7 @@ export function useSessionActions({
         // No title: the backend auto-names the branch from its parent's lineage.
         const branched = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
+          source: 'desktop',
           ...(cwd && { cwd }),
           messages: branchMessages.map(({ content, role }) => ({ content, role })),
           ...(parentStoredId && { parent_session_id: parentStoredId })
