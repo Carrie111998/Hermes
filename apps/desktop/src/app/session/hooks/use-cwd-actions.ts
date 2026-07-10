@@ -7,6 +7,7 @@ import {
   $newChatWorkspaceTargetGeneration,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentCwdExplicit,
   setNewChatWorkspaceTarget
 } from '@/store/session'
 import type { SessionRuntimeInfo } from '@/types/hermes'
@@ -62,6 +63,7 @@ export function useCwdActions({ activeSessionIdRef, onSessionRuntimeInfo, reques
       if (!sessionId) {
         setCurrentCwd(trimmed)
         const workspaceGeneration = setNewChatWorkspaceTarget(trimmed)
+        setCurrentCwdExplicit(true)
 
         try {
           const info = await requestGateway<{ branch?: string; cwd?: string }>('config.get', {

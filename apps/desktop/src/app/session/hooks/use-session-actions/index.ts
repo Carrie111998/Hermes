@@ -24,6 +24,7 @@ import {
 import {
   $activeSessionStoredIdRotation,
   $currentCwd,
+  $currentCwdExplicit,
   $currentFastMode,
   $currentModel,
   $currentProvider,
@@ -41,6 +42,7 @@ import {
   setBusy,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentCwdExplicit,
   setCurrentCwdTransient,
   setCurrentServiceTier,
   setCurrentUsage,
@@ -175,7 +177,7 @@ async function desktopSessionCreateParams(cwd: string): Promise<Record<string, u
   return {
     cols: 96,
     source: 'desktop',
-    ...(cwd && { cwd }),
+    ...(cwd && { cwd, cwd_explicit: $currentCwdExplicit.get() }),
     ...(profile ? { profile } : {}),
     ...(selection.model
       ? { model: selection.model, ...(selection.provider ? { provider: selection.provider } : {}) }
@@ -329,6 +331,10 @@ export function useSessionActions({
       setCurrentServiceTier('')
       setYoloActive(false)
       setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
+      // A deliberate string workspace target is an explicit cwd choice (#52589);
+      // a plain new chat (or detached `null`) is not, so an inherited launch
+      // workspace still yields to a named profile's configured cwd.
+      setCurrentCwdExplicit(typeof workspaceTarget === 'string')
 
       if (!hasWorkspaceTarget) {
         // In a project → the repo's default-branch checkout; not in a project →
@@ -339,7 +345,6 @@ export function useSessionActions({
       } else if (typeof workspaceTarget === 'string') {
         setCurrentCwd(workspaceTarget)
       }
-
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
