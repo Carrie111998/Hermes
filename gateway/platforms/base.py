@@ -2201,6 +2201,26 @@ def _resolve_extensionless_candidate(path: str) -> Optional[str]:
     return validate_media_delivery_path(path)
 
 
+def _is_placeholder_media_path(path: str) -> bool:
+    """Recognize narrow documentation/example paths that must not be delivered."""
+    normalized = str(path or "").strip().strip("`\"'")
+    if normalized.startswith("file://"):
+        normalized = normalized[7:]
+    try:
+        normalized = os.path.expanduser(normalized)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    lowered = normalized.lower().replace("\\", "/")
+    parts = [part for part in lowered.split("/") if part]
+    if len(parts) < 2:
+        return False
+    # An extension may appear on the *final* example filename (for example
+    # ``/ruta/absoluta.png``), but never normalize directory names: doing so
+    # would turn ordinary ``/absolute.json/path/...`` paths into placeholders.
+    second = parts[1].rsplit(".", 1)[0] if len(parts) == 2 else parts[1]
+    return (parts[0], second) in {("absolute", "path"), ("ruta", "absoluta")}
+
+
 def _strip_media_tag_directives(text: str) -> str:
     """Remove MEDIA: tags and [[audio_as_voice]] / [[as_document]] markers.
 
@@ -2232,6 +2252,8 @@ def _strip_media_tag_directives(text: str) -> str:
         resolved = _match_extensionless_path(masked, match)
         if resolved is not None:
             spans.append((match.start(), resolved[1]))
+        elif _is_placeholder_media_path(path):
+            spans.append(match.span())
 
     if spans:
         chars = list(cleaned)
@@ -5155,22 +5177,7 @@ class BasePlatformAdapter(ABC):
         Keep this intentionally narrow so genuinely wrong generated paths (for
         example ``/tmp/generated-chart.png``) still surface.
         """
-        normalized = str(path or "").strip().strip("`\"'")
-        if normalized.startswith("file://"):
-            normalized = normalized[7:]
-        try:
-            normalized = os.path.expanduser(normalized)
-        except (OSError, RuntimeError, ValueError):
-            return False
-        lowered = normalized.lower().replace("\\", "/")
-        parts = [p for p in lowered.split("/") if p]
-        part_stems = [p.rsplit(".", 1)[0] for p in parts]
-        placeholder_prefixes = (
-            ["absolute", "path"],
-            ["absolute", "path", "to"],
-            ["ruta", "absoluta"],
-        )
-        return any(part_stems[:len(prefix)] == prefix for prefix in placeholder_prefixes)
+        return _is_placeholder_media_path(path)
 
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
