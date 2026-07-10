@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -1354,39 +1354,74 @@ class SessionStore:
                 # end_reason not None -> session ended — prune
                 if row is not None and row.get("end_reason") is not None:
                     recovered_entry = None
-                    recovery_lookup_failed = False
                     if entry.origin is not None:
-                        try:
-                            recovered_entry = self._recover_session_from_db(
-                                session_key=key,
-                                source=entry.origin,
-                                now=_now(),
-                                raise_on_lookup_error=True,
-                            )
-                        except Exception as exc:
-                            logger.debug(
-                                "gateway.session: recovery lookup failed for stale "
-                                "sessions.json entry %r -> %s: %s",
-                                key,
-                                entry.session_id,
-                                exc,
-                            )
-                            recovery_lookup_failed = True
-
-                    if recovery_lookup_failed:
-                        continue
+                        # ponytail (#61993): only recover a session that is
+                        # genuinely LIVE. The stale routing entry points at an
+                        # ended session; if the DB's latest peer row is ALSO
+                        # ended (explicit reset / ``/new``, or a compression-
+                        # ended parent whose newest sibling is ended too),
+                        # recovery via ``reopen_session`` would silently un-end
+                        # it and resurrect the full history on the next message
+                        # — defeating the user's reset. Recovery must never
+                        # recreate an ended session.
+                        #
+                        # Peek the latest peer row's liveness *before* recovery,
+                        # because ``_recover_session_from_db`` reopens the row
+                        # (clears end_reason) before we could inspect it.
+                        _finder = getattr(db, "find_latest_gateway_session_for_peer", None)
+                        _latest: Optional[Dict[str, Any]] = None
+                        _lookup_errored = False
+                        if callable(_finder):
+                            try:
+                                _latest = cast(
+                                    "Dict[str, Any]",
+                                    _finder(
+                                        source=entry.origin.platform.value,
+                                        user_id=entry.origin.user_id,
+                                        session_key=key,
+                                        chat_id=entry.origin.chat_id,
+                                        chat_type=entry.origin.chat_type,
+                                        thread_id=entry.origin.thread_id,
+                                    ),
+                                )
+                            except Exception:
+                                _lookup_errored = True
+                        if _lookup_errored:
+                            # Indeterminate lookup — keep the routing handle so
+                            # the runtime stale guard can retry on next message
+                            # (don't silently drop the only mapping on a DB hiccup).
+                            continue
+                        if _latest is not None and _latest.get("end_reason") is None:
+                            try:
+                                recovered_entry = self._recover_session_from_db(
+                                    session_key=key,
+                                    source=entry.origin,
+                                    now=_now(),
+                                    recovered_row=_latest,
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    "gateway.session: recovery lookup failed for stale "
+                                    "sessions.json entry %r -> %s: %s",
+                                    key,
+                                    entry.session_id,
+                                    exc,
+                                )
 
                     # If the stale entry points at a compression-ended parent but
-                    # a newer live child session exists for the exact same gateway
+                    # a LIVE child session exists for the exact same gateway
                     # peer, repoint the routing index instead of dropping it. A
                     # hard restart between compression rotation and the next clean
                     # save otherwise leaves Telegram with no resumable mapping, so
                     # queued/resume-pending work disappears until the user sends a
                     # fresh message.
-                    if recovered_entry is not None and recovered_entry.session_id != entry.session_id:
+                    if (
+                        recovered_entry is not None
+                        and recovered_entry.session_id != entry.session_id
+                    ):
                         logger.warning(
                             "gateway.session: repointing stale sessions.json entry "
-                            "%r from ended %s (end_reason=%r) to recovered %s",
+                            "%r from ended %s (end_reason=%r) to recovered live %s",
                             key,
                             entry.session_id,
                             row["end_reason"],
@@ -1394,14 +1429,18 @@ class SessionStore:
                         )
                         self._entries[key] = recovered_entry
                         recovered_keys += 1
-                        continue
-
-                    logger.warning(
-                        "gateway.session: pruning stale sessions.json entry "
-                        "%r -> %s (end_reason=%r); left by a crashed gateway",
-                        key, entry.session_id, row["end_reason"],
-                    )
-                    stale_keys.append(key)
+                    else:
+                        if recovered_entry is not None:
+                            logger.warning(
+                                "gateway.session: NOT resurrecting ended session %s "
+                                "(end_reason=%r) for routing key %r; dropping stale "
+                                "entry so a fresh session starts on next message",
+                                entry.session_id,
+                                row["end_reason"],
+                                key,
+                            )
+                        stale_keys.append(key)
+                    continue
         except Exception as exc:
             logger.warning(
                 "gateway.session: stale-entry pruning skipped due to DB error: %s",
@@ -1705,63 +1744,59 @@ class SessionStore:
         session_key: str,
         source: SessionSource,
         now: datetime,
-        raise_on_lookup_error: bool = False,
+        recovered_row: Optional[Dict[str, Any]] = None,
     ) -> Optional[SessionEntry]:
-        """Rebuild a missing session-key mapping from durable state.db data."""
-        legacy_key = self._legacy_slack_session_key(source)
-        recovered = self._find_gateway_session_row(
-            session_key=session_key,
-            source=source,
-            allow_peer_fallback=legacy_key is None,
-            raise_on_lookup_error=raise_on_lookup_error,
-        )
-        migrated_legacy = False
-        if (
-            not recovered
-            and legacy_key
-            and self._claim_legacy_slack_key(legacy_key)
-        ):
-            recovered = self._find_gateway_session_row(
-                session_key=legacy_key,
-                source=source,
-                allow_peer_fallback=False,
-                raise_on_lookup_error=raise_on_lookup_error,
-            )
-            migrated_legacy = bool(recovered)
-        if not recovered:
+        """Rebuild a missing session-key mapping from durable state.db data.
+
+        ``recovered_row`` may carry a peer row already fetched by the caller
+        (e.g. the liveness peek in ``_prune_stale_sessions_locked``) to avoid a
+        second ``find_latest_gateway_session_for_peer`` query.
+        """
+        if not self._db:
             return None
-        if not self._recovered_row_matches_source_scope(recovered, source):
+        if recovered_row is None:
+            finder = getattr(self._db, "find_latest_gateway_session_for_peer", None)
+            if not callable(finder):
+                return None
+            try:
+                recovered_row = finder(
+                    source=source.platform.value,
+                    user_id=source.user_id,
+                    session_key=session_key,
+                    chat_id=source.chat_id,
+                    chat_type=source.chat_type,
+                    thread_id=source.thread_id,
+                )
+            except Exception as exc:
+                logger.debug("Gateway session DB recovery failed for %s: %s", session_key, exc)
+                return None
+        if not recovered_row:
+            return None
+        if not self._recovered_row_matches_source_scope(recovered_row, source):
             return None
         if not self._recovered_row_allowed_for_active_profile(
             requested_session_key=session_key,
-            recovered=recovered,
+            recovered=recovered_row,
         ):
             logger.warning(
                 "Gateway session DB recovery ignored %s for %s because "
                 "multiplex_profiles is disabled and the row belongs to a "
                 "different profile",
-                recovered.get("session_key"),
+                recovered_row.get("session_key"),
                 session_key,
             )
             return None
         try:
-            self._db.reopen_session(str(recovered["id"]))
+            self._db.reopen_session(str(recovered_row["id"]))
         except Exception as exc:
             logger.debug("Gateway session DB reopen failed for %s: %s", session_key, exc)
-        entry = self._create_entry_from_recovered_row(
-            row=recovered,
+            return None
+        return self._create_entry_from_recovered_row(
+            row=recovered_row,
             session_key=session_key,
             source=source,
             now=now,
         )
-        if migrated_legacy:
-            self._record_gateway_session_peer(
-                entry.session_id,
-                session_key,
-                source,
-                display_name=entry.display_name,
-            )
-        return entry
 
     def _query_recoverable_session(
         self, *, session_key, source, now, lookup_session_key=None
