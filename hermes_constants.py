@@ -43,12 +43,43 @@ def get_hermes_home_override() -> str | None:
     return str(override)
 
 
+# Files/dirs whose presence marks a directory as a real, initialized Hermes
+# root (as opposed to stray state left by a misdirected process). Used only by
+# the Windows fallback below to decide between the platform-native location
+# and a legacy ``~/.hermes`` installation.
+_HERMES_ROOT_MARKERS = ("active_profile", "config.yaml", "profiles")
+
+
+def _is_initialized_hermes_root(path: Path) -> bool:
+    try:
+        return any((path / marker).exists() for marker in _HERMES_ROOT_MARKERS)
+    except OSError:
+        return False
+
+
 def _get_platform_default_hermes_home() -> Path:
-    """Return the platform-native default Hermes home path."""
+    """Return the platform-native default Hermes home path.
+
+    On Windows the native default is ``%LOCALAPPDATA%\\hermes`` — but an
+    installation rooted at the legacy ``~/.hermes`` (pre-LOCALAPPDATA layout,
+    or a POSIX-style setup driven by a user-level HERMES_HOME env var that a
+    given shell failed to inherit) must not be shadowed by an *uninitialized*
+    native directory. Without this, a shell with HERMES_HOME unset resolves a
+    store no gateway reads, and — under Microsoft-Store Python — the AppData
+    write is additionally virtualized into the app's LocalCache sandbox, so
+    e.g. ``hermes cron create`` reports success while the job is invisible to
+    every other process (2026-07-09 incident). Only when the native location
+    carries no root markers and ``~/.hermes`` does is the legacy root
+    returned; an initialized native root keeps upstream behaviour.
+    """
     if sys.platform == "win32":
         local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
         base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-        return base / "hermes"
+        native = base / "hermes"
+        legacy = Path.home() / ".hermes"
+        if not _is_initialized_hermes_root(native) and _is_initialized_hermes_root(legacy):
+            return legacy
+        return native
     return Path.home() / ".hermes"
 
 

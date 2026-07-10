@@ -116,6 +116,87 @@ class TestGetHermesHome:
         assert get_hermes_home() == local_appdata / "hermes"
 
 
+class TestWindowsLegacyHomeFallback:
+    """win32 default-home resolution must not let an UNINITIALIZED
+    %LOCALAPPDATA%\\hermes shadow an INITIALIZED legacy ``~/.hermes`` root.
+
+    Regression guard for the 2026-07-09 cron-create incident: a shell without
+    HERMES_HOME resolved the platform-native %LOCALAPPDATA%\\hermes, found no
+    active_profile there, and wrote cron jobs into a store the gateway
+    (rooted at ~/.hermes/profiles/main) never reads — made worse by
+    Microsoft-Store Python virtualizing the AppData write into its
+    LocalCache sandbox.  An installation rooted at ~/.hermes must win the
+    fallback whenever the native location is not a real Hermes root.
+    """
+
+    def _win_env(self, tmp_path, monkeypatch):
+        local_appdata = tmp_path / "LocalAppData"
+        home = tmp_path / "Home"
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", True)
+        return local_appdata / "hermes", home / ".hermes"
+
+    @pytest.mark.parametrize("marker", ["active_profile", "config.yaml", "profiles"])
+    def test_initialized_legacy_home_wins_over_uninitialized_native(
+        self, tmp_path, monkeypatch, marker
+    ):
+        native, legacy = self._win_env(tmp_path, monkeypatch)
+        legacy.mkdir(parents=True)
+        if marker == "profiles":
+            (legacy / marker).mkdir()
+        else:
+            (legacy / marker).write_text("main")
+
+        assert get_default_hermes_root() == legacy
+        assert get_hermes_home() == legacy
+
+    def test_initialized_native_wins_even_when_legacy_initialized(
+        self, tmp_path, monkeypatch
+    ):
+        """A deliberately initialized native root keeps upstream behaviour."""
+        native, legacy = self._win_env(tmp_path, monkeypatch)
+        native.mkdir(parents=True)
+        (native / "config.yaml").write_text("model: {}\n")
+        legacy.mkdir(parents=True)
+        (legacy / "active_profile").write_text("main")
+
+        assert get_default_hermes_root() == native
+        assert get_hermes_home() == native
+
+    def test_native_junk_without_markers_is_not_initialized(
+        self, tmp_path, monkeypatch
+    ):
+        """Stray state (cron/, state.db) in the native dir is not a root marker."""
+        native, legacy = self._win_env(tmp_path, monkeypatch)
+        (native / "cron").mkdir(parents=True)
+        (native / "state.db").write_bytes(b"")
+        legacy.mkdir(parents=True)
+        (legacy / "active_profile").write_text("main")
+
+        assert get_default_hermes_root() == legacy
+
+    def test_neither_initialized_keeps_native_default(self, tmp_path, monkeypatch):
+        native, legacy = self._win_env(tmp_path, monkeypatch)
+        legacy.mkdir(parents=True)  # exists but empty — not initialized
+
+        assert get_default_hermes_root() == native
+        assert get_hermes_home() == native
+
+    def test_hermes_home_env_still_wins(self, tmp_path, monkeypatch):
+        """An explicit HERMES_HOME bypasses the marker heuristic entirely."""
+        native, legacy = self._win_env(tmp_path, monkeypatch)
+        legacy.mkdir(parents=True)
+        (legacy / "active_profile").write_text("main")
+        explicit = tmp_path / "explicit"
+        explicit.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(explicit))
+
+        assert get_hermes_home() == explicit
+
+
 class TestHermesManagedNode:
     def test_windows_node_dir_prefers_portable_root(self, tmp_path, monkeypatch):
         home = tmp_path / "hermes"
