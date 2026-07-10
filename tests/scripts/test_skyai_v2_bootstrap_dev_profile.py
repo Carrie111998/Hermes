@@ -38,7 +38,7 @@ def test_bootstrap_profile_apply_creates_dedicated_skyai_profile(tmp_path: Path)
 def test_bootstrap_profile_can_inherit_nonsecret_model_config(tmp_path: Path) -> None:
     profile_home = tmp_path / "profiles" / "skyai-v2-dev"
     model_config = {
-        "default": "gpt-5.5",
+        "default": "gpt-5.6-sol",
         "provider": "openai-codex",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "api_mode": "codex_responses",
@@ -58,12 +58,12 @@ def test_merge_model_config_explicit_values_override_inherited_fields() -> None:
             "api_mode": "codex_responses",
         },
         {
-            "default": "gpt-5.5",
+            "default": "gpt-5.6-sol",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_mode": "",
         },
     ) == {
-        "default": "gpt-5.5",
+        "default": "gpt-5.6-sol",
         "provider": "openai-codex",
         "api_mode": "codex_responses",
         "base_url": "https://chatgpt.com/backend-api/codex",
@@ -74,7 +74,7 @@ def test_parse_args_accepts_explicit_model_flags() -> None:
     args = bootstrap.parse_args(
         [
             "--model-default",
-            "gpt-5.5",
+            "gpt-5.6-sol",
             "--model-provider",
             "openai-codex",
             "--model-base-url",
@@ -84,7 +84,7 @@ def test_parse_args_accepts_explicit_model_flags() -> None:
         ]
     )
 
-    assert args.model_default == "gpt-5.5"
+    assert args.model_default == "gpt-5.6-sol"
     assert args.model_provider == "openai-codex"
     assert args.model_base_url == "https://chatgpt.com/backend-api/codex"
     assert args.model_api_mode == "codex_responses"
@@ -97,7 +97,7 @@ def test_load_nonsecret_root_model_config_filters_secret_like_fields(tmp_path: P
         yaml.safe_dump(
             {
                 "model": {
-                    "default": "gpt-5.5",
+                    "default": "gpt-5.6-sol",
                     "provider": "openai-codex",
                     "api_mode": "codex_responses",
                     "api_key": "must-not-copy",
@@ -109,7 +109,7 @@ def test_load_nonsecret_root_model_config_filters_secret_like_fields(tmp_path: P
     )
 
     assert bootstrap.load_nonsecret_root_model_config(root) == {
-        "default": "gpt-5.5",
+        "default": "gpt-5.6-sol",
         "provider": "openai-codex",
         "api_mode": "codex_responses",
     }

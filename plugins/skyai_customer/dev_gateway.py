@@ -621,6 +621,12 @@ def _run_agent_turn(
             system_message=system_prompt or build_skyai_system_prompt(),
             conversation_history=history,
         )
+        if isinstance(result, dict):
+            trace = result.setdefault("trace", {})
+            if isinstance(trace, dict):
+                trace.setdefault("model", runtime["model"])
+                trace.setdefault("provider", runtime["provider"])
+                trace.setdefault("api_mode", runtime["api_mode"])
         return result
     finally:
         reset_hermes_home_override(token)
@@ -1321,7 +1327,7 @@ def render_widget_html(settings: CanarySettings) -> str:
                 const node = document.createElement('div');
                 node.className = 'trace';
                 const fallback = trace.fallback_active || trace.fallback ? 'fallback=on' : 'fallback=off';
-                const model = trace.customer_model || (trace.model_lane === 'openai_codex_cli' ? 'gpt-5.5' : trace.model_lane || 'gpt-5.5');
+                const model = trace.customer_model || (trace.model_lane === 'openai_codex_cli' ? 'gpt-5.6-sol' : trace.model_lane || 'gpt-5.6-sol');
                 const auth = trace.auth_route === 'chatgpt_oauth_pro' ? 'oauth=chatgpt_pro' : trace.auth_route ? `auth=${trace.auth_route}` : '';
                 const status = response.status || 'unknown-status';
                 node.textContent = auth ? `${status} · ${model} · ${auth} · ${fallback}` : `${status} · ${model} · ${fallback}`;
@@ -1696,6 +1702,11 @@ async def build_chat_response(
             "surface": surface,
         },
     }
+    runner_trace = runner_result.get("trace") if isinstance(runner_result, dict) else None
+    if isinstance(runner_trace, dict):
+        for key in ("model", "provider", "api_mode"):
+            if runner_trace.get(key):
+                response["trace"][key] = str(runner_trace[key])
     if voice_action:
         response["voice_action"] = voice_action
         response["trace"]["voice_action"] = voice_action.get("voice_action")

@@ -56,7 +56,7 @@ The first slice adds:
 python scripts/skyai_v2_bootstrap_dev_profile.py \
   --apply \
   --inherit-model-config \
-  --model-default gpt-5.5 \
+  --model-default gpt-5.6-sol \
   --model-provider openai-codex \
   --model-base-url https://chatgpt.com/backend-api/codex \
   --model-api-mode codex_responses

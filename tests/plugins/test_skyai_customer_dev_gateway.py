@@ -169,6 +169,29 @@ async def test_build_chat_response_allows_injected_runner(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_build_chat_response_exposes_resolved_model_trace(tmp_path: Path) -> None:
+    async def fake_runner(message, history, conversation_id, canary_settings):
+        return {
+            "final_response": "Отговор от Hermes.",
+            "trace": {
+                "model": "gpt-5.6-sol",
+                "provider": "openai-codex",
+                "api_mode": "codex_responses",
+            },
+        }
+
+    response = await dev_gateway.build_chat_response(
+        {"conversation_id": "c1", "message": "Здравей"},
+        settings(tmp_path, live_model=True),
+        agent_runner=fake_runner,
+    )
+
+    assert response["trace"]["model"] == "gpt-5.6-sol"
+    assert response["trace"]["provider"] == "openai-codex"
+    assert response["trace"]["api_mode"] == "codex_responses"
+
+
+@pytest.mark.asyncio
 async def test_build_chat_response_passes_voice_system_prompt_to_hermes_runner(tmp_path: Path) -> None:
     seen = {}
 
@@ -944,7 +967,7 @@ def test_resolve_profile_runtime_reads_model_dict() -> None:
     runtime = dev_gateway._resolve_profile_runtime(
         {
             "model": {
-                "default": "gpt-5.5",
+                "default": "gpt-5.6-sol",
                 "provider": "openai-codex",
                 "base_url": "https://chatgpt.com/backend-api/codex",
                 "api_mode": "codex_responses",
@@ -953,7 +976,7 @@ def test_resolve_profile_runtime_reads_model_dict() -> None:
     )
 
     assert runtime == {
-        "model": "gpt-5.5",
+        "model": "gpt-5.6-sol",
         "provider": "openai-codex",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "api_mode": "codex_responses",
@@ -974,7 +997,7 @@ def test_resolve_agent_runtime_refreshes_codex_credentials() -> None:
     runtime = dev_gateway._resolve_agent_runtime(
         {
             "model": {
-                "default": "gpt-5.5",
+                "default": "gpt-5.6-sol",
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
             }
@@ -984,7 +1007,7 @@ def test_resolve_agent_runtime_refreshes_codex_credentials() -> None:
 
     assert seen == {"refresh_if_expiring": True}
     assert runtime == {
-        "model": "gpt-5.5",
+        "model": "gpt-5.6-sol",
         "provider": "openai-codex",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "api_mode": "codex_responses",
@@ -1328,7 +1351,7 @@ async def test_build_compare_response_runs_dev_and_prod_sides(tmp_path: Path) ->
             "version": "prod-v",
             "reply": f"PROD: {payload['message']}",
             "cards": [{"title": "card"}],
-            "trace": {"model": "gpt-5.5", "latency_ms": 20},
+            "trace": {"model": "gpt-5.6-sol", "latency_ms": 20},
         }
 
     response = await dev_gateway.build_compare_response(
@@ -1378,7 +1401,7 @@ async def test_build_compare_response_compares_card_links_prices_and_images(
                     "image_url": "https://cdn.example/massage.jpg",
                 }
             ],
-            "trace": {"model": "gpt-5.5"},
+            "trace": {"model": "gpt-5.6-sol"},
         }
 
     monkeypatch.setattr(dev_gateway.public_tools, "handle_skyai_product_detail", fake_detail)

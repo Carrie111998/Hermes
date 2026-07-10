@@ -26,7 +26,7 @@ Current production SkyAI is a chat-only backend behind the production ingress:
 - current version family: `skyai-chat-prod.v*`;
 - public chat surface: `POST /chatkit/message`;
 - health/readiness surfaces: `GET /health`, `GET /ready`, `GET /version`;
-- current customer model lane: `openai-codex` / `gpt-5.5` through the existing
+- current customer model lane: `openai-codex` / `gpt-5.6-sol` through the existing
   Codex OAuth runtime;
 - response mode: final response only, not streaming;
 - public tools: catalog cache, product detail, public slots, campaign facts,
