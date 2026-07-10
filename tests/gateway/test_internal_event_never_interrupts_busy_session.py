@@ -69,6 +69,7 @@ def _make_runner() -> GatewayRunner:
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
+    runner._queued_events = {}
     runner._busy_ack_ts = {}
     runner._draining = False
     runner.adapters = {}
@@ -127,3 +128,25 @@ async def test_internal_event_does_not_interrupt_busy_session() -> None:
     adapter._send_with_retry.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_non_internal_event_still_interrupts() -> None:
+    """A real user message still interrupts, and becomes the next queued turn."""
+    runner = _make_runner()
+    runner._busy_input_mode = "interrupt"
+    adapter = _make_adapter()
+    internal = _make_internal_event(text="[background process completed]")
+    event = _make_internal_event(text="please stop")
+    object.__setattr__(event, "internal", False)
+    object.__setattr__(event, "source", internal.source)
+    sk = build_session_key(event.source)
+    adapter._pending_messages[sk] = internal
+    parent = _make_running_parent()
+    runner._running_agents[sk] = parent
+    runner.adapters[event.source.platform] = adapter
+
+    handled = await runner._handle_active_session_busy_message(event, sk)
+
+    assert handled is True
+    parent.interrupt.assert_called_once_with("please stop")
+    assert adapter._pending_messages[sk] is event
+    assert runner._queued_events[sk] == [internal]
