@@ -63,6 +63,27 @@ test('Windows bootstrap recovery chooses --update when any real-install signal i
   )
 })
 
+test('findPythonForRoot rejects non-spawnable Python (app-execution-alias stubs) for override and venv candidates', () => {
+  const source = readMain()
+  const fnStart = source.indexOf('function findPythonForRoot(')
+  assert.notEqual(fnStart, -1, 'findPythonForRoot must exist in main.cjs')
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1)
+  const body = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd)
+  // The HERMES_DESKTOP_PYTHON override must be gated on spawnability, not just
+  // fileExists — a reparse-point alias passes fileExists yet spawn-EPERMs.
+  assert.match(
+    body,
+    /override && fileExists\(override\) && isSpawnablePythonExe\(override/,
+    'override must be guarded by isSpawnablePythonExe so an app-execution-alias falls through'
+  )
+  // Venv candidates get the same guard.
+  assert.match(
+    body,
+    /fileExists\(candidate\) && isSpawnablePythonExe\(candidate/,
+    'venv candidates must be guarded by isSpawnablePythonExe too'
+  )
+})
+
 test('unwrapWindowsVenvHermesCommand smoke-tests the venv python before trusting it', () => {
   const source = readMain()
   const fnStart = source.indexOf('function unwrapWindowsVenvHermesCommand(')

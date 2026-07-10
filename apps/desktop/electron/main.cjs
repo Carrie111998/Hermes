@@ -49,6 +49,7 @@ const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-reques
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
 const { buildDesktopBackendEnv, normalizeHermesHomeRoot } = require('./backend-env.cjs')
 const { readWindowsUserEnvVar } = require('./windows-user-env.cjs')
+const { isSpawnablePythonExe } = require('./python-spawnable.cjs')
 const { readWslWindowsClipboardImage } = require('./wsl-clipboard-image.cjs')
 const {
   nativeOverlayWidth: computeNativeOverlayWidth,
@@ -1474,8 +1475,15 @@ function isHermesSourceRoot(root) {
 }
 
 function findPythonForRoot(root) {
+  // NOTE: fileExists() alone is not enough. A Microsoft Store "App Execution
+  // Alias" python.exe (a reparse-point stub) can pass fileExists() yet throw
+  // spawn EPERM in the desktop's detached launch context (boot failure,
+  // 2026-07-09). isSpawnablePythonExe() rejects such stubs so we fall through
+  // to a real interpreter instead of returning a landmine.
   const override = process.env.HERMES_DESKTOP_PYTHON
-  if (override && fileExists(override)) return override
+  if (override && fileExists(override) && isSpawnablePythonExe(override, { log: rememberLog })) {
+    return override
+  }
 
   const relativePaths = IS_WINDOWS
     ? [path.join('.venv', 'Scripts', 'python.exe'), path.join('venv', 'Scripts', 'python.exe')]
@@ -1483,7 +1491,9 @@ function findPythonForRoot(root) {
 
   for (const relativePath of relativePaths) {
     const candidate = path.join(root, relativePath)
-    if (fileExists(candidate)) return candidate
+    if (fileExists(candidate) && isSpawnablePythonExe(candidate, { log: rememberLog })) {
+      return candidate
+    }
   }
 
   return findSystemPython()
