@@ -5209,6 +5209,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         checkpoints: bool = False,
         pass_session_id: bool = False,
         ignore_rules: bool = False,
+        no_streaming: bool = False,
     ):
         """
         Initialize the Hermes CLI.
@@ -5285,7 +5286,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.verbose = bool(verbose) if verbose is not None else False
         
         # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
-        self.streaming_enabled = CLI_CONFIG["display"].get("streaming", False)
+        self.streaming_enabled = (
+            False if no_streaming
+            else CLI_CONFIG["display"].get("streaming", False)
+        )
         # show_timestamps: prefix user and assistant labels with timestamps
         self.show_timestamps = CLI_CONFIG["display"].get("timestamps", False)
         self.timestamp_format = CLI_CONFIG["display"].get("timestamp_format", "%H:%M")
@@ -21647,6 +21651,7 @@ def main(
     pass_session_id: bool = False,
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
+    no_streaming: bool = False,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -21849,6 +21854,7 @@ def main(
             checkpoints=checkpoints,
             pass_session_id=pass_session_id,
             ignore_rules=ignore_rules,
+            no_streaming=no_streaming,
         )
     except ImportError as e:
         # Direct `python cli.py` / `python -m cli` bypasses cmd_chat's
