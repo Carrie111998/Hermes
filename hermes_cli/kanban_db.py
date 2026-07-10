@@ -538,6 +538,27 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def archived_board_exists(board: Optional[str] = None) -> bool:
+    """Return True if an archived ``<slug>-<timestamp>`` sibling exists.
+
+    Archived boards live under ``boards/_archived/`` (see
+    :func:`remove_board`). A concurrent :func:`create_board` for a slug that
+    has an archived sibling would silently fabricate a fresh, empty live board
+    over the archive (#61945) — this lets callers detect and refuse that.
+    """
+    slug = _normalize_board_slug(board)
+    if not slug or slug == DEFAULT_BOARD:
+        return False
+    archive_root = boards_root() / "_archived"
+    if not archive_root.is_dir():
+        return False
+    prefix = f"{slug}-"
+    return any(
+        child.is_dir() and child.name.startswith(prefix)
+        for child in archive_root.iterdir()
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -754,6 +775,16 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
+    # #61945: a slug with an archived sibling (boards/_archived/<slug>-<ts>/)
+    # must not silently fabricate a fresh empty live board on a concurrent
+    # connect — that strands the archive behind a live-collision and forces
+    # manual reconciliation. Refuse and point at the safe restore path.
+    if not board_exists(normed) and archived_board_exists(normed):
+        raise ValueError(
+            f"board {normed!r} is archived; restore it with "
+            f"'hermes kanban boards restore {normed}' or create a new board "
+            f"with a different slug (refusing to fabricate an empty live board)"
+        )
     meta = write_board_metadata(
         normed,
         name=name,

@@ -249,6 +249,34 @@ class TestBoardCRUD:
         assert Path(res["new_path"]).exists()
         assert "toremove" not in [b["slug"] for b in kb.list_boards()]
 
+    # ── #61945: never fabricate a live board over an archived slug ──────────
+
+    def test_create_board_refuses_over_archived_slug(self, fresh_home):
+        kb.create_board("projx")
+        kb.remove_board("projx")  # archive -> boards/_archived/projx-<ts>/
+        assert kb.archived_board_exists("projx")
+
+        # A concurrent connect for the same slug must NOT silently fabricate
+        # an empty live board.
+        with pytest.raises(ValueError, match="archived"):
+            kb.create_board("projx")
+
+        # The archive must remain untouched — no live board fabricated.
+        assert not kb.board_exists("projx")
+        assert kb.archived_board_exists("projx")
+
+    def test_create_board_allows_new_slug_after_archive(self, fresh_home):
+        kb.create_board("projx")
+        kb.remove_board("projx")
+        # A genuinely different slug is unaffected by the archived sibling.
+        meta = kb.create_board("projx2")
+        assert meta["slug"] == "projx2"
+        assert kb.board_exists("projx2")
+
+    def test_archived_board_exists_false_for_live_only(self, fresh_home):
+        kb.create_board("liveonly")
+        assert not kb.archived_board_exists("liveonly")
+
     def test_remove_hard_delete(self, fresh_home):
         kb.create_board("nuke")
         d = kb.board_dir("nuke")
