@@ -124,11 +124,11 @@ function downloadInstallScript(commit, destPath) {
           https
             .get(res.headers.location, res2 => {
               if (res2.statusCode !== 200) {
-                reject(
-                  new Error(
-                    `Failed to download ${scriptName}: HTTP ${res2.statusCode} from redirect ${res.headers.location}`
-                  )
+                const redirectErr = new Error(
+                  `Failed to download ${scriptName}: HTTP ${res2.statusCode} from redirect ${res.headers.location}`
                 )
+                redirectErr.statusCode = res2.statusCode
+                reject(redirectErr)
                 return
               }
               const out2 = fs.createWriteStream(tmpPath)
@@ -150,7 +150,9 @@ function downloadInstallScript(commit, destPath) {
           } catch {
             void 0
           }
-          reject(new Error(`Failed to download ${scriptName}: HTTP ${res.statusCode} from ${url}`))
+          const statusErr = new Error(`Failed to download ${scriptName}: HTTP ${res.statusCode} from ${url}`)
+          statusErr.statusCode = res.statusCode
+          reject(statusErr)
           return
         }
         res.pipe(out)
@@ -177,6 +179,32 @@ function downloadInstallScript(commit, destPath) {
         reject(err)
       })
   })
+}
+
+// Raw GitHub URLs pinned to a SHA are immutable, so a 404 for a given commit
+// is permanent: it means the stamped commit was never pushed to
+// NousResearch/hermes-agent (typical for a desktop build produced from a
+// local-only/private checkout). Remember every commit that 404ed so a
+// renderer "Reload and retry" doesn't hammer the identical URL forever --
+// the fallback rungs (installed-agent checkout) are still re-checked fresh
+// on every attempt, since those CAN change between retries.
+const NOT_FOUND_COMMITS = new Set()
+
+function isNotFoundDownloadError(err) {
+  return Boolean(err) && (err.statusCode === 404 || /HTTP 404/.test(err.message || ''))
+}
+
+function installScriptUnavailableError(commit) {
+  const err = new Error(
+    `${installScriptName()} for pinned commit ${commit.slice(0, 12)} is not available upstream ` +
+      '(HTTP 404 from raw.githubusercontent.com). This build was stamped from a commit that ' +
+      'only exists in a local checkout, so retrying the download cannot succeed. ' +
+      'Set HERMES_DESKTOP_HERMES_ROOT to your hermes-agent checkout and restart the app, ' +
+      'or reinstall Hermes Desktop from an official build.'
+  )
+  err.installScriptUnavailable = true
+  err.pinnedCommit = commit
+  return err
 }
 
 async function resolveInstallScript({
@@ -215,39 +243,63 @@ async function resolveInstallScript({
     // not cached; download
   }
 
-  emit({
-    type: 'log',
-    line: `[bootstrap] fetching ${installScriptName()} for ${installStamp.commit.slice(0, 12)} from GitHub`
-  })
-  try {
-    await _download(installStamp.commit, cached)
-    emit({ type: 'log', line: `[bootstrap] saved to ${cached}` })
-    return { path: cached, source: 'download', commit: installStamp.commit, kind: installScriptKind() }
-  } catch (err) {
-    // The pinned commit may not be fetchable from GitHub -- most commonly a
-    // locally-built desktop app stamped to an unpushed HEAD (see
-    // write-build-stamp.cjs fromLocalGit). Fall back to the installer that
-    // ships inside the already-installed agent checkout so dev/self-builds can
-    // still bootstrap instead of dying with a fatal 404.
-    const installed = installedAgentInstallScript(hermesHome)
-    if (installed) {
-      emit({
-        type: 'log',
-        line:
-          `[bootstrap] GitHub fetch failed (${err.message}); ` +
-          `falling back to installed agent ${installScriptName()} at ${installed}`
-      })
-      try {
-        fs.mkdirSync(path.dirname(cached), { recursive: true })
-        fs.copyFileSync(installed, cached)
-        return { path: cached, source: 'installed-agent', commit: installStamp.commit, kind: installScriptKind() }
-      } catch {
-        // Cache copy failed (read-only FS, etc.) -- use the source path directly.
-        return { path: installed, source: 'installed-agent', commit: installStamp.commit, kind: installScriptKind() }
+  let downloadError = null
+  if (NOT_FOUND_COMMITS.has(installStamp.commit)) {
+    emit({
+      type: 'log',
+      line:
+        `[bootstrap] skipping GitHub fetch for ${installStamp.commit.slice(0, 12)}: ` +
+        'it already returned HTTP 404 this session (SHA raw URLs are immutable)'
+    })
+    downloadError = installScriptUnavailableError(installStamp.commit)
+  } else {
+    emit({
+      type: 'log',
+      line: `[bootstrap] fetching ${installScriptName()} for ${installStamp.commit.slice(0, 12)} from GitHub`
+    })
+    try {
+      await _download(installStamp.commit, cached)
+      emit({ type: 'log', line: `[bootstrap] saved to ${cached}` })
+      return { path: cached, source: 'download', commit: installStamp.commit, kind: installScriptKind() }
+    } catch (err) {
+      downloadError = err
+      if (isNotFoundDownloadError(err)) {
+        NOT_FOUND_COMMITS.add(installStamp.commit)
       }
     }
-    throw err
   }
+
+  // The pinned commit may not be fetchable from GitHub -- most commonly a
+  // locally-built desktop app stamped to an unpushed HEAD (see
+  // write-build-stamp.cjs fromLocalGit). Fall back to the installer that
+  // ships inside the already-installed agent checkout so dev/self-builds can
+  // still bootstrap instead of dying with a fatal 404.
+  const installed = installedAgentInstallScript(hermesHome)
+  if (installed) {
+    emit({
+      type: 'log',
+      line:
+        `[bootstrap] GitHub fetch failed (${downloadError.message}); ` +
+        `falling back to installed agent ${installScriptName()} at ${installed}`
+    })
+    try {
+      fs.mkdirSync(path.dirname(cached), { recursive: true })
+      fs.copyFileSync(installed, cached)
+      return { path: cached, source: 'installed-agent', commit: installStamp.commit, kind: installScriptKind() }
+    } catch {
+      // Cache copy failed (read-only FS, etc.) -- use the source path directly.
+      return { path: installed, source: 'installed-agent', commit: installStamp.commit, kind: installScriptKind() }
+    }
+  }
+
+  // A permanent 404 with nothing to fall back to is unrecoverable by
+  // retrying -- replace the bare HTTP error with instructions the user can
+  // actually act on. Transient failures (offline, DNS, 5xx) rethrow as-is
+  // so the retry path stays honest for them.
+  if (isNotFoundDownloadError(downloadError)) {
+    throw installScriptUnavailableError(installStamp.commit)
+  }
+  throw downloadError
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +770,14 @@ async function runBootstrap(opts) {
     return { ok: true, marker }
   } catch (err) {
     emit({ type: 'failed', error: err.message || String(err) })
-    return { ok: false, error: err.message || String(err) }
+    const failure = { ok: false, error: err.message || String(err) }
+    if (err && err.installScriptUnavailable) {
+      // Permanent condition (stamped commit not on GitHub, no local
+      // fallback): let main.cjs surface the actionable message directly
+      // instead of the generic "check the log and retry" wrapper.
+      failure.installScriptUnavailable = true
+    }
+    return failure
   } finally {
     try {
       runLog.stream.end()

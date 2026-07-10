@@ -11,7 +11,34 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const { canImportHermesCli, hermesRuntimeImportProbe, verifyHermesCli } = require('./backend-probes.cjs')
+const {
+  canImportHermesCli,
+  hermesRuntimeImportProbe,
+  verifyHermesCli,
+  PROBE_TIMEOUT_MS
+} = require('./backend-probes.cjs')
+
+// Build a fake execFileSync that throws a scripted sequence of errors (null =
+// succeed) and records the options of every call. Lets us exercise the
+// timeout-retry logic without real 15s hangs.
+function scriptedExec(failures) {
+  const calls = []
+  const fn = (_cmd, _args, options) => {
+    const failure = failures[calls.length] || null
+    calls.push(options)
+    if (failure) {
+      const err = new Error(failure.message || failure.code || 'probe failure')
+      if (failure.code) err.code = failure.code
+      if (failure.status != null) err.status = failure.status
+      throw err
+    }
+  }
+  return { fn, calls }
+}
+
+function timeoutError() {
+  return { code: 'ETIMEDOUT', message: 'spawnSync hermes ETIMEDOUT' }
+}
 
 // Resolve the host's own Node binary -- guaranteed to be on disk and
 // runnable. We use it as both a stand-in for "a python that doesn't
@@ -81,6 +108,51 @@ test('verifyHermesCli returns true when --version exits 0', () => {
       void 0
     }
   }
+})
+
+test('probe timeout accommodates hermes --version under boot-time CPU storms', () => {
+  // `hermes --version` measures 2.4-2.9s warm and 4.5s+ under cold-boot CPU
+  // pressure; a 5s deadline made the PATH rung flake on healthy installs.
+  assert.equal(PROBE_TIMEOUT_MS, 15000)
+})
+
+test('verifyHermesCli retries once after a timeout and succeeds', () => {
+  const { fn, calls } = scriptedExec([timeoutError(), null])
+  assert.equal(verifyHermesCli('hermes', { _execFileSync: fn }), true)
+  assert.equal(calls.length, 2, 'timed-out first attempt should be retried exactly once')
+  for (const options of calls) {
+    assert.equal(options.timeout, PROBE_TIMEOUT_MS)
+  }
+})
+
+test('verifyHermesCli gives up after the single timeout retry', () => {
+  const { fn, calls } = scriptedExec([timeoutError(), timeoutError()])
+  assert.equal(verifyHermesCli('hermes', { _execFileSync: fn }), false)
+  assert.equal(calls.length, 2, 'must not retry beyond one extra attempt')
+})
+
+test('verifyHermesCli does not retry a nonzero exit (broken shim fails fast)', () => {
+  const { fn, calls } = scriptedExec([{ status: 1, message: 'Command failed: hermes --version' }])
+  assert.equal(verifyHermesCli('hermes', { _execFileSync: fn }), false)
+  assert.equal(calls.length, 1, 'a real exit code is a definitive verdict; no retry')
+})
+
+test('verifyHermesCli does not retry a missing binary', () => {
+  const { fn, calls } = scriptedExec([{ code: 'ENOENT', message: 'spawnSync hermes ENOENT' }])
+  assert.equal(verifyHermesCli('hermes', { _execFileSync: fn }), false)
+  assert.equal(calls.length, 1)
+})
+
+test('canImportHermesCli retries once after a timeout and succeeds', () => {
+  const { fn, calls } = scriptedExec([timeoutError(), null])
+  assert.equal(canImportHermesCli('python', { _execFileSync: fn }), true)
+  assert.equal(calls.length, 2)
+})
+
+test('canImportHermesCli does not retry a nonzero exit', () => {
+  const { fn, calls } = scriptedExec([{ status: 1, message: 'ModuleNotFoundError' }])
+  assert.equal(canImportHermesCli('python', { _execFileSync: fn }), false)
+  assert.equal(calls.length, 1)
 })
 
 test('verifyHermesCli swallows timeouts (does not throw)', () => {

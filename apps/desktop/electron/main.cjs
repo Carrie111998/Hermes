@@ -3208,13 +3208,22 @@ async function ensureRuntime(backend) {
     }
 
     if (!bootstrapResult.ok) {
-      const bootstrapError = new Error(
-        `Hermes bootstrap failed${bootstrapResult.failedStage ? ` at stage '${bootstrapResult.failedStage}'` : ''}: ` +
-          `${bootstrapResult.error || 'unknown error'}. ` +
-          `Check ${path.join(HERMES_HOME, 'logs', 'desktop.log')} for the full transcript.`
-      )
+      // installScriptUnavailable means the stamped commit 404s on GitHub and
+      // no local fallback exists -- a permanent condition for this build, so
+      // the runner's actionable message (set HERMES_DESKTOP_HERMES_ROOT /
+      // reinstall) goes to the user verbatim. Wrapping it in the generic
+      // "check the log and retry" framing sent users into a retry loop that
+      // could never succeed.
+      const bootstrapError = bootstrapResult.installScriptUnavailable
+        ? new Error(bootstrapResult.error)
+        : new Error(
+            `Hermes bootstrap failed${bootstrapResult.failedStage ? ` at stage '${bootstrapResult.failedStage}'` : ''}: ` +
+              `${bootstrapResult.error || 'unknown error'}. ` +
+              `Check ${path.join(HERMES_HOME, 'logs', 'desktop.log')} for the full transcript.`
+          )
       bootstrapError.isBootstrapFailure = true
       bootstrapError.failedStage = bootstrapResult.failedStage || null
+      bootstrapError.installScriptUnavailable = Boolean(bootstrapResult.installScriptUnavailable)
       // Latch the failure so subsequent startHermes() calls return this
       // same error without re-running install.ps1.  Cleared by the
       // hermes:bootstrap:reset IPC (renderer's "Reload and retry").

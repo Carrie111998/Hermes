@@ -19,9 +19,14 @@
  * sentinel, which is exactly what we want when nothing pre-existing
  * actually works.
  *
- * Both probes are deliberately fast and forgiving:
- *   - 5s timeout (a hung interpreter beats forever, but we still give
- *     slow disks / cold caches room to breathe)
+ * Both probes are deliberately forgiving:
+ *   - 15s timeout with one retry on timeout only. `hermes --version`
+ *     measures 2.4-2.9s warm and 4.5s+ under boot-time CPU storms
+ *     (login-storm boots with a dozen startup tasks competing), so the
+ *     old 5s deadline flaked the PATH rung on perfectly healthy
+ *     installs and dumped users into the bootstrap installer. A
+ *     genuinely broken shim exits non-zero quickly and still fails the
+ *     rung on the first attempt -- only ETIMEDOUT earns the retry.
  *   - stdio ignored (we only care about exit code; stdout/stderr are
  *     not surfaced to the user, just to recentHermesLog for forensics
  *     via the caller's catch block if it chooses)
@@ -34,7 +39,28 @@
 
 const { execFileSync } = require('node:child_process')
 
-const PROBE_TIMEOUT_MS = 5000
+const PROBE_TIMEOUT_MS = 15000
+const PROBE_TIMEOUT_RETRIES = 1
+
+// spawnSync surfaces a timeout kill as an error with code ETIMEDOUT (the
+// child never got to exit on its own); a real exit lands in err.status and
+// a missing binary in code ENOENT. Only the timeout is ambiguous about the
+// candidate's health, so only the timeout is worth a second attempt.
+function isProbeTimeout(err) {
+  return Boolean(err) && (err.code === 'ETIMEDOUT' || err.errno === 'ETIMEDOUT')
+}
+
+function runProbe(exec, command, args, options) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      exec(command, args, options)
+      return true
+    } catch (err) {
+      if (isProbeTimeout(err) && attempt < PROBE_TIMEOUT_RETRIES) continue
+      return false
+    }
+  }
+}
 
 /**
  * Return the Python snippet used to verify Hermes can import far enough to
@@ -64,21 +90,17 @@ function hermesRuntimeImportProbe() {
  * @param {string} pythonPath - Absolute path to a python.exe / python.
  * @param {object} [opts]
  * @param {object} [opts.env] - Additional environment for the probe.
+ * @param {Function} [opts._execFileSync] - Test seam.
  * @returns {boolean}
  */
 function canImportHermesCli(pythonPath, opts = {}) {
   if (!pythonPath) return false
-  try {
-    execFileSync(pythonPath, ['-c', hermesRuntimeImportProbe()], {
-      env: { ...process.env, ...(opts.env || {}) },
-      stdio: 'ignore',
-      timeout: PROBE_TIMEOUT_MS,
-      windowsHide: true
-    })
-    return true
-  } catch {
-    return false
-  }
+  return runProbe(opts._execFileSync || execFileSync, pythonPath, ['-c', hermesRuntimeImportProbe()], {
+    env: { ...process.env, ...(opts.env || {}) },
+    stdio: 'ignore',
+    timeout: PROBE_TIMEOUT_MS,
+    windowsHide: true
+  })
 }
 
 /**
@@ -100,21 +122,17 @@ function canImportHermesCli(pythonPath, opts = {}) {
  *   .cmd/.bat shims on Windows execFileSync needs shell:true to find
  *   the cmd interpreter; mirrors the same flag isCommandScript() drives
  *   in resolveHermesBackend.
+ * @param {Function} [opts._execFileSync] - Test seam.
  * @returns {boolean}
  */
 function verifyHermesCli(hermesCommand, opts = {}) {
   if (!hermesCommand) return false
-  try {
-    execFileSync(hermesCommand, ['--version'], {
-      stdio: 'ignore',
-      timeout: PROBE_TIMEOUT_MS,
-      shell: Boolean(opts.shell),
-      windowsHide: true
-    })
-    return true
-  } catch {
-    return false
-  }
+  return runProbe(opts._execFileSync || execFileSync, hermesCommand, ['--version'], {
+    stdio: 'ignore',
+    timeout: PROBE_TIMEOUT_MS,
+    shell: Boolean(opts.shell),
+    windowsHide: true
+  })
 }
 
 module.exports = {
