@@ -8840,6 +8840,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+        elif canonical == "architect":
+            self._handle_architect_command(cmd_original)
         elif canonical == "steer":
             # Inject a message after the next tool call without interrupting.
             # If the agent is actively running, push the text into the agent's

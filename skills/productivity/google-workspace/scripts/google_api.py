@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -52,6 +53,28 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/documents",
 ]
+
+DRIVE_UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+DRIVE_UPLOAD_MAX_TRANSIENT_ERRORS = 12
+
+
+def _is_transient_upload_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionError, TimeoutError)):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) in {32, 54, 60, 10053, 10054, 110}:
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "broken pipe",
+            "connection aborted",
+            "connection reset",
+            "read operation timed out",
+            "timed out",
+            "timeout",
+        )
+    )
 
 
 def _normalize_authorized_user_payload(payload: dict) -> dict:
@@ -624,12 +647,34 @@ def drive_upload(args):
         metadata["parents"] = [args.parent]
 
     service = build_service("drive", "v3")
-    media = MediaFileUpload(str(local_path), mimetype=mime, resumable=True)
-    result = service.files().create(
+    media = MediaFileUpload(
+        str(local_path),
+        mimetype=mime,
+        resumable=True,
+        chunksize=DRIVE_UPLOAD_CHUNK_SIZE,
+    )
+    request = service.files().create(
         body=metadata,
         media_body=media,
         fields="id, name, mimeType, webViewLink",
-    ).execute()
+    )
+    result = None
+    transient_errors = 0
+    while result is None:
+        try:
+            _, result = request.next_chunk(num_retries=5)
+        except Exception as exc:
+            if transient_errors >= DRIVE_UPLOAD_MAX_TRANSIENT_ERRORS or not _is_transient_upload_error(exc):
+                raise
+            transient_errors += 1
+            wait_seconds = min(60, 2 ** min(transient_errors, 5))
+            print(
+                "WARN: transient Drive upload error; resuming upload "
+                f"({transient_errors}/{DRIVE_UPLOAD_MAX_TRANSIENT_ERRORS}) after "
+                f"{wait_seconds}s: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
     print(json.dumps({
         "status": "uploaded",
         "id": result["id"],

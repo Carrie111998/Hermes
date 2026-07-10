@@ -435,6 +435,95 @@ def test_api_gmail_reply_reads_headers_case_insensitively_and_uses_conventional_
     assert "\nreferences: " not in raw_text
 
 
+def test_drive_upload_retries_transient_chunk_timeout(api_module, tmp_path, monkeypatch, capsys):
+    """Large Drive uploads should resume after transient socket timeouts.
+
+    DR backups are multi-GB files. A single broken pipe/read timeout must not
+    force the backup wrapper to restart the entire upload from byte zero.
+    """
+    local_path = tmp_path / "artifact.bin"
+    local_path.write_bytes(b"payload")
+    captured_media = {}
+
+    class FakeMediaFileUpload:
+        def __init__(self, filename, *, mimetype, resumable, chunksize):
+            captured_media.update(
+                {
+                    "filename": filename,
+                    "mimetype": mimetype,
+                    "resumable": resumable,
+                    "chunksize": chunksize,
+                }
+            )
+
+    class FakeRequest:
+        def __init__(self):
+            self.calls = 0
+
+        def execute(self, num_retries=0):
+            raise AssertionError("drive_upload should use an explicit resumable chunk loop")
+
+        def next_chunk(self, num_retries=0):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("read operation timed out")
+            if self.calls == 2:
+                return object(), None
+            return object(), {
+                "id": "file-1",
+                "name": "artifact.bin",
+                "mimeType": "application/octet-stream",
+                "webViewLink": "https://drive.example/file-1",
+            }
+
+    request = FakeRequest()
+
+    class FakeFiles:
+        def create(self, *, body, media_body, fields):
+            assert body == {"name": "artifact.bin", "parents": ["parent-1"]}
+            assert fields == "id, name, mimeType, webViewLink"
+            assert media_body is not None
+            return request
+
+    class FakeService:
+        def files(self):
+            return FakeFiles()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "googleapiclient.http",
+        types.SimpleNamespace(MediaFileUpload=FakeMediaFileUpload),
+    )
+    monkeypatch.setattr(api_module, "build_service", lambda *_args, **_kwargs: FakeService())
+    monkeypatch.setattr(
+        api_module,
+        "time",
+        types.SimpleNamespace(sleep=lambda _seconds: None),
+        raising=False,
+    )
+
+    args = api_module.argparse.Namespace(
+        path=str(local_path),
+        mime_type=None,
+        parent="parent-1",
+        name="artifact.bin",
+        func=api_module.drive_upload,
+    )
+
+    api_module.drive_upload(args)
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == "uploaded"
+    assert result["id"] == "file-1"
+    assert request.calls == 3
+    assert captured_media == {
+        "filename": str(local_path),
+        "mimetype": "application/octet-stream",
+        "resumable": True,
+        "chunksize": 8 * 1024 * 1024,
+    }
+
+
 def test_api_get_credentials_refresh_persists_authorized_user_type(api_module, monkeypatch):
     token_path = api_module.TOKEN_PATH
     _write_token(token_path, token="ya29.old")

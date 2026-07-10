@@ -755,6 +755,70 @@ async def test_post_connect_initialization_skips_same_fingerprint_after_success(
 
 
 @pytest.mark.asyncio
+async def test_post_connect_initialization_retries_when_attempt_overwrote_old_success_fingerprint(tmp_path, monkeypatch):
+    """A failed attempt must not make a stale success look current.
+
+    Older sync-state files stored one ``fingerprint`` field. The adapter records
+    an attempt before syncing; if that attempt changed ``fingerprint`` but the
+    sync failed, the stale ``last_success_at`` from a previous fingerprint must
+    not suppress future retries for the new desired command set.
+    """
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+
+    class _DesiredCommand:
+        def to_dict(self, tree):
+            return {
+                "name": "search",
+                "description": "Second Brain Recall",
+                "type": 1,
+                "options": [],
+            }
+
+    fake_tree = SimpleNamespace(
+        get_commands=lambda: [_DesiredCommand()],
+        fetch_commands=AsyncMock(return_value=[]),
+    )
+    fake_http = SimpleNamespace(
+        upsert_global_command=AsyncMock(),
+        edit_global_command=AsyncMock(),
+        delete_global_command=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        tree=fake_tree,
+        http=fake_http,
+        application_id=999,
+        user=SimpleNamespace(id=999),
+    )
+
+    fingerprint = adapter._desired_command_sync_fingerprint()
+    state_path = (
+        tmp_path
+        / discord_platform._DISCORD_COMMAND_SYNC_STATE_SUBDIR
+        / discord_platform._DISCORD_COMMAND_SYNC_STATE_FILENAME
+    )
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "999": {
+                    "fingerprint": fingerprint,
+                    "last_attempt_at": 200.0,
+                    "last_success_at": 100.0,
+                    "summary": {"total": 1},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    await adapter._run_post_connect_initialization()
+
+    fake_tree.fetch_commands.assert_awaited_once()
+    fake_http.upsert_global_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_post_connect_initialization_respects_discord_retry_after(tmp_path, monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)

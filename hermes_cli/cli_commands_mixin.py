@@ -1471,6 +1471,32 @@ class CLICommandsMixin:
             # slash command returns and runs it as a normal agent turn.
             self._pending_agent_seed = seed
 
+    def _handle_architect_command(self, cmd: str):
+        """Handle /architect — turn a rough request into an agent-ready prompt.
+
+        The shared handler returns an acknowledgement plus an ``agent_seed``.
+        When present, the seed is stashed as a one-shot pending message so the
+        interactive loop runs it as a normal user turn, preserving role
+        alternation and avoiding any prompt-cache mutation.
+        """
+        import shlex
+
+        try:
+            tokens = shlex.split(cmd)[1:] if cmd else []
+        except ValueError:
+            tokens = (cmd or "").split()[1:]
+        args = " ".join(shlex.quote(t) for t in tokens)
+        try:
+            from hermes_cli.architect_cmd import handle_architect_command
+            result = handle_architect_command(args)
+        except Exception as e:
+            self._console_print(f"/architect command failed: {e}")
+            return
+        self._console_print(result.text)
+        seed = getattr(result, "agent_seed", None)
+        if seed:
+            self._pending_agent_seed = seed
+
     def _handle_curator_command(self, cmd: str):
         """Handle /curator slash command.
 

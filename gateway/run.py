@@ -9910,6 +9910,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "background":
             return await self._handle_background_command(event)
 
+        if canonical == "architect":
+            _architect_result = await self._handle_architect_command(event)
+            _architect_seed = getattr(_architect_result, "agent_seed", None)
+            if _architect_seed:
+                _ack = getattr(_architect_result, "text", "") or ""
+                if _ack:
+                    try:
+                        adapter = self.adapters.get(source.platform)
+                        if adapter:
+                            _ack_meta = self._thread_metadata_for_source(source)
+                            await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
+                    except Exception:
+                        logger.debug("architect ack send failed", exc_info=True)
+                try:
+                    event.text = _architect_seed
+                except Exception:
+                    return getattr(_architect_result, "text", "") or None
+            else:
+                return getattr(_architect_result, "text", "") or None
+
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
             # Strip the prefix so downstream treats it as a normal user
@@ -11859,12 +11879,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             ts = time.time()  # Unix epoch float — consistent with DB storage
             
-            # If this is a fresh session (no history), write the full tool
-            # definitions as the first entry so the transcript is self-describing
-            # -- the same list of dicts sent as tools=[...] in the API request.
+            # If this is a fresh session from the agent's perspective (no
+            # replayable user/assistant/tool history), write the full tool
+            # definitions as the first entry so the transcript is
+            # self-describing. An /architect-created Discord thread may already
+            # contain a metadata-only preindex row so it is visible in
+            # Desktop/Skeleton while the first turn runs; that row should not
+            # suppress tool-definition logging.
             if is_context_overflow_failure:
                 pass  # Skip all transcript writes — don't grow a broken session
-            elif not history:
+            elif agent_result.get("history_offset", len(history)) == 0:
                 tool_defs = agent_result.get("tools", [])
                 self.session_store.append_to_transcript(
                     session_entry.session_id,

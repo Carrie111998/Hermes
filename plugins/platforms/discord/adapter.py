@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import struct
 import subprocess
 import tempfile
@@ -1534,8 +1535,25 @@ class DiscordAdapter(BasePlatformAdapter):
         if retry_after_until > now:
             remaining = max(1, int(retry_after_until - now))
             return f"Discord asked us to wait before syncing slash commands; retry in {remaining}s"
-        if entry.get("fingerprint") == fingerprint and entry.get("last_success_at"):
-            return "same slash-command fingerprint already synced"
+
+        last_success_at = float(entry.get("last_success_at") or 0)
+        last_attempt_at = float(entry.get("last_attempt_at") or 0)
+        last_success_fingerprint = entry.get("last_success_fingerprint")
+
+        # Only skip when the matching fingerprint is known to have completed a
+        # successful sync. Older state files stored a single ``fingerprint``
+        # field and _record_command_sync_attempt() updated it before the sync
+        # finished; if that attempt then failed, a stale last_success_at from a
+        # previous fingerprint could incorrectly suppress all future retries.
+        if last_success_at:
+            if last_success_fingerprint == fingerprint:
+                return "same slash-command fingerprint already synced"
+            if (
+                last_success_fingerprint is None
+                and entry.get("fingerprint") == fingerprint
+                and last_attempt_at <= last_success_at
+            ):
+                return "same slash-command fingerprint already synced"
         return None
 
     def _record_command_sync_attempt(self, app_id: Any, fingerprint: str) -> None:
@@ -1571,6 +1589,7 @@ class DiscordAdapter(BasePlatformAdapter):
         state = self._read_command_sync_state()
         state[self._command_sync_state_key(app_id)] = {
             "fingerprint": fingerprint,
+            "last_success_fingerprint": fingerprint,
             "last_attempt_at": time.time(),
             "last_success_at": time.time(),
             "summary": summary,
@@ -4216,6 +4235,15 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
+        @tree.command(name="architect", description="Turn a rough request into an agent-ready execution prompt")
+        @discord.app_commands.describe(args="Arguments: [--fast|--deep] [rough request]")
+        async def slash_architect(interaction: discord.Interaction, args: str = ""):
+            await self._handle_architect_thread_slash(interaction, args)
+
+        @tree.command(name="done", description="Check the current thread for open items, then delete it")
+        async def slash_done(interaction: discord.Interaction):
+            await self._handle_done_slash(interaction)
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash
@@ -4329,6 +4357,69 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning(
                 "Discord auto-register from plugin commands failed: %s", e
             )
+
+        # ── Skill-bundle slash commands ────────────────────────────────
+        # A bundle invoked as typed text (/<bundle> args) already falls
+        # through to the gateway bundle dispatcher. Mirror bundles into the
+        # native Discord slash picker as first-class app commands so custom
+        # workflows such as /search <query> are discoverable and don't rely
+        # on Discord passing through a raw leading slash message.
+        def _build_bundle_slash_command(_slug: str, _description: str):
+            discord_name = _slug.lower().replace("_", "-")[:32]
+            desc = (_description or f"Run /{_slug}")[:100]
+            app_commands = getattr(discord, "app_commands")
+
+            if discord_name == "search":
+                @app_commands.describe(
+                    query="Question to search across Hermes memory and connected sources"
+                )
+                async def _search_handler(interaction, query: str):
+                    await self._run_simple_slash(
+                        interaction, f"/{_slug} {query}".strip()
+                    )
+                handler = _search_handler
+            else:
+                @app_commands.describe(args=f"Arguments for /{_slug}"[:100])
+                async def _bundle_handler(interaction, args: str = ""):
+                    await self._run_simple_slash(
+                        interaction, f"/{_slug} {args}".strip()
+                    )
+                handler = _bundle_handler
+
+            handler.__name__ = f"bundle_slash_{discord_name.replace('-', '_')}"
+            return app_commands.Command(  # type: ignore
+                name=discord_name,
+                description=desc,
+                callback=handler,
+            )
+
+        try:
+            from agent.skill_bundles import list_bundles
+
+            for bundle in list_bundles():
+                bundle_slug = str(bundle.get("slug") or "").strip().lower()
+                if not bundle_slug:
+                    continue
+                discord_name = bundle_slug.replace("_", "-")[:32]
+                if discord_name in already_registered:
+                    continue
+                if len(already_registered) >= slot_cap:
+                    dropped_over_cap += 1
+                    continue
+                try:
+                    tree.add_command(
+                        _build_bundle_slash_command(
+                            bundle_slug,
+                            str(bundle.get("description") or ""),
+                        )
+                    )
+                    already_registered.add(discord_name)
+                except Exception:
+                    # Bad bundle names/descriptions should not prevent the
+                    # rest of Discord startup or command sync.
+                    pass
+        except Exception as e:
+            logger.warning("Discord auto-register from skill bundles failed: %s", e)
 
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
@@ -4641,6 +4732,900 @@ class DiscordAdapter(BasePlatformAdapter):
     # Thread creation helpers
     # ------------------------------------------------------------------
 
+    def _architect_thread_name(self, args: str) -> str:
+        """Build a readable Discord thread title for an /architect invocation."""
+        raw = (args or "").strip()
+        title_tokens: list[str] = []
+        if raw:
+            try:
+                tokens = shlex.split(raw)
+            except ValueError:
+                tokens = raw.split()
+            options_done = False
+            for token in tokens:
+                if not options_done and token in {"--fast", "-f", "--deep", "-d"}:
+                    continue
+                if not options_done and token == "--":
+                    options_done = True
+                    continue
+                if not options_done and token.startswith("--"):
+                    continue
+                options_done = True
+                title_tokens.append(token)
+
+        title = " ".join(title_tokens).strip() or raw or "Architect"
+        title = re.sub(r"<@[!&]?\d+>", "", title)
+        title = re.sub(r"<#\d+>", "", title)
+        title = re.sub(r"\s+", " ", title).strip() or "Architect"
+        title = title[0].upper() + title[1:] if title else "Architect"
+        title = title[:80]
+        if len(title) > 77:
+            title = title[:77] + "..."
+        return f"Architect: {title}" if title != "Architect" else "Architect"
+
+    def _build_thread_session_source(
+        self,
+        interaction: Any,
+        thread_id: str,
+        thread_name: str,
+    ):
+        """Build the gateway session source used for a Discord thread turn."""
+        guild_name = ""
+        if hasattr(interaction, "guild") and interaction.guild:
+            guild_name = interaction.guild.name
+
+        chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
+
+        # Inherit forum topic when the thread was created inside a forum channel.
+        _chan = getattr(interaction, "channel", None)
+        chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
+
+        return self.build_source(
+            chat_id=thread_id,
+            chat_name=chat_name,
+            chat_type="thread",
+            user_id=str(interaction.user.id),
+            user_name=interaction.user.display_name,
+            thread_id=thread_id,
+            chat_topic=chat_topic,
+        )
+
+    def _preindex_architect_thread_session(
+        self,
+        interaction: Any,
+        thread_id: str,
+        thread_name: str,
+    ) -> None:
+        """Create a listable state.db row for a just-created /architect thread.
+
+        Desktop/Skeleton lists sessions via state.db with min_message_count=1.
+        The actual agent turn can take a while to flush its first user row, so
+        seed a metadata-only transcript entry that is ignored by the LLM replay
+        path but makes the new thread selectable immediately.
+        """
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None or not thread_id:
+            return
+
+        try:
+            source = self._build_thread_session_source(interaction, thread_id, thread_name)
+            entry = session_store.get_or_create_session(source)
+        except Exception as exc:
+            logger.debug("[%s] Failed to preindex /architect thread session: %s", self.name, exc)
+            return
+
+        db = getattr(session_store, "_db", None)
+        if db is None:
+            return
+
+        try:
+            title = (thread_name or "Architect").strip() or "Architect"
+            try:
+                db.set_session_title(entry.session_id, title)
+            except ValueError:
+                suffix = f" ({thread_id})"
+                db.set_session_title(entry.session_id, f"{title[:100 - len(suffix)]}{suffix}")
+
+            transcript = session_store.load_transcript(entry.session_id)
+            if not any(
+                msg.get("role") == "session_meta"
+                and msg.get("content") == "Architect thread created via Discord /architect."
+                for msg in transcript
+            ):
+                session_store.append_to_transcript(
+                    entry.session_id,
+                    {
+                        "role": "session_meta",
+                        "content": "Architect thread created via Discord /architect.",
+                        "timestamp": time.time(),
+                    },
+                )
+        except Exception as exc:
+            logger.debug("[%s] Failed to seed /architect thread session row: %s", self.name, exc)
+
+    async def _handle_architect_thread_slash(
+        self,
+        interaction: discord.Interaction,
+        args: str = "",
+    ) -> None:
+        """Create a fresh Discord thread and run /architect inside it."""
+        command_text = f"/architect {args}".strip()
+        if not await self._check_slash_authorization(interaction, command_text):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        thread_name = self._architect_thread_name(args)
+        result = await self._create_thread(
+            interaction,
+            name=thread_name,
+            message="",
+            auto_archive_duration=1440,
+            public=True,
+        )
+
+        if not result.get("success"):
+            error = result.get("error", "unknown error")
+            await interaction.followup.send(
+                f"Failed to create architect thread: {error}",
+                ephemeral=True,
+            )
+            return
+
+        thread_id = result.get("thread_id")
+        created_thread_name = result.get("thread_name") or thread_name
+        link = f"<#{thread_id}>" if thread_id else f"**{created_thread_name}**"
+        await interaction.followup.send(f"Created architect thread {link}", ephemeral=True)
+
+        if thread_id:
+            self._threads.mark(thread_id)
+            self._preindex_architect_thread_session(
+                interaction,
+                thread_id,
+                created_thread_name,
+            )
+            await self._dispatch_thread_session(
+                interaction,
+                thread_id,
+                created_thread_name,
+                command_text,
+            )
+
+    async def _handle_done_slash(self, interaction: discord.Interaction) -> None:
+        """Inspect the current Discord thread for open work and delete it via /done."""
+        if not await self._check_slash_authorization(interaction, "/done"):
+            return
+
+        channel = await self._resolve_interaction_channel(interaction)
+        if not isinstance(channel, discord.Thread):
+            await interaction.response.send_message(
+                "Run `/done` inside the Discord thread you want to close.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            messages = await self._fetch_done_thread_messages(channel)
+        except Exception as exc:
+            logger.warning("[%s] /done could not fetch thread history: %s", self.name, exc, exc_info=True)
+            await interaction.followup.send(
+                f"I couldn't inspect this thread before deleting it: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        outstanding = self._analyze_done_thread_messages(messages)
+        if outstanding:
+            view = DoneThreadDeleteConfirmView(
+                adapter=self,
+                thread=channel,
+                invoking_user=interaction.user,
+                outstanding_items=outstanding[:5],
+            )
+            msg = await interaction.followup.send(
+                self._format_done_confirmation(outstanding),
+                view=view,
+                ephemeral=True,
+            )
+            try:
+                view._message = msg
+            except Exception:
+                pass
+            return
+
+        result = await self._complete_done_thread_delete(
+            thread=channel,
+            acting_user=interaction.user,
+            outstanding_items=[],
+            confirmed=False,
+        )
+        if result.get("success"):
+            await interaction.followup.send(
+                "No outstanding items found — deleted this thread.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"I couldn't delete this thread: {result.get('error', 'unknown error')}",
+                ephemeral=True,
+            )
+
+    async def _fetch_done_thread_messages(self, thread: Any, limit: int = 100) -> list[Any]:
+        """Fetch recent messages from a thread in chronological order for /done checks."""
+        collected: list[Any] = []
+        saw_contentless_user_message = False
+        async for msg in thread.history(limit=limit, oldest_first=False):
+            # Ignore Discord system noise; test doubles may not expose ``type``.
+            msg_type = getattr(msg, "type", None)
+            if msg_type is not None:
+                allowed_types = {getattr(discord.MessageType, "default", None), getattr(discord.MessageType, "reply", None)}
+                if msg_type not in allowed_types:
+                    continue
+            content = self._done_message_content(msg)
+            if not content:
+                if not self._done_message_is_bot(msg):
+                    saw_contentless_user_message = True
+                continue
+            # Slash invocations themselves are not actionable thread content.
+            if content.strip().lower().startswith("/done"):
+                continue
+            collected.append(msg)
+        if saw_contentless_user_message:
+            # If Discord lets us see user messages but not their text, deleting
+            # would silently bypass the safety check. Fail closed even when
+            # other bot/status messages in the thread had readable content.
+            raise RuntimeError(
+                "I could see user messages in this thread, but could not read "
+                "their content for the outstanding-item check."
+            )
+        collected.reverse()
+        return collected
+
+    def _done_message_content(self, msg: Any) -> str:
+        """Return user-visible text for a Discord message-like object."""
+        content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
+        if not content and getattr(msg, "attachments", None):
+            content = "(attachment)"
+        return str(content).strip()
+
+    def _done_message_author_id(self, msg: Any) -> str:
+        author = getattr(msg, "author", None)
+        return str(getattr(author, "id", ""))
+
+    def _done_message_is_bot(self, msg: Any) -> bool:
+        author = getattr(msg, "author", None)
+        return bool(getattr(author, "bot", False))
+
+    def _format_done_confirmation(self, outstanding_items: list[str]) -> str:
+        """Build the mobile-readable /done warning shown above the buttons."""
+        compact_items = self._compact_done_outstanding_items(outstanding_items)
+        count = len(compact_items)
+        if count == 0:
+            return "⚠️ `/done` found possible open work.\nReview the thread, or press **Delete anyway**."
+
+        detail_limit = 90 if count == 1 else 48 if count == 2 else 28
+        compact_items = self._compact_done_outstanding_items(
+            outstanding_items,
+            detail_max_length=detail_limit,
+        )
+        count = len(compact_items)
+        noun = "item" if count == 1 else "items"
+        lines = [f"⚠️ `/done` found {count} possible open {noun}."]
+        shown = compact_items[:3]
+        lines.extend(f"- {item}" for item in shown)
+        remaining = count - len(shown)
+        if remaining > 0:
+            lines.append(f"- +{remaining} more")
+        lines.append("Review the thread, or press **Delete anyway**.")
+        return "\n".join(lines)
+
+    def _compact_done_outstanding_items(
+        self,
+        outstanding_items: list[str],
+        *,
+        detail_max_length: int = 90,
+    ) -> list[str]:
+        """Deduplicate and shorten /done warning items for Discord mobile."""
+        label_map = {
+            "Possible unresolved item": "TODO/follow-up",
+            "Work/check still in progress": "In progress",
+            "Verification/risk not clearly resolved": "Needs verification",
+            "Recent failure/blocker may still be open": "Failure/blocker",
+            "Unanswered question": "Unanswered question",
+        }
+        compact: list[str] = []
+        seen_sources: set[str] = set()
+        for item in outstanding_items:
+            normalized = re.sub(r"\s+", " ", item or "").strip()
+            if not normalized:
+                continue
+            label, _sep, detail = normalized.partition(":")
+            label = label.strip()
+            detail = detail.strip()
+            key_source = detail or normalized
+            key = re.sub(r"[^a-z0-9]+", " ", key_source.lower()).strip()
+            key = key[:160] or normalized.lower()
+            if key in seen_sources:
+                continue
+            seen_sources.add(key)
+            short_label = label_map.get(label, label or "Possible open item")
+            excerpt = self._done_compact_excerpt(detail, max_length=detail_max_length)
+            compact.append(f"{short_label}: {excerpt}" if excerpt else short_label)
+        return compact
+
+    def _done_compact_excerpt(self, detail: str, *, max_length: int = 90) -> str:
+        """Return a short, actionable source excerpt for /done warnings."""
+        normalized = re.sub(r"<@[!&]?\d+>", "", detail or "")
+        normalized = re.sub(r"\s+", " ", normalized).strip(" -")
+        if not normalized:
+            return ""
+        if len(normalized) <= max_length:
+            return normalized
+
+        keyword_match = re.search(
+            r"\b(todo|follow[- ]?up|next steps?|need(?:s)?|verify|check|proof|"
+            r"evidence|error|failed|failing|failure|blocked|blocker|pending|"
+            r"unanswered|question|risk|caveat)\b",
+            normalized,
+            re.IGNORECASE,
+        )
+        if keyword_match:
+            start = max(0, keyword_match.start() - 16)
+            end = min(len(normalized), start + max_length)
+            excerpt = normalized[start:end].strip(" -")
+            if start > 0:
+                excerpt = "…" + excerpt
+        else:
+            excerpt = normalized[:max_length].rstrip()
+        if len(excerpt) > max_length:
+            excerpt = excerpt[: max_length - 1].rstrip() + "…"
+        elif len(normalized) > len(excerpt.lstrip("…")):
+            excerpt = excerpt.rstrip(" .") + "…"
+        return excerpt
+
+    def _analyze_done_thread_messages(self, messages: list[Any]) -> list[str]:
+        """Conservative heuristic scan for unresolved work in the current thread.
+
+        This intentionally avoids consulting external systems: /done's contract is
+        "current Discord thread only."  The scan favours short, human-readable
+        warnings over exhaustive task extraction; users can still confirm and
+        delete immediately.
+        """
+        if not messages:
+            return []
+
+        resolution_re = re.compile(
+            r"(?<!/)\b(done|fixed|resolved|complete(?:d)?|verified|tested|passes?|passed|"
+            r"succeeded|success|confirmed|implemented|changed|updated|patched|"
+            r"improved|added|removed|revised|no outstanding|nothing outstanding|"
+            r"closed|merged|deployed|shipped|all set|looks good|works now|working now)\b",
+            re.IGNORECASE,
+        )
+        in_progress_re = re.compile(
+            r"\b(working on|checking|investigating|looking into|will check|will verify|"
+            r"i['’]?ll check|i['’]?ll verify|need to check|need to verify)\b",
+            re.IGNORECASE,
+        )
+        todo_re = re.compile(
+            r"\b(todo|to do|follow[- ]?up|need(?:s)? to|still need|open issue|"
+            r"unresolved|blocked|blocker|pending|left outstanding|remaining|next steps?)\b",
+            re.IGNORECASE,
+        )
+        verify_re = re.compile(
+            r"\b(verify|verified|verification|test(?:ed|s|ing)?|check(?:ed|ing)?|"
+            r"confirm(?:ed|ing)?|make sure|proof|evidence|screenshot|live ui)\b",
+            re.IGNORECASE,
+        )
+        failure_re = re.compile(
+            r"\b(error|failed|failing|failure|traceback|exception|not working|doesn'?t work|"
+            r"can'?t|cannot|couldn['’]?t|could not|unable|refused|broken|blocked)\b",
+            re.IGNORECASE,
+        )
+        explicit_open_re = re.compile(
+            r"(?im)(?:^|\n)\s*(?:[-*]\s*)?(?:todo|to do|follow[- ]?up|"
+            r"next steps?|remaining|still need|needs? to|blocked|blocker|pending)\s*[:\-]|"
+            r"\b(?:todo|to do|follow[- ]?up|next steps?|remaining)\s*:|"
+            r"\b(?:still need|unresolved|blocked|blocker|pending|left outstanding|remaining)\b",
+        )
+
+        contents = [self._done_message_content(m) for m in messages]
+        lowered = [c.lower() for c in contents]
+
+        outstanding: list[str] = []
+        seen_keys: set[str] = set()
+
+        def add(label: str, text: str) -> None:
+            snippet = re.sub(r"\s+", " ", text).strip()
+            snippet = re.sub(r"<@[!&]?\d+>", "", snippet).strip()
+            if len(snippet) > 110:
+                snippet = snippet[:107].rstrip() + "..."
+            item = f"{label}: {snippet}" if snippet else label
+            key = item.lower()
+            if key not in seen_keys:
+                seen_keys.add(key)
+                outstanding.append(item)
+
+        for idx, (msg, content, _lower) in enumerate(zip(messages, contents, lowered)):
+            if not content:
+                continue
+            if self._done_message_is_bot(msg) and self._done_is_tool_progress_message(content):
+                continue
+
+            question_like = "?" in content
+            open_task_detail = self._done_open_task_signal_text(
+                content,
+                todo_re=todo_re,
+                explicit_open_re=explicit_open_re,
+                resolution_re=resolution_re,
+                failure_re=failure_re,
+            )
+            in_progress_detail = self._done_first_matching_segment(content, in_progress_re)
+            failure_detail = self._done_open_failure_signal_text(content, failure_re=failure_re)
+            resolved_later = self._done_has_later_resolution(messages, idx, content, resolution_re)
+            verify_detail = self._done_verification_risk_signal_text(content, verify_re)
+
+            # A message that is itself clearly reporting completion/verification
+            # should count as evidence, not become a fresh verification risk.
+            # Historical words like "failed" or "blocked" are allowed when the
+            # same sentence says they are now fixed/no longer blocked.
+            if (
+                resolution_re.search(content)
+                and not question_like
+                and not open_task_detail
+                and not in_progress_detail
+                and not failure_detail
+            ):
+                continue
+
+            # Emit at most one blocking finding per source message. Pick the
+            # highest-signal reason so /done does not show the same excerpt as
+            # TODO + verification + blocker noise.
+            if question_like and not self._done_has_later_reply(messages, idx):
+                add("Unanswered question", content)
+            elif failure_detail and not resolved_later:
+                add("Recent failure/blocker may still be open", failure_detail)
+            elif in_progress_detail and not resolved_later:
+                add("Work/check still in progress", in_progress_detail)
+            elif open_task_detail and not resolved_later:
+                add("Possible unresolved item", open_task_detail)
+            elif verify_detail and not resolution_re.search(content) and not resolved_later:
+                add("Verification/risk not clearly resolved", verify_detail)
+
+            if len(outstanding) >= 8:
+                break
+
+        return outstanding
+
+    def _done_has_open_task_signal(
+        self,
+        content: str,
+        *,
+        todo_re: re.Pattern[str],
+        explicit_open_re: re.Pattern[str],
+        resolution_re: re.Pattern[str],
+        failure_re: re.Pattern[str],
+    ) -> bool:
+        """Return True for explicit open-work language not negated by closeout text."""
+        return self._done_open_task_signal_text(
+            content,
+            todo_re=todo_re,
+            explicit_open_re=explicit_open_re,
+            resolution_re=resolution_re,
+            failure_re=failure_re,
+        ) is not None
+
+    def _done_open_task_signal_text(
+        self,
+        content: str,
+        *,
+        todo_re: re.Pattern[str],
+        explicit_open_re: re.Pattern[str],
+        resolution_re: re.Pattern[str],
+        failure_re: re.Pattern[str],
+    ) -> str | None:
+        """Return the concrete open-work segment, if one exists."""
+        if not (todo_re.search(content) or explicit_open_re.search(content)):
+            return None
+        for segment in self._done_signal_segments(content):
+            if not (todo_re.search(segment) or explicit_open_re.search(segment)):
+                continue
+            if self._done_segment_resolves_open_signal(
+                segment,
+                resolution_re=resolution_re,
+                failure_re=failure_re,
+            ):
+                continue
+            return segment
+        return None
+
+    def _done_has_open_failure_signal(self, content: str, *, failure_re: re.Pattern[str]) -> bool:
+        """Return True for failure/blocker language that is not described as fixed."""
+        return self._done_open_failure_signal_text(
+            content,
+            failure_re=failure_re,
+        ) is not None
+
+    def _done_open_failure_signal_text(self, content: str, *, failure_re: re.Pattern[str]) -> str | None:
+        """Return the concrete failure/blocker segment, if one exists."""
+        if not failure_re.search(content):
+            return None
+        for segment in self._done_signal_segments(content):
+            if not failure_re.search(segment):
+                continue
+            if self._done_segment_resolves_failure_signal(segment):
+                continue
+            return segment
+        return None
+
+    def _done_first_matching_segment(self, content: str, pattern: re.Pattern[str]) -> str | None:
+        """Return the first message segment matching a scan pattern."""
+        if not pattern.search(content):
+            return None
+        for segment in self._done_signal_segments(content):
+            if pattern.search(segment):
+                return segment
+        return content.strip() or None
+
+    def _done_verification_risk_signal_text(self, content: str, pattern: re.Pattern[str]) -> str | None:
+        """Return verification-risk text, excluding TDD/process proof."""
+        if not pattern.search(content):
+            return None
+        for segment in self._done_signal_segments(content):
+            if not pattern.search(segment):
+                continue
+            if self._done_segment_is_tdd_failure_evidence(segment.lower()):
+                continue
+            if self._done_segment_is_non_actionable_failure_reference(segment):
+                continue
+            return segment
+        return None
+
+    def _done_signal_segments(self, content: str) -> list[str]:
+        """Split a message into small heuristic units for open/closed signals."""
+        return [
+            segment.strip()
+            for segment in re.split(r"(?:\n+|[.;]\s+)", content)
+            if segment.strip()
+        ]
+
+    def _done_segment_resolves_open_signal(
+        self,
+        segment: str,
+        *,
+        resolution_re: re.Pattern[str],
+        failure_re: re.Pattern[str],
+    ) -> bool:
+        lowered = segment.lower()
+        if self._done_segment_is_non_actionable_failure_reference(segment):
+            return True
+        if re.search(
+            r"\b(?:classifier\s+miss|false positive)\b",
+            lowered,
+        ) and re.search(
+            r"\b(?:screenshot|warning|analysis|/done|stale\s+restart)\b",
+            lowered,
+        ):
+            return True
+        if re.search(r"\bwhat changed\b|\bchanged\s*:", lowered):
+            return True
+        if re.search(
+            r"\b(no longer|not anymore|no outstanding|nothing outstanding|"
+            r"nothing open|no open|none remaining|not blocked|not pending)\b",
+            lowered,
+        ):
+            return True
+        if re.search(
+            r"\b(todo|to do|follow[- ]?up|next steps?|still need|needs? to|"
+            r"need to|pending|remaining)\b",
+            lowered,
+        ):
+            return False
+        return bool(
+            resolution_re.search(segment)
+            and not self._done_has_open_failure_signal(segment, failure_re=failure_re)
+        )
+
+    def _done_segment_resolves_failure_signal(self, segment: str) -> bool:
+        lowered = segment.lower()
+        if self._done_segment_is_non_actionable_failure_reference(segment):
+            return True
+        if re.search(
+            r"\b(still|currently|continues?|keeps?|remains?|again)\b.{0,40}"
+            r"\b(error|failed|failing|failure|not working|broken|blocked)\b",
+            lowered,
+        ):
+            return False
+        if self._done_segment_is_tdd_failure_evidence(lowered):
+            return True
+        return bool(
+            re.search(
+                r"\b(no longer|not anymore|fixed|resolved|handled|recovered|"
+                r"working now|works now|passes?|passed|succeeded|success|ok)\b",
+                lowered,
+            )
+        )
+
+    def _done_segment_is_non_actionable_failure_reference(self, segment: str) -> bool:
+        """Return True for quoted/history/example failure text, not live breakage."""
+        lowered = segment.lower()
+        stripped = lowered.strip()
+        if re.match(
+            r"^(?:>\s*)?(?:[-*•]\s*|\d+[.)]\s*)?`?\s*"
+            r"(?:failure/blocker|verification/risk|possible unresolved item|"
+            r"unanswered question|work/check still in progress)\b",
+            stripped,
+        ):
+            return True
+        if re.match(
+            r"^(?:>\s*)?(?:[-*•]\s*|\d+[.)]\s*)?`[^`]+`\s*$",
+            stripped,
+        ):
+            return True
+        if re.search(r"\bfailed\s+before\s+(?:the\s+)?(?:fix|patch|change)\b", lowered):
+            return True
+        if re.search(r"\b(?:failed|failing|failure)\b", lowered) and "unrelated" in lowered:
+            return True
+        if "not an unresolved failure" in lowered or "not an open failure" in lowered:
+            return True
+        if "not a blocker" in lowered or "should not block" in lowered:
+            return True
+        if "not as a real open item" in lowered or "not a real open item" in lowered:
+            return True
+        if re.search(
+            r"\b(?:preserv(?:e|ed|ing)\s+)?real\s+current\s+(?:failures|blockers)\s+like\b",
+            lowered,
+        ):
+            return True
+        if "real current failures like" in lowered:
+            return True
+        if ("false positive" in lowered or "failure/blocker" in lowered) and re.search(
+            r"\b(flagged|flagging|warning|analysis)\b",
+            lowered,
+        ):
+            return True
+        return False
+
+    def _done_segment_is_tdd_failure_evidence(self, lowered_segment: str) -> bool:
+        """Return True for TDD RED-phase evidence, not current breakage.
+
+        Closeout summaries often say a "failing test reproduced the bug
+        first."  That is proof the regression test caught the old behavior,
+        not an unresolved failure. Keep phrases like "still failing" or
+        "blocked" as real blockers.
+        """
+        if re.search(
+            r"\b(still|currently|continues?|keeps?|remains?|again|blocked|blocker|"
+            r"unresolved|pending)\b",
+            lowered_segment,
+        ):
+            return False
+        if re.search(
+            r"\b(?:add(?:ed|ing)?|wrote|written|creat(?:ed|ing)|introduced?)\b"
+            r".{0,80}\b(?:fail(?:ed|ing)\s+)?regression\b",
+            lowered_segment,
+        ) and re.search(
+            r"\b(test|tests|tdd|red(?:-green)?|repro|reproduced?|exact|user-note|shape)\b",
+            lowered_segment,
+        ):
+            return True
+        if re.search(
+            r"\b(?:new\s+)?regression\b",
+            lowered_segment,
+        ) and re.search(
+            r"\bfail(?:ed|ing)\b",
+            lowered_segment,
+        ) and re.search(
+            r"\b(first|before\s+(?:the\s+)?(?:fix|patch|change)|reproduced?|repro|"
+            r"red(?:-green)?|tdd|exact\s+sentence)\b",
+            lowered_segment,
+        ):
+            return True
+        if re.search(
+            r"\b(?:regression\s+)?tests?\b",
+            lowered_segment,
+        ) and re.search(
+            r"\b(first|intentionally written|covered the bug|proves? the test)\b",
+            lowered_segment,
+        ):
+            return True
+        if not re.search(r"\b(?:new\s+)?fail(?:ed|ing)\s+tests?\b", lowered_segment):
+            return False
+        return bool(
+            re.search(
+                r"\b(reproduced?|repro|regression|tdd|red(?:-green)?|first|expected)\b",
+                lowered_segment,
+            )
+        )
+
+    def _done_has_later_reply(self, messages: list[Any], idx: int) -> bool:
+        asker_id = self._done_message_author_id(messages[idx])
+        for later in messages[idx + 1:]:
+            content = self._done_message_content(later)
+            if not content or self._done_is_tool_progress_message(content):
+                continue
+            if self._done_message_author_id(later) != asker_id or self._done_message_is_bot(later):
+                return True
+        return False
+
+    def _done_has_later_resolution(
+        self,
+        messages: list[Any],
+        idx: int,
+        content: str,
+        resolution_re: re.Pattern[str],
+    ) -> bool:
+        """Return True only when later text plausibly resolves this item.
+
+        A generic later "done" message is not enough: it may refer to a
+        different subtask.  Either the resolution must be a global closeout
+        phrase or it must share meaningful words with the open item.
+        """
+        for later in messages[idx + 1:]:
+            later_content = self._done_message_content(later)
+            if not later_content or self._done_is_tool_progress_message(later_content):
+                continue
+            if not resolution_re.search(later_content):
+                continue
+            if self._done_is_global_resolution_message(later_content):
+                return True
+            if self._done_content_overlaps(content, later_content):
+                return True
+        return False
+
+    def _done_is_tool_progress_message(self, content: str) -> bool:
+        """Identify Hermes tool-progress preview messages that are not answers."""
+        stripped = content.strip()
+        # Discord progress previews usually look like ``📚 skill_view: ...``.
+        # Do not rely on a complete emoji list; strip any leading icon/prefix
+        # characters and classify known tool-call prefixes instead.
+        normalized = re.sub(r"^[^A-Za-z0-9_/.-]+", "", stripped).lstrip()
+        return bool(
+            re.match(
+                r"^(?:functions\.)?(?:"
+                r"browser_[a-z_]+|cronjob|delegate_task|discord(?:_admin)?|"
+                r"execute_code|memory|patch|process|read_file|search_files|"
+                r"session_search|skill_manage|skill_view|skills_list|terminal|todo|"
+                r"vision_analyze|write_file"
+                r")\s*:",
+                normalized,
+            )
+        )
+
+    def _done_is_global_resolution_message(self, content: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(no outstanding|nothing outstanding|nothing open|all set|all done|"
+                r"everything (?:is )?(?:done|resolved|complete)|thread (?:is )?(?:done|resolved|complete))\b",
+                content,
+                re.IGNORECASE,
+            )
+        )
+
+    def _done_content_overlaps(self, open_content: str, resolution_content: str) -> bool:
+        return bool(self._done_keyword_set(open_content) & self._done_keyword_set(resolution_content))
+
+    def _done_keyword_set(self, content: str) -> set[str]:
+        stopwords = {
+            "about", "after", "again", "also", "because", "before", "being",
+            "check", "could", "done", "from", "have", "into", "need", "needs",
+            "please", "should", "that", "this", "thread", "want", "what", "when",
+            "where", "whether", "with", "work", "works", "would", "you", "your",
+        }
+        keywords: set[str] = set()
+        for word in re.findall(r"[a-zA-Z0-9]+", content.lower()):
+            if len(word) < 4 or word in stopwords:
+                continue
+            keywords.add(self._done_normalize_keyword(word))
+        return keywords
+
+    def _done_normalize_keyword(self, word: str) -> str:
+        if word.startswith(("verif", "proof")):
+            return "verify"
+        if word.startswith("test"):
+            return "test"
+        if word.startswith("deploy"):
+            return "deploy"
+        if word.startswith(("resolv", "fix", "fixed")):
+            return "resolve"
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(word) > len(suffix) + 3 and word.endswith(suffix):
+                return word[: -len(suffix)]
+        return word
+
+    async def _complete_done_thread_delete(
+        self,
+        *,
+        thread: Any,
+        acting_user: Any,
+        outstanding_items: list[str],
+        confirmed: bool,
+    ) -> Dict[str, Any]:
+        """Write /done audit outside the target thread, then delete it."""
+        try:
+            await self._send_done_audit(
+                thread=thread,
+                acting_user=acting_user,
+                outstanding_items=outstanding_items,
+                confirmed=confirmed,
+            )
+        except Exception as exc:
+            logger.warning("[%s] /done audit failed before delete: %s", self.name, exc, exc_info=True)
+            return {"success": False, "error": f"could not save /done audit: {exc}"}
+
+        try:
+            display_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
+            await thread.delete(reason=f"/done requested by {display_name}")
+            return {"success": True}
+        except Exception as exc:
+            logger.warning("[%s] /done thread delete failed: %s", self.name, exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
+    async def _send_done_audit(
+        self,
+        *,
+        thread: Any,
+        acting_user: Any,
+        outstanding_items: list[str],
+        confirmed: bool,
+    ) -> None:
+        """Post a compact /done deletion audit to the parent channel/context."""
+        parent = getattr(thread, "parent", None)
+        if parent is None and self._client is not None:
+            parent_id = self._get_parent_channel_id(thread)
+            if parent_id:
+                parent = self._client.get_channel(int(parent_id))
+                if parent is None:
+                    parent = await self._client.fetch_channel(int(parent_id))
+        if parent is None:
+            raise RuntimeError("could not resolve parent channel for /done audit")
+
+        text = self._format_done_audit(thread, acting_user, outstanding_items, confirmed)
+        if self._is_forum_parent(parent):
+            result = await self._forum_post_file(
+                parent,
+                thread_name=f"/done audit: {getattr(thread, 'name', 'thread')}",
+                content=text,
+            )
+            if getattr(result, "success", False) is False:
+                raise RuntimeError(getattr(result, "error", "forum audit post failed"))
+            return
+
+        send = getattr(parent, "send", None)
+        if send is None:
+            raise RuntimeError("parent channel cannot receive audit messages")
+        await send(text)
+
+    def _format_done_audit(
+        self,
+        thread: Any,
+        acting_user: Any,
+        outstanding_items: list[str],
+        confirmed: bool,
+    ) -> str:
+        thread_name = getattr(thread, "name", None) or "thread"
+        thread_id = str(getattr(thread, "id", "?"))
+        user_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
+        user_id = str(getattr(acting_user, "id", "?"))
+        ts = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
+        compact_items = self._compact_done_outstanding_items(
+            outstanding_items,
+            detail_max_length=140,
+        )
+        status = f"found {len(compact_items)} possible item(s)" if compact_items else "none found"
+        lines = [
+            f"`/done` deleted thread: **{thread_name}** (`{thread_id}`)",
+            f"Invoked by: {user_name} (`{user_id}`)",
+            f"Deleted at: {ts}",
+            f"Outstanding check: {status}",
+            f"Deleted after confirmation: {'yes' if confirmed else 'not needed'}",
+        ]
+        if compact_items:
+            lines.append("")
+            lines.append("Outstanding:")
+            lines.extend(f"- {item}" for item in compact_items[:5])
+        return "\n".join(lines)
+
     async def _handle_thread_create_slash(
         self,
         interaction: discord.Interaction,
@@ -4700,25 +5685,7 @@ class DiscordAdapter(BasePlatformAdapter):
         text: str,
     ) -> None:
         """Build a MessageEvent pointing at a thread and send it through handle_message."""
-        guild_name = ""
-        if hasattr(interaction, "guild") and interaction.guild:
-            guild_name = interaction.guild.name
-
-        chat_name = f"{guild_name} / {thread_name}" if guild_name else thread_name
-
-        # Inherit forum topic when the thread was created inside a forum channel.
-        _chan = getattr(interaction, "channel", None)
-        chat_topic = self._get_effective_topic(_chan, is_thread=True) if _chan else None
-
-        source = self.build_source(
-            chat_id=thread_id,
-            chat_name=chat_name,
-            chat_type="thread",
-            user_id=str(interaction.user.id),
-            user_name=interaction.user.display_name,
-            thread_id=thread_id,
-            chat_topic=chat_topic,
-        )
+        source = self._build_thread_session_source(interaction, thread_id, thread_name)
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
         _parent_id = str(getattr(_parent_channel, "id", "") or "")
@@ -5246,6 +6213,7 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         message: str = "",
         auto_archive_duration: int = 1440,
+        public: bool = False,
     ) -> Dict[str, Any]:
         """Create a thread in the current Discord channel.
 
@@ -5275,12 +6243,39 @@ class DiscordAdapter(BasePlatformAdapter):
         reason = f"Requested by {display_name} via /thread"
         starter_message = (message or "").strip()
 
+        if public:
+            # discord.py documents that TextChannel.create_thread(message=None)
+            # creates a private thread by default. In practice, Discord still
+            # returned private bot-owned threads for /architect even when the type
+            # kwarg was set to public_thread. Create from a visible starter
+            # message instead; Discord's message-thread endpoint creates public
+            # threads, which are listable in the channel sidebar.
+            try:
+                seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
+                seed_msg = await parent_channel.send(seed_content)
+                thread = await seed_msg.create_thread(
+                    name=name,
+                    auto_archive_duration=auto_archive_duration,
+                    reason=reason,
+                )
+                await self._add_thread_requester(thread, interaction)
+                return {
+                    "success": True,
+                    "thread_id": str(thread.id),
+                    "thread_name": getattr(thread, "name", None) or name,
+                }
+            except Exception as public_error:
+                return {
+                    "error": f"Discord rejected public thread creation from a starter message: {public_error}"
+                }
+
         try:
             thread = await parent_channel.create_thread(
                 name=name,
                 auto_archive_duration=auto_archive_duration,
                 reason=reason,
             )
+            await self._add_thread_requester(thread, interaction)
             if starter_message:
                 await thread.send(starter_message)
             return {
@@ -5297,6 +6292,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     auto_archive_duration=auto_archive_duration,
                     reason=reason,
                 )
+                await self._add_thread_requester(thread, interaction)
                 return {
                     "success": True,
                     "thread_id": str(thread.id),
@@ -5309,6 +6305,17 @@ class DiscordAdapter(BasePlatformAdapter):
                         f"Direct error: {direct_error}. Fallback error: {fallback_error}"
                     )
                 }
+
+    async def _add_thread_requester(self, thread: Any, interaction: Any) -> None:
+        """Best-effort add the slash-command user to a newly-created thread."""
+        add_user = getattr(thread, "add_user", None)
+        user = getattr(interaction, "user", None)
+        if add_user is None or user is None:
+            return
+        try:
+            await add_user(user)
+        except Exception as exc:
+            logger.debug("[%s] Could not add requester to thread %s: %s", self.name, getattr(thread, "id", "?"), exc)
 
     # ------------------------------------------------------------------
     # Auto-thread helpers
@@ -6817,7 +7824,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    global ExecApprovalView, SlashConfirmView, DoneThreadDeleteConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -7080,6 +8087,113 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class DoneThreadDeleteConfirmView(discord.ui.View):
+        """Confirm deletion for /done when possible outstanding items were found."""
+
+        def __init__(
+            self,
+            *,
+            adapter: Any,
+            thread: Any,
+            invoking_user: Any,
+            outstanding_items: list[str],
+        ):
+            super().__init__(timeout=300)
+            self.adapter = adapter
+            self.thread = thread
+            self.invoking_user = invoking_user
+            self.outstanding_items = outstanding_items
+            self.allowed_user_ids = getattr(adapter, "_allowed_user_ids", set())
+            self.allowed_role_ids = getattr(adapter, "_allowed_role_ids", set())
+            self.resolved = False
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        async def _disable_buttons(self, interaction: discord.Interaction, label: str) -> None:
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            try:
+                await interaction.response.edit_message(
+                    content=f"{label} — deleting this thread now.",
+                    view=self,
+                )
+            except Exception:
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                except Exception:
+                    pass
+
+        @discord.ui.button(label="Delete anyway", style=discord.ButtonStyle.red, emoji="🗑️")
+        async def delete_anyway(
+            self, interaction: discord.Interaction, button: discord.ui.Button,
+        ):
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This /done prompt has already been resolved.", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to delete this thread.", ephemeral=True,
+                )
+                return
+
+            await self._disable_buttons(interaction, "Confirmed")
+            result = await self.adapter._complete_done_thread_delete(
+                thread=self.thread,
+                acting_user=interaction.user,
+                outstanding_items=self.outstanding_items,
+                confirmed=True,
+            )
+            if result.get("success"):
+                try:
+                    await interaction.followup.send("Deleted this thread.", ephemeral=True)
+                except Exception:
+                    pass
+            else:
+                await interaction.followup.send(
+                    f"I couldn't delete this thread: {result.get('error', 'unknown error')}",
+                    ephemeral=True,
+                )
+
+        @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey)
+        async def cancel(
+            self, interaction: discord.Interaction, button: discord.ui.Button,
+        ):
+            if self.resolved:
+                await interaction.response.send_message(
+                    "This /done prompt has already been resolved.", ephemeral=True,
+                )
+                return
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this prompt.", ephemeral=True,
+                )
+                return
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            await interaction.response.edit_message(
+                content="Cancelled — thread was not deleted.",
+                view=self,
+            )
+
+        async def on_timeout(self):
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            msg = getattr(self, '_message', None)
+            if msg:
+                try:
+                    await msg.edit(content="/done confirmation expired — thread was not deleted.", view=self)
+                except Exception:
+                    pass
+
 
     class UpdatePromptView(discord.ui.View):
         """Interactive Yes/No buttons for ``hermes update`` prompts.

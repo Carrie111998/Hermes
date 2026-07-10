@@ -99,6 +99,20 @@ class GatewaySlashCommandsMixin:
         adapter = self.adapters.get(platform) if getattr(self, "adapters", None) else None
         return getattr(adapter, "typed_command_prefix", "/") if adapter is not None else "/"
 
+    async def _handle_architect_command(self, event: MessageEvent):
+        """Handle /architect in the gateway.
+
+        Returns an ArchitectCommandResult. Dispatch rewrites ``event.text`` to the
+        result's ``agent_seed`` and falls through to the normal agent path so the
+        prompt architect behavior happens as a regular user turn.
+        """
+        try:
+            from hermes_cli.architect_cmd import handle_architect_command
+            return handle_architect_command(event.get_command_args().strip())
+        except Exception as exc:  # pragma: no cover - defensive
+            from hermes_cli.architect_cmd import ArchitectCommandResult
+            return ArchitectCommandResult(text=f"/architect command failed: {exc}")
+
     async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /new or /reset command."""
         source = event.source
