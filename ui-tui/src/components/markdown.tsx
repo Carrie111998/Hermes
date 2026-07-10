@@ -153,14 +153,14 @@ const autolinkUrl = (raw: string) =>
 const defaultLinkLabel = (url: string) =>
   url.startsWith('mailto:') ? url.replace(/^mailto:/, '') : /^https?:\/\//i.test(url) ? urlSlugTitleLabel(url) : url
 
-const pickFallbackLabel = (label: string | undefined, target: string): string | undefined => {
+const pickFallbackLabel = (label: string | undefined): string | undefined => {
   const trimmed = label?.trim()
 
   if (!trimmed) {
     return undefined
   }
 
-  return normalizeExternalUrl(trimmed) === target ? undefined : trimmed
+  return trimmed
 }
 
 interface ResolvedLinkProps {
@@ -170,8 +170,9 @@ interface ResolvedLinkProps {
 }
 
 function ResolvedLink({ fallbackLabel, t, url }: ResolvedLinkProps) {
-  const fetched = useLinkTitle(url)
-  const display = fetched || fallbackLabel || defaultLinkLabel(url)
+  const explicitLabel = fallbackLabel?.trim()
+  const fetched = useLinkTitle(explicitLabel ? null : url)
+  const display = explicitLabel || fetched || defaultLinkLabel(url)
 
   return (
     <Link url={url}>
@@ -185,7 +186,7 @@ function ResolvedLink({ fallbackLabel, t, url }: ResolvedLinkProps) {
 const renderResolvedLink = (k: number, t: Theme, rawUrl: string, label?: string) => {
   const target = normalizeExternalUrl(rawUrl)
 
-  return <ResolvedLink fallbackLabel={pickFallbackLabel(label, target)} key={k} t={t} url={target} />
+  return <ResolvedLink fallbackLabel={pickFallbackLabel(label)} key={k} t={t} url={target} />
 }
 
 export const stripInlineMarkup = (v: string) =>
@@ -561,7 +562,7 @@ function MdInline({ t, text }: { t: Theme; text: string }) {
     } else if (m[3] && m[4]) {
       parts.push(renderResolvedLink(parts.length, t, m[4], m[3]))
     } else if (m[5]) {
-      parts.push(renderResolvedLink(parts.length, t, autolinkUrl(m[5]), m[5].replace(/^mailto:/, '')))
+      parts.push(renderResolvedLink(parts.length, t, autolinkUrl(m[5])))
     } else if (m[6]) {
       parts.push(
         <Text key={parts.length} strikethrough>

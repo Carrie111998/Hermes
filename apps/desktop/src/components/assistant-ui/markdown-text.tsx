@@ -8,7 +8,7 @@ import {
   tailBoundedRemend
 } from '@assistant-ui/react-streamdown'
 import { code } from '@streamdown/code'
-import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
+import { type ComponentProps, createContext, memo, useContext, useEffect, useMemo, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
@@ -220,7 +220,20 @@ function childrenToText(children: unknown): string {
   return ''
 }
 
-function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a'>) {
+interface MarkdownLinkProps extends ComponentProps<'a'> {
+  node?: { position?: { start?: { offset?: number } } }
+}
+
+const MarkdownSourceContext = createContext('')
+
+function isExplicitMarkdownLink(markdown: string, node: MarkdownLinkProps['node']): boolean {
+  const start = node?.position?.start?.offset
+
+  return typeof start === 'number' && markdown.slice(start).trimStart().startsWith('[')
+}
+
+function MarkdownLink({ children, className, href, node, ...props }: MarkdownLinkProps) {
+  const markdown = useContext(MarkdownSourceContext)
   const mediaPath = mediaPathFromMarkdownHref(href)
 
   if (mediaPath) {
@@ -253,10 +266,11 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
   }
 
   const text = childrenToText(children)
+  const explicitMarkdownLink = Boolean(text && isExplicitMarkdownLink(markdown, node))
 
   // Bare autolink → inline rich embed when a provider matches. Labeled links
   // (`[watch](url)`) stay plain. Desktop only (webview / iframe renderers).
-  if (window.hermesDesktop && text && normalizeExternalUrl(text) === target) {
+  if (window.hermesDesktop && !explicitMarkdownLink && text && normalizeExternalUrl(text) === target) {
     const embed = detectEmbed(target)
 
     if (embed) {
@@ -264,7 +278,7 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
     }
   }
 
-  const fallbackLabel = text && normalizeExternalUrl(text) !== target ? text : undefined
+  const fallbackLabel = explicitMarkdownLink ? text : undefined
 
   return (
     <PrettyLink className={cn('wrap-anywhere', className)} fallbackLabel={fallbackLabel} href={target} {...props} />
@@ -522,23 +536,25 @@ function MarkdownTextSurface({ containerClassName, containerProps, defer }: Mark
   }
 
   return (
-    <StreamdownTextPrimitive
-      components={components}
-      containerClassName={cn(MARKDOWN_CONTAINER_CLASS_NAME, containerClassName)}
-      containerProps={containerProps}
-      defer={defer}
-      lineNumbers={false}
-      mode="streaming"
-      // Incomplete-markdown repair runs in preprocessWithTailRepair on the
-      // full accumulated text; the built-in tail-bounded remend is disabled
-      // because a custom parseMarkdownIntoBlocksFn is supplied, and
-      // parseIncompleteMarkdown stays false to avoid a second full-text
-      // remend pass.
-      parseIncompleteMarkdown={false}
-      parseMarkdownIntoBlocksFn={parseMarkdownIntoBlocksCached}
-      plugins={plugins}
-      preprocess={preprocessWithTailRepair}
-    />
+    <MarkdownSourceContext.Provider value={text}>
+      <StreamdownTextPrimitive
+        components={components}
+        containerClassName={cn(MARKDOWN_CONTAINER_CLASS_NAME, containerClassName)}
+        containerProps={containerProps}
+        defer={defer}
+        lineNumbers={false}
+        mode="streaming"
+        // Incomplete-markdown repair runs in preprocessWithTailRepair on the
+        // full accumulated text; the built-in tail-bounded remend is disabled
+        // because a custom parseMarkdownIntoBlocksFn is supplied, and
+        // parseIncompleteMarkdown stays false to avoid a second full-text
+        // remend pass.
+        parseIncompleteMarkdown={false}
+        parseMarkdownIntoBlocksFn={parseMarkdownIntoBlocksCached}
+        plugins={plugins}
+        preprocess={preprocessWithTailRepair}
+      />
+    </MarkdownSourceContext.Provider>
   )
 }
 
