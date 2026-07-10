@@ -45,7 +45,9 @@ fi
 # writes its egg-info beside pyproject.toml, so bootstrap performs the install
 # as root and leaves both source and venv non-writable to the runtime user.
 "$APP_ROOT/.venv/bin/python" -m pip install \
-  --disable-pip-version-check --no-input --editable "$APP_ROOT"
+  --disable-pip-version-check --no-input \
+  --editable "$APP_ROOT" \
+  'websockets==15.0.1'
 chown -R root:root "$APP_ROOT/.venv"
 
 "$APP_ROOT/.venv/bin/python" \
