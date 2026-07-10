@@ -2578,8 +2578,26 @@ class MCPServerTask:
             self._tools = []
             self._register_discovered_tools_if_needed()
             return
+        # Bound tool discovery the same way the handshake is bounded (#59349).
+        # A GET/SSE stream drop immediately after ``initialize`` (session ID
+        # assigned, protocol negotiated) under event-loop starvation leaves
+        # ``list_tools`` awaiting a response that never lands on the half-open
+        # transport. Without a timeout the run() coroutine wedges *inside* the
+        # transport context managers forever: it never returns and never
+        # raises, so the reconnect/park state machine — and its periodic
+        # self-probe — is never reached, and the server sits tool-less until a
+        # human restarts the process (observed 2026-07-10: a dashboard lost
+        # mempalace for ~6h despite the server being healthy the whole time).
+        # Timing out converts the hang into a normal failure that unwinds the
+        # transport and re-enters run()'s reconnect loop, which eventually
+        # parks with a self-probe and self-heals once pressure clears.
+        discovery_timeout = float(
+            self._config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+        )
         async with self._rpc_lock:
-            tools_result = await self.session.list_tools()
+            tools_result = await asyncio.wait_for(
+                self.session.list_tools(), timeout=discovery_timeout
+            )
         self._tools = (
             tools_result.tools
             if hasattr(tools_result, "tools")
