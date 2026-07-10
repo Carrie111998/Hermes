@@ -1,6 +1,6 @@
 model:
   provider: openai-direct-primary
-  default: gpt-5.4-mini
+  default: gpt-5.6-luna
   base_url: https://api.openai.com/v1
   api_key_source:
     type: env
@@ -238,16 +238,16 @@ onboarding:
 auxiliary:
   compression:
     provider: main
-    model: gpt-5.4-mini
+    model: gpt-5.6-luna
     timeout: 120
   session_search:
     provider: main
-    model: gpt-5.4-mini
+    model: gpt-5.6-luna
     timeout: 60
     max_concurrency: 2
   title_generation:
     provider: main
-    model: gpt-5.4-mini
+    model: gpt-5.6-luna
     timeout: 30
   vision:
     provider: gemini
@@ -260,7 +260,7 @@ providers:
     name: OpenAI Direct Primary
     api: https://api.openai.com/v1
     key_env: OPENAI_API_KEY
-    default_model: gpt-5.4-mini
+    default_model: gpt-5.6-luna
     transport: codex_responses
 
 # one conversation per group chat (teren-greenlit 2026-06-17) — overrides per-participant default

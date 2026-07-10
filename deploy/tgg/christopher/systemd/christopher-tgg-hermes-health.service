@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify Christopher TGG Hermes runtime invariants
+After=network-online.target christopher-tgg-hermes.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/pclaw/apps/hermes-pcl
+ExecStart=/home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/verify_runtime.sh --quick
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal

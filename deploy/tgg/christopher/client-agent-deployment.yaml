@@ -1,0 +1,293 @@
+apiVersion: pa.papercutlabs.com/v1
+kind: ClientAgentDeployment
+
+metadata:
+  name: christopher-tgg
+  client: tgg
+  agent: christopher
+  owner: edna
+  environment: production
+  sourceWb: 27b80282-e7ac-4b1a-bbf4-5a8c6f897552
+
+spec:
+  # The deployment points at an immutable AgentBrain recovery. It does not copy
+  # the behavior payload into this file. The two source artifacts and their
+  # composite hash make the pointer independently reconstructable.
+  brainRef: agentbrain:tgg:christopher:june-2026@sha256:433d98de07a61f6978862db04fa1a81a943a81bad92446898c26741652afea1e
+  brain:
+    sourceSnapshotCommit: bd57c948a7b3d2bf80242ef4e373b987ca9d21d3
+    recoveryCommit: 2aad945aba62c78a3f617ce18470b66848529435
+    recoveredConfig:
+      path: deploy/tgg/christopher/baselines/june-2026/config.live-2026-06-19.yaml
+      sha256: 27c005b2edf83ff978940841bdabe8f9acc4790e600cb957022d2471650a17b5
+    recoveredConstitution:
+      path: deploy/tgg/christopher/baselines/june-2026/christopher_tgg_constitution.live-2026-06-19.yaml
+      sha256: 59dfdf8c8d66b12e6b473b3c89965908932b8e5e6b2f2f31bfa9790e7d2e9bff
+    provenance:
+      path: deploy/tgg/christopher/baselines/june-2026/PROVENANCE.md
+      checksumManifest: deploy/tgg/christopher/baselines/june-2026/SHA256SUMS
+
+  host:
+    hostRef: tenant:tgg/host:app-1
+    resolution:
+      command: pcl service locate --system christopher --domain pa
+      expectedSshTargetAlias: tgg-app-1
+      expectedHostname: tgg-app-1
+    forbiddenTargets:
+      - rescue-box
+
+  roles:
+    runtime:
+      hostRef: tenant:tgg/host:app-1
+      owner: edna
+      mutablePaths:
+        - /home/pclaw/apps/hermes-pcl
+        - /home/pclaw/.hermes-christopher-tgg
+        - /home/pclaw/.hermes-christopher-tgg-test
+        - /etc/systemd/system/christopher-tgg-hermes.service
+        - /etc/systemd/system/christopher-tgg-hermes-health.service
+        - /etc/systemd/system/christopher-tgg-hermes-health.timer
+    capture:
+      hostRef: tenant:tgg/host:app-1
+      owner: stream-f
+      access: read-only
+      service: tgg-capture-whatsapp-bridge.service
+      forbiddenActions:
+        - restart
+        - stop
+        - reconfigure
+        - write /opt/tgg-capture
+        - write /var/lib/tgg-capture
+    systems:
+      owner: stream-a
+      access: none
+      forbiddenActions:
+        - write application paths
+        - restart application units
+
+  runtime:
+    implementation: hermes-pcl
+    sourceRepository:
+      canonicalCheckout: /Users/pcloffice/pcl-dev/hermes-pcl
+      upstreamUpgradeAllowed: false
+      note: The intentional upstream lag is outside this deployment.
+    remoteAppRoot: /home/pclaw/apps/hermes-pcl
+    user: pclaw
+    group: pclaw
+    supplementaryGroups:
+      - tggcapture
+    hermesHome: /home/pclaw/.hermes-christopher-tgg
+    testHome: /home/pclaw/.hermes-christopher-tgg-test
+    configPath: /home/pclaw/.hermes-christopher-tgg/config.yaml
+    constitutionPath: /home/pclaw/.hermes-christopher-tgg/christopher_tgg_constitution.yaml
+    stateDbPath: /home/pclaw/.hermes-christopher-tgg/state.db
+    groupSessionsPerUser: false
+
+  processing:
+    enabled: false
+    authority: teren-rung-gate
+    activationIncludedInThisDeployment: false
+    gatePath: /home/pclaw/.hermes-christopher-tgg/runtime/processing-gate.json
+    configPath: /home/pclaw/.hermes-christopher-tgg/config.yaml
+    configKey: pa.enabled
+    requiredConfigValue: false
+    effectiveEnableRule: pa.enabled AND processing-gate.enabled
+    initialCursorPosition: end
+    cursorPath: /home/pclaw/.hermes-christopher-tgg/runtime/capture-cursor.json
+    inboxPath: /home/pclaw/.hermes-christopher-tgg/runtime/capture-inbox.db
+    standbyContract:
+      configEnabled: false
+      gateEnabled: false
+      sourceOpened: false
+      cursorAdvanced: false
+      productionInboxRows: 0
+      productionTurnsAfterDisabledBoundary: 0
+      outboundSent: 0
+
+  engine:
+    provider: openai-direct-primary
+    transport: codex_responses
+    baseUrl: https://api.openai.com/v1
+    defaultSlot: gpt-5.4-mini
+    allowedSlots:
+      - gpt-5.4-mini
+      - gpt-5.6-luna
+    slotManifest: deploy/tgg/christopher/runtime-slots/SHA256SUMS
+    slotStatePath: /home/pclaw/.hermes-christopher-tgg/runtime/engine-slot
+    switchCommand: /home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/switch_engine_slot.sh
+    switchRequiresCodeRedeploy: false
+    auxiliary:
+      provider: gemini
+      model: gemini-3.1-flash-lite
+
+  env:
+    materialization: /home/pclaw/.hermes-christopher-tgg/.env
+    mode: "0600"
+    refs:
+      - name: OPENAI_API_KEY
+        source: marshal-secrets
+        requiredWhen: always
+      - name: GEMINI_API_KEY
+        source: marshal-secrets
+        requiredWhen: always
+      - name: GEMINI_API_KEY_PCL_PA_SHARED
+        source: GEMINI_API_KEY
+        requiredWhen: always
+      - name: CHRISTOPHER_TGG_PS_SERVICE_TOKEN
+        source: marshal-secrets
+        requiredWhen: processing-enabled
+    secretValuesInSpec: false
+
+  channels:
+    whatsapp:
+      declared: true
+      hermesBuiltInGatewayEnabled: false
+      externalCaptureService: tgg-capture-whatsapp-bridge.service
+      captureBind: 127.0.0.1:3011
+      durableSource:
+        path: /var/lib/tgg-capture/whatsapp/capture/events.jsonl
+        access: read-only
+        ordering: append-before-volatile-queue
+        mediaRoot: /var/lib/tgg-capture/whatsapp/media
+      consumer:
+        implementation: gateway/durable_jsonl_consumer.py
+        mode: durable-jsonl-tail
+        singletonLock: /home/pclaw/.hermes-christopher-tgg/runtime/capture-consumer.lock
+        cursorCommitRule: sqlite-inbox-before-cursor
+        outboundDelivery: disabled
+        liveTestInputAllowed: false
+        fixtureTestOnly: true
+      prohibitedConsumerSurface:
+        method: GET
+        path: /messages
+        reasons:
+          - destructive splice drains the whole in-memory queue
+          - at-most-once with no cursor, acknowledgement, lease, retry, or replay
+          - concurrent consumers race and crash-after-GET loses buffer items to the consumer
+          - unauthenticated to any loopback process
+          - queue is capped at 100 and drops the oldest item on overflow
+      capturedItemFields:
+        - messageId
+        - chatId
+        - senderId
+        - senderName
+        - chatName
+        - isGroup
+        - body
+        - hasMedia
+        - mediaType
+        - mediaUrls
+        - mentionedIds
+        - quotedMessageId
+        - quotedParticipant
+        - quotedRemoteJid
+        - hasQuotedMessage
+        - botIds
+        - timestamp
+        - fromMe
+        - historySync
+        - historySyncType
+        - historyIsLatest
+      timestampContract: producer-native; consumers must not assume ISO-8601
+      allowlists:
+        directMessages:
+          - "6591455515"
+          - "188690831777827"
+          - "6596515711"
+          - "6594564662"
+          - "6591711776"
+          - "6591132954"
+          - "6580913349"
+          - "244809512038554"
+        operationsChats:
+          - 120363403088884777@g.us
+          - 120363403845802098@g.us
+          - 120363405141229117@g.us
+          - 120363420803272720@g.us
+          - 120363421153247095@g.us
+          - 120363421424519051@g.us
+          - 120363422582425366@g.us
+          - 120363423535922556@g.us
+          - 120363423568509280@g.us
+        managementChats:
+          - 120363409954029949@g.us
+          - 120363427363740087@g.us
+          - 120363427897872447@g.us
+          - 120363407433776639@g.us
+          - 120363426509183563@g.us
+          - 120363407903158826@g.us
+        outboundAllowedChats:
+          - 120363409954029949@g.us
+          - 120363427363740087@g.us
+          - 120363427897872447@g.us
+          - 120363407433776639@g.us
+          - 120363426509183563@g.us
+          - 120363407903158826@g.us
+      currentOutboundPolicy: no-external-send
+    telegram:
+      declaredByBrainSelectors: true
+      ingressDeployed: false
+      processingEnabled: false
+      selectorChats:
+        operations:
+          - "-5192935862"
+        management:
+          - "-5295904349"
+
+  units:
+    owned:
+      - name: christopher-tgg-hermes.service
+        desiredState: active-enabled
+        source: deploy/tgg/christopher/systemd/christopher-tgg-hermes.service
+      - name: christopher-tgg-hermes-health.service
+        desiredState: oneshot-on-timer
+        source: deploy/tgg/christopher/systemd/christopher-tgg-hermes-health.service
+      - name: christopher-tgg-hermes-health.timer
+        desiredState: active-enabled
+        source: deploy/tgg/christopher/systemd/christopher-tgg-hermes-health.timer
+    externalDependencies:
+      - name: tgg-capture-whatsapp-bridge.service
+        owner: stream-f
+        requiredState: active
+        interaction: read-only filesystem dependency only
+        restartAllowed: false
+
+  deploy:
+    controller: pcl pa-agent
+    manifestRef: deploy/tgg/christopher/pa-agent.hermes.manifest.json
+    transport: ssh-rsync
+    immutableBundles: true
+    remoteBoxEditingAllowed: false
+    deployCommand: deploy/tgg/christopher/scripts/deploy_runtime.sh
+    verifyCommand: deploy/tgg/christopher/scripts/verify_runtime.sh --check-mode
+    rollback:
+      controllerCommand: pcl pa-agent rollback
+      retainedDeploys: 5
+      scope: hermes-only
+      firstDeployFallback:
+        - stop and disable Christopher Hermes-owned units
+        - remove only Christopher Hermes unit links
+        - preserve capture and systems services and data
+
+  acceptance:
+    - deployed file hashes match the selected committed slot manifest
+    - pa.enabled is false and group_sessions_per_user is false
+    - the production consumer remains standby without opening capture state
+    - production cursor equals its immutable initial end-of-file boundary
+    - production inbox and post-boundary production turn count are zero
+    - owned Hermes service and health timer are active
+    - the destructive /messages route is absent from the consumer unit
+    - the configured OpenAI slot and Gemini auxiliary model are reachable
+    - a fixture-only controlled inbound produces a completed pa_turn on the deployed stack
+    - the isolated turn records exact provider and model with a non-empty response
+    - isolated verification records zero client mutations and zero external sends
+    - a second agent independently confirms source, live state, and rebuildability
+
+  reconciliation:
+    stateChangeCheck:
+      logicalKey: pa.tgg.christopher.runtime_invariants
+      definition: deploy/tgg/christopher/checks/runtime-invariants.json
+      command: deploy/tgg/christopher/scripts/verify_runtime.sh --check-mode
+      owner: edna
+      expectedCadence: on-deploy and state-change, hourly full reconciliation, every 15 minutes on-host quick verification
+      redAction: page-edna-and-fail-closed

@@ -1,25 +1,33 @@
 [Unit]
-Description=Christopher TGG Hermes Gateway (read-only WhatsApp observer)
-After=network-online.target tailscaled.service
+Description=Christopher TGG Hermes durable capture consumer (processing gated)
+After=network-online.target tailscaled.service tgg-capture-whatsapp-bridge.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=pclaw
 Group=pclaw
+SupplementaryGroups=tggcapture
 WorkingDirectory=/home/pclaw/apps/hermes-pcl
 Environment=HOME=/home/pclaw
 Environment=USER=pclaw
 Environment=LOGNAME=pclaw
 Environment=HERMES_HOME=/home/pclaw/.hermes-christopher-tgg
-Environment=PATH=/home/pclaw/apps/hermes-pcl/.venv/bin:/home/pclaw/.local/bin:/home/pclaw/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=/home/pclaw/apps/hermes-pcl/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=VIRTUAL_ENV=/home/pclaw/apps/hermes-pcl/.venv
-ExecStart=/home/pclaw/apps/hermes-pcl/.venv/bin/python -m hermes_cli.main gateway run --replace
+EnvironmentFile=/home/pclaw/.hermes-christopher-tgg/.env
+ExecStartPre=+/home/pclaw/apps/hermes-pcl/.venv/bin/python /home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/apply_engine_slot.py --app-root /home/pclaw/apps/hermes-pcl --hermes-home /home/pclaw/.hermes-christopher-tgg
+ExecStart=/home/pclaw/apps/hermes-pcl/.venv/bin/python /home/pclaw/apps/hermes-pcl/gateway/durable_jsonl_consumer.py run --source /var/lib/tgg-capture/whatsapp/capture/events.jsonl --cursor /home/pclaw/.hermes-christopher-tgg/runtime/capture-cursor.json --inbox /home/pclaw/.hermes-christopher-tgg/runtime/capture-inbox.db --config /home/pclaw/.hermes-christopher-tgg/config.yaml --state-db /home/pclaw/.hermes-christopher-tgg/state.db --processing-gate /home/pclaw/.hermes-christopher-tgg/runtime/processing-gate.json --lock-file /home/pclaw/.hermes-christopher-tgg/runtime/capture-consumer.lock --status-file /home/pclaw/.hermes-christopher-tgg/runtime/capture-consumer-status.json --poll-seconds 2 --max-records 100
 Restart=always
 RestartSec=5
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=240
+TimeoutStopSec=60
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadOnlyPaths=/var/lib/tgg-capture
 StandardOutput=journal
 StandardError=journal
 

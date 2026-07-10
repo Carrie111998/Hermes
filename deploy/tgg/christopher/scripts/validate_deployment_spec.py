@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Fail closed when Christopher's deployment artifacts drift from the spec."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+EXPECTED_API_VERSION = "pa.papercutlabs.com/v1"
+EXPECTED_KIND = "ClientAgentDeployment"
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"{path} must contain a YAML mapping")
+    return data
+
+
+def _resolve(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    if path != root and root not in path.parents:
+        raise RuntimeError(f"spec path escapes app root: {relative}")
+    if not path.is_file():
+        raise RuntimeError(f"spec path does not exist: {relative}")
+    return path
+
+
+def _selector_chats(
+    constitution: dict[str, Any], *, platform: str, job_type: str
+) -> list[str]:
+    return [
+        str(selector["match"]["source.chat_id"])
+        for selector in constitution.get("selectors", [])
+        if selector.get("job_type") == job_type
+        and selector.get("match", {}).get("source.platform") == platform
+    ]
+
+
+def _parse_checksums(path: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        digest, relative = raw.split(None, 1)
+        result[relative.strip()] = digest
+    return result
+
+
+def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
+    app_root = app_root.resolve()
+    spec_path = spec_path.resolve()
+    document = _load_yaml(spec_path)
+    if document.get("apiVersion") != EXPECTED_API_VERSION:
+        raise RuntimeError("deployment apiVersion mismatch")
+    if document.get("kind") != EXPECTED_KIND:
+        raise RuntimeError("deployment kind mismatch")
+    if document.get("metadata", {}).get("client") != "tgg":
+        raise RuntimeError("deployment client must be tgg")
+    if document.get("metadata", {}).get("agent") != "christopher":
+        raise RuntimeError("deployment agent must be christopher")
+
+    spec = document["spec"]
+    if spec["processing"]["enabled"] is not False:
+        raise RuntimeError("processing must remain disabled for this deployment")
+    if spec["processing"]["activationIncludedInThisDeployment"] is not False:
+        raise RuntimeError("the deployment must not include processing activation")
+    if (
+        spec["processing"]["effectiveEnableRule"]
+        != "pa.enabled AND processing-gate.enabled"
+    ):
+        raise RuntimeError(
+            "production activation must require config and the root gate"
+        )
+    if spec["runtime"]["groupSessionsPerUser"] is not False:
+        raise RuntimeError("group_sessions_per_user judgment must remain false")
+    if spec["channels"]["whatsapp"]["hermesBuiltInGatewayEnabled"] is not False:
+        raise RuntimeError("Hermes must not connect its built-in WhatsApp gateway")
+    if spec["channels"]["whatsapp"]["consumer"]["mode"] != "durable-jsonl-tail":
+        raise RuntimeError("WhatsApp consumer must use the durable JSONL tail")
+    if spec["channels"]["whatsapp"]["prohibitedConsumerSurface"]["path"] != "/messages":
+        raise RuntimeError("the destructive bridge route must stay prohibited")
+
+    brain = spec["brain"]
+    recovered_config_path = _resolve(app_root, brain["recoveredConfig"]["path"])
+    recovered_constitution_path = _resolve(
+        app_root, brain["recoveredConstitution"]["path"]
+    )
+    recovered_config_hash = _sha256(recovered_config_path)
+    recovered_constitution_hash = _sha256(recovered_constitution_path)
+    if recovered_config_hash != brain["recoveredConfig"]["sha256"]:
+        raise RuntimeError("recovered June config hash mismatch")
+    if recovered_constitution_hash != brain["recoveredConstitution"]["sha256"]:
+        raise RuntimeError("recovered June constitution hash mismatch")
+    composite = hashlib.sha256(
+        (
+            f"config {recovered_config_hash}\n"
+            f"constitution {recovered_constitution_hash}\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    if not str(spec["brainRef"]).endswith(f"@sha256:{composite}"):
+        raise RuntimeError("brainRef composite hash mismatch")
+
+    recovered_config = _load_yaml(recovered_config_path)
+    recovered_constitution = _load_yaml(recovered_constitution_path)
+    active_config = _load_yaml(app_root / "deploy/tgg/christopher/config.yaml")
+    active_constitution = _load_yaml(
+        app_root / "deploy/tgg/christopher/christopher_tgg_constitution.yaml"
+    )
+    engine = spec["engine"]
+    default_slot = engine["defaultSlot"]
+    allowed_slots = list(engine["allowedSlots"])
+    if default_slot != "gpt-5.4-mini":
+        raise RuntimeError("default engine slot must remain gpt-5.4-mini")
+    if allowed_slots != ["gpt-5.4-mini", "gpt-5.6-luna"]:
+        raise RuntimeError("engine slot set drifted")
+
+    slot_manifest_path = _resolve(app_root, engine["slotManifest"])
+    checksums = _parse_checksums(slot_manifest_path)
+    slot_hashes: dict[str, dict[str, str]] = {}
+    for model in allowed_slots:
+        slot_root = app_root / "deploy/tgg/christopher/runtime-slots" / model
+        config_path = slot_root / "config.yaml"
+        constitution_path = slot_root / "christopher_tgg_constitution.yaml"
+        config = _load_yaml(config_path)
+        constitution = _load_yaml(constitution_path)
+        if config["pa"]["enabled"] is not False:
+            raise RuntimeError(f"slot {model} enables PA")
+        if config["platforms"]["whatsapp"]["enabled"] is not False:
+            raise RuntimeError(f"slot {model} enables the built-in WhatsApp gateway")
+        if config["group_sessions_per_user"] is not False:
+            raise RuntimeError(f"slot {model} changed group_sessions_per_user")
+        if config["model"]["provider"] != engine["provider"]:
+            raise RuntimeError(f"slot {model} provider mismatch")
+        if config["model"]["default"] != model:
+            raise RuntimeError(f"slot {model} model mismatch")
+        if constitution["runtime"] != {
+            "provider": engine["provider"],
+            "model": model,
+        }:
+            raise RuntimeError(f"slot {model} constitution engine mismatch")
+        relative_config = f"{model}/config.yaml"
+        relative_constitution = f"{model}/christopher_tgg_constitution.yaml"
+        config_hash = _sha256(config_path)
+        constitution_hash = _sha256(constitution_path)
+        if checksums.get(relative_config) != config_hash:
+            raise RuntimeError(f"slot manifest mismatch for {relative_config}")
+        if checksums.get(relative_constitution) != constitution_hash:
+            raise RuntimeError(f"slot manifest mismatch for {relative_constitution}")
+        slot_hashes[model] = {
+            "config": config_hash,
+            "constitution": constitution_hash,
+        }
+
+    default_root = app_root / "deploy/tgg/christopher/runtime-slots" / default_slot
+    if (app_root / "deploy/tgg/christopher/config.yaml").read_bytes() != (
+        default_root / "config.yaml"
+    ).read_bytes():
+        raise RuntimeError("root deployment config differs from the default slot")
+    if (
+        app_root / "deploy/tgg/christopher/christopher_tgg_constitution.yaml"
+    ).read_bytes() != (default_root / "christopher_tgg_constitution.yaml").read_bytes():
+        raise RuntimeError("root constitution differs from the default slot")
+
+    whatsapp = spec["channels"]["whatsapp"]
+    expected_dms = [
+        str(value)
+        for value in recovered_config["platforms"]["whatsapp"]["extra"]["allow_from"]
+    ]
+    expected_outbound = list(
+        recovered_config["platforms"]["whatsapp"]["extra"]["outbound_allowed_chats"]
+    )
+    expected_ops = _selector_chats(
+        recovered_constitution,
+        platform="whatsapp",
+        job_type="tgg_ops_ingest",
+    )
+    expected_management = _selector_chats(
+        recovered_constitution,
+        platform="whatsapp",
+        job_type="tgg_management",
+    )
+    if whatsapp["allowlists"]["directMessages"] != expected_dms:
+        raise RuntimeError("WhatsApp DM allowlist drifted from the recovered brain")
+    if whatsapp["allowlists"]["operationsChats"] != expected_ops:
+        raise RuntimeError("WhatsApp operations selectors drifted")
+    if whatsapp["allowlists"]["managementChats"] != expected_management:
+        raise RuntimeError("WhatsApp management selectors drifted")
+    if whatsapp["allowlists"]["outboundAllowedChats"] != expected_outbound:
+        raise RuntimeError("WhatsApp outbound allowlist drifted")
+    if (
+        active_config["platforms"]["whatsapp"]["extra"]["allow_from"]
+        != recovered_config["platforms"]["whatsapp"]["extra"]["allow_from"]
+    ):
+        raise RuntimeError("active config changed the recovered DM allowlist")
+    if active_constitution["selectors"] != recovered_constitution["selectors"]:
+        raise RuntimeError("active default constitution changed recovered selectors")
+
+    telegram = spec["channels"]["telegram"]["selectorChats"]
+    if telegram["operations"] != _selector_chats(
+        recovered_constitution,
+        platform="telegram",
+        job_type="tgg_ops_ingest",
+    ):
+        raise RuntimeError("Telegram operations selectors drifted")
+    if telegram["management"] != _selector_chats(
+        recovered_constitution,
+        platform="telegram",
+        job_type="tgg_management",
+    ):
+        raise RuntimeError("Telegram management selectors drifted")
+
+    unit_sources = {
+        entry["name"]: _resolve(app_root, entry["source"])
+        for entry in spec["units"]["owned"]
+    }
+    expected_units = {
+        "christopher-tgg-hermes.service",
+        "christopher-tgg-hermes-health.service",
+        "christopher-tgg-hermes-health.timer",
+    }
+    if set(unit_sources) != expected_units:
+        raise RuntimeError("owned Hermes unit set drifted")
+    consumer_unit = unit_sources["christopher-tgg-hermes.service"].read_text(
+        encoding="utf-8"
+    )
+    if "/messages" in consumer_unit:
+        raise RuntimeError("consumer unit references the destructive /messages route")
+    if whatsapp["durableSource"]["path"] not in consumer_unit:
+        raise RuntimeError("consumer unit does not declare the durable capture source")
+    if spec["processing"]["gatePath"] not in consumer_unit:
+        raise RuntimeError("consumer unit does not enforce the root processing gate")
+
+    manifest_path = _resolve(app_root, spec["deploy"]["manifestRef"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_services = {entry["name"] for entry in manifest.get("services", [])}
+    if manifest_services != {"christopher-tgg-hermes.service"}:
+        raise RuntimeError(
+            "deploy manifest may restart only the Christopher Hermes service"
+        )
+    if any(
+        forbidden in json.dumps(manifest)
+        for forbidden in (
+            "tgg-capture-whatsapp-bridge.service",
+            "christopher-tgg-systems.service",
+            "singpass-pair-server.service",
+        )
+    ):
+        raise RuntimeError("deploy manifest crossed the service ownership boundary")
+
+    check_path = _resolve(
+        app_root, spec["reconciliation"]["stateChangeCheck"]["definition"]
+    )
+    check_wrapper = json.loads(check_path.read_text(encoding="utf-8"))
+    checks = check_wrapper.get("checks", [])
+    if len(checks) != 1:
+        raise RuntimeError(
+            "deployment must declare exactly one runtime invariant check"
+        )
+    check = checks[0]
+    if (
+        check.get("logical_key")
+        != spec["reconciliation"]["stateChangeCheck"]["logicalKey"]
+    ):
+        raise RuntimeError("runtime invariant check logical key drifted from the spec")
+    if check.get("red_owner_agent_override") != "edna":
+        raise RuntimeError("runtime invariant check must page Edna on red")
+    if check.get("checker_error_direction") != "fail_closed":
+        raise RuntimeError("runtime invariant check must fail closed")
+
+    return {
+        "ok": True,
+        "spec": str(spec_path),
+        "brain_ref": spec["brainRef"],
+        "default_slot": default_slot,
+        "allowed_slots": allowed_slots,
+        "slot_hashes": slot_hashes,
+        "processing_enabled": False,
+        "group_sessions_per_user": False,
+        "owned_units": sorted(expected_units),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--app-root", required=True)
+    parser.add_argument("--spec", required=True)
+    args = parser.parse_args()
+    result = validate(Path(args.app_root), Path(args.spec))
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

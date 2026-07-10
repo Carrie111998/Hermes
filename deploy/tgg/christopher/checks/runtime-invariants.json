@@ -1,0 +1,57 @@
+{
+  "origin_wb": "27b80282-e7ac-4b1a-bbf4-5a8c6f897552",
+  "checks": [
+    {
+      "logical_key": "pa.tgg.christopher.runtime_invariants",
+      "proof_kind": "state",
+      "result_statement": "Christopher's deployed Hermes files match the selected committed engine slot, production processing is effectively disabled without opening or advancing capture state, and a fixture-only inbound completes on the selected provider and model without client mutation or external delivery",
+      "why": "A live process alone cannot detect an accidental processing flip, hollow provider configuration, deployment drift, or a consumer that silently touches the capture store while PA is disabled",
+      "subject": {
+        "type": "client_agent",
+        "ref": "tgg/christopher",
+        "display_name": "TGG Christopher Hermes runtime",
+        "owner": "edna"
+      },
+      "attachment": {
+        "kind": "deploy",
+        "ref": "deploy/tgg/christopher/client-agent-deployment.yaml"
+      },
+      "activation": {
+        "kind": "state_change",
+        "interval_seconds": 3600,
+        "events": [
+          "pa_agent_deployed:tgg/christopher",
+          "model_slot_changed:tgg/christopher",
+          "processing_gate_changed:tgg/christopher",
+          "service_failed:christopher-tgg-hermes",
+          "consumer_file_changed:tgg/christopher"
+        ]
+      },
+      "evaluator": {
+        "kind": "deterministic",
+        "runner": {
+          "kind": "shell",
+          "ref": "tgg-christopher-runtime-invariants",
+          "params": {
+            "command": [
+              "/Users/pcloffice/pcl-dev/hermes-pcl/deploy/tgg/christopher/scripts/verify_runtime.sh",
+              "--check-mode"
+            ],
+            "timeout_ms": 120000,
+            "output_cap_bytes": 65536
+          }
+        }
+      },
+      "pass_condition": {
+        "type": "exit_code",
+        "exit_code": 0
+      },
+      "red_owner_agent_override": "edna",
+      "severity": "blocker",
+      "enforcement_mode": "alert",
+      "checker_error_direction": "fail_closed",
+      "freshness_sla_seconds": 7200,
+      "active": true
+    }
+  ]
+}

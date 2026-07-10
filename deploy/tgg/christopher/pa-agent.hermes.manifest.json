@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "remoteRoot": "/home/pclaw/apps/hermes-pcl",
+  "requiredEnv": [
+    {
+      "name": "OPENAI_API_KEY",
+      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+    },
+    {
+      "name": "GEMINI_API_KEY",
+      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+    },
+    {
+      "name": "GEMINI_API_KEY_PCL_PA_SHARED",
+      "envFile": "/home/pclaw/.hermes-christopher-tgg/.env"
+    }
+  ],
+  "services": [
+    {
+      "name": "christopher-tgg-hermes.service",
+      "preRestartHooks": [
+        {
+          "name": "bootstrap-hermes-runtime",
+          "command": "APP_ROOT=/home/pclaw/apps/hermes-pcl HERMES_HOME=/home/pclaw/.hermes-christopher-tgg CAPTURE_SOURCE=/var/lib/tgg-capture/whatsapp/capture/events.jsonl bash /home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/bootstrap_runtime.sh",
+          "timeoutMs": 600000
+        }
+      ],
+      "postRestartHooks": [
+        {
+          "name": "quick-runtime-invariants",
+          "command": "/home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/verify_runtime.sh --quick",
+          "timeoutMs": 120000
+        }
+      ]
+    }
+  ],
+  "verifyHooks": [
+    {
+      "name": "christopher-hermes-full-consumer-check",
+      "command": "/home/pclaw/apps/hermes-pcl/deploy/tgg/christopher/scripts/verify_runtime.sh --full",
+      "timeoutMs": 600000
+    }
+  ],
+  "runtimeOnlyDriftExclusions": [
+    ".venv",
+    "__pycache__",
+    "logs",
+    "deploy/tgg/christopher/__pycache__",
+    "gateway/__pycache__"
+  ],
+  "retainDeploys": 5
+}

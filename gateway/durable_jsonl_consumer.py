@@ -1,0 +1,786 @@
+"""Crash-safe JSONL ingress for externally captured messaging events.
+
+The bridge's HTTP ``/messages`` route is deliberately not used here.  That
+route drains an unauthenticated, in-memory, capped queue.  This consumer reads
+the bridge's append-first durable JSONL store, stages every complete record in
+its own SQLite inbox, and advances a committed cursor only after the inbox
+transaction commits.
+
+Production processing requires two independent declarations: ``pa.enabled``
+in the consumer's Hermes config and the root-owned processing gate passed to
+the daemon.  Unless both are true, the daemon does not open the source JSONL
+and does not advance either the source cursor or inbox state.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import fcntl
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Mapping, Sequence
+
+import yaml
+
+
+CURSOR_VERSION = 1
+INBOX_SCHEMA_VERSION = 1
+
+
+class ConsumerError(RuntimeError):
+    """Fail-closed consumer contract violation."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    data = (json.dumps(dict(payload), sort_keys=True, indent=2) + "\n").encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
+@dataclass(frozen=True)
+class SourceCursor:
+    version: int
+    source_path: str
+    source_device: int
+    source_inode: int
+    initial_offset: int
+    offset: int
+    initialized_at: str
+    updated_at: str
+    last_message_id: str | None = None
+
+    @classmethod
+    def from_path(cls, path: Path) -> "SourceCursor":
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        cursor = cls(
+            version=int(raw["version"]),
+            source_path=str(raw["source_path"]),
+            source_device=int(raw["source_device"]),
+            source_inode=int(raw["source_inode"]),
+            initial_offset=int(raw.get("initial_offset", raw["offset"])),
+            offset=int(raw["offset"]),
+            initialized_at=str(raw["initialized_at"]),
+            updated_at=str(raw["updated_at"]),
+            last_message_id=(
+                str(raw["last_message_id"]) if raw.get("last_message_id") else None
+            ),
+        )
+        if cursor.version != CURSOR_VERSION:
+            raise ConsumerError(
+                f"unsupported cursor version {cursor.version}; expected {CURSOR_VERSION}"
+            )
+        if cursor.offset < 0 or cursor.initial_offset < 0:
+            raise ConsumerError("cursor offsets cannot be negative")
+        if cursor.offset < cursor.initial_offset:
+            raise ConsumerError("cursor offset cannot precede its initial boundary")
+        return cursor
+
+
+def initialize_cursor(
+    source: Path, cursor_path: Path, *, position: str
+) -> SourceCursor:
+    source = source.resolve()
+    if position not in {"start", "end"}:
+        raise ConsumerError("initial cursor position must be start or end")
+    stat = source.stat()
+    now = _utc_now()
+    initial_offset = int(stat.st_size if position == "end" else 0)
+    cursor = SourceCursor(
+        version=CURSOR_VERSION,
+        source_path=str(source),
+        source_device=int(stat.st_dev),
+        source_inode=int(stat.st_ino),
+        initial_offset=initial_offset,
+        offset=initial_offset,
+        initialized_at=now,
+        updated_at=now,
+        last_message_id=None,
+    )
+    if cursor_path.exists():
+        existing = SourceCursor.from_path(cursor_path)
+        if existing.source_path != cursor.source_path:
+            raise ConsumerError(
+                f"cursor already belongs to {existing.source_path}, not {cursor.source_path}"
+            )
+        return existing
+    _atomic_write_json(cursor_path, asdict(cursor))
+    return cursor
+
+
+class SingletonLock:
+    """Process singleton guard backed by a non-blocking flock."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle: Any = None
+
+    def __enter__(self) -> "SingletonLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            self._handle.close()
+            self._handle = None
+            raise ConsumerError(
+                f"consumer singleton already holds {self.path}"
+            ) from exc
+        self._handle.seek(0)
+        self._handle.truncate()
+        self._handle.write(f"{os.getpid()}\n")
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._handle is None:
+            return
+        fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+        self._handle.close()
+        self._handle = None
+
+
+def _bridge_item(value: Any) -> dict[str, Any]:
+    """Accept the durable bridge item or a shallow append-envelope wrapper."""
+    if not isinstance(value, Mapping):
+        raise ConsumerError("durable JSONL record is not an object")
+    candidates = [value]
+    for key in ("message", "event", "payload", "data"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            candidates.append(nested)
+    for candidate in candidates:
+        if candidate.get("messageId") and candidate.get("chatId"):
+            return dict(candidate)
+    raise ConsumerError("durable JSONL record has no bridge messageId/chatId item")
+
+
+@dataclass(frozen=True)
+class InboxRecord:
+    seq: int
+    message_id: str
+    chat_id: str
+    start_offset: int
+    end_offset: int
+    raw: dict[str, Any]
+
+
+class DurableInbox:
+    """Consumer-owned durable inbox and source cursor staging ledger."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def _init_schema(self) -> None:
+        with self.connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ingress_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ingress_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    chat_id TEXT NOT NULL,
+                    source_device INTEGER NOT NULL,
+                    source_inode INTEGER NOT NULL,
+                    start_offset INTEGER NOT NULL,
+                    end_offset INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','processing','completed','skipped','failed')),
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    pa_turn_id TEXT,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ingress_events_status_seq_idx
+                    ON ingress_events(status, seq);
+                """
+            )
+            conn.execute(
+                "INSERT INTO ingress_meta(key,value) VALUES('schema_version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(INBOX_SCHEMA_VERSION),),
+            )
+
+    def stage_from_source(
+        self,
+        source: Path,
+        cursor_path: Path,
+        *,
+        max_records: int = 100,
+    ) -> int:
+        """Stage complete JSONL records, then advance the source cursor.
+
+        DB commit happens before the cursor write.  A crash between them only
+        re-reads already-unique message IDs; it cannot lose a record.
+        """
+        source = source.resolve()
+        if not cursor_path.exists():
+            raise ConsumerError("source cursor is missing; initialize it explicitly")
+        cursor = SourceCursor.from_path(cursor_path)
+        if cursor.source_path != str(source):
+            raise ConsumerError(
+                f"cursor source mismatch: {cursor.source_path} != {source}"
+            )
+        stat = source.stat()
+        if (int(stat.st_dev), int(stat.st_ino)) != (
+            cursor.source_device,
+            cursor.source_inode,
+        ):
+            raise ConsumerError(
+                "source JSONL inode changed; explicit rotation recovery required"
+            )
+        if cursor.offset > stat.st_size:
+            raise ConsumerError("source JSONL truncated below committed cursor")
+
+        staged: list[tuple[int, int, dict[str, Any]]] = []
+        last_message_id = cursor.last_message_id
+        with source.open("rb") as handle:
+            handle.seek(cursor.offset)
+            for _ in range(max(1, max_records)):
+                start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                end = handle.tell()
+                if not line.endswith(b"\n"):
+                    break
+                try:
+                    decoded = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ConsumerError(
+                        f"invalid JSONL at byte {start}: {exc.msg}"
+                    ) from exc
+                item = _bridge_item(decoded)
+                message_id = str(item["messageId"])
+                staged.append((start, end, item))
+                last_message_id = message_id
+
+        if not staged:
+            return 0
+
+        now = _utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for start, end, item in staged:
+                conn.execute(
+                    """
+                    INSERT INTO ingress_events(
+                        message_id,chat_id,source_device,source_inode,
+                        start_offset,end_offset,raw_json,status,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,'pending',?,?)
+                    ON CONFLICT(message_id) DO NOTHING
+                    """,
+                    (
+                        str(item["messageId"]),
+                        str(item["chatId"]),
+                        cursor.source_device,
+                        cursor.source_inode,
+                        start,
+                        end,
+                        json.dumps(item, sort_keys=True, separators=(",", ":")),
+                        now,
+                        now,
+                    ),
+                )
+            conn.commit()
+
+        updated = SourceCursor(
+            version=cursor.version,
+            source_path=cursor.source_path,
+            source_device=cursor.source_device,
+            source_inode=cursor.source_inode,
+            initial_offset=cursor.initial_offset,
+            offset=staged[-1][1],
+            initialized_at=cursor.initialized_at,
+            updated_at=now,
+            last_message_id=last_message_id,
+        )
+        _atomic_write_json(cursor_path, asdict(updated))
+        return len(staged)
+
+    def pending(self, *, limit: int = 10) -> list[InboxRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT seq,message_id,chat_id,start_offset,end_offset,raw_json "
+                "FROM ingress_events WHERE status='pending' ORDER BY seq LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+        return [
+            InboxRecord(
+                seq=int(row["seq"]),
+                message_id=str(row["message_id"]),
+                chat_id=str(row["chat_id"]),
+                start_offset=int(row["start_offset"]),
+                end_offset=int(row["end_offset"]),
+                raw=json.loads(row["raw_json"]),
+            )
+            for row in rows
+        ]
+
+    def claim(self, records: Sequence[InboxRecord]) -> None:
+        if not records:
+            return
+        now = _utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for record in records:
+                changed = conn.execute(
+                    "UPDATE ingress_events SET status='processing', attempts=attempts+1, "
+                    "updated_at=? WHERE seq=? AND status='pending'",
+                    (now, record.seq),
+                ).rowcount
+                if changed != 1:
+                    raise ConsumerError(f"inbox record {record.seq} was not pending")
+            conn.commit()
+
+    def finish(
+        self,
+        records: Sequence[InboxRecord],
+        *,
+        status: str,
+        pa_turn_id: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"completed", "skipped", "failed"}:
+            raise ConsumerError(f"invalid inbox finish status {status}")
+        now = _utc_now()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for record in records:
+                conn.execute(
+                    "UPDATE ingress_events SET status=?, pa_turn_id=?, last_error=?, "
+                    "updated_at=? WHERE seq=? AND status='processing'",
+                    (status, pa_turn_id, (error or "")[:2000] or None, now, record.seq),
+                )
+            conn.commit()
+
+    def counts(self) -> dict[str, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT status,COUNT(*) AS n FROM ingress_events GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["n"]) for row in rows}
+
+
+def processing_enabled(config_path: Path) -> bool:
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    pa = data.get("pa") if isinstance(data, dict) else None
+    return bool(pa.get("enabled")) if isinstance(pa, dict) else False
+
+
+def processing_gate_state(gate_path: Path) -> dict[str, Any]:
+    if not gate_path.is_file():
+        raise ConsumerError(f"production processing gate is missing: {gate_path}")
+    try:
+        state = json.loads(gate_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ConsumerError(f"production processing gate is unreadable: {exc}") from exc
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise ConsumerError("production processing gate must be a version-1 object")
+    if state.get("enabled") not in {True, False}:
+        raise ConsumerError("production processing gate enabled must be boolean")
+    generation = state.get("generation")
+    if not isinstance(generation, int) or generation < 0:
+        raise ConsumerError(
+            "production processing gate generation must be non-negative"
+        )
+    return state
+
+
+def configured_engine(config_path: Path) -> tuple[str, str]:
+    data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    model = data.get("model") if isinstance(data, dict) else None
+    if not isinstance(model, dict):
+        raise ConsumerError("config.model must be a mapping")
+    provider = str(model.get("provider") or "")
+    selected = str(model.get("default") or model.get("model") or "")
+    if not provider or not selected:
+        raise ConsumerError("config model provider/default is incomplete")
+    return provider, selected
+
+
+def _turn_row(
+    state_db: Path,
+    *,
+    replay_run_id: str | None = None,
+    started_after: float | None = None,
+) -> sqlite3.Row | None:
+    if not state_db.exists():
+        return None
+    conn = sqlite3.connect(state_db)
+    conn.row_factory = sqlite3.Row
+    try:
+        if replay_run_id:
+            return conn.execute(
+                "SELECT * FROM pa_turns WHERE replay_run_id=? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (replay_run_id,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT * FROM pa_turns WHERE started_at>=? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (float(started_after or 0),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
+def _assert_completed_turn(
+    row: sqlite3.Row | None,
+    *,
+    provider: str,
+    model: str,
+    require_response: bool,
+) -> str:
+    if row is None:
+        raise ConsumerError("Hermes produced no pa_turn record")
+    if str(row["turn_status"]) != "completed":
+        raise ConsumerError(
+            f"Hermes pa_turn {row['turn_id']} status={row['turn_status']}"
+        )
+    if str(row["provider"]) != provider or str(row["model"]) != model:
+        raise ConsumerError(
+            f"Hermes pa_turn engine mismatch: {row['provider']}/{row['model']}"
+        )
+    if require_response:
+        envelope = json.loads(row["raw_turn_envelope_json"] or "{}")
+        response = str(envelope.get("final_response") or "").strip()
+        if not response:
+            raise ConsumerError("Hermes pa_turn completed without a provider response")
+    return str(row["turn_id"])
+
+
+async def process_replay_records(
+    records: Sequence[InboxRecord],
+    *,
+    config_path: Path,
+    state_db: Path,
+    run_id: str,
+) -> dict[str, Any]:
+    """Process fixture records through Hermes replay with outbound captured."""
+    from gateway.config import load_gateway_config
+    from gateway.replay import ReplayPlan
+    from gateway.run import GatewayRunner
+
+    provider, model = configured_engine(config_path)
+    runner = GatewayRunner(load_gateway_config())
+    result = await runner.replay(
+        ReplayPlan(
+            platform="whatsapp",
+            messages=tuple(record.raw for record in records),
+            run_id=run_id,
+            attempt_id=f"attempt-{uuid.uuid4().hex[:12]}",
+            delivery_mode="capture",
+            bypass_require_mention=True,
+            bypass_auth=True,
+            source_path="fixture-only-durable-jsonl-consumer",
+        )
+    )
+    row = _turn_row(state_db, replay_run_id=run_id)
+    turn_id = _assert_completed_turn(
+        row,
+        provider=provider,
+        model=model,
+        require_response=True,
+    )
+    return {
+        "turn_id": turn_id,
+        "provider": provider,
+        "model": model,
+        "processed": int(result.processed),
+        "outbound_captured": len(result.outbound),
+        "blocked_commands": len(result.blocked_commands),
+    }
+
+
+async def process_live_records(
+    records: Sequence[InboxRecord],
+    *,
+    config_path: Path,
+    state_db: Path,
+) -> dict[str, Any]:
+    """Process live durable records sequentially with all outbound disabled.
+
+    The WhatsApp adapter is built with ``connect=False`` and therefore never
+    starts or polls the bridge.  Its existing event shaping and turn bundling
+    are reused, but the final response is deliberately not delivered.
+    """
+    from gateway.config import Platform, PlatformConfig, load_gateway_config
+    from gateway.run import GatewayRunner
+
+    provider, model = configured_engine(config_path)
+    runner = GatewayRunner(load_gateway_config())
+    platform_config = runner.config.platforms.get(Platform.WHATSAPP)
+    if platform_config is None:
+        platform_config = PlatformConfig(enabled=True, extra={})
+    adapter, _ = await runner._build_adapter(
+        Platform.WHATSAPP, platform_config, connect=False
+    )
+    if adapter is None:
+        raise ConsumerError("Hermes could not build the offline WhatsApp adapter")
+
+    handled: list[dict[str, Any]] = []
+
+    async def _sequential(event: Any) -> None:
+        started = time.time()
+        await runner._handle_message(event)
+        row = _turn_row(state_db, started_after=started)
+        turn_id = _assert_completed_turn(
+            row,
+            provider=provider,
+            model=model,
+            require_response=False,
+        )
+        raw = getattr(event, "raw_message", None)
+        ids = list(raw.get("sourceMessageIds") or []) if isinstance(raw, dict) else []
+        if not ids and getattr(event, "message_id", None):
+            ids = [str(event.message_id)]
+        handled.append({"message_ids": ids, "turn_id": turn_id})
+
+    # Deliberately bypass BasePlatformAdapter.handle_message: the normal live
+    # method spawns background send tasks.  The consumer owns sequential
+    # processing and never sends a response.
+    adapter.handle_message = _sequential  # type: ignore[method-assign]
+    processed = await adapter.replay_bridge_messages(
+        [record.raw for record in records],
+        bypass_require_mention=False,
+    )
+    return {
+        "provider": provider,
+        "model": model,
+        "processed": int(processed or 0),
+        "handled": handled,
+        "outbound_sent": 0,
+    }
+
+
+def _write_status(path: Path, payload: Mapping[str, Any]) -> None:
+    _atomic_write_json(path, {"version": 1, "updated_at": _utc_now(), **dict(payload)})
+
+
+async def run_consumer(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).resolve()
+    source = Path(args.source).resolve()
+    cursor = Path(args.cursor).resolve()
+    inbox = DurableInbox(Path(args.inbox).resolve())
+    status_path = Path(args.status_file).resolve()
+    gate_path = Path(args.processing_gate).resolve()
+
+    with SingletonLock(Path(args.lock_file).resolve()):
+        while True:
+            config_enabled = processing_enabled(config_path)
+            gate = processing_gate_state(gate_path)
+            gate_enabled = gate["enabled"] is True
+            if not (config_enabled and gate_enabled):
+                _write_status(
+                    status_path,
+                    {
+                        "state": "standby",
+                        "processing_enabled": False,
+                        "config_enabled": config_enabled,
+                        "gate_enabled": gate_enabled,
+                        "gate_generation": int(gate["generation"]),
+                        "source_opened": False,
+                        "cursor_advanced": False,
+                        "inbox": inbox.counts(),
+                    },
+                )
+                if args.once:
+                    return 0
+                await asyncio.sleep(args.poll_seconds)
+                continue
+
+            staged = inbox.stage_from_source(
+                source, cursor, max_records=args.max_records
+            )
+            records = inbox.pending(limit=args.max_records)
+            if records:
+                inbox.claim(records)
+                try:
+                    result = await process_live_records(
+                        records, config_path=config_path, state_db=Path(args.state_db)
+                    )
+                    handled_ids = {
+                        message_id
+                        for group in result["handled"]
+                        for message_id in group["message_ids"]
+                    }
+                    turn_ids = [group["turn_id"] for group in result["handled"]]
+                    handled = [r for r in records if r.message_id in handled_ids]
+                    skipped = [r for r in records if r.message_id not in handled_ids]
+                    if handled:
+                        inbox.finish(
+                            handled,
+                            status="completed",
+                            pa_turn_id=turn_ids[-1] if turn_ids else None,
+                        )
+                    if skipped:
+                        inbox.finish(skipped, status="skipped")
+                except Exception as exc:
+                    inbox.finish(records, status="failed", error=str(exc))
+                    raise
+            _write_status(
+                status_path,
+                {
+                    "state": "running",
+                    "processing_enabled": True,
+                    "config_enabled": True,
+                    "gate_enabled": True,
+                    "gate_generation": int(gate["generation"]),
+                    "staged": staged,
+                    "inbox": inbox.counts(),
+                },
+            )
+            if args.once:
+                return 0
+            await asyncio.sleep(args.poll_seconds)
+
+
+async def run_fixture(args: argparse.Namespace) -> int:
+    test_root = Path(args.test_root).resolve()
+    source = Path(args.source).resolve()
+    cursor = Path(args.cursor).resolve()
+    inbox_path = Path(args.inbox).resolve()
+    config_path = Path(args.config).resolve()
+    state_db = Path(args.state_db).resolve()
+    for path in (source, cursor, inbox_path, config_path, state_db):
+        if path != test_root and test_root not in path.parents:
+            raise ConsumerError(f"fixture path escapes test root: {path}")
+    if "/var/lib/tgg-capture" in str(source):
+        raise ConsumerError("fixture mode refuses the live capture store")
+    if not processing_enabled(config_path):
+        raise ConsumerError("fixture config must explicitly enable PA inside test root")
+
+    inbox = DurableInbox(inbox_path)
+    initialize_cursor(source, cursor, position="start")
+    staged = inbox.stage_from_source(source, cursor, max_records=args.max_records)
+    records = inbox.pending(limit=args.max_records)
+    if not records:
+        raise ConsumerError("fixture source staged no records")
+    inbox.claim(records)
+    try:
+        result = await process_replay_records(
+            records,
+            config_path=config_path,
+            state_db=state_db,
+            run_id=args.run_id,
+        )
+        inbox.finish(records, status="completed", pa_turn_id=result["turn_id"])
+    except Exception as exc:
+        inbox.finish(records, status="failed", error=str(exc))
+        raise
+    report = {
+        "ok": True,
+        "mode": "fixture-only",
+        "staged": staged,
+        "inbox": inbox.counts(),
+        "result": result,
+    }
+    _atomic_write_json(Path(args.report).resolve(), report)
+    print(json.dumps(report, sort_keys=True))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init-cursor", help="Create the source cursor once")
+    init.add_argument("--source", required=True)
+    init.add_argument("--cursor", required=True)
+    init.add_argument("--position", choices=("start", "end"), required=True)
+
+    run = sub.add_parser("run", help="Run the production standby/consumer loop")
+    run.add_argument("--source", required=True)
+    run.add_argument("--cursor", required=True)
+    run.add_argument("--inbox", required=True)
+    run.add_argument("--config", required=True)
+    run.add_argument("--state-db", required=True)
+    run.add_argument("--processing-gate", required=True)
+    run.add_argument("--lock-file", required=True)
+    run.add_argument("--status-file", required=True)
+    run.add_argument("--poll-seconds", type=float, default=2.0)
+    run.add_argument("--max-records", type=int, default=100)
+    run.add_argument("--once", action="store_true")
+
+    fixture = sub.add_parser(
+        "fixture", help="Run the same ingress path against isolated fixture state"
+    )
+    fixture.add_argument("--test-root", required=True)
+    fixture.add_argument("--source", required=True)
+    fixture.add_argument("--cursor", required=True)
+    fixture.add_argument("--inbox", required=True)
+    fixture.add_argument("--config", required=True)
+    fixture.add_argument("--state-db", required=True)
+    fixture.add_argument("--report", required=True)
+    fixture.add_argument("--run-id", required=True)
+    fixture.add_argument("--max-records", type=int, default=10)
+    return parser
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    try:
+        if args.command == "init-cursor":
+            cursor = initialize_cursor(
+                Path(args.source), Path(args.cursor), position=args.position
+            )
+            print(json.dumps(asdict(cursor), sort_keys=True))
+            return 0
+        if args.command == "run":
+            return asyncio.run(run_consumer(args))
+        if args.command == "fixture":
+            return asyncio.run(run_fixture(args))
+        raise ConsumerError(f"unknown command {args.command}")
+    except ConsumerError as exc:
+        print(f"consumer error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
