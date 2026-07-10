@@ -399,6 +399,72 @@ class TestFlushQueueChunking:
         )
         assert len(remaining) > 0, "Failed chunks must be preserved for retry"
 
+    def test_has_queued_messages_reflects_queue_state(
+        self, bus, quiet_config, queue_path
+    ):
+        """has_queued_messages() is the signal the gateway flush gate keys on to
+        tell a drained flush from a stranded one. Missing/empty → False; items → True."""
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        # Missing file
+        assert escalator.has_queued_messages() is False
+        # Empty list
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue_path.write_text("[]", encoding="utf-8")
+        assert escalator.has_queued_messages() is False
+        # Non-empty
+        queue_path.write_text(json.dumps([{"message": "x", "queued_at": "t"}]),
+                              encoding="utf-8")
+        assert escalator.has_queued_messages() is True
+
+    def test_total_delivery_failure_strands_whole_queue(
+        self, bus, quiet_config, queue_path
+    ):
+        """The 2026-07-10 shape: WhatsApp bridge down at 7am → the FIRST chunk
+        fails → the ENTIRE queue is preserved and has_queued_messages() stays
+        True, so the gateway gate knows the flush did NOT drain and must retry
+        (rather than burning the day's single attempt)."""
+        queue_path.parent.mkdir(parents=True, exist_ok=True)
+        queue = [
+            {"message": f"event_{i}", "queued_at": "2026-07-10T03:00:00"}
+            for i in range(105)
+        ]
+        queue_path.write_text(json.dumps(queue), encoding="utf-8")
+
+        def fake_send(msg):
+            raise RuntimeError("WhatsApp bridge down (creds.json 0 bytes)")
+
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=fake_send,
+        )
+
+        count = escalator.flush_queue()
+
+        assert count == 0, "Nothing delivered when the bridge is down"
+        remaining = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(remaining) == 105, "Total failure must preserve the whole queue"
+        assert escalator.has_queued_messages() is True
+
+    def test_queue_size_capped_drops_oldest(
+        self, bus, quiet_config, queue_path
+    ):
+        """_queue_message caps the queue at _MAX_QUEUE_SIZE (drop-oldest) so a
+        multi-day WhatsApp outage can't grow quiet_queue.json unbounded."""
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+        cap = escalator._MAX_QUEUE_SIZE
+        for i in range(cap + 25):
+            escalator._queue_message(f"msg_{i}")
+
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(queue) == cap, f"expected cap {cap}, got {len(queue)}"
+        # Oldest 25 dropped; newest preserved.
+        assert queue[0]["message"] == "msg_25"
+        assert queue[-1]["message"] == f"msg_{cap + 24}"
+
     def test_small_queue_still_drains_in_single_chunk(
         self, bus, quiet_config, queue_path
     ):
@@ -639,3 +705,43 @@ def test_watchdog_burst_maps_to_urgent_tier():
     from events.schema import EventType
 
     assert _TIER_BY_EVENT[EventType.WATCHDOG_BURST] == EscalationTier.URGENT
+
+
+class TestCredentialLoss:
+    """R70 alert-gap fix (2026-07-10): a credential/infra loss must break through
+    quiet hours by name, unlike the URGENT-tier watchdog_burst it replaces."""
+
+    def _ev(self, payload=None):
+        return Event(
+            event_id="cl",
+            event_type=EventType.CREDENTIAL_LOSS,
+            source="watchdog",
+            timestamp="2026-07-10T02:48:58Z",
+            priority=EventType.CREDENTIAL_LOSS.default_priority,
+            payload=payload or {},
+        )
+
+    def test_credential_loss_is_immediate_tier(self):
+        # The whole point: IMMEDIATE, not the URGENT that watchdog_burst gets.
+        assert classify_tier(self._ev()) == EscalationTier.IMMEDIATE
+
+    def test_credential_loss_priority_is_critical(self):
+        assert EventType.CREDENTIAL_LOSS.default_priority == Priority.CRITICAL
+
+    def test_credential_loss_breaks_through_quiet_hours(self, bus, quiet_config, queue_path):
+        escalator = WhatsAppEscalator(bus, quiet_config_path=quiet_config, queue_path=queue_path)
+        event = self._ev({"probe": "WhatsApp session creds present",
+                          "before": "healthy", "after": "down",
+                          "detail": "creds.json 0 bytes"})
+        with patch.object(escalator, "_is_quiet_hours", return_value=True):
+            assert escalator.should_deliver_now(event) is True
+
+    def test_credential_loss_message_names_the_probe(self, bus, quiet_config, queue_path):
+        escalator = WhatsAppEscalator(bus, quiet_config_path=quiet_config, queue_path=queue_path)
+        event = self._ev({"probe": "WhatsApp session creds present",
+                          "before": "healthy", "after": "down",
+                          "detail": "creds.json 0 bytes -- ENOSPC truncation?"})
+        msg = escalator.format_message(event)
+        assert "WhatsApp session creds present" in msg
+        assert "DOWN" in msg
+        assert "creds.json 0 bytes" in msg

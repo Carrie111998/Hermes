@@ -168,6 +168,12 @@ TOPIC_ROUTING: Dict[str, str] = {
     'user_inbound_message': 'scribe_daily',
     # -> security_and_system
     'secret_detected': 'security_and_system',
+    # Credential/infra loss (2026-07-10, R70 alert-gap fix). Lands in the
+    # "Security & System" topic Diego watches. CRITICAL priority => survives
+    # significant_only and is never batched; Telegram delivers even during
+    # quiet hours, so this is the RELIABLE 3am channel when WhatsApp itself
+    # is the lost credential (the WhatsApp IMMEDIATE route can't self-deliver).
+    'credential_loss': 'security_and_system',
     # agent_iteration: TOPIC_ROUTING entry is the FALLBACK only — the
     # actual primary route is per-agent via resolve_target() reading
     # payload.agent against AGENT_TOPIC_MAP below. resolve_target() short-
@@ -601,6 +607,15 @@ class TelegramNotifier(BaseSubscriber):
                 f"File: {p.get('file_path', '?')}:{p.get('line_no', '?')}\n"
                 f"Preview: {p.get('match_preview', '?')}"
             )
+
+        if et == EventType.CREDENTIAL_LOSS:
+            # Named credential/infra loss from the watchdog sweep (2026-07-10).
+            # Lead with the probe + its state edge, then the actionable detail;
+            # the generic fallback would splat watchdog_type/tier/category noise.
+            return (
+                f"{p.get('probe', '?')}: {p.get('before', '?')} → {p.get('after', '?')}\n"
+                f"{p.get('detail', '')}"
+            ).strip()
 
         # Generic fallback
         lines = [f"{k}: {v}" for k, v in p.items() if v]

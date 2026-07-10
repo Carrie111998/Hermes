@@ -360,7 +360,20 @@ class EventBus:
             params,
         ).fetchall()
 
-        return [self._row_to_event(r) for r in rows]
+        # Version-skew tolerance (mirrors subscribe() above): a producer on newer
+        # code can write event_types this process hasn't loaded. Skip the
+        # unparseable row + WARN rather than crashing the whole query — otherwise a
+        # single unknown row takes down every query() consumer. Observed 2026-07-10:
+        # 9 'weekly_analytics_summary' rows crashed DigestComposer.compose() on
+        # every poll tick, silently killing the morning digest.
+        events: List[Event] = []
+        for r in rows:
+            try:
+                events.append(self._row_to_event(r))
+            except ValueError as e:
+                logger.warning("query: skipping unparseable event %s: %s",
+                               r["event_id"], e)
+        return events
 
     def checkpoint(self) -> None:
         """Run a passive WAL checkpoint so external readers see recent data."""

@@ -183,6 +183,13 @@ class TestAgentIterationRouting:
         missing = required - covered
         assert not missing, f"TOPIC_ROUTING missing: {missing}"
 
+    def test_credential_loss_routes_to_security_and_system(self):
+        """R70 alert-gap fix (2026-07-10): a named credential/infra loss lands in
+        the Security & System topic Diego watches. CRITICAL priority => survives
+        significant_only and delivers even during quiet hours (the reliable 3am
+        channel when WhatsApp itself is the lost credential)."""
+        assert TOPIC_ROUTING["credential_loss"] == "security_and_system"
+
     def test_devflow_pr_events_route_to_devflow_firehose(self):
         """DevFlow PR activity (opened, closed, merged) belongs in the
         devflow_firehose topic alongside the existing devflow.run_*

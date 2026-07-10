@@ -45,6 +45,14 @@ _TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
     # Immediate
     EventType.INTERVIEW_SIGNAL: EscalationTier.IMMEDIATE,
     EventType.OFFER_SIGNAL: EscalationTier.IMMEDIATE,
+    # Credential/infra loss (2026-07-10, R70 alert-gap fix). IMMEDIATE so it
+    # breaks quiet hours -- a 2:44am WhatsApp-creds zeroing (or OAuth/ENOSPC
+    # credential loss) must wake Diego, not queue to the 7am flush. SELF-
+    # REFERENCE CAVEAT: when the lost credential IS WhatsApp, this WhatsApp
+    # escalation cannot deliver -- the Telegram route (security_and_system,
+    # unaffected by quiet hours) is the reliable channel for that case. Kept
+    # IMMEDIATE anyway so a NON-WhatsApp credential loss still breaks through here.
+    EventType.CREDENTIAL_LOSS: EscalationTier.IMMEDIATE,
     # Urgent
     EventType.APPLICATION_BLOCKED: EscalationTier.URGENT,
     EventType.APPLICATION_FAILED: EscalationTier.URGENT,
@@ -360,6 +368,11 @@ class WhatsAppEscalator(BaseSubscriber):
                 f"{count} agent errors in last 15 min. Latest: {source_agent}: "
                 f"{str(msg)[:140]}"
             )
+        elif et == EventType.CREDENTIAL_LOSS:
+            # Named credential/infra loss from the watchdog sweep (2026-07-10).
+            probe = p.get("probe", "?")
+            after = str(p.get("after", "down")).upper()
+            text = f"🔑 Credential loss: {probe} is {after}. {p.get('detail', '')}".strip()
         else:
             text = f"{et.type_string}: {json.dumps(p)[:200]}"
 
@@ -514,7 +527,14 @@ class WhatsAppEscalator(BaseSubscriber):
             )
 
     def _queue_message(self, message: str) -> None:
-        """Queue message for morning flush."""
+        """Queue a message for the morning flush.
+
+        Bounded at ``_MAX_QUEUE_SIZE`` (drop-oldest). Without a cap, a multi-day
+        WhatsApp outage grows quiet_queue.json without limit — the flush delivers
+        OVER WhatsApp, so while the bridge is down nothing drains and every
+        queued alert accumulates (2026-04-30 saw 1814 queued events = 508KB; the
+        2026-07-10 bridge outage stranded 105). The newest alerts are the most
+        actionable, so overflow drops the oldest and logs the loss."""
         self._queue_path.parent.mkdir(parents=True, exist_ok=True)
         queue = []
         if self._queue_path.exists():
@@ -526,6 +546,14 @@ class WhatsAppEscalator(BaseSubscriber):
             "message": message,
             "queued_at": datetime.now().isoformat(),
         })
+        if len(queue) > self._MAX_QUEUE_SIZE:
+            dropped = len(queue) - self._MAX_QUEUE_SIZE
+            queue = queue[-self._MAX_QUEUE_SIZE:]
+            logger.warning(
+                "WhatsAppEscalator: quiet queue exceeded %d; dropped %d oldest "
+                "message(s) — WhatsApp bridge down for an extended period?",
+                self._MAX_QUEUE_SIZE, dropped,
+            )
         self._queue_path.write_text(json.dumps(queue, indent=2), encoding="utf-8")
 
     # Maximum body characters per chunk. Sized to keep the full summary
@@ -534,6 +562,12 @@ class WhatsAppEscalator(BaseSubscriber):
     # footer. The bridge's express.json() body limit (~100KB by default) is
     # also satisfied by chunks of this size.
     _FLUSH_CHUNK_BODY_LIMIT = 3500
+
+    # Hard cap on queued morning-flush messages (drop-oldest on overflow). Bounds
+    # quiet_queue.json growth during an extended WhatsApp outage, when nothing
+    # drains (the flush delivers over WhatsApp itself). 500 keeps the file well
+    # under ~200KB while preserving a generous window of the most recent alerts.
+    _MAX_QUEUE_SIZE = 500
 
     def flush_queue(self) -> int:
         """Flush queued messages as one or more chunked summaries.
@@ -611,3 +645,21 @@ class WhatsAppEscalator(BaseSubscriber):
         # All chunks delivered.
         self._queue_path.write_text("[]", encoding="utf-8")
         return total
+
+    def has_queued_messages(self) -> bool:
+        """True if the morning-flush queue currently holds any items.
+
+        Lets the gateway flush trigger distinguish a DRAINED flush from a
+        STRANDED one: flush_queue() preserves the queue on delivery failure
+        (e.g. the WhatsApp bridge itself down at 7am, as on 2026-07-10 when a
+        0/105 flush left the whole overnight queue behind) and returns 0 — which
+        is indistinguishable from "nothing to flush" by the return value alone.
+        The caller keys its once-per-day gate on this so a failed flush RETRIES
+        later instead of burning the day's single attempt. A missing/corrupt
+        queue file reads as empty (nothing stranded)."""
+        if not self._queue_path.exists():
+            return False
+        try:
+            return bool(json.loads(self._queue_path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            return False

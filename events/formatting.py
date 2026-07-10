@@ -56,6 +56,9 @@ EVENT_TYPE_EMOJI = {
     # flood remediation — without this entry event_icon() returned "" and the
     # header rendered with a double-space gap that swam in a noisy feed.
     EventType.SECRET_DETECTED:          "🔐",
+    # Credential/infra loss (2026-07-10, R70 alert-gap fix). Key icon = a
+    # credential is gone; distinct from the padlock (a secret was *found*).
+    EventType.CREDENTIAL_LOSS:          "🔑",
     # Phase B Stage-3 iter2 — HITL approvals + apply packet
     EventType.APPROVAL_REQUEST:         "🙋",
     EventType.APPLY_PACKET:             "📦",

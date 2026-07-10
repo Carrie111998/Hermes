@@ -55,6 +55,13 @@ POLL_LOOP_ERROR_COOLDOWN_SECONDS = 900
 # and alert on staleness > a few minutes, so this cadence must be tight
 # enough that a single missed write stays under the alert threshold.
 HEARTBEAT_INTERVAL_SECONDS = 60
+# WhatsApp morning-flush retry throttle. The flush delivers the overnight queue
+# OVER WhatsApp, so when the WhatsApp bridge is itself down at 7am (2026-07-10:
+# a 0/105 flush stranded the whole overnight queue) the flush fails and must
+# RETRY later the same day rather than burning the single per-ET-date attempt.
+# Retries are throttled to this interval so a persistently-down bridge can't
+# hammer _deliver (which blocks ~5s per failed send) on every 1s poll tick.
+FLUSH_RETRY_INTERVAL_SECONDS = 900  # 15 min
 
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
@@ -434,6 +441,34 @@ def _pick_digest_target(
     return None
 
 
+def _should_attempt_whatsapp_flush(
+    et_hour: int,
+    last_flush_date: str,
+    today_et: str,
+    now: float,
+    last_flush_attempt: float,
+    retry_interval: float = FLUSH_RETRY_INTERVAL_SECONDS,
+) -> bool:
+    """Whether the WhatsApp morning flush should be ATTEMPTED on this tick.
+
+    True iff it is >= 7am ET, today's queue has not yet been *successfully*
+    drained (``last_flush_date`` advances only on a clean drain — see the caller),
+    and we have not attempted within ``retry_interval``.
+
+    The throttle is what lets a FAILED flush retry safely: on 2026-07-10 the
+    WhatsApp bridge was down at 7am, the flush delivered 0/105, and the old gate
+    burned the day's single attempt (advancing the date unconditionally) so the
+    overnight queue stranded until the next ET date. Retrying is now allowed, but
+    throttled so a persistently-down bridge cannot re-attempt on every 1s poll
+    tick (each failed ``_deliver`` blocks ~5s).
+    """
+    if et_hour < 7:
+        return False
+    if last_flush_date == today_et:
+        return False
+    return (now - last_flush_attempt) >= retry_interval
+
+
 def _subscriber_poll_loop() -> None:
     """Background thread that polls all subscribers at their configured intervals.
 
@@ -474,6 +509,11 @@ def _subscriber_poll_loop() -> None:
         fired_digest_keys.append(_legacy_digest_key)
     _flush_state = load_state(whatsapp_flush_state_path(), default={})
     last_flush_date: str = _flush_state.get("last_flush_date", "")
+    # Monotonic timestamp of the last morning-flush ATTEMPT (success or fail),
+    # throttling failed-flush retries. In-memory only (resets on restart, which
+    # is fine — a restart should re-attempt promptly). -inf => first eligible
+    # tick attempts immediately.
+    last_flush_attempt: float = float("-inf")
     lag_alerts_sent: Dict[str, float] = {}  # subscriber_id -> monotonic timestamp
     consecutive_outer_errors: int = 0
     last_outer_error_emit: float = 0.0
@@ -551,22 +591,39 @@ def _subscriber_poll_loop() -> None:
                     except Exception:
                         logger.exception("Failed to save digest state")
 
-                # WhatsApp morning flush — one per ET date, any time >= 7am.
-                # Catches up if gateway was offline during the 7am tick.
-                if et_hour >= 7 and last_flush_date != today_et:
+                # WhatsApp morning flush — one SUCCESSFUL drain per ET date, any
+                # time >= 7am. Catches up if the gateway was offline during the
+                # 7am tick. Also RETRIES (throttled) later the same day if the
+                # flush itself FAILED — e.g. the WhatsApp bridge down at 7am on
+                # 2026-07-10, whose 0/105 flush previously burned the day's only
+                # attempt (last_flush_date was advanced unconditionally) and
+                # stranded the overnight queue until the next ET date. Now the
+                # date advances ONLY once the queue actually drained.
+                if _should_attempt_whatsapp_flush(
+                    et_hour, last_flush_date, today_et, now, last_flush_attempt
+                ):
+                    last_flush_attempt = now
+                    all_drained = True
                     for sub in _registry.subscribers:
                         if isinstance(sub, WhatsAppEscalator):
                             try:
                                 count = sub.flush_queue()
                                 if count:
                                     logger.info("WhatsApp morning flush: %d messages", count)
+                                # A preserved (non-empty) queue means delivery
+                                # failed or was partial — do NOT consume today's
+                                # slot; a later throttled tick retries.
+                                if sub.has_queued_messages():
+                                    all_drained = False
                             except Exception:
                                 logger.exception("WhatsApp flush failed")
-                    last_flush_date = today_et
-                    try:
-                        save_state(whatsapp_flush_state_path(), {"last_flush_date": today_et})
-                    except Exception:
-                        logger.exception("Failed to save whatsapp flush state")
+                                all_drained = False
+                    if all_drained:
+                        last_flush_date = today_et
+                        try:
+                            save_state(whatsapp_flush_state_path(), {"last_flush_date": today_et})
+                        except Exception:
+                            logger.exception("Failed to save whatsapp flush state")
 
             # Subscriber lag check every 5 minutes
             if _registry and _bus and now - last_lag_check >= 300:

@@ -133,3 +133,52 @@ def test_whatsapp_flush_does_not_re_fire_after_restart(tmp_path, monkeypatch):
     state = load_state(whatsapp_flush_state_path(), default={})
     already_fired_today = state.get("last_flush_date") == today
     assert already_fired_today
+
+
+# --- WhatsApp flush retry-on-failure gate (2026-07-10 stranded-queue fix) -----
+#
+# The old gate advanced last_flush_date unconditionally, so a flush that FAILED
+# (WhatsApp bridge down at 7am -> 0/105 delivered) burned the day's only attempt
+# and stranded the overnight queue until the next ET date. The date now advances
+# only on a clean drain (caller-side, keyed on has_queued_messages()); this gate
+# decides WHEN to (re)attempt, throttled so a persistently-down bridge can't
+# hammer _deliver every 1s tick.
+
+_INTERVAL = gi.FLUSH_RETRY_INTERVAL_SECONDS
+
+
+def test_flush_not_attempted_before_7am():
+    assert gi._should_attempt_whatsapp_flush(
+        et_hour=6, last_flush_date="", today_et="2026-07-10",
+        now=10_000.0, last_flush_attempt=float("-inf")) is False
+
+
+def test_flush_not_attempted_once_drained_today():
+    # last_flush_date == today means today's queue already drained cleanly.
+    assert gi._should_attempt_whatsapp_flush(
+        et_hour=9, last_flush_date="2026-07-10", today_et="2026-07-10",
+        now=10_000.0, last_flush_attempt=0.0) is False
+
+
+def test_flush_attempted_first_eligible_tick():
+    # 7am+, not drained today, never attempted (-inf) -> attempt immediately.
+    assert gi._should_attempt_whatsapp_flush(
+        et_hour=7, last_flush_date="", today_et="2026-07-10",
+        now=10_000.0, last_flush_attempt=float("-inf")) is True
+
+
+def test_flush_retry_throttled_within_interval():
+    # Attempted 60s ago (< 15 min) -> do NOT re-attempt yet.
+    now = 10_000.0
+    assert gi._should_attempt_whatsapp_flush(
+        et_hour=8, last_flush_date="", today_et="2026-07-10",
+        now=now, last_flush_attempt=now - 60) is False
+
+
+def test_flush_retry_allowed_after_interval():
+    # The 2026-07-10 recovery case: 7am flush failed (date NOT advanced), bridge
+    # recovers later; once the throttle window elapses the flush re-attempts.
+    now = 10_000.0
+    assert gi._should_attempt_whatsapp_flush(
+        et_hour=11, last_flush_date="", today_et="2026-07-10",
+        now=now, last_flush_attempt=now - _INTERVAL - 1) is True

@@ -126,6 +126,24 @@ class TestSubscribe:
 
 
 class TestQuery:
+    def test_query_skips_unknown_event_type(self, bus):
+        """A row whose event_type isn't in the EventType enum (cross-version
+        skew / legacy producer) must be SKIPPED by query(), not crash the whole
+        call. Regression for 2026-07-10: 9 'weekly_analytics_summary' rows made
+        query() raise, crashing DigestComposer.compose() every poll tick."""
+        bus.emit(EventType.CRON_STARTED, "scout", {})
+        conn = bus._get_conn()
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, source, timestamp, priority) "
+            "VALUES ('bad-1', 'weekly_analytics_summary', 'analytics', "
+            "'2026-07-01T00:00:00Z', 'low')"
+        )
+        conn.commit()
+
+        results = bus.query()  # must NOT raise
+        assert len(results) == 1
+        assert results[0].event_type == EventType.CRON_STARTED
+
     def test_query_by_type(self, bus):
         bus.emit(EventType.CRON_STARTED, "scout", {})
         bus.emit(EventType.JOB_DISCOVERED, "scout", {})

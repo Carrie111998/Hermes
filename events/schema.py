@@ -120,6 +120,17 @@ class EventType(Enum):
 
     # Security
     SECRET_DETECTED = ("secret_detected", Priority.HIGH)
+    # Credential/infra loss detected by the laptop-monitor watchdog sweep
+    # (2026-07-10, R70 alert-gap fix). A curated allowlist of probes (WhatsApp
+    # session creds, the ENOSPC 0-byte credential/config sweep, OAuth token
+    # validity) transitioning healthy->down/error is emitted INDIVIDUALLY by
+    # watchdog_sweep._emit_transitions (never folded into WATCHDOG_BURST) so the
+    # specific loss is NAMED, at CRITICAL priority mapped to WhatsApp
+    # EscalationTier.IMMEDIATE + Telegram security_and_system so it BREAKS quiet
+    # hours. Closes the 2026-07-10 02:44 WhatsApp-creds-zeroing miss where the
+    # burst-coalesced, URGENT-tier, quiet-hours-queued signal never woke Diego.
+    # See memory whatsapp_session_zeroed_repair_pending.md.
+    CREDENTIAL_LOSS = ("credential_loss", Priority.CRITICAL)
 
     # Phase B Stage-3 iter2 (HITL + apply + tracker -> Postgres)
     APPROVAL_REQUEST = ("approval_request", Priority.HIGH)
