@@ -48,12 +48,22 @@ test('unpackedDirName maps platform to the electron-builder dir', () => {
   assert.equal(unpackedDirName('win32'), 'win-unpacked')
 })
 
-test('resolveUnpackedRelease returns the dir for a binary UNDER release/<plat>-unpacked', () => {
-  const exec = path.join(UNPACKED, 'hermes')
-  assert.equal(resolveUnpackedRelease(exec, ROOT, 'linux'), UNPACKED)
-  // The unpacked dir itself also counts.
-  assert.equal(resolveUnpackedRelease(UNPACKED, ROOT, 'linux'), UNPACKED)
-})
+test(
+  'resolveUnpackedRelease returns the dir for a binary UNDER release/<plat>-unpacked',
+  // This is Linux-only product code (#45205). resolveUnpackedRelease uses
+  // path.resolve() on an absolute POSIX execPath, which on a Windows host
+  // prepends the current drive (C:\home\u\...) while the expected UNPACKED is
+  // built with path.join and stays drive-less (\home\u\...), so the segment
+  // prefix check can never match. The behavior is correct on Linux; skip the
+  // faithless reproduction on win32.
+  { skip: process.platform === 'win32' && 'POSIX-absolute-path resolution differs on win32' },
+  () => {
+    const exec = path.join(UNPACKED, 'hermes')
+    assert.equal(resolveUnpackedRelease(exec, ROOT, 'linux'), UNPACKED)
+    // The unpacked dir itself also counts.
+    assert.equal(resolveUnpackedRelease(UNPACKED, ROOT, 'linux'), UNPACKED)
+  }
+)
 
 test('resolveUnpackedRelease is null for AppImage / .deb / .rpm / dev / unresolved paths', () => {
   // AppImage mount
