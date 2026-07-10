@@ -78,3 +78,12 @@ answer a question from your own notes, use the `llm-wiki` skill. Always orient
 first — read `SCHEMA.md`, `index.md`, and the recent `log.md` entries — before
 ingesting, querying, or linting, so you don't create duplicates or miss
 cross-references.
+
+The wiki is git-synced with a shared private remote — other agents (Claude
+Cowork on Gilles' Mac) read AND write the same repo. Protocol, when
+`$WIKI_GIT_REMOTE` is set (credentials are already configured):
+- **Before** a wiki session: `git -C "$WIKI_PATH" pull --rebase --autostash`
+  to pick up the other writers' notes.
+- **After ANY wiki edit**: publish it —
+  `cd "$WIKI_PATH" && git add -A && git commit -m "<what changed>" && git pull --rebase --autostash && git push`.
+- Never force-push; on a real conflict keep both versions and note it in `log.md`.

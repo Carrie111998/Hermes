@@ -240,6 +240,56 @@ if [ -d "$INSTALL_DIR/skills" ]; then
     python3 "$INSTALL_DIR/tools/skills_sync.py"
 fi
 
+# --- LLM-wiki git sync (idempotent, best-effort) -----------------------------
+# The wiki at $WIKI_PATH is shared with other agents (Claude Cowork on the Mac)
+# through a plain git remote (WIKI_GIT_REMOTE — see .env.railway). First boot
+# with the var set adopts the existing tree into a fresh repo; later boots
+# commit local drift, rebase on the remote, and push. Everything runs best-effort
+# in a subshell so a git/network failure never blocks boot (set -e is active).
+# The credential helper reads the PAT from the environment at run time, so no
+# token is ever written to the volume; the helper also serves the agent's own
+# `git push` after wiki edits (SOUL.md instructs it to publish).
+if [ -n "${WIKI_PATH:-}" ] && [ -d "${WIKI_PATH:-}" ] && [ -n "${WIKI_GIT_REMOTE:-}" ] \
+    && [ -n "${GITHUB_PERSONAL_ACCESS_TOKEN:-}" ] && command -v git >/dev/null 2>&1; then
+    (
+        set +e
+        cd "$WIKI_PATH" || exit 0
+        export GIT_TERMINAL_PROMPT=0
+        if [ ! -d .git ]; then
+            echo "[entrypoint] wiki: initializing git repo for $WIKI_GIT_REMOTE"
+            git init -q -b main
+        fi
+        git config user.name "hermes-agent"
+        git config user.email "hermes-agent@noreply.railway.app"
+        git config credential.helper \
+            '!f() { echo username=x-access-token; echo "password=${GITHUB_PERSONAL_ACCESS_TOKEN}"; }; f'
+        if git remote get-url origin >/dev/null 2>&1; then
+            git remote set-url origin "$WIKI_GIT_REMOTE"
+        else
+            git remote add origin "$WIKI_GIT_REMOTE"
+        fi
+        # The hot files are append-only; union-merge them so the two writers
+        # (this agent + Cowork) never conflict on concurrent appends.
+        if [ ! -f .gitattributes ]; then
+            printf 'log.md merge=union\n_meta/inbox.md merge=union\n' > .gitattributes
+        fi
+        git add -A
+        git diff --cached --quiet || git commit -q -m "wiki: boot sync"
+        git fetch -q origin main 2>/dev/null
+        if git rev-parse -q --verify origin/main >/dev/null 2>&1; then
+            if ! git rebase --autostash origin/main >/dev/null 2>&1; then
+                git rebase --abort >/dev/null 2>&1
+                echo "[entrypoint] wiki: WARNING rebase conflict — keeping local state, resolve manually"
+            fi
+        fi
+        if git push -q -u origin main >/dev/null 2>&1; then
+            echo "[entrypoint] wiki: synced with $WIKI_GIT_REMOTE"
+        else
+            echo "[entrypoint] wiki: WARNING push failed — will retry on next boot"
+        fi
+    )
+fi
+
 # Google OAuth — decode base64 credentials from env vars into files.
 # Always overwrite so Railway env var updates take effect on redeploy.
 # Set GOOGLE_TOKEN_B64 and GOOGLE_CLIENT_SECRET_B64 in Railway dashboard.
