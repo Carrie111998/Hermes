@@ -20,11 +20,14 @@ or real-looking key, so secret scanners do not flag this file.
 from gateway.run import _redact_approval_command
 
 # Synthetic, scanner-safe credential fixtures. Each matches its redactor
-# regex (ghp_/sk-/JWT) but is unmistakably fake -- a run of X's, never a
-# real or real-format key.
+# regex (ghp_/sk-/JWT/Discord) but is unmistakably fake -- repeated marker
+# characters, never a real or real-format key.
 _FAKE_GHP = "ghp_" + "X" * 36
 _FAKE_OPENAI = "sk-proj-" + "X" * 40
 _FAKE_JWT = "eyJ" + "X" * 20 + "." + "eyJ" + "X" * 24 + "." + "X" * 30
+
+
+_FAKE_DISCORD_CREDENTIAL = "D" * 24 + "." + "M" * 6 + "." + "Z" * 38
 
 
 class TestRedactApprovalCommand:
@@ -48,6 +51,22 @@ class TestRedactApprovalCommand:
         raw = "curl -H 'Authorization: Bearer " + _FAKE_JWT + "' https://api.example.com"
         out = _redact_approval_command(raw)
         assert _FAKE_JWT not in out
+
+    def test_gateway_boundary_redacts_discord_and_cookie_even_when_disabled(
+        self, monkeypatch
+    ):
+        raw = (
+            "curl -H 'Cookie: session=alpha; theme=dark' https://example.test "
+            f"&& printf '%s' '{_FAKE_DISCORD_CREDENTIAL}'"
+        )
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False, raising=False)
+
+        out = _redact_approval_command(raw)
+
+        assert _FAKE_DISCORD_CREDENTIAL not in out
+        assert "Cookie: session=***; theme=***" in out
+        assert "https://example.test" in out
+        assert out.count("'") == raw.count("'")
 
     def test_clean_command_passes_through_unchanged(self):
         raw = "ls -la /tmp && echo hello"

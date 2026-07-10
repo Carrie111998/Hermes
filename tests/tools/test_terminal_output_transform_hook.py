@@ -119,7 +119,7 @@ def test_terminal_output_transform_still_runs_strip_and_redact(monkeypatch, tmp_
     # or collection-time import order (the module snapshots env at import).
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
 
-    secret = "sk-proj-abc123def456ghi789jkl012mno345"
+    secret = "sk-proj-" + "abc123def4567890" + "o345"
     result, _mock_env = _run_terminal(
         monkeypatch,
         tmp_path,
@@ -136,6 +136,30 @@ def test_terminal_output_transform_still_runs_strip_and_redact(monkeypatch, tmp_
     assert "OPENAI_API_KEY=" in result["output"]
     assert "sk-pro" in result["output"]  # prefix marker from _mask_token
     assert "abc123def456" not in result["output"]  # secret body is gone
+
+
+def test_terminal_result_redacts_bare_discord_and_cookie_output(monkeypatch, tmp_path):
+    """Exercise the production foreground terminal result boundary, whose
+    normal command path intentionally uses code_file=True."""
+    monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+    discord_credential = "D" * 24 + "." + "M" * 6 + "." + "Z" * 38
+    raw_output = (
+        f"discord={discord_credential}\n"
+        "Cookie: session=alpha; theme=dark\n"
+        "Set-Cookie: sid=beta; Path=/; HttpOnly"
+    )
+
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output=raw_output,
+        command="python inspect_response.py",
+    )
+
+    assert discord_credential not in result["output"]
+    assert "discord=DDDDDD...ZZZZ" in result["output"]
+    assert "Cookie: session=***; theme=***" in result["output"]
+    assert "Set-Cookie: sid=***; Path=/; HttpOnly" in result["output"]
 
 
 def test_terminal_output_transform_hook_exception_falls_back(monkeypatch, tmp_path):

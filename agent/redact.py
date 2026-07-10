@@ -210,6 +210,35 @@ _SECRET_HEADER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Cookie headers need structure-aware handling rather than the single-value
+# header rule above.  The optional quote/backreference pair supports serialized
+# header maps (``{"Cookie": "a=b"}``) while the unquoted form supports normal
+# wire headers and shell strings (``-H 'Cookie: a=b'``).  The value span itself
+# is located by _redact_cookie_headers so surrounding shell/JSON quotes are not
+# consumed or damaged.
+_cookie_header_re = re.compile(
+    r"(?<![A-Za-z0-9-])"
+    r"(?P<name_quote>[\"']?)(?P<name>Set-Cookie|Cookie)(?P=name_quote)"
+    r"(?P<separator>[ \t]*:[ \t]*)",
+    re.IGNORECASE,
+)
+
+# Discord bot/user tokens are otherwise bare: unlike most credentials they do
+# not carry a vendor prefix.  Their three URL-safe-base64-ish segments are very
+# distinctive.  Keep the first segment deliberately narrow (24-26 chars), the
+# range produced by Discord snowflake IDs used by real bots, and require the
+# fixed six-character middle segment plus a substantial final segment.  These
+# constraints avoid treating ordinary dotted prose, semantic versions, and
+# dotted hashes as credentials.  Legacy user tokens beginning ``mfa.`` use a
+# separate distinctive prefix and a long URL-safe body.
+_discord_credential_re = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:"
+    r"[A-Za-z0-9_-]{24,26}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{25,110}"
+    r"|mfa\.[A-Za-z0-9_-]{40,}"
+    r")(?![A-Za-z0-9_-])"
+)
+_discord_file_sentinel = "«redacted:discord-token»"
+
 # Telegram bot tokens: bot<digits>:<token> or <digits>:<token>,
 # where token part is restricted to [-A-Za-z0-9_] and length >= 30
 _TELEGRAM_RE = re.compile(
@@ -461,6 +490,161 @@ def _redact_form_body(text: str) -> str:
     return _redact_query_string(text.strip())
 
 
+def _find_unescaped_quote(text: str, start: int, end: int, quote: str) -> int | None:
+    """Return the next unescaped ``quote`` index within ``[start, end)``."""
+    i = start
+    while i < end:
+        if text[i] == "\\":
+            # In JSON/shell-rendered text an escaped quote is part of the
+            # header value, not the surrounding string's terminator.
+            i += 2
+            continue
+        if text[i] == quote:
+            return i
+        i += 1
+    return None
+
+
+def _split_cookie_value(value: str) -> list[str]:
+    """Split a Cookie/Set-Cookie value on unquoted semicolons, preserving them."""
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            escaped = value[i + 1]
+            # JSON-rendered cookie values use escaped quotes. Treat those quote
+            # characters as delimiters for semicolon scanning while preserving
+            # both bytes in the returned segments.
+            if escaped in {"\"", "'"}:
+                if quote is None:
+                    quote = escaped
+                elif quote == escaped:
+                    quote = None
+            i += 2
+            continue
+        if ch in {"\"", "'"}:
+            if quote is None:
+                quote = ch
+            elif quote == ch:
+                quote = None
+        elif ch == ";" and quote is None:
+            parts.extend((value[start:i], ";"))
+            start = i + 1
+        i += 1
+    parts.append(value[start:])
+    return parts
+
+
+def _mask_cookie_assignment(segment: str) -> str:
+    """Fully mask one ``name=value`` cookie pair without changing its syntax."""
+    if "=" not in segment:
+        return segment
+    name, equals, raw_value = segment.partition("=")
+
+    leading_len = len(raw_value) - len(raw_value.lstrip())
+    trailing_len = len(raw_value) - len(raw_value.rstrip())
+    if leading_len == len(raw_value):
+        trailing_len = 0
+    leading = raw_value[:leading_len]
+    # Avoid overlapping slices when the original value is whitespace-only.
+    core_end = len(raw_value) - trailing_len if trailing_len else len(raw_value)
+    core = raw_value[leading_len:core_end]
+    trailing = raw_value[core_end:]
+
+    # Preserve quotes around individual cookie values, including the escaped
+    # quotes found inside serialized JSON strings.
+    if len(core) >= 2 and core[0] == core[-1] and core[0] in {"\"", "'"}:
+        masked = f"{core[0]}***{core[-1]}"
+    elif (
+        len(core) >= 4
+        and core[:2] in {"\\\"", "\\'"}
+        and core[-2:] == core[:2]
+    ):
+        masked = f"{core[:2]}***{core[-2:]}"
+    else:
+        masked = "***"
+    return f"{name}{equals}{leading}{masked}{trailing}"
+
+
+def _mask_cookie_header_value(value: str, *, set_cookie: bool) -> str:
+    """Mask request Cookie pairs or only Set-Cookie's leading cookie pair."""
+    parts = _split_cookie_value(value)
+    if set_cookie:
+        # Set-Cookie attributes (Path, Domain, HttpOnly, Secure, SameSite,
+        # Expires, Max-Age, extensions) are operational metadata, not cookie
+        # values. Mask only the first name=value segment and preserve every
+        # subsequent byte.
+        if parts:
+            parts[0] = _mask_cookie_assignment(parts[0])
+        return "".join(parts)
+
+    # Request Cookie headers carry multiple cookies. Every name=value segment
+    # is sensitive; delimiters, whitespace, names, and quotes remain unchanged.
+    for i in range(0, len(parts), 2):
+        parts[i] = _mask_cookie_assignment(parts[i])
+    return "".join(parts)
+
+
+def _redact_cookie_headers(text: str) -> str:
+    """Redact all Cookie/Set-Cookie headers in plain, shell, or JSON text."""
+    chunks: list[str] = []
+    cursor = 0
+    search_at = 0
+    text_len = len(text)
+
+    while True:
+        match = _cookie_header_re.search(text, search_at)
+        if match is None:
+            break
+
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        if line_end < 0:
+            line_end = text_len
+        cr = text.find("\r", match.end(), line_end)
+        if cr >= 0:
+            line_end = cr
+
+        value_start = match.end()
+        value_end = line_end
+
+        # JSON/dict header map: {"Cookie": "a=b"}. The name quotes are part
+        # of the regex; leave the value quotes outside the replacement span.
+        if value_start < line_end and text[value_start] in {"\"", "'"}:
+            quote = text[value_start]
+            closing = _find_unescaped_quote(text, value_start + 1, line_end, quote)
+            if closing is not None:
+                value_start += 1
+                value_end = closing
+        # Shell or JSON string containing a literal header:
+        # curl -H 'Cookie: a=b' / "Cookie: a=b".
+        elif match.start() > line_start and text[match.start() - 1] in {"\"", "'"}:
+            quote = text[match.start() - 1]
+            closing = _find_unescaped_quote(text, value_start, line_end, quote)
+            if closing is not None:
+                value_end = closing
+
+        chunks.append(text[cursor:value_start])
+        chunks.append(
+            _mask_cookie_header_value(
+                text[value_start:value_end],
+                set_cookie=match.group("name").lower() == "set-cookie",
+            )
+        )
+        cursor = value_end
+        # If a surrounding closing quote was found, skip it for the next regex
+        # search while retaining it in the final untouched slice.
+        search_at = value_end + (1 if value_end < line_end else 0)
+
+    if not chunks:
+        return text
+    chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
 def _mask_token_nonreusable(token: str) -> str:
     """Redact a prefix-matched credential to a NON-REUSABLE sentinel.
 
@@ -505,7 +689,8 @@ def redact_sensitive_text(
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
     constants, "apiKey": "test" fixtures). Prefix patterns, auth headers,
-    private keys, DB connstrings, JWTs, and URL secrets are still redacted.
+    Cookie headers, Discord tokens, private keys, DB connstrings, JWTs, and URL
+    secrets are still redacted.
 
     Set file_read=True for file *content* returned to the agent (read_file /
     search_files / cat). Secrets are STILL redacted — they are never exposed —
@@ -545,6 +730,19 @@ def redact_sensitive_text(
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
+
+    # Bare Discord credentials have no vendor prefix, but their constrained
+    # three-segment shape (or distinctive mfa. prefix) is recognizable. This
+    # pass intentionally applies to source output and file reads too. File
+    # reads retain NONE of the token's random bytes: use a syntactically invalid
+    # non-reusable sentinel rather than the normal head/tail display mask.
+    if "." in text:
+        discord_sub = (
+            (lambda _m: _discord_file_sentinel)
+            if file_read
+            else (lambda m: _mask_token(m.group(0)))
+        )
+        text = _discord_credential_re.sub(discord_sub, text)
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
@@ -600,6 +798,13 @@ def redact_sensitive_text(
             lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
             text,
         )
+
+    # Cookie is a multi-value header and Set-Cookie has non-secret attributes,
+    # so neither can use the opaque single-header-value rule. Header names are
+    # case-insensitive; all lines are processed. This is deliberately scoped to
+    # explicit headers and does NOT scan or blanket-mask URL query strings.
+    if "cookie" in text.lower():
+        text = _redact_cookie_headers(text)
 
     # API-key style headers (x-api-key, api-key, …). Header values are
     # colon-separated, so gate on ":" — the regex itself is the precise filter.

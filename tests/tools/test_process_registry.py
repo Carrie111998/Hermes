@@ -1176,6 +1176,43 @@ class TestProcessToolHandler:
         result = json.loads(_handle_process({"action": "poll"}))
         assert "error" in result
 
+    @pytest.mark.parametrize(
+        ("action", "method"),
+        [("poll", "poll"), ("log", "read_log"), ("wait", "wait")],
+    )
+    def test_output_actions_redact_discord_and_cookie_data(
+        self, monkeypatch, action, method
+    ):
+        """Exercise each production process-tool egress, not only the shared
+        redaction helper used beneath it."""
+        import tools.process_registry as process_module
+
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+        discord_credential = "D" * 24 + "." + "M" * 6 + "." + "Z" * 38
+
+        def fake_result(*_args, **_kwargs):
+            return {
+                "status": "exited",
+                "command": "python background.py",
+                "output": (
+                    f"discord={discord_credential}\n"
+                    "Cookie: session=alpha; theme=dark\n"
+                    "Set-Cookie: sid=beta; Path=/; Secure"
+                ),
+            }
+
+        monkeypatch.setattr(process_module.process_registry, method, fake_result)
+        result = json.loads(
+            process_module._handle_process(
+                {"action": action, "session_id": "proc_redaction_test"}
+            )
+        )
+
+        assert discord_credential not in result["output"]
+        assert "discord=DDDDDD...ZZZZ" in result["output"]
+        assert "Cookie: session=***; theme=***" in result["output"]
+        assert "Set-Cookie: sid=***; Path=/; Secure" in result["output"]
+
     def test_unknown_action(self):
         from tools.process_registry import _handle_process
         result = json.loads(_handle_process({"action": "unknown_action"}))

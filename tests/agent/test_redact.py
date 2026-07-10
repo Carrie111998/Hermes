@@ -532,6 +532,178 @@ class TestDiscordMentions:
         assert redact_sensitive_text(text) == text
 
 
+class TestDiscordCredentialRedaction:
+    """Bare Discord credentials have no vendor prefix, so their constrained
+    segment shape must be recognized on every output path without matching
+    ordinary dotted text."""
+
+    @staticmethod
+    def _bot_credential(first: int = 24, final: int = 38) -> str:
+        # Built from obviously synthetic runs so no credential is embedded in
+        # the repository while still exercising Discord's real segment shape.
+        return "D" * first + "." + "M" * 6 + "." + "Z" * final
+
+    def test_bare_bot_credential_is_masked(self):
+        credential = self._bot_credential()
+        out = redact_sensitive_text(f"discord returned {credential}", force=True)
+        assert credential not in out
+        assert out.startswith("discord returned DDDDDD...")
+        assert out.endswith("ZZZZ")
+
+    def test_url_safe_characters_and_26_char_first_segment(self):
+        credential = "D_" * 13 + ".m-f_aB." + "Z-" * 19
+        out = redact_sensitive_text(credential, force=True)
+        assert credential not in out
+        assert "..." in out
+
+    def test_mfa_credential_is_masked(self):
+        credential = "mfa." + "Q" * 84
+        out = redact_sensitive_text(f"value={credential}", force=True)
+        assert credential not in out
+        assert "mfa." in out
+
+    @pytest.mark.parametrize("code_file", [False, True])
+    def test_applies_to_normal_and_code_file_output(self, code_file):
+        credential = self._bot_credential()
+        out = redact_sensitive_text(
+            f'credential = "{credential}"', force=True, code_file=code_file
+        )
+        assert credential not in out
+
+    @pytest.mark.parametrize(
+        "credential",
+        [
+            "D" * 24 + "." + "M" * 6 + "." + "Z" * 38,
+            "mfa." + "Q" * 84,
+        ],
+    )
+    def test_file_read_uses_nonreusable_zero_byte_sentinel(self, credential):
+        out = redact_sensitive_text(
+            f"discord: {credential}", force=True, file_read=True
+        )
+        assert out == "discord: «redacted:discord-token»"
+        assert credential not in out
+        # No random head/tail bytes survive on a file-read path.
+        assert "DDDDDD" not in out
+        assert "ZZZZ" not in out
+        assert "QQQQ" not in out
+        assert "..." not in out
+
+    def test_multiple_credentials_are_all_masked(self):
+        first = self._bot_credential()
+        second = "mfa." + "Q" * 84
+        out = redact_sensitive_text(f"{first}\n{second}", force=True)
+        assert first not in out
+        assert second not in out
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "release 1.2.3 and docs.python.org are public",
+            "a" * 64 + "." + "b" * 64 + "." + "c" * 64,
+            "D" * 23 + "." + "M" * 6 + "." + "Z" * 38,
+            "D" * 27 + "." + "M" * 6 + "." + "Z" * 38,
+            "D" * 24 + "." + "M" * 7 + "." + "Z" * 38,
+            "mfa.documentation-is-not-a-token",
+        ],
+    )
+    def test_ordinary_dotted_text_and_near_misses_are_unchanged(self, text):
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_credential_shape_inside_url_is_masked_without_blanket_query_redaction(self):
+        credential = self._bot_credential()
+        opaque_url = "https://example.test/cb?token=opaque-round-trip-value&state=ok"
+        assert redact_sensitive_text(opaque_url, force=True) == opaque_url
+
+        credential_url = f"https://example.test/cb?value={credential}&state=ok"
+        out = redact_sensitive_text(credential_url, force=True)
+        assert credential not in out
+        assert "&state=ok" in out
+
+
+class TestCookieHeaders:
+    def test_cookie_masks_every_value_and_preserves_names_and_delimiters(self):
+        text = "Cookie: session=alpha; theme=dark; empty="
+        assert redact_sensitive_text(text, force=True) == (
+            "Cookie: session=***; theme=***; empty=***"
+        )
+
+    def test_cookie_is_case_insensitive_and_preserves_whitespace_and_quotes(self):
+        text = 'cOoKiE :  session = "alpha" ;\tpreference=\'dark\''
+        assert redact_sensitive_text(text, force=True) == (
+            'cOoKiE :  session = "***" ;\tpreference=\'***\''
+        )
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_cookie_in_shell_header_preserves_surrounding_quote(self, quote):
+        text = (
+            f"curl -H {quote}Cookie: session=alpha; theme=dark{quote} "
+            "https://example.test"
+        )
+        expected = (
+            f"curl -H {quote}Cookie: session=***; theme=***{quote} "
+            "https://example.test"
+        )
+        assert redact_sensitive_text(text, force=True) == expected
+
+    def test_cookie_in_json_header_map_preserves_json_syntax(self):
+        text = '{"Cookie": "session=alpha; theme=dark", "ok": true}'
+        assert redact_sensitive_text(text, force=True) == (
+            '{"Cookie": "session=***; theme=***", "ok": true}'
+        )
+
+    def test_cookie_preserves_escaped_quotes_in_json_string(self):
+        text = r'{"Cookie": "session=\"alpha\"; theme=dark"}'
+        assert redact_sensitive_text(text, force=True) == (
+            r'{"Cookie": "session=\"***\"; theme=***"}'
+        )
+
+    def test_set_cookie_masks_only_first_value_and_preserves_all_attributes(self):
+        text = (
+            "Set-Cookie: session=alpha; Path=/account; Domain=example.test; "
+            "HttpOnly; Secure; SameSite=Lax; "
+            "Expires=Wed, 09 Jul 2026 10:00:00 GMT; Max-Age=3600"
+        )
+        expected = (
+            "Set-Cookie: session=***; Path=/account; Domain=example.test; "
+            "HttpOnly; Secure; SameSite=Lax; "
+            "Expires=Wed, 09 Jul 2026 10:00:00 GMT; Max-Age=3600"
+        )
+        assert redact_sensitive_text(text, force=True) == expected
+
+    def test_set_cookie_preserves_quoted_cookie_and_attribute_values(self):
+        text = (
+            "set-cookie: session=\"alpha;beta\"; Path=/; "
+            "SameSite=None; Secure"
+        )
+        assert redact_sensitive_text(text, force=True) == (
+            "set-cookie: session=\"***\"; Path=/; SameSite=None; Secure"
+        )
+
+    def test_multiple_cookie_header_lines_are_all_processed(self):
+        text = (
+            "Cookie: first=alpha; second=beta\r\n"
+            "Set-Cookie: sid=gamma; Path=/; HttpOnly\r\n"
+            "COOKIE: third=delta\r\n"
+        )
+        assert redact_sensitive_text(text, force=True) == (
+            "Cookie: first=***; second=***\r\n"
+            "Set-Cookie: sid=***; Path=/; HttpOnly\r\n"
+            "COOKIE: third=***\r\n"
+        )
+
+    @pytest.mark.parametrize("mode", [{"code_file": True}, {"file_read": True}])
+    def test_cookie_headers_apply_to_code_and_file_read_paths(self, mode):
+        text = "Cookie: session=alpha; theme=dark"
+        assert redact_sensitive_text(text, force=True, **mode) == (
+            "Cookie: session=***; theme=***"
+        )
+
+    def test_cookie_like_query_string_is_not_blanket_redacted(self):
+        text = "https://example.test/cb?cookie=session%3Dalpha&theme=dark"
+        assert redact_sensitive_text(text, force=True) == text
+
+
 class TestWebUrlsNotRedacted:
     """Web URLs (http/https/wss) pass through unchanged — magic-link
     checkouts, OAuth callbacks the agent is meant to follow, and pre-signed
