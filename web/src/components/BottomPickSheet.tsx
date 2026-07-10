@@ -33,7 +33,12 @@ export function BottomPickSheet({
   const [dragOffsetPx, setDragOffsetPx] = useState(0);
   const [dragActive, setDragActive] = useState(false);
 
-  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Explicitly `number` (not `ReturnType<typeof setTimeout>`): some
+  // transitive dependency's ambient .d.ts pulls in @types/node's global
+  // augmentation, which shadows the DOM lib's `setTimeout` overload with
+  // Node's `NodeJS.Timeout` — mismatching the `number` that
+  // `window.setTimeout` actually returns in a browser build.
+  const closeTimerRef = useRef<number | null>(null);
   const sheetRef = useRef<HTMLDivElement>(null);
   const dragTrackingRef = useRef(false);
   const dragStartYRef = useRef(0);
