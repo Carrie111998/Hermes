@@ -184,6 +184,7 @@ pty = [
   # without pulling in extra packages.
 ]
 honcho = ["honcho-ai==2.0.1"]
+acp = ["agent-client-protocol==0.9.0"]
 # Cloud memory providers - opt-in, lazy-installed via tools/lazy_deps.py
 # (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
 # LAZY_DEPS pins (enforced by tests/test_project_metadata.py). Deliberately
