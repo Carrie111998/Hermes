@@ -22,6 +22,10 @@ class TeacherInfo(BaseModel):
     org_id: Optional[str] = None
 
 
+class StudentInfo(BaseModel):
+    student_id: str = "local_student"
+
+
 class TeacherAgentChatRequest(BaseModel):
     request_id: str = "local-smoke"
     session_id: str = "gradeos-smoke-session"
@@ -42,6 +46,27 @@ class TeacherAgentChatRequest(BaseModel):
     gradeos_tools: Dict[str, Any] = Field(default_factory=dict)
 
 
+class StudentAgentChatRequest(BaseModel):
+    request_id: str = "local-student-smoke"
+    session_id: str = "gradeos-student-smoke-session"
+    message: str
+    student: StudentInfo = Field(default_factory=StudentInfo)
+    scope: Dict[str, Any] = Field(default_factory=dict)
+    context: Dict[str, Any] = Field(default_factory=dict)
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    attachments: List[Dict[str, Any]] = Field(default_factory=list)
+    tool_policy: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "allow_writes": False,
+            "allow_external_web": False,
+            "system_data": False,
+            "native_memory": False,
+            "artifact_generation": False,
+        }
+    )
+    gradeos_scope_token: Optional[str] = None
+
+
 class TeacherAgentChatResponse(BaseModel):
     request_id: str
     session_id: str
@@ -52,6 +77,24 @@ class TeacherAgentChatResponse(BaseModel):
     tool_calls: List[Dict[str, Any]] = Field(default_factory=list)
     artifacts: List[Dict[str, Any]] = Field(default_factory=list)
     action_proposals: List[Dict[str, Any]] = Field(default_factory=list)
+    usage: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StudentAgentChatResponse(BaseModel):
+    request_id: str
+    session_id: str
+    session_key: str
+    content: str
+    model: Optional[str] = None
+    response_type: str = "explanation"
+    next_question: Optional[str] = None
+    question_options: List[str] = Field(default_factory=list)
+    focus_mode: bool = True
+    concept_breakdown: List[Dict[str, Any]] = Field(default_factory=list)
+    mastery: Dict[str, Any] = Field(default_factory=dict)
+    parse_status: str = "hermes_ok"
+    parse_error_code: Optional[str] = None
+    safety_level: Optional[str] = None
     usage: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -101,6 +144,12 @@ def _fallback_session_key(request: TeacherAgentChatRequest) -> str:
     return f"gradeos:tenant:{tenant_id}:teacher:{user_id}:conversation:{request.session_id}"
 
 
+def _fallback_student_session_key(request: StudentAgentChatRequest) -> str:
+    tenant_id = request.scope.get("tenant_id") or "local"
+    user_id = request.student.student_id
+    return f"gradeos:tenant:{tenant_id}:student:{user_id}:conversation:{request.session_id}"
+
+
 def _build_agent(session_id: str, session_key: str) -> AIAgent:
     return AIAgent(
         provider=os.getenv("HERMES_INFERENCE_PROVIDER") or "openrouter",
@@ -128,6 +177,37 @@ def _build_agent(session_id: str, session_key: str) -> AIAgent:
         skip_context_files=True,
         quiet_mode=True,
         max_iterations=8,
+    )
+
+
+def _build_student_agent(session_id: str, session_key: str) -> AIAgent:
+    return AIAgent(
+        provider=os.getenv("HERMES_INFERENCE_PROVIDER") or "openrouter",
+        model=os.getenv("HERMES_INFERENCE_MODEL") or "qwen/qwen3.7-plus",
+        platform="gradeos_student",
+        session_id=session_id,
+        user_id=session_key,
+        gateway_session_key=session_key,
+        enabled_toolsets=["skills"],
+        disabled_toolsets=[
+            "memory",
+            "session_search",
+            "terminal",
+            "file",
+            "browser",
+            "computer",
+            "computer_use",
+            "code_execution",
+            "delegation",
+            "cronjob",
+            "web",
+            "image_gen",
+            "tts",
+            "gradeos_tools",
+        ],
+        skip_context_files=True,
+        quiet_mode=True,
+        max_iterations=6,
     )
 
 
@@ -173,6 +253,13 @@ def _list_field(data: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _string_list_field(data: Dict[str, Any], key: str) -> List[str]:
+    value = data.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
 
 
 def _usage_field(parsed: Dict[str, Any], fallback: Dict[str, Any]) -> Dict[str, Any]:
@@ -331,5 +418,110 @@ async def teacher_agent_chat(
         tool_calls=_list_field(parsed, "tool_calls"),
         artifacts=_list_field(parsed, "artifacts"),
         action_proposals=_list_field(parsed, "action_proposals"),
+        usage=_usage_field(parsed, usage),
+    )
+
+
+@app.post("/v1/gradeos/student-agent/chat", response_model=StudentAgentChatResponse)
+async def student_agent_chat(
+    request: StudentAgentChatRequest,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_hermes_session_key: Optional[str] = Header(default=None, alias="X-Hermes-Session-Key"),
+    x_hermes_session_id: Optional[str] = Header(default=None, alias="X-Hermes-Session-Id"),
+) -> StudentAgentChatResponse:
+    _verify_internal_auth(authorization)
+    if not os.getenv("OPENROUTER_API_KEY"):
+        raise HTTPException(status_code=503, detail="OPENROUTER_API_KEY is not configured")
+
+    session_id = _validate_header_scope(
+        x_hermes_session_id or request.session_id,
+        "X-Hermes-Session-Id",
+    )
+    session_key = _validate_header_scope(
+        x_hermes_session_key or _fallback_student_session_key(request),
+        "X-Hermes-Session-Key",
+    )
+
+    attachment_context = [_compact_attachment(item) for item in request.attachments]
+    model_name = os.getenv("HERMES_INFERENCE_MODEL") or "qwen/qwen3.7-plus"
+    response_contract = {
+        "content": "student-facing tutoring answer",
+        "response_type": "chat | question | assessment | explanation",
+        "next_question": "optional diagnostic question",
+        "question_options": [],
+        "focus_mode": True,
+        "concept_breakdown": [],
+        "mastery": {
+            "score": 0,
+            "level": "beginner | developing | proficient | mastery",
+            "analysis": "",
+            "evidence": [],
+            "suggestions": [],
+        },
+        "model": model_name,
+        "usage": {},
+    }
+    # Codex change: student smoke endpoint is intentionally toolless/read-only.
+    enriched_message = (
+        "You are the GradeOS student learning assistant. Tutor the student with "
+        "first-principles explanations and Socratic questions.\n"
+        "Return exactly one JSON object with these fields: content, response_type, "
+        "next_question, question_options, focus_mode, concept_breakdown, mastery, "
+        "model, usage, parse_status. Do not return teacher-facing artifacts, action "
+        "proposals, internal URLs, raw tokens, or hidden reasoning.\n\n"
+        "<gradeos-student-context>\n"
+        f"student_id: {request.student.student_id}\n"
+        f"session_id: {session_id}\n"
+        f"session_key: {session_key}\n"
+        f"scope: {request.scope}\n"
+        f"context: {request.context}\n"
+        f"history: {request.history[-8:]}\n"
+        f"attachments: {attachment_context}\n"
+        f"tool_policy: {request.tool_policy}\n"
+        f"response_contract: {response_contract}\n"
+        "security: GradeOS backend is the authority for identity, class scope, "
+        "conversation persistence, progress records, and safety events. Do not "
+        "attempt to read or write GradeOS internal data directly.\n"
+        "</gradeos-student-context>\n\n"
+        f"Student question:\n{request.message}"
+    )
+    agent = _build_student_agent(session_id, session_key)
+    result = await asyncio.to_thread(agent.run_conversation, enriched_message)
+    content = ""
+    usage: Dict[str, Any] = {}
+    if isinstance(result, dict):
+        raw_content = result.get("final_response") or result.get("response") or ""
+        content = (
+            raw_content
+            if isinstance(raw_content, str)
+            else json.dumps(raw_content, ensure_ascii=False)
+        )
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    else:
+        content = str(result)
+    if not usage:
+        usage = _agent_usage(agent, result, model_name)
+    parsed = _json_from_text(content) or {}
+    mastery = parsed.get("mastery") if isinstance(parsed.get("mastery"), dict) else {}
+
+    return StudentAgentChatResponse(
+        request_id=request.request_id,
+        session_id=session_id,
+        session_key=session_key,
+        content=str(parsed.get("content") or content),
+        model=str(parsed.get("model") or model_name),
+        response_type=str(parsed.get("response_type") or "explanation"),
+        next_question=(
+            str(parsed.get("next_question")) if parsed.get("next_question") else None
+        ),
+        question_options=_string_list_field(parsed, "question_options"),
+        focus_mode=bool(parsed.get("focus_mode", True)),
+        concept_breakdown=_list_field(parsed, "concept_breakdown"),
+        mastery=mastery,
+        parse_status=str(parsed.get("parse_status") or "hermes_ok"),
+        parse_error_code=(
+            str(parsed.get("parse_error_code")) if parsed.get("parse_error_code") else None
+        ),
+        safety_level=str(parsed.get("safety_level")) if parsed.get("safety_level") else None,
         usage=_usage_field(parsed, usage),
     )
