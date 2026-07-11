@@ -238,6 +238,42 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
+# Core first-party modules that cron jobs and the gateway rely on at runtime.
+# A long-lived gateway/desktop process can hold a stale cached copy of one of
+# these modules in memory after the on-disk source changes underneath it
+# (e.g. a function a module imports gets renamed or removed), which surfaces
+# as an ImportError only inside that stale process — never here, since
+# `hermes doctor` always re-imports from current disk. What this check *does*
+# catch is the class of regression that causes it: a first-party module that
+# no longer imports cleanly at all, which would break every fresh process
+# too (see the terminal_tool / hermes_cli.cron ImportError incidents).
+_CORE_MODULE_IMPORTS: tuple[tuple[str, str], ...] = (
+    ("tools.terminal_tool", "Terminal tool"),
+    ("hermes_cli.cron", "Cron CLI"),
+    ("cron.scheduler", "Cron scheduler"),
+    ("gateway.run", "Gateway runtime"),
+)
+
+
+def _check_core_module_imports(issues: list[str]) -> None:
+    """Verify core modules import cleanly; catches source-level ImportErrors early."""
+    import importlib
+
+    _section("Core Module Imports")
+    for module_name, label in _CORE_MODULE_IMPORTS:
+        try:
+            importlib.import_module(module_name)
+            check_ok(label, f"({module_name})")
+        except Exception as e:
+            _fail_and_issue(
+                label,
+                f"({module_name}: {type(e).__name__}: {e})",
+                f"Fix the import error in {module_name}, then restart the gateway "
+                f"(hermes gateway restart) so long-running processes pick up the fix.",
+                issues,
+            )
+
+
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
@@ -481,7 +517,9 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
-    
+
+    _check_core_module_imports(issues)
+
     _section("Configuration Files")
     # Check ~/.hermes/.env (primary location for user config)
     env_path = HERMES_HOME / '.env'

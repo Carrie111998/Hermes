@@ -1307,3 +1307,32 @@ class TestDoctorCodexCliHintPlacement:
         minimax_idx = next(i for i, l in enumerate(lines) if "MiniMax OAuth" in l)
         assert self._hint_line() not in lines[minimax_idx - 1]
         assert minimax_idx + 1 >= len(lines) or self._hint_line() not in lines[minimax_idx + 1]
+
+
+class TestCoreModuleImportsCheck:
+    """Regression coverage for the terminal_tool/hermes_cli.cron ImportError
+    class of bug: a first-party module that no longer imports cleanly should
+    surface in `hermes doctor`, not just as a runtime failure in a stale
+    long-lived process."""
+
+    def _run(self):
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod._check_core_module_imports(issues)
+        return buf.getvalue(), issues
+
+    def test_reports_ok_for_real_core_modules(self):
+        out, issues = self._run()
+        assert "Terminal tool" in out
+        assert "Cron CLI" in out
+        assert "Cron scheduler" in out
+        assert issues == []
+
+    def test_reports_fail_and_issue_when_a_module_is_broken(self, monkeypatch):
+        broken = ("tests.hermes_cli._does_not_exist_module", "Broken module")
+        monkeypatch.setattr(doctor_mod, "_CORE_MODULE_IMPORTS", (broken,))
+        out, issues = self._run()
+        assert "Broken module" in out
+        assert len(issues) == 1
+        assert "tests.hermes_cli._does_not_exist_module" in issues[0]
