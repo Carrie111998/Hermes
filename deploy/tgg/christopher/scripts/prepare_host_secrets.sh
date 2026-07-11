@@ -27,7 +27,7 @@ trap 'rm -f "$tmp"' EXIT
 python3 - "$tmp" <<'PY'
 import json, os, pathlib, sys
 
-keys = ["OPENAI_API_KEY", "GEMINI_API_KEY", "CHRISTOPHER_TGG_PS_SERVICE_TOKEN"]
+keys = ["OPENAI_API_KEY", "GEMINI_API_KEY"]
 lines = []
 for key in keys:
     value = os.environ.get(key)
@@ -36,6 +36,12 @@ for key in keys:
 lines.append(f"GEMINI_API_KEY_PCL_PA_SHARED={json.dumps(os.environ['GEMINI_API_KEY'])}")
 pathlib.Path(sys.argv[1]).write_text("\n".join(lines) + "\n", encoding="utf-8")
 PY
+
+# The TGG PS service token is deliberately not copied from Studio secrets and
+# Bobby's legacy token is never reused. The processing activation transaction
+# requires a separately migrated Christopher-scoped token in the co-located
+# Systems authority and proves its identity/scopes read-only before either
+# processing key can flip.
 
 ssh "$target" 'set -euo pipefail
 if ! getent passwd pclaw >/dev/null; then

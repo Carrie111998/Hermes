@@ -87,6 +87,11 @@ spec:
     enabled: false
     authority: teren-rung-gate
     activationIncludedInThisDeployment: false
+    activationPrimitive: deploy/tgg/christopher/scripts/activate_processing.py
+    activationSemantics: >-
+      The primitive ships with the runtime but deploy never invokes it. A separate
+      Teren-authorized trust-ladder transition must prove the canonical check
+      handoff, stage the bridge fail-closed, then invoke both-key activation.
     gatePath: /home/pclaw/.hermes-christopher-tgg/runtime/processing-gate.json
     configPath: /home/pclaw/.hermes-christopher-tgg/config.yaml
     configKey: pa.enabled
@@ -134,7 +139,11 @@ spec:
         source: GEMINI_API_KEY
         requiredWhen: always
       - name: CHRISTOPHER_TGG_PS_SERVICE_TOKEN
-        source: marshal-secrets
+        source: /etc/systems-papercut-labs/tgg.env#CHRISTOPHER_TGG_PS_SERVICE_TOKEN
+        materializer: deploy/tgg/christopher/scripts/processing_activation_transaction.py
+        verifier: >-
+          GET /api/operator/auth/identity must return tenant=tgg, agent=christopher,
+          and all operator scopes; then GET /api/operator/cases/count must pass
         requiredWhen: processing-enabled
     secretValuesInSpec: false
 

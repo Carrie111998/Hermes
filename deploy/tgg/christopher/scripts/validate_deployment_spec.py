@@ -73,6 +73,27 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         raise RuntimeError("processing must remain disabled for this deployment")
     if spec["processing"]["activationIncludedInThisDeployment"] is not False:
         raise RuntimeError("the deployment must not include processing activation")
+    expected_activation_primitive = (
+        "deploy/tgg/christopher/scripts/activate_processing.py"
+    )
+    if spec["processing"].get("activationPrimitive") != expected_activation_primitive:
+        raise RuntimeError("processing activation primitive path drifted")
+    _resolve(app_root, expected_activation_primitive)
+    ps_token = next(
+        (row for row in spec["env"]["refs"] if row.get("name") == "CHRISTOPHER_TGG_PS_SERVICE_TOKEN"),
+        None,
+    )
+    if ps_token != {
+        "name": "CHRISTOPHER_TGG_PS_SERVICE_TOKEN",
+        "source": "/etc/systems-papercut-labs/tgg.env#CHRISTOPHER_TGG_PS_SERVICE_TOKEN",
+        "materializer": "deploy/tgg/christopher/scripts/processing_activation_transaction.py",
+        "verifier": (
+            "GET /api/operator/auth/identity must return tenant=tgg, agent=christopher, "
+            "and all operator scopes; then GET /api/operator/cases/count must pass"
+        ),
+        "requiredWhen": "processing-enabled",
+    }:
+        raise RuntimeError("processing PS service-token materialization contract drifted")
     if (
         spec["processing"]["effectiveEnableRule"]
         != "pa.enabled AND processing-gate.enabled"
@@ -251,6 +272,8 @@ def validate(app_root: Path, spec_path: Path) -> dict[str, Any]:
         "model_tools.py",
         "deploy/tgg/christopher/client-agent-deployment.yaml",
         "deploy/tgg/christopher/scripts/build_pa_agent_manifest.py",
+        "deploy/tgg/christopher/scripts/activate_processing.py",
+        "deploy/tgg/christopher/scripts/processing_activation_transaction.py",
         "deploy/tgg/christopher/scripts/validate_deployment_spec.py",
         "deploy/tgg/christopher/scripts/verify_runtime.sh",
     }

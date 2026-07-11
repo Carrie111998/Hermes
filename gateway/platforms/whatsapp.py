@@ -1477,8 +1477,19 @@ class WhatsAppAdapter(BasePlatformAdapter):
                         data = await resp.json()
                         last_message_id = data.get("messageId")
                     else:
-                        error = await resp.text()
-                        return SendResult(success=False, error=error)
+                        body = await resp.text()
+                        try:
+                            data = json.loads(body)
+                        except (TypeError, json.JSONDecodeError):
+                            data = {"error": body}
+                        if resp.status == 202 and data.get("outcome") == "unknown":
+                            return SendResult(
+                                success=False,
+                                error=data.get("error") or "WhatsApp send outcome unknown",
+                                raw_response=data,
+                                retryable=False,
+                            )
+                        return SendResult(success=False, error=body, raw_response=data)
 
                 # Small delay between chunks to avoid rate limiting
                 if len(chunks) > 1:
@@ -1519,8 +1530,19 @@ class WhatsAppAdapter(BasePlatformAdapter):
                 if resp.status == 200:
                     return SendResult(success=True, message_id=message_id)
                 else:
-                    error = await resp.text()
-                    return SendResult(success=False, error=error)
+                    body = await resp.text()
+                    try:
+                        data = json.loads(body)
+                    except (TypeError, json.JSONDecodeError):
+                        data = {"error": body}
+                    if resp.status == 202 and data.get("outcome") == "unknown":
+                        return SendResult(
+                            success=False,
+                            error=data.get("error") or "WhatsApp media outcome unknown",
+                            raw_response=data,
+                            retryable=False,
+                        )
+                    return SendResult(success=False, error=body, raw_response=data)
         except Exception as e:
             return SendResult(success=False, error=str(e))
 

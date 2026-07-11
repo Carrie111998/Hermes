@@ -314,6 +314,21 @@ class TestSendChunking:
         assert "Internal Server Error" in result.error
 
     @pytest.mark.asyncio
+    async def test_bridge_unknown_outcome_is_explicitly_non_retryable(self):
+        adapter = _make_adapter()
+        resp = MagicMock(status=202)
+        resp.text = AsyncMock(
+            return_value='{"success":false,"outcome":"unknown","retrySafe":false,"error":"still pending"}'
+        )
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send("chat1", "hello")
+        assert result.success is False
+        assert result.retryable is False
+        assert result.raw_response["outcome"] == "unknown"
+        assert result.raw_response["retrySafe"] is False
+
+    @pytest.mark.asyncio
     async def test_not_connected_returns_failure(self):
         adapter = _make_adapter()
         adapter._running = False

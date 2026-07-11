@@ -1,0 +1,332 @@
+from __future__ import annotations
+
+import importlib.util
+import base64
+import json
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+
+SCRIPT = (
+    Path(__file__).resolve().parents[2]
+    / "deploy/tgg/christopher/scripts/processing_activation_transaction.py"
+)
+SPEC = importlib.util.spec_from_file_location("tgg_processing_activation", SCRIPT)
+assert SPEC and SPEC.loader
+module = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = module
+SPEC.loader.exec_module(module)
+
+
+class FakeService:
+    def __init__(self, config: Path, gate: Path) -> None:
+        self.config = config
+        self.gate = gate
+        self.running = True
+        self.stops = 0
+        self.starts = 0
+
+    def stop(self) -> None:
+        self.running = False
+        self.stops += 1
+
+    def start(self) -> None:
+        self.running = True
+        self.starts += 1
+
+    def wait(
+        self,
+        enabled: bool,
+        *,
+        generation: int,
+        change_run_id: str,
+        changed_at: str,
+    ) -> dict[str, object]:
+        assert self.running
+        state = module.read_states(self.config.read_bytes(), self.gate.read_bytes())
+        assert state["configEnabled"] is enabled
+        assert state["gateEnabled"] is enabled
+        assert generation == state["gateGeneration"]
+        assert change_run_id
+        assert datetime.fromisoformat(changed_at.replace("Z", "+00:00"))
+        return {
+            "state": "running" if enabled else "standby",
+            "config_enabled": enabled,
+            "gate_enabled": enabled,
+            "gate_generation": state["gateGeneration"],
+            "gate_change_run_id": change_run_id,
+            "pid": 123,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def fixture(tmp_path: Path, *, enabled: bool = False) -> tuple[Path, Path, Path, FakeService]:
+    config = tmp_path / "config.yaml"
+    gate = tmp_path / "processing-gate.json"
+    cursor = tmp_path / "capture-cursor.json"
+    config.write_text(
+        "pa:\n"
+        f"  enabled: {'true' if enabled else 'false'}\n"
+        "platforms:\n"
+        "  whatsapp:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    gate.write_text(
+        json.dumps({"version": 1, "enabled": enabled, "generation": 4}) + "\n",
+        encoding="utf-8",
+    )
+    cursor.write_text(
+        json.dumps({"version": 1, "initial_offset": 100, "offset": 100}) + "\n",
+        encoding="utf-8",
+    )
+    return config, gate, cursor, FakeService(config, gate)
+
+
+def test_activate_sets_both_keys_while_consumer_is_stopped_and_preserves_cursor(tmp_path: Path) -> None:
+    config, gate, cursor, service = fixture(tmp_path)
+    receipt = module.apply_transition(
+        mode="activate",
+        config_path=config,
+        gate_path=gate,
+        cursor_path=cursor,
+        service=service,
+        metadata={"terenVerdictId": "verdict-1", "preCheckRunId": "run-1"},
+    )
+    state = module.read_states(config.read_bytes(), gate.read_bytes())
+    assert state == {"configEnabled": True, "gateEnabled": True, "gateGeneration": 5}
+    assert "platforms:\n  whatsapp:\n    enabled: false" in config.read_text()
+    assert receipt["before"]["configEnabled"] is False
+    assert receipt["after"]["configEnabled"] is True
+    assert receipt["cursorBeforeSha256"] == receipt["cursorAfterSha256"]
+    assert receipt["terenVerdictId"] == "verdict-1"
+    assert service.stops == 1 and service.starts == 1
+
+
+def test_deactivate_is_the_symmetric_both_key_reverse(tmp_path: Path) -> None:
+    config, gate, cursor, service = fixture(tmp_path, enabled=True)
+    receipt = module.apply_transition(
+        mode="deactivate",
+        config_path=config,
+        gate_path=gate,
+        cursor_path=cursor,
+        service=service,
+        metadata={},
+    )
+    state = module.read_states(config.read_bytes(), gate.read_bytes())
+    assert state == {"configEnabled": False, "gateEnabled": False, "gateGeneration": 5}
+    assert receipt["mode"] == "deactivate"
+    assert receipt["consumerStatus"]["state"] == "standby"
+
+
+def test_second_file_failure_rolls_both_keys_back_before_consumer_restarts(tmp_path: Path) -> None:
+    config, gate, cursor, service = fixture(tmp_path)
+    original_config = config.read_bytes()
+    original_gate = gate.read_bytes()
+    calls = 0
+
+    def fail_once_on_second_write(path: Path, data: bytes) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("fixture second rename failed")
+        module.atomic_replace(path, data)
+
+    with pytest.raises(OSError, match="second rename failed"):
+        module.apply_transition(
+            mode="activate",
+            config_path=config,
+            gate_path=gate,
+            cursor_path=cursor,
+            service=service,
+            metadata={},
+            writer=fail_once_on_second_write,
+        )
+    assert config.read_bytes() == original_config
+    assert gate.read_bytes() == original_gate
+    assert service.running is True
+    assert service.stops == 2 and service.starts == 1
+
+
+def test_split_initial_state_refuses_before_stopping_service(tmp_path: Path) -> None:
+    config, gate, cursor, service = fixture(tmp_path)
+    gate.write_text(json.dumps({"version": 1, "enabled": True, "generation": 4}) + "\n")
+    with pytest.raises(RuntimeError, match="already split"):
+        module.apply_transition(
+            mode="activate",
+            config_path=config,
+            gate_path=gate,
+            cursor_path=cursor,
+            service=service,
+            metadata={},
+        )
+    assert service.stops == 0 and service.starts == 0
+
+
+def test_activation_grant_is_signature_context_expiry_and_replay_bound(tmp_path: Path) -> None:
+    private = Ed25519PrivateKey.generate()
+    public_path = tmp_path / "controller.pub"
+    public_path.write_bytes(
+        private.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    now = datetime.now(timezone.utc)
+    payload = {
+        "schema": module.GRANT_SCHEMA,
+        "purpose": "processing-activate",
+        "transitionId": "transition-1",
+        "packetHash": "a" * 64,
+        "sourceEventId": "transition-1:processing-activate",
+        "authoritySha256": "b" * 64,
+        "hermesCommit": "c" * 40,
+        "canonicalRunIds": {"preLive": "run-1", "armedDetector": "run-2"},
+        "remoteTransactionSha256": "d" * 64,
+        "issuedAt": now.isoformat(),
+        "expiresAt": (now + timedelta(minutes=5)).isoformat(),
+        "nonce": "fixture-nonce",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    request = {
+        "transitionId": "transition-1",
+        "transitionPacketHash": "a" * 64,
+        "authoritySha256": "b" * 64,
+        "hermesCommit": "c" * 40,
+        "remoteTransactionSha256": "d" * 64,
+        "preCheckRunId": "run-1",
+        "armedDetectorRunId": "run-2",
+        "grantB64": base64.b64encode(raw).decode(),
+        "grantSignatureB64": base64.b64encode(private.sign(raw)).decode(),
+    }
+    verified = module.verify_controller_grant(request, public_key_path=public_path, now=now)
+    wrong_transaction = dict(request)
+    wrong_transaction["remoteTransactionSha256"] = "e" * 64
+    with pytest.raises(RuntimeError, match="remoteTransactionSha256 mismatch"):
+        module.verify_controller_grant(
+            wrong_transaction, public_key_path=public_path, now=now
+        )
+    ledger = tmp_path / "ledger"
+    module.consume_controller_grant(verified, ledger=ledger)
+    with pytest.raises(FileExistsError):
+        module.consume_controller_grant(verified, ledger=ledger)
+    request["authoritySha256"] = "d" * 64
+    with pytest.raises(RuntimeError, match="authoritySha256 mismatch"):
+        module.verify_controller_grant(request, public_key_path=public_path, now=now)
+
+
+class FakePsResponse:
+    status = 200
+
+    def __init__(self, payload: dict[str, object]) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "FakePsResponse":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode()
+
+
+def test_ps_service_token_materializes_from_systems_and_verifies_without_receipt_leak(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "systems.env"
+    target = tmp_path / "hermes.env"
+    source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
+    target.write_text("OPENAI_API_KEY=fixture-openai\n", encoding="utf-8")
+    os.chmod(target, 0o600)
+    observed: list[tuple[str, str, int]] = []
+
+    def opener(request: object, *, timeout: int) -> FakePsResponse:
+        observed.append((request.full_url, request.headers.get("Authorization"), timeout))
+        if request.full_url == module.PS_SERVICE_IDENTITY_URL:
+            return FakePsResponse(
+                {
+                    "ok": True,
+                    "data": {
+                        "tenantSlug": "tgg",
+                        "agentName": "christopher",
+                        "scopes": sorted(module.EXPECTED_PS_SCOPES),
+                    },
+                }
+            )
+        return FakePsResponse({"ok": True, "data": {"total": 3397}})
+
+    evidence = module.materialize_ps_service_token(
+        source_env_path=source,
+        target_env_path=target,
+        opener=opener,
+    )
+    assert module.read_env_value(
+        target.read_text(encoding="utf-8"), module.TARGET_PS_TOKEN_KEY
+    ) == "fixture-token"
+    assert "OPENAI_API_KEY=fixture-openai" in target.read_text(encoding="utf-8")
+    assert observed == [
+        (module.PS_SERVICE_IDENTITY_URL, "Bearer fixture-token", 5),
+        (module.PS_SERVICE_VERIFY_URL, "Bearer fixture-token", 5),
+    ]
+    assert evidence["changed"] is True
+    assert evidence["verification"]["caseCount"] == 3397
+    assert evidence["verification"]["agentName"] == "christopher"
+    assert "fixture-token" not in json.dumps(evidence)
+
+
+def test_ps_service_token_verification_failure_restores_target_env(tmp_path: Path) -> None:
+    source = tmp_path / "systems.env"
+    target = tmp_path / "hermes.env"
+    source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
+    original = b"OPENAI_API_KEY=fixture-openai\n"
+    target.write_bytes(original)
+    os.chmod(target, 0o600)
+
+    def opener(_request: object, *, timeout: int) -> FakePsResponse:
+        assert timeout == 5
+        return FakePsResponse({"ok": False, "error": {"code": "INVALID_TOKEN"}})
+
+    with pytest.raises(RuntimeError, match="response was invalid"):
+        module.materialize_ps_service_token(
+            source_env_path=source,
+            target_env_path=target,
+            opener=opener,
+        )
+    assert target.read_bytes() == original
+
+
+def test_bobby_scoped_token_is_a_hard_activation_failure(tmp_path: Path) -> None:
+    source = tmp_path / "systems.env"
+    target = tmp_path / "hermes.env"
+    source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
+    original = b"OPENAI_API_KEY=fixture-openai\n"
+    target.write_bytes(original)
+    os.chmod(target, 0o600)
+
+    def opener(_request: object, *, timeout: int) -> FakePsResponse:
+        assert timeout == 5
+        return FakePsResponse(
+            {
+                "ok": True,
+                "data": {
+                    "tenantSlug": "tgg",
+                    "agentName": "bobby",
+                    "scopes": sorted(module.EXPECTED_PS_SCOPES),
+                },
+            }
+        )
+
+    with pytest.raises(RuntimeError, match="not Christopher-scoped"):
+        module.materialize_ps_service_token(
+            source_env_path=source,
+            target_env_path=target,
+            opener=opener,
+        )
+    assert target.read_bytes() == original

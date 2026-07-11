@@ -1187,6 +1187,20 @@ async def _send_whatsapp(extra, chat_id, message):
                         "message_id": data.get("messageId"),
                     }
                 body = await resp.text()
+                if resp.status == 202:
+                    try:
+                        data = json.loads(body)
+                    except (TypeError, json.JSONDecodeError):
+                        data = {}
+                    if data.get("outcome") == "unknown" and data.get("retrySafe") is False:
+                        return {
+                            "success": False,
+                            "platform": "whatsapp",
+                            "chat_id": chat_id,
+                            "outcome": "unknown",
+                            "retry_safe": False,
+                            "error": data.get("error") or "WhatsApp send outcome unknown",
+                        }
                 return _error(f"WhatsApp bridge error ({resp.status}): {body}")
     except Exception as e:
         return _error(f"WhatsApp send failed: {e}")
