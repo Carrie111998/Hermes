@@ -130,6 +130,17 @@ _NEVER_CONSUME = frozenset({
 })
 
 
+def _probe_actionable(transition: dict) -> bool:
+    """A probe state-change worth a phone ping: a DEGRADATION (anything not
+    ending 'healthy') of a non-optional-tier probe. Missing/unknown tiers
+    fail open (treated as actionable) so producer drift degrades to noisy,
+    not silent."""
+    return (
+        transition.get("after") != "healthy"
+        and transition.get("tier") != "optional"
+    )
+
+
 def classify_tier(event: Event) -> Optional[EscalationTier]:
     """Classify an event into its WhatsApp escalation tier.
 
@@ -148,6 +159,24 @@ def classify_tier(event: Event) -> Optional[EscalationTier]:
         if score >= HIGH_SCORE_WA_THRESHOLD:
             return EscalationTier.IMPORTANT
         return None
+
+    # Conditional: watchdog probe signals are tier-aware (2026-07-11 operator
+    # feedback — WhatsApp was flooded with count-55 bursts of optional-tier
+    # container flaps and pure recoveries). Only a degradation of a probe the
+    # operator must act on (tier critical/important) earns a phone ping;
+    # optional-tier noise and recovery-only signals stay on Telegram/bus.
+    # A burst with a missing/empty transitions list falls through to the
+    # tier map (fail open — an URGENT ping on a malformed payload beats
+    # silently dropping a real outage).
+    if event.event_type == EventType.WATCHDOG_BURST:
+        transitions = [t for t in (event.payload.get("transitions") or [])
+                       if isinstance(t, dict)]
+        if transitions and not any(_probe_actionable(t) for t in transitions):
+            return None
+
+    if event.event_type == EventType.WATCHDOG_PROBE_TRANSITION:
+        if not _probe_actionable(event.payload):
+            return None
 
     return _TIER_BY_EVENT.get(event.event_type)
 
@@ -372,8 +401,21 @@ class WhatsAppEscalator(BaseSubscriber):
             self._flush_throttle_buffer()
 
     def format_message(self, event: Event) -> str:
-        """Format event as plain-text WhatsApp message."""
-        from events.formatting import format_whatsapp_message
+        """Format event as plain-text WhatsApp message.
+
+        Every escalated type gets a complete plain-English sentence. The
+        pre-2026-07-11 fallback (`json.dumps(payload)[:200]`) shipped
+        truncated raw JSON to Diego's phone — never reintroduce it; add a
+        branch (or a shared body helper in events.formatting) instead.
+        """
+        from events.formatting import (
+            failure_cluster_body,
+            format_whatsapp_message,
+            humanize_health_detail,
+            probe_transition_body,
+            silence_alert_body,
+            watchdog_burst_body,
+        )
 
         p = event.payload
         et = event.event_type
@@ -393,7 +435,9 @@ class WhatsAppEscalator(BaseSubscriber):
         elif et == EventType.CRON_FAILED_CONSECUTIVE:
             text = f"Cron job '{p.get('job_name', '?')}' has failed {p.get('consecutive_errors', '?')} times in a row: {p.get('error', '')}"
         elif et == EventType.GATEWAY_HEALTH:
-            text = f"Gateway {p.get('platform', '?')} is DOWN. {p.get('detail', '')}"
+            reason = humanize_health_detail(p.get("detail", ""))
+            text = f"The {p.get('platform', '?')} gateway is DOWN"
+            text += f" — {reason}" if reason else "."
         elif et == EventType.FOLLOWUP_DUE:
             text = f"Follow-up due for {p.get('company', '?')} — {p.get('days', 14)}+ days no response"
         elif et == EventType.AGENT_ERROR:
@@ -409,8 +453,68 @@ class WhatsAppEscalator(BaseSubscriber):
             probe = p.get("probe", "?")
             after = str(p.get("after", "down")).upper()
             text = f"🔑 Credential loss: {probe} is {after}. {p.get('detail', '')}".strip()
+        elif et == EventType.WATCHDOG_BURST:
+            text = watchdog_burst_body(p)
+        elif et == EventType.WATCHDOG_PROBE_TRANSITION:
+            text = probe_transition_body(p)
+        elif et == EventType.WATCHDOG_SILENCE_ALERT:
+            text = silence_alert_body(p)
+        elif et == EventType.AGENT_FAILURE_CLUSTER:
+            text = failure_cluster_body(p)
+        elif et == EventType.SECRET_DETECTED:
+            text = (
+                f"Possible secret ({p.get('rule_id', '?')}) found in "
+                f"{p.get('file_path', '?')}:{p.get('line_no', '?')}. "
+                f"Verify and rotate if real."
+            )
+        elif et == EventType.APPROVAL_REQUEST:
+            text = (
+                f"JobFlow is paused waiting on your approval: "
+                f"{p.get('job_title', '?')} at {p.get('job_company', '?')} "
+                f"(score {p.get('score', '?')})."
+            )
+        elif et == EventType.APPLY_PACKET:
+            text = (
+                f"Apply packet ready: {p.get('title', '?')} at "
+                f"{p.get('company', '?')} — everything staged for your manual submit."
+            )
+        elif et == EventType.CRITIC_PROPOSAL:
+            text = (
+                f"Critic proposal ({p.get('kind', 'tuning')}): "
+                f"{str(p.get('summary') or 'see Telegram for the proposal')[:200]}"
+            )
+        elif et == EventType.DEVFLOW_BUILD_FAILED:
+            text = f"Build '{p.get('build_name', '?')}' failed in {p.get('repo', '?')}"
+            if p.get("branch"):
+                text += f" on {p['branch']}"
+            text += "."
+            err = str(p.get("error_summary") or "").strip()
+            if err:
+                text += f" {err[:160]}"
+        elif et == EventType.DEVFLOW_PR_REVIEW_REQUESTED:
+            text = (
+                f"PR #{p.get('pr_number', '?')} in {p.get('repo', '?')} "
+                f"needs your review: {p.get('title', '?')}"
+            )
+            if p.get("url"):
+                text += f"\n{p['url']}"
+        elif et == EventType.DEVFLOW_APPROVAL_REQUESTED:
+            text = f"DevFlow run {p.get('run_id', '?')} needs your approval"
+            reason = str(p.get("reason") or p.get("title") or "").strip()
+            text += f": {reason[:160]}" if reason else "."
         else:
-            text = f"{et.type_string}: {json.dumps(p)[:200]}"
+            # Last-resort fallback for types added to the tier map without a
+            # branch above: readable scalar pairs, never raw/truncated JSON.
+            scalars = [
+                f"{k}: {v}" for k, v in p.items()
+                if isinstance(v, (str, int, float, bool))
+                and str(v).strip() and k != "watchdog_type"
+            ]
+            body = " · ".join(scalars[:6])[:300]
+            text = (
+                f"{et.type_string}: {body}" if body
+                else f"{et.type_string} event — details in Telegram"
+            )
 
         formatted = format_whatsapp_message(event, text.strip())
         return f"{formatted}\n\nDetails in Telegram"

@@ -549,7 +549,36 @@ class TelegramNotifier(BaseSubscriber):
             return f"Error: {p.get('error', 'Unknown')}\nCompany: {p.get('company', '?')}"
 
         if et == EventType.GATEWAY_HEALTH:
-            return f"Platform: {p.get('platform', '?')} → {p.get('status', '?')}\n{p.get('detail', '')}"
+            # Lead with the plain-language diagnosis; keep the raw error
+            # below it — Telegram is the diagnostic surface.
+            from events.formatting import humanize_health_detail
+            detail = p.get("detail", "")
+            reason = humanize_health_detail(detail)
+            lines = [f"Platform: {p.get('platform', '?')} → {p.get('status', '?')}"]
+            if reason:
+                lines.append(reason)
+            if detail and detail != reason:
+                lines.append(f"raw: {detail}")
+            return "\n".join(lines)
+
+        # Watchdog signals share plain-language bodies with the WhatsApp
+        # escalator (2026-07-11) — the generic fallback used to splat the
+        # raw `transitions` list of dicts into the topic.
+        if et == EventType.WATCHDOG_BURST:
+            from events.formatting import watchdog_burst_body
+            return watchdog_burst_body(p, max_listed=15, aggregate_optional=False)
+
+        if et == EventType.WATCHDOG_PROBE_TRANSITION:
+            from events.formatting import probe_transition_body
+            return probe_transition_body(p)
+
+        if et == EventType.WATCHDOG_SILENCE_ALERT:
+            from events.formatting import silence_alert_body
+            return silence_alert_body(p)
+
+        if et == EventType.AGENT_FAILURE_CLUSTER:
+            from events.formatting import failure_cluster_body
+            return failure_cluster_body(p)
 
         if et == EventType.RESOURCE_PRESSURE:
             # 2026-06-11 pagefile-burst remediation. Render a tight operator

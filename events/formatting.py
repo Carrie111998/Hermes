@@ -6,6 +6,7 @@ TelegramNotifier, TelegramMirror, WhatsAppEscalator, and DigestComposer.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -205,13 +206,221 @@ def format_event_message(event: Event, body: str) -> str:
     return header
 
 
+# WhatsApp header titles in plain language (2026-07-11 operator feedback:
+# "what the heck is a WATCHDOG_BURST????"). WhatsApp is Diego's phone-
+# lockscreen surface — enum names like WATCHDOG_PROBE_TRANSITION are
+# system jargon there. Telegram keeps the raw enum names (format_header)
+# because its topics are the operator/diagnostic surface. Types not in
+# this map fall back to the enum name.
+WHATSAPP_TITLE_BY_EVENT = {
+    EventType.WATCHDOG_BURST:              "SYSTEM HEALTH ALERT",
+    EventType.WATCHDOG_PROBE_TRANSITION:   "SYSTEM HEALTH ALERT",
+    EventType.WATCHDOG_SILENCE_ALERT:      "AGENT WENT QUIET",
+    EventType.AGENT_FAILURE_CLUSTER:       "REPEATED FAILURES",
+    EventType.GATEWAY_HEALTH:              "GATEWAY HEALTH",
+    EventType.CREDENTIAL_LOSS:             "CREDENTIAL LOST",
+    EventType.CRON_FAILED_CONSECUTIVE:     "CRON JOB FAILING",
+    EventType.AGENT_ERROR:                 "AGENT ERRORS",
+    EventType.DEVFLOW_BUILD_FAILED:        "BUILD FAILED",
+    EventType.DEVFLOW_PR_REVIEW_REQUESTED: "PR REVIEW NEEDED",
+    EventType.DEVFLOW_APPROVAL_REQUESTED:  "DEVFLOW APPROVAL NEEDED",
+    EventType.APPROVAL_REQUEST:            "APPROVAL NEEDED",
+    EventType.APPLY_PACKET:                "APPLY PACKET READY",
+    EventType.CRITIC_PROPOSAL:             "CRITIC PROPOSAL",
+    EventType.INTERVIEW_SIGNAL:            "INTERVIEW SIGNAL",
+    EventType.OFFER_SIGNAL:                "JOB OFFER",
+    EventType.SECRET_DETECTED:             "SECRET DETECTED",
+    EventType.RESOURCE_PRESSURE:           "RESOURCE PRESSURE",
+    EventType.DIGEST_GENERATED:            "MORNING DIGEST",
+}
+
+
+def format_whatsapp_header(event: Event) -> str:
+    """WhatsApp header: like format_header but with a plain-language title."""
+    title = WHATSAPP_TITLE_BY_EVENT.get(event.event_type)
+    if title is None or event.event_type == EventType.MAILBOX_MESSAGE:
+        return format_header(event)
+    dot = priority_dot(event.priority)
+    icon = event_icon(event)
+    ts = _short_time(event.timestamp)
+    return f"{dot} {icon} {title} — {event.source} · {ts}"
+
+
 def format_whatsapp_message(event: Event, body: str) -> str:
     """Compact formatted message for WhatsApp: header + body, no separator.
 
     WhatsApp is a scanning medium; body should already be concise. Caller
     decides whether to append 'Details in Telegram.'
     """
-    header = format_header(event)
+    header = format_whatsapp_header(event)
     if body:
         return f"{header}\n{body}"
     return header
+
+
+# --- Plain-language alert bodies (2026-07-11) --------------------------------
+# Shared by WhatsAppEscalator (compact) and TelegramNotifier (full detail) so
+# both surfaces tell the same story. Contract: every function returns complete
+# sentences an operator can act on from a phone — NEVER raw payload JSON.
+# Payload shapes come from profiles/watchdog/workspace/watchdog_sweep.py
+# (_detect_transitions / _detect_silences) and events/producers/health_monitor.py.
+
+# Probe tiers as assigned by laptop-monitor status.json. Anything not
+# explicitly "optional" is treated as operator-actionable (fail-open on
+# unknown/missing tiers so producer drift degrades to noisy, not silent).
+_TIER_RANK = {"critical": 0, "important": 1, "optional": 2}
+
+
+def format_duration(seconds) -> str:
+    """Render a second count as '45s' / '8m 29s' / '2h 5m'."""
+    try:
+        s = int(float(seconds))
+    except (TypeError, ValueError):
+        return str(seconds)
+    s = max(s, 0)
+    if s < 60:
+        return f"{s}s"
+    m, sec = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {sec}s" if sec else f"{m}m"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def humanize_health_detail(detail: str) -> str:
+    """Translate a raw requests/urllib3 error string into plain language.
+
+    'HTTPConnectionPool(host=..., port=3000): Max retries exceeded ...
+    NewConnectionError(...)' reads as gibberish on a phone; render the
+    diagnosis ('connection refused — nothing listening on 127.0.0.1:3000')
+    instead. Unrecognized details pass through trimmed to one line.
+    """
+    d = str(detail or "").strip()
+    if not d:
+        return ""
+    m = re.search(r"host='([^']+)'(?:,\s*port=(\d+))?", d)
+    where = ""
+    if m:
+        where = f"{m.group(1)}:{m.group(2)}" if m.group(2) else m.group(1)
+    if "Read timed out" in d:
+        base = "it accepted the connection but never answered (timed out)"
+    elif (
+        "Failed to establish a new connection" in d
+        or "Connection refused" in d
+        or "NewConnectionError" in d
+        or "Max retries exceeded" in d
+    ):
+        base = "connection refused — nothing is listening"
+    elif "getaddrinfo" in d or "Name or service not known" in d:
+        base = "DNS lookup failed"
+    elif d.startswith("HTTP "):
+        return f"health endpoint returned {d}"
+    else:
+        return d.splitlines()[0][:160]
+    return f"{base} on {where}" if where else base
+
+
+def watchdog_burst_body(payload: dict, *, max_listed: int = 5,
+                        aggregate_optional: bool = True) -> str:
+    """Plain-language summary of a coalesced watchdog_burst payload.
+
+    A 'burst' is the watchdog sweep seeing 2+ monitored probes change state
+    in the same pass. Lead with what is FAILING (critical first), aggregate
+    optional-tier flaps and recoveries into counts. With
+    aggregate_optional=False (Telegram), optional-tier failures are listed
+    individually like the rest.
+    """
+    transitions = [t for t in (payload.get("transitions") or [])
+                   if isinstance(t, dict)]
+    count = payload.get("count") or len(transitions)
+    if not transitions:
+        return (f"{count} monitored services changed state in one sweep "
+                f"(no probe detail attached).")
+
+    failing = [t for t in transitions if t.get("after") != "healthy"]
+    recovered = [t for t in transitions if t.get("after") == "healthy"]
+
+    if not failing:
+        names = ", ".join(t.get("probe", "?") for t in recovered[:3])
+        more = f" +{len(recovered) - 3} more" if len(recovered) > 3 else ""
+        return (f"Good news — all {len(recovered)} changes were recoveries: "
+                f"{names}{more}.")
+
+    if aggregate_optional:
+        listed = [t for t in failing if t.get("tier") != "optional"]
+        optional_failing = [t for t in failing if t.get("tier") == "optional"]
+    else:
+        listed = list(failing)
+        optional_failing = []
+    listed.sort(key=lambda t: _TIER_RANK.get(t.get("tier"), 1))
+
+    lines = []
+    if recovered:
+        lines.append(f"{len(failing)} checks failing, {len(recovered)} recovered:")
+    else:
+        plural = "s" if len(failing) != 1 else ""
+        lines.append(f"{len(failing)} health check{plural} failing:")
+
+    for t in listed[:max_listed]:
+        line = f"✗ {t.get('probe', '?')}: {t.get('before', '?')} → {t.get('after', '?')}"
+        if t.get("tier") == "critical":
+            line += " [critical]"
+        detail = str(t.get("detail") or "").strip()
+        if detail:
+            line += f" — {detail[:90]}"
+        lines.append(line)
+    hidden = len(listed) - max_listed
+    if hidden > 0:
+        lines.append(f"…and {hidden} more failing")
+    if optional_failing:
+        plural = "s" if len(optional_failing) != 1 else ""
+        lines.append(f"(+{len(optional_failing)} low-priority probe flap{plural})")
+    if recovered:
+        names = ", ".join(t.get("probe", "?") for t in recovered[:3])
+        more = f" +{len(recovered) - 3} more" if len(recovered) > 3 else ""
+        lines.append(f"✓ Recovered: {names}{more}")
+    return "\n".join(lines)
+
+
+def probe_transition_body(payload: dict) -> str:
+    """One monitored probe changed state — say which and what it means."""
+    probe = payload.get("probe", "?")
+    before = payload.get("before", "?")
+    after = payload.get("after", "?")
+    detail = str(payload.get("detail") or "").strip()
+    if after == "healthy":
+        text = f"✓ {probe} recovered ({before} → healthy)."
+    else:
+        text = f"✗ {probe} went {before} → {after}."
+        if payload.get("tier") == "critical":
+            text += " This is a critical check."
+    if detail:
+        text += f" {detail[:140]}"
+    return text
+
+
+def silence_alert_body(payload: dict) -> str:
+    """An agent missed its expected reporting cadence — say for how long."""
+    source = payload.get("source", "?")
+    expected = format_duration(payload.get("expected_cadence_seconds"))
+    since = payload.get("time_since_last_seconds")
+    last_seen = payload.get("last_seen")
+    if since is None or last_seen is None:
+        return (f"{source} has never been heard from "
+                f"(expected to report every {expected}).")
+    text = (f"{source} went quiet — nothing heard for {format_duration(since)} "
+            f"(normally reports every {expected}; last seen {_short_time(last_seen)}).")
+    if payload.get("severity") == "dormant":
+        text += " Quiet for 3×+ its normal cadence — likely dead, not just slow."
+    return text
+
+
+def failure_cluster_body(payload: dict) -> str:
+    """An agent failed repeatedly in a row — say who and how many times."""
+    source = payload.get("source", "?")
+    size = payload.get("cluster_size", "?")
+    last_type = payload.get("last_event_type", "?")
+    last_ts = payload.get("last_timestamp")
+    when = f" at {_short_time(last_ts)}" if last_ts else ""
+    return (f"{source} has failed {size} times in a row "
+            f"(latest: {last_type}{when}). Something is stuck — needs a look.")

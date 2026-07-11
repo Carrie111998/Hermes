@@ -887,3 +887,180 @@ class TestThrottlePersistence:
         )
         assert fresh._throttle_buffer == escalator._throttle_buffer
         assert fresh._throttle_start is not None
+
+
+class TestWatchdogRelevanceGating:
+    """2026-07-11 operator feedback: WhatsApp was flooded with count-55
+    WATCHDOG_BURSTs of optional-tier container flaps and pure recoveries.
+    Only degradations of critical/important-tier probes earn a phone ping;
+    everything else stays on Telegram/bus."""
+
+    def _burst(self, transitions) -> Event:
+        return Event.create(
+            EventType.WATCHDOG_BURST, "watchdog",
+            {"watchdog_type": "watchdog_burst", "count": len(transitions),
+             "trigger": "burst_threshold", "transitions": transitions},
+            priority=Priority.NORMAL,
+        )
+
+    def test_optional_only_burst_does_not_escalate(self):
+        event = self._burst([
+            {"probe": "Container: devflow-api", "tier": "optional",
+             "before": "healthy", "after": "down"},
+            {"probe": "Container: devflow-worker", "tier": "optional",
+             "before": "healthy", "after": "unknown"},
+        ])
+        assert classify_tier(event) is None
+
+    def test_recovery_only_burst_does_not_escalate(self):
+        event = self._burst([
+            {"probe": "Bridge: hermes->devflow lag", "tier": "important",
+             "before": "down", "after": "healthy"},
+            {"probe": "Postgres :5437", "tier": "critical",
+             "before": "down", "after": "healthy"},
+        ])
+        assert classify_tier(event) is None
+
+    def test_important_degradation_escalates_urgent(self):
+        event = self._burst([
+            {"probe": "Bridge: hermes->devflow lag", "tier": "important",
+             "before": "healthy", "after": "down"},
+            {"probe": "Container: devflow-api", "tier": "optional",
+             "before": "healthy", "after": "down"},
+        ])
+        assert classify_tier(event) == EscalationTier.URGENT
+
+    def test_missing_tier_fails_open(self):
+        # Producer drift (no tier field) must degrade to noisy, not silent.
+        event = self._burst([
+            {"probe": "mystery-probe", "before": "healthy", "after": "down"},
+        ])
+        assert classify_tier(event) == EscalationTier.URGENT
+
+    def test_empty_transitions_fails_open(self):
+        event = self._burst([])
+        assert classify_tier(event) == EscalationTier.URGENT
+
+    def test_probe_transition_recovery_does_not_escalate(self):
+        event = Event.create(
+            EventType.WATCHDOG_PROBE_TRANSITION, "watchdog",
+            {"probe": "Bridge: hermes->devflow lag", "tier": "important",
+             "before": "down", "after": "healthy"},
+        )
+        assert classify_tier(event) is None
+
+    def test_probe_transition_optional_does_not_escalate(self):
+        event = Event.create(
+            EventType.WATCHDOG_PROBE_TRANSITION, "watchdog",
+            {"probe": "Container: devflow-api", "tier": "optional",
+             "before": "healthy", "after": "down"},
+        )
+        assert classify_tier(event) is None
+
+    def test_probe_transition_critical_degradation_escalates(self):
+        event = Event.create(
+            EventType.WATCHDOG_PROBE_TRANSITION, "watchdog",
+            {"probe": "Postgres :5437", "tier": "critical",
+             "before": "healthy", "after": "down"},
+        )
+        assert classify_tier(event) == EscalationTier.URGENT
+
+
+class TestHumanReadableMessages:
+    """2026-07-11 operator feedback: escalated WhatsApp messages arrived as
+    raw payload JSON truncated at 200 chars. Every escalated type must render
+    complete plain-English sentences — no braces, no watchdog_type, no
+    HTTPConnectionPool spew."""
+
+    def _escalator(self, bus, quiet_config, queue_path):
+        return WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+        )
+
+    def test_watchdog_burst_message_is_readable(self, bus, quiet_config, queue_path):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        event = Event.create(
+            EventType.WATCHDOG_BURST, "watchdog",
+            {"watchdog_type": "watchdog_burst", "count": 2,
+             "trigger": "burst_threshold",
+             "transitions": [
+                 {"probe": "Bridge: hermes->devflow lag", "tier": "important",
+                  "category": "hermes", "before": "healthy", "after": "down"},
+                 {"probe": "Container: devflow-api", "tier": "optional",
+                  "category": "infra", "before": "healthy", "after": "down"},
+             ]},
+            priority=Priority.NORMAL,
+        )
+        msg = escalator.format_message(event)
+        assert "Bridge: hermes->devflow lag" in msg
+        assert "SYSTEM HEALTH ALERT" in msg          # plain header title
+        assert "WATCHDOG_BURST" not in msg           # no enum jargon
+        assert "{" not in msg and "}" not in msg     # no raw JSON
+        assert "watchdog_type" not in msg
+        assert "Details in Telegram" in msg
+
+    def test_silence_alert_message_is_readable(self, bus, quiet_config, queue_path):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        event = Event.create(
+            EventType.WATCHDOG_SILENCE_ALERT, "watchdog",
+            {"watchdog_type": "watchdog_silence_alert",
+             "source": "devflow-bridge",
+             "expected_cadence_seconds": 300,
+             "time_since_last_seconds": 509,
+             "last_seen": "2026-07-11T17:55:10.218930+00:00",
+             "severity": "silent"},
+            priority=Priority.HIGH,
+        )
+        msg = escalator.format_message(event)
+        assert "devflow-bridge went quiet" in msg
+        assert "8m 29s" in msg
+        assert "{" not in msg and "watchdog_type" not in msg
+
+    def test_gateway_health_message_humanizes_conn_error(self, bus, quiet_config, queue_path):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        detail = (
+            "HTTPConnectionPool(host='127.0.0.1', port=3000): "
+            "Max retries exceeded with url: /health (Caused by "
+            "NewConnectionError('HTTPConnection(host=127.0.0.1, "
+            "port=3000): Failed to establish a new connection'))"
+        )
+        event = Event.create(
+            EventType.GATEWAY_HEALTH, "system",
+            {"platform": "whatsapp", "status": "down", "detail": detail},
+            priority=Priority.HIGH,
+        )
+        msg = escalator.format_message(event)
+        assert "whatsapp gateway is DOWN" in msg
+        assert "connection refused" in msg
+        assert "127.0.0.1:3000" in msg
+        assert "HTTPConnectionPool" not in msg
+
+    def test_failure_cluster_message_is_readable(self, bus, quiet_config, queue_path):
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        event = Event.create(
+            EventType.AGENT_FAILURE_CLUSTER, "watchdog",
+            {"watchdog_type": "agent_failure_cluster",
+             "source": "mailbox:tailor", "cluster_size": 4,
+             "last_event_type": "cron_failed",
+             "last_timestamp": "2026-07-11T18:03:00+00:00",
+             "fingerprint": "mailbox:tailor|abc123"},
+            priority=Priority.HIGH,
+        )
+        msg = escalator.format_message(event)
+        assert "mailbox:tailor" in msg
+        assert "4 times in a row" in msg
+        assert "{" not in msg
+
+    def test_fallback_never_emits_raw_json(self, bus, quiet_config, queue_path):
+        # A type with no dedicated branch must render scalar pairs, not
+        # a truncated json.dumps of the payload.
+        escalator = self._escalator(bus, quiet_config, queue_path)
+        event = Event.create(
+            EventType.CRON_STALE, "cron",
+            {"job_name": "nightly-consolidate", "minutes_stale": 95,
+             "nested": {"deep": "dict"}},
+        )
+        msg = escalator.format_message(event)
+        assert "job_name: nightly-consolidate" in msg
+        assert "minutes_stale: 95" in msg
+        assert "{" not in msg and "'deep'" not in msg

@@ -87,7 +87,9 @@ def test_format_whatsapp_message_has_no_separator():
     e = _make_event(EventType.OFFER_SIGNAL, source="mailbox:notifier")
     msg = format_whatsapp_message(e, "You have an offer from Acme")
     assert SEPARATOR not in msg
-    assert "OFFER_SIGNAL" in msg
+    # 2026-07-11: WhatsApp headers use plain-language titles, not enum names.
+    assert "JOB OFFER" in msg
+    assert "OFFER_SIGNAL" not in msg
     assert "You have an offer from Acme" in msg
 
 
@@ -117,6 +119,163 @@ def test_watchdog_burst_renders_with_burst_icon():
     # the convention SECRET_DETECTED's docstring articulates.
     from events.formatting import PRIORITY_EMOJI
     assert EVENT_TYPE_EMOJI[EventType.WATCHDOG_BURST] not in PRIORITY_EMOJI.values()
+
+
+class TestPlainLanguageBodies:
+    """2026-07-11 operator feedback: WhatsApp escalations rendered as raw
+    payload JSON truncated at 200 chars ('what the heck is a
+    WATCHDOG_BURST????'). These helpers must produce complete sentences
+    with zero payload-JSON leakage on every surface."""
+
+    def test_format_duration(self):
+        from events.formatting import format_duration
+        assert format_duration(45) == "45s"
+        assert format_duration(509) == "8m 29s"
+        assert format_duration(300) == "5m"
+        assert format_duration(7500) == "2h 5m"
+        assert format_duration(None) == "None"  # graceful, not crashing
+
+    def test_humanize_health_detail_connection_refused(self):
+        from events.formatting import humanize_health_detail
+        raw = ("HTTPConnectionPool(host='127.0.0.1', port=3000): Max retries "
+               "exceeded with url: /health (Caused by NewConnectionError("
+               "\"HTTPConnection(host='127.0.0.1', port=3000): Failed to "
+               "establish a new connection\"))")
+        out = humanize_health_detail(raw)
+        assert "connection refused" in out
+        assert "127.0.0.1:3000" in out
+        assert "HTTPConnectionPool" not in out
+
+    def test_humanize_health_detail_read_timeout(self):
+        from events.formatting import humanize_health_detail
+        raw = ("HTTPConnectionPool(host='127.0.0.1', port=3000): "
+               "Read timed out. (read timeout=5)")
+        out = humanize_health_detail(raw)
+        assert "timed out" in out
+        assert "127.0.0.1:3000" in out
+        assert "HTTPConnectionPool" not in out
+
+    def test_humanize_health_detail_passthrough_and_empty(self):
+        from events.formatting import humanize_health_detail
+        assert humanize_health_detail("") == ""
+        assert humanize_health_detail("HTTP 503") == "health endpoint returned HTTP 503"
+        assert humanize_health_detail("some other failure") == "some other failure"
+
+    def test_watchdog_burst_body_leads_with_failures(self):
+        from events.formatting import watchdog_burst_body
+        body = watchdog_burst_body({
+            "count": 3,
+            "transitions": [
+                {"probe": "Container: devflow-api", "tier": "optional",
+                 "category": "infra", "before": "healthy", "after": "down"},
+                {"probe": "Bridge: hermes->devflow lag", "tier": "important",
+                 "category": "hermes", "before": "healthy", "after": "down"},
+                {"probe": "Postgres :5437", "tier": "critical",
+                 "category": "infra", "before": "healthy", "after": "down",
+                 "detail": "CONNECT_TIMEOUT"},
+            ],
+        })
+        # Critical listed first, optional aggregated into a count.
+        lines = body.splitlines()
+        assert "3 health checks failing" in lines[0]
+        assert "Postgres :5437" in lines[1] and "[critical]" in lines[1]
+        assert "CONNECT_TIMEOUT" in lines[1]
+        assert "Bridge: hermes->devflow lag" in lines[2]
+        assert "Container: devflow-api" not in body
+        assert "+1 low-priority probe flap" in body
+        # No payload JSON leakage.
+        assert "{" not in body and "watchdog_type" not in body
+
+    def test_watchdog_burst_body_recovery_only(self):
+        from events.formatting import watchdog_burst_body
+        body = watchdog_burst_body({
+            "count": 2,
+            "transitions": [
+                {"probe": "A", "tier": "important", "before": "down", "after": "healthy"},
+                {"probe": "B", "tier": "critical", "before": "unknown", "after": "healthy"},
+            ],
+        })
+        assert "recoveries" in body
+        assert "A" in body and "B" in body
+
+    def test_watchdog_burst_body_telegram_lists_optional(self):
+        from events.formatting import watchdog_burst_body
+        body = watchdog_burst_body({
+            "count": 1,
+            "transitions": [
+                {"probe": "Container: devflow-api", "tier": "optional",
+                 "before": "healthy", "after": "down"},
+            ],
+        }, aggregate_optional=False)
+        assert "Container: devflow-api" in body
+
+    def test_watchdog_burst_body_caps_listing(self):
+        from events.formatting import watchdog_burst_body
+        transitions = [
+            {"probe": f"probe-{i}", "tier": "important",
+             "before": "healthy", "after": "down"}
+            for i in range(9)
+        ]
+        body = watchdog_burst_body({"count": 9, "transitions": transitions},
+                                   max_listed=5)
+        assert "…and 4 more failing" in body
+
+    def test_watchdog_burst_body_empty_transitions(self):
+        from events.formatting import watchdog_burst_body
+        body = watchdog_burst_body({"count": 7, "transitions": []})
+        assert "7" in body and "{" not in body
+
+    def test_silence_alert_body(self):
+        from events.formatting import silence_alert_body
+        body = silence_alert_body({
+            "source": "devflow-bridge",
+            "expected_cadence_seconds": 300,
+            "time_since_last_seconds": 509,
+            "last_seen": "2026-07-11T17:55:10.218930+00:00",
+            "severity": "silent",
+        })
+        assert "devflow-bridge went quiet" in body
+        assert "8m 29s" in body
+        assert "5m" in body
+        assert "17:55 UTC" in body
+        assert "{" not in body
+
+    def test_silence_alert_body_never_seen(self):
+        from events.formatting import silence_alert_body
+        body = silence_alert_body({
+            "source": "sentinel",
+            "expected_cadence_seconds": 600,
+            "time_since_last_seconds": None,
+            "last_seen": None,
+            "severity": "never_seen",
+        })
+        assert "sentinel" in body and "never" in body
+
+    def test_failure_cluster_body(self):
+        from events.formatting import failure_cluster_body
+        body = failure_cluster_body({
+            "source": "mailbox:tailor",
+            "cluster_size": 4,
+            "last_event_type": "cron_failed",
+            "last_timestamp": "2026-07-11T18:03:00+00:00",
+        })
+        assert "mailbox:tailor" in body
+        assert "4 times in a row" in body
+        assert "cron_failed" in body
+
+    def test_whatsapp_header_uses_plain_title_for_watchdog_burst(self):
+        from events.formatting import format_whatsapp_header
+        e = _make_event(EventType.WATCHDOG_BURST, source="watchdog",
+                        priority=Priority.HIGH)
+        h = format_whatsapp_header(e)
+        assert "SYSTEM HEALTH ALERT" in h
+        assert "WATCHDOG_BURST" not in h
+        assert "watchdog" in h  # source retained
+
+    def test_whatsapp_header_falls_back_to_enum_for_unmapped_types(self):
+        from events.formatting import format_whatsapp_header
+        e = _make_event(EventType.CRON_COMPLETED, source="polish-verify")
+        assert "CRON_COMPLETED" in format_whatsapp_header(e)
 
 
 def test_resource_pressure_has_distinct_icon():
