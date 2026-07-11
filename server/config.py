@@ -1,0 +1,66 @@
+"""Configuration for the interfaze-agent product API.
+
+Non-secret behavior is read from ``config.yaml`` under ``interfaze_server``.
+Environment variables are reserved for deployment paths and credentials.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+from hermes_constants import get_hermes_home
+
+
+def _config_values() -> dict:
+    path = get_hermes_home() / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    values = data.get("interfaze_server") or {}
+    return values if isinstance(values, dict) else {}
+
+
+@dataclass(frozen=True)
+class Settings:
+    database_path: Path
+    database_url: str = ""
+    auth_mode: str = "local"
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_service_role_key: str = ""
+    cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://localhost:5173")
+    bootstrap_admin_email: str = ""
+    bootstrap_admin_password: str = ""
+    credential_key: str = ""
+    upload_dir: Path = field(default_factory=lambda: get_hermes_home() / "interfaze" / "uploads")
+
+    @classmethod
+    def load(cls) -> "Settings":
+        cfg = _config_values()
+        home = get_hermes_home() / "interfaze"
+        origins = cfg.get("cors_origins") or [
+            "http://localhost:3000",
+            "http://localhost:5173",
+        ]
+        return cls(
+            database_path=Path(os.environ.get(
+                "INTERFAZE_DATABASE_PATH",
+                cfg.get("database_path") or home / "interfaze.db",
+            )).expanduser(),
+            database_url=os.environ.get("SUPABASE_DB_URL", ""),
+            auth_mode=str(cfg.get("auth_mode") or "local").lower(),
+            supabase_url=os.environ.get("SUPABASE_URL", "").rstrip("/"),
+            supabase_anon_key=os.environ.get("SUPABASE_ANON_KEY", ""),
+            supabase_service_role_key=os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""),
+            cors_origins=tuple(str(origin) for origin in origins),
+            bootstrap_admin_email=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_EMAIL", ""),
+            bootstrap_admin_password=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD", ""),
+            credential_key=os.environ.get("INTERFAZE_CREDENTIAL_KEY", ""),
+            upload_dir=Path(cfg.get("upload_dir") or home / "uploads").expanduser(),
+        )

@@ -1,0 +1,82 @@
+# Company configuration schema — what every client configures in the frontend.
+#
+# Each tenant gets one Company Brain built from these fields during onboarding
+# (PRODUCT.md §6, routes §7.5). The skills in skills/sales/ read these values
+# at runtime; nothing company-specific is hardcoded. The silverline/ directory
+# is the demo instance of this schema.
+#
+# "configured_via" = the frontend surface / API route that owns the field.
+# API keys and model providers are ADMIN-configured (admin panel), not client-configured.
+
+company_identity:
+  configured_via: /api/v1/onboarding/company-identity   # Onboarding step 1
+  fields: [company_name, legal_name, website, headquarters_country, city,
+           founded_year, industry, sub_industry, employee_count,
+           business_model, main_language, sales_regions_current,
+           sales_regions_target]
+
+company_positioning:
+  configured_via: /api/v1/onboarding/positioning        # Onboarding step 2
+  fields: [what_company_sells, main_value_proposition, quality_position,
+           price_position, premium_or_mass_market, main_differentiators,
+           certifications, manufacturing_capacity, export_capacity,
+           delivery_capabilities, after_sales_support]
+
+products:
+  configured_via: /api/v1/onboarding/products, /api/v1/products
+  fields: [product_name, product_category, description, technical_specs,
+           materials, certifications, target_industries, target_customer_types,
+           buyer_roles, price_range_optional, moq_optional,
+           production_capacity_optional, available_markets, restricted_markets]
+
+internal_sales_data:
+  configured_via: /api/v1/onboarding/internal-sales-data, /api/v1/documents/upload
+  fields: [past_sales, past_customers, current_contacts, existing_distributors,
+           lost_deals, active_deals, previous_outreach, price_lists,
+           email_examples, customer_objections]
+
+sender_identity:
+  configured_via: /api/v1/integrations/email/connect/*   # one salesperson mailbox per company
+  fields: [sender_name, sender_email, sender_phone]
+  note: Resolved into template placeholders {{sender_name}} {{sender_email}} {{sender_phone}}.
+
+market_preferences:
+  configured_via: /api/v1/onboarding/target-markets, /api/v1/lead-map/selected-countries, /api/v1/company/sales-preferences
+  shape: three ISO 3166-1 alpha-2 lists selected by the client in the UI
+  fields:
+    target_markets:      {note: prioritized markets — lead map defaults here, agent works them first}
+    no_outreach_markets: {note: never contacted on any channel; research still allowed (market intelligence)}
+    no_research_markets: {note: never scanned or researched for leads}
+  note: >
+    Replaces the old hardcoded responsibility matrix. Exclusion-based: any
+    market not listed is allowed. Enforced at run creation (lead_scan checks
+    no_research; sends check no_outreach). Demo: silverline/market-preferences.yaml.
+
+outreach_rules:
+  configured_via: /api/v1/company/sales-preferences      # frontend settings, per client
+  fields:
+    daily_email_limit:      {type: int,  demo_default: 50}
+    daily_whatsapp_limit:   {type: int,  demo_default: 50}
+    re_reach_days:          {type: int,  demo_default: 30}
+    send_windows:           {type: "HH:MM-HH:MM list", demo_default: "09:00-12:00,13:00-15:00", timezone: recipient-local}
+    one_channel_per_day:    {type: bool, demo_default: true}
+    excluded_industries:    {type: keyword list, demo_default: "industrial kitchen, HORECA, catering equipment"}
+    fixed_subject_line:     {type: string, note: translated per target language}
+    default_send_mode:      {type: "draft|approved_send", demo_default: draft}
+    auto_reply:             {type: bool, locked: false}   # always off — replies belong to humans
+
+cc_rules:
+  configured_via: /api/v1/cc-rules                        # PRODUCT.md §7.20
+  shape: rows of {name, market_country, market_region, product_id, industry, cc_emails, is_default}
+
+templates:
+  configured_via: /api/v1/documents/upload (type: email_examples) + generation from Company Brain
+  files: [email templates per language, whatsapp templates per language,
+          linkedin note templates per language, country→language map,
+          fixed-subject translation table]
+  note: Placeholders resolved at send time; media bundles registered as company assets.
+
+# Deliberately NOT in this schema (admin panel, per PRODUCT.md §12):
+#   - model provider + API keys (incl. any local model endpoint)
+#   - email/WhatsApp provider credentials and OAuth apps
+#   - platform-level limits and data sources

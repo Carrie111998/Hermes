@@ -1,0 +1,52 @@
+# Silverline — demo Company Brain seed (interfaze-agent Sales Agent MVP)
+# Field names follow PRODUCT.md §6 (customer onboarding).
+# Sourced from the hand-built OpenClaw prototype ("silver-claw"), scrubbed of personal data.
+
+company_identity:
+  company_name: Silverline
+  website: https://www.silverline.com
+  headquarters_country: TR
+  industry: Kitchen appliances
+  sub_industry: Built-in domestic kitchen appliances (hoods, ovens, hobs)
+  business_model: Manufacturer / exporter / supplier
+  main_language: tr
+  sales_regions_target: see market-preferences.yaml  # client-selected target markets
+
+company_positioning:
+  what_company_sells: >
+    Domestic kitchen appliances: range hoods (including designer and downdraft
+    models), built-in ovens, hobs, and a commercial line (refrigerators,
+    dishwashers). NOT industrial kitchen equipment — industrial-kitchen firms
+    are an exclusion filter in lead discovery.
+  main_differentiators:
+    - Own manufacturing (factory tour video available)
+    - Designer hood lines (DayLight ambient, SilverMute downdraft)
+    - Export experience across Middle East and Africa
+  export_capacity: yes
+
+target_buyers:
+  # from PRODUCT.md §6.6
+  - appliance distributors
+  - kitchen appliance importers
+  - hotel equipment suppliers
+  - construction project suppliers
+  - kitchen design companies
+  - retail chains
+  - white goods dealers
+
+sender_identity:
+  # The connected salesperson mailbox (PRODUCT.md §3: one main mailbox per company).
+  # Real values are configured at onboarding, never committed.
+  sender_name: "{{sender_name}}"
+  sender_email: "{{sender_email}}"
+  sender_phone: "{{sender_phone}}"
+
+assets:
+  catalogue_pdf_url: https://disk.yandex.com.tr/d/Okzuoi-jpu7a4Q
+  factory_tour_video_url: https://disk.yandex.com.tr/i/wiHJtku8_4_YaQ
+  product_photos:
+    - hood-showcase
+    - built-in-oven-hob-combo
+    - designer-hood-daylight
+    - downdraft-silvermute
+    - commercial-line

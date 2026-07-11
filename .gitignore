@@ -144,3 +144,15 @@ apps/desktop/demo/
 # PR body is the archive. See the hermes-agent-dev skill's
 # pr-infographic-workflow reference (storage rule + lapse #8 / #COMMIT-1).
 infographic/
+
+# Client company data packs are configured per-tenant via the frontend and
+# must never be committed. Only the scrubbed "silverline" demo pack ships in
+# the repo — see company-packs/README.md.
+company-packs/*
+!company-packs/README.md
+!company-packs/company-config-schema.yaml
+!company-packs/silverline/
+
+# Agent-run harness local SQLite store (runtime state, never committed)
+server/runs.db
+server/*.db

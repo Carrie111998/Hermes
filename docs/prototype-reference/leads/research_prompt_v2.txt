@@ -1,0 +1,51 @@
+# Research Subagent Prompt Template v2 (validated 2026-06-30)
+# Use for: tip-A research (web_search → bridge file write) per EMAIL_WORKFLOW.md
+# Model: qwen2.5:7b-instruct-q4_K_M (local, via ollama 11434)
+# Cleanup: delete (per MEMORY 2026-06-17 lessons)
+
+# ── Inputs (interpolate before spawn) ──
+# {json_path} = /tmp/batch_R{first_row}-R{last_row}.json (customer list)
+# {row}       = single row number for single-customer spawn
+
+# ── Single-customer prompt (preferred for quality) ──
+Read {json_path}. web_search "{company_name} {city} {country} appliances distributor".
+STRICT RULES:
+- Paragraph max 320 chars
+- NO phrases containing 'leading' OR 'prominent' OR 'expanding business footprint' OR 'stands out' OR 'trusted provider of'
+- Line 1: 3 specific sentences about {company_name} products/distribution/years
+- Line 2: exactly "FACTS:" + 3 short facts separated by semicolons
+- Use \n between Line 1 and Line 2
+- Write to /tmp/bridge_R{row}.txt
+- After write, reply DONE only
+
+# ── Batch prompt (3-5 customers, more tokens but parallel) ──
+Read {json_path}. For each customer in the JSON array (rows N..M):
+1. web_search "<company> <city> <country> appliances"
+2. Write bridge to /tmp/bridge_R{row}.txt (Line 1 = paragraph, Line 2 = "FACTS:" + 3 facts, \n separator)
+3. NO generic filler (leading/prominent/expanding/stands out/trusted provider)
+After all done, reply "DONE: <rows processed>".
+
+# ── Parent-side bridge parser ──
+import re
+text = open(f"/tmp/bridge_R{row}.txt").read()
+# Split on " FACTS:" (with space) or "\nFACTS:"
+parts = re.split(r'\s+FACTS:\s*', text, maxsplit=1)
+paragraph = parts[0].strip()
+facts = parts[1].strip() if len(parts) > 1 else ""
+
+# Quality gate (parent-side):
+def bridge_valid(p, f):
+    if not p or len(p) > 350: return False
+    if not f or len(f.split(';')) < 3: return False  # need 3 facts
+    bad = ['leading', 'prominent', 'expanding business', 'stands out', 'trusted provider']
+    if any(b in p.lower() for b in bad): return False
+    return True
+
+# ── Lessons learned ──
+# - 7B qwen DOES produce useful bridges when given STRICT anti-generic rules
+# - Without anti-generic rules, output is filler ("leading global brand")
+# - max 320 chars enforced = paragraph stays tight
+# - "FACTS:" line is parseable metadata for parent quality gate
+# - Subagent sometimes reports wrong row in final reply (cosmetic, file is correct)
+# - Single-customer dispatch = better quality, batch dispatch = more efficient
+# - Recommended: 5 parallel subagents per wave, 1 customer each (saudi_multiagent_v2.py pattern)

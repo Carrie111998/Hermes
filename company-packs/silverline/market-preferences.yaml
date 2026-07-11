@@ -1,0 +1,20 @@
+# Market preferences — selected by the client in the UI (lead map + settings).
+# Replaces the old hardcoded responsibility matrix. Three independent lists;
+# a market may appear in more than one (e.g. researched but not contacted).
+#
+# Default for any market NOT listed: allowed for both research and outreach.
+# The exclusion lists are hard guards; target_markets is the prioritized set
+# the agent works first and the lead map defaults to.
+#
+# Values are ISO 3166-1 alpha-2. This file is the on-disk shape of what the
+# frontend writes; every client has their own.
+
+# Favored markets — actively discovered, researched, and reached.
+target_markets: [SA, MA, AE, EG, IQ, KW, OM, JO, DZ, TN, NG, KE, ZA, PK]
+
+# Markets that will NOT be reached on any channel (email / WhatsApp / LinkedIn).
+# Lead discovery/research may still run here for market intelligence.
+no_outreach_markets: []
+
+# Markets where the agent will NOT scan or research leads at all.
+no_research_markets: []

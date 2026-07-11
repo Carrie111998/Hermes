@@ -1,0 +1,118 @@
+"""Regression checks for the production AgentRunService."""
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from fastapi import HTTPException
+
+from server.agent_service import (AgentRunService, BaseRunExecutor, StubRunExecutor,
+                                  extract_json)
+from server.db import Database, json_dump, new_id, now
+from server.run_types import REGISTRY
+
+
+def service(executor=None):
+    db = Database(Path(tempfile.mktemp(suffix=".db")))
+    company_id, stamp = new_id("cmp"), now()
+    db.execute("INSERT INTO companies VALUES(?,?,?,?,?,?,?)",
+               (company_id, "Acme", None, "active", json_dump({}), stamp, stamp))
+    return AgentRunService(db, executor or StubRunExecutor()), company_id
+
+
+def wait(runs, company_id, run_id):
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        run = runs.get(company_id, run_id)
+        if run["status"] in {"succeeded", "failed", "cancelled"}:
+            return run
+        time.sleep(0.01)
+    raise AssertionError("run timed out")
+
+
+def test_all_11_run_types_registered():
+    assert set(REGISTRY) == {
+        "document_processing", "product_extraction", "company_brain_build", "lead_scan",
+        "lead_research", "contact_discovery", "outreach_generation", "email_send",
+        "whatsapp_send", "linkedin_note_generation", "analytics_refresh",
+    }
+
+
+def test_stub_dispatch_and_events():
+    runs, company_id = service()
+    run = runs.create(company_id, "lead_scan", {"countries": ["DE"]})
+    runs.start(company_id, run["id"])
+    completed = wait(runs, company_id, run["id"])
+    assert completed["status"] == "succeeded"
+    assert [event["kind"] for event in runs.events(company_id, run["id"])] == [
+        "created", "started", "succeeded",
+    ]
+
+
+def test_idempotency_returns_same_run():
+    runs, company_id = service()
+    first = runs.create(company_id, "analytics_refresh", {}, "same")
+    second = runs.create(company_id, "analytics_refresh", {}, "same")
+    assert first["id"] == second["id"]
+
+
+def test_send_runs_cannot_bypass_delivery_service():
+    runs, company_id = service()
+    for run_type in ("email_send", "whatsapp_send"):
+        try:
+            runs.create(company_id, run_type, {"approved": True})
+            raise AssertionError("send run bypass was accepted")
+        except HTTPException as exc:
+            assert exc.status_code == 422
+
+
+def test_six_country_scan_rejected_in_service():
+    runs, company_id = service()
+    try:
+        runs.create(company_id, "lead_scan", {"countries": ["DE", "FR", "NL", "GB", "ES", "IT"]})
+        raise AssertionError("six-country scan was accepted")
+    except HTTPException as exc:
+        assert exc.status_code == 422
+
+
+def test_structured_output_extraction():
+    value = extract_json("progress\n```json\n{\"leads\": []}\n```\n")
+    assert value == {"leads": []}
+
+
+class BlockingExecutor(BaseRunExecutor):
+    def __init__(self):
+        self.cancelled = False
+
+    def execute(self, runs, run):
+        while not self.cancelled:
+            time.sleep(0.01)
+        raise InterruptedError("cancelled")
+
+    def cancel(self, run_id):
+        self.cancelled = True
+
+
+def test_running_executor_is_cancelled():
+    executor = BlockingExecutor()
+    runs, company_id = service(executor)
+    run = runs.create(company_id, "analytics_refresh", {})
+    runs.start(company_id, run["id"])
+    runs.cancel(company_id, run["id"])
+    completed = wait(runs, company_id, run["id"])
+    assert completed["status"] == "cancelled"
+
+
+if __name__ == "__main__":
+    tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
+    for test in tests:
+        test()
+        print(f"ok  {test.__name__}")
+    print(f"\n{len(tests)} run-service checks passed")
+

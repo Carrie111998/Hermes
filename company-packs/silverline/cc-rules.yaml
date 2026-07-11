@@ -1,0 +1,18 @@
+# Silverline CC rules — PRODUCT.md §7.20 format.
+# Prototype rule: one email per lead company; To = primary contact,
+# CC = every other known contact at that company, plus internal notification.
+cc_rules:
+  - name: Default company-wide CC
+    is_default: true
+    cc_emails: []            # filled per-lead: all other contacts of the lead company
+    notes: >
+      One send per lead company. Primary contact goes in To; all other
+      discovered contacts of the same company go in CC on the same message.
+      Never send separate copies of the same cold email to colleagues.
+  - name: Internal salesman notification
+    is_default: true
+    cc_emails: ["{{internal_sales_email}}"]
+    notes: >
+      The responsible internal salesperson is notified after each send
+      (prototype notified via a separate internal message, not CC — either
+      is acceptable; pick one at implementation time).
