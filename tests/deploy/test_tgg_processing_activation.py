@@ -244,6 +244,7 @@ def test_ps_service_token_materializes_from_systems_and_verifies_without_receipt
     target = tmp_path / "hermes.env"
     source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
     target.write_text("OPENAI_API_KEY=fixture-openai\n", encoding="utf-8")
+    os.chmod(source, 0o640)
     os.chmod(target, 0o600)
     observed: list[tuple[str, str, int]] = []
 
@@ -266,6 +267,7 @@ def test_ps_service_token_materializes_from_systems_and_verifies_without_receipt
         source_env_path=source,
         target_env_path=target,
         opener=opener,
+        expected_source_uid=os.getuid(),
     )
     assert module.read_env_value(
         target.read_text(encoding="utf-8"), module.TARGET_PS_TOKEN_KEY
@@ -287,6 +289,7 @@ def test_ps_service_token_verification_failure_restores_target_env(tmp_path: Pat
     source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
     original = b"OPENAI_API_KEY=fixture-openai\n"
     target.write_bytes(original)
+    os.chmod(source, 0o640)
     os.chmod(target, 0o600)
 
     def opener(_request: object, *, timeout: int) -> FakePsResponse:
@@ -298,6 +301,7 @@ def test_ps_service_token_verification_failure_restores_target_env(tmp_path: Pat
             source_env_path=source,
             target_env_path=target,
             opener=opener,
+            expected_source_uid=os.getuid(),
         )
     assert target.read_bytes() == original
 
@@ -308,6 +312,7 @@ def test_bobby_scoped_token_is_a_hard_activation_failure(tmp_path: Path) -> None
     source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
     original = b"OPENAI_API_KEY=fixture-openai\n"
     target.write_bytes(original)
+    os.chmod(source, 0o640)
     os.chmod(target, 0o600)
 
     def opener(_request: object, *, timeout: int) -> FakePsResponse:
@@ -328,5 +333,77 @@ def test_bobby_scoped_token_is_a_hard_activation_failure(tmp_path: Path) -> None
             source_env_path=source,
             target_env_path=target,
             opener=opener,
+            expected_source_uid=os.getuid(),
         )
+    assert target.read_bytes() == original
+
+
+def test_ps_service_token_refuses_insecure_systems_source(tmp_path: Path) -> None:
+    source = tmp_path / "systems.env"
+    target = tmp_path / "hermes.env"
+    source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
+    target.write_text("OPENAI_API_KEY=fixture-openai\n", encoding="utf-8")
+    os.chmod(source, 0o644)
+    os.chmod(target, 0o600)
+
+    with pytest.raises(RuntimeError, match="0640-or-stricter"):
+        module.materialize_ps_service_token(
+            source_env_path=source,
+            target_env_path=target,
+            expected_source_uid=os.getuid(),
+        )
+
+
+def test_activation_failure_after_credential_materialization_restores_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "systems.env"
+    target = tmp_path / "hermes.env"
+    source.write_text("CHRISTOPHER_TGG_PS_SERVICE_TOKEN=fixture-token\n", encoding="utf-8")
+    original = b"OPENAI_API_KEY=fixture-openai\n"
+    target.write_bytes(original)
+    os.chmod(source, 0o640)
+    os.chmod(target, 0o600)
+
+    def opener(request: object, *, timeout: int) -> FakePsResponse:
+        assert timeout == 5
+        if request.full_url == module.PS_SERVICE_IDENTITY_URL:
+            return FakePsResponse(
+                {
+                    "ok": True,
+                    "data": {
+                        "tenantSlug": "tgg",
+                        "agentName": "christopher",
+                        "scopes": sorted(module.EXPECTED_PS_SCOPES),
+                    },
+                }
+            )
+        return FakePsResponse({"ok": True, "data": {"total": 3397}})
+
+    real_materialize = module.materialize_ps_service_token
+    monkeypatch.setattr(module, "HERMES_ENV_PATH", target)
+    monkeypatch.setattr(module, "verify_controller_grant", lambda _request: {"grantId": "fixture"})
+    monkeypatch.setattr(module, "consume_controller_grant", lambda _grant: None)
+    monkeypatch.setattr(
+        module,
+        "materialize_ps_service_token",
+        lambda: real_materialize(
+            source_env_path=source,
+            target_env_path=target,
+            opener=opener,
+            expected_source_uid=os.getuid(),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "apply_transition",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("fixture transition failure")),
+    )
+    request = {
+        "mode": "activate",
+        "remoteTransactionSha256": module._sha(Path(module.__file__).read_bytes()),
+    }
+    with pytest.raises(RuntimeError, match="fixture transition failure"):
+        module.run_fixed_remote(request)
     assert target.read_bytes() == original

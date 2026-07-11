@@ -194,11 +194,17 @@ def materialize_ps_service_token(
     target_env_path: Path = HERMES_ENV_PATH,
     opener: Callable[..., Any] = urlopen,
     writer: Callable[[Path, bytes], None] = atomic_replace,
+    expected_source_uid: int | None = 0,
 ) -> dict[str, Any]:
     for label, env_path in (("systems source", source_env_path), ("Hermes target", target_env_path)):
         stat = env_path.lstat()
         if not env_path.is_file() or env_path.is_symlink():
             raise RuntimeError(f"{label} env must be a regular non-symlink file")
+        if label == "systems source":
+            if expected_source_uid is not None and stat.st_uid != expected_source_uid:
+                raise RuntimeError("systems source env has the wrong owner")
+            if stat.st_mode & 0o027:
+                raise RuntimeError("systems source env must be 0640-or-stricter")
         if label == "Hermes target" and stat.st_mode & 0o077:
             raise RuntimeError("Hermes target env must be 0600-or-stricter")
     source_token = read_env_value(source_env_path.read_text(encoding="utf-8"), SOURCE_PS_TOKEN_KEY)
@@ -516,23 +522,33 @@ def run_fixed_remote(request: dict[str, Any]) -> dict[str, Any]:
             "states": states,
             "consumerStatus": status,
         }
+    credential_env_before: bytes | None = None
     if mode == "activate":
         deployed_transaction_sha256 = _sha(Path(__file__).read_bytes())
         if deployed_transaction_sha256 != request.get("remoteTransactionSha256"):
             raise RuntimeError("deployed activation transaction does not match the signed grant")
         grant = verify_controller_grant(request)
         consume_controller_grant(grant)
+        credential_env_before = HERMES_ENV_PATH.read_bytes()
         credential = materialize_ps_service_token()
     else:
         credential = None
-    result = apply_transition(
-        mode=mode,
-        config_path=CONFIG_PATH,
-        gate_path=GATE_PATH,
-        cursor_path=CURSOR_PATH,
-        service=SystemdController(STATUS_PATH),
-        metadata=request,
-    )
+    try:
+        result = apply_transition(
+            mode=mode,
+            config_path=CONFIG_PATH,
+            gate_path=GATE_PATH,
+            cursor_path=CURSOR_PATH,
+            service=SystemdController(STATUS_PATH),
+            metadata=request,
+        )
+    except Exception:
+        if credential is not None and credential.get("changed") is True and credential_env_before is not None:
+            try:
+                atomic_replace(HERMES_ENV_PATH, credential_env_before)
+            except Exception as rollback_error:
+                raise RuntimeError("PS service credential rollback failed") from rollback_error
+        raise
     if credential is not None:
         result["psServiceCredential"] = credential
     return result
