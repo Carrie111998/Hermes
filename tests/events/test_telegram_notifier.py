@@ -1458,3 +1458,102 @@ class TestNotificationDeliveredReverseSignal:
         assert len(notifier._batch_buffer) > 0
         # No reverse signal for the batched (yet-to-flush) event
         assert bus.query(event_type=EventType.NOTIFICATION_DELIVERED) == []
+
+
+class TestSynthesizedIterationSuppression:
+    """Synthesized AGENT_ITERATION placeholders (scheduler marker-missing
+    fallback) are bus-only telemetry — never delivered to chat
+    (2026-07-11 comms audit: devflow-bridge emitted ~918/day of these)."""
+
+    def _make(self, synthesized: bool):
+        payload = {"agent": "devflow", "summary": "devflow completed"}
+        if synthesized:
+            payload["synthesized"] = True
+        return Event.create(EventType.AGENT_ITERATION, "devflow", payload)
+
+    def test_synthesized_iteration_never_reaches_chat(
+        self, bus, topics_config, verbosity_config,
+    ):
+        sent = []
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda *a, **k: sent.append(a),
+        )
+        notifier.handle(self._make(synthesized=True))
+        assert sent == []
+        assert all(not msgs for msgs in notifier._batch_buffer.values()), \
+            "synthesized iteration must not even be batched"
+
+    def test_real_iteration_still_flows(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda *a, **k: None,
+        )
+        notifier.handle(self._make(synthesized=False))
+        # AGENT_ITERATION is LOW priority => it lands in the batch buffer.
+        assert any(msgs for msgs in notifier._batch_buffer.values())
+
+
+class TestCronLifecycleRouting:
+    """2026-07-11 comms-audit split: routine cron lifecycle -> cron_firehose;
+    failure modes stay on watchdog_alerts."""
+
+    @pytest.fixture
+    def topics_with_cron_firehose(self, tmp_path):
+        config = {
+            "group_chat_id": "-1001234567890",
+            "topics": {
+                "watchdog_alerts": {"thread_id": 100, "name": "Watchdog Alerts"},
+                "cron_firehose": {"thread_id": 110, "name": "Cron Firehose"},
+            },
+        }
+        path = tmp_path / "telegram" / "topics_cron.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(config))
+        return path
+
+    def test_cron_lifecycle_routes_to_cron_firehose(
+        self, bus, topics_with_cron_firehose, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_with_cron_firehose,
+            verbosity_path=verbosity_config,
+        )
+        for et in (
+            EventType.CRON_STARTED, EventType.CRON_COMPLETED,
+            EventType.CRON_SKIPPED, EventType.CRON_TRIGGERED,
+            EventType.CRON_SKIPPED_DUPLICATE,
+            EventType.CRON_SKIPPED_MIN_INTERVAL,
+        ):
+            ev = Event.create(et, "postgres-sync", {"job_name": "postgres-sync"})
+            assert notifier.resolve_target(ev)[2] == "110", \
+                f"{et.type_string} should route to cron_firehose"
+
+    def test_cron_failures_stay_on_watchdog_alerts(
+        self, bus, topics_with_cron_firehose, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_with_cron_firehose,
+            verbosity_path=verbosity_config,
+        )
+        for et in (
+            EventType.CRON_FAILED, EventType.CRON_FAILED_CONSECUTIVE,
+            EventType.CRON_STALE,
+        ):
+            ev = Event.create(et, "postgres-sync", {"job_name": "postgres-sync"})
+            assert notifier.resolve_target(ev)[2] == "100", \
+                f"{et.type_string} should stay on watchdog_alerts"
+
+    def test_missing_cron_firehose_falls_back_to_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # topics_config fixture predates the cron_firehose topic — cron
+        # telemetry must degrade to watchdog_alerts, not leak to General
+        # via an empty thread_id.
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        ev = Event.create(EventType.CRON_COMPLETED, "postgres-sync", {})
+        assert notifier.resolve_target(ev)[2] == "100"

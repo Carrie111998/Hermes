@@ -64,6 +64,15 @@ def whatsapp_flush_state_path() -> Path:
     return notifications_home() / "whatsapp_flush_state.json"
 
 
+def whatsapp_throttle_path() -> Path:
+    """WhatsAppEscalator throttle-buffer persistence (2026-07-11).
+
+    Mirrors notifier_batch_path(): buffered-but-unflushed escalations
+    survive a gateway restart instead of being silently lost.
+    """
+    return notifications_home() / "whatsapp_throttle.json"
+
+
 def cron_stale_thresholds_path() -> Path:
     """Optional per-job stale-threshold overrides (CronStaleMonitor).
 

@@ -599,9 +599,26 @@ def _subscriber_poll_loop() -> None:
                 # attempt (last_flush_date was advanced unconditionally) and
                 # stranded the overnight queue until the next ET date. Now the
                 # date advances ONLY once the queue actually drained.
-                if _should_attempt_whatsapp_flush(
+                _flush_now = _should_attempt_whatsapp_flush(
                     et_hour, last_flush_date, today_et, now, last_flush_attempt
-                ):
+                )
+                # Stranded-queue retry (2026-07-11 comms audit): the
+                # escalator now REQUEUES failed immediate/throttled sends
+                # into the quiet queue. Once today's morning drain has
+                # already consumed last_flush_date, the morning gate above
+                # never re-fires — so a message stranded by a mid-day
+                # bridge outage would wait for tomorrow 7am. Re-attempt a
+                # non-empty queue outside quiet hours (07-23 ET), on the
+                # same failed-flush throttle interval.
+                if (not _flush_now
+                        and _registry is not None
+                        and 7 <= et_hour < 23
+                        and now - last_flush_attempt >= FLUSH_RETRY_INTERVAL_SECONDS):
+                    _flush_now = any(
+                        isinstance(sub, WhatsAppEscalator) and sub.has_queued_messages()
+                        for sub in _registry.subscribers
+                    )
+                if _flush_now:
                     last_flush_attempt = now
                     all_drained = True
                     for sub in _registry.subscribers:

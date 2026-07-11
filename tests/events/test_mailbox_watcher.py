@@ -224,3 +224,52 @@ def test_summarize_covers_key_message_types(tmp_path):
                              "payload": {"company": "Acme", "title": "VP"}})
     finally:
         bus.close()
+
+
+class TestWatermarkRecencyTrim:
+    r"""2026-07-11 KB_QUERY replay-loop fix: the watermark trims by RECENCY
+    (insertion order), not alphabetically. The old ``sorted()[-2000:]`` trim
+    evicted early-sorting paths (``cv-handler\...``) on every save, so any
+    file stuck in an early-sorting inbox was re-emitted on every scan —
+    7 stale KB_QUERY files replayed ~14,600 times/day before the fix."""
+
+    def test_early_sorting_entry_survives_trim(self, bus, mailbox_root):
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        # Seed >2000 alphabetically-LATE entries. Under the old alphabetical
+        # trim these would all outrank (and evict) the real file's
+        # early-sorting 'main/inbox/...' key on save.
+        for i in range(2100):
+            watcher._seen[rf"tracker\processed\zzz_{i:05d}.json"] = None
+        path = _write_message(
+            mailbox_root / "main" / "inbox", "SCORE_RESULT", "matcher", {},
+        )
+        assert watcher.scan() == 1
+        key = str(path.relative_to(mailbox_root))
+        assert key in watcher._seen, "recency trim must keep the newest entry"
+        assert len(watcher._seen) <= 2000
+        # The replay-loop symptom: the same file must NOT re-emit next scan.
+        assert watcher.scan() == 0
+
+    def test_reload_round_trips_watermark(self, bus, mailbox_root):
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        _write_message(mailbox_root / "main" / "inbox", "SCORE_RESULT", "matcher", {})
+        assert watcher.scan() == 1
+        fresh = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        assert fresh.scan() == 0
+
+
+class TestKbRpcNotMirrored:
+    """KB_QUERY / KB_RESPONSE are tailor<->cv-handler machine RPC — removed
+    from MIRRORED_MESSAGE_TYPES 2026-07-11 (comms audit)."""
+
+    def test_kb_query_and_response_stay_off_the_bus(self, bus, mailbox_root):
+        watcher = MailboxWatcher(bus, mailbox_root=mailbox_root)
+        _write_message(
+            mailbox_root / "main" / "inbox", "KB_QUERY", "tailor",
+            {"query_type": "log_application"},
+        )
+        _write_message(
+            mailbox_root / "main" / "inbox", "KB_RESPONSE", "cv-handler", {},
+        )
+        assert watcher.scan() == 0
+        assert len(bus.query(event_type=EventType.MAILBOX_MESSAGE)) == 0

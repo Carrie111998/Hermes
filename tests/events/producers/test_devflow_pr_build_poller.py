@@ -327,3 +327,61 @@ class TestLoadConfig:
         cfg = load_config(repos_path=repos_path)
         assert cfg is not None
         assert cfg.token == "gh-from-fallback"
+
+
+class TestAuthLossEscalation:
+    """2026-07-11: a dead GitHub token used to surface only as errors=1
+    inside every 15-min cron_completed (96 noise messages/day, zero
+    escalation). The ok->fail edge now emits ONE credential_loss."""
+
+    @staticmethod
+    def _auth_fail_fetch(repo, config):
+        from events.producers.devflow_pr_build_poller import GitHubAPIError
+        raise GitHubAPIError(
+            f"GET https://api.github.com/repos/{repo}/pulls -> HTTP 401 (Unauthorized)"
+        )
+
+    @staticmethod
+    def _not_found_fetch(repo, config):
+        from events.producers.devflow_pr_build_poller import GitHubAPIError
+        raise GitHubAPIError(
+            f"GET https://api.github.com/repos/{repo}/pulls -> HTTP 404 (Not Found)"
+        )
+
+    def test_401_emits_credential_loss_once_per_outage(self, bus, tmp_path, state_path):
+        from events.producers.devflow_pr_build_poller import run_poll
+        config = _make_config(tmp_path, state_path)
+
+        run_poll(bus, config, fetch_prs=self._auth_fail_fetch,
+                 fetch_builds=lambda *a: [])
+        events = bus.query(event_type=EventType.CREDENTIAL_LOSS)
+        assert len(events) == 1
+        assert "HERMES_GITHUB_TOKEN" in events[0].payload["probe"]
+        assert "HTTP 401" in events[0].payload["detail"]
+
+        # Same failure on the next tick: NO second emit (state remembered).
+        run_poll(bus, config, fetch_prs=self._auth_fail_fetch,
+                 fetch_builds=lambda *a: [])
+        assert len(bus.query(event_type=EventType.CREDENTIAL_LOSS)) == 1
+
+    def test_recovery_then_new_failure_re_emits(self, bus, tmp_path, state_path):
+        from events.producers.devflow_pr_build_poller import run_poll
+        config = _make_config(tmp_path, state_path)
+
+        run_poll(bus, config, fetch_prs=self._auth_fail_fetch,
+                 fetch_builds=lambda *a: [])
+        # Token recovered: clean poll resets the state, emits nothing new.
+        run_poll(bus, config, fetch_prs=lambda repo, cfg: [],
+                 fetch_builds=lambda *a: [])
+        assert len(bus.query(event_type=EventType.CREDENTIAL_LOSS)) == 1
+        # A NEW outage fires again.
+        run_poll(bus, config, fetch_prs=self._auth_fail_fetch,
+                 fetch_builds=lambda *a: [])
+        assert len(bus.query(event_type=EventType.CREDENTIAL_LOSS)) == 2
+
+    def test_non_auth_errors_do_not_emit(self, bus, tmp_path, state_path):
+        from events.producers.devflow_pr_build_poller import run_poll
+        config = _make_config(tmp_path, state_path)
+        run_poll(bus, config, fetch_prs=self._not_found_fetch,
+                 fetch_builds=lambda *a: [])
+        assert len(bus.query(event_type=EventType.CREDENTIAL_LOSS)) == 0

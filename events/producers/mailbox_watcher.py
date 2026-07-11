@@ -20,7 +20,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 from events.bus import EventBus
 from events.schema import EventType
@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 PROCESSED_RECOVERY_WINDOW_SECONDS = 2 * 60 * 60
 
 # Message types worth mirroring (from protocol.md)
+# KB_QUERY / KB_RESPONSE removed 2026-07-11: they are tailor↔cv-handler
+# machine-to-machine RPC with no operator value, and a stuck inbox file
+# combined with the watermark eviction bug (see _save_watermark) replayed
+# 7 of them ~14,600 times/day into Scribe Daily. Agents still exchange
+# them via the mailbox; they just no longer mirror onto the event bus.
 MIRRORED_MESSAGE_TYPES = {
     "SCOUT_DISCOVERY", "SCORE_REQUEST", "SCORE_RESULT", "SCORE_BATCH_SUMMARY",
     "TAILOR_REQUEST", "TAILOR_COMPLETE", "TAILOR_REVISION",
@@ -41,7 +46,7 @@ MIRRORED_MESSAGE_TYPES = {
     "PIPELINE_UPDATE", "STATUS_REQUEST", "STATUS_RESPONSE", "FOLLOWUP_ALERT",
     "NOTIFICATION", "HIGH_SCORE_ALERT",
     "VIP_DISCOVERY", "VIP_PROMOTE", "VIP_SCAN_REQUEST",
-    "KB_QUERY", "KB_RESPONSE", "ERROR",
+    "ERROR",
 }
 
 
@@ -76,24 +81,34 @@ class MailboxWatcher:
             mailbox_root = _default_mailbox_root()
         self.mailbox_root = Path(mailbox_root)
         self._watermark_path = self.mailbox_root / ".event_watermark.json"
-        self._seen: Set[str] = self._load_watermark()
+        # Insertion-ordered dict used as an ordered set: membership checks are
+        # O(1) and _save_watermark can trim by RECENCY (oldest-seen first).
+        self._seen: Dict[str, None] = self._load_watermark()
 
-    def _load_watermark(self) -> Set[str]:
-        """Load the set of already-seen file paths from disk."""
+    def _load_watermark(self) -> Dict[str, None]:
+        """Load the ordered set of already-seen file paths from disk."""
         if self._watermark_path.exists():
             try:
                 data = json.loads(self._watermark_path.read_text(encoding="utf-8"))
-                return set(data.get("seen", []))
+                return dict.fromkeys(data.get("seen", []))
             except (json.JSONDecodeError, KeyError):
-                return set()
-        return set()
+                return {}
+        return {}
 
     def _save_watermark(self) -> None:
-        """Persist the seen set to disk."""
+        """Persist the seen set to disk.
+
+        Trim to the last 2000 entries by INSERTION ORDER (recency), not
+        alphabetically. The pre-2026-07-11 ``sorted(self._seen)[-2000:]``
+        trim evicted whichever paths sorted first (``cv-handler\\...`` lost
+        to ``main\\...``/``tracker\\...`` every time), so any file stuck in
+        an early-sorting inbox was forgotten on every save and re-emitted
+        as "new" on every scan — 7 stale KB_QUERY files replayed ~14,600
+        times/day into the bus before this fix.
+        """
         self._watermark_path.parent.mkdir(parents=True, exist_ok=True)
-        # Keep only the last 2000 entries to prevent unbounded growth
-        trimmed = sorted(self._seen)[-2000:]
-        self._seen = set(trimmed)
+        trimmed = list(self._seen)[-2000:]
+        self._seen = dict.fromkeys(trimmed)
         self._watermark_path.write_text(
             json.dumps({"seen": trimmed}),
             encoding="utf-8",
@@ -180,7 +195,7 @@ class MailboxWatcher:
             if file_key in self._seen or msg_file.name in seen_basenames:
                 continue
 
-            self._seen.add(file_key)
+            self._seen[file_key] = None
             seen_basenames.add(msg_file.name)
 
             if not self._is_protocol_message(msg_file.name):

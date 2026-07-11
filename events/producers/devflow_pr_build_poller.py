@@ -292,7 +292,76 @@ def run_poll(
                 if emitted:
                     summary.transitions_emitted += 1
 
+    _check_auth_transition(bus, config, summary)
     return summary
+
+
+# ------------------------------------------------------- auth-loss detection
+
+# GitHubAPIError text markers that mean the TOKEN is bad (not the repo/network).
+# 401 = expired/revoked; 403 can be SSO-enforcement or fine-grained-PAT scope
+# revocation — both need the operator to mint/authorize a new token.
+_AUTH_ERROR_MARKERS = ("HTTP 401", "HTTP 403")
+
+
+def _auth_state_path(config: PollerConfig) -> Path:
+    """Sibling of the tracker state file (hermetic under test tmp paths)."""
+    sp = config.state_path
+    return sp.with_name(sp.stem + "_auth.json")
+
+
+def _check_auth_transition(bus: EventBus, config: PollerConfig, summary: PollSummary) -> None:
+    """Emit ONE credential_loss event when the GitHub token goes bad.
+
+    Before 2026-07-11 a dead HERMES_GITHUB_TOKEN surfaced only as a
+    ``errors=1`` line inside every 15-min cron_completed (96 noise
+    messages/day, zero escalation — the comms-audit trigger case). Now the
+    ok→fail edge emits a single CREDENTIAL_LOSS (WhatsApp IMMEDIATE +
+    Telegram security_and_system, same payload shape as the watchdog's
+    named credential probes) and the fail state is remembered so repeats
+    stay silent until the token recovers. Recovery is logged, not emitted.
+    Best-effort: state/emit failures never break the poll itself.
+    """
+    auth_errors = [
+        err for err in summary.errors
+        if any(marker in err for marker in _AUTH_ERROR_MARKERS)
+    ]
+    state_path = _auth_state_path(config)
+    try:
+        prev_ok = True
+        if state_path.exists():
+            try:
+                prev_ok = bool(json.loads(state_path.read_text(encoding="utf-8")).get("auth_ok", True))
+            except (OSError, json.JSONDecodeError):
+                prev_ok = True
+
+        now_ok = not auth_errors
+        if not now_ok and prev_ok:
+            from events.schema import EventType
+            bus.emit(
+                event_type=EventType.CREDENTIAL_LOSS,
+                source="devflow-pr-build-poll",
+                payload={
+                    "probe": "HERMES_GITHUB_TOKEN (devflow-pr-build-poll)",
+                    "after": "dead",
+                    "detail": (
+                        f"GitHub API rejected the token: {auth_errors[0][:300]} — "
+                        "mint a new PAT and update HERMES_GITHUB_TOKEN in ~/.hermes/.env"
+                    ),
+                },
+            )
+        elif now_ok and not prev_ok:
+            logger.info(
+                "devflow-pr-build-poll: GitHub token auth RECOVERED after prior loss"
+            )
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"auth_ok": now_ok}),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("devflow-pr-build-poll: auth-transition check failed")
 
 
 def _pr_extras(pr: dict) -> dict:

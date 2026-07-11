@@ -85,26 +85,29 @@ TOPIC_ROUTING: Dict[str, str] = {
     'gateway_started': 'watchdog_alerts',  # gateway lifecycle (boot)
     'gateway_stopped': 'watchdog_alerts',  # gateway lifecycle (shutdown / dead-pid)
     'agent_error': 'watchdog_alerts',
-    'cron_started': 'watchdog_alerts',
-    'cron_skipped': 'watchdog_alerts',  # added 2026-04-30 — cron-restart-catchup-gap
-    'cron_triggered': 'watchdog_alerts',
-    'cron_completed': 'watchdog_alerts',
+    # -> cron_firehose (2026-07-11 comms-audit split). Routine cron
+    # LIFECYCLE telemetry moved off watchdog_alerts into a dedicated,
+    # operator-muteable firehose topic: the ≥120-char HIGH boost
+    # (cron_emitter.MEANINGFUL_OUTPUT_CHAR_THRESHOLD) was pushing ~340
+    # routine completions/day past watchdog_alerts' significant_only gate,
+    # burying the ~15 real alerts/day. FAILURE modes (cron_failed,
+    # cron_failed_consecutive, cron_stale) deliberately STAY on
+    # watchdog_alerts — those are the operator-actionable signals.
+    'cron_started': 'cron_firehose',
+    'cron_skipped': 'cron_firehose',  # added 2026-04-30 — cron-restart-catchup-gap
+    'cron_triggered': 'cron_firehose',
+    'cron_completed': 'cron_firehose',
     'cron_failed': 'watchdog_alerts',
     'cron_failed_consecutive': 'watchdog_alerts',
     'cron_stale': 'watchdog_alerts',
     # cron_skipped_duplicate: same-job concurrency guard, low-priority
-    # informational telemetry (LOW priority => batched / digest_only-gated
-    # alongside cron_started). Routed to watchdog_alerts so a sudden burst
-    # of duplicate-skips on one job is visible to the operator without
-    # needing a dedicated topic. Added 2026-04-30 with EventType.
-    'cron_skipped_duplicate': 'watchdog_alerts',
+    # informational telemetry (LOW priority => batched). A sudden burst of
+    # duplicate-skips on one job is visible in the cron firehose.
+    'cron_skipped_duplicate': 'cron_firehose',
     # cron_skipped_min_interval: Guard #4 (sequential-burst rejection).
-    # Same routing rationale as cron_skipped_duplicate — a sudden burst of
-    # min-interval rejections on one job indicates an external trigger
-    # source misbehaving and should be visible to the operator. LOW
-    # priority => batched. Added 2026-04-30 follow-up to sentinel-vip-
-    # burst-rc-2026-04-30.md §6.
-    'cron_skipped_min_interval': 'watchdog_alerts',
+    # Same routing rationale as cron_skipped_duplicate. LOW priority =>
+    # batched. Added 2026-04-30 follow-up to sentinel-vip-burst-rc §6.
+    'cron_skipped_min_interval': 'cron_firehose',
     'application_blocked': 'watchdog_alerts',
     'application_failed': 'watchdog_alerts',
     # iter5: proper watchdog event types (replacing AGENT_ERROR fallback)
@@ -340,6 +343,18 @@ class TelegramNotifier(BaseSubscriber):
         # Hot-reload verbosity config on each cycle (spec: hot-reloadable)
         self._reload_verbosity()
 
+        # Synthesized AGENT_ITERATION placeholders (scheduler marker-missing
+        # fallback, payload.synthesized=True) are telemetry for the Critic /
+        # dashboards, not operator signal — the body is always the same
+        # "<agent> completed (synthesized — agent did not emit
+        # AGENT_ITERATION_JSON)" line. devflow-bridge alone produced ~918 of
+        # these per day into devflow_firehose (2026-07-11 comms audit).
+        # Bus-only: skip chat delivery, keep every other consumer unchanged.
+        if (event.event_type == EventType.AGENT_ITERATION
+                and isinstance(event.payload, dict)
+                and event.payload.get("synthesized")):
+            return
+
         # Infrastructure noise: lag alerts about the bus itself become a feedback
         # loop (digest -> agent_error -> digest). Suppress them from chat; they
         # remain in the bus for audit-logger and the gateway log.
@@ -477,6 +492,12 @@ class TelegramNotifier(BaseSubscriber):
                 topic_key = "scribe_daily"
 
         topic = self.topics.get(topic_key, {})
+        if not topic and topic_key == "cron_firehose":
+            # Code deployed before topics.json gained the cron_firehose
+            # topic (2026-07-11 split) — degrade to the pre-split
+            # watchdog_alerts routing rather than leaking cron telemetry
+            # into the group's General thread via an empty thread_id.
+            topic = self.topics.get("watchdog_alerts", {})
         thread_id = str(topic.get("thread_id", ""))
         return ("telegram", self.group_chat_id, thread_id)
 

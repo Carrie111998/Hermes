@@ -761,3 +761,129 @@ class TestCredentialLoss:
         assert "WhatsApp session creds present" in msg
         assert "DOWN" in msg
         assert "creds.json 0 bytes" in msg
+
+
+class TestDeliveryFailureRequeue:
+    """2026-07-11 hardening: failed sends are requeued into the bounded
+    quiet queue instead of being dropped (observed loss 2026-07-11 11:29,
+    bridge 503 'Not connected to WhatsApp')."""
+
+    @staticmethod
+    def _failing_send(msg):
+        raise RuntimeError("WhatsApp bridge error (503): Not connected")
+
+    def test_immediate_failure_requeues(self, bus, quiet_config, queue_path):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=self._failing_send,
+        )
+        event = Event.create(
+            EventType.INTERVIEW_SIGNAL, "tracker", {"company": "Google"},
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(event)
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(queue) == 1
+        assert "Google" in queue[0]["message"]
+
+    def test_throttle_flush_failure_requeues_and_clears_buffer(
+        self, bus, quiet_config, queue_path,
+    ):
+        import time as _time
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=self._failing_send,
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "visa?"},
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(event)
+            assert len(escalator._throttle_buffer) == 1
+            escalator._throttle_start = _time.monotonic() - (
+                escalator.THROTTLE_WINDOW_SECONDS + 1
+            )
+            escalator._maybe_flush_throttle()
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(queue) == 1
+        assert "Acme" in queue[0]["message"]
+        assert escalator._throttle_buffer == []
+
+
+class TestThrottleAgeOutOnPoll:
+    """2026-07-11 hardening: a lone buffered escalation flushes once its
+    window ages out (via poll()), instead of waiting for the NEXT event."""
+
+    def test_lone_buffered_event_flushes_via_poll(
+        self, bus, quiet_config, queue_path,
+    ):
+        import time as _time
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "visa?"},
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(event)
+            assert sent == []  # buffered, not sent
+            escalator._throttle_start = _time.monotonic() - (
+                escalator.THROTTLE_WINDOW_SECONDS + 1
+            )
+            escalator.poll()
+        assert len(sent) == 1
+        assert "Acme" in sent[0]
+
+    def test_age_out_during_quiet_hours_moves_to_queue(
+        self, bus, quiet_config, queue_path,
+    ):
+        import time as _time
+        sent = []
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: sent.append(msg),
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "visa?"},
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(event)
+        escalator._throttle_start = _time.monotonic() - (
+            escalator.THROTTLE_WINDOW_SECONDS + 1
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=True):
+            escalator._maybe_flush_throttle()
+        assert sent == []
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+        assert len(queue) == 1
+        assert escalator._throttle_buffer == []
+
+
+class TestThrottlePersistence:
+    """2026-07-11 hardening: the throttle buffer survives a restart
+    (persisted via whatsapp_throttle_path under HERMES_HOME)."""
+
+    def test_buffer_restored_by_new_instance(self, bus, quiet_config, queue_path):
+        escalator = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: None,
+        )
+        event = Event.create(
+            EventType.APPLICATION_BLOCKED, "applier",
+            {"company": "Acme", "question": "visa?"},
+        )
+        with patch.object(escalator, "_is_quiet_hours", return_value=False):
+            escalator.handle(event)
+        assert len(escalator._throttle_buffer) == 1
+
+        fresh = WhatsAppEscalator(
+            bus, quiet_config_path=quiet_config, queue_path=queue_path,
+            send_fn=lambda msg: None,
+        )
+        assert fresh._throttle_buffer == escalator._throttle_buffer
+        assert fresh._throttle_start is not None

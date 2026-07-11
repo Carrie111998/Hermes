@@ -184,9 +184,20 @@ class WhatsAppEscalator(BaseSubscriber):
             from events.paths import quiet_queue_path
             self._queue_path = quiet_queue_path()
 
-        # Throttle state
+        # Throttle state — persisted across restarts (2026-07-11): a buffered
+        # escalation used to be in-memory only, so a gateway restart inside
+        # the 15-min window silently dropped it. Monotonic timestamps don't
+        # survive restarts, so a restored buffer restarts its window "now"
+        # (worst case: one extra window of delay, never a loss).
+        from events.state import load_state as _load_state
+        from events.paths import whatsapp_throttle_path as _throttle_path
         self._throttle_buffer: List[str] = []
         self._throttle_start: Optional[float] = None
+        _saved_throttle = _load_state(_throttle_path(), default={})
+        if isinstance(_saved_throttle.get("buffer"), list):
+            self._throttle_buffer = [str(m) for m in _saved_throttle["buffer"]]
+        if self._throttle_buffer:
+            self._throttle_start = time.monotonic()
         self._daily_send_count: int = 0
         self._daily_reset_date: Optional[str] = None
 
@@ -336,7 +347,17 @@ class WhatsAppEscalator(BaseSubscriber):
         # still log via the existing logger.warning; their reverse-signal
         # coverage is a Phase 2 follow-up.
         if classify_tier(event) == EscalationTier.IMMEDIATE:
-            self._deliver(message, event=event)
+            if not self._deliver(message, event=event):
+                # 2026-07-11: a failed breakthrough send (e.g. WhatsApp
+                # bridge 503 mid-reconnect) used to be dropped on the
+                # floor. Requeue into the bounded quiet queue so the
+                # stranded-queue retry in gateway_integration re-attempts
+                # it instead of losing the one escalation that mattered.
+                self._queue_message(message)
+                logger.warning(
+                    "WhatsAppEscalator: IMMEDIATE delivery failed; "
+                    "requeued for stranded-queue retry"
+                )
             return
 
         # Throttle: buffer events within 15-minute windows
@@ -345,6 +366,7 @@ class WhatsAppEscalator(BaseSubscriber):
             self._throttle_start = now
 
         self._throttle_buffer.append(message.split("\n\nDetails in Telegram")[0])
+        self._persist_throttle_buffer()
 
         if now - self._throttle_start >= self.THROTTLE_WINDOW_SECONDS:
             self._flush_throttle_buffer()
@@ -394,7 +416,13 @@ class WhatsAppEscalator(BaseSubscriber):
         return f"{formatted}\n\nDetails in Telegram"
 
     def _flush_throttle_buffer(self) -> None:
-        """Flush accumulated throttle buffer into a single WhatsApp message."""
+        """Flush accumulated throttle buffer into a single WhatsApp message.
+
+        On delivery failure the combined message is requeued into the
+        bounded quiet queue (2026-07-11) — before that, a bridge outage at
+        flush time silently dropped every buffered escalation (observed
+        2026-07-11 11:29, bridge 503 "Not connected to WhatsApp").
+        """
         if not self._throttle_buffer:
             self._throttle_start = None
             return
@@ -404,9 +432,54 @@ class WhatsAppEscalator(BaseSubscriber):
             text = f"{len(self._throttle_buffer)} updates:\n\n"
             text += "\n\n".join(f"- {m}" for m in self._throttle_buffer)
             text += "\n\nDetails in Telegram"
-        self._deliver(text)
+        if not self._deliver(text):
+            self._queue_message(text)
+            logger.warning(
+                "WhatsAppEscalator: throttle flush failed; requeued to quiet queue"
+            )
         self._throttle_buffer.clear()
         self._throttle_start = None
+        self._persist_throttle_buffer()
+
+    def poll(self) -> int:
+        """Poll events, then age out the throttle buffer.
+
+        2026-07-11: the throttle buffer used to flush only from inside
+        handle() — i.e. only when a LATER escalatable event arrived. A
+        lone URGENT event with no follow-up sat buffered indefinitely
+        (until shutdown). Piggybacking on the registry's poll cadence
+        gives a wall-clock flush without a dedicated timer thread.
+        """
+        n = super().poll()
+        self._maybe_flush_throttle()
+        return n
+
+    def _maybe_flush_throttle(self) -> None:
+        """Flush the throttle buffer once its window has aged out."""
+        if not self._throttle_buffer or self._throttle_start is None:
+            return
+        if time.monotonic() - self._throttle_start < self.THROTTLE_WINDOW_SECONDS:
+            return
+        if self._is_quiet_hours():
+            # The window aged out INTO quiet hours (e.g. buffered 22:50,
+            # flush due 23:05): move to the morning queue instead of
+            # pinging overnight.
+            for m in self._throttle_buffer:
+                self._queue_message(m + "\n\nDetails in Telegram")
+            self._throttle_buffer.clear()
+            self._throttle_start = None
+            self._persist_throttle_buffer()
+            return
+        self._flush_throttle_buffer()
+
+    def _persist_throttle_buffer(self) -> None:
+        """Write throttle state to disk so it survives restart."""
+        try:
+            from events.paths import whatsapp_throttle_path
+            from events.state import save_state
+            save_state(whatsapp_throttle_path(), {"buffer": list(self._throttle_buffer)})
+        except Exception:
+            logger.exception("WhatsAppEscalator: failed to persist throttle buffer")
 
     def shutdown(self) -> None:
         """Flush pending throttle buffer and queue on shutdown."""
