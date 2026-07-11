@@ -43,6 +43,13 @@ not fetch it or create a media cache file. A downstream secure consumer must
 authorize the sender and redeem the handle within the TTL before the attachment
 becomes model-ready.
 
+Handle-bearing events also carry a random `deliveryId`. The sidecar retains the
+event until the adapter posts `/inbound-ack` after sender authorization, secure
+handle acceptance, and successful message processing. A dropped connection
+replays the same delivery without redeeming the handle twice. The queue is
+bounded to 128 events with a five-minute TTL and wipes attachment buffers when
+an event expires or the process shuts down.
+
 ## Run standalone
 
 For debugging:
