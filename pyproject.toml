@@ -203,7 +203,7 @@ Documentation = "https://hermes-agent.nousresearch.com/docs"
 # This section is deliberately minimal - most deps come from PyPI via uv.lock.
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 exclude = ["tests*", "scripts*"]
 
 [tool.ruff]
