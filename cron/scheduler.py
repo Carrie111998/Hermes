@@ -2900,6 +2900,26 @@ def _run_job_script(script_path: str, timeout_s=None) -> tuple[bool, str]:
     if script_timeout is None:
         script_timeout = _get_script_timeout()
 
+    # Re-read .env fresh for every script run, mirroring the agent-job path
+    # (see the identical block in _process_job): script subprocesses inherit
+    # the GATEWAY's os.environ below, and without this reload a rotated
+    # secret in profiles/<active>/.env is invisible until a gateway restart.
+    # Bit for real on 2026-07-11: HERMES_GITHUB_TOKEN was rotated in .env but
+    # devflow-pr-build-poll kept 401'ing with the launch-inherited dead token.
+    # Same env-staleness class as the 2026-07-10 TELEGRAM_HOME_CHANNEL miss.
+    try:
+        from hermes_cli.env_loader import (
+            load_hermes_dotenv,
+            reset_secret_source_cache,
+        )
+        reset_secret_source_cache()
+        load_hermes_dotenv(hermes_home=_get_hermes_home())
+    except Exception as e:
+        # A broken .env reload must not block a script that may not even
+        # need env at all; the stale-env behavior is the pre-2026-07-11
+        # status quo, not a new failure.
+        logger.warning("Script-slot .env reload failed (continuing with process env): %s", e)
+
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
