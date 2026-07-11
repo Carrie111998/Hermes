@@ -866,12 +866,41 @@ class TestSkillViewCollisionDetection:
         assert "hint" in result
 
 
-    def test_support_markdown_does_not_collide_with_real_skill(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("skill_name", "support_path", "body"),
+        [
+            (
+                "pixel-art",
+                (
+                    "creative",
+                    "baoyu-infographic",
+                    "references",
+                    "styles",
+                    "pixel-art.md",
+                ),
+                "REAL PIXEL ART SKILL",
+            ),
+            (
+                "sketch",
+                (
+                    "creative",
+                    "article-illustrator",
+                    "references",
+                    "styles",
+                    "sketch.md",
+                ),
+                "REAL SKETCH SKILL",
+            ),
+        ],
+    )
+    def test_support_markdown_does_not_collide_with_real_skill(
+        self, tmp_path, skill_name, support_path, body
+    ):
         """Supporting reference docs named <skill>.md are not skills.
 
-        A real-world regression had creative/sketch/SKILL.md become
+        Real-world regressions had creative/<skill>/SKILL.md become
         unloadable because another skill carried
-        references/styles/sketch.md. Support files are loaded via
+        references/styles/<skill>.md. Support files are loaded via
         skill_view(skill, file_path=...), not as bare skill names.
         """
         local_dir = tmp_path / "local"
@@ -879,27 +908,20 @@ class TestSkillViewCollisionDetection:
         local_dir.mkdir()
         external_dir.mkdir()
 
-        _make_skill(local_dir, "article-illustrator", category="creative")
-        support_file = (
-            local_dir
-            / "creative"
-            / "article-illustrator"
-            / "references"
-            / "styles"
-            / "sketch.md"
-        )
+        _make_skill(local_dir, support_path[1], category=support_path[0])
+        support_file = local_dir.joinpath(*support_path)
         support_file.parent.mkdir(parents=True, exist_ok=True)
-        support_file.write_text("# Sketch style support doc\n")
-        _make_skill(local_dir, "sketch", category="creative", body="REAL SKETCH SKILL")
+        support_file.write_text(f"# {skill_name} style support doc\n")
+        _make_skill(local_dir, skill_name, category="creative", body=body)
 
         p1, p2 = self._patch_dirs(local_dir, [external_dir])
         with p1, p2:
-            raw = skill_view("sketch")
+            raw = skill_view(skill_name)
 
         result = json.loads(raw)
         assert result["success"] is True
-        assert result["path"] == "creative/sketch/SKILL.md"
-        assert "REAL SKETCH SKILL" in result["content"]
+        assert result["path"] == f"creative/{skill_name}/SKILL.md"
+        assert body in result["content"]
 
 
     def test_two_externals_same_name_also_refuse(self, tmp_path):
