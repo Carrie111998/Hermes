@@ -193,6 +193,18 @@ acp = ["agent-client-protocol==0.9.0"]
 supermemory = ["supermemory==3.50.0"]
 mem0 = ["mem0ai==2.0.10"]
 
+all = [
+  "hermes-agent[cron]",
+  "hermes-agent[cli]",
+  "hermes-agent[pty]",
+  "hermes-agent[mcp]",
+  "hermes-agent[homeassistant]",
+  "hermes-agent[sms]",
+  "hermes-agent[acp]",
+  "hermes-agent[google]",
+  "hermes-agent[web]",
+]
+
 [project.urls]
 Homepage = "https://github.com/NousResearch/hermes-agent"
 Repository = "https://github.com/NousResearch/hermes-agent"
