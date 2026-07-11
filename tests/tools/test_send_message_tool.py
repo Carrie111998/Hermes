@@ -253,6 +253,35 @@ def _install_telegram_mock(monkeypatch, bot):
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
 
+@pytest.mark.asyncio
+async def test_standalone_telegram_rejects_invisible_only(monkeypatch):
+    """Bug class #60848: the standalone/cron sender must also refuse
+    zero-width-only content, not just the gateway adapter path."""
+    from tools.send_message_tool import _send_telegram
+
+    bot = AsyncMock()
+    _install_telegram_mock(monkeypatch, bot)
+
+    invisible = "\u200b\u200c\u200d\u2060\ufeff\u00ad"  # zero-width cluster only
+    await _send_telegram(token="x", chat_id=123, message=invisible)
+
+    bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_standalone_telegram_sends_visible(monkeypatch):
+    """Regression guard: real text still delivers through the standalone path."""
+    from tools.send_message_tool import _send_telegram
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value={"message_id": 1})
+    _install_telegram_mock(monkeypatch, bot)
+
+    await _send_telegram(token="x", chat_id=123, message="hello\u200bworld")
+
+    bot.send_message.assert_called()
+
+
 def _ensure_slack_mock(monkeypatch):
     if "slack_bolt" in sys.modules and hasattr(sys.modules["slack_bolt"], "__file__"):
         return
