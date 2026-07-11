@@ -1021,6 +1021,7 @@ export function useSessionActions({
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
+          defer_history: !watchWindow,
           // REST is the transcript authority for Desktop. Avoid duplicating a
           // potentially huge compression lineage in the WebSocket response.
           // Watch windows attach lazily (live mirror). Every other cold resume
@@ -1070,7 +1071,6 @@ export function useSessionActions({
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
         }
-
         const currentMessages = $messages.get()
 
         // Keep the local snapshot when resume would only reshuffle runtime
