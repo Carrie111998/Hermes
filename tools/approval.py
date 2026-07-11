@@ -913,6 +913,17 @@ DANGEROUS_PATTERNS = [
     (r'\bgit\s+clean\s+-[^\s]*f', "git clean with force (deletes untracked files)"),
     (r'\bgit\s+clean\b.*--forc[a-z]*\b', "git clean with force long flag (deletes untracked files)"),
     (r'\bgit\s+branch\s+-D\b', "git branch force delete"),
+    # `git checkout -- <path>` treats every following argument as a pathspec
+    # and restores its working-tree content from the index, discarding
+    # unstaged changes. The required path token keeps a bare `git checkout --`
+    # (which errors without changing anything) out of the approval flow.
+    (r'\bgit\s+checkout\s+--\s+[^\s;|&]+', "git checkout -- (discards working-tree changes)"),
+    # `git restore` defaults to restoring the working tree. A direct path,
+    # including `.` for the whole tree, is therefore destructive; `--staged`
+    # alone changes only the index and must remain safe. The worktree flags
+    # explicitly select the destructive mode even when used with other flags.
+    (r'\bgit\s+restore\b[^;|&\n]*(?:\s--worktree\b|\s-W\b)', "git restore working tree (discards uncommitted changes)"),
+    (r'\bgit\s+restore\b(?![^;|&\n]*\s--staged\b)[^;|&\n]*?\s(?!-)[^\s;|&]+', "git restore path (discards working-tree changes)"),
     # `-D` is shorthand for `-d --force`; the long-flag spellings
     # (`--delete`, `--force`) are different tokens entirely, so they slip
     # past the `-D\b` pattern above even though `git branch -d --force`

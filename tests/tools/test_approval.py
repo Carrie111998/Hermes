@@ -935,6 +935,128 @@ class TestGitDestructiveOps:
             dangerous, _, _ = detect_dangerous_command(cmd)
             assert dangerous is False, cmd
 
+    def test_git_reset_help_not_flagged(self):
+        """--help must not resolve as an abbreviation of --hard."""
+        cmd = "git reset --help"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_push_force_detected(self):
+        cmd = "git push --force origin main"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "force" in desc.lower()
+
+    def test_git_push_dash_f_detected(self):
+        cmd = "git push -f origin main"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_clean_force_detected(self):
+        cmd = "git clean -fd"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "clean" in desc.lower()
+
+    def test_git_checkout_dash_dash_all_detected(self):
+        cmd = "git checkout -- ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_checkout_dash_dash_file_detected(self):
+        cmd = "git checkout -- src/main.py"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_checkout_branch_not_flagged(self):
+        cmd = "git checkout feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_checkout_new_branch_not_flagged(self):
+        cmd = "git checkout -b new-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_restore_dot_detected(self):
+        cmd = "git restore ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_path_detected(self):
+        cmd = "git restore src/main.py"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_worktree_flag_detected(self):
+        cmd = "git restore --worktree ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_short_worktree_flag_detected(self):
+        cmd = "git restore -W ."
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_restore_staged_not_flagged(self):
+        cmd = "git restore --staged src/main.py"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_branch_force_delete_detected(self):
+        cmd = "git branch -D feature-branch"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_safe_git_status_not_flagged(self):
+        cmd = "git status"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_safe_git_push_not_flagged(self):
+        """Normal push without --force must not be flagged."""
+        cmd = "git push origin main"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
+    def test_git_branch_lowercase_d_also_flagged(self):
+        """git branch -d triggers approval too — IGNORECASE is global.
+
+        This is intentional: -d is safer than -D but an approval prompt
+        for branch deletion is reasonable. The user can still approve.
+        """
+        cmd = "git branch -d feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_branch_long_flag_delete_force_detected(self):
+        # `--delete --force` performs the exact same unmerged-branch force
+        # delete as `-D` (verified live), but is a different token
+        # spelling entirely so the `-D\b` pattern never sees it.
+        cmd = "git branch --delete --force feature-branch"
+        dangerous, _, desc = detect_dangerous_command(cmd)
+        assert dangerous is True
+        assert "force delete" in desc.lower()
+
+    def test_git_branch_short_delete_long_force_detected(self):
+        # `-d --force` is git's own documented equivalent of `-D`.
+        cmd = "git branch -d --force feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_branch_force_first_delete_detected(self):
+        cmd = "git branch --force --delete feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is True
+
+    def test_git_branch_long_delete_without_force_not_flagged(self):
+        """Plain --delete (merged-only, equivalent to -d) has no force
+        token, so the new combined delete+force patterns must not fire —
+        only an actual force flag alongside it should trigger."""
+        cmd = "git branch --delete feature-branch"
+        dangerous, _, _ = detect_dangerous_command(cmd)
+        assert dangerous is False
+
 
 class TestChmodExecuteCombo:
     """chmod +x && ./ is the two-step social engineering pattern where a
