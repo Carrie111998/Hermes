@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hermes-agent"
 version = "0.18.2"
-description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
+description = "The self-improving AI agent - creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
 # Python from `requires-python`, and an inherited `UV_PYTHON` env var (or a
@@ -22,7 +22,7 @@ authors = [{ name = "Nous Research" }]
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-  # Core — every direct dep is exact-pinned to ==X.Y.Z (no ranges).
+  # Core - every direct dep is exact-pinned to ==X.Y.Z (no ranges).
   # Rationale: ranges allow PyPI to ship a fresh version of a transitive
   # at any time without a code review on our side. Exact pins mean the
   # only way a new package version reaches a user is via an intentional
@@ -60,7 +60,7 @@ dependencies = [
   "pydantic==2.13.4",
   # Interactive CLI (prompt_toolkit is used directly by cli.py)
   "prompt_toolkit==3.0.52",
-  # Cron scheduler (built-in feature — scheduled cron/interval jobs use croniter).
+  # Cron scheduler (built-in feature - scheduled cron/interval jobs use croniter).
   "croniter==6.0.0",
   # ``packaging`` is imported directly on three production paths but was never
   # declared, so it only reached users transitively (pip/uv pull it for other
@@ -69,7 +69,7 @@ dependencies = [
   # ``_meets_minimum_version`` disables update_mode='append' (#40503),
   # tools/lazy_deps.py treats every version constraint as satisfied, and
   # hermes_cli/main.py drops to naive requirement parsing. Pure-Python
-  # py3-none-any wheel, no compiled extensions — safe to ship everywhere.
+  # py3-none-any wheel, no compiled extensions - safe to ship everywhere.
   # Pinned to the version already resolved in uv.lock (no resolution churn).
   "packaging==26.0",
   # Markdown -> HTML conversion for rich message delivery (Matrix
@@ -79,10 +79,10 @@ dependencies = [
   # back to plain text, so cron/agent deliveries render raw `##`/`**`/tables
   # in clients like Element (see #32486). Pure-Python py3-none-any wheel
   # (~108KB, no compiled extensions, no platform constraints), so unlike the
-  # matrix extra's `mautrix`/`python-olm` it is safe to ship everywhere — keeps
+  # matrix extra's `mautrix`/`python-olm` it is safe to ship everywhere - keeps
   # it out of the lazy-install path that exists only for the heavy matrix deps.
   "Markdown==3.10.2",
-  # Skills Hub (GitHub App JWT auth — optional, only needed for bot identity)
+  # Skills Hub (GitHub App JWT auth - optional, only needed for bot identity)
   "PyJWT[crypto]==2.13.0",  # PYSEC-2026-175/177/178/179
   # urllib3 2.7.0 fixes GHSA-mf9v-mfxr-j63j (decompression-bomb bypass)
   # and GHSA-qccp-gfcp-xxvc (header leak across origins).
@@ -99,7 +99,7 @@ dependencies = [
   # Cross-platform process / PID management.  ``psutil`` is the canonical
   # answer for "is this PID alive" and process-tree walking across Linux,
   # macOS and Windows.  It replaces POSIX-only idioms like `os.kill(pid, 0)`
-  # (which is a silent killer on Windows — see CONTRIBUTING.md) and
+  # (which is a silent killer on Windows - see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil==7.2.2",
   # Browser CDP supervisor + browser_dialog import this directly. Keep core
@@ -122,18 +122,18 @@ dependencies = [
   # bricks the session on Anthropic's non-retryable 400. Pure-wheel, no system
   # libs required for the codecs we use, so it's safe to ship in the base
   # install rather than gating it behind an extra + a mid-session lazy install
-  # (which deadlocked the CLI under prompt_toolkit — see #40490).
+  # (which deadlocked the CLI under prompt_toolkit - see #40490).
   "Pillow==12.2.0",
   # Windows log rotation. Stdlib ``RotatingFileHandler.doRollover()`` uses
   # ``os.rename()`` which fails with ``PermissionError [WinError 32]`` on
   # Windows whenever any other process holds an append-mode handle on
-  # ``agent.log`` (always the case in Hermes — TUI, gateway, ``hy_memory``
+  # ``agent.log`` (always the case in Hermes - TUI, gateway, ``hy_memory``
   # server, MCP servers, and on-demand CLI commands all log from separate
   # processes), pinning ``agent.log`` at the 5 MiB threshold and spamming
   # stderr on every emit (see #44873). ``concurrent-log-handler`` wraps the
   # rename in a cross-process file lock (via ``portalocker``: pywin32 on
   # Windows) so only one process rotates at a time. ``hermes_logging.py``
-  # aliases it ONLY on Windows — POSIX renames an open file fine, so stdlib
+  # aliases it ONLY on Windows - POSIX renames an open file fine, so stdlib
   # already works there and managed-mode perms depend on its exact lifecycle.
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it is actually used.
@@ -141,17 +141,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Native Anthropic provider — only needed when provider=anthropic (not via
+# Native Anthropic provider - only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
-# Web search backends — each only loaded when the user picks it as their
+# Web search backends - each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.10.2"]
 firecrawl = ["firecrawl-py==4.17.0"]
 parallel-web = ["parallel-web==0.4.2"]
 # Image generation backends
 fal = ["fal-client==0.13.1"]
-# Edge TTS — default TTS provider but still optional (users can pick
+# Edge TTS - default TTS provider but still optional (users can pick
 # ElevenLabs / OpenAI / MiniMax instead).
 edge-tts = ["edge-tts==7.2.7"]
 modal = ["modal==1.3.4"]
@@ -162,7 +162,7 @@ messaging = ["python-telegram-bot[webhooks]==22.6", "discord.py[voice]==2.7.1", 
 cron = []  # croniter is now a core dependency; this extra kept for back-compat
 slack = ["slack-bolt==1.27.0", "slack-sdk==3.40.1", "aiohttp==3.14.1"]
 matrix = ["mautrix[encryption]==0.21.0", "aiosqlite==0.22.1", "asyncpg==0.31.0", "aiohttp-socks==0.11.0", "aiohttp==3.14.1"]  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525 (mautrix/aiohttp-socks only cap aiohttp<4 / >=3.10, so pin the patched floor directly)
-# WeCom callback-mode adapter — parses untrusted XML POST bodies from
+# WeCom callback-mode adapter - parses untrusted XML POST bodies from
 # WeCom-controlled callback endpoints, so we use defusedxml (drop-in
 # replacement for stdlib xml.etree.ElementTree) to block billion-laughs
 # and XXE. aiohttp/httpx are already in [messaging]; defusedxml lands
@@ -178,13 +178,13 @@ voice = [
   "numpy==2.4.3",
 ]
 pty = [
-  # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
+  # Kept as a no-op back-compat alias - `ptyprocess` and `pywinpty` are now
   # in the main `dependencies` list (with the same platform markers), so
   # any existing `pip install hermes-agent[pty]` invocations resolve cleanly
   # without pulling in extra packages.
 ]
 honcho = ["honcho-ai==2.0.1"]
-# Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
+# Cloud memory providers - opt-in, lazy-installed via tools/lazy_deps.py
 # (memory.supermemory / memory.mem0) at first use. Exact pins MUST match the
 # LAZY_DEPS pins (enforced by tests/test_project_metadata.py). Deliberately
 # excluded from [all] like honcho/hindsight so a quarantined upstream release
@@ -200,7 +200,7 @@ Documentation = "https://hermes-agent.nousresearch.com/docs"
 
 [tool.uv.sources]
 # Override sources for packages not on PyPI or needing special handling.
-# This section is deliberately minimal — most deps come from PyPI via uv.lock.
+# This section is deliberately minimal - most deps come from PyPI via uv.lock.
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -258,34 +258,33 @@ select = [
   "T20", # flake8-print
 ]
 ignore = [
-  "SIM102", # "Consider using `with` statement" — false positive on try/except
-  "SIM103", # "Consider using `return` instead of `else`" — false positive
-  "ARG001", # Unused function argument — common in callbacks
-  "ARG002", # Unused method argument — common in callbacks
-  "TID252", # "Prefer `from __future__ import annotations`" — we already have it
-  "ERA001", # "Consider using `dict.get`" — not always equivalent
-  "B008",   # "Do not perform function calls in argument defaults" — acceptable for lazy init
-  "ANN101", # Missing type annotation for `self` — not needed
-  "ANN102", # Missing type annotation for `cls` — not needed
-  "ANN401", # Dynamically typed — acceptable for dynamic code
-  "DTZ001", # Use timezone-aware datetime — acceptable for TZ=UTC pinned env
-  "LOG001", # Use lazy logging format — acceptable for structured logging
-  "PTH118", # Use os.path.getmtime — acceptable for mtime
-  "NPY002", # Use np.float64 — acceptable for explicit typing
-  "PERF401",# Use dict comprehension — not always clearer
-  "BLE001", # Catch specific exception — acceptable for top-level handlers
-  "INP001", # Use itertools — not always applicable
-  "ASYNC101",# Use asyncio.to_thread — not always available
-  "T201",   # Use logging instead of print — acceptable for CLI output
-  "ANN201", # Missing return type — acceptable for simple functions
-  "ANN202", # Missing return type — acceptable for simple functions
-  "ANN204", # Missing return type — acceptable for generators
+  "SIM102", # "Consider using `with` statement" - false positive on try/except
+  "SIM103", # "Consider using `return` instead of `else`" - false positive
+  "ARG001", # Unused function argument - common in callbacks
+  "ARG002", # Unused method argument - common in callbacks
+  "TID252", # "Prefer `from __future__ import annotations`" - we already have it
+  "ERA001", # "Consider using `dict.get`" - not always equivalent
+  "B008",   # "Do not perform function calls in argument defaults" - acceptable for lazy init
+  "ANN101", # Missing type annotation for `self` - not needed
+  "ANN102", # Missing type annotation for `cls` - not needed
+  "ANN401", # Dynamically typed - acceptable for dynamic code
+  "DTZ001", # Use timezone-aware datetime - acceptable for TZ=UTC pinned env
+  "LOG001", # Use lazy logging format - acceptable for structured logging
+  "PTH118", # Use os.path.getmtime - acceptable for mtime
+  "NPY002", # Use np.float64 - acceptable for explicit typing
+  "PERF401",# Use dict comprehension - not always clearer
+  "BLE001", # Catch specific exception - acceptable for top-level handlers
+  "INP001", # Use itertools - not always applicable
+  "ASYNC101",# Use asyncio.to_thread - not always available
+  "T201",   # Use logging instead of print - acceptable for CLI output
+  "ANN201", # Missing return type - acceptable for simple functions
+  "ANN202", # Missing return type - acceptable for simple functions
+  "ANN204", # Missing return type - acceptable for generators
 ]
-per-file-ignores = {
-  "tests/*" = ["S101", "T201", "T203"],  # assert/pytest print in tests OK
-  "scripts/*" = ["S101", "T201", "T203"],
-  "src/hermes_cli/*" = ["T201", "T203"],
-}
+[per-file-ignores]
+"tests/*" = ["S101", "T201", "T203"]
+"scripts/*" = ["S101", "T201", "T203"]
+"src/hermes_cli/*" = ["T201", "T203"]
 
 [tool.ruff.format]
 quote-style = "double"
