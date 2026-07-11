@@ -7,6 +7,7 @@ customer/admin systems.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -67,13 +68,13 @@ _TOOLS = (
 )
 
 
-def _tool_handler(handler: Callable[..., dict[str, Any]]) -> Callable[..., dict[str, Any]]:
-    """Adapt public-safe helpers to Hermes registry's ``handler(args, **ctx)`` call shape."""
+def _tool_handler(handler: Callable[..., dict[str, Any]]) -> Callable[..., str]:
+    """Adapt fact helpers to Hermes' string-based tool-result contract."""
 
-    def wrapped(args: dict[str, Any] | None = None, **_context: Any) -> dict[str, Any]:
+    def wrapped(args: dict[str, Any] | None = None, **_context: Any) -> str:
         if not isinstance(args, dict):
             args = {}
-        return handler(**args)
+        return json.dumps(handler(**args), ensure_ascii=False, sort_keys=True)
 
     return wrapped
 

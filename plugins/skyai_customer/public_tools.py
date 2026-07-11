@@ -562,10 +562,9 @@ def _catalog_selection_context(items: list[dict[str, Any]]) -> dict[str, Any]:
             "diverse_items keeps the same public evidence but interleaves activity families so Hermes can "
             "avoid accidental same-family clusters when the customer's request is exploratory."
         ),
-        "selection_guidance": (
-            "Use judgment. If the customer is still exploring, start with different gift/activity families "
-            "and ask a natural narrowing question. If the customer clearly wants one activity family, "
-            "similar options are fine."
+        "evidence_interpretation_contract": (
+            "category_mix and diverse_items describe the retrieved evidence; they do not select the final "
+            "customer-facing answer. Hermes remains the reasoning owner."
         ),
         "category_mix": [
             {"category_key": key, "count": category_counts[key]}
@@ -1061,9 +1060,9 @@ def handle_skyai_campaign_knowledge(
                             "когато после се създаде профил със същия имейл, подаръкът трябва да се появи "
                             "автоматично в профила"
                         ),
-                        "customer_guidance": (
-                            "Не насочвай клиента да добавя подаръчния бонус ръчно с бутон „Добави ваучер“; "
-                            "при липсващ подарък се проверява имейлът от поръчката и профилът."
+                        "missing_entitlement_resolution": (
+                            "Подаръчният бонус не се добавя ръчно с бутон „Добави ваучер“; при липсващ "
+                            "подарък проверката е по имейла от поръчката и свързания профил."
                         ),
                     },
                     "how_to_book": "клиентът избира таймслот и резервира полета през системата",
@@ -1145,9 +1144,9 @@ def handle_skyai_campaign_knowledge(
                 "platform_scale": "SkyVision вече предлага над 1000 преживявания, но летенето остава личната страст на основателите",
                 "personal_flight_fact": "Емил и Малина все още лично летят и изпълняват част от полетите",
                 "reason": "мисията на SkyVision е да споделя любовта към летенето и да радва хората",
-                "approval_guidance": (
-                    "ако клиентът иска човекът, за когото купува, да използва бонуса, SkyAI може директно "
-                    "да даде публичния телефон на Емил за лично одобрение"
+                "recipient_transfer_approval": (
+                    "използване на бонуса от друг човек е изключение с лично одобрение от Емил; "
+                    "публичният му телефон е наличен в public_founder_contact"
                 ),
             },
             "public_founder_contact": "+359 886 417 142",

@@ -17,6 +17,8 @@ ALLOWED_PREFIXES = (
     "plugins/skyai_customer/",
     "skills/productivity/skyai-customer-hermes-v2/",
     "docs/skyai-v2-",
+    "docs/skyai-voice-contract-v0.1.md",
+    "docs/voice/skyai-voice-joint-contract-v0.1.md",
     "tests/plugins/test_skyai_customer_",
     "tests/scripts/test_skyai_v2_bootstrap_dev_profile.py",
     "tests/scripts/test_skyai_v2_compare_matrix.py",
@@ -24,6 +26,7 @@ ALLOWED_PREFIXES = (
     "scripts/skyai_v2_bootstrap_dev_profile.py",
     "scripts/skyai_v2_compare_matrix.py",
     "scripts/skyai_v2_upstream_sync_check.py",
+    "scripts/skyai_voice_",
 )
 
 

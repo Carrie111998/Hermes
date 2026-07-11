@@ -90,7 +90,7 @@ def test_registered_tool_handlers_accept_hermes_dispatch_context(monkeypatch, tm
                 handler=tool["handler"],
                 toolset=tool["toolset"],
             )
-        result = registry.dispatch(
+        raw_result = registry.dispatch(
             "skyai_event_log_append",
             {
                 "event_type": "product_recommended",
@@ -98,6 +98,8 @@ def test_registered_tool_handlers_accept_hermes_dispatch_context(monkeypatch, tm
             },
             task_id="runtime-task",
         )
+        assert isinstance(raw_result, str)
+        result = json.loads(raw_result)
 
         assert result["status"] == "ok"
         assert (tmp_path / "events.jsonl").exists()
@@ -629,7 +631,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     assert "автоматично в профила" in gift_linking["logged_in_order"]
     assert "имейла от поръчката" in gift_linking["guest_or_no_profile_order"]
     assert "същия имейл" in gift_linking["later_profile_with_same_email"]
-    assert "Не насочвай клиента да добавя" in gift_linking["customer_guidance"]
+    assert "не се добавя ръчно" in gift_linking["missing_entitlement_resolution"]
     assert "без предварително купуване на ваучер" in campaign["booknow_nuance"]
     assert "парите ще бъдат възстановени" in campaign["booknow_nuance"]
     assert campaign["bonus_product"]["product_id"] == 95435
@@ -652,7 +654,7 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     assert "все още лично летят" in founder_facts["personal_flight_fact"]
     assert "пилот-инструктор" in founder_facts["founder_role"]
     assert "лично одобрение" in founder_facts["recipient_transfer"]
-    assert "публичния телефон на Емил" in founder_facts["approval_guidance"]
+    assert "public_founder_contact" in founder_facts["recipient_transfer_approval"]
     assert result["founder_transfer_facts"]["public_founder_contact"] == "+359 886 417 142"
 
 

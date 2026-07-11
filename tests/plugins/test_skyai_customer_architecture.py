@@ -76,6 +76,8 @@ def test_customer_tools_return_facts_not_instruction_keys() -> None:
 def test_catalog_tool_has_no_backend_persona_or_keyword_policy() -> None:
     source = Path("plugins/skyai_customer/public_tools.py").read_text(encoding="utf-8")
 
+    assert "_guidance" not in source
+
     forbidden_symbols = {
         "_CALM_QUERY_TOKENS",
         "_CALM_PRODUCT_SIGNALS",
