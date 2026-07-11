@@ -256,6 +256,18 @@ Documentation = "https://hermes-agent.nousresearch.com/docs"
 where = ["."]
 exclude = ["tests*", "scripts*"]
 
+[tool.setuptools.package-data]
+hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
+gateway = ["assets/**/*"]
+plugins = [
+  "*/dashboard/manifest.json",
+  "*/dashboard/dist/*",
+  "*/dashboard/dist/**/*",
+  "**/plugin.yaml",
+  "**/plugin.yml",
+  "**/README.md",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
