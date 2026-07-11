@@ -44,6 +44,10 @@ personal WhatsApp account or WhatsApp Web session.
 - The user wants outreach messages drafted for approval.
 - Tracking replies or opt-outs on previously sent WhatsApp outreach.
 
+In an `outreach_generation` agent run, compose and QA only, then return the
+JSON output — the server owns approval and delivery; never call the
+generate/approve/send APIs from inside a generation run.
+
 ## Prerequisites
 
 - A connected WhatsApp Business integration (`GET /api/v1/integrations/whatsapp`

@@ -52,6 +52,8 @@ _MCP_CATALOG_FILES = {"hermes_cli/mcp_catalog.py"}
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
+    if p == "PRODUCT.md":  # tests/server/test_api_mvp.py parses it for route contracts
+        return False
     return p.endswith((".md", ".mdx")) or p.startswith("docs/") or p.startswith("LICENSE")
 
 

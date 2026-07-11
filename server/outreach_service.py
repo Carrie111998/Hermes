@@ -255,9 +255,13 @@ class OutreachService:
         minute = local.hour * 60 + local.minute
         allowed = False
         for window in windows:
-            start, end = window.split("-", 1)
-            sh, sm = map(int, start.split(":"))
-            eh, em = map(int, end.split(":"))
+            try:
+                start, end = window.split("-", 1)
+                sh, sm = map(int, start.split(":"))
+                eh, em = map(int, end.split(":"))
+            except ValueError:
+                raise HTTPException(422, {"message": "Invalid send window; expected HH:MM-HH:MM",
+                                          "window": window})
             allowed |= sh * 60 + sm <= minute < eh * 60 + em
         if not allowed:
             raise HTTPException(409, {"message": "Outside recipient-local send window",

@@ -104,16 +104,25 @@ def extract_json(text: str) -> dict:
             return value
     except json.JSONDecodeError:
         pass
+    # The final answer is the LAST top-level JSON object on stdout; earlier
+    # ones are echoed payloads or tool logs. Parse forward, skipping past each
+    # complete object so nested dicts are never mistaken for the answer.
     decoder = json.JSONDecoder()
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
+    last: dict | None = None
+    index = 0
+    while (index := text.find("{", index)) != -1:
         try:
-            value, _ = decoder.raw_decode(text[index:])
+            value, end = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
+            index += 1
             continue
         if isinstance(value, dict):
-            return value
+            last = value
+            index += end
+        else:
+            index += 1
+    if last is not None:
+        return last
     raise ValueError("agent output did not contain a JSON object")
 
 
@@ -333,10 +342,10 @@ class AgentRunService:
             self.event(run_id, company_id, "failed", str(exc)[:1000])
 
     def _validate_output(self, run_type: str, output: dict) -> None:
+        # No stub escape hatch: model stdout is untrusted, and StubRunExecutor
+        # output carries every required key anyway.
         if not isinstance(output, dict):
             raise ValueError("run output must be a JSON object")
-        if output.get("stub"):
-            return
         missing = OUTPUT_KEYS[run_type] - set(output)
         if missing:
             raise ValueError(f"run output missing fields: {sorted(missing)}")
@@ -460,7 +469,7 @@ class AgentRunService:
                 name = str(product.get("product_name") or product.get("name") or "").strip()
                 if not name:
                     continue
-                normalized = " ".join(name.lower().split())
+                normalized = normalize_name(name)
                 self.db.execute(
                     "INSERT INTO products(id,company_id,name,normalized_name,data,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?) ON CONFLICT(company_id,normalized_name) DO UPDATE SET "
@@ -502,6 +511,9 @@ class AgentRunService:
                     continue
                 if per_country.get(country, 0) >= cap:
                     continue
+                # ponytail: SQLite lower() is ASCII-only, so Turkish/accented
+                # name variants won't dedup here; add a normalized_name column
+                # (quality.normalize_name) to leads if duplicate rates matter.
                 duplicate = self.db.one(
                     "SELECT id FROM leads WHERE company_id=? AND country=? AND "
                     "(lower(company_name)=lower(?) OR (website IS NOT NULL AND website=?)) LIMIT 1",

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -17,7 +18,10 @@ E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
 PLACEHOLDER_RE = re.compile(r"{{[^{}]+}}|\[[A-Z][^\]]*(?:HERE|SENTENCE|INSERT|TODO)[^\]]*\]", re.I)
 INTERNAL_MARKER_RE = re.compile(r"\[(?:SKIP|EXCEPTION|HEADER ROW|NOT RELEVANT)\]", re.I)
 UNKNOWN_RE = re.compile(r"\bunknown\b", re.I)
-TURKISH_CHARS_RE = re.compile(r"[ığüşöçĞÜŞİÖÇ]")
+# Turkish-distinctive letters only. ö/ü/ç are shared with German/French/etc.
+# and would fail every legitimate "Frau Müller" email; ı/İ/ğ/Ğ/ş/Ş appear in
+# essentially all leaked Turkish operator text without false-positives.
+TURKISH_CHARS_RE = re.compile(r"[ıİğĞşŞ]")
 BOUNCE_RE = re.compile(
     r"mailer-daemon|postmaster|undeliverable|delivery (?:failed|failure|status)|"
     r"returned mail|failure notice|spam quarantine", re.I,
@@ -33,7 +37,17 @@ def content_hash(content: dict) -> str:
 
 
 def normalize_name(value: str) -> str:
-    return " ".join(value.casefold().split())
+    """Aggressive dedup key: casefold + strip diacritics.
+
+    Handles Turkish input correctly — plain casefold() maps İ→i̇ (combining
+    dot) and leaves ı distinct, so "İSTANBUL"/"istanbul"/"ISTANBUL" would get
+    three different keys. Folding to ASCII-ish also matches Müller≈Muller.
+    Keys are internal only, never displayed.
+    """
+    value = value.replace("İ", "i").replace("I", "i").replace("ı", "i")
+    folded = unicodedata.normalize("NFKD", value.casefold())
+    stripped = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return " ".join(stripped.split())
 
 
 def validate_email(value: str | None) -> bool:
@@ -93,7 +107,7 @@ def preflight_message(
     failures: list[str] = []
     if not content.get("to") or not validate_email(str(content.get("to"))):
         failures.append("invalid_or_missing_recipient")
-    invalid_cc = [address for address in content.get("cc", []) if not validate_email(str(address))]
+    invalid_cc = [address for address in (content.get("cc") or []) if not validate_email(str(address))]
     if invalid_cc:
         failures.append("invalid_cc_recipient")
     if INTERNAL_MARKER_RE.search(combined):

@@ -38,7 +38,7 @@ metadata:
         prompt: "During which recipient-local hours may emails be sent?"
       - key: sales.excluded_industries
         description: Comma-separated industry keywords that disqualify a lead (skip, never send).
-        default: "industrial kitchen,HORECA,catering equipment"
+        default: "industrial kitchen,commercial kitchen,HORECA,catering equipment,professional kitchen equipment"
         prompt: "Which industries should be excluded from outreach?"
       - key: sales.subject_line
         description: Fixed outreach subject line (canonical language); translated per target language, never personalized.
@@ -70,6 +70,9 @@ product database (leads, outreach messages, campaigns), never in spreadsheets.
 
 ## Modes
 
+- **Generation run (`outreach_generation`):** compose and run preflight QA
+  only, then return the JSON output. The server owns approval and delivery —
+  never call draft/send/approve APIs from inside a generation run.
 - **Draft mode (default):** compose and `create_draft` in the connected
   mailbox; a human reviews and sends. Use unless the message is explicitly
   approved.
