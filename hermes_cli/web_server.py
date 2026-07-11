@@ -2702,6 +2702,7 @@ async def fs_default_cwd():
 # ---------------------------------------------------------------------------
 
 from hermes_cli import web_git as _web_git  # noqa: E402
+from hermes_cli import web_github as _web_github  # noqa: E402
 
 
 async def _git_op(fn, *args):
@@ -2777,6 +2778,24 @@ from hermes_cli.web_routers.git import (  # noqa: E402,F401 — legacy re-export
 
 
 
+@app.get("/api/github/pull-requests")
+async def github_pull_requests_route(kind: str, state: str, limit: int = 100):
+    try:
+        _web_github.validate_filter(kind, state, limit)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await asyncio.to_thread(_web_github.list_pull_requests, kind, state, limit)
+
+
+@app.get("/api/github/pull-requests/detail")
+async def github_pull_request_detail_route(repository: str, number: int):
+    try:
+        _web_github.validate_ref(repository, number)
+        return await asyncio.to_thread(_web_github.pull_request_detail, repository, number)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # Host TCP ports each port-binding gateway platform listens on, as

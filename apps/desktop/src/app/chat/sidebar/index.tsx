@@ -102,6 +102,7 @@ import {
   type AppView,
   ARTIFACTS_ROUTE,
   MESSAGING_ROUTE,
+  PULL_REQUESTS_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
   SKILLS_ROUTE
@@ -169,6 +170,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="files" {...props} />,
     route: ARTIFACTS_ROUTE,
     keybindActionId: 'nav.artifacts'
+  },
+  {
+    id: 'pull-requests',
+    label: '',
+    icon: props => <Codicon name="git-pull-request" {...props} />,
+    route: PULL_REQUESTS_ROUTE
   }
 ]
 
@@ -1134,6 +1141,7 @@ export function ChatSidebar({
                   (item.id === 'skills' && currentView === 'skills') ||
                   (item.id === 'messaging' && currentView === 'messaging') ||
                   (item.id === 'artifacts' && currentView === 'artifacts') ||
+                  (item.id === 'pull-requests' && currentView === 'pull-requests') ||
                   // Contributed rows light up at their own route.
                   (Boolean(item.route) && pathname === item.route)
 
