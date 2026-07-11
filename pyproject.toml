@@ -261,6 +261,7 @@ select = [
   "SIM", # flake8-simplify
   "ANN", # flake8-annotations
   "PL",  # pylint
+  "PLW1514", # unspecified-encoding (load-bearing for Windows)
   "DTZ", # flake8-datetimez
   "LOG", # flake8-logging-format
   "NPY", # flake8-numpy
