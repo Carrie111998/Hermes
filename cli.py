@@ -4412,10 +4412,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
 
         self._explicit_api_key = api_key
+        # ponytail: explicit --base-url must win over the alias's base_url
+        # (#62534). Only fall back to the alias URL when no explicit one given.
         self._explicit_base_url = (
-            _model_alias_target.base_url.rstrip("/")
-            if _model_alias_target is not None and _model_alias_target.base_url
-            else base_url
+            base_url
+            if base_url
+            else (_model_alias_target.base_url.rstrip("/")
+                  if _model_alias_target is not None and _model_alias_target.base_url
+                  else None)
         )
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().

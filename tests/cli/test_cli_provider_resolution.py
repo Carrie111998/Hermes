@@ -628,3 +628,32 @@ def test_cli_model_alias_resolves_to_target_provider_and_base_url(monkeypatch):
     shell3 = cli.HermesCLI(model="anthropic/claude-3.5", compact=True, max_turns=1)
     assert shell3.model == "anthropic/claude-3.5"
     assert shell3.requested_provider == "openrouter"
+
+
+def test_cli_explicit_base_url_wins_over_alias(monkeypatch):
+    """#62534: an explicit --base-url must override the alias's base_url.
+
+    Regression for the alias-resolution clobbering caller-supplied endpoints.
+    """
+    cli = _import_cli()
+
+    _config = load_config()
+    _config["model_aliases"] = {
+        "gemma": {
+            "base_url": "http://localhost:1234/v1",
+            "model": "gemma-4-31B-it-qat-bf16",
+            "provider": "custom",
+        },
+    }
+    _config["model"] = {"provider": "openrouter", "default": "tencent/hy3:free"}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: _config)
+    monkeypatch.setattr(cli, "CLI_CONFIG", _config)
+
+    shell = cli.HermesCLI(
+        model="gemma", base_url="https://explicit.example/v1", compact=True, max_turns=1
+    )
+    # model + provider still come from the alias...
+    assert shell.model == "gemma-4-31B-it-qat-bf16"
+    assert shell.requested_provider == "custom"
+    # ...but the explicit base_url wins over the alias's localhost URL.
+    assert shell.base_url == "https://explicit.example/v1"
