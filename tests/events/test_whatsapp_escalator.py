@@ -78,6 +78,22 @@ class TestEscalationTier:
         assert classify_tier(self._ev(EventType.APPLICATION_READY)) == EscalationTier.IMPORTANT
         assert classify_tier(self._ev(EventType.FOLLOWUP_DUE)) == EscalationTier.IMPORTANT
 
+    def test_devflow_decisions_escalate_urgent(self):
+        # 2026-07-11 operator request: DevFlow decision signals escalate to
+        # WhatsApp (URGENT) alongside the devflow_decisions Telegram topic.
+        assert classify_tier(self._ev(EventType.DEVFLOW_APPROVAL_REQUESTED)) == EscalationTier.URGENT
+        assert classify_tier(self._ev(EventType.DEVFLOW_PR_REVIEW_REQUESTED)) == EscalationTier.URGENT
+        assert classify_tier(self._ev(EventType.DEVFLOW_BUILD_FAILED)) == EscalationTier.URGENT
+
+    def test_secret_detected_escalates_immediate(self):
+        # Security critical: breaks quiet hours like CREDENTIAL_LOSS.
+        assert classify_tier(self._ev(EventType.SECRET_DETECTED)) == EscalationTier.IMMEDIATE
+
+    def test_devflow_firehose_events_do_not_escalate(self):
+        # Firehose lifecycle (NOT decisions) stays bus/Telegram-only.
+        assert classify_tier(self._ev(EventType.DEVFLOW_RUN_STARTED)) is None
+        assert classify_tier(self._ev(EventType.DEVFLOW_BUILD_SUCCEEDED)) is None
+
     def test_non_escalated_events_return_none(self):
         assert classify_tier(self._ev(EventType.CRON_COMPLETED)) is None
         assert classify_tier(self._ev(EventType.JOB_DISCOVERED)) is None

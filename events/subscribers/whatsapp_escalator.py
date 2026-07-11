@@ -88,6 +88,20 @@ _TIER_BY_EVENT: Dict[EventType, EscalationTier] = {
     # source. Real ones (NOT watchdog self-emissions thanks to the
     # source=watchdog skip in watchdog_sweep.py) escalate as URGENT.
     EventType.AGENT_FAILURE_CLUSTER: EscalationTier.URGENT,
+    # DevFlow decisions -> WhatsApp (2026-07-11, operator request: route DevFlow
+    # decision signals to WhatsApp alongside the devflow_decisions Telegram
+    # topic). All three are Priority.HIGH and land in devflow_decisions via
+    # TOPIC_ROUTING. URGENT = queue during quiet hours, flush at 7:01am — a
+    # pending review / broken build shouldn't wake Diego at 3am but must not
+    # wait for the daily digest either. Mirrors APPROVAL_REQUEST=URGENT. NOTE:
+    # devflow.pr_* emitters are partly deferred (events/producers/
+    # devflow_pr_build.py); entries are harmless-inert until those fire.
+    EventType.DEVFLOW_APPROVAL_REQUESTED: EscalationTier.URGENT,
+    EventType.DEVFLOW_PR_REVIEW_REQUESTED: EscalationTier.URGENT,
+    EventType.DEVFLOW_BUILD_FAILED: EscalationTier.URGENT,
+    # Security critical: a detected secret is as wake-worthy as CREDENTIAL_LOSS.
+    # IMMEDIATE so it breaks quiet hours (2026-07-11 operator request).
+    EventType.SECRET_DETECTED: EscalationTier.IMMEDIATE,
     # WATCHDOG_TICK + WATCHDOG_RECOVERED intentionally NOT in tier map ->
     # bus-only, no WhatsApp escalation.
     # JOB_HIGH_SCORE is conditional (>= 9.0) — handled in classify_tier
