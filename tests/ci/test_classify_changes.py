@@ -29,12 +29,13 @@ DEFAULT = {
     "scan": True,
     "deps": True,
     "npm_lock": True,
+    "nix": True,
     "mcp_catalog": False,
     "ci_review": True,
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm_lock=False, mcp_catalog=False, docker_meta=False, ci_review=False) -> dict[str, bool]:
+def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm_lock=False, nix=False, mcp_catalog=False, docker_meta=False, ci_review=False) -> dict[str, bool]:
     return {
         "python": python,
         "frontend": frontend,
@@ -43,6 +44,7 @@ def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm
         "scan": scan,
         "deps": deps,
         "npm_lock": npm_lock,
+        "nix": nix,
         "mcp_catalog": mcp_catalog,
         "ci_review": ci_review,
     }
@@ -56,8 +58,14 @@ CASES = {
     "ts package → frontend": (["apps/desktop/src/app.tsx"], _lanes(frontend=True)),
     "ui-tui → frontend": (["ui-tui/src/entry.ts"], _lanes(frontend=True)),
     # Lockfile bump shifts every TS package's tree, but not the Python suite.
+    # It also feeds the offline Nix build, but via the frontend lane (which
+    # nix-build OR-gates on), so the nix lane itself stays off here.
     "root lockfile → frontend, not python": (["package-lock.json"], _lanes(frontend=True, npm_lock=True)),
     "nested lockfile → npm_lock": (["website/package-lock.json"], _lanes(site=True, npm_lock=True)),
+    # Nix flake inputs gate the offline `nix build .#web .#tui .#desktop` lane.
+    # Python stays on as the conservative fail-safe (unrecognized top-level path).
+    "flake.lock → nix": (["flake.lock"], _lanes(python=True, nix=True)),
+    "nix expression → nix": (["nix/desktop.nix"], _lanes(python=True, nix=True)),
     "website → site": (["website/docs/intro.md"], _lanes(site=True)),
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
