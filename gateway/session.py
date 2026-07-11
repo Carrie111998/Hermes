@@ -1354,6 +1354,7 @@ class SessionStore:
                 # end_reason not None -> session ended — prune
                 if row is not None and row.get("end_reason") is not None:
                     recovered_entry = None
+                    _latest: Optional[Dict[str, Any]] = None
                     if entry.origin is not None:
                         # ponytail (#61993): only recover a session that is
                         # genuinely LIVE. The stale routing entry points at an
@@ -1439,6 +1440,30 @@ class SessionStore:
                                 row["end_reason"],
                                 key,
                             )
+                        # #62012: dropping the routing key alone is not enough.
+                        # The per-message recovery path (`get_or_create_session`
+                        # -> `_query_recoverable_session`) re-queries the finder,
+                        # which still returns `agent_close` rows and would reopen
+                        # one, resurrecting the very history the user reset. When
+                        # the latest recoverable peer row is only `agent_close`,
+                        # finalize it to a terminal `superseded` reason so the
+                        # next inbound message mints a fresh session instead.
+                        # Genuine crash recovery is untouched: it fires when the
+                        # routing key is ABSENT, which the prune never visits.
+                        if (
+                            _latest is not None
+                            and _latest.get("end_reason") == "agent_close"
+                        ):
+                            _sup = getattr(db, "mark_session_superseded", None)
+                            if callable(_sup):
+                                try:
+                                    _sup(str(_latest["id"]))
+                                except Exception as exc:
+                                    logger.debug(
+                                        "gateway.session: superseding recoverable "
+                                        "row %s failed: %s",
+                                        _latest.get("id"), exc,
+                                    )
                         stale_keys.append(key)
                     continue
         except Exception as exc:
