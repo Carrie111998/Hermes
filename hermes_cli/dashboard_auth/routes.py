@@ -1014,4 +1014,3 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
         },
         status_code=401,
     )
-
