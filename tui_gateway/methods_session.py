@@ -382,6 +382,11 @@ def _(rid, params: dict) -> dict:
             profile_home
         )
 
+        stored_attachment_roots = _stored_desktop_attachment_fallback_roots(
+            found,
+            profile_home=profile_home,
+        )
+
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             payload = _live_session_payload(
                 sid,
@@ -441,6 +446,7 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                desktop_attachment_fallback_roots=stored_attachment_roots,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -539,6 +545,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                desktop_attachment_fallback_roots=stored_attachment_roots,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -683,6 +690,7 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        desktop_attachment_fallback_roots=stored_attachment_roots,
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
