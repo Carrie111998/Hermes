@@ -98,7 +98,174 @@ def _make_adapter(platform_val="telegram"):
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("busy_mode", ["interrupt", "steer"])
+    @pytest.mark.parametrize("chat_type", ["group", "supergroup"])
+    async def test_telegram_group_different_user_falls_back_to_queue(
+        self, busy_mode, chat_type,
+    ):
+        """A second group user must not redirect the active user's turn."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = busy_mode
+        adapter = _make_adapter()
 
+        active_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="group-123",
+            chat_type=chat_type,
+            user_id="active-user",
+        )
+        event = MessageEvent(
+            text="different user's follow-up",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="group-123",
+                chat_type=chat_type,
+                user_id="other-user",
+            ),
+            message_id="msg-other",
+        )
+        sk = build_session_key(active_source, group_sessions_per_user=False)
+        runner._session_sources = {sk: active_source}
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is False
+        agent.interrupt.assert_not_called()
+        agent.steer.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_telegram_group_different_user_is_queued_by_dispatch_path(self):
+        """The busy guard's fallthrough must retain the incoming message."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        runner.config.group_sessions_per_user = False
+        adapter = _make_adapter()
+
+        active_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="group-123",
+            chat_type="group",
+            user_id="active-user",
+        )
+        event = MessageEvent(
+            text="queue me after the active user's turn",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="group-123",
+                chat_type="group",
+                user_id="other-user",
+            ),
+            message_id="msg-other",
+        )
+        sk = build_session_key(active_source, group_sessions_per_user=False)
+        runner._session_sources = {sk: active_source}
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        assert adapter._pending_messages[sk] is event
+        agent.interrupt.assert_not_called()
+        adapter._send_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_telegram_group_same_user_still_interrupts(self):
+        """Per-user isolation must preserve the active user's interrupt control."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        event = MessageEvent(
+            text="redirect my active turn",
+            message_type=MessageType.TEXT,
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="group-123",
+                chat_type="group",
+                user_id="active-user",
+            ),
+            message_id="msg-active",
+        )
+        sk = build_session_key(event.source, group_sessions_per_user=False)
+        runner._session_sources = {sk: event.source}
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.interrupt.assert_called_once_with("redirect my active turn")
+
+    @pytest.mark.asyncio
+    async def test_telegram_dm_behavior_is_unchanged(self):
+        """The group-only guard must not alter existing DM busy semantics."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        active_source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="dm-123",
+            chat_type="dm",
+            user_id="active-user",
+        )
+        event = MessageEvent(
+            text="normal dm follow-up",
+            message_type=MessageType.TEXT,
+            source=active_source,
+            message_id="msg-dm",
+        )
+        sk = build_session_key(active_source)
+        runner._session_sources = {sk: active_source}
+        runner.adapters[Platform.TELEGRAM] = adapter
+
+        agent = MagicMock()
+        runner._running_agents[sk] = agent
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        agent.interrupt.assert_called_once_with("normal dm follow-up")
+
+    @pytest.mark.asyncio
+    async def test_handle_message_queue_mode_queues_without_interrupt(self):
+        """Runner queue mode must not interrupt an active agent for text follow-ups."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+
+        event = _make_event(text="follow up in queue mode")
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        runner._busy_input_mode = "queue"
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await GatewayRunner._handle_message(runner, event)
+
+        assert result is None
+        assert sk in adapter._pending_messages
+        assert adapter._pending_messages[sk] is event
+        assert sk not in runner._pending_messages
+        running_agent.interrupt.assert_not_called()
     @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
         """Rapid Telegram text follow-ups in queue mode must not merge."""
@@ -469,5 +636,4 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
 
