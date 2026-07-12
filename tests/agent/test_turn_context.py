@@ -94,6 +94,8 @@ class _FakeAgent:
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
         self._ensure_db_prompt_at_call = "<unset>"
+        self._fallback_policy_refreshes = 0
+        self._fallback_events = []
 
     def _warn_context_overflow_blocked(self, reason, preflight_tokens, threshold_tokens):
         # Mirror the real AIAgent helper so tests can assert the warning fired.
@@ -115,7 +117,12 @@ class _FakeAgent:
         self._ensure_db_prompt_at_call = self._cached_system_prompt
 
     def _restore_primary_runtime(self):
-        pass
+        self._fallback_events.append("restore")
+
+    def _refresh_fallback_policy(self):
+        self._fallback_policy_refreshes += 1
+        self._fallback_events.append("refresh")
+        return "any"
 
     def _cleanup_dead_connections(self):
         return False
@@ -252,6 +259,16 @@ def test_applies_agent_side_effects():
     # task/turn ids assigned on the agent.
     assert agent._current_task_id
     assert agent._current_turn_id
+
+
+def test_cached_agent_refreshes_policy_before_restore_on_every_turn():
+    agent = _FakeAgent()
+
+    _build(agent)
+    _build(agent)
+
+    assert agent._fallback_policy_refreshes == 2
+    assert agent._fallback_events == ["refresh", "restore", "refresh", "restore"]
 
 
 def test_task_id_passthrough():
