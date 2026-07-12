@@ -340,7 +340,7 @@ locales = ["locales/*.yaml"]
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
 # Dashboard SPA and Supabase migrations used by the interfaze-api process.
-server = ["webui/**/*", "supabase/migrations/*.sql"]
+server = ["webui/**/*", "supabase/migrations/*.sql", "demo_data/*.json"]
 gateway = ["assets/**/*"]
 plugins = [
   "*/dashboard/manifest.json",

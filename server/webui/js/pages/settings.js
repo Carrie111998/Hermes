@@ -29,7 +29,7 @@ export async function mount(root, ctx) {
         companyCard(profile, render),
         salesPrefsCard(prefs, render),
         authCard(),
-        demoCard(ctx)));
+        guardrailsCard(ctx)));
   }
 
   await render();
@@ -111,8 +111,8 @@ function authCard() {
       kv([
         ['User', session?.user?.name || db.user.name],
         ['Email', session?.user?.email || db.user.email],
-        ['Role', db.user.role],
-        ['Company', db.company.name],
+        ['Role', session?.user?.role || db.user.role],
+        ['Company', session?.company?.name || db.company.name || 'Not selected'],
       ]),
       el('div', { class: 'ifz-mt-4' },
         badge('active', 'Bearer session'),
@@ -120,7 +120,7 @@ function authCard() {
   });
 }
 
-function demoCard(ctx) {
+function guardrailsCard(ctx) {
   const notes = textarea({ value: [
     'Lead Map selects up to five markets.',
     'Draft mode is the safe default for email.',
@@ -128,13 +128,15 @@ function demoCard(ctx) {
     'LinkedIn remains manual: profile open, note generation, manual status update.',
   ].join('\n'), rows: 6 });
   return card({
-    title: 'Demo rules',
+    title: 'MVP guardrails',
     body: el('div', {},
       field('MVP guardrails', notes),
       el('div', { class: 'ifz-row wrap' },
         button('Lead Map', { icon: 'map', onClick: () => ctx.navigate('/app/lead-map') }),
         button('Custom Outreach', { icon: 'send', onClick: () => ctx.navigate('/app/custom-outreach') }),
-        button('Admin demo', { icon: 'building', onClick: () => ctx.navigate('/admin/dashboard') })),
+        getSession()?.user?.role === 'admin'
+          ? button('Administration', { icon: 'building', onClick: () => ctx.navigate('/admin/dashboard') })
+          : null),
       el('div', { class: 'ifz-mt-4 ifz-hint' }, `Target markets: ${db.company.sales_regions_target.map(countryName).join(', ')}`)),
   });
 }

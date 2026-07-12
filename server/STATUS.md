@@ -18,7 +18,8 @@ Status as of 2026-07-12.
 - Analytics, CSV exports, data sources, activity logs, run logs/events.
 - SQLite local backend and Supabase Postgres/RLS/Storage deployment path.
 - Installable `interfaze-api` entry point and packaged server/company packs.
-- Packaged same-origin WebUI with hybrid real/mock data adapters.
+- Packaged same-origin WebUI that uses the real API by default, with mock mode
+  available only when explicitly selected for frontend development.
 - Tenant-scoped Ask Hermes SSE bridge with restricted agent turns, durable
   chat history, single-use stream capabilities, and concurrent-turn control.
 - Real WebUI multipart uploads, authenticated CSV downloads, dashboard-shaped
@@ -44,14 +45,15 @@ Status as of 2026-07-12.
 
 - `tests/server/test_api_mvp.py`: 9 API qualification checks.
 - `tests/server/test_run_harness.py`: 7 production run-service checks.
-- `tests/server/test_webui.py`: 15 serving, core-flow, chat-isolation, and
-  Phase 4 long-tail checks.
-- Full `tests/server` qualification: 37 passed.
+- `tests/server/test_webui.py`: 16 serving, security, connection, core-flow,
+  chat-isolation, and long-tail checks.
+- `tests/server/test_demo_seed.py`: 2 tenant seed and local draft-flow checks.
+- Full `tests/server` qualification: 40 passed.
 - PRODUCT route comparison: 216/216.
 - Python compile pass for `server/` and `tests/server/`.
-- Headless Edge hybrid acceptance passed: login/dashboard, multipart upload,
-  filtered leads, authenticated CSV download, analytics, WhatsApp profile,
-  completed-onboarding state, real 404 behavior, and admin errors/logs.
+- The persisted local Silverine profile passed an API smoke test for customer
+  login, tenant scoping, 25 seeded leads, approval-to-local-draft, health, and
+  browser security headers. The database was reset afterward for clean testing.
 
 ## External release gates
 
@@ -63,7 +65,7 @@ credential-free checkout:
 2. Complete OAuth sandbox delivery tests for Gmail and Microsoft Graph:
    create draft, send approved message, refresh token, read reply/status.
 3. Complete WhatsApp test-number delivery/webhook/ambiguous-timeout tests.
-4. Run the Silverline document→brain→scan→research→contact→email acceptance
+4. Run the Silverine document→brain→scan→research→contact→email acceptance
    chain with the production model and record its fixtures.
 5. Refresh `uv.lock`; this workspace could not access uv's cache because its
    approval/credit gate rejected the operation.

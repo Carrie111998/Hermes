@@ -24,15 +24,17 @@
      - Errors: non-2xx with { error | message | detail } -> ApiError.
    ============================================================ */
 
-import { adaptRequest, adaptResponse } from './adapters.js';
+import { adaptRequest, adaptResponse, normalizeResponseTimestamps } from './adapters.js';
 import { syncRealResponse } from './real-state.js';
 
 export const config = {
-  mode: 'hybrid',            // 'mock' | 'hybrid' | 'real'
+  mode: 'real',              // production/test default; mock mode must be explicit
   baseUrl: '/api/v1',
   latencyMs: [120, 420],     // simulated mock latency range
   authHeader: null,          // () => string | null
   beforeRequest: null,       // (req) => req
+  refreshAuth: null,         // async () => replacement Authorization value
+  onAuthFailure: null,       // () => clear session and return to login
   chatEnabled: globalThis.window?.__HERMES_CONFIG__?.chatEnabled === true,
   // Future sales backend only. The browser must never call Hermes directly.
   // That backend owns the Hermes session, CSRF/cookie flow, and all provider secrets.
@@ -320,11 +322,7 @@ export const routes = {
    - DEFERRED: the backend route exists but the request/response shape (or
      transport) is not adapted yet; flipping it early would break the page.
    Shrink this set as phases land; never add try-real-fallback-mock logic. */
-export const MOCK_ROUTES = new Set([
-  // UI-EXTRA — dormant agent-bridge probes
-  'agent.capabilities',
-  'agent.status',
-]);
+export const MOCK_ROUTES = new Set();
 
 /* ---------------- Mock plumbing ---------------- */
 let _mockHandlers = null;
@@ -388,7 +386,7 @@ export async function call(name, { params, query, body } = {}) {
 
 /* Real-backend request. `authOverride` lets response adapters chain follow-up
    requests before the session token is stored (e.g. the auth.login composite). */
-async function realCall(name, { params, query, body, authOverride } = {}) {
+async function realCall(name, { params, query, body, authOverride, authRetried = false } = {}) {
   const [method, template] = routes[name];
   let url = config.baseUrl + interpolate(template, params);
   if (query && Object.keys(query).length) {
@@ -420,6 +418,15 @@ async function realCall(name, { params, query, body, authOverride } = {}) {
   if (typeof config.beforeRequest === 'function') req = config.beforeRequest({ url, ...req }) || req;
 
   const res = await fetch(url, req);
+  if (res.status === 401 && !authRetried && authOverride == null
+      && !['auth.login', 'auth.refresh'].includes(name)
+      && typeof config.refreshAuth === 'function') {
+    const replacement = await config.refreshAuth();
+    if (replacement) {
+      return realCall(name, { params, query, body, authOverride: replacement, authRetried: true });
+    }
+    config.onAuthFailure?.();
+  }
   if (res.status === 204) return null;
   if (name === 'exports.download') {
     if (!res.ok) {
@@ -443,7 +450,9 @@ async function realCall(name, { params, query, body, authOverride } = {}) {
     throw new ApiError(errorMessage(payload) || `${method} ${url} failed (${res.status})`, res.status, payload?.code);
   }
   if (Array.isArray(payload)) payload = { items: payload, total: payload.length };
-  const adapted = await adaptResponse(name, payload, { realCall, params, query, body, requestBody });
+  const adapted = normalizeResponseTimestamps(
+    await adaptResponse(name, payload, { realCall, params, query, body, requestBody }),
+  );
   syncRealResponse(name, adapted, { params, query, body });
   return adapted;
 }

@@ -32,6 +32,23 @@ interfaze-api --host 127.0.0.1 --port 8000
 
 OpenAPI is available at `/openapi.json` and interactive API docs at `/docs`.
 
+## Seed the tenant-backed test client
+
+For local product testing, seed the deterministic Silverine client into the
+configured local database. The command replaces only the `company_silverline`
+tenant and leaves every other company untouched:
+
+```bash
+python -m server seed-demo \
+  --email client@silverline.test \
+  --password silverline-test-123
+```
+
+Then sign in at `/` with those credentials. The profile contains 7 products,
+5 historical document records, 25 leads, 14 contacts, 2 campaigns, 10 outreach
+messages, and 16 completed agent runs. Historical document records cannot be
+reprocessed until their source files are uploaded again.
+
 ## Production / Supabase
 
 Apply `server/supabase/migrations/001_initial.sql` for a fresh database. Existing
@@ -79,4 +96,3 @@ scripts/run_tests.sh tests/server/
 The local suite is credential-free. Release qualification additionally
 requires sandbox runs against Gmail, Microsoft Graph, WhatsApp Cloud, and a
 hosted Supabase project.
-

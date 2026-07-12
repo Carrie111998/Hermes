@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
 from ..db import json_dump, json_load, new_id, now
-from ..email_providers import GmailProvider, MicrosoftProvider
+from ..email_providers import GmailProvider, MicrosoftProvider, StubEmailProvider
 from ..whatsapp_provider import WhatsAppCloudProvider
 
 
@@ -135,7 +135,8 @@ def delete_email_integration(integration_id: str, request: Request,
 
 def _email_adapter(row, request: Request):
     credentials = request.app.state.cipher.decrypt(row["encrypted_credentials"])
-    cls = {"google": GmailProvider, "microsoft": MicrosoftProvider}.get(row["provider"])
+    cls = {"google": GmailProvider, "microsoft": MicrosoftProvider,
+           "stub": StubEmailProvider}.get(row["provider"])
     if not cls:
         raise HTTPException(422, "Integration provider cannot be tested")
     adapter = cls()

@@ -1,8 +1,8 @@
-/* Boot: wire auth, seed mock DB, build route table, start the router. */
+/* Boot: wire auth, initialize tenant-safe state, build routes, start the router. */
 
 import { startRouter, navigate } from './router.js';
-import { reset } from './mocks/db.js';
-import { isAuthed, getSession } from './session.js';
+import { reset, resetReal } from './mocks/db.js';
+import { clearSession, getSession, homeRoute, isAuthed, updateSession } from './session.js';
 import { config } from './api.js';
 import { mountShell } from './shell.js';
 import { el, emptyState, button } from './ui.js';
@@ -28,6 +28,39 @@ config.authHeader = () => {
   const token = getSession()?.token;
   return token ? `Bearer ${token}` : null;
 };
+let refreshPromise = null;
+config.refreshAuth = async () => {
+  const session = getSession();
+  if (!session?.refresh_token) return null;
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      try {
+        const response = await fetch('/api/v1/auth/refresh', {
+          method: 'POST',
+          headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: session.refresh_token }),
+        });
+        if (!response.ok) return null;
+        const auth = await response.json();
+        const next = updateSession({
+          token: auth.access_token,
+          refresh_token: auth.refresh_token,
+          expires_in: auth.expires_in,
+          expires_at: Date.now() + Number(auth.expires_in || 3600) * 1000,
+        });
+        return `Bearer ${next.token}`;
+      } catch {
+        return null;
+      }
+    })().finally(() => { refreshPromise = null; });
+  }
+  return refreshPromise;
+};
+config.onAuthFailure = () => {
+  clearSession();
+  resetReal();
+  navigate('/login', { replace: true });
+};
 config.beforeRequest = req => {
   const session = getSession();
   const companyId = session?.company?.id;
@@ -38,10 +71,8 @@ config.beforeRequest = req => {
   };
 };
 
-// Deterministic Silverine demo state on every load. Still needed in hybrid
-// mode: MOCK_ROUTES handlers and pages that read mocks/db.js directly
-// (dashboard, settings) depend on the seed.
-if (config.mode !== 'real') reset();
+if (config.mode === 'mock') await reset();
+else resetReal();
 
 const appRoot = document.getElementById('app');
 
@@ -94,13 +125,19 @@ const routes = [
 startRouter({
   routes,
   beforeEach(route) {
-    if (route.path === '/' || route.path === '') return isAuthed() ? '/app/dashboard' : '/login';
+    const session = getSession();
+    const home = homeRoute(session);
+    if (route.path === '/' || route.path === '') return isAuthed() ? home : '/login';
     if (route.public) {
-      if (route.path === '/login' && isAuthed()) return '/app/dashboard';
+      if (route.path === '/login' && isAuthed()) return home;
       return null;
     }
     if (!route.mount) return null; // unmatched — handled by notFound
     if (!isAuthed()) return '/login';
+    if (route.path.startsWith('/admin') && session?.user?.role !== 'admin') return home;
+    if (route.path.startsWith('/app') && session?.user?.role === 'admin' && !session?.company?.id) {
+      return '/admin/dashboard';
+    }
     return null;
   },
   notFound(path) {
@@ -111,10 +148,24 @@ startRouter({
         icon: 'search',
         title: 'Page not found',
         hint: `No page matches "${path}".`,
-        action: button('Back to dashboard', { kind: 'primary', onClick: () => navigate('/app/dashboard') }),
+        action: button('Back to dashboard', { kind: 'primary', onClick: () => navigate(homeRoute()) }),
       }));
     } else {
       navigate('/login', { replace: true });
     }
+  },
+  onError(path, error) {
+    if (error?.status === 401) {
+      config.onAuthFailure?.();
+      return;
+    }
+    const shell = mountShell(appRoot);
+    shell.setTitle(error?.status === 403 ? 'Access denied' : 'Something went wrong');
+    shell.pageRoot.replaceChildren(emptyState({
+      icon: error?.status === 403 ? 'ban' : 'warning',
+      title: error?.status === 403 ? 'You do not have access to this page' : 'This page could not be loaded',
+      hint: error?.message || `The route ${path} failed to load.`,
+      action: button('Back to dashboard', { kind: 'primary', onClick: () => navigate(homeRoute()) }),
+    }));
   },
 });

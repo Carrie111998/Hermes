@@ -5,6 +5,7 @@
 let _routes = [];
 let _beforeEach = null;
 let _notFound = null;
+let _onError = null;
 let _cleanup = null;
 let _mountSeq = 0;
 
@@ -79,13 +80,15 @@ async function handleChange() {
     else if (seq !== _mountSeq && typeof result === 'function') result(); // stale mount — clean immediately
   } catch (e) {
     console.error('[router] mount failed for', path, e);
+    if (_onError) _onError(path, e);
   }
 }
 
-export function startRouter({ routes, beforeEach, notFound }) {
+export function startRouter({ routes, beforeEach, notFound, onError }) {
   _routes = routes;
   _beforeEach = beforeEach || null;
   _notFound = notFound || null;
+  _onError = onError || null;
   window.addEventListener('hashchange', handleChange);
   handleChange();
 }

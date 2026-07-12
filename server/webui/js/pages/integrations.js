@@ -5,7 +5,6 @@ import {
   input, select, modal, setBusy, kv, fmt,
 } from '../ui.js';
 import { call } from '../api.js';
-import { adapterIsEnabled, getAgentCapabilities } from '../agent-bridge.js';
 import { db, subscribe } from '../mocks/db.js';
 import {
   providerLabel, integrationLogo, countryOptions, languageOptions, leadFor,
@@ -15,8 +14,6 @@ import {
 const EMAIL_PROVIDERS = [
   { key: 'google', title: 'Google Workspace', route: 'emailIntegrations.connectGoogle', logo: 'G' },
   { key: 'microsoft', title: 'Microsoft 365', route: 'emailIntegrations.connectMicrosoft', logo: 'M' },
-  { key: 'zoho', title: 'Zoho Mail', route: 'emailIntegrations.connectZoho', logo: 'Z' },
-  { key: 'smtp', title: 'Generic SMTP', route: 'emailIntegrations.connectSmtp', logo: 'S' },
 ];
 
 export async function mount(root, ctx) {
@@ -29,12 +26,12 @@ export async function mount(root, ctx) {
   }), host);
 
   async function render() {
-    const [emailRes, whatsappRes, linkedInRes, sourcesRes, agentCapabilities] = await Promise.all([
+    const [emailRes, whatsappRes, linkedInRes, sourcesRes, runtime] = await Promise.all([
       call('emailIntegrations.list'),
       call('whatsapp.integrations'),
       call('linkedin.actions'),
       call('dataSources.list'),
-      getAgentCapabilities(),
+      fetch('/health').then(response => response.ok ? response.json() : null).catch(() => null),
     ]);
     if (disposed) return;
     const whatsapp = whatsappRes.items[0] || null;
@@ -55,7 +52,7 @@ export async function mount(root, ctx) {
           ['Automation policy', 'manual only'],
           ['Profiles opened', linkedInRes.items.filter(a => ['opened', 'connection_sent', 'connected', 'replied'].includes(a.status)).length],
         ]) }),
-        agentAdapterSection(agentCapabilities)),
+        agentAdapterSection(runtime)),
       emailSection(emailRes.items, render),
       el('div', { class: 'ifz-grid cols-2 ifz-mt-4' },
         whatsappSection(whatsapp, render),
@@ -69,10 +66,13 @@ export async function mount(root, ctx) {
 }
 
 function emailSection(items, onChange) {
+  const providers = items.some(item => item.provider === 'stub')
+    ? [{ key: 'stub', title: 'Local test mailbox', route: null, logo: 'T' }, ...EMAIL_PROVIDERS]
+    : EMAIL_PROVIDERS;
   return card({
     title: 'Email providers',
     body: el('div', { class: 'ifz-grid cols-4' },
-      EMAIL_PROVIDERS.map(provider => {
+      providers.map(provider => {
         const connected = items.find(i => i.provider === provider.key);
         return el('div', { class: 'ifz-integration-card ifz-panellet' },
           integrationLogo(provider.logo),
@@ -96,27 +96,6 @@ function emailSection(items, onChange) {
 }
 
 function connectProvider(provider, onChange) {
-  if (provider.key === 'smtp') {
-    const host = input({ value: 'smtp.silverine.com.tr' });
-    const mailbox = input({ value: db.company.sales_preferences.connected_mailbox });
-    const connect = button('Connect SMTP', { kind: 'primary', icon: 'plug' });
-    const m = modal({
-      title: 'Connect SMTP',
-      body: el('div', {}, field('SMTP host', host), field('Mailbox', mailbox)),
-      actions: [button('Cancel', { onClick: () => m.close() }), connect],
-    });
-    connect.addEventListener('click', async () => {
-      try {
-        await call(provider.route, { body: { host: host.value, mailbox: mailbox.value } });
-        toast('SMTP connected', 'success');
-        m.close();
-        onChange();
-      } catch (err) {
-        toast(err.message || 'SMTP is not available on this server', 'error');
-      }
-    });
-    return;
-  }
   call(provider.route).then(() => {
     toast(`${provider.title} connected`, 'success');
     onChange();
@@ -220,17 +199,19 @@ function whatsappSection(whatsapp, onChange) {
   });
 }
 
-function agentAdapterSection(capabilities) {
-  const available = adapterIsEnabled(capabilities);
+function agentAdapterSection(runtime) {
+  const available = runtime?.agent_runs_enabled === true;
   return card({
     title: 'Agent connection',
     body: el('div', { class: 'ifz-agent-readiness' },
-      badge(available ? 'active' : 'not_connected', available ? 'Hermes adapter ready' : 'Backend adapter not configured'),
+      badge(available ? 'active' : 'not_connected', available ? 'Hermes backend ready' : 'Hermes command unavailable'),
       el('div', { class: 'ifz-agent-readiness-copy' },
         available
-          ? 'Agent-backed runs are available through the workspace backend.'
-          : 'This workspace remains in mock mode until a server-side Hermes adapter is configured.'),
-      el('div', { class: 'ifz-hint' }, capabilities?.detail || 'No agent capability response is available yet.')),
+          ? 'Agent-backed runs are available through the tenant-scoped workspace backend.'
+          : 'Install or expose the hermes command before starting agent-backed work.'),
+      el('div', { class: 'ifz-hint' }, available
+        ? 'Model and provider readiness is validated when a run starts.'
+        : 'Historical tenant data remains available while the runtime is offline.')),
   });
 }
 

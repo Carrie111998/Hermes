@@ -6,7 +6,7 @@ import {
 } from '../ui.js';
 import { call } from '../api.js';
 import { db, subscribe } from '../mocks/db.js';
-import { COUNTRY_NAMES, BUYER_INDUSTRIES } from '../mocks/seed.js';
+import { COUNTRY_NAMES, BUYER_INDUSTRIES } from '../catalog.js';
 import { exportCsv, waitForRun } from './_page-utils.js';
 
 const STATUSES = ['new', 'researched', 'contacted', 'replied', 'interested', 'do_not_contact', 'archived'];

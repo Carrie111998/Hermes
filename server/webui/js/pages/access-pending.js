@@ -19,9 +19,8 @@ export function mount(root, ctx) {
         logoNode({ compactTag: true, variant: 'light' }),
         el('div', { class: 'ifz-login-title' }, 'Access pending'),
         el('div', { class: 'ifz-login-sub' }, 'Your company account exists, but an admin still needs to activate it.'),
-        el('div', { class: 'ifz-login-note' }, 'Demo note: this page is part of the frontend route surface only. It does not call a backend.'),
+        el('div', { class: 'ifz-login-note' }, 'Contact your interfaze administrator if access should already be active.'),
         el('div', { class: 'ifz-row ifz-mt-4' },
-          button('Back to sign in', { kind: 'primary', onClick: () => ctx.navigate('/login') }),
-          button('Admin demo', { onClick: () => ctx.navigate('/admin/dashboard') }))))));
+          button('Back to sign in', { kind: 'primary', onClick: () => ctx.navigate('/login') }))))));
   document.title = 'Access pending · interfaze-agent';
 }

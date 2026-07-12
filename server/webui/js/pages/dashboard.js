@@ -4,7 +4,7 @@ import { el, icon, card, hbarList, timeline, fmt, button, badge, input } from '.
 import { call, config } from '../api.js';
 import { subscribe, db } from '../mocks/db.js';
 import { renderMiniMap } from './lead-map.js';
-import { COUNTRY_NAMES } from '../mocks/seed.js';
+import { COUNTRY_NAMES } from '../catalog.js';
 import { isHermesAvailable, askHermes } from '../hermes-client.js';
 
 function workspaceContext(data) {

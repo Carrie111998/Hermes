@@ -4,7 +4,7 @@ import {
 } from '../ui.js';
 import { call } from '../api.js';
 import { db } from '../mocks/db.js';
-import { COUNTRY_NAMES, LANGUAGES, BUYER_INDUSTRIES } from '../mocks/seed.js';
+import { COUNTRY_NAMES, LANGUAGES, BUYER_INDUSTRIES } from '../catalog.js';
 
 export const SEND_MODES = [
   { value: 'create_draft', label: 'Create drafts' },
@@ -152,7 +152,7 @@ export function openMessageReviewModal(message, { onUpdated, title = 'Review mes
     wide: true,
     body: el('div', {},
       el('div', { class: 'ifz-row between ifz-mb-4' },
-        el('div', { class: 'ifz-muted ifz-small' }, 'Mock-only editor. Nothing leaves the browser.'),
+        el('div', { class: 'ifz-muted ifz-small' }, 'Edits are saved to this revision. Delivery still requires explicit approval.'),
         statusNode),
       field('Subject', subjectInput),
       field('Body', bodyInput),
@@ -309,6 +309,7 @@ export function providerLabel(provider) {
   return ({
     google: 'Google Workspace',
     microsoft: 'Microsoft 365',
+    stub: 'Local test mailbox',
     zoho: 'Zoho Mail',
     smtp: 'Generic SMTP',
   })[provider] || provider;

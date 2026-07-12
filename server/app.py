@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -64,6 +65,23 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+            "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; font-src 'self'",
+        )
+        if request.url.scheme == "https":
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
+
     api_prefix = "/api/v1"
     app.include_router(auth.router, prefix=api_prefix)
     app.include_router(admin.router, prefix=api_prefix)
@@ -81,7 +99,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     @app.get("/health")
     def health():
         return {"status": "ok", "service": "interfaze-agent", "api_version": "v1",
-                "chat_enabled": bool(chat_service)}
+                "chat_enabled": bool(chat_service),
+                "agent_runs_enabled": shutil.which("hermes") is not None}
 
     webui_dir = Path(__file__).resolve().parent / "webui"
     if settings.webui_enabled and webui_dir.is_dir():

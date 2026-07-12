@@ -29,7 +29,7 @@ export async function mount(root, ctx) {
 
   root.append(pageHead({
     title: 'Onboarding',
-    sub: 'Define Silverine deeply enough that the agent can research, score, and write like a sales teammate.',
+    sub: `Define ${db.company.name || 'your company'} deeply enough that the agent can research, score, and write like a sales teammate.`,
     actions: [
       button('Company Brain', { icon: 'brain', onClick: () => ctx.navigate('/app/company-brain') }),
       button('Integrations', { icon: 'plug', onClick: () => ctx.navigate('/app/integrations') }),
@@ -217,10 +217,12 @@ function documentsStep(mark, key) {
       { key: 'status', label: 'Status', render: d => badge(d.status) },
       { key: 'size', label: 'Size', render: d => `${d.size_kb} KB` },
       { key: 'uploaded', label: 'Uploaded', render: d => fmtDate(d.uploaded_at) },
-      { key: 'action', label: '', width: '120px', render: d => button('Process', { size: 'sm', icon: 'refresh', onClick: async () => {
-        const res = await call('documents.process', { params: { documentId: d.id } });
-        toast('Document processing started', 'success', { actionLabel: 'Watch', onAction: () => location.hash = `#/app/agent-runs/${res.run_id}` });
-      } }) },
+      { key: 'action', label: '', width: '120px', render: d => d.demo_record
+        ? button('Historical', { size: 'sm', disabled: true, title: 'Upload the original file to process it again.' })
+        : button('Process', { size: 'sm', icon: 'refresh', onClick: async () => {
+          const res = await call('documents.process', { params: { documentId: d.id } });
+          toast('Document processing started', 'success', { actionLabel: 'Watch', onAction: () => location.hash = `#/app/agent-runs/${res.run_id}` });
+        } }) },
     ],
     rows: db.documents,
   });

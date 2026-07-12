@@ -167,7 +167,7 @@ async function ccRulesView() {
           field('Market region', regionInput)),
         field('Product', productSelect),
         field('Industry', industryInput),
-        field('CC emails', ccInput, { hint: 'Comma-separated; mock-only.' })),
+        field('CC emails', ccInput, { hint: 'Comma-separated email addresses.' })),
       actions: [button('Cancel', { onClick: () => m.close() }), saveBtn],
     });
     saveBtn.addEventListener('click', async () => {
@@ -313,7 +313,7 @@ export async function mountDetail(root, ctx) {
           : emptyState({ icon: 'clock', title: 'No campaign activity yet' }) }),
         card({ title: 'Approval posture', body: el('div', { class: 'ifz-col' },
           badge(campaign.send_mode === 'create_draft' ? 'draft_created' : 'approved', campaign.send_mode === 'create_draft' ? 'Drafts first' : 'Approved send'),
-          el('p', { class: 'ifz-muted', style: { lineHeight: 1.55 } }, 'The WebUI keeps review controls visible before any mock send action. Real provider wiring is intentionally not connected.')) })),
+          el('p', { class: 'ifz-muted', style: { lineHeight: 1.55 } }, 'Every message remains revision-bound and requires approval before the configured provider creates a draft or sends it.')) })),
       card({ title: 'Message queue', flush: true, body: table }),
       messages[0] ? el('div', { class: 'ifz-mt-4' }, card({ title: 'Latest preview', body: emailPreview(messages[0]) })) : null);
   }

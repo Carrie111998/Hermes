@@ -156,3 +156,4 @@ company-packs/*
 # Agent-run harness local SQLite store (runtime state, never committed)
 server/runs.db
 server/*.db
+server/.test-hermes/

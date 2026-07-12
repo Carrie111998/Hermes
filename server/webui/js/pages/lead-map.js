@@ -8,7 +8,7 @@ import {
 } from '../ui.js';
 import { call, ApiError } from '../api.js';
 import { db } from '../mocks/db.js';
-import { COUNTRY_NAMES, BUYER_INDUSTRIES, SCAN_DATA_SOURCES } from '../mocks/seed.js';
+import { COUNTRY_NAMES, BUYER_INDUSTRIES, SCAN_DATA_SOURCES } from '../catalog.js';
 
 /* ---------------- SVG loading + normalization ---------------- */
 let _svgPromise = null;
@@ -298,7 +298,7 @@ export async function mount(root, ctx) {
         field('Data sources', sourceChips, { hint: 'Where the agent hunts for buyer companies.' }),
         field('Products to match', productChips, { hint: 'Leads are scored against the selected products.' }),
         field('Buyer industries', industryChips),
-        field('Leads per country', leadCount, { hint: 'Controls how many qualified companies the mock scan inserts per selected market.' })),
+        field('Leads per country', leadCount, { hint: 'Maximum qualified companies to add per selected market.' })),
       actions: [
         button('Cancel', { onClick: () => m.close() }),
         startBtn,

@@ -44,6 +44,8 @@ class Settings:
     chat_enabled: bool = True
     chat_model: str = ""
     chat_toolset: str = "none"
+    auth_max_attempts: int = 8
+    auth_window_seconds: int = 300
 
     @classmethod
     def load(cls) -> "Settings":
@@ -73,4 +75,6 @@ class Settings:
             chat_enabled=cfg.get("chat_enabled") is not False,
             chat_model=str(cfg.get("chat_model") or ""),
             chat_toolset=str(cfg.get("chat_toolset") or "none").lower(),
+            auth_max_attempts=max(1, int(cfg.get("auth_max_attempts", 8))),
+            auth_window_seconds=max(30, int(cfg.get("auth_window_seconds", 300))),
         )

@@ -48,6 +48,9 @@ def test_index_serves_spa_with_placeholders_substituted():
     assert "maxUploadBytes:26214400" in res.text
     assert 'csrfToken:""' in res.text
     assert "chatEnabled:true" in res.text
+    assert res.headers["x-content-type-options"] == "nosniff"
+    assert res.headers["x-frame-options"] == "DENY"
+    assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
 
 
 def test_index_respects_max_upload_bytes_setting():
@@ -479,11 +482,10 @@ def test_phase4_promoted_routes_and_exports_are_tenant_safe():
     assert logs.status_code == 200 and len(logs.json()) <= 2
 
 
-def test_phase4_hybrid_mode_only_mocks_dormant_agent_probes():
+def test_real_mode_has_no_mock_routes_or_tenant_seed():
     source = (ROOT / "server" / "webui" / "js" / "api.js").read_text(encoding="utf-8")
-    block = source.split("export const MOCK_ROUTES = new Set([", 1)[1].split("]);", 1)[0]
-    mocked = set(re.findall(r"'([^']+)'", block))
-    assert mocked == {"agent.capabilities", "agent.status"}
+    assert "mode: 'real'" in source
+    assert "export const MOCK_ROUTES = new Set();" in source
     assert "requestBody instanceof FormData" in source
 
     onboarding = (ROOT / "server" / "webui" / "js" / "pages" / "onboarding.js").read_text(
@@ -496,5 +498,20 @@ def test_phase4_hybrid_mode_only_mocks_dormant_agent_probes():
     assert "call('exports.download'" in helpers
     main = (ROOT / "server" / "webui" / "js" / "main.js").read_text(encoding="utf-8")
     assert "'X-Company-ID': companyId" in main
+    assert "else resetReal()" in main
+    assert "homeRoute(session)" in main
+    assert "config.refreshAuth" in main
     state = (ROOT / "server" / "webui" / "js" / "real-state.js").read_text(encoding="utf-8")
     assert "payload.status === 'completed'" in state and "? 'complete'" in state
+
+
+def test_login_rate_limit_fails_closed():
+    _, client = make_client(auth_max_attempts=2, auth_window_seconds=60)
+    for _ in range(2):
+        assert client.post("/api/v1/auth/login", json={
+            "email": "admin@example.test", "password": "wrong-password",
+        }).status_code == 401
+    blocked = client.post("/api/v1/auth/login", json={
+        "email": "admin@example.test", "password": "wrong-password",
+    })
+    assert blocked.status_code == 429

@@ -22,8 +22,9 @@ def _user_response(row) -> dict:
 
 
 @router.post("/login")
-def login(body: LoginRequest, service: AuthService = Depends(auth_service)):
-    return service.login(body.email, body.password)
+def login(body: LoginRequest, request: Request, service: AuthService = Depends(auth_service)):
+    client_id = request.client.host if request.client else "unknown"
+    return service.login(body.email, body.password, client_id)
 
 
 @router.post("/logout", status_code=204)

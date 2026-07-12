@@ -7,6 +7,7 @@ import hmac
 import os
 import secrets
 import time
+import threading
 from dataclasses import dataclass
 
 import httpx
@@ -64,6 +65,8 @@ class AuthService:
     def __init__(self, db: Database, settings: Settings):
         self.db = db
         self.settings = settings
+        self._login_attempts: dict[str, list[float]] = {}
+        self._login_lock = threading.Lock()
 
     def bootstrap_admin(self) -> None:
         if not self.settings.bootstrap_admin_email or not self.settings.bootstrap_admin_password:
@@ -80,12 +83,24 @@ class AuthService:
              json_dump({}), stamp, stamp),
         )
 
-    def login(self, email: str, password: str) -> dict:
+    def login(self, email: str, password: str, client_id: str = "unknown") -> dict:
         if self.settings.auth_mode != "local":
             return self._supabase_password_login(email, password)
+        key = f"{client_id}:{email.strip().lower()}"
+        stamp = time.monotonic()
+        with self._login_lock:
+            cutoff = stamp - self.settings.auth_window_seconds
+            attempts = [value for value in self._login_attempts.get(key, []) if value >= cutoff]
+            self._login_attempts[key] = attempts
+            if len(attempts) >= self.settings.auth_max_attempts:
+                raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many sign-in attempts. Try again shortly.")
         user = self.db.one("SELECT * FROM users WHERE lower(email)=lower(?)", (email,))
         if not user or user["status"] != "active" or not verify_password(password, user["password_hash"]):
+            with self._login_lock:
+                self._login_attempts.setdefault(key, []).append(stamp)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid email or password")
+        with self._login_lock:
+            self._login_attempts.pop(key, None)
         return self._issue_session(user["id"])
 
     def _issue_session(self, user_id: str) -> dict:

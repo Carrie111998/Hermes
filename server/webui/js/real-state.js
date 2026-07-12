@@ -56,7 +56,17 @@ function syncOnboarding(payload) {
 }
 
 export function syncRealResponse(name, payload, { params = {} } = {}) {
-  if (name === 'company.getProfile' || name === 'company.updateProfile') {
+  if (name === 'auth.login') {
+    db.user = payload?.user || db.user;
+    db.company = { ...db.company, ...(payload?.company || {}) };
+    emit('user', db.user);
+    emit('company', db.company);
+  } else if (name === 'auth.me') {
+    db.user = payload?.user || db.user;
+    db.company = { ...db.company, ...(payload?.company || {}) };
+    emit('user', db.user);
+    emit('company', db.company);
+  } else if (name === 'company.getProfile' || name === 'company.updateProfile') {
     const positioning = db.company?.positioning || {};
     const salesPreferences = db.company?.sales_preferences || {};
     db.company = {

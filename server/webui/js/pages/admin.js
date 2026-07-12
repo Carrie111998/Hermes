@@ -1,11 +1,12 @@
-/* Admin demo surfaces - mock customer/user management and health views. */
+/* Administrator surfaces backed by the real tenant-aware API. */
 
 import {
   el, card, button, pageHead, statCard, dataTable, badge, emptyState, toast,
   input, select, field, modal, setBusy, kv, fmt, hbarList,
 } from '../ui.js';
 import { call } from '../api.js';
-import { db } from '../mocks/db.js';
+import { db, emit } from '../mocks/db.js';
+import { updateSession } from '../session.js';
 import { countryName, recordTitle, providerLabel } from './_page-utils.js';
 
 const ADMIN_TABS = [
@@ -40,18 +41,19 @@ function withAdmin(root, ctx, title, sub, activePath, body, actions = []) {
 }
 
 export async function mountDashboard(root, ctx) {
-  const [companies, users, errors, logs] = await Promise.all([
+  const [companies, users, errors, logs, runs] = await Promise.all([
     call('admin.companies.list'),
     call('admin.users.list'),
     call('admin.errors'),
     call('admin.logs', { query: { limit: 8 } }),
+    call('agentRuns.list').catch(() => ({ items: [], total: 0 })),
   ]);
   withAdmin(root, ctx, 'Admin Dashboard', 'Customer workspace operations for interfaze-agent.', '/admin/dashboard',
     el('div', {},
       el('div', { class: 'ifz-grid cols-4 ifz-mb-4' },
         statCard({ label: 'Companies', value: String(companies.total), delta: `${companies.items.filter(c => c.status === 'active').length} active`, deltaDir: 'up' }),
         statCard({ label: 'Users', value: String(users.total), delta: `${users.items.filter(u => u.status === 'active').length} active`, deltaDir: 'flat' }),
-        statCard({ label: 'Agent runs', value: String(db.agentRuns.length), delta: `${db.agentRuns.filter(r => r.status === 'running').length} running`, deltaDir: 'flat' }),
+        statCard({ label: 'Agent runs', value: String(runs.total), delta: `${runs.items.filter(r => r.status === 'running').length} running`, deltaDir: 'flat' }),
         statCard({ label: 'Warnings', value: String(errors.total), delta: 'run health', deltaDir: errors.total ? 'flat' : 'up' })),
       el('div', { class: 'ifz-grid cols-2' },
         card({
@@ -99,7 +101,15 @@ export async function mountCompanyDetail(root, ctx) {
     el('div', {},
       el('div', { class: 'ifz-grid cols-3 ifz-mb-4' }, statusPanel, profilePanel, actionPanel),
       usersPanel),
-    [button('Edit', { icon: 'edit', onClick: () => openCompanyModal(company, () => ctx.navigate(`/admin/companies/${company.id}`)) })]);
+    [
+      button('Open workspace', { kind: 'primary', icon: 'dashboard', onClick: () => {
+        updateSession({ company: { id: company.id, name: company.name } });
+        db.company = { ...db.company, id: company.id, name: company.name };
+        emit('company', db.company);
+        ctx.navigate('/app/dashboard');
+      } }),
+      button('Edit', { icon: 'edit', onClick: () => openCompanyModal(company, () => ctx.navigate(`/admin/companies/${company.id}`)) }),
+    ]);
 }
 
 export async function mountUsers(root, ctx) {
@@ -111,7 +121,7 @@ export async function mountUsers(root, ctx) {
 
 export async function mountAgentRuns(root, ctx) {
   const res = await call('agentRuns.list');
-  withAdmin(root, ctx, 'Admin Agent Runs', 'Cross-workspace run audit view.', '/admin/agent-runs',
+  withAdmin(root, ctx, 'Admin Agent Runs', 'Run audit for the selected workspace.', '/admin/agent-runs',
     card({ flush: true, body: dataTable({
       columns: [
         { key: 'label', label: 'Run', render: r => recordTitle(r.label, r.type.replace(/_/g, ' ')) },
@@ -126,7 +136,7 @@ export async function mountAgentRuns(root, ctx) {
 
 export async function mountAnalytics(root, ctx) {
   const dash = await call('dashboard.summary');
-  withAdmin(root, ctx, 'Admin Analytics', 'Operational health across customer workspaces.', '/admin/analytics',
+  withAdmin(root, ctx, 'Admin Analytics', 'Operational health for the selected workspace.', '/admin/analytics',
     el('div', { class: 'ifz-grid cols-2' },
       card({ title: 'Best markets', body: hbarList(dash.market.best_countries.map(c => ({ label: countryName(c.country), value: c.score }))) }),
       card({ title: 'Top industries', body: hbarList(dash.market.top_industries, { suffix: ' leads' }) }),

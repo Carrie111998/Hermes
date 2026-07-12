@@ -47,15 +47,18 @@ export const fmt = {
   pct(n) { return `${Math.round(n)}%`; },
   date(iso) {
     if (!iso) return '—';
-    return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    const value = typeof iso === 'number' && iso < 100000000000 ? iso * 1000 : iso;
+    return new Date(value).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   },
   time(iso) {
     if (!iso) return '—';
-    return new Date(iso).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+    const value = typeof iso === 'number' && iso < 100000000000 ? iso * 1000 : iso;
+    return new Date(value).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
   },
   ago(iso) {
     if (!iso) return '—';
-    const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+    const value = typeof iso === 'number' && iso < 100000000000 ? iso * 1000 : iso;
+    const s = Math.max(0, (Date.now() - new Date(value).getTime()) / 1000);
     if (s < 60) return 'just now';
     if (s < 3600) return `${Math.floor(s / 60)}m ago`;
     if (s < 86400) return `${Math.floor(s / 3600)}h ago`;

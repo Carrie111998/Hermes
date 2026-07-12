@@ -48,6 +48,22 @@ function displayName(email) {
   return local.replace(/[._-]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+function timestampValue(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return value;
+  return new Date(value < 100000000000 ? value * 1000 : value).toISOString();
+}
+
+export function normalizeResponseTimestamps(value, key = '') {
+  if (Array.isArray(value)) return value.map(item => normalizeResponseTimestamps(item));
+  if (!value || typeof value !== 'object') {
+    return /(?:_at|^at|_time)$/.test(key) ? timestampValue(value) : value;
+  }
+  return Object.fromEntries(Object.entries(value).map(([childKey, child]) => [
+    childKey,
+    normalizeResponseTimestamps(child, childKey),
+  ]));
+}
+
 /* Backend /auth/me returns the flat principal {id,email,role,company_id,status};
    the UI renders user.name, which the backend does not store. */
 function userFromPrincipal(me) {
@@ -183,7 +199,7 @@ function run(value = {}) {
 function activity(value = {}) {
   return {
     ...value,
-    kind: value.kind || (String(value.action || '').includes('repl') ? 'reply' : 'agent'),
+    kind: value.kind || value.data?.kind || (String(value.action || '').includes('repl') ? 'reply' : 'agent'),
     label: value.label || String(value.action || 'activity').replace(/_/g, ' '),
     at: value.at || value.created_at,
     ref: value.ref || { [value.entity_type ? `${value.entity_type}_id` : 'entity_id']: value.entity_id },
@@ -202,6 +218,7 @@ function brain(value) {
 
 function document(value = {}) {
   return {
+    ...(value.data || {}),
     ...value,
     type: value.type || value.document_type || 'other',
     size_kb: value.size_kb ?? Math.ceil((value.size_bytes || 0) / 1024),
@@ -211,6 +228,17 @@ function document(value = {}) {
 
 function integration(value = {}) {
   return { ...(value.data || {}), ...value, data: value.data || {} };
+}
+
+function adminCompany(value = {}) {
+  return { ...(value.data || {}), ...value, data: value.data || {} };
+}
+
+function adminUser(value = {}) {
+  return {
+    ...(value.data || {}), ...value, data: value.data || {},
+    name: value.name || value.data?.name || displayName(value.email),
+  };
 }
 
 function weeklySeries(value) {
@@ -290,11 +318,18 @@ export async function adaptResponse(name, payload, { realCall, body }) {
         const profile = await realCall('company.getProfile', { authOverride: auth });
         company = { ...company, name: profile?.name || profile?.legal_name || '' };
       } catch { /* no profile yet — name stays empty */ }
+    } else if (me.user?.role === 'admin') {
+      try {
+        const companies = await realCall('admin.companies.list', { authOverride: auth });
+        const active = companies?.items?.filter(item => item.status === 'active') || [];
+        if (active.length === 1) company = { id: active[0].id, name: active[0].name };
+      } catch { /* admin can still use global pages without a selected workspace */ }
     }
     return {
       token: payload.access_token,
       refresh_token: payload.refresh_token,
       expires_in: payload.expires_in,
+      expires_at: Date.now() + Number(payload.expires_in || 3600) * 1000,
       user: me.user,
       company,
     };
@@ -315,6 +350,10 @@ export async function adaptResponse(name, payload, { realCall, body }) {
       existing_leads: payload?.existing_leads ?? payload?.lead_count ?? 0,
     };
   }
+  if (name === 'admin.companies.list') return mapItems(payload, adminCompany);
+  if (['admin.companies.get', 'admin.companies.create', 'admin.companies.update'].includes(name)) return adminCompany(payload);
+  if (name === 'admin.users.list') return mapItems(payload, adminUser);
+  if (['admin.users.get', 'admin.users.create', 'admin.users.update'].includes(name)) return adminUser(payload);
   if (name === 'leadScans.list') return mapItems(payload, value => ({ ...value, ...value.config, name: value.name || `Scan — ${(value.config?.countries || []).join(', ')}` }));
   if (name === 'leadScans.create' || name === 'leadScans.get') {
     return { ...payload, ...payload?.config, name: payload?.name || body?.name || `Scan — ${(payload?.config?.countries || []).join(', ')}` };
@@ -385,6 +424,13 @@ export async function adaptResponse(name, payload, { realCall, body }) {
     };
   }
   if (name === 'brain.get' || name === 'brain.update' || name === 'brain.approve') return brain(payload);
+  if (name === 'brain.snapshots') {
+    return mapItems(payload, value => ({
+      ...value,
+      note: value.note || value.sources?.[0] || '',
+      approved: value.status === 'approved',
+    }));
+  }
 
   return payload;
 }

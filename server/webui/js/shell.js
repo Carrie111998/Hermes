@@ -3,7 +3,7 @@
 import { el, icon } from './ui.js';
 import { navigate } from './router.js';
 import { call, config } from './api.js';
-import { db, subscribe } from './mocks/db.js';
+import { db, resetReal, subscribe } from './mocks/db.js';
 import { getSession, clearSession } from './session.js';
 
 const NAV_GROUPS = [
@@ -64,8 +64,13 @@ let _shell = null;
 export function mountShell(root) {
   if (_shell) return _shell;
 
+  const session = getSession();
+  const isAdmin = session?.user?.role === 'admin';
+  const visibleGroups = NAV_GROUPS.filter(group => group.label === 'Admin'
+    ? isAdmin
+    : !isAdmin || Boolean(session?.company?.id));
   const runBadge = el('span', { class: 'ifz-nav-badge', style: { display: 'none' }, 'aria-label': 'Running agents' });
-  const navHost = el('nav', { class: 'ifz-nav', 'aria-label': 'Primary' }, NAV_GROUPS.map(group =>
+  const navHost = el('nav', { class: 'ifz-nav', 'aria-label': 'Primary' }, visibleGroups.map(group =>
     [el('div', { class: 'ifz-nav-group-label', id: `nav-g-${group.label}` }, group.label),
      group.items.map(item => el('button', {
        class: 'ifz-nav-item',
@@ -101,7 +106,6 @@ export function mountShell(root) {
   });
   paintThemeIcon();
 
-  const session = getSession();
   const userName = session?.user?.name || 'User';
   const initials = userName.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
 
@@ -150,8 +154,9 @@ export function mountShell(root) {
         onclick: async () => {
           closeMenu();
           if (!window.confirm('Log out of interfaze-agent?')) return;
-          try { await call('auth.logout'); } catch { /* mock */ }
+          try { await call('auth.logout'); } catch { /* local session is cleared regardless */ }
           clearSession();
+          resetReal();
           navigate('/login');
         },
       }, icon('logout', 14), 'Log out'));
@@ -190,13 +195,22 @@ export function mountShell(root) {
     onclick: closeNav,
   });
 
+  const initialCompanyName = session?.company?.name || db.company?.name || '';
+  const companyAvatar = el('span', { class: 'ifz-avatar', 'aria-hidden': 'true' }, initialCompanyName.slice(0, 1).toUpperCase() || '—');
+  const companyNameNode = el('span', {}, initialCompanyName || (isAdmin ? 'No workspace selected' : 'Workspace'));
+  subscribe('company', company => {
+    const name = company?.name || getSession()?.company?.name || '';
+    companyAvatar.textContent = name.slice(0, 1).toUpperCase() || '—';
+    companyNameNode.textContent = name || (isAdmin ? 'No workspace selected' : 'Workspace');
+  });
+
   const topbar = el('header', { class: 'ifz-topbar' },
     menuBtn,
     titleNode,
     el('div', { class: 'ifz-topbar-spacer' }),
     el('span', { class: 'ifz-company-chip' },
-      el('span', { class: 'ifz-avatar', 'aria-hidden': 'true' }, 'S'),
-      el('span', {}, db.company ? db.company.name : 'Silverine')),
+      companyAvatar,
+      companyNameNode),
     themeBtn,
     menuHost);
 

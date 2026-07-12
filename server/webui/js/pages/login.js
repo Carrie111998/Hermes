@@ -1,6 +1,6 @@
 /* Login page — full-screen, outside the app shell. */
 
-import { el, field, input, button, setBusy, toast, passwordField } from '../ui.js';
+import { el, field, input, button, setBusy, toast, passwordField, modal } from '../ui.js';
 import { call, config } from '../api.js';
 import { setSession } from '../session.js';
 import { logoNode, destroyShell } from '../shell.js';
@@ -50,7 +50,18 @@ export function mount(root, ctx) {
     field('Password', passWrap, { required: true }),
     submitBtn,
     el('div', { class: 'ifz-mt-2', style: { textAlign: 'right' } },
-      el('a', { href: '#/login', class: 'ifz-small', onclick: (e) => { e.preventDefault(); toast('Password reset link sent (demo)', 'info'); } }, 'Forgot password?')),
+      el('a', { href: '#/login', class: 'ifz-small', onclick: async (e) => {
+        e.preventDefault();
+        const email = emailInput.value.trim();
+        if (!email) { setFieldError(emailInput, 'Enter your work email first'); emailInput.focus(); return; }
+        try {
+          const result = await call('auth.passwordResetRequest', { body: { email } });
+          if (result?.reset_token) openLocalReset(result.reset_token);
+          else toast('If that account exists, reset instructions are on the way.', 'info');
+        } catch (err) {
+          toast(err.message || 'Password reset could not be started', 'error');
+        }
+      } }, 'Forgot password?')),
     config.mode === 'mock'
       ? el('div', { class: 'ifz-login-note' }, 'Demo environment — any credentials sign in to the Silverine workspace. Accounts are provisioned by your interfaze administrator.')
       : null);
@@ -71,8 +82,8 @@ export function mount(root, ctx) {
     setBusy(submitBtn, true, 'Signing in…');
     try {
       const res = await call('auth.login', { body: { email: emailInput.value, password: passInput.value } });
-      setSession({ token: res.token, user: res.user, company: res.company });
-      ctx.navigate('/app/dashboard');
+      setSession(res);
+      ctx.navigate(res.user?.role === 'admin' ? '/admin/dashboard' : '/app/dashboard');
     } catch (err) {
       setBusy(submitBtn, false);
       toast(err.message || 'Sign-in failed', 'error');
@@ -92,4 +103,29 @@ export function mount(root, ctx) {
     el('div', { class: 'ifz-login-formside' }, form)));
 
   document.title = 'Sign in · interfaze-agent';
+}
+
+function openLocalReset(token) {
+  const { wrap: passwordWrap, input: passwordInput } = passwordField({ placeholder: 'At least 10 characters' });
+  const save = button('Set new password', { kind: 'primary' });
+  const dialog = modal({
+    title: 'Reset password',
+    body: field('New password', passwordWrap, { required: true }),
+    actions: [button('Cancel', { onClick: () => dialog.close() }), save],
+  });
+  save.addEventListener('click', async () => {
+    if (passwordInput.value.length < 10) {
+      toast('Use at least 10 characters', 'warning');
+      return;
+    }
+    setBusy(save, true, 'Saving…');
+    try {
+      await call('auth.passwordResetConfirm', { body: { token, password: passwordInput.value } });
+      dialog.close();
+      toast('Password updated. You can sign in now.', 'success');
+    } catch (err) {
+      setBusy(save, false);
+      toast(err.message || 'Password reset failed', 'error');
+    }
+  });
 }

@@ -26,7 +26,7 @@ export async function mount(root, ctx) {
 
   root.append(pageHead({
     title: 'Custom Outreach',
-    sub: 'Create a one-off lead, add or find a contact, generate a cold email, then create a draft or mock-send after approval.',
+    sub: 'Create a one-off lead, add or find a contact, generate a cold email, then create a draft or send after approval.',
     actions: [button('All leads', { icon: 'leads', onClick: () => ctx.navigate('/app/leads') })],
   }), host);
 
@@ -204,7 +204,7 @@ export async function mount(root, ctx) {
             el('div', { class: 'ifz-actionrow-body' },
               el('div', { class: 'ifz-actionrow-title' }, i.title),
               el('div', { class: 'ifz-actionrow-sub' }, i.body))))) :
-          emptyState({ icon: 'search', title: 'Research has not run yet', hint: 'The mock agent will produce company insights and update the lead.' }),
+          emptyState({ icon: 'search', title: 'Research has not run yet', hint: 'Hermes will produce company insights and update the lead.' }),
         el('div', { class: 'ifz-row wrap' }, runBtn, continueBtn,
           state.researchRunId ? button('Watch latest run', { icon: 'bolt', onClick: () => ctx.navigate(`/app/agent-runs/${state.researchRunId}`) }) : null)),
     });
