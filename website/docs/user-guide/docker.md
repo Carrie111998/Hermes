@@ -59,7 +59,7 @@ docker run -d \
 Port 8642 exposes the gateway's [OpenAI-compatible API server](./features/api-server.md) and health endpoint. It's optional if you only use chat platforms (Telegram, Discord, etc.), but required if you want the dashboard or external tools to reach the gateway.
 
 :::tip Gateway runs supervised
-Inside the official Docker image, `gateway run` is **automatically supervised by s6-overlay**: if the gateway process crashes it's restarted within a couple of seconds without losing the container, and the dashboard (when `HERMES_DASHBOARD=1` is set) is supervised alongside it. The `gateway run` CMD process itself is a `sleep infinity` heartbeat that keeps the container alive while s6 manages the actual gateway process — so `docker stop` still shuts everything down cleanly, but `docker logs` shows the supervised gateway's output.
+Inside the official Docker image, `gateway run` is **automatically supervised by s6-overlay**: if the gateway process crashes it's restarted within a couple of seconds without losing the container, and the dashboard (when `HERMES_DASHBOARD=true` is set) is supervised alongside it. The `gateway run` CMD process itself is a `sleep infinity` heartbeat that keeps the container alive while s6 manages the actual gateway process — so `docker stop` still shuts everything down cleanly, but `docker logs` shows the supervised gateway's output.
 
 You'll see a one-line breadcrumb in `docker logs` confirming the upgrade. To opt out — and get the historical "gateway is the container's main process, container exit = gateway exit" semantics — pass `--no-supervise` or set `HERMES_GATEWAY_NO_SUPERVISE=1`. The opt-out is useful for CI smoke tests that want the container to exit with the gateway's status code; for production deployments the supervised default is strictly better.
 
@@ -89,7 +89,7 @@ Opening any port on an internet facing machine is a security risk. You should no
 
 ## Running the dashboard
 
-The built-in web dashboard runs as a supervised s6-rc service alongside the gateway in the same container. Set `HERMES_DASHBOARD=1` to bring it up:
+The built-in web dashboard runs as a supervised s6-rc service alongside the gateway in the same container. Set `HERMES_DASHBOARD=true` to bring it up:
 
 ```sh
 docker run -d \
@@ -98,7 +98,7 @@ docker run -d \
   -v ~/.hermes:/opt/data \
   -p 8642:8642 \
   -p 9119:9119 \
-  -e HERMES_DASHBOARD=1 \
+  -e HERMES_DASHBOARD=true \
   nousresearch/hermes-agent gateway run
 ```
 
@@ -106,12 +106,18 @@ The dashboard is supervised by s6 — if it crashes, `s6-supervise` restarts it 
 
 | Environment variable | Description | Default |
 |---------------------|-------------|---------|
-| `HERMES_DASHBOARD` | Set to `1` (or `true` / `yes`) to enable the supervised dashboard service | *(unset — service is registered but stays down)* |
-| `HERMES_DASHBOARD_HOST` | Bind address for the dashboard HTTP server | `0.0.0.0` |
-| `HERMES_DASHBOARD_PORT` | Port for the dashboard HTTP server | `9119` |
+| `HERMES_DASHBOARD` | Set to `true` (or `1` / `yes`) to enable the supervised dashboard service. Canonical gateway deployments require this to be enabled. | *(unset — service is registered but stays down)* |
+| `HERMES_DASHBOARD_HOST` | Bind address for the dashboard HTTP server. Canonical gateway deployments require `127.0.0.1`. | `0.0.0.0` |
+| `HERMES_DASHBOARD_PORT` | Port for the dashboard HTTP server. Canonical gateway deployments require `9119`. | `9119` |
 | `HERMES_DASHBOARD_INSECURE` | Set to `1` (or `true` / `yes`) to bind without the OAuth auth gate. Only use on trusted networks behind a reverse proxy without the OAuth contract — the dashboard exposes API keys and session data | *(unset — gate enforced when a `DashboardAuthProvider` is registered)* |
 
-The dashboard inside the container defaults to binding `0.0.0.0` — without it, the published `-p 9119:9119` port would not be reachable from the host. To restrict the bind to container loopback (for sidecar / reverse-proxy setups), set `HERMES_DASHBOARD_HOST=127.0.0.1`.
+The dashboard inside the container defaults to binding `0.0.0.0`. For the canonical gateway deployment behind Nginx, keep the dashboard loopback-only and let Nginx own the public route:
+
+- `HERMES_DASHBOARD=true`
+- `HERMES_DASHBOARD_HOST=127.0.0.1`
+- `HERMES_DASHBOARD_PORT=9119`
+
+In that canonical layout, `dash.leanframeworklab.com` is the public hostname, `127.0.0.1:9119` is the internal dashboard listener, and Nginx Basic Auth is the access gate.
 
 The dashboard's auth gate engages automatically when both of the following are true:
 
@@ -263,7 +269,7 @@ The s6 container has four distinct log surfaces, and "why isn't my gateway showi
 | Source | Where it lands | How to read it |
 |---|---|---|
 | **Per-profile gateway** (`hermes gateway run` and per-profile gateways under s6) | Tee'd to two places: `docker logs <container>` (real time, no extra prefix) **and** `${HERMES_HOME}/logs/gateways/<profile>/current` (rotated, ISO-8601 timestamped, 10 archives × 1 MB each) | `docker logs -f hermes` or `tail -F ~/.hermes/logs/gateways/default/current` on the host |
-| **Dashboard** (when `HERMES_DASHBOARD=1`) | `docker logs <container>` (no prefix) | `docker logs -f hermes` — interleaved with gateway lines |
+| **Dashboard** (when `HERMES_DASHBOARD=true`) | `docker logs <container>` (no prefix) | `docker logs -f hermes` — interleaved with gateway lines |
 | **Boot reconciler** (records which profile gateways were restored on each container start) | `${HERMES_HOME}/logs/container-boot.log` (append-only audit log) | `tail -F ~/.hermes/logs/container-boot.log` |
 | **Generic Hermes logs** (`agent.log`, `errors.log`) | `${HERMES_HOME}/logs/` (profile-aware) | `docker exec hermes hermes logs --follow [--level WARNING] [--session <id>]` |
 
@@ -294,6 +300,8 @@ This page covers running Hermes itself inside Docker. If you want Hermes to exec
 
 For persistent deployment with both the gateway and dashboard, a `docker-compose.yaml` is convenient:
 
+The example below is a generic compose pattern. For the canonical Nginx-fronted gateway deployment, follow the checklist above and keep the dashboard bound to `127.0.0.1:9119` behind Nginx Basic Auth instead of publishing it directly.
+
 ```yaml
 services:
   hermes:
@@ -303,11 +311,13 @@ services:
     command: gateway run
     ports:
       - "8642:8642"   # gateway API
-      - "9119:9119"   # dashboard (only reached when HERMES_DASHBOARD=1)
+      - "9119:9119"   # dashboard (only reached when HERMES_DASHBOARD=true)
     volumes:
       - ~/.hermes:/opt/data
     environment:
-      - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD=true
+      - HERMES_DASHBOARD_HOST=127.0.0.1
+      - HERMES_DASHBOARD_PORT=9119
       # Uncomment to forward specific env vars instead of using .env file:
       # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -320,6 +330,18 @@ services:
 ```
 
 Start with `docker compose up -d` and view logs with `docker compose logs -f`. The supervised gateway's stdout is also tee'd to `${HERMES_HOME}/logs/gateways/<profile>/current` on the volume — see [Where the logs go](#where-the-logs-go) for the full routing map.
+
+## Canonical gateway deployment checklist
+
+Use this checklist for the Nginx-fronted canonical deployment:
+
+- [ ] `HERMES_DASHBOARD=true`
+- [ ] `HERMES_DASHBOARD_HOST=127.0.0.1`
+- [ ] `HERMES_DASHBOARD_PORT=9119`
+- [ ] dashboard service is running
+- [ ] `127.0.0.1:9119` is listening
+- [ ] `GET http://127.0.0.1:9119/` returns `200`
+- [ ] `https://dash.leanframeworklab.com` returns `401` without credentials, confirming Basic Auth is active
 
 ## Optional: Linux desktop audio bridge
 
@@ -472,7 +494,7 @@ Each profile created with `hermes profile create <name>` automatically gets an s
 **Supervision benefits over the pre-s6 image:**
 
 - Gateway crashes are auto-restarted by `s6-supervise` after a ~1s backoff.
-- Dashboard, when enabled with `HERMES_DASHBOARD=1`, is supervised on the same supervision tree and gets the same auto-restart treatment.
+- Dashboard, when enabled with `HERMES_DASHBOARD=true`, is supervised on the same supervision tree and gets the same auto-restart treatment.
 - `docker restart` preserves running gateways: the cont-init reconciler reads `$HERMES_HOME/profiles/<name>/gateway_state.json` and brings the slot back up if the last recorded state was `running`. Stopped gateways stay stopped.
 - Per-profile gateway logs persist under `$HERMES_HOME/logs/gateways/<profile>/current` (rotated by `s6-log`), and the reconciler's actions are appended to `$HERMES_HOME/logs/container-boot.log` per boot. See [Where the logs go](#where-the-logs-go) for the full routing map.
 

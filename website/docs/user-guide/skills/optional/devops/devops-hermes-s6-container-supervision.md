@@ -62,7 +62,7 @@ If you're just running the Hermes Agent and want to use Docker, see `website/doc
 │
 ├── s6-rc.d (static services, in /etc/s6-overlay/s6-rc.d/)
 │   ├── main-hermes/run                ← exec sleep infinity (no-op slot)
-│   └── dashboard/run                  ← if HERMES_DASHBOARD=1, runs `hermes dashboard`
+│   └── dashboard/run                  ← if HERMES_DASHBOARD=true, runs `hermes dashboard`
 │
 ├── /run/service (s6-svscan watches; tmpfs)
 │   ├── gateway-coder/                 ← runtime-registered per-profile
