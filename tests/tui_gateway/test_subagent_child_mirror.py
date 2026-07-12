@@ -110,7 +110,8 @@ def test_live_child_session_gets_native_stream(server, emits):
     assert child[2][1] == {"text": "hmm"}
     # The rotated-out tool closes with the same id it opened with.
     assert child[3][1]["tool_id"] == first_tool["tool_id"]
-    assert child[6][1] == {"text": "done deal"}
+    assert child[6][1]["text"] == "done deal"
+    assert child[6][1]["turn_id"] == child[0][1]["turn_id"]
 
     # Parent relay is untouched alongside the mirror.
     assert [e for e, s, _ in emits if s == "parent-sid"] == [
@@ -215,9 +216,17 @@ def test_start_mirrors_as_immediate_header_line(server, emits):
     _relay(server, "subagent.progress", preview="step 1/3", child_session_id="child-1")
 
     child = [(e, p) for e, s, p in emits if s == "live-1"]
+    turn_id = child[0][1]["turn_id"]
     assert child == [
-        ("message.start", None),
-        ("message.delta", {"text": "starting child branch\n"}),
+        ("message.start", {"turn_id": turn_id}),
+        (
+            "message.delta",
+            {
+                "text": "starting child branch\n",
+                "turn_id": turn_id,
+                "offset": 0,
+            },
+        ),
     ]
 
 
@@ -231,10 +240,55 @@ def test_text_mirrors_as_message_delta(server, emits):
     _relay(server, "subagent.text", preview="the answer.", child_session_id="child-1")
 
     child = [(e, p) for e, s, p in emits if s == "live-1"]
+    turn_id = child[0][1]["turn_id"]
     assert child == [
-        ("message.start", None),
-        ("message.delta", {"text": "Here is "}),
-        ("message.delta", {"text": "the answer."}),
+        ("message.start", {"turn_id": turn_id}),
+        (
+            "message.delta",
+            {"text": "Here is ", "turn_id": turn_id, "offset": 0},
+        ),
+        (
+            "message.delta",
+            {"text": "the answer.", "turn_id": turn_id, "offset": 8},
+        ),
     ]
 
 
+def test_text_routes_to_watch_transport_without_contextvar(server, monkeypatch):
+    """Async/background path: the child runs on a detached daemon thread that
+    carries NO contextvar transport binding. Routing must still reach the
+    watch window because write_json keys event frames off the session's STORED
+    transport, not the current context. Exercises the real _emit/write_json."""
+    monkeypatch.setattr(server, "_tool_progress_enabled", lambda sid: True)
+
+    frames: list = []
+
+    class RecTransport:
+        def write(self, obj):
+            frames.append(obj)
+            return True
+
+    watch_t = RecTransport()
+    # A lazy watch resume stored its transport on the live child session.
+    server._sessions["live-1"] = {
+        "session_key": "child-1",
+        "agent": None,
+        "transport": watch_t,
+    }
+
+    # Relay with NO transport bound on the current context (the daemon worker
+    # thread never inherits the parent's contextvar) — mirrors the async case.
+    assert server.current_transport() is None
+    _relay(server, "subagent.text", preview="streamed reply", child_session_id="child-1")
+
+    routed = [
+        (f["params"]["type"], f["params"]["session_id"], f["params"].get("payload"))
+        for f in frames
+        if f.get("method") == "event" and f["params"]["session_id"] == "live-1"
+    ]
+    start = next(payload for event, sid, payload in routed if event == "message.start")
+    assert (
+        "message.delta",
+        "live-1",
+        {"text": "streamed reply", "turn_id": start["turn_id"], "offset": 0},
+    ) in routed
