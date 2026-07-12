@@ -722,6 +722,88 @@ def test_ws_disconnect_releases_wake_word_owner(monkeypatch):
     assert released == created
 
 
+def test_old_socket_disconnect_cannot_detach_a_concurrent_reconnect(monkeypatch):
+    old_transport = object()
+    new_transport = object()
+    cleanup_reached_session = threading.Event()
+    allow_cleanup = threading.Event()
+    scheduled = []
+
+    class GateLock:
+        def __enter__(self):
+            cleanup_reached_session.set()
+            assert allow_cleanup.wait(timeout=2)
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    server._sessions.clear()
+    server._sessions["raced"] = {
+        "transport": old_transport,
+        "close_on_disconnect": False,
+        "history_lock": GateLock(),
+        "session_key": "stored",
+    }
+    monkeypatch.setattr(
+        server,
+        "_schedule_ws_orphan_reap",
+        lambda sid: scheduled.append(sid),
+    )
+    result = {}
+
+    def disconnect_old_socket():
+        result["counts"] = server._close_sessions_for_transport(old_transport)
+
+    cleanup = threading.Thread(target=disconnect_old_socket)
+    cleanup.start()
+    assert cleanup_reached_session.wait(timeout=1)
+    server._sessions["raced"]["transport"] = new_transport
+    allow_cleanup.set()
+    cleanup.join(timeout=1)
+    assert not cleanup.is_alive()
+
+    assert result["counts"] == (0, 0)
+    assert server._sessions["raced"]["transport"] is new_transport
+    assert scheduled == []
+    server._sessions.clear()
+
+
+def test_ws_write_loop_stall_does_not_latch_transport(monkeypatch):
+    """A write that times out because the event loop is stalled (GIL-heavy
+    agent turn) must NOT latch the transport closed — the frame is already
+    scheduled and flushes when the loop recovers. Latching here permanently
+    silenced live watch windows after one slow write."""
+    monkeypatch.setattr(ws_mod, "_WS_WRITE_TIMEOUT_S", 0.05)
+    sent = []
+
+    class FakeWS:
+        async def send_text(self, line):
+            sent.append(line)
+
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        transport = ws_mod.WSTransport(FakeWS(), loop, peer="stall-test")
+        # Stall the loop well past the write timeout, then write from this
+        # (non-loop) thread: the wait times out but the send stays in flight.
+        loop.call_soon_threadsafe(time.sleep, 0.3)
+        assert transport.write({"a": 1}) is True
+        assert transport._closed is False
+
+        # Once the loop breathes again, both the stalled frame and new writes
+        # must reach the socket.
+        assert transport.write({"b": 2}) is True
+        deadline = time.time() + 2
+        while len(sent) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(sent) == 2
+        assert transport._closed is False
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
 
 
 def test_ws_starts_mcp_discovery_before_ready(monkeypatch):
