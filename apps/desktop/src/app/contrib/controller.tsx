@@ -59,7 +59,7 @@ import { $previewOpenRequest, $previewTabs, closeRightRail } from '@/store/previ
 import { $reviewOpen, closeReview, openReview, REVIEW_PANE_ID } from '@/store/review'
 import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
-import { $statusbarVisible } from '@/store/statusbar-prefs'
+import { $statusbarVisible, toggleStatusbarVisible } from '@/store/statusbar-prefs'
 
 import type { SessionDragPayload } from '../chat/composer/inline-refs'
 import { watchRouteTiles } from '../chat/route-tile'
@@ -302,7 +302,7 @@ registry.registerMany([
     icon: PanelBottom,
     keywords: ['status bar', 'statusbar', 'bottom bar', 'hide', 'show', 'chrome'],
     get: () => $statusbarVisible.get(),
-    set: enabled => $statusbarVisible.set(enabled)
+    set: () => toggleStatusbarVisible()
   }),
   // The keybind panel's non-titlebar door (the keyboard icon is gone).
   {

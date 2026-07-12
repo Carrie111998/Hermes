@@ -1122,6 +1122,9 @@ DEFAULT_CONFIG = {
         "focus_view": False,
         "focus_saved_tool_progress": "all",
         "skin": "default",
+        # Desktop bottom status bar. Off keeps the default workspace quiet;
+        # users can opt into an always-visible or bottom-edge reveal surface.
+        "desktop_statusbar": "off",  # on | off | auto-hide
         # UI language for static user-facing messages (approval prompts, a
         # handful of gateway slash-command replies).  Does NOT affect agent
         # responses, log lines, tool outputs, or slash-command descriptions.

@@ -13,7 +13,13 @@ import { selectableCardClass } from '@/lib/selectable-card'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
+import {
+  $desktopStatusbarMode,
+  type DesktopStatusbarMode,
+  persistDesktopStatusbarMode
+} from '@/store/desktop-statusbar'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
+import { notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
@@ -23,6 +29,8 @@ import { getBaseColors, useTheme } from '@/themes/context'
 import { installVscodeThemeFromMarketplace } from '@/themes/install'
 import type { DesktopTheme } from '@/themes/types'
 import { $marketplaceInstalls, isUserTheme, removeUserTheme } from '@/themes/user-themes'
+
+import { setHermesConfigCache } from '../hooks/use-config-record'
 
 import { MODE_OPTIONS } from './constants'
 import { PetSettings } from './pet-settings'
@@ -244,7 +252,7 @@ function MarketplaceThemeResults({
   )
 }
 
-export function AppearanceSettings() {
+export function AppearanceSettings({ onConfigSaved }: { onConfigSaved?: () => void }) {
   const { t, isSavingLocale } = useI18n()
   const { themeName, mode, resolvedMode, availableThemes, setTheme, setMode } = useTheme()
   const toolViewMode = useStore($toolViewMode)
@@ -254,6 +262,7 @@ export function AppearanceSettings() {
   const translucency = useStore($translucency)
   const reactionsEnabled = useStore($reactionsEnabled)
   const backdrop = useStore($backdrop)
+  const desktopStatusbarMode = useStore($desktopStatusbarMode)
   const installs = useStore($marketplaceInstalls)
   const profiles = useStore($profiles)
   const activeProfileKey = normalizeProfileKey(useStore($activeGatewayProfile))
@@ -298,6 +307,12 @@ export function AppearanceSettings() {
   ] as const satisfies readonly { id: EmbedMode; label: string }[]
 
   const uiScaleOptions = UI_SCALE_PRESETS.map(preset => ({ id: preset, label: `${preset}%` }))
+
+  const statusbarOptions = [
+    { id: 'on', label: a.statusbarOn },
+    { id: 'auto-hide', label: a.statusbarAutoHide },
+    { id: 'off', label: a.statusbarOff }
+  ] as const satisfies readonly { id: DesktopStatusbarMode; label: string }[]
 
   const matchedScalePreset = matchUiScalePreset(zoomPercent)
 
@@ -432,6 +447,26 @@ export function AppearanceSettings() {
           />
 
           <TerminalFontSetting />
+
+          <ListRow
+            action={
+              <SegmentedControl
+                onChange={mode => {
+                  triggerHaptic('selection')
+                  void persistDesktopStatusbarMode(mode)
+                    .then(config => {
+                      setHermesConfigCache(config)
+                      onConfigSaved?.()
+                    })
+                    .catch(error => notifyError(error, a.statusbarSaveFailed))
+                }}
+                options={statusbarOptions}
+                value={desktopStatusbarMode}
+              />
+            }
+            description={a.statusbarDesc}
+            title={a.statusbarTitle}
+          />
 
           <ListRow
             action={

@@ -1,16 +1,22 @@
+import { computed } from 'nanostores'
+
 import { Codecs, persistentAtom } from '@/lib/persisted'
 
-const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
-const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
+import { $desktopStatusbarMode, toggleDesktopStatusbarVisible } from './desktop-statusbar'
 
-// Whole-bar visibility, VS Code's `workbench.statusBar.visible`. Off by default
-// — the bar is opt-in. Hiding it unmounts the bar (its 15s status poll goes with
-// it), so the way back is the `view.toggleStatusbar` keybind or the ⌘K row,
-// never the bar itself.
-export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, false, Codecs.bool)
+const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
+
+// Compatibility facade for the whole-bar UI added before the profile-scoped
+// on/off/auto-hide setting. One source of truth keeps Settings, the keybind,
+// the command palette, and the context menu in sync. The controller consumes
+// this derived boolean to unmount the bar (and its 15s status poll) in off mode.
+export const $statusbarVisible = computed($desktopStatusbarMode, mode => mode !== 'off')
 
 export function toggleStatusbarVisible() {
-  $statusbarVisible.set(!$statusbarVisible.get())
+  // These chrome actions have no error surface. Persistence already rolls the
+  // optimistic atom back, so consume the rejection instead of leaking an
+  // unhandled promise.
+  void toggleDesktopStatusbarVisible().catch(() => undefined)
 }
 
 // Items the bar hides until the user turns them on from its context menu. The

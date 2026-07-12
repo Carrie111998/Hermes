@@ -1588,6 +1588,7 @@ display:
   personality: ""         # Legacy cosmetic field still surfaced in some summaries
   compact: false          # Compact output mode (less whitespace)
   resume_display: full    # full (show previous messages on resume) | minimal (one-liner only)
+  desktop_statusbar: off  # Desktop only: on | off | auto-hide
   bell_on_complete: false # Play terminal bell when agent finishes (great for long tasks)
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
@@ -1603,6 +1604,23 @@ display:
   file_mutation_verifier: true    # Append an advisory footer when write_file/patch calls failed this turn
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   language: en            # UI language for static messages (approval prompts, some gateway replies). en | zh | zh-hant | ja | de | es | fr | tr | uk | af | ko | it | ga | pt | ru | hu
+```
+
+### Desktop status bar
+
+`display.desktop_statusbar` controls the bottom status bar in Hermes Desktop. It is independent from the terminal TUI `/statusbar` command and `display.tui_statusbar` setting.
+
+| Value | Behavior |
+|-------|----------|
+| `on` | Always show the Desktop status bar. |
+| `off` | Hide the Desktop status bar (default). Chat input controls remain visible. |
+| `auto-hide` | Hide the bar until the pointer or keyboard focus reaches the bottom edge of the window. |
+
+You can also change this under **Settings → Appearance → Desktop Status Bar**.
+
+```yaml
+display:
+  desktop_statusbar: auto-hide
 ```
 
 ### Per-turn summary and spinner token flow
