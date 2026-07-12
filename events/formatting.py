@@ -337,14 +337,29 @@ def watchdog_burst_body(payload: dict, *, max_listed: int = 5,
         return (f"{count} monitored services changed state in one sweep "
                 f"(no probe detail attached).")
 
-    failing = [t for t in transitions if t.get("after") != "healthy"]
+    # "unknown" = the probe was skipped this pass (monitor over its time
+    # budget), not a verdict. Newer sweeps drop these at the producer; this
+    # keeps older/in-flight bursts honest instead of calling skips failures.
+    skipped = [t for t in transitions if t.get("after") == "unknown"]
+    failing = [t for t in transitions
+               if t.get("after") not in ("healthy", "unknown")]
     recovered = [t for t in transitions if t.get("after") == "healthy"]
+
+    skipped_note = (f"({len(skipped)} probes skipped this pass — health "
+                    f"monitor over its time budget, not real failures)"
+                    if skipped else "")
+
+    if not failing and not recovered:
+        return (f"No real state changes — {len(skipped)} probes were skipped "
+                f"this pass because the health monitor ran over its time "
+                f"budget. Nothing is known to be down.")
 
     if not failing:
         names = ", ".join(t.get("probe", "?") for t in recovered[:3])
         more = f" +{len(recovered) - 3} more" if len(recovered) > 3 else ""
-        return (f"Good news — all {len(recovered)} changes were recoveries: "
+        text = (f"Good news — all {len(recovered)} changes were recoveries: "
                 f"{names}{more}.")
+        return f"{text}\n{skipped_note}" if skipped_note else text
 
     if aggregate_optional:
         listed = [t for t in failing if t.get("tier") != "optional"]
@@ -379,6 +394,27 @@ def watchdog_burst_body(payload: dict, *, max_listed: int = 5,
         names = ", ".join(t.get("probe", "?") for t in recovered[:3])
         more = f" +{len(recovered) - 3} more" if len(recovered) > 3 else ""
         lines.append(f"✓ Recovered: {names}{more}")
+    if skipped_note:
+        lines.append(skipped_note)
+    return "\n".join(lines)
+
+
+def watchdog_self_degraded_body(payload: dict) -> str:
+    """The watchdog itself can't do its job — say why in plain language."""
+    reason = str(payload.get("reason") or "unspecified").strip()
+    lines = [f"The health monitor itself is degraded: {reason}."]
+    skipped = payload.get("skipped_probes")
+    if skipped:
+        lines.append(f"{skipped} probes were not checked this pass "
+                     f"(monitor ran over its time budget — usually resource "
+                     f"pressure). Service states are unchanged, not down.")
+    age = payload.get("age_seconds")
+    if age is not None:
+        lines.append(f"status.json hasn't updated in "
+                     f"{format_duration(age)} — laptop-monitor may be stuck.")
+    path = payload.get("path")
+    if path:
+        lines.append(f"File: {path}")
     return "\n".join(lines)
 
 

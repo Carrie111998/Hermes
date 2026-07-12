@@ -225,6 +225,63 @@ class TestPlainLanguageBodies:
         body = watchdog_burst_body({"count": 7, "transitions": []})
         assert "7" in body and "{" not in body
 
+    def test_watchdog_burst_body_all_skipped_is_not_a_failure(self):
+        # 2026-07-11 pass-overrun storms: after="unknown" means the probe was
+        # SKIPPED (monitor over budget), not that the service failed. A burst
+        # of pure skips must not read as "55 health checks failing".
+        from events.formatting import watchdog_burst_body
+        transitions = [
+            {"probe": f"probe-{i}", "tier": "important", "before": "healthy",
+             "after": "unknown",
+             "detail": "skipped: pass exceeded 50s budget (probe not run this tick)"}
+            for i in range(55)
+        ]
+        body = watchdog_burst_body({"count": 55, "transitions": transitions})
+        assert "failing" not in body
+        assert "skipped" in body and "time budget" in body
+        assert "Nothing is known to be down" in body
+
+    def test_watchdog_burst_body_mixed_skips_stay_out_of_failing(self):
+        from events.formatting import watchdog_burst_body
+        body = watchdog_burst_body({
+            "count": 3,
+            "transitions": [
+                {"probe": "Postgres :5437", "tier": "critical",
+                 "before": "healthy", "after": "down", "detail": "CONNECT_TIMEOUT"},
+                {"probe": "skipped-A", "tier": "important",
+                 "before": "healthy", "after": "unknown",
+                 "detail": "skipped: pass exceeded 50s budget"},
+                {"probe": "skipped-B", "tier": "important",
+                 "before": "healthy", "after": "unknown",
+                 "detail": "skipped: pass exceeded 50s budget"},
+            ],
+        })
+        assert "1 health check failing" in body
+        assert "Postgres :5437" in body
+        assert "2 probes skipped this pass" in body
+        assert "not real failures" in body
+
+    def test_watchdog_self_degraded_body_over_budget(self):
+        from events.formatting import watchdog_self_degraded_body
+        body = watchdog_self_degraded_body({
+            "reason": "monitor pass over budget",
+            "skipped_probes": 55,
+            "sample_detail": "skipped: pass exceeded 50s budget",
+        })
+        assert "monitor pass over budget" in body
+        assert "55 probes were not checked" in body
+        assert "unchanged, not down" in body
+        assert "{" not in body
+
+    def test_watchdog_self_degraded_body_stale_status(self):
+        from events.formatting import watchdog_self_degraded_body
+        body = watchdog_self_degraded_body({
+            "reason": "laptop-monitor status.json stale",
+            "age_seconds": 900,
+        })
+        assert "degraded" in body
+        assert "15m" in body
+
     def test_silence_alert_body(self):
         from events.formatting import silence_alert_body
         body = silence_alert_body({
