@@ -9,6 +9,301 @@ from tui_gateway import server
 from tui_gateway import ws as ws_mod
 
 
+def test_gateway_ready_advertises_revisioned_mobile_sync(monkeypatch):
+    sent = []
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    authorization = {
+        "subject": "user-1",
+        "provider": "stub",
+        "audience": "hermes.mobile",
+        "scopes": ("conversation.read", "conversation.write"),
+    }
+
+    asyncio.run(ws_mod.handle_ws(FakeWS(), authorization=authorization))
+
+    assert sent[0] == {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {
+            "type": "gateway.ready",
+            "payload": {
+                "skin": "test-skin",
+                "server": {
+                    "version": "test-version",
+                    "release_date": "test-release",
+                    "instance_id": "test-instance",
+                },
+                "protocol": {"name": "hermes.tui.jsonrpc", "major": 1},
+                "contract": {"name": "hermes.mobile", "major": 1},
+                "schemas": {
+                    "gateway.ready": 1,
+                    "authorization.grant": 1,
+                    "authorization.error": 1,
+                    "session.synchronization": 1,
+                    "session.event": 1,
+                },
+                "capabilities": {
+                    "auth.ws_scopes": {"version": 1},
+                    "conversation.sync": {
+                        "version": 1,
+                        "delta_offsets": {"unit": "utf8_bytes"},
+                        "replay": {
+                            "max_events": 512,
+                            "max_bytes": 1048576,
+                        },
+                    },
+                },
+                "authorization": {
+                    "subject": "user-1",
+                    "provider": "stub",
+                    "audience": "hermes.mobile",
+                    "scopes": ["conversation.read", "conversation.write"],
+                },
+            },
+        },
+    }
+
+
+def test_mobile_authorization_is_enforced_on_requests_from_the_live_socket(
+    monkeypatch,
+):
+    sent = []
+    received = False
+    monkeypatch.setattr(mcp_startup, "start_background_mcp_discovery", lambda **_kw: None)
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            nonlocal received
+            if not received:
+                received = True
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "mobile-request",
+                        "method": "not.a.mobile.method",
+                        "params": {},
+                    }
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(
+        ws_mod.handle_ws(
+            FakeWS(),
+            authorization={
+                "subject": "user-1",
+                "provider": "stub",
+                "audience": "hermes.mobile",
+                "scopes": ("conversation.read",),
+            },
+        )
+    )
+
+    assert sent[1]["error"] == {
+        "code": 4030,
+        "message": "insufficient authorization scope",
+        "data": {
+            "reason": "method_not_available_to_mobile",
+            "method": "not.a.mobile.method",
+            "required_scope": "mobile.unavailable",
+            "required_scopes": ["mobile.unavailable"],
+            "missing_scopes": ["mobile.unavailable"],
+            "granted_scopes": ["conversation.read"],
+            "grantable": False,
+        },
+    }
+
+
+def test_mobile_socket_create_delta_and_live_resume_share_one_sync_stream(
+    monkeypatch,
+):
+    """Exercise synchronization through the real handle_ws transport boundary."""
+    sent = []
+    receive_index = 0
+    state = {}
+    server._sessions.clear()
+    monkeypatch.setattr(
+        mcp_startup, "start_background_mcp_discovery", lambda **_kw: None
+    )
+    monkeypatch.setattr(
+        server, "_claim_active_session_slot", lambda *_a, **_k: (None, None)
+    )
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_profile_home", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server, "_completion_cwd", lambda *_a, **_k: server.os.getcwd()
+    )
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda *_a, **_k: "")
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test/model")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        server, "_close_sessions_for_transport", lambda *_a, **_k: (0, 0)
+    )
+
+    class FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": server.os.getcwd()}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def get_messages_as_conversation(self, _session_id, include_ancestors=False):
+            return []
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+
+    async def wait_for_response(request_id):
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            match = next(
+                (frame for frame in sent if frame.get("id") == request_id), None
+            )
+            if match is not None:
+                return match
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"missing WebSocket response {request_id}")
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            nonlocal receive_index
+            receive_index += 1
+            if receive_index == 1:
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "create-sync",
+                        "method": "session.create",
+                        "params": {"cols": 100},
+                    }
+                )
+            if receive_index == 2:
+                created = (await wait_for_response("create-sync"))["result"]
+                state["created"] = created
+                sid = created["session_id"]
+                session = server._sessions[sid]
+
+                def emit_deltas():
+                    with session["history_lock"]:
+                        server._start_inflight_turn(session, "question")
+                    server._emit_inflight_delta(sid, session, "A💡")
+                    server._emit_inflight_delta(sid, session, "B")
+
+                await asyncio.to_thread(emit_deltas)
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "resume-sync",
+                        "method": "session.resume",
+                        "params": {
+                            "session_id": created["stored_session_id"],
+                            "cols": 100,
+                            "cursor": created["synchronization"]["recovery"]["cursor"],
+                        },
+                    }
+                )
+            await wait_for_response("resume-sync")
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    authorization = {
+        "subject": "mobile-user",
+        "provider": "stub",
+        "audience": "hermes.mobile",
+        "scopes": (
+            "conversation.read",
+            "conversation.write",
+            "conversation.control",
+        ),
+    }
+
+    try:
+        asyncio.run(ws_mod.handle_ws(FakeWS(), authorization=authorization))
+    finally:
+        server._sessions.clear()
+
+    created = state["created"]
+    resumed = next(frame for frame in sent if frame.get("id") == "resume-sync")[
+        "result"
+    ]
+    deltas = [
+        frame["params"]
+        for frame in sent
+        if frame.get("params", {}).get("type") == "message.delta"
+    ]
+    assert [params["payload"]["offset"] for params in deltas] == [0, 5]
+    assert len({params["payload"]["turn_id"] for params in deltas}) == 1
+    assert [params["sequence"] for params in deltas] == [1, 2]
+    assert resumed["session_id"] == created["session_id"]
+    assert (
+        resumed["synchronization"]["snapshot"]["stream_id"]
+        == created["synchronization"]["snapshot"]["stream_id"]
+    )
+    assert resumed["synchronization"]["recovery"]["outcome"] == "complete"
+    assert len(resumed["synchronization"]["recovery"]["events"]) == 2
+
+
+    calls = []
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "start_background_mcp_discovery",
+        lambda **kw: calls.append(kw),
+    )
+
+    class FakeWS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            pass
+
+        async def receive_text(self):
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    server._sessions.clear()
+    try:
+        asyncio.run(ws_mod.handle_ws(FakeWS()))
+    finally:
+        server._sessions.clear()
+
+    assert calls == []
 
 
 def _run_disconnect(monkeypatch, seed):
