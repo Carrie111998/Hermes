@@ -159,8 +159,19 @@ function outboundPolicyDecision(chatId) {
   if (OUTBOUND_DISABLED) {
     return { allowed: false, reason: 'global_disabled' };
   }
+  // Unconfigured filter = NO CHAT allowed (secure default). Matches the inbound
+  // sibling in allowlist.js: "Empty allowlist = NO ONE allowed". Operators who
+  // want an open bot must set the outbound chat filter explicitly.
+  //
+  // This previously returned allowed:true ('legacy_open'), which meant that
+  // clearing WHATSAPP_OUTBOUND_DISABLED on a host with no configured filter
+  // opened *every* chat -- including a client's live operations chats. The
+  // ordering requirement ("configure the allowlist before flipping the switch")
+  // was a procedure, and procedures lose to whoever does the natural thing on a
+  // go-live morning. A fail-closed default dissolves the ordering requirement
+  // rather than asking a human to remember it.
   if (!OUTBOUND_CHAT_FILTER_CONFIGURED) {
-    return { allowed: true, reason: 'legacy_open' };
+    return { allowed: false, reason: 'filter_unconfigured' };
   }
   if (matchesAllowedChat(chatId, OUTBOUND_ALLOWED_CHATS, SESSION_DIR)) {
     return { allowed: true, reason: 'explicitly_allowed' };
