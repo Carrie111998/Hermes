@@ -183,6 +183,7 @@ DEFAULT_SPOTIFY_SCOPE = " ".join((
 ))
 SERVICE_PROVIDER_NAMES: Dict[str, str] = {
     "spotify": "Spotify",
+    "aws-bid": "Amazon BID",
 }
 
 # LM Studio's default no-auth mode still requires *some* non-empty bearer for
@@ -1991,6 +1992,23 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
         if auth_store.get("active_provider") == target:
             auth_store["active_provider"] = None
             cleared = True
+
+        # Amazon BID device-flow leaves poll/token state on disk in the build
+        # plugin dir. Clear it alongside the pool entry so logout is complete.
+        if target == "aws-bid":
+            try:
+                import os as _os
+                _plug = _os.path.join(
+                    _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes")),
+                    "plugins", "build",
+                )
+                for _f in (".bid_flow.json", ".bid_token.json", ".bid_registration.json"):
+                    _p = _os.path.join(_plug, _f)
+                    if _os.path.exists(_p):
+                        _os.unlink(_p)
+                        cleared = True
+            except Exception:  # noqa: BLE001
+                pass
 
         if not cleared:
             return False
@@ -7114,6 +7132,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
+    if target == "aws-bid":
+        return get_aws_bid_auth_status()
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -7126,6 +7146,53 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         except ImportError:
             return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
     return {"logged_in": False}
+
+
+def get_aws_bid_auth_status() -> Dict[str, Any]:
+    """Structural auth status for Amazon BID (Build ID).
+
+    Reads the credential pool entry (written by `hermes auth add aws-bid`),
+    never mints or refreshes a token here. Falls back to the build plugin's
+    get_status() when no pool entry exists yet (mid device-flow).
+    """
+    from agent.credential_pool import load_pool  # local import; not top-level
+    pool = load_pool("aws-bid")
+    entries = pool.entries()
+    if entries:
+        entry = pool.peek() or entries[0]
+        return {
+            "logged_in": True,
+            "provider": "aws-bid",
+            "auth_type": entry.auth_type,
+            "label": entry.label,
+            "expires_at_ms": entry.expires_at_ms,
+        }
+    # No pool entry — surface in-flight device-flow state if present.
+    try:
+        from hermes_plugins.build.auth import sso_oidc  # type: ignore
+    except Exception:  # noqa: BLE001
+        import importlib.util as _ilu, os as _os
+        _plug_dir = _os.path.join(
+            _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes")),
+            "plugins", "build",
+        )
+        _spec = _ilu.spec_from_file_location(
+            "hermes_plugins.build.auth.sso_oidc",
+            _os.path.join(_plug_dir, "auth", "sso_oidc.py"),
+        )
+        sso_oidc = _ilu.module_from_spec(_spec)  # type: ignore[assignment]
+        _spec.loader.exec_module(sso_oidc)  # type: ignore[union-attr]
+    try:
+        st = sso_oidc.get_status()
+        return {
+            "logged_in": bool(st.get("authenticated")),
+            "provider": "aws-bid",
+            "phase": st.get("phase"),
+            "user_code": st.get("user_code"),
+            "verification_uri_complete": st.get("verification_uri_complete"),
+        }
+    except Exception:
+        return {"logged_in": False, "provider": "aws-bid"}
 
 
 def _get_azure_foundry_auth_status() -> Dict[str, Any]:
