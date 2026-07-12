@@ -36,6 +36,12 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 # Providers that support OAuth login in addition to API keys.
 _OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
 
+# Non-inference auth providers whose only auth path is a device-code / OAuth
+# flow (no API key). They are allowlisted so `hermes auth add <name>` does not
+# hit the "Unknown provider" guard, but they are NOT inference providers and
+# must not be added to PROVIDER_REGISTRY.
+_DEVICE_CODE_AUTH_PROVIDERS = {"aws-bid"}
+
 
 def _get_custom_provider_names() -> list:
     """Return list of (display_name, pool_key, provider_key) tuples."""
@@ -163,8 +169,14 @@ def _format_exhausted_status(entry) -> str:
 
 def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
-    if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
+    if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX) and provider not in _DEVICE_CODE_AUTH_PROVIDERS:
         raise SystemExit(f"Unknown provider: {provider}")
+
+    # Amazon BID (Build ID) is OAuth-device-code only — route it to its branch
+    # unconditionally so it never falls into the API-key prompt path.
+    if provider == "aws-bid":
+        _auth_add_aws_bid(args)
+        return
 
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:
@@ -432,6 +444,84 @@ def auth_add_command(args) -> None:
         return
 
     raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
+
+
+def _auth_add_aws_bid(args) -> None:
+    """Drive the Amazon BID (Build ID) SSO-OIDC device flow and persist the
+    resulting credential into the Hermes credential pool.
+
+    The OAuth device authorization itself lives in the `build` plugin
+    (hermes_plugins.build.auth.sso_oidc); this is the CLI orchestrator.
+    """
+    provider = "aws-bid"
+    pool = load_pool(provider)
+    try:
+        from hermes_plugins.build.auth import sso_oidc  # type: ignore
+    except Exception:  # noqa: BLE001
+        # Standalone `hermes auth` invocations may run before the plugin
+        # loader has injected the hermes_plugins namespace. Import the build
+        # plugin's sso_oidc module directly by file path as a fallback.
+        import importlib.util as _ilu, os as _os
+        _slug = "build"
+        _plug_dir = _os.path.join(
+            _os.environ.get("HERMES_HOME", _os.path.expanduser("~/.hermes")),
+            "plugins", _slug,
+        )
+        _spec = _ilu.spec_from_file_location(
+            f"hermes_plugins.{_slug}.auth.sso_oidc",
+            _os.path.join(_plug_dir, "auth", "sso_oidc.py"),
+        )
+        sso_oidc = _ilu.module_from_spec(_spec)  # type: ignore[assignment]
+        _spec.loader.exec_module(sso_oidc)  # type: ignore[union-attr]
+    login = sso_oidc.start_login()
+    if not login.get("user_code"):
+        raise SystemExit("Amazon BID device authorization failed to start.")
+    print("Approve this Amazon BID login in your browser (Brave, signed into Google):")
+    print(f"  {login['verification_uri_complete']}")
+    print(f"  user_code: {login['user_code']}")
+    # Poll to completion. get_status() does one poll pass; loop it until the
+    # OIDC server records approval, the flow expires, or an error occurs.
+    # Poll state lives on disk (.bid_flow.json) so any process can complete
+    # it — this loop is the CLI-side waiter for the interactive `auth add`.
+    status = None
+    deadline = time.time() + login.get("expires_in", 600)
+    while time.time() < deadline:
+        status = sso_oidc.get_status()
+        if status.get("authenticated"):
+            break
+        if str(status.get("error") or "").startswith("error:"):
+            raise SystemExit(
+                f"Amazon BID login failed: {status['error']}"
+            )
+        time.sleep(status.get("interval", 1))
+    if not status or not status.get("authenticated"):
+        raise SystemExit(
+            "Amazon BID login was not approved in time. Re-run "
+            "`hermes auth add aws-bid` to try again."
+        )
+    token = sso_oidc._load_token() or {}
+    access = token.get("access_token")
+    refresh = token.get("refresh_token")
+    exp_sec = token.get("expires_at") or status.get("token_expires_at")
+    exp_ms = int(exp_sec * 1000) if exp_sec else None
+    label = (getattr(args, "label", None) or "").strip() or label_from_token(
+        access or login["user_code"],
+        _oauth_default_label(provider, len(pool.entries()) + 1),
+    )
+    entry = PooledCredential(
+        provider=provider,
+        id=uuid.uuid4().hex[:6],
+        label=label,
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source=SOURCE_MANUAL_DEVICE_CODE,
+        access_token=access,
+        refresh_token=refresh,
+        expires_at_ms=exp_ms,
+    )
+    pool.add_entry(entry)
+    print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+    return
 
 
 def auth_list_command(args) -> None:
