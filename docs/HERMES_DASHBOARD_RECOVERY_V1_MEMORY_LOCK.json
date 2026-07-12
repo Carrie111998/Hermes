@@ -1,0 +1,61 @@
+{
+  "mission": "HERMES_DASHBOARD_RECOVERY_V1",
+  "status": "HERMES_DASHBOARD_RECOVERY_V1_COMPLETE",
+  "date_utc": "2026-07-12",
+  "repository": "/home/deploy/hermes-agent",
+  "canonical_deployment_source": "/home/deploy/hermes-agent/docker-compose.yml",
+  "branch": "hermes-dashboard-recovery-v1",
+  "commit": "7b64f24c3",
+  "root_cause": "The canonical gateway service did not set HERMES_DASHBOARD, so the dashboard service stayed down and 127.0.0.1:9119 was never available.",
+  "durable_configuration": {
+    "HERMES_DASHBOARD": "true",
+    "HERMES_DASHBOARD_HOST": "127.0.0.1",
+    "HERMES_DASHBOARD_PORT": "9119",
+    "network_mode": "host",
+    "restart_policy": "unless-stopped",
+    "mount": "/home/deploy/.hermes:/opt/data",
+    "public_exposure": "none"
+  },
+  "codegraph": {
+    "hermes_repo_status": "not initialized",
+    "tools_repo_status": "available and up to date",
+    "fallback": "bounded static inspection"
+  },
+  "superpowers_plan": {
+    "root_cause": "missing dashboard activation in compose",
+    "files_changed": [
+      "docker-compose.yml",
+      "tests/test_docker_compose_dashboard_config.py"
+    ],
+    "tests": [
+      "git diff --check",
+      "docker compose -f /home/deploy/hermes-agent/docker-compose.yml config",
+      "python3 -m pytest -o addopts='' /home/deploy/hermes-agent/tests/test_docker_compose_dashboard_config.py /home/deploy/hermes-agent/tests/test_docker_home_override_scripts.py -q",
+      "python3 -m pytest -o addopts='' /home/deploy/hermes-agent/tests/test_docker_compose_dashboard_config.py -q"
+    ]
+  },
+  "approval": {
+    "live_apply_command": "docker compose -f /home/deploy/hermes-agent/docker-compose.yml up -d --force-recreate --no-deps --no-build gateway",
+    "approval_state": "approved_and_executed"
+  },
+  "live_evidence": {
+    "compose_state": "Container hermes Recreated / Starting / Started",
+    "container_status": "Up",
+    "dashboard_process": "pid 131, hermes dashboard --host 127.0.0.1 --port 9119 --no-open",
+    "gateway_process": "pid 165, hermes gateway run",
+    "dashboard_listener": "127.0.0.1:9119 listening inside the container",
+    "dashboard_get": "GET http://127.0.0.1:9119/ returned 200 inside the container",
+    "nginx_proxy": "https://dash.leanframeworklab.com returned 401 Basic Auth through host Nginx when probed from the container",
+    "nginx_auth": "Basic Auth remains active",
+    "mount_intact": "/home/deploy/.hermes:/opt/data preserved",
+    "unrelated_containers": [
+      "cartelogic-remote-memory-cartelogic-remote-memory-1 Up",
+      "qdrant Up"
+    ],
+    "logs": "s6-rc reported dashboard started successfully; no dashboard startup failure appeared in the filtered logs"
+  },
+  "notes": [
+    "A host-side curl from this session could not be used as the decisive proof because the session's own network path to 127.0.0.1 is isolated; the container-local GET and the in-container proxy probe were the runtime evidence used instead.",
+    "GitHub push/PR workflow is blocked separately by repository permission/credential limits (403 on push), not by the runtime recovery."
+  ]
+}
