@@ -73,14 +73,14 @@ def test_all_product_routes_are_exposed():
     }
     expected = set()
     for method, path in re.findall(
-        r"^(GET|POST|PATCH|DELETE)\s+(/api/v1/[^\s]+)",
+        r"^(GET|POST|PUT|PATCH|DELETE)\s+(/api/v1/[^\s]+)",
         (ROOT / "PRODUCT.md").read_text(encoding="utf-8"), re.MULTILINE,
     ):
         for old, new in names.items():
             path = path.replace(f":{old}", "{" + new + "}")
         expected.add((method, path))
     actual = {(method.upper(), path) for path, value in client.app.openapi()["paths"].items()
-              for method in value if method.upper() in {"GET", "POST", "PATCH", "DELETE"}}
+              for method in value if method.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE"}}
     assert expected <= actual, sorted(expected - actual)
 
 

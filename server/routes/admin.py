@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..auth import Principal, hash_password, require_admin
 from ..db import Database, json_dump, json_load, new_id, now
@@ -26,6 +26,39 @@ def _user(row) -> dict:
         "data": json_load(row["data"], {}), "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
+
+
+@router.get("/errors")
+def errors(request: Request, limit: int = Query(default=200, ge=1, le=500),
+           _: Principal = Depends(require_admin)):
+    return [{
+        "id": row["id"],
+        "level": "error",
+        "area": row["run_type"],
+        "message": row["error"] or "Agent run failed",
+        "at": row["completed_at"] or row["updated_at"],
+        "company_id": row["company_id"],
+    } for row in request.app.state.db.all(
+        "SELECT id,company_id,run_type,error,completed_at,updated_at FROM agent_runs "
+        "WHERE status='failed' ORDER BY COALESCE(completed_at,updated_at) DESC LIMIT ?",
+        (limit,),
+    )]
+
+
+@router.get("/logs")
+def logs(request: Request, limit: int = Query(default=100, ge=1, le=500),
+         _: Principal = Depends(require_admin)):
+    return [{
+        "id": row["id"],
+        "area": row["entity_type"] or "system",
+        "message": str(row["action"]).replace("_", " "),
+        "at": row["created_at"],
+        "company_id": row["company_id"],
+    } for row in request.app.state.db.all(
+        "SELECT id,company_id,action,entity_type,created_at FROM activity_log "
+        "ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )]
 
 
 @router.get("/companies")

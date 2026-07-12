@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, Query, Request
 from pydantic import BaseModel, Field
 
 from ..agent_service import AgentRunService
@@ -25,8 +25,15 @@ def _scope(principal: Principal, header: str | None, body_company: str | None = 
 
 @router.get("")
 def list_runs(request: Request, principal: Principal = Depends(current_principal),
-              x_company_id: str | None = Header(default=None)):
-    return request.app.state.runs.list(_scope(principal, x_company_id))
+              x_company_id: str | None = Header(default=None),
+              run_type: str | None = Query(default=None, alias="type"),
+              status: str | None = Query(default=None)):
+    values = request.app.state.runs.list(_scope(principal, x_company_id))
+    if run_type:
+        values = [value for value in values if value.get("run_type") == run_type]
+    if status:
+        values = [value for value in values if value.get("status") == status]
+    return values
 
 
 @router.post("", status_code=201)

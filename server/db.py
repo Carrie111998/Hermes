@@ -148,6 +148,11 @@ CREATE TABLE IF NOT EXISTS run_events (
     company_id TEXT NOT NULL, ts REAL NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL DEFAULT '',
     data TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id TEXT PRIMARY KEY, company_id TEXT NOT NULL REFERENCES companies(id),
+    user_id TEXT NOT NULL REFERENCES users(id), profile TEXT NOT NULL DEFAULT 'default',
+    history TEXT NOT NULL DEFAULT '[]', created_at REAL NOT NULL, updated_at REAL NOT NULL
+);
 
 CREATE INDEX IF NOT EXISTS ix_users_company ON users(company_id);
 CREATE INDEX IF NOT EXISTS ix_documents_company ON documents(company_id);
@@ -157,6 +162,7 @@ CREATE INDEX IF NOT EXISTS ix_messages_company ON outreach_messages(company_id);
 CREATE INDEX IF NOT EXISTS ix_delivery_message ON delivery_attempts(message_id);
 CREATE INDEX IF NOT EXISTS ix_runs_company ON agent_runs(company_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS ix_activity_company ON activity_log(company_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_chat_sessions_tenant ON chat_sessions(company_id, user_id, updated_at DESC);
 """
 
 

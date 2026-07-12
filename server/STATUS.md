@@ -1,10 +1,10 @@
 # Sales Agent backend status
 
-Status as of 2026-07-11.
+Status as of 2026-07-12.
 
 ## Code-complete surfaces
 
-- All 207 API method/path contracts in PRODUCT.md are exposed and checked
+- All 216 API method/path contracts in PRODUCT.md are exposed and checked
   against generated OpenAPI.
 - Local auth plus Supabase GoTrue login/token validation/refresh/logout/reset.
 - Admin-managed companies and users with tenant-scoped customer access.
@@ -18,6 +18,11 @@ Status as of 2026-07-11.
 - Analytics, CSV exports, data sources, activity logs, run logs/events.
 - SQLite local backend and Supabase Postgres/RLS/Storage deployment path.
 - Installable `interfaze-api` entry point and packaged server/company packs.
+- Packaged same-origin WebUI with hybrid real/mock data adapters.
+- Tenant-scoped Ask Hermes SSE bridge with restricted agent turns, durable
+  chat history, single-use stream capabilities, and concurrent-turn control.
+- Real WebUI multipart uploads, authenticated CSV downloads, dashboard-shaped
+  analytics, promoted onboarding/admin/WhatsApp routes, and server-side list filters.
 
 ## Run types
 
@@ -39,8 +44,14 @@ Status as of 2026-07-11.
 
 - `tests/server/test_api_mvp.py`: 9 API qualification checks.
 - `tests/server/test_run_harness.py`: 7 production run-service checks.
-- PRODUCT route comparison: 207/207.
+- `tests/server/test_webui.py`: 15 serving, core-flow, chat-isolation, and
+  Phase 4 long-tail checks.
+- Full `tests/server` qualification: 37 passed.
+- PRODUCT route comparison: 216/216.
 - Python compile pass for `server/` and `tests/server/`.
+- Headless Edge hybrid acceptance passed: login/dashboard, multipart upload,
+  filtered leads, authenticated CSV download, analytics, WhatsApp profile,
+  completed-onboarding state, real 404 behavior, and admin errors/logs.
 
 ## External release gates
 

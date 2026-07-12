@@ -26,6 +26,15 @@ class IntegrationPatch(BaseModel):
     status: str | None = None
 
 
+class WhatsAppProfile(BaseModel):
+    business_name: str = Field(min_length=1)
+    whatsapp_business_account_id: str = Field(min_length=1)
+    phone_number_id: str = Field(min_length=1)
+    display_phone_number: str = ""
+    business_country: str = "TR"
+    default_language: str = "en"
+
+
 def _scope(principal: Principal, header: str | None) -> str:
     return company_scope(principal, header)
 
@@ -170,6 +179,106 @@ def whatsapp_integrations(request: Request, principal: Principal = Depends(curre
         "SELECT * FROM integrations WHERE company_id=? AND kind='whatsapp' ORDER BY created_at DESC",
         (_scope(principal, x_company_id),),
     )]
+
+
+def _whatsapp_profile_row(request: Request, company_id: str):
+    return request.app.state.db.one(
+        "SELECT * FROM integrations WHERE company_id=? AND kind='whatsapp' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (company_id,),
+    )
+
+
+def _whatsapp_profile(row) -> dict | None:
+    if not row:
+        return None
+    data = json_load(row["data"], {})
+    return {
+        **data,
+        "id": row["id"],
+        "company_id": row["company_id"],
+        "provider": row["provider"],
+        "status": row["status"],
+        "data": data,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+# Literal profile routes must stay above /integrations/whatsapp/{integration_id}.
+@router.get("/integrations/whatsapp/profile")
+def whatsapp_profile(request: Request, principal: Principal = Depends(current_principal),
+                     x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    return _whatsapp_profile(_whatsapp_profile_row(request, company_id))
+
+
+@router.put("/integrations/whatsapp/profile")
+def save_whatsapp_profile(body: WhatsAppProfile, request: Request,
+                          principal: Principal = Depends(current_principal),
+                          x_company_id: str | None = Header(default=None)):
+    company_id, stamp = _scope(principal, x_company_id), now()
+    row = _whatsapp_profile_row(request, company_id)
+    existing = json_load(row["data"], {}) if row else {}
+    data = {
+        **existing,
+        **body.model_dump(),
+        "profile_state": "saved",
+        "credential_state": "configured" if row and row["encrypted_credentials"] else "server_required",
+        "template_status": existing.get("template_status", "not_configured"),
+        "verification": None,
+        "profile_saved_at": stamp,
+    }
+    if row:
+        request.app.state.db.execute(
+            "UPDATE integrations SET data=?,updated_at=? WHERE id=?",
+            (json_dump(data), stamp, row["id"]),
+        )
+        integration_id = row["id"]
+    else:
+        integration_id = new_id("int")
+        request.app.state.db.execute(
+            "INSERT INTO integrations VALUES(?,?,?,?,?,?,?,?,?)",
+            (integration_id, company_id, "whatsapp", "profile", "not_connected", None,
+             json_dump(data), stamp, stamp),
+        )
+    request.app.state.db.activity(
+        company_id, principal.id, "whatsapp_profile_saved", "integration", integration_id,
+    )
+    return _whatsapp_profile(request.app.state.db.one(
+        "SELECT * FROM integrations WHERE id=?", (integration_id,),
+    ))
+
+
+@router.post("/integrations/whatsapp/profile/verify")
+def verify_whatsapp_profile(request: Request, principal: Principal = Depends(current_principal),
+                            x_company_id: str | None = Header(default=None)):
+    company_id = _scope(principal, x_company_id)
+    row = _whatsapp_profile_row(request, company_id)
+    if not row:
+        raise HTTPException(422, "Save a WhatsApp Business profile before verifying it")
+    data = json_load(row["data"], {})
+    required = ("business_name", "whatsapp_business_account_id", "phone_number_id")
+    missing = [field for field in required if not str(data.get(field) or "").strip()]
+    if missing:
+        raise HTTPException(422, {"message": "WhatsApp profile is incomplete", "fields": missing})
+    verification = {
+        "status": "verified",
+        "checked_at": now(),
+        "message": (
+            "Profile identifiers passed the readiness check. "
+            "Server credentials are still required for live delivery."
+        ),
+    }
+    data.update({"profile_state": "verified", "verification": verification})
+    request.app.state.db.execute(
+        "UPDATE integrations SET data=?,updated_at=? WHERE id=?",
+        (json_dump(data), now(), row["id"]),
+    )
+    request.app.state.db.activity(
+        company_id, principal.id, "whatsapp_profile_verified", "integration", row["id"],
+    )
+    return verification
 
 
 @router.get("/integrations/whatsapp/webhook")

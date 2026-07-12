@@ -1,8 +1,8 @@
 # interfaze-agent product API
 
 The agent/backend implementation of the Sales Agent MVP in `PRODUCT.md`.
-The customer dashboard is a separate repository and consumes this service at
-`/api/v1`.
+The packaged customer dashboard is served by this process at `/` and consumes
+the product API at `/api/v1`.
 
 ## Start locally
 
@@ -14,6 +14,11 @@ interfaze_server:
   cors_origins:
     - http://localhost:3000
     - http://localhost:5173
+  webui_enabled: true
+  max_upload_bytes: 26214400  # 25 MiB; 0 disables the size limit
+  chat_enabled: true
+  chat_model: ""       # empty uses the configured Hermes default
+  chat_toolset: none   # allowed: none, search, web; anything else fails closed
 ```
 
 Bootstrap the first administrator with deployment secrets, then start:
@@ -29,7 +34,9 @@ OpenAPI is available at `/openapi.json` and interactive API docs at `/docs`.
 
 ## Production / Supabase
 
-Apply `server/supabase/migrations/001_initial.sql` and configure:
+Apply `server/supabase/migrations/001_initial.sql` for a fresh database. Existing
+installations also apply `server/supabase/migrations/002_chat_sessions.sql`.
+Then configure:
 
 ```text
 SUPABASE_DB_URL
@@ -50,11 +57,14 @@ admin in the product database. Documents use the private
 - `db.py` / `postgres.py` — local SQLite and Supabase Postgres backends.
 - `agent_service.py` — queued runs, subprocess streaming, cancellation,
   retries, output contracts, and deterministic domain persistence.
+- `chat_bridge.py` — tenant-scoped WebUI sessions, restricted one-turn agents,
+  and single-use SSE stream capabilities.
 - `outreach_service.py` — immutable approval revisions, preflight QA,
   provider idempotency, send windows/caps, reply polling, and bounce circuit.
 - `email_providers/` — Gmail, Microsoft Graph, and test adapter.
 - `whatsapp_provider.py` — Meta WhatsApp Business Cloud API.
-- `routes/` — all 207 method/path contracts specified by PRODUCT.md.
+- `routes/` — all 216 PRODUCT.md contracts, including promoted WebUI convenience routes,
+  and the service-gated chat bridge.
 - `quality.py` — deterministic rules ported from the prototype QA scripts.
 
 The Hermes runtime generates research and content. It never owns authorization,
@@ -63,8 +73,7 @@ tenant IDs, database IDs, approvals, or provider-send decisions.
 ## Qualification
 
 ```bash
-python tests/server/test_api_mvp.py
-python tests/server/test_run_harness.py
+scripts/run_tests.sh tests/server/
 ```
 
 The local suite is credential-free. Release qualification additionally

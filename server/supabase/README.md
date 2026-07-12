@@ -1,6 +1,7 @@
 # Supabase deployment
 
-1. Create a Supabase project and apply `migrations/001_initial.sql`.
+1. Create a Supabase project and apply the SQL files in `migrations/` order.
+   Existing Phase 2 databases apply `002_chat_sessions.sql` when enabling chat.
 2. Configure the API process with `SUPABASE_DB_URL`, `SUPABASE_URL`,
    `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and a Fernet
    `INTERFAZE_CREDENTIAL_KEY`.

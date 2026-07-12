@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..auth import Principal, company_scope, current_principal
@@ -287,11 +287,25 @@ def cancel_campaign(campaign_id: str, request: Request, principal: Principal = D
 
 @router.get("/outreach/messages")
 def messages(request: Request, principal: Principal = Depends(current_principal),
-             x_company_id: str | None = Header(default=None)):
-    return [message_dict(row) for row in request.app.state.db.all(
+             x_company_id: str | None = Header(default=None),
+             campaign_id: str | None = Query(default=None),
+             lead_id: str | None = Query(default=None),
+             contact_id: str | None = Query(default=None),
+             status: str | None = Query(default=None)):
+    values = [message_dict(row) for row in request.app.state.db.all(
         "SELECT * FROM outreach_messages WHERE company_id=? ORDER BY created_at DESC",
         (_scope(principal, x_company_id),),
     )]
+    filters = {
+        "campaign_id": campaign_id,
+        "lead_id": lead_id,
+        "contact_id": contact_id,
+        "status": status,
+    }
+    for key, expected in filters.items():
+        if expected:
+            values = [value for value in values if value.get(key) == expected]
+    return values
 
 
 @router.get("/outreach/messages/{message_id}")

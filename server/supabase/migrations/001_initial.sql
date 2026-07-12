@@ -138,6 +138,12 @@ create table if not exists run_events (
   ts double precision not null, kind text not null, message text not null default '',
   data jsonb not null default '{}'::jsonb
 );
+create table if not exists chat_sessions (
+  id text primary key, company_id text not null references companies(id),
+  user_id text not null references users(id), profile text not null default 'default',
+  history jsonb not null default '[]'::jsonb,
+  created_at double precision not null, updated_at double precision not null
+);
 
 create index if not exists ix_users_company on users(company_id);
 create index if not exists ix_documents_company on documents(company_id);
@@ -146,6 +152,7 @@ create index if not exists ix_contacts_company on contacts(company_id);
 create index if not exists ix_messages_company on outreach_messages(company_id);
 create index if not exists ix_runs_company on agent_runs(company_id,created_at desc);
 create index if not exists ix_activity_company on activity_log(company_id,created_at desc);
+create index if not exists ix_chat_sessions_tenant on chat_sessions(company_id,user_id,updated_at desc);
 
 create or replace function interfaze_is_admin() returns boolean
 language sql stable security definer set search_path=public as $$
@@ -175,7 +182,7 @@ begin
     'company_sections','onboarding','documents','products','company_brain_snapshots',
     'selected_countries','lead_scans','leads','research','contacts','outreach_campaigns',
     'outreach_messages','delivery_attempts','cc_rules','integrations','linkedin_actions',
-    'data_sources','exports','agent_runs','run_events'
+    'data_sources','exports','agent_runs','run_events','chat_sessions'
   ] loop
     execute format('alter table %I enable row level security', table_name);
     execute format(

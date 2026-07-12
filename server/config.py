@@ -39,6 +39,11 @@ class Settings:
     bootstrap_admin_password: str = ""
     credential_key: str = ""
     upload_dir: Path = field(default_factory=lambda: get_hermes_home() / "interfaze" / "uploads")
+    webui_enabled: bool = True
+    max_upload_bytes: int = 25 * 1024 * 1024
+    chat_enabled: bool = True
+    chat_model: str = ""
+    chat_toolset: str = "none"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -63,4 +68,9 @@ class Settings:
             bootstrap_admin_password=os.environ.get("INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD", ""),
             credential_key=os.environ.get("INTERFAZE_CREDENTIAL_KEY", ""),
             upload_dir=Path(cfg.get("upload_dir") or home / "uploads").expanduser(),
+            webui_enabled=cfg.get("webui_enabled") is not False,
+            max_upload_bytes=max(0, int(cfg.get("max_upload_bytes", 25 * 1024 * 1024))),
+            chat_enabled=cfg.get("chat_enabled") is not False,
+            chat_model=str(cfg.get("chat_model") or ""),
+            chat_toolset=str(cfg.get("chat_toolset") or "none").lower(),
         )

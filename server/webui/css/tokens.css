@@ -1,0 +1,153 @@
+/* ============================================================
+   interfaze-agent — mobile-native design tokens
+   Warm filled surfaces, zero outlines, subtle 4px corners.
+   ============================================================ */
+
+:root {
+  --bg: #FAF9F5;
+  --surface: #F3F1EB;
+  --surface-2: #EBE8E0;
+  --surface-3: #E3DFD5;
+
+  --apple-blue: #0062D6;
+
+  --sidebar: #0062D6;
+  --sidebar-2: rgba(255, 255, 255, 0.12);
+  --sidebar-active: rgba(255, 255, 255, 0.22);
+  --sidebar-text: rgba(255, 255, 255, 0.82);
+  --sidebar-text-strong: #FFFFFF;
+  --sidebar-faint: rgba(255, 255, 255, 0.55);
+  --sidebar-badge-bg: #FFFFFF;
+  --sidebar-badge-text: #0062D6;
+
+  --text: #2B2926;
+  --text-strong: #1C1B18;
+  --muted: #6B6860;
+  --faint: #9C9890;
+
+  --accent: #1C1B18;
+  --accent-hover: #3A3834;
+  --accent-soft: #EBE8E0;
+  --accent-softer: #F3F1EB;
+  --accent-text: #1C1B18;
+  --accent-contrast: #FAF9F5;
+  --accent-glow: transparent;
+
+  --cta: #1C1B18;
+  --cta-hover: #3A3834;
+  --cta-soft: #EBE8E0;
+  --cta-contrast: #FAF9F5;
+  --cta-glow: transparent;
+
+  --success: #2D6A4F;
+  --success-soft: #E4EFE9;
+  --warning: #9A6700;
+  --warning-soft: #F5EDD8;
+  --error: #B42318;
+  --error-soft: #F8E8E6;
+  --info: #0B6E99;
+  --info-soft: #E4F0F6;
+
+  --score-high: #2D6A4F;
+  --score-mid: #9A6700;
+  --score-low: #9C9890;
+
+  --border: transparent;
+  --border-strong: var(--surface-3);
+
+  --map-land: #E3DFD5;
+  --map-land-hover: #D4CFC4;
+  --map-border: transparent;
+  --map-selected: #1C1B18;
+  --map-selected-hover: #3A3834;
+  --map-recommended: #9C9890;
+  --map-water: transparent;
+
+  --focus-ring: none;
+  --focus-ring-cta: none;
+
+  --radius-sm: 4px;
+  --radius-md: 4px;
+  --radius-lg: 4px;
+  --radius-xl: 4px;
+  --radius-pill: 4px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+  --space-10: 64px;
+
+  --shadow-1: none;
+  --shadow-2: none;
+  --shadow-3: none;
+
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --fs-xs: 12px;
+  --fs-sm: 13px;
+  --fs-base: 15px;
+  --fs-md: 16px;
+  --fs-lg: 18px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-3xl: 34px;
+
+  --touch-min: 44px;
+  --line-body: 1.55;
+}
+
+:root.dark {
+  --bg: #141312;
+  --surface: #1E1D1B;
+  --surface-2: #282624;
+  --surface-3: #32302D;
+
+  --apple-blue: #0074E5;
+
+  --sidebar: #0074E5;
+  --sidebar-2: rgba(255, 255, 255, 0.1);
+  --sidebar-active: rgba(255, 255, 255, 0.2);
+  --sidebar-text: rgba(255, 255, 255, 0.82);
+  --sidebar-text-strong: #FFFFFF;
+  --sidebar-faint: rgba(255, 255, 255, 0.5);
+  --sidebar-badge-bg: #FFFFFF;
+  --sidebar-badge-text: #0074E5;
+
+  --text: #E8E4DC;
+  --text-strong: #F5F3EE;
+  --muted: #A8A49C;
+  --faint: #7A766E;
+
+  --accent: #F5F3EE;
+  --accent-hover: #E8E4DC;
+  --accent-soft: #32302D;
+  --accent-softer: #282624;
+  --accent-text: #F5F3EE;
+  --accent-contrast: #141312;
+
+  --cta: #F5F3EE;
+  --cta-hover: #E8E4DC;
+  --cta-soft: #32302D;
+  --cta-contrast: #141312;
+
+  --success: #5CB88A;
+  --success-soft: #1A2E24;
+  --warning: #D4A843;
+  --warning-soft: #2E2618;
+  --error: #E87A70;
+  --error-soft: #2E1A18;
+  --info: #5BB8E8;
+  --info-soft: #182A32;
+
+  --map-land: #32302D;
+  --map-land-hover: #3F3C38;
+  --map-selected: #F5F3EE;
+  --map-selected-hover: #E8E4DC;
+  --map-recommended: #7A766E;
+}
