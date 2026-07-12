@@ -1,0 +1,49 @@
+Use two PowerShell terminals.
+
+Terminal 1 — start an isolated local server:
+
+cd C:\Users\ISLAM\Desktop\hermesagent
+$env:HERMES_HOME="$PWD\.local-hermes"
+New-Item -ItemType Directory -Force $env:HERMES_HOME | Out-Null
+@'
+interfaze_server:
+  auth_mode: local
+  webui_enabled: true
+  chat_enabled: false
+  max_upload_bytes: 26214400
+'@ | Set-Content "$env:HERMES_HOME\config.yaml"
+$env:INTERFAZE_BOOTSTRAP_ADMIN_EMAIL="admin@example.test"
+$env:INTERFAZE_BOOTSTRAP_ADMIN_PASSWORD="admin-password-123"
+.\.venv\Scripts\python.exe -m server.api_cli --host 127.0.0.1 --port 8000 --reload
+Terminal 2 — create a customer workspace:
+
+$login = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/api/v1/auth/login" `
+  -ContentType "application/json" `
+  -Body (@{
+    email = "admin@example.test"
+    password = "admin-password-123"
+  } | ConvertTo-Json)
+$headers = @{ Authorization = "Bearer $($login.access_token)" }
+$company = Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/api/v1/admin/companies" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body (@{ name = "Local Test Company" } | ConvertTo-Json)
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/api/v1/admin/users" `
+  -Headers $headers `
+  -ContentType "application/json" `
+  -Body (@{
+    email = "customer@example.test"
+    password = "customer-pass-123"
+    role = "customer"
+    company_id = $company.id
+  } | ConvertTo-Json)
+Open:
+
+http://127.0.0.1:8000/
+Log in with:
+
+customer@example.test
+customer-pass-123
