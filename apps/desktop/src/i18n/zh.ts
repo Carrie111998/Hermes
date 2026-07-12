@@ -2658,6 +2658,9 @@ export const zh: Translations = {
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: '会话',
+      runtimeSessionElapsed: '运行时会话已用时间',
+      fallback: '备用',
+      effectiveFallbackPolicy: policy => `当前备用策略：${policy}`,
       yoloOn: 'YOLO 已开启 — 自动批准危险命令。Shift+点击可全局切换。',
       yoloOff: 'YOLO 已关闭。Shift+点击可全局切换。',
       modelNone: '无',

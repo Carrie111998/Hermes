@@ -4580,7 +4580,9 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
+        mock_try_activate_fallback.assert_called_once_with(
+            FailoverReason.content_policy_blocked
+        )
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
@@ -5014,7 +5016,7 @@ class TestRunConversation:
 
         fallback_called = {"called": False}
 
-        def _mock_fallback():
+        def _mock_fallback(*_args, **_kwargs):
             fallback_called["called"] = True
             # Simulate what _try_activate_fallback does: just advance the
             # index and set the flag (the client is already mocked).
@@ -5042,6 +5044,8 @@ class TestRunConversation:
         agent._fallback_chain = [{"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}]
         agent._fallback_index = 0
         agent._fallback_activated = False
+        emitted_statuses = []
+        agent.status_callback = lambda kind, text: emitted_statuses.append((kind, text))
 
         empty_resp = _mock_response(content=None, finish_reason="stop")
         # 4 empty from primary (1 + 3 retries), fallback activated,
@@ -5051,11 +5055,15 @@ class TestRunConversation:
             empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
         ]
 
-        def _mock_fallback():
+        def _mock_fallback(*_args, **_kwargs):
             if agent._fallback_index >= len(agent._fallback_chain):
                 return False
             agent._fallback_index += 1
             agent._fallback_activated = True
+            agent._emit_fallback_status(
+                "Fallback policy any: primary failed; switching to "
+                "anthropic/claude-sonnet-4 via openrouter."
+            )
             agent.model = "anthropic/claude-sonnet-4"
             agent.provider = "openrouter"
             return True
@@ -5071,6 +5079,20 @@ class TestRunConversation:
         # #34452: explanation replaces the bare "(empty)" sentinel.
         assert result["final_response"] != "(empty)"
         assert "No reply:" in result["final_response"]
+        switch_decisions = [
+            text
+            for kind, text in emitted_statuses
+            if kind == "fallback" and "switching to" in text
+        ]
+        assert switch_decisions == [
+            "Fallback policy any: primary failed; switching to "
+            "anthropic/claude-sonnet-4 via openrouter."
+        ]
+        assert not any(
+            "switched to fallback" in text.lower()
+            for kind, text in emitted_statuses
+            if kind != "fallback"
+        )
 
     def test_empty_response_emits_status_for_gateway(self, agent):
         """_emit_status is called during empty retries so gateway users see feedback."""

@@ -24,6 +24,7 @@ import {
   $busy,
   $connection,
   $currentCwd,
+  $currentFallbackPolicy,
   $currentUsage,
   $selectedStoredSessionId,
   $sessions,
@@ -102,6 +103,7 @@ export function useStatusbarItems({
   const projectTree = useStore($projectTree)
   const projectName = useMemo(() => projectNameForCwd(currentCwd), [currentCwd, projectTree])
   const primaryUsage = useStore($currentUsage)
+  const currentFallbackPolicy = useStore($currentFallbackPolicy)
   const gatewayRestarting = useStore($gatewayRestarting)
   const primarySessionStartedAt = useStore($sessionStartedAt)
   const primaryTurnStartedAt = useStore($turnStartedAt)
@@ -500,6 +502,15 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
+        detail: currentFallbackPolicy || undefined,
+        hidden: !activeSessionId || !currentFallbackPolicy,
+        icon: <Codicon name="shield" size="0.75rem" />,
+        id: 'fallback-policy',
+        label: copy.fallback,
+        title: copy.effectiveFallbackPolicy(currentFallbackPolicy || copy.unknown),
+        variant: 'text'
+      },
+      {
         ...approvalModeItem,
         hidden: gatewayState !== 'open',
         toggleLabel: copy.toggleApprovalMode
@@ -528,6 +539,7 @@ export function useStatusbarItems({
       contextBar,
       contextUsage,
       copy,
+      currentFallbackPolicy,
       currentUsage,
       publishContextUsage,
       requestGateway,

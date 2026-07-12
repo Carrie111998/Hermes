@@ -4,6 +4,7 @@ import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { preserveLocalAssistantErrors } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { flushPendingFallbackNotices } from '@/lib/fallback-notices'
 import { persistInFlightTurnState } from '@/lib/inflight-turn-journal'
 import { setMutableRef } from '@/lib/mutable-ref'
 import {
@@ -11,6 +12,7 @@ import {
   $busy,
   $messages,
   setActiveSessionStoredIdRotation,
+  setCurrentFallbackPolicy,
   setCurrentFastMode,
   setCurrentModel,
   setCurrentPersonality,
@@ -38,6 +40,7 @@ interface SessionStateCacheOptions {
 function syncRuntimeMetadataToView(state: ClientSessionState) {
   setCurrentModel(state.model ?? '')
   setCurrentProvider(state.provider ?? '')
+  setCurrentFallbackPolicy(state.fallbackPolicy ?? '')
   setCurrentReasoningEffort(state.reasoningEffort ?? '')
   setCurrentServiceTier(state.serviceTier ?? '')
   setCurrentFastMode(state.fast ?? false)
@@ -131,6 +134,7 @@ export function useSessionStateCache({
 
         if (storedSessionId) {
           runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+          flushPendingFallbackNotices(sessionId, storedSessionId)
         }
       }
 
@@ -142,6 +146,7 @@ export function useSessionStateCache({
 
     if (storedSessionId) {
       runtimeIdByStoredSessionIdRef.current.set(storedSessionId, sessionId)
+      flushPendingFallbackNotices(sessionId, storedSessionId)
     }
 
     return created

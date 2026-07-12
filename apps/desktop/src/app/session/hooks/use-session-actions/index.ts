@@ -6,6 +6,7 @@ import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import { restoreFallbackNotices } from '@/lib/fallback-notices'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
@@ -42,6 +43,7 @@ import {
   setCurrentBranch,
   setCurrentCwd,
   setCurrentCwdTransient,
+  setCurrentFallbackPolicy,
   setCurrentServiceTier,
   setCurrentUsage,
   setFreshDraftReady,
@@ -136,9 +138,14 @@ function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?
 function reconcileAuthoritativeMessages(
   authoritativeMessages: SessionResumeResponse['messages'],
   previousMessages: ChatMessage[],
-  liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>
+  liveProjection?: Pick<SessionResumeResponse, 'inflight' | 'queued' | 'session_id'>,
+  storedSessionId?: string | null
 ): ChatMessage[] {
-  const authoritative = toChatMessages(authoritativeMessages)
+  // Fallback notices are desktop-local (never persisted server-side), so any
+  // authoritative transcript reload would drop them without this restore.
+  const authoritative = storedSessionId
+    ? restoreFallbackNotices(storedSessionId, toChatMessages(authoritativeMessages))
+    : toChatMessages(authoritativeMessages)
   const withLiveProjection = liveProjection ? appendLiveSessionProjection(authoritative, liveProjection) : authoritative
   const reconciled = reconcileResumeMessages(withLiveProjection, previousMessages)
   const withPendingTurn = preserveLocalPendingTurnMessages(reconciled, previousMessages)
@@ -327,6 +334,7 @@ export function useSessionActions({
       // refreshCurrentModel). Only $currentServiceTier (a live-session mirror)
       // is cleared.
       setCurrentServiceTier('')
+      setCurrentFallbackPolicy('')
       setYoloActive(false)
       setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
 
@@ -734,7 +742,7 @@ export function useSessionActions({
 
               let activatedMessages =
                 activated.messages.length || activated.inflight || activated.queued
-                  ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated)
+                  ? reconcileAuthoritativeMessages(activated.messages, cachedViewState.messages, activated, storedSessionId)
                   : cachedViewState.messages
 
               const running = Boolean(activated.running ?? cachedViewState.busy)
@@ -759,7 +767,7 @@ export function useSessionActions({
                   persisted.session_id === activatedStoredSessionId
 
                 if (persisted && persistedMatchesActivatedSession) {
-                  activatedMessages = reconcileAuthoritativeMessages(persisted.messages, activatedMessages)
+                  activatedMessages = reconcileAuthoritativeMessages(persisted.messages, activatedMessages, undefined, activatedStoredSessionId || storedSessionId)
                 }
               }
 
@@ -901,7 +909,7 @@ export function useSessionActions({
             ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
             : $messages.get()
 
-          localSnapshot = reconcileAuthoritativeMessages(prefetchedResult.messages, previousMessages)
+          localSnapshot = reconcileAuthoritativeMessages(prefetchedResult.messages, previousMessages, undefined, prefetchedResult.session_id || storedSessionId)
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
         }
@@ -928,7 +936,7 @@ export function useSessionActions({
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
                   : currentMessages
 
-                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
+                const resumedMessages = reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed, storedSessionId)
 
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
               })()
@@ -1037,7 +1045,7 @@ export function useSessionActions({
           // only carrier of a crashed turn's progress on this path.
           const fallbackRecovery = recoverInFlightTurnJournal(
             storedSessionId,
-            reconcileAuthoritativeMessages(fallback.messages, previousMessages)
+            reconcileAuthoritativeMessages(fallback.messages, previousMessages, undefined, storedSessionId)
           )
 
           setMessages(fallbackRecovery.messages)

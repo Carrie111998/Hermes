@@ -4,6 +4,7 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import { $approvalModes, approvalModeForProfile } from '@/store/approval-mode'
 import { $desktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $currentFallbackPolicy, setCurrentFallbackPolicy } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
@@ -24,6 +25,17 @@ const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial
   ({ id, role, parts: [{ type: 'text', text }], ...extra }) as ChatMessage
 
 const session = (over: Partial<SessionInfo>): SessionInfo => over as SessionInfo
+
+describe('applyRuntimeInfo fallback policy', () => {
+  it('hydrates the effective fallback policy on cold resume', () => {
+    setCurrentFallbackPolicy('')
+
+    expect(applyRuntimeInfo({ fallback_policy: 'local-only' })).toMatchObject({ fallbackPolicy: 'local-only' })
+    expect($currentFallbackPolicy.get()).toBe('local-only')
+
+    setCurrentFallbackPolicy('')
+  })
+})
 
 describe('applyRuntimeInfo approval mode', () => {
   beforeEach(() => {

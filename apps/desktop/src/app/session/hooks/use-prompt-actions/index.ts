@@ -8,6 +8,7 @@ import { stripAnsi } from '@/lib/ansi'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
+import { countTranscriptMessages, pruneFallbackNoticesAfter } from '@/lib/fallback-notices'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
@@ -776,7 +777,8 @@ export function usePromptActions({
         return
       }
 
-      const plan = planReload($messages.get(), parentId)
+      const priorMessages = $messages.get()
+      const plan = planReload(priorMessages, parentId)
 
       if (!plan) {
         return
@@ -795,6 +797,15 @@ export function usePromptActions({
           },
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
+
+        const reloadStoredSessionId = selectedStoredSessionIdRef.current
+
+        if (reloadStoredSessionId) {
+          pruneFallbackNoticesAfter(
+            reloadStoredSessionId,
+            countTranscriptMessages(priorMessages.slice(0, plan.userIndex))
+          )
+        }
       } catch (err) {
         updateSessionState(sessionId, state => ({
           ...state,
@@ -804,7 +815,7 @@ export function usePromptActions({
         notifyError(err, copy.regenerateFailed)
       }
     },
-    [activeSessionIdRef, copy.regenerateFailed, requestGateway, updateSessionState]
+    [activeSessionIdRef, copy.regenerateFailed, requestGateway, selectedStoredSessionIdRef, updateSessionState]
   )
 
   // Cursor-style "restore checkpoint": rewind the conversation to a past user
@@ -850,6 +861,15 @@ export function usePromptActions({
 
       try {
         await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+
+        const restoreStoredSessionId = selectedStoredSessionIdRef.current
+
+        if (restoreStoredSessionId) {
+          pruneFallbackNoticesAfter(
+            restoreStoredSessionId,
+            countTranscriptMessages(messages.slice(0, plan.sourceIndex))
+          )
+        }
       } catch (err) {
         // The rewind never landed (e.g. the gateway stayed busy past the retry
         // deadline). Roll the optimistic truncation back to the full original
@@ -867,7 +887,7 @@ export function usePromptActions({
         throw err
       }
     },
-    [activeSessionIdRef, busyRef, submitRewindPrompt, updateSessionState]
+    [activeSessionIdRef, busyRef, selectedStoredSessionIdRef, submitRewindPrompt, updateSessionState]
   )
 
   const editMessage = useCallback(
@@ -901,6 +921,15 @@ export function usePromptActions({
 
       try {
         await submitRewindPrompt(sessionId, plan.text, plan.truncateOrdinal, busyRef.current || $busy.get())
+
+        const editStoredSessionId = selectedStoredSessionIdRef.current
+
+        if (!plan.isFailedTurn && editStoredSessionId) {
+          pruneFallbackNoticesAfter(
+            editStoredSessionId,
+            countTranscriptMessages(messages.slice(0, plan.sourceIndex))
+          )
+        }
       } catch (err) {
         let surfaced = err
 
@@ -925,7 +954,7 @@ export function usePromptActions({
         notifyError(surfaced, copy.editFailed)
       }
     },
-    [activeSessionIdRef, busyRef, copy.editFailed, submitRewindPrompt, updateSessionState]
+    [activeSessionIdRef, busyRef, copy.editFailed, selectedStoredSessionIdRef, submitRewindPrompt, updateSessionState]
   )
 
   const handleThreadMessagesChange = useCallback(

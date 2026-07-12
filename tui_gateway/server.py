@@ -5525,6 +5525,10 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    active_fallback_entry = (
+        getattr(agent, "_active_fallback_entry", None)
+        or getattr(agent, "_init_fallback_entry", None)
+    )
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -5558,6 +5562,10 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
+        "fallback_chain_from_config": getattr(
+            agent, "_fallback_chain_from_config", False
+        ),
+        "initial_fallback_entry": active_fallback_entry,
     }
 
 
@@ -5849,7 +5857,7 @@ def _resolve_runtime_with_fallback(
                 fb_api_key = resolve_entry_api_key(entry)
                 if fb_api_key:
                     fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
+                runtime = dict(resolve_runtime_provider(**fb_kwargs))
                 import logging
 
                 logging.getLogger(__name__).warning(
@@ -5858,10 +5866,44 @@ def _resolve_runtime_with_fallback(
                     fb_provider,
                     fb_model,
                 )
+                from hermes_cli.fallback_config import get_fallback_policy
+
+                policy = get_fallback_policy(_load_cfg())
+                primary_model = str(
+                    kwargs.get("target_model") or "configured model"
+                )
+                primary_provider = str(
+                    kwargs.get("requested") or "primary provider"
+                )
+                runtime["initial_fallback_decision"] = (
+                    f"🔄 Fallback policy {policy}: {primary_model} via "
+                    f"{primary_provider} could not initialize (reason: "
+                    f"{primary_exc}); switching to {fb_model} via "
+                    f"{fb_provider}."
+                )
+                runtime["initial_fallback_entry"] = dict(entry)
                 return _RuntimeFallbackResolution(runtime, fb_model, True)
             except Exception:
                 continue
-        raise
+        from hermes_cli.fallback_config import get_fallback_policy
+
+        policy = get_fallback_policy(_load_cfg())
+        if policy == "off":
+            detail = "Fallback policy off: no backup provider was attempted."
+        elif policy == "local-only":
+            detail = (
+                "Fallback policy local-only: no usable local backup route remained."
+            )
+        else:
+            detail = (
+                "Fallback policy any: no usable configured backup route remained."
+            )
+        raise AuthError(
+            f"{primary_exc}\n{detail}",
+            provider=getattr(primary_exc, "provider", ""),
+            code=getattr(primary_exc, "code", None),
+            relogin_required=getattr(primary_exc, "relogin_required", False),
+        ) from primary_exc
 
 
 def _make_agent(
@@ -6047,6 +6089,9 @@ def _make_agent(
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
+        fallback_chain_from_config=True,
+        initial_fallback_decision=runtime.get("initial_fallback_decision"),
+        initial_fallback_entry=runtime.get("initial_fallback_entry"),
         **_agent_cbs(sid),
     )
 
@@ -13392,7 +13437,12 @@ def _(rid, params: dict) -> dict:
             from run_agent import AIAgent
 
             result = AIAgent(
-                **_background_agent_kwargs(session["agent"], task_id)
+                **_background_agent_kwargs(session["agent"], task_id),
+                status_callback=lambda kind, text=None: _status_update(
+                    parent,
+                    str(kind),
+                    None if text is None else str(text),
+                ),
             ).run_conversation(
                 user_message=text,
                 task_id=task_id,

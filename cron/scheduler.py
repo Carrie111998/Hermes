@@ -3292,6 +3292,9 @@ def run_job(
             or configured_provider_for_drift
             or None
         )
+        _initial_fallback_decision = None
+        _initial_fallback_entry = None
+        _runtime_model = model
         try:
             # Do not inject HERMES_INFERENCE_PROVIDER here. resolve_runtime_provider()
             # already prefers persisted config over stale shell/env overrides when
@@ -3335,7 +3338,10 @@ def run_job(
                 if not fb_provider or not fb_model:
                     continue
                 try:
-                    from hermes_cli.fallback_config import resolve_entry_api_key
+                    from hermes_cli.fallback_config import (
+                        get_fallback_policy,
+                        resolve_entry_api_key,
+                    )
 
                     fb_kwargs = {
                         "requested": fb_provider,
@@ -3347,24 +3353,47 @@ def run_job(
                     if fb_api_key:
                         fb_kwargs["explicit_api_key"] = fb_api_key
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    model = fb_model
                     logger.info(
                         "Job '%s': fallback resolved to %s model %s",
                         job_id,
                         runtime.get("provider"),
                         fb_model,
                     )
+                    _policy = get_fallback_policy(_cfg)
+                    _initial_fallback_decision = (
+                        f"🔄 Fallback policy {_policy}: {model} via "
+                        f"{job.get('provider') or 'primary provider'} could not "
+                        f"initialize (reason: {auth_exc}); switching to "
+                        f"{fb_model} via {fb_provider}."
+                    )
+                    _initial_fallback_entry = dict(entry)
+                    _runtime_model = fb_model
                     break
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
             if runtime is None:
-                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+                from hermes_cli.fallback_config import get_fallback_policy
+
+                _policy = get_fallback_policy(_cfg)
+                if _policy == "off":
+                    _detail = "Fallback policy off: no backup provider was attempted."
+                elif _policy == "local-only":
+                    _detail = (
+                        "Fallback policy local-only: no usable local backup route remained."
+                    )
+                else:
+                    _detail = (
+                        "Fallback policy any: no usable configured backup route remained."
+                    )
+                raise RuntimeError(
+                    f"{format_runtime_provider_error(auth_exc)}\n{_detail}"
+                ) from auth_exc
         except Exception as exc:
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
         reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
+            _cfg if isinstance(_cfg, dict) else {}, str(_runtime_model)
         )
 
         # Provider/model-drift fail-closed guard (#44585).
@@ -3476,7 +3505,7 @@ def run_job(
             )
 
         agent = AIAgent(
-            model=model,
+            model=_runtime_model,
             api_key=runtime.get("api_key"),
             base_url=runtime.get("base_url"),
             provider=runtime.get("provider"),
@@ -3488,6 +3517,9 @@ def run_job(
             reasoning_config=reasoning_config,
             prefill_messages=prefill_messages,
             fallback_model=fallback_model,
+            fallback_chain_from_config=True,
+            initial_fallback_decision=_initial_fallback_decision,
+            initial_fallback_entry=_initial_fallback_entry,
             credential_pool=credential_pool,
             providers_allowed=pr.get("only"),
             providers_ignored=pr.get("ignore"),
