@@ -386,6 +386,19 @@ VALID_HOOKS: Set[str] = {
     #   alias_used: the exact token the user typed (str), args_raw: str,
     #   session_key: str | None (gateway), platform: str | None (gateway).
     "pre_command",
+    # Background-review host contract (P2.1). Plugins piggyback on the
+    # self-improvement review fork through these instead of monkey-patching.
+    #   background_review_started  — kwargs: context (ReviewExecutionContext),
+    #                               prompt, review_memory, review_skills;
+    #                               return {"prompt_suffix": str} (concatenated).
+    #   background_review_message  — kwargs: context, message (observer-only);
+    #                               per assistant message from the fork.
+    #   background_review_finished — kwargs: context, messages (list[dict]),
+    #                               status ("finished"|"failed"), error (str|None);
+    #                               fires once, including exception paths.
+    "background_review_started",
+    "background_review_message",
+    "background_review_finished",
 }
 
 # Hooks whose return value carries a directive that the shell-hook response
