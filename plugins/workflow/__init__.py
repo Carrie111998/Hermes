@@ -78,7 +78,7 @@ def get_config() -> Dict[str, Any]:
 
 
 def register(ctx):
-    """Register the workflow_analyst auxiliary with the Hermes plugin system."""
+    """Register workflow tools and the workflow_analyst auxiliary."""
     ctx.register_auxiliary_task(
         key="workflow_analyst",
         display_name="Workflow analyst",
@@ -88,3 +88,38 @@ def register(ctx):
             "extra_body": {},
         },
     )
+
+    # --- Agent-facing workflow tools -------------------------------------------
+    from plugins.workflow.tools import (
+        check_workflow_requirements,
+        handle_workflow_start,
+        handle_workflow_view,
+        handle_workflow_validate,
+        handle_workflow_status,
+        handle_workflow_list,
+        handle_workflow_show,
+        WORKFLOW_START_SCHEMA,
+        WORKFLOW_VIEW_SCHEMA,
+        WORKFLOW_VALIDATE_SCHEMA,
+        WORKFLOW_STATUS_SCHEMA,
+        WORKFLOW_LIST_SCHEMA,
+        WORKFLOW_SHOW_SCHEMA,
+    )
+
+    _TOOLS = [
+        (WORKFLOW_START_SCHEMA,    handle_workflow_start),
+        (WORKFLOW_VIEW_SCHEMA,     handle_workflow_view),
+        (WORKFLOW_VALIDATE_SCHEMA, handle_workflow_validate),
+        (WORKFLOW_STATUS_SCHEMA,   handle_workflow_status),
+        (WORKFLOW_LIST_SCHEMA,     handle_workflow_list),
+        (WORKFLOW_SHOW_SCHEMA,     handle_workflow_show),
+    ]
+
+    for schema, handler in _TOOLS:
+        ctx.register_tool(
+            name=schema["name"],
+            toolset="workflow",
+            schema=schema,
+            handler=handler,
+            check_fn=check_workflow_requirements,
+        )
