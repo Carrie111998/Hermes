@@ -56,14 +56,18 @@ def test_faster_whisper_is_not_a_base_dependency():
     assert any(dep.startswith("faster-whisper") for dep in voice_extra)
 
 
-# Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
-# 1.0.1. Anything below that lets a malformed Host header desync
-# ``request.url.path`` from the dispatched ASGI path, bypassing path-based
-# authz in middleware/endpoints that gate on ``request.url``. Starlette is a
-# transitive dep (fastapi in [web]; sse-starlette/mcp in [mcp]/[computer-use]/
-# [dev]) so we pin it directly in every extra that exposes a server surface and
-# enforce the floor in both pyproject and the committed lockfile.
-_STARLETTE_CVE_FLOOR = (1, 0, 1)
+# Minimum reviewed Starlette floor after the 2026 advisory set. 1.0.1 fixed
+# CVE-2026-48710 ("BadHost"); 1.3.1 also covers the later request-smuggling,
+# multipart, and denial-of-service advisories affecting the same server
+# surfaces. Starlette is transitive through FastAPI/MCP, so pin it directly in
+# every exposed server extra and enforce the floor in the committed lockfile.
+_STARLETTE_CVE_FLOOR = (1, 3, 1)
+_CORE_SECURITY_FLOORS = {
+    # Core requirements are exact-pinned by policy. These are the reviewed
+    # versions that close the current cryptography and multipart advisories.
+    "cryptography": (48, 0, 1),
+    "python-multipart": (0, 0, 32),
+}
 
 
 def _version_tuple(spec: str) -> tuple[int, ...]:
@@ -79,11 +83,11 @@ def _version_tuple(spec: str) -> tuple[int, ...]:
 
 
 def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
-    """Every extra that declares Starlette must pin a patched (>=1.0.1) version.
+    """Every extra that declares Starlette must exact-pin the reviewed floor.
 
     Regression guard for #35067 / CVE-2026-48710. A future edit that drops the
     pin (re-exposing the unbounded transitive ``starlette>=0.27`` from mcp /
-    ``>=0.40.0`` from fastapi) or pins a pre-1.0.1 version fails here instead of
+    ``>=0.40.0`` from fastapi) or pins an older version fails here instead of
     shipping a Host-header auth-bypass to dashboard / MCP-HTTP users.
     """
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -180,6 +184,46 @@ def _pins_from_specs(specs):
             continue
         pins.setdefault(_canonical(m.group(1)), set()).add(m.group(2))
     return pins
+
+
+def test_core_security_dependencies_keep_reviewed_exact_pins():
+    """Core crypto and multipart paths must retain reviewed exact pins.
+
+    Ranges are not sufficient for core dependencies: a fresh release could be
+    selected without review, while an old lower bound would let update paths
+    preserve a vulnerable install. This is a minimum-security invariant, not a
+    lockfile snapshot; later audited exact versions remain valid.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core_pins = _pins_from_specs(data["project"]["dependencies"])
+
+    for package, floor in _CORE_SECURITY_FLOORS.items():
+        versions = core_pins.get(package)
+        assert versions, f"core {package} must use an audited exact pin"
+        assert all(_version_tuple(version) >= floor for version in versions), (
+            f"core {package} exact pin(s) {sorted(versions)} are below the reviewed "
+            f"security floor {'.'.join(map(str, floor))}"
+        )
+
+
+def test_dashboard_security_lazy_dependencies_match_packaging_metadata():
+    """Dashboard lazy installs must enforce the reviewed server security pins.
+
+    Exercise the public lazy-dependency API rather than inspecting
+    ``tools/lazy_deps.py`` source. The dashboard path must match the packaged
+    web extra for Starlette, while multipart must agree across core, web, and
+    lazy installs.
+    """
+    from tools.lazy_deps import feature_specs
+
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = _pins_from_specs(data["project"]["dependencies"])
+    web = _pins_from_specs(data["project"]["optional-dependencies"]["web"])
+    dashboard = _pins_from_specs(feature_specs("tool.dashboard"))
+
+    assert dashboard.get("starlette") == web.get("starlette")
+    assert dashboard.get("python-multipart") == web.get("python-multipart")
+    assert dashboard.get("python-multipart") == core.get("python-multipart")
 
 
 def _pyproject_pinned_specs():
