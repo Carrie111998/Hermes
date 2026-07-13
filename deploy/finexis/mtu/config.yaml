@@ -1,0 +1,27 @@
+# hermes-mtu gateway config (Studio-local pilot) — deployed to $HERMES_HOME/config.yaml
+#
+# Model: piloting on gpt-5.4-mini (openai-direct-primary) — same engine christopher runs live.
+#   The MTU constitution's DESIGN intent is gemini-3.1-flash-lite, but (a) no gemini key is
+#   available on this Studio and (b) christopher deliberately moved OFF gemini to gpt-5.4-mini
+#   for structured-extraction/drafting accuracy. This is a FLAGGED model choice (see the ship
+#   report + MTU ops note), not a silent swap. Swap back to gemini by setting model.provider:
+#   gemini + default: gemini-3.1-flash-lite once a shared PA gemini key is on the host.
+model:
+  provider: openai-direct-primary
+  default: gpt-5.4-mini
+  base_url: https://api.openai.com/v1
+  api_key_source:
+    type: env
+    secrets_env_key: OPENAI_API_KEY
+agent:
+  profile: pa
+  max_turns: 12
+pa:
+  enabled: true
+  job_type: bor_generation                 # REQUIRED — MTU declares no selectors; without this the constitution is silently ignored
+  constitution_path: /Users/pcloffice/.hermes-mtu/mtu_constitution.yaml
+platforms:
+  telegram:
+    enabled: true
+    extra:
+      require_mention: false               # advisor DMs the bot directly; no @mention needed

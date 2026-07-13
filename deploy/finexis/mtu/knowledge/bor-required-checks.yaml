@@ -1,0 +1,132 @@
+# MTU P0 — BOR Required Checks ("the BOR table")
+#
+# The checklist the MTU agent runs before drafting a BOR. Grounded in Melody's
+# 18 real cases + the amelia-finexis bor-scraper encoded standard (see GROUNDING.md).
+# HELD for Amelia; Melody confirms/edits this table before the agent drafts live.
+#
+# applies_when values:
+#   always     - every BOR
+#   rop        - only when it is a replacement of policy (switch)
+#   ilp        - only when an investment-linked / investment product is involved
+#   accident   - only for personal-accident product recommendations
+#
+# collect: what the agent must obtain from the advisor before drafting
+# derive:  what the agent computes / states from collected inputs
+# never:   guardrail — the agent must not do this
+
+meta:
+  version: v0-draft
+  status: HELD_for_amelia_and_melody_review
+  grounded_in: "18 OneDrive YFB cases (10 text-readable) + bor-scraper analyzer/pdf-extractor"
+  note: >-
+    Melody set BOR generation as P0. This is the FIRST version of the table for her
+    to confirm; she may add must-check items before the agent drafts live BORs.
+
+# ── Intake: the three things the advisor states up front ──────────────────────
+intake:
+  - id: existing_plan
+    ask: "What plan(s) does the client currently have? (insurer, plan name, and category)"
+    collect: [insurer, plan_name, category, sum_assured_by_benefit, premium, coverage_till_age]
+    why: "The BOR must refer to the client's starting position clearly."
+    applies_when: always
+  - id: proposed_plan
+    ask: "What plan is being proposed? (insurer, plan name + riders, and category)"
+    collect: [insurer, plan_name, riders, category, sum_assured_by_benefit, premium_first_year, premium_subsequent, policy_term, min_investment_period]
+    why: "The recommended product with its specifics anchors the whole BOR."
+    applies_when: always
+  - id: is_replacement
+    ask: "Is this a replacement of policy (ROP)? If yes — what is being replaced, and with what?"
+    collect: [is_rop, replaced_products, replacing_products, replaced_type_investment_or_insurance]
+    why: "ROP cases need the extra replacement checks + more careful wording."
+    applies_when: always
+
+# ── Required checks (the compliant-BOR must-covers) ───────────────────────────
+checks:
+  - id: coverage_comparison
+    ask: "How does coverage change for Death, TI, TPD, and CI — amount AND duration, before vs after?"
+    derive: coverage_delta_statement   # "meets/does not meet client's needs for protection of family/assets, disability, CI"
+    why: "The BOR must show the actual change in protection, not just product names. Shortfalls are stated, not hidden."
+    grounded: "files 01, 17 — 'Total coverage of the plan meets/does not meet client's needs for…'"
+    applies_when: always
+  - id: premium_comparison
+    ask: "Is the new plan cheaper or more expensive than the old plan? If higher, why is the increase justified?"
+    derive: premium_movement_statement
+    why: "The recommendation must explain the trade-off clearly."
+    grounded: "files 01, 17 — 'premiums are lowered compared to previous planning' / justification when higher"
+    applies_when: always
+  - id: income_sustainability_threshold
+    ask: "Is the new premium / investment budget more than 50% of the client's income (net worth / surplus)?"
+    derive: sustainability_flag
+    why: >-
+      Key affordability check before finalising. The YFB carries a standing note:
+      'If the budget you set aside is more than 50% of your net worth / surplus,
+      you may wish to consider the sustainability of your premiums / investment amounts.'
+    grounded: "files 03, 13, 17 — the 50% sustainability note"
+    applies_when: always
+  - id: alternatives_considered
+    ask: "Were other products / methods considered? Which, and why were they not selected?"
+    collect: [alternatives_considered, reason_recommended_over_alternatives]
+    why: "The BOR must explain why the recommended product was chosen over alternatives."
+    grounded: "files 01, 17 — 'After discussing the pros and cons of [WL/term/ILP/endowment/…], the client preferred X because…'"
+    applies_when: always
+  - id: reason_for_change
+    ask: "Why is the client changing / why this recommendation? (in the client's own terms)"
+    collect: [client_stated_rationale]
+    why: "The draft must reflect the client's ACTUAL rationale — the agent must not invent one."
+    grounded: "every readable ROP case — 'the reason for the switch/replacement is highlighted below:'"
+    never: "invent a rationale the advisor did not state"
+    applies_when: always
+  - id: rop_disadvantages_acknowledged
+    ask: "Confirm the client was advised of the replacement disadvantages and wishes to proceed."
+    derive: rop_disadvantage_acknowledgement   # inserts the standard 4-point disadvantage disclosure (see standard-disclosures.md)
+    why: "ROP compliance — client must be shown the downside of switching before proceeding."
+    grounded: "files 01, 17 — the 4 general disadvantages + 'wish to proceed notwithstanding'"
+    applies_when: rop
+  - id: alternatives_to_replacement_explored
+    ask: "Were other options to a full replacement explored — increasing sum assured, adding riders, converting the existing policy?"
+    collect: [alternatives_to_replacement]
+    why: "ROP declaration requires confirming replacement was chosen only after these were considered and it is best-interest."
+    grounded: "file 01 — 'Other available options—such as increasing the sum assured, attaching riders, or converting the policy—have been explored.'"
+    applies_when: rop
+  - id: product_comparison_freshness
+    ask: "Are the comparison products still available in market and is the comparison list current?"
+    derive: freshness_flag
+    why: "Comparisons must not be against outdated products. Melody flags a ~monthly refresh of the comparison list."
+    grounded: "spec + Melody note"
+    applies_when: always
+  - id: reference_numbers
+    ask: "Does this BOR need an application / reference number (e.g. ECIM)? If so, where does the advisor get it?"
+    collect: [reference_numbers]
+    why: "Some BOR flows require reference numbers."
+    never: "invent a reference number — ask the advisor, or leave a clearly-marked placeholder"
+    applies_when: always
+  # ── ILP-specific checks (only when an investment-linked product is involved) ──
+  - id: ilp_cka_risk_profile
+    ask: "For the ILP: what was the CKA result (passed / not passed) and the client's risk profile?"
+    collect: [cka_result, risk_profile]
+    why: "ILP recommendations must reference CKA + risk profile for fund suitability."
+    grounded: "file 01 — 'Client did not pass CKA and has a risk profile of aggressive.'"
+    applies_when: ilp
+  - id: ilp_fund_justification
+    ask: "Which fund(s), and why does the fund's objective align with the client's goals?"
+    collect: [fund_name, fund_objective_alignment]
+    why: "Fund choice must be justified against the client's investment horizon and goals."
+    grounded: "file 01 — fund recommended as objective aligns with long-term horizon"
+    applies_when: ilp
+  - id: ilp_risk_disclosures
+    ask: "Confirm the ILP risk disclosures apply (non-guaranteed returns, market volatility, surrender charges timeline, premium holiday, welcome/start-up bonus)."
+    derive: ilp_disclosure_block   # see standard-disclosures.md
+    why: "ILP-specific caveats are mandatory in the BOR narrative."
+    grounded: "files 01, 03, 13, 18"
+    applies_when: ilp
+
+# ── Output contract ───────────────────────────────────────────────────────────
+output:
+  produce:
+    - "a WhatsApp-ready BOR draft (the recommendation-rationale narrative), per recommended product / need-bucket"
+    - "a short note listing: which details were used, which fields were still missing, and anything to check with Melody"
+  never:
+    - "make product recommendations by itself"
+    - "invent missing facts (SA, premium, reference numbers, client rationale)"
+    - "treat an incomplete case as ready — ask for the missing checklist items first"
+    - "give compliance sign-off — the draft is for ADVISOR review; unclear/sensitive cases escalate to Melody"
