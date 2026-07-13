@@ -96,6 +96,12 @@
     "scoring": ["tone_variety", "reasoning_quality"]
   },
   {
+    "id": "session_context_concision",
+    "source_threads": ["1526268062624649289", "1526269441334182071"],
+    "principle": "Treat prior turns as shared conversation context and presume earlier information is known. Focus each answer on the delta in the customer's latest turn instead of recapping prior facts, steps, directions, or contacts merely because the topic continues. When the customer corrects SkyAI or expresses dissatisfaction, acknowledge and repair the new issue without summarizing the old answer. Repeat only the necessary part when the customer explicitly asks again or when correcting prior information.",
+    "scoring": ["conversation_continuity", "conciseness", "natural_tone", "requested_recall"]
+  },
+  {
     "id": "no_keyword_backend_patches",
     "source_threads": ["architecture"],
     "principle": "Do not fix these issues with keyword guards or one-off backend branches. Use prompt principles, facts, and evaluation scoring.",

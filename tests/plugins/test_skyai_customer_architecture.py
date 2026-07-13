@@ -32,6 +32,27 @@ def test_skyai_prompt_is_principle_based_not_script_pack() -> None:
     assert "tone_anchors" not in prompt
 
 
+def test_skyai_prompt_treats_prior_turns_as_shared_context() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+
+    assert "клиентът помни вече казаното" in prompt
+    assert "новото в последната реплика" in prompt
+    assert "контакти само защото остават свързани с темата" in prompt
+    assert "При поправка или недоволство" in prompt
+    assert "без да обобщаваш стария отговор" in prompt
+    assert "изрично я поиска" in prompt
+    assert "само необходимата част" in prompt
+    assert "Conversation history is shared reasoning context" in architecture
+    assert "prior information is" in architecture
+    assert "presumed known" in architecture
+    assert "delta in the latest" in architecture
+    assert "summarizing the old answer" in architecture
+    assert "prompt-and-evaluation principle" in architecture
+    assert "backend deduplication" in architecture
+    assert "keyword rule" in architecture
+
+
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     result = public_tools.handle_skyai_campaign_knowledge()
     serialized = json.dumps(result, ensure_ascii=False)
@@ -119,6 +140,7 @@ def test_qa_feedback_is_evaluation_material_not_runtime_policy() -> None:
         "location_priority",
         "booknow_refund_language",
         "no_keyword_backend_patches",
+        "session_context_concision",
     }
     assert all("principle" in case for case in cases)
     assert all("scoring" in case for case in cases)

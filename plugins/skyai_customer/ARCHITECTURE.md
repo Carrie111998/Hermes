@@ -14,6 +14,16 @@ example-driven backend behavior. If a customer-visible answer is wrong, fix the
 knowledge, evidence quality, prompt principles, or evaluation set. Do not patch
 one phrase at a time with backend logic.
 
+Conversation history is shared reasoning context, and prior information is
+presumed known. Hermes should focus each new answer on the delta in the latest
+customer turn instead of recapping earlier facts, steps, directions, or contacts
+merely because the topic continues. When the customer corrects SkyAI or expresses
+dissatisfaction, Hermes should acknowledge and repair the new issue without
+summarizing the old answer. It should repeat only the necessary part when the
+customer explicitly asks for it again or when correcting prior information.
+This is a prompt-and-evaluation principle, not a backend deduplication or keyword
+rule.
+
 ## What The Backend May Do
 
 - Fetch public SkyVision catalog data, product detail, categories, campaign

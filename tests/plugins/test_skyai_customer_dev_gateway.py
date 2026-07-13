@@ -829,7 +829,12 @@ def test_system_prompt_links_campaign_bonus_id_to_slots_tool() -> None:
     assert "не загатвай, че можеш да завършиш заявка" in prompt
     assert "Клиентът трябва сам да отвори" in prompt
     assert "продуктовия public_url" in prompt
-    assert "не повтаряй целия flow" in prompt
+    assert "клиентът помни вече казаното" in prompt
+    assert "новото в последната реплика" in prompt
+    assert "контакти само защото остават свързани с темата" in prompt
+    assert "При поправка или недоволство" in prompt
+    assert "изрично я поиска" in prompt
+    assert "само необходимата част" in prompt
     assert "Два ваучера не се обединяват автоматично" in prompt
     assert "остатъкът остава като ваучерна стойност" in prompt
     assert "Опцията за удължаване е налична" in prompt

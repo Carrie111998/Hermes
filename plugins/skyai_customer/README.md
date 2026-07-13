@@ -47,6 +47,10 @@ Current line:
 - `v2.4` - campaign bonus transfer nuance: the bonus stays linked to the buyer
   by default, while founder-approved human exceptions may use Emil's public
   phone and SkyVision's founding flight story.
+- `v2.5` - session continuity: Hermes treats prior turns as shared context,
+  advances with the newly relevant information, and repeats earlier details
+  only when the customer explicitly asks or prior information must be
+  corrected. No backend deduplication or keyword guard is added.
 
 ## Voice Contract
 
