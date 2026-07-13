@@ -91,6 +91,25 @@ def read_cron(*, jobs_path: Optional[Path] = None) -> list[dict]:
     return out
 
 
+def _read_pipeline_summary() -> dict:
+    """Pipeline stage/state counts from the jobflow control plane (:4100).
+
+    Uses the API's fast SQL summary instead of parsing the ~38MB canonical
+    pipeline.json per poll (live artifacts hit this endpoint every ~15s).
+    Must dial 127.0.0.1 — Windows resolves localhost to ::1 first, where
+    nothing answers for :4100. Soft-fails to a note so the submissions view
+    still renders when the control plane is down.
+    """
+    import urllib.request
+
+    url = "http://127.0.0.1:4100/api/v1/jobs/summary"
+    try:
+        with urllib.request.urlopen(url, timeout=2.5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — any failure means "plane down"
+        return {"unavailable": f"{exc.__class__.__name__}: {exc}"}
+
+
 def read_jobflow(*, submissions_dir: Optional[Path] = None) -> dict:
     d = submissions_dir or (_root() / "profiles" / "applier" / "workspace" / "submissions")
     subs: list[dict] = []
@@ -109,7 +128,11 @@ def read_jobflow(*, submissions_dir: Optional[Path] = None) -> dict:
             subs.append(entry)
             st = str(s.get("status") or "unknown")
             counts[st] = counts.get(st, 0) + 1
-    return {"submissions": subs, "counts_by_status": counts}
+    return {
+        "pipeline": _read_pipeline_summary(),
+        "submissions": subs,
+        "counts_by_status": counts,
+    }
 
 
 def read_financier(*, workspace_dir: Optional[Path] = None) -> dict:
