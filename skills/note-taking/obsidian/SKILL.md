@@ -1,19 +1,25 @@
 ---
 name: obsidian
 description: Read, search, create, and edit notes in the Obsidian vault.
-version: 1.0.0
+version: 1.1.0
 author: Teknium (teknium1), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [Obsidian, Notes, Markdown, Vault]
-    related_skills: []
+    related_skills: [obsidian-markdown, obsidian-cli, obsidian-bases, json-canvas]
 ---
 
 # Obsidian Vault
 
 Use this skill for filesystem-first Obsidian vault work: reading notes, listing notes, searching note files, creating notes, appending content, and adding wikilinks.
+
+When the task is format-specific or app-specific, route to the specialized skills instead:
+- `.md` note authoring with wikilinks, properties/frontmatter, callouts, embeds, or Obsidian-specific Markdown semantics -> `obsidian-markdown`
+- running Obsidian app workflows, Obsidian CLI usage, plugin development, or theme development -> `obsidian-cli`
+- editing `.base` files or working with Bases filters, views, and formulas -> `obsidian-bases`
+- editing `.canvas` files or visual canvases -> `json-canvas`
 
 ## Vault path
 
