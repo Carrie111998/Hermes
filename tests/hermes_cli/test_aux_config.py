@@ -43,6 +43,10 @@ def test_title_generation_present_in_default_config():
     assert tg["extra_body"] == {}
 
 
+def test_curator_reasoning_effort_is_a_schema_default():
+    curator = DEFAULT_CONFIG["auxiliary"]["curator"]
+
+    assert curator["reasoning_effort"] == ""
 
 
 
