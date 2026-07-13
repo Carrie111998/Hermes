@@ -374,3 +374,47 @@ class TestRealDbStartupThenNextMessage:
         new_entry = store.get_or_create_session(source)
         assert new_entry.session_id != old_id
 
+
+class TestRecoveredEntryPreservesOriginalTimestamp:
+    def test_recovered_entry_updated_at_is_original_not_now(self, tmp_path):
+        """#62012 follow-up (lucianosillem): a genuinely-recovered live session
+        must keep its original `updated_at`, not be stamped `now`. Otherwise
+        `_should_reset()` sees a "fresh today" session and silently skips the
+        daily/idle reset policy, defeating the reset entirely.
+        """
+        from hermes_state import SessionDB
+        from datetime import datetime as _dt
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="5140768830", chat_type="dm",
+            user_id="5140768830", user_name="João",
+        )
+        config = GatewayConfig(default_reset_policy=SessionResetPolicy(mode="daily"))
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._db = db
+        store._loaded = True
+
+        key = store._generate_session_key(source)
+        past = _dt.now().timestamp() - 86400  # last active yesterday
+        row = {
+            "id": "sid_old",
+            "session_key": key,
+            "started_at": past,
+            "ended_at": past,       # logically ended yesterday, but a live
+            "end_reason": None,     # (recoverable) row — the recovery scenario
+            "source": source.platform.value,
+            "user_id": source.user_id,
+            "chat_id": source.chat_id,
+            "chat_type": source.chat_type,
+        }
+        recovered = store._create_entry_from_recovered_row(
+            row=row, session_key=key, source=source, now=_dt.now(),
+        )
+        # updated_at reflects the ORIGINAL timestamp (yesterday), NOT now —
+        # so _should_reset() correctly detects the daily-reset boundary.
+        assert recovered.updated_at is not None
+        assert abs(recovered.updated_at.timestamp() - past) < 2
+        assert recovered.updated_at.timestamp() < _dt.now().timestamp() - 3600
+
