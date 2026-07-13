@@ -1039,8 +1039,63 @@ def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
         yield
 
 
+def _pid_alive(pid: int) -> bool:
+    """Best-effort liveness probe. Prefers /proc (Linux, authoritative and not
+    affected by os.kill sandboxing under test); falls back to os.kill(pid, 0).
+    On any ambiguity returns True (assume alive) so a live store is never pruned."""
+    proc_root = Path("/proc")
+    if proc_root.exists():  # Linux — the containers we run in
+        return (proc_root / str(pid)).exists()
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, another user's process
+    except OSError:
+        return False
+    except Exception:
+        return True  # unknown mechanism — safest is "alive"
+
+
+def _prune_auth_tmp_orphans(auth_file: Path) -> None:
+    """Best-effort cleanup of `<name>.tmp.<pid>.<uuid>` files stranded when a
+    write was hard-killed between tmp-create and atomic_replace. Only removes
+    orphans whose embedded PID is dead (or that are older than a day when the
+    PID can't be parsed). Never touches the live store. Silent on any error —
+    cleanup must never break auth loading. (Fixes the tmp-storm: 91 orphans
+    accumulated on a box that exit-137'd repeatedly.)"""
+    try:
+        parent = auth_file.parent
+        prefix = auth_file.name + ".tmp."
+        now = time.time()
+        for tmp in parent.glob(auth_file.name + ".tmp.*"):
+            name = tmp.name
+            if not name.startswith(prefix):
+                continue
+            parts = name[len(prefix):].split(".", 1)
+            pid_str = parts[0] if parts else ""
+            if pid_str.isdigit():
+                dead = not _pid_alive(int(pid_str))
+            else:
+                # unparseable pid — fall back to age (24h)
+                try:
+                    dead = (now - tmp.stat().st_mtime) > 86400
+                except OSError:
+                    dead = False
+            if dead:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
+    _prune_auth_tmp_orphans(auth_file)
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
