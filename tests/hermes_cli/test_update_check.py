@@ -64,6 +64,52 @@ def test_check_for_updates_invalidates_on_git_identity_change(tmp_path, monkeypa
     assert written["upstream"] == "post-merge-origin"
 
 
+def test_check_for_updates_caches_post_fetch_identity(tmp_path, monkeypatch):
+    """Store the ref identity produced by the refresh, not the pre-fetch ref."""
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    (repo_dir / ".git").mkdir(parents=True)
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir()
+    fake_banner.touch()
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 0,
+                "rev": None,
+                "ver": banner.VERSION,
+                "head": "old-head",
+                "upstream": "old-origin",
+            }
+        )
+    )
+
+    identity = {"origin": "pre-fetch-origin"}
+    monkeypatch.setattr(
+        banner,
+        "_local_git_cache_identity",
+        lambda _repo: ("same-head", identity["origin"]),
+    )
+
+    def refreshed_check(_repo):
+        identity["origin"] = "post-fetch-origin"
+        return 1
+
+    monkeypatch.setattr(banner, "_check_via_local_git", refreshed_check)
+
+    assert banner.check_for_updates() == 1
+    written = json.loads(cache_file.read_text())
+    assert written["head"] == "same-head"
+    assert written["upstream"] == "post-fetch-origin"
+
+
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     """When cache identity is unchanged, return it without a git fetch."""
     import hermes_cli.banner as banner

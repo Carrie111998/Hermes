@@ -331,11 +331,13 @@ def check_for_updates() -> Optional[int]:
         # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
         # Path(__file__) always resolves to the actual installed checkout.
         repo_dir = repo_dir or _resolve_repo_dir()
-        cache_head, cache_upstream = _local_git_cache_identity(repo_dir)
         if repo_dir is None:
             behind = check_via_pypi()
         else:
             behind = _check_via_local_git(repo_dir)
+            # _check_via_local_git fetches origin; cache the refreshed refs rather
+            # than the pre-fetch identity so the next invocation can use its TTL.
+            cache_head, cache_upstream = _local_git_cache_identity(repo_dir)
 
     try:
         cache_file.write_text(
