@@ -1,0 +1,13 @@
+# Secret-scanning pre-commit for the agent-src repo.
+# Mirrors the ~/.hermes gitleaks wiring (SR-001) and the jobflow-dashboard repo:
+# same pinned rev and the same shared laptop ruleset, so allowlists stay in one
+# place. Install the hook with `pre-commit install` after cloning (the generated
+# .git/hooks/pre-commit is not tracked; this file is). gitleaks 8.30 uses `git`,
+# not the deprecated `protect`.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        args:
+          - --config=C:/Users/diego/.config/gitleaks/gitleaks.toml
