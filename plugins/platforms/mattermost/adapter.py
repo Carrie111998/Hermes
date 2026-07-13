@@ -357,6 +357,70 @@ class MattermostAdapter(BasePlatformAdapter):
             return data["root_id"]
         return post_id
 
+    def _has_active_dm_thread_session(
+        self, channel_id: str, thread_id: str, user_id: str
+    ) -> bool:
+        """Return whether this exact Mattermost DM thread already has history."""
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None:
+            return False
+        try:
+            source = self.build_source(
+                chat_id=channel_id,
+                chat_type="dm",
+                user_id=user_id,
+                thread_id=thread_id,
+            )
+            session_key = session_store._generate_session_key(source)
+            lookup = getattr(session_store, "peek_session_id", None)
+            if callable(lookup):
+                return bool(lookup(session_key))
+            # Backward compatibility for injected older/test SessionStore
+            # implementations that predate the public lock-held accessor.
+            session_store._ensure_loaded()
+            return session_key in session_store._entries
+        except Exception:
+            return False
+
+    async def _fetch_dm_thread_context(
+        self, channel_id: str, thread_id: str, current_post_id: str
+    ) -> str:
+        """Fetch prior posts from one DM thread for its first Hermes turn."""
+        try:
+            data = await self._api_get(f"posts/{thread_id}/thread")
+            posts = data.get("posts") if isinstance(data, dict) else None
+            order = data.get("order") if isinstance(data, dict) else None
+            if not isinstance(posts, dict) or not isinstance(order, list):
+                return ""
+
+            context_parts: List[str] = []
+            for post_id in order[-30:]:
+                if str(post_id) == current_post_id:
+                    continue
+                post = posts.get(post_id)
+                if not isinstance(post, dict) or post.get("type"):
+                    continue
+                text = str(post.get("message") or "").strip()
+                if not text:
+                    continue
+                author = str(post.get("user_id") or "unknown")
+                if author == self._bot_user_id:
+                    author = self._bot_username or "assistant"
+                prefix = "[thread parent] " if str(post_id) == thread_id else ""
+                context_parts.append(f"{prefix}{author}: {text}")
+
+            if not context_parts:
+                return ""
+            return (
+                "[Mattermost DM thread context — prior messages in this exact "
+                "thread, not yet in conversation history:]\n"
+                + "\n".join(context_parts)
+                + "\n[End of Mattermost DM thread context]\n\n"
+            )
+        except Exception as exc:
+            logger.warning("Mattermost: failed to fetch DM thread context: %s", exc)
+            return ""
+
     async def send(
         self,
         chat_id: str,
@@ -892,6 +956,25 @@ class MattermostAdapter(BasePlatformAdapter):
             and post_id
         ):
             thread_id = post_id
+
+        # A reply turns a flat Mattermost DM into a distinct Hermes thread
+        # session. Hydrate only that exact server-side thread on its first turn;
+        # later turns (including after restart) load the persisted transcript.
+        # Channels keep their existing isolated behavior because multi-user
+        # authorization/trust semantics differ from a two-party DM.
+        if (
+            channel_type_raw == "D"
+            and thread_id
+            and post_id
+            and not self._has_active_dm_thread_session(
+                channel_id, thread_id, sender_id
+            )
+        ):
+            thread_context = await self._fetch_dm_thread_context(
+                channel_id, thread_id, post_id
+            )
+            if thread_context:
+                message_text = thread_context + message_text
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
