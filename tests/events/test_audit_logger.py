@@ -82,36 +82,52 @@ class TestAuditLogger:
         assert not audit_path.exists()
 
 
-class TestRotation:
-    """Tests for weekly rotation and 90-day archive cleanup."""
+def _write_oversized(path: Path) -> None:
+    """Create a file just over SIZE_CAP_BYTES without building a 256 MiB
+    string in memory: seek past the cap and write one byte (the filesystem
+    extends with zeros). st_size is all the size-cap arm looks at."""
+    from events.subscribers.audit_logger import SIZE_CAP_BYTES
 
-    def test_rotation_moves_old_file_to_archive(self, bus, audit_path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        f.seek(SIZE_CAP_BYTES + 1024)
+        f.write(b"\n")
+
+
+class TestRotation:
+    """Tests for the emergency size-cap backstop and 90-day archive cleanup.
+
+    Live-file rotation is OWNED by the external audit-rotate cron
+    (~/.hermes/scripts/audit_rotate.py, daily tail-preserving trim into
+    per-day archives); in-gateway only the 256 MiB size cap remains, as a
+    backstop. The weekly age arm was removed 2026-07-13 — dead code from
+    birth (handle() refreshed st_mtime microseconds before every check).
+    """
+
+    def test_age_does_not_trigger_rotation(self, bus, audit_path):
+        """A stale-mtime file under the size cap must NOT rotate: in-gateway
+        rotation bare-renames the file, emptying the live tail that
+        curator/critic_retro/scribe consumers read (they need 7-14 days)."""
         import os
         import time as _time
 
         logger_inst = AuditLogger(bus, audit_path=audit_path)
         _seed_audit_logger_cursor(bus)
 
-        # Write some events first
         bus.emit(EventType.CRON_COMPLETED, "scout", {"jobs": 3})
         logger_inst.poll()
         assert audit_path.exists()
 
-        # Fake the file age by setting mtime to 8 days ago
-        old_mtime = _time.time() - (8 * 86400)
+        # 30 days old — far beyond the removed ROTATION_INTERVAL (7 days).
+        old_mtime = _time.time() - (30 * 86400)
         os.utime(str(audit_path), (old_mtime, old_mtime))
 
-        # Trigger rotation
         logger_inst._rotate_if_needed()
 
-        # audit.jsonl should be gone (renamed to archive)
-        assert not audit_path.exists()
-
-        # Archive dir should contain the rotated file
+        assert audit_path.exists(), "age alone must not rotate the live file"
         archive_dir = audit_path.parent / "audit"
-        assert archive_dir.exists()
-        archives = list(archive_dir.glob("audit-*.jsonl"))
-        assert len(archives) == 1
+        archives = list(archive_dir.glob("audit-*.jsonl")) if archive_dir.exists() else []
+        assert archives == []
 
     def test_cleanup_removes_old_archives(self, bus, audit_path):
         import os
@@ -140,19 +156,11 @@ class TestRotation:
         assert recent_file.exists()
 
     def test_new_events_written_after_rotation(self, bus, audit_path):
-        import os
-        import time as _time
-
         logger_inst = AuditLogger(bus, audit_path=audit_path)
         _seed_audit_logger_cursor(bus)
 
-        # Write initial event
-        bus.emit(EventType.CRON_COMPLETED, "scout", {"jobs": 1})
-        logger_inst.poll()
-
-        # Force rotation by aging the file
-        old_mtime = _time.time() - (8 * 86400)
-        os.utime(str(audit_path), (old_mtime, old_mtime))
+        # Force the size-cap backstop — the only in-gateway rotation trigger.
+        _write_oversized(audit_path)
         logger_inst._rotate_if_needed()
 
         assert not audit_path.exists()
@@ -168,15 +176,17 @@ class TestRotation:
         entry = json.loads(lines[0])
         assert entry["event_type"] == "job_high_score"
 
-    def test_size_cap_triggers_rotation_before_age(self, bus, audit_path):
-        """If audit.jsonl exceeds SIZE_CAP_BYTES, rotate even if age < 7 days."""
+    def test_size_cap_triggers_rotation(self, bus, audit_path):
+        """The emergency backstop: audit.jsonl over SIZE_CAP_BYTES rotates
+        wholesale into audit/. Only reachable if the audit-rotate cron has
+        been broken for weeks, but it must still work when that day comes."""
         from events.subscribers.audit_logger import SIZE_CAP_BYTES
 
         sub = AuditLogger(bus, audit_path=audit_path)
         _seed_audit_logger_cursor(bus)
 
-        # Write enough bytes to exceed the cap.
-        audit_path.write_text("x" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
+        # Build a file exceeding the cap.
+        _write_oversized(audit_path)
 
         # Force a rotation check. Use -inf so the gate (`now - last > 3600`)
         # always fires regardless of how recently `time.monotonic()`'s clock
@@ -185,8 +195,8 @@ class TestRotation:
         bus.emit(EventType.CRON_COMPLETED, "test", {})
         sub.poll()
 
-        # The rotated file should be in audit/ subdir; the live audit.jsonl is now
-        # the small one written by the most recent handle() call.
+        # handle() appends the event line first, then the size check fires:
+        # the oversized file (plus that line) lands in the audit/ subdir.
         archive_dir = audit_path.parent / "audit"
         assert archive_dir.exists(), "audit/ archive dir should be created"
         rotated = list(archive_dir.glob("audit-*.jsonl"))
@@ -194,10 +204,10 @@ class TestRotation:
         assert rotated[0].stat().st_size > SIZE_CAP_BYTES, "rotated file should be the oversized one"
 
         # M4: same-day second oversized rotation must land as audit-{date}-1.jsonl
-        # rather than overwriting the first archive file. Verifies the existing
-        # collision-counter logic in _rotate_if_needed still works under the
-        # new size-cap-triggered rotation cadence.
-        audit_path.write_text("y" * (SIZE_CAP_BYTES + 1024), encoding="utf-8")
+        # rather than overwriting the first archive file. Verifies the
+        # collision-counter logic in _rotate_if_needed still works when the
+        # size-cap backstop fires twice in one day.
+        _write_oversized(audit_path)
         sub._last_rotation_check = float("-inf")
         bus.emit(EventType.CRON_COMPLETED, "test", {})
         sub.poll()
