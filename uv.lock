@@ -1567,6 +1567,7 @@ all = [
     { name = "simple-term-menu" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
     { name = "youtube-transcript-api" },
 ]
 anthropic = [
@@ -1645,6 +1646,7 @@ matrix = [
 mcp = [
     { name = "mcp" },
     { name = "starlette" },
+    { name = "watchfiles" },
 ]
 mem0 = [
     { name = "mem0ai" },
@@ -1692,6 +1694,7 @@ termux = [
     { name = "python-telegram-bot", extra = ["webhooks"] },
     { name = "simple-term-menu" },
     { name = "starlette" },
+    { name = "watchfiles" },
 ]
 termux-all = [
     { name = "agent-client-protocol" },
@@ -1707,6 +1710,7 @@ termux-all = [
     { name = "simple-term-menu" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
 ]
 tts-premium = [
     { name = "elevenlabs" },
@@ -1854,6 +1858,7 @@ requires-dist = [
     { name = "urllib3", specifier = ">=2.7.0,<3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0,<1" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = "==0.41.0" },
+    { name = "watchfiles", marker = "extra == 'mcp'", specifier = "==1.1.1" },
     { name = "websockets", specifier = "==15.0.1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
