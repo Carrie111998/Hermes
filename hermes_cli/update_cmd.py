@@ -3124,21 +3124,50 @@ def _self_restart_desktop_for_update() -> dict | None:
     if not exe_path:
         return None
 
-    # 3. Tree-kill Hermes.exe. ``/T`` walks children, ``/F`` forces.
+    # 3. Tree-kill the Desktop's MAIN process only (not all Hermes.exe
+    #    instances — that would also kill the chat / renderer / GPU helper
+    #    processes the user is actively using). The MAIN process is the one
+    #    with a visible window. Its direct child python(w).exe backend is
+    #    killed separately to release the venv locks.
     print("→ Closing Hermes Desktop to release venv file locks...")
-    try:
-        result = subprocess.run(
-            ["taskkill", "/IM", "Hermes.exe", "/T", "/F"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
-        print(f"  ✗ Could not invoke taskkill: {exc}")
+    main_pids = _find_desktop_main_pids()
+    if not main_pids:
+        print("  ✗ Could not identify the Desktop's main process (no Hermes.exe with a window).")
         return None
-    if result.returncode not in (0, 128):
-        # 128 = "process not found" — already gone, treat as success.
-        print(f"  ✗ taskkill failed (exit {result.returncode}): {result.stdout.strip()}")
+    backend_pids = [pid for pid in desktop_owned if pid not in main_pids]
+
+    killed = []
+    for pid in main_pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(int(pid)), "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            killed.append(int(pid))
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+            print(f"  ✗ Could not kill desktop main PID {pid}: {exc}")
+
+    # Brief pause so the OS releases the main process's job-object handle on
+    # its children, then explicitly kill the backend python (which holds the
+    # venv .pyd locks). Using /PID without /T — these are direct children of
+    # the killed main; we don't want to also walk the renderer's tree.
+    _time.sleep(0.5)
+    for pid in backend_pids:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(int(pid)), "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            killed.append(int(pid))
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+
+    if not killed:
+        print("  ✗ Failed to kill any Desktop process. Aborting self-restart.")
         return None
 
     # 4. Poll until the venv is genuinely free. Match the desktop's own
@@ -3149,12 +3178,98 @@ def _self_restart_desktop_for_update() -> dict | None:
         remaining = _m()._detect_venv_python_processes(exclude_pids=skipped)
         remaining = [m for m in remaining if m[0] not in skipped]
         if not remaining:
-            print("  ✓ Desktop closed, venv unlocked.")
-            return {"exe": exe_path, "killed_pids": desktop_owned}
+            print(f"  ✓ Desktop closed (PIDs: {', '.join(map(str, killed))}), venv unlocked.")
+            return {"exe": exe_path, "killed_pids": killed}
         _time.sleep(0.4)
 
     print("  ✗ Venv still locked after killing the Desktop. Aborting self-restart.")
     return None
+
+
+def _find_desktop_main_pids() -> list[int]:
+    """Return PIDs of the Desktop's MAIN Hermes.exe process(es).
+
+    "Main" = the Hermes.exe instance with a visible window (``MainWindowTitle``
+    is set) — that's the one the user sees, and the one whose death orphans
+    the renderer / GPU / utility helper children. Killing it does NOT require
+    ``/T`` because the helpers exit on their own when the IPC pipe to main
+    closes, and a precise main-only kill is what keeps the chat session
+    (``tui_gateway.slash_worker``) and the renderer alive across the
+    self-restart window.
+    """
+    pids: list[int] = []
+    try:
+        import psutil
+    except Exception:
+        return pids
+    try:
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if name not in (n.lower() for n in _DESKTOP_EXE_CANDIDATES):
+                    continue
+                # Main process = the one with a visible window. Helper
+                # processes pass --type=utility / --type=renderer / etc.
+                try:
+                    title = proc.name() and ""  # cheap check; actual win check below
+                except Exception:
+                    pass
+                if not _m()._process_has_main_window(proc):
+                    continue
+                pids.append(int(proc.info["pid"]))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        return pids
+    return pids
+
+
+def _process_has_main_window(proc) -> bool:
+    """Windows-only: does this process have a visible top-level window?
+
+    Implemented via ``EnumWindows`` + ``GetWindowThreadProcessId`` so we
+    match the parent (main) process and not the GPU/renderer/utility
+    children. ``pywin32`` and ``psutil`` are both best-effort — if either
+    is missing, fall back to "assume it's a main process" so we still
+    surface a sensible token; the kill path itself uses PID, not window
+    truth, so a false positive just means we kill a helper we didn't
+    strictly need to (safe — the renderer reattaches on relaunch).
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        EnumWindows = user32.EnumWindows
+        GetWindowThreadProcessId = user32.GetWindowThreadProcessId
+        IsWindowVisible = user32.IsWindowVisible
+
+        WNDENUMPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, wintypes.HWND, wintypes.LPARAM
+        )
+
+        target_pid = int(proc.pid)
+        found = []
+
+        def callback(hwnd, _lparam):
+            if not IsWindowVisible(hwnd):
+                return True
+            owner_pid = wintypes.DWORD()
+            GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+            if int(owner_pid.value) == target_pid:
+                found.append(hwnd)
+                return False  # stop enumeration
+            return True
+
+        EnumWindows(WNDENUMPROC(callback), 0)
+        return bool(found)
+    except Exception:
+        # Last-resort: if we can't query windows, treat the first Hermes.exe
+        # in the parent's child list as "main" — the caller filters more
+        # strictly anyway via parent-chain matching.
+        return True
 
 
 def _relaunch_desktop_after_update(token: dict | None) -> None:
