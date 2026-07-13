@@ -50,12 +50,17 @@ def check_workflow_requirements() -> bool:
         logger.debug("workflow_engine import failed: %s", exc)
         return False
 
-    # workflows_dir lives under the repo; resolve via the engine class so
-    # the gate reflects whatever directory the engine itself would use.
+    # Check HERMES_FLEET_PIPELINES env var first (canonical fleet path),
+    # then fall back to the repo-relative path.
     try:
         from pathlib import Path
-        engine_mod = __import__("plugins.workflow.engine", fromlist=["WorkflowEngine"])
-        workflows_dir = Path(engine_mod.__file__).resolve().parent.parent / "docs" / "fleet-pipelines"
+        import os
+        env_path = os.environ.get("HERMES_FLEET_PIPELINES")
+        if env_path:
+            workflows_dir = Path(env_path)
+        else:
+            engine_mod = __import__("plugins.workflow.engine", fromlist=["WorkflowEngine"])
+            workflows_dir = Path(engine_mod.__file__).resolve().parent.parent / "docs" / "fleet-pipelines"
         if not workflows_dir.is_dir():
             return False
     except Exception:
@@ -95,6 +100,7 @@ def handle_workflow_start(
     scope: str = "project",
     single_flight: bool = False,
     delivery_target: str = "",
+    inputs: Optional[Dict[str, Any]] = None,
     **kwargs: Any,
 ) -> str:
     """Start a pipeline in the given mode.
@@ -135,6 +141,7 @@ def handle_workflow_start(
         dry_run=dry_run,
         resume=resume,
         single_flight=single_flight,
+        inputs=inputs,
     )
 
 
@@ -145,6 +152,7 @@ def _handle_workflow_start_predefined(
     dry_run: bool = False,
     resume: bool = False,
     single_flight: bool = False,
+    inputs: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Predefined mode: look up YAML in docs/fleet-pipelines/, validate,
     dispatch via engine."""
@@ -178,6 +186,7 @@ def _handle_workflow_start_predefined(
             start_node=node,
             dry_run=dry_run,
             resume=resume,
+            inputs=inputs,
         )
     except FileNotFoundError as exc:
         return _err(f"workflow not found: {workflow}", hint=str(exc))
@@ -536,6 +545,15 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                     "Optional delivery target (e.g. 'discord:CHANNEL_ID'). "
                     "When set, the workflow summary is posted on completion. "
                     "Dynamic mode only."
+                ),
+            },
+            "inputs": {
+                "type": "object",
+                "description": (
+                    "Optional key=value input pairs (e.g. {'question': 'Should we ship X?'}). "
+                    "Available as {inputs.<key>} in YAML templates. Also promoted to top-level "
+                    "context for backward compatibility with bare {key} references. "
+                    "Use this instead of context for workflow-specific parameters."
                 ),
             },
         },
