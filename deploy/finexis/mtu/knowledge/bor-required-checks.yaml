@@ -76,11 +76,8 @@ checks:
       no: "The client's total annual premiums do not exceed 50% of annual income."
       yes: "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment."
     exact_mapping_rule: "Copy the sentence matching the supplied boolean exactly. YES maps only to the `yes` sentence; NO maps only to the `no` sentence. Never invert, recalculate, infer, or soften the answer."
-    why: >-
-      Key affordability check before finalising. The YFB carries a standing note:
-      'If the budget you set aside is more than 50% of your net worth / surplus,
-      you may wish to consider the sustainability of your premiums / investment amounts.'
-    grounded: "files 03, 13, 17 — the 50% sustainability note"
+    why: "Key affordability check before finalising; the advisor supplies the threshold result without exposing the client's financial figures."
+    grounded: "Amelia correction 2026-07-14; 50% sustainability language appears in files 03, 13, 17"
     applies_when: always
   - id: alternatives_considered
     resolution: template_default
