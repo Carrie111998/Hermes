@@ -445,7 +445,17 @@ async def api_proposals_bulk_snooze_all():
 
 @app.post("/api/v1/pipeline/jobs/{job_id}/stage")
 async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONResponse:
-    """Update a job's stage via PipelineManager.
+    """Update a job's stage — intent-lane first, direct PipelineManager fallback.
+
+    2026-07-12: this endpoint previously called PipelineManager.update_stage
+    directly, which reached ONLY the legacy workspaces projection — never
+    Postgres, never the tracker's canonical store. It now records an intent
+    via the JobOps API (same lane as the :3002 dashboard and the
+    Telegram/WhatsApp reply-handlers); the tracker-intent-applier subscriber
+    applies it within ~1-3s to the legacy projection + Postgres and mirrors a
+    PIPELINE_UPDATE into the tracker mailbox for the canonical store. If the
+    JobOps API is unreachable (or rejects the stage), we fall back to the old
+    direct write so the endpoint never loses availability.
 
     Request body (JSON):
         {
@@ -456,14 +466,16 @@ async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONRespo
             "metadata": {...}                     # optional, merged non-destructively
         }
 
-    Returns: {"ok": True, "job_id": "...", "stage": "..."} on success.
+    Returns: {"ok": True, "job_id": "...", "stage": "...", "queued": bool} —
+    queued=True means the intent lane accepted it (applied asynchronously);
+    queued=False means the direct-write fallback ran synchronously.
 
     Errors:
         400 if stage missing
         404 if job_id not in pipeline.json (no upsert from this endpoint —
             unknown jobs are surfaced as errors so callers don't accidentally
             create stray records via typos)
-        500 on PipelineManager exception
+        500 on PipelineManager exception (fallback path)
     """
     from pipeline_state import PipelineManager
 
@@ -489,6 +501,30 @@ async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONRespo
         )
 
     try:
+        from intent_applier import JobOpsClient
+
+        client = JobOpsClient(
+            base_url=os.environ.get("HERMES_JOBOPS_URL", "http://127.0.0.1:4100"),
+        )
+        client.post_intent(
+            job_id=job_id,
+            stage=stage,
+            actor_id=actor,
+            source=source,
+            notes=notes,
+            metadata=metadata or {},
+        )
+        return JSONResponse(
+            {"ok": True, "job_id": job_id, "stage": stage, "queued": True}
+        )
+    except Exception as exc:
+        logger.warning(
+            "api_v1_pipeline_jobs_stage: intent route failed for %s (%s: %s); "
+            "falling back to direct PipelineManager write",
+            job_id, exc.__class__.__name__, exc,
+        )
+
+    try:
         mgr.update_stage(
             job_id=job_id,
             new_stage=stage,
@@ -504,7 +540,7 @@ async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONRespo
             status_code=500,
         )
 
-    return JSONResponse({"ok": True, "job_id": job_id, "stage": stage})
+    return JSONResponse({"ok": True, "job_id": job_id, "stage": stage, "queued": False})
 
 
 # ---------------------------------------------------------------------------
