@@ -323,3 +323,76 @@ class TestCanonicalEmission:
         a.inbox_dir = blocker / "sub"  # parent is a file -> any write fails
 
         a._emit_canonical_pipeline_update(msg)  # must not raise
+
+
+class TestPartialDoesNotBurnIdempotencyKey:
+    """The idempotency key is a promise that the *Postgres* mirror committed.
+
+    A step-4 transient failure (read-timeout, 5xx, socket error) or an open
+    circuit breaker means ``post_legacy_stage`` did NOT commit — the intent
+    goes to ``partial/`` for later reconciliation. Burning the key there
+    permanently diverges the ledger from Postgres: a future legitimate
+    ``(job, stage)`` transition would be silently ``skipped_idempotent`` and
+    never land (observed 2026-07-13, job 4de4f9fb :withdrawn). The key must be
+    committed ONLY on a confirmed 2xx from ``post_legacy_stage``.
+    """
+
+    KEY = VALID_INTENT_PAYLOAD["idempotency_key"]
+
+    def test_transient_partial_does_not_burn_key(self, mailbox, applier):
+        a, jobops, _mgr = applier
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError(
+            "JobOps API timed out after 10.0s"
+        )
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "partial"
+        assert (mailbox["partial"] / "intent.json").exists()
+        # Server never committed -> key must remain unburned.
+        assert not a.idempotency.is_applied(self.KEY)
+
+    def test_partial_is_redrivable_after_transient_clears(self, mailbox, applier):
+        """The core regression: after :4100 recovers, re-issuing the same
+        intent must actually APPLY (land Postgres) — not skip_idempotent."""
+        a, jobops, _mgr = applier
+        # First attempt hits a read-timeout -> partial, key not burned.
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("read timeout")
+        f1 = write_intent(mailbox["inbox"], "intent1.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f1) == "partial"
+        assert not a.idempotency.is_applied(self.KEY)
+
+        # :4100 recovers; a re-driven intent for the same key must land.
+        jobops.post_legacy_stage.side_effect = None
+        jobops.post_legacy_stage.return_value = {"success": True}
+        f2 = write_intent(mailbox["inbox"], "intent2.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f2) == "applied"
+        assert a.idempotency.is_applied(self.KEY)
+        assert (mailbox["processed"] / "intent2.json").exists()
+
+    def test_circuit_breaker_open_partial_does_not_burn_key(self, mailbox, applier):
+        a, jobops, _mgr = applier
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("503")
+        # Trip the breaker (failure_threshold=5); none of these may burn a key.
+        for i in range(5):
+            f = write_intent(
+                mailbox["inbox"], f"int-{i}.json",
+                {**VALID_INTENT_PAYLOAD, "message_id": f"m-{i}", "idempotency_key": f"key-{i}"},
+            )
+            assert a.apply_one(f) == "partial"
+            assert not a.idempotency.is_applied(f"key-{i}")
+        # 6th: breaker is open -> JobOps never attempted, so definitely uncommitted.
+        jobops.post_legacy_stage.reset_mock()
+        f = write_intent(
+            mailbox["inbox"], "after.json",
+            {**VALID_INTENT_PAYLOAD, "message_id": "m-x", "idempotency_key": "key-x"},
+        )
+        assert a.apply_one(f) == "partial"
+        jobops.post_legacy_stage.assert_not_called()
+        assert not a.idempotency.is_applied("key-x")
+
+    def test_successful_apply_burns_key(self, mailbox, applier):
+        """Guard against over-correction: a confirmed 2xx MUST burn the key."""
+        a, jobops, _mgr = applier
+        jobops.post_legacy_stage.return_value = {"success": True}
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+        assert a.idempotency.is_applied(self.KEY)

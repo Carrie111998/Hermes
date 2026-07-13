@@ -8,7 +8,8 @@ For each intent file in the inbox:
       inbox, so the tracker agent applies it to ITS canonical projection
       (profiles/tracker/workspace/pipeline.json) on the next cron cycle
   4. JobOps API write via JobOpsClient (Postgres mirror)
-     - Transient failure: leave pipeline.json done, move file to partial/
+     - Transient failure (read-timeout / 5xx / socket) or breaker-open:
+       leave pipeline.json done, move file to partial/, key NOT burned
      - Permanent failure: dead-letter
   5. Mark idempotent + move file to processed/
   6. Optionally call resume_full if metadata.thread_id is present
@@ -16,6 +17,13 @@ For each intent file in the inbox:
 Pipeline.json is canonical: if step 3 succeeds, the operation is logically
 successful. Step 4 failures are recorded in a partial queue for later
 reconciliation but do not block subsequent intents.
+
+The idempotency key represents "the Postgres mirror committed" and is burned
+ONLY on a confirmed 2xx from ``post_legacy_stage`` (step 5). A transient /
+breaker-open failure moves the intent to partial/ WITHOUT burning the key, so
+it stays re-drivable — burning it there diverges the ledger from Postgres and
+makes a later legitimate (job, stage) transition silently skipped_idempotent
+(latent bug observed 2026-07-13, job 4de4f9fb :withdrawn).
 """
 from __future__ import annotations
 
@@ -169,17 +177,32 @@ class IntentApplier:
             )
         except CircuitBreakerOpen:
             logger.warning(
-                "intent-applier: JobOps circuit-breaker open; pipeline.json updated but Postgres skipped for %s",
+                "intent-applier: JobOps circuit-breaker open; pipeline.json updated but "
+                "Postgres skipped for %s — idempotency key NOT burned so the intent stays "
+                "re-drivable from partial/",
                 msg.job_id,
             )
+            # Do NOT mark_applied: the Postgres mirror never committed (JobOps
+            # wasn't even attempted). Burning the key here would permanently
+            # diverge the ledger from Postgres and cause a future legitimate
+            # (job, stage) transition to be silently skipped_idempotent
+            # (observed 2026-07-13, job 4de4f9fb :withdrawn). The key is
+            # committed only on a confirmed 2xx at step 6.
             self._move_to(intent_path, self.partial_dir)
-            self.idempotency.mark_applied(msg.idempotency_key, message_id=msg.message_id)
             return "partial"
         except JobOpsClientTransientError as exc:
             logger.warning("intent-applier: JobOps transient error for %s: %s", msg.job_id, exc)
             self.circuit_breaker.record_failure()
+            # Do NOT mark_applied: a transient failure (read-timeout / 5xx /
+            # socket error) means post_legacy_stage did NOT commit to Postgres.
+            # Leave the key unburned so this intent remains re-drivable from
+            # partial/. The step-3b PIPELINE_UPDATE mirror is intentionally left
+            # in place (not gated on Postgres success): it carries the same
+            # canonical decision as the step-3 legacy projection write, dedupes
+            # downstream by idempotency_key, and gating only the mirror would
+            # desync the legacy vs tracker-canonical projections. See the
+            # _emit_canonical_pipeline_update docstring.
             self._move_to(intent_path, self.partial_dir)
-            self.idempotency.mark_applied(msg.idempotency_key, message_id=msg.message_id)
             return "partial"
         except JobOpsClientPermanentError as exc:
             logger.error("intent-applier: JobOps permanent error for %s: %s", msg.job_id, exc)
