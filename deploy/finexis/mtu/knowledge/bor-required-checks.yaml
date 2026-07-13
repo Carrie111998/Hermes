@@ -68,10 +68,14 @@ checks:
     grounded: "files 01, 17 — 'premiums are lowered compared to previous planning' / justification when higher"
     applies_when: always
   - id: income_sustainability_threshold
-    resolution: derive
-    inputs: [proposed_plan.premium_first_year, proposed_plan.premium_subsequent, income_or_surplus]
-    derive: sustainability_flag
-    missing_input_rule: "Ask for income or surplus only when the draft needs a sustainability conclusion; otherwise flag the conclusion as unavailable without blocking the rest of the draft."
+    resolution: collect
+    ask_if_missing: "Do the client's total annual premiums exceed 50% of annual income? Answer yes or no."
+    collect: [total_annual_premiums_above_50_percent_of_annual_income]
+    never_collect: [income, annual_income, monthly_income, surplus, net_worth]
+    output:
+      no: "The client's total annual premiums do not exceed 50% of annual income."
+      yes: "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment."
+    exact_mapping_rule: "Copy the sentence matching the supplied boolean exactly. YES maps only to the `yes` sentence; NO maps only to the `no` sentence. Never invert, recalculate, infer, or soften the answer."
     why: >-
       Key affordability check before finalising. The YFB carries a standing note:
       'If the budget you set aside is more than 50% of your net worth / surplus,
@@ -164,6 +168,8 @@ output:
   interaction:
     - "If irreducible COLLECT facts are missing, ask once in one compact message instead of drafting; do not recap facts already supplied, output a partial BOR, or append an unresolved list."
     - "Do not ask for derived conclusions, standard alternatives, product-comparison freshness, or reference numbers by default."
+    - "For affordability, ask only the 50%-of-income yes/no question. Never request or print the client's income or surplus figures."
+    - "Preserve the affordability boolean exactly: YES = exceeds threshold and caution; NO = does not exceed threshold."
     - "Use plain text only: no Markdown asterisks, decorative headings, tables, or repeated offers to reformat."
   never:
     - "make product recommendations by itself"

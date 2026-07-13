@@ -5,7 +5,7 @@ This is the concise narrative structure used per recommended product / need-buck
 ## Interaction before drafting
 
 - Use every fact already supplied. Do not repeat it back as an intake recap.
-- Derive coverage movement, premium movement, and the 50% sustainability result from the figures provided.
+- Derive coverage and premium movement from the plan figures provided. For sustainability, use only the advisor's yes/no answer to whether total annual premiums exceed 50% of annual income; never request or print income or surplus figures.
 - Insert the category-specific alternatives sentence below. Do not ask which alternatives were considered unless the path is novel, the advisor names an exception, or the standard wording conflicts with the case.
 - Do not ask about comparison-list freshness or reference numbers by default. Reference numbers are outside the BOR narrative unless the advisor explicitly requests one or names a workflow that requires one.
 - If irreducible facts are missing, ask for all of them once in one compact message instead of drafting. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement; and ILP-only suitability facts when an ILP is involved. Do not output a partial BOR, placeholders, or an unresolved list in that turn.
@@ -49,9 +49,9 @@ Do not claim the plan matches affordability unless the supplied figures support 
 
 5. Derived comparison
 
-> {{COVERAGE_DELTA_STATEMENT}} {{PREMIUM_MOVEMENT_STATEMENT}} {{SUSTAINABILITY_STATEMENT_IF_DERIVABLE}}
+> {{COVERAGE_DELTA_STATEMENT}} {{PREMIUM_MOVEMENT_STATEMENT}} {{SUSTAINABILITY_STATEMENT_FROM_50_PERCENT_BOOLEAN}}
 
-State the before/after amounts and durations directly. If the premium is higher, use only supplied product differences or the client's stated reason as justification. If income/surplus was not supplied, omit the sustainability conclusion or mark it unavailable; do not guess.
+State the before/after amounts and durations directly. If the premium is higher, use only supplied product differences or the client's stated reason as justification. Copy the exact sentence for the supplied boolean: NO → "The client's total annual premiums do not exceed 50% of annual income." YES → "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment." Never invert, recalculate, infer, or soften this mapping. Never request or expose the client's income or surplus.
 
 6. Conditional blocks
 

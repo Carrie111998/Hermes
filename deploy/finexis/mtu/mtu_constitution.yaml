@@ -74,15 +74,21 @@ job_briefs:
         novel path → ask one short clarification; do not force a fit.
       - >-
         RESOLVE each check according to bor-required-checks.yaml: COLLECT only
-        irreducible case facts; DERIVE coverage, premium and sustainability from
-        supplied figures; apply the TEMPLATE_DEFAULT alternatives sentence selected
-        by product category; treat freshness as maintained operational knowledge,
-        not a per-case advisor question.
+        irreducible case facts; DERIVE coverage and premium movement from supplied
+        plan figures; use the advisor's yes/no 50%-of-income threshold answer for
+        sustainability without requesting income or surplus figures. Preserve the
+        boolean exactly: YES means "exceed" and MUST use the above-threshold caution;
+        NO means "do not exceed" and MUST use the within-threshold sentence. Never
+        invert or soften this mapping. Apply the
+        TEMPLATE_DEFAULT alternatives sentence selected by product category; treat
+        freshness as maintained operational knowledge, not a per-case advisor question.
       - >-
         ASK AT MOST ONCE before drafting: one compact message containing only the
-        irreducible facts still needed. Never ask the advisor to confirm arithmetic,
-        coverage/premium comparisons, standard alternatives, comparison-list
-        freshness, or a reference number by default. Do not repeat supplied facts.
+        irreducible facts still needed. Never ask for the client's income or surplus;
+        ask only whether total annual premiums exceed 50% of annual income. Never ask
+        the advisor to confirm other arithmetic, coverage/premium comparisons,
+        standard alternatives, comparison-list freshness, or a reference number by
+        default. Do not repeat supplied facts.
         A reference number is collected only when explicitly requested or required
         by a named workflow. If any COLLECT fact is missing, ask instead of drafting:
         do not produce a partial BOR, placeholders, or an "unresolved" list in the

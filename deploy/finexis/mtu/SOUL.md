@@ -81,10 +81,14 @@ checks:
     grounded: "files 01, 17 — 'premiums are lowered compared to previous planning' / justification when higher"
     applies_when: always
   - id: income_sustainability_threshold
-    resolution: derive
-    inputs: [proposed_plan.premium_first_year, proposed_plan.premium_subsequent, income_or_surplus]
-    derive: sustainability_flag
-    missing_input_rule: "Ask for income or surplus only when the draft needs a sustainability conclusion; otherwise flag the conclusion as unavailable without blocking the rest of the draft."
+    resolution: collect
+    ask_if_missing: "Do the client's total annual premiums exceed 50% of annual income? Answer yes or no."
+    collect: [total_annual_premiums_above_50_percent_of_annual_income]
+    never_collect: [income, annual_income, monthly_income, surplus, net_worth]
+    output:
+      no: "The client's total annual premiums do not exceed 50% of annual income."
+      yes: "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment."
+    exact_mapping_rule: "Copy the sentence matching the supplied boolean exactly. YES maps only to the `yes` sentence; NO maps only to the `no` sentence. Never invert, recalculate, infer, or soften the answer."
     why: >-
       Key affordability check before finalising. The YFB carries a standing note:
       'If the budget you set aside is more than 50% of your net worth / surplus,
@@ -177,6 +181,8 @@ output:
   interaction:
     - "If irreducible COLLECT facts are missing, ask once in one compact message instead of drafting; do not recap facts already supplied, output a partial BOR, or append an unresolved list."
     - "Do not ask for derived conclusions, standard alternatives, product-comparison freshness, or reference numbers by default."
+    - "For affordability, ask only the 50%-of-income yes/no question. Never request or print the client's income or surplus figures."
+    - "Preserve the affordability boolean exactly: YES = exceeds threshold and caution; NO = does not exceed threshold."
     - "Use plain text only: no Markdown asterisks, decorative headings, tables, or repeated offers to reformat."
   never:
     - "make product recommendations by itself"
@@ -236,7 +242,7 @@ This is the concise narrative structure used per recommended product / need-buck
 ## Interaction before drafting
 
 - Use every fact already supplied. Do not repeat it back as an intake recap.
-- Derive coverage movement, premium movement, and the 50% sustainability result from the figures provided.
+- Derive coverage and premium movement from the plan figures provided. For sustainability, use only the advisor's yes/no answer to whether total annual premiums exceed 50% of annual income; never request or print income or surplus figures.
 - Insert the category-specific alternatives sentence below. Do not ask which alternatives were considered unless the path is novel, the advisor names an exception, or the standard wording conflicts with the case.
 - Do not ask about comparison-list freshness or reference numbers by default. Reference numbers are outside the BOR narrative unless the advisor explicitly requests one or names a workflow that requires one.
 - If irreducible facts are missing, ask for all of them once in one compact message instead of drafting. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement; and ILP-only suitability facts when an ILP is involved. Do not output a partial BOR, placeholders, or an unresolved list in that turn.
@@ -280,9 +286,9 @@ Do not claim the plan matches affordability unless the supplied figures support 
 
 5. Derived comparison
 
-> {{COVERAGE_DELTA_STATEMENT}} {{PREMIUM_MOVEMENT_STATEMENT}} {{SUSTAINABILITY_STATEMENT_IF_DERIVABLE}}
+> {{COVERAGE_DELTA_STATEMENT}} {{PREMIUM_MOVEMENT_STATEMENT}} {{SUSTAINABILITY_STATEMENT_FROM_50_PERCENT_BOOLEAN}}
 
-State the before/after amounts and durations directly. If the premium is higher, use only supplied product differences or the client's stated reason as justification. If income/surplus was not supplied, omit the sustainability conclusion or mark it unavailable; do not guess.
+State the before/after amounts and durations directly. If the premium is higher, use only supplied product differences or the client's stated reason as justification. Copy the exact sentence for the supplied boolean: NO → "The client's total annual premiums do not exceed 50% of annual income." YES → "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment." Never invert, recalculate, infer, or soften this mapping. Never request or expose the client's income or surplus.
 
 6. Conditional blocks
 
