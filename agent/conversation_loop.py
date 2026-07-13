@@ -604,6 +604,8 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    agent._turn_api_time = 0.0
+    agent._turn_tool_time = 0.0
     final_response = None
     interrupted = False
     failed = False
@@ -1091,6 +1093,8 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        api_timer_start = time.perf_counter()
+        _api_time_accounted = 0.0
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -1332,25 +1336,37 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
-                )
-                
-                api_duration = time.time() - api_start_time
-                
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                finally:
+                    # Failed calls and retry/backoff time are still API time.
+                    # Otherwise a 300s provider timeout appears as "other" in
+                    # the footer, which is precisely the lie this metric exists
+                    # to avoid. api_start_time spans the entire retry loop, so
+                    # add only the new delta after each attempt rather than
+                    # repeatedly adding the cumulative duration.
+                    api_duration = time.perf_counter() - api_timer_start
+                    agent._turn_api_time += max(
+                        0.0,
+                        api_duration - _api_time_accounted,
+                    )
+                    _api_time_accounted = api_duration
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
@@ -2303,7 +2319,7 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
-                api_elapsed = time.time() - api_start_time
+                api_elapsed = time.perf_counter() - api_timer_start
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
                 interrupted = True
                 # Preserve any assistant text already streamed to the user
@@ -2971,7 +2987,7 @@ def run_conversation(
                     )
 
                 retry_count += 1
-                elapsed_time = time.time() - api_start_time
+                elapsed_time = time.perf_counter() - api_timer_start
                 agent._touch_activity(
                     f"API error recovery (attempt {retry_count}/{max_retries})"
                 )
@@ -4712,7 +4728,18 @@ def run_conversation(
                     except Exception:
                         pass
 
-                agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                _tool_phase_started = time.perf_counter()
+                try:
+                    agent._execute_tool_calls(
+                        assistant_message,
+                        messages,
+                        effective_task_id,
+                        api_call_count,
+                    )
+                finally:
+                    # Count failed tool phases too; their wall time does not
+                    # become generic overhead merely because execution raised.
+                    agent._turn_tool_time += time.perf_counter() - _tool_phase_started
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
@@ -5348,6 +5375,8 @@ def run_conversation(
         _should_review_memory=_should_review_memory,
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
+        turn_api_time=agent._turn_api_time,
+        turn_tool_time=agent._turn_tool_time,
     )
 
 
