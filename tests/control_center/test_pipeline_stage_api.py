@@ -69,10 +69,30 @@ def test_stage_falls_back_to_direct_write_when_intent_lane_fails(
     fake_manager.update_stage.assert_called_once()
 
 
-def test_stage_unknown_job_404(client, fake_manager):
+def test_stage_unknown_job_404_when_intent_lane_also_rejects(
+    client, fake_manager, monkeypatch
+):
     fake_manager.get_job.return_value = None
+    jobops = MagicMock()
+    jobops.post_intent.side_effect = RuntimeError("400 unknown job")
+    monkeypatch.setattr(intent_applier, "JobOpsClient", MagicMock(return_value=jobops))
+
     r = client.post("/api/v1/pipeline/jobs/nope/stage", json={"stage": "approved"})
     assert r.status_code == 404
+    fake_manager.update_stage.assert_not_called()
+
+
+def test_stage_unknown_locally_but_intent_lane_accepts(client, fake_manager, monkeypatch):
+    """Jobs discovered after the legacy projection's last refresh exist only
+    in the control plane — JobOps arbitrates, not the stale local file."""
+    fake_manager.get_job.return_value = None
+    jobops = MagicMock()
+    monkeypatch.setattr(intent_applier, "JobOpsClient", MagicMock(return_value=jobops))
+
+    r = client.post("/api/v1/pipeline/jobs/fresh-job/stage", json={"stage": "approved"})
+    assert r.status_code == 200
+    assert r.json()["queued"] is True
+    jobops.post_intent.assert_called_once()
 
 
 def test_stage_missing_stage_400(client, fake_manager):

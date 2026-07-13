@@ -472,9 +472,10 @@ async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONRespo
 
     Errors:
         400 if stage missing
-        404 if job_id not in pipeline.json (no upsert from this endpoint —
-            unknown jobs are surfaced as errors so callers don't accidentally
-            create stray records via typos)
+        404 if job_id is unknown to BOTH the intent lane and the local
+            projection — the legacy projection used to be the sole guard, but
+            it lags canonical (jobs discovered recently may exist only in the
+            control plane), so JobOps now arbitrates unknown ids first
         500 on PipelineManager exception (fallback path)
     """
     from pipeline_state import PipelineManager
@@ -494,11 +495,7 @@ async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONRespo
     metadata = payload.get("metadata") or None
 
     mgr = PipelineManager()
-    if mgr.get_job(job_id) is None:
-        return JSONResponse(
-            {"ok": False, "error": f"job {job_id} not found in pipeline"},
-            status_code=404,
-        )
+    known_locally = mgr.get_job(job_id) is not None
 
     try:
         from intent_applier import JobOpsClient
@@ -518,6 +515,13 @@ async def api_v1_pipeline_jobs_stage(job_id: str, request: Request) -> JSONRespo
             {"ok": True, "job_id": job_id, "stage": stage, "queued": True}
         )
     except Exception as exc:
+        if not known_locally:
+            # The intent lane rejected it and the local projection has never
+            # seen it — nothing safe to fall back to (no upsert from typos).
+            return JSONResponse(
+                {"ok": False, "error": f"job {job_id} not found in pipeline"},
+                status_code=404,
+            )
         logger.warning(
             "api_v1_pipeline_jobs_stage: intent route failed for %s (%s: %s); "
             "falling back to direct PipelineManager write",
