@@ -1,13 +1,17 @@
 # hermes-mtu gateway config (Studio-local pilot) — deployed to $HERMES_HOME/config.yaml
 #
-# Model: piloting on gpt-5.4-mini (openai-direct-primary) — same engine christopher runs live.
-#   The MTU constitution's DESIGN intent is gemini-3.1-flash-lite, but (a) no gemini key is
-#   available on this Studio and (b) christopher deliberately moved OFF gemini to gpt-5.4-mini
-#   for structured-extraction/drafting accuracy. This is a FLAGGED model choice (see the ship
-#   report + MTU ops note), not a silent swap. Swap back to gemini by setting model.provider:
-#   gemini + default: gemini-3.1-flash-lite once a shared PA gemini key is on the host.
+# Model: piloting on gpt-5.4-mini via provider `custom` (OpenAI-direct) — the proven-working
+#   pattern for OpenAI-direct on this hermes runtime (matches ~/.hermes-tss-support). NOTE:
+#   `openai-direct-primary` is a NAMED runtime-provider that only resolves in a HERMES_HOME
+#   carrying a `runtime_providers` registry block (christopher's does); a fresh HERMES_HOME
+#   does NOT, so it fails "Unknown provider". `provider: custom` + base_url + api_key_source
+#   is the portable equivalent and is what actually runs here.
+#   The MTU constitution's DESIGN intent is gemini-3.1-flash-lite; christopher deliberately
+#   moved OFF gemini to gpt-5.4-mini for structured-extraction/drafting accuracy. FLAGGED
+#   model choice (see ship report + ops note), not a silent swap. A GEMINI_API_KEY IS present
+#   on this host — swap back by setting provider: gemini + default: gemini-3.1-flash-lite.
 model:
-  provider: openai-direct-primary
+  provider: custom
   default: gpt-5.4-mini
   base_url: https://api.openai.com/v1
   api_key_source:

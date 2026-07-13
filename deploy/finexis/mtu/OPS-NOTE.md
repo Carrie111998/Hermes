@@ -2,25 +2,29 @@
 
 **Owner:** edna · **Sponsor:** amelia · **WB:** ad8e3abd · **Built:** 2026-07-13
 
-## Deploy specifics
+## Deploy specifics (RESOLVED — live pilot 2026-07-13)
 | Item | Value |
 |---|---|
-| **Host** | Studio-local pilot (`HERMES_HOME=~/.hermes-mtu`), runs on the `~/pcl-dev/hermes-pcl` main checkout venv. Reversible; Carbon target is client-VPS (Amelia's call — flagged). |
-| **Runtime** | hermes `gateway run` (interactive two-way). Isolated state at `~/.hermes-mtu/{state.db,sessions/}`. |
-| **Channel** | Telegram (native hermes platform). Thin/swappable — constitution+knowledge are channel-agnostic; WA can be added later by enabling the WA platform, no rebuild. |
-| **Model** | `gpt-5.4-mini` via `openai-direct-primary` (OPENAI_API_KEY). **FLAGGED swap** from the constitution's design intent `gemini-3.1-flash-lite`: (a) no gemini key on this Studio, (b) christopher runs gpt-5.4-mini after dropping gemini for extraction accuracy. Not silent — revert by setting `model.provider: gemini` once a shared PA gemini key is on the host. |
-| **Bot token** | `~/.hermes-mtu/.env` → `TELEGRAM_BOT_TOKEN` (chmod 600, NOT committed). **Currently unresolved — see What remains.** |
-| **Advisor allowlist** | `~/.hermes-mtu/.env` → `TELEGRAM_ALLOWED_USERS`. Pilot self-test uses the controlled tester account `276672685`. Melody's / Amelia's Telegram user IDs must be added before they can message it (DMs bypass `allowed_chats`; the user allowlist is the gate). |
-| **engagement_id** | TBD — set at DEBUT (constitution `client.engagement_id`). Ties to the `amelia-finexis` Finexis engagement (deal `179de144`). |
+| **Host** | Studio-local pilot (`HERMES_HOME=~/.hermes-mtu`), runs on the `~/pcl-dev/hermes-pcl` main checkout venv (`.venv/bin/python`). Reversible; Carbon target is client-VPS (Amelia's call — flagged). |
+| **Runtime** | hermes `gateway run` (foreground/nohup, interactive two-way). Isolated state at `~/.hermes-mtu/`. Gateway confirmed `running` + telegram `connected`. |
+| **Channel** | Telegram (native hermes platform), bot **@pcl_mtu_bor_bot** (id `8869502462`). Thin/swappable — constitution+knowledge are channel-agnostic; WA can be added later by enabling the WA platform, no rebuild. |
+| **Model** | `gpt-5.4-mini` via **`provider: custom`** (OpenAI-direct, `OPENAI_API_KEY`). **Provider fix:** the inherited config used `openai-direct-primary`, which is a NAMED runtime-provider that only resolves in a HERMES_HOME carrying a `runtime_providers` registry (christopher's does; a fresh home does NOT → "Unknown provider"). `provider: custom` + base_url + api_key_source is the portable equivalent (matches `~/.hermes-tss-support`) and is what runs here. **FLAGGED model swap** from the constitution's design intent `gemini-3.1-flash-lite`: christopher runs gpt-5.4-mini after moving off gemini for structured-extraction/drafting accuracy. Correction to the prior note: a `GEMINI_API_KEY` **IS present** on this host — so gemini is available; gpt-5.4-mini is a deliberate accuracy choice, not a key-absence fallback. Revert by setting `model.provider: gemini` + `default: gemini-3.1-flash-lite`. |
+| **Bot token** | Canonical: `~/.marshal/secrets.env` → `MTU_BOR_BOT_TOKEN` (chmod 600). Runtime copy: `~/.hermes-mtu/.env` → `TELEGRAM_BOT_TOKEN` (chmod 600). NOT committed. |
+| **Advisor allowlist** | `~/.hermes-mtu/.env` → `TELEGRAM_ALLOWED_USERS`. Pilot self-test uses the controlled tester account `276672685` (Teren's Telegram, @t4177x). Melody's / Amelia's Telegram user IDs must be added before they can message it (DMs bypass `allowed_chats`; the user allowlist is the gate). |
+| **engagement_id** | Ties to the `amelia-finexis` Finexis engagement (deal `179de144-79ac-4caf-a0d5-e2dccc9e9b82`). Literal `client.engagement_id` in the constitution still `TBD` — set at DEBUT (out of build scope). |
 | **Escalation contact** | Melody Tan (constitution `escalation.escalation_to`). |
 
+## Controlled-tester pass (DoD 5)
+- **2026-07-13** — READY-state controlled-tester pass run through the **production stack** (Hermes gateway + native Telegram ingress), synthetic cases only, tester `276672685`. Transcript: `test-transcripts/2026-07-13-synthetic-e2e.md`. Case A (ROP Term→Term) drafted a full BOR with ROP disadvantages disclosure + `[[MISSING: ECIM]]` placeholder; Case B (non-ROP new purchase) correctly did NOT fire ROP checks. Agent behaviour is constitution/knowledge-driven, not generic-LLM.
+
 ## What remains (before a real advisor can use it)
-1. **[BLOCKER — needs a human decision] A free Telegram bot.** Teren's Telegram account is at the hard **20-bot cap**. New-bot creation via BotFather is refused. Reuse is unsafe to auto-pick: a bot's freeness can't be verified without `getUpdates`, which disrupts whatever is polling it — the first candidate (`@pcl_tggtest_bot`, which looked dead: no webhook, 0 pending, no local binding) turned out to be **actively long-polled by another consumer**. Need one of: (a) Teren deletes one genuinely-dead bot → I mint `@pcl_mtu_bor_bot`; or (b) Teren names an existing bot safe to repurpose; or (c) a bot token from another Telegram account with free slots. Once provided: `bootstrap_local.sh <token-file> <allowlist>` + `gateway run` → live + tested in minutes.
-2. **[Amelia gate]** DEBUT go (first real advisor) — WB 16f2b3ae.
-3. **[Melody gate]** Confirm/edit the BOR table (`knowledge/bor-required-checks.yaml`) + approved disclosure wording.
-4. Set `engagement_id`, add Melody's/advisors' Telegram IDs to the allowlist.
-5. (Optional) launchd unit `com.pcl.hermes-mtu` for persistence (currently foreground/nohup pilot run).
-6. (Optional) register hermes-mtu in the PA runtime registry so `pcl service locate --system mtu` resolves — do once it's persistently running.
+1. ~~**[BLOCKER] A free Telegram bot.**~~ **RESOLVED 2026-07-13.** Teren authorised freeing one slot from the 20-bot cap. Deleted exactly one retired throwaway (`pcl_mofextest_bot`, interlock-verified: BotFather's confirmation prompt was asserted to name mofextest and NOT `pcl_moltbot`=Kleya's before confirming). Minted **@pcl_mtu_bor_bot** (id 8869502462). Deployed + live + synthetic-E2E tested.
+2. **[Amelia gate]** DEBUT go (first real advisor) — WB 16f2b3ae. **Still open — nothing reaches a real advisor before this.**
+3. **[Melody gate]** Confirm/edit the BOR table (`knowledge/bor-required-checks.yaml`) + approved disclosure wording. **Still open.**
+4. Set literal `engagement_id`, add Melody's/advisors' Telegram IDs to the allowlist (currently tester-only `276672685`).
+5. **Persistence:** currently a foreground/nohup pilot run (dies on host reboot / process kill). Before real-advisor use, add a launchd unit `com.pcl.hermes-mtu` (or move to the Carbon client-VPS target — Amelia's call).
+6. Register hermes-mtu in the PA runtime registry so `pcl service locate --system mtu` resolves — do once it's persistently running.
+7. **WhatsApp divergence:** the P0 design assumed WhatsApp (Finexis advisors use WA); this pilot ships on **Telegram** per Amelia's stated intent + faster path to "working". The constitution + knowledge are channel-agnostic — WA can be added later by enabling the WA platform, no rebuild. Flag for Amelia: confirm whether the real advisor DEBUT is Telegram or WA.
 
 ## Rollback
 | Change | Revert |
@@ -31,6 +35,10 @@
 | (If a bot is reused) display-name rename | BotFather `/setname` back to original |
 No data-loss risk: synthetic-only pilot; no client data ingested.
 
-## Verification status
-- Stack: gateway boots, loads MTU constitution + SOUL KB, authenticates a Telegram token, reaches `getUpdates` — **validated** (blocked only on the token conflict above).
-- E2E BOR flow (ROP + non-ROP synthetic): **pending a free bot** (DoD #2, #3, #5).
+## Verification status (2026-07-13 — all deploy DoD verified)
+- Stack: gateway `running`, telegram `connected`, loads MTU constitution + SOUL KB, model `gpt-5.4-mini` via `provider: custom` — **validated live**.
+- Bot: `@pcl_mtu_bor_bot` getMe OK (id 8869502462), clean webhook, real message → real agent response (not stub) — **DoD #1 verified**.
+- E2E BOR flow (ROP synthetic, full draft): classify path → run checks → ask missing → draft copy-pasteable BOR with disclosures + `[[MISSING]]` placeholder — **DoD #2 verified**.
+- Config-driving-behaviour (ROP fires ROP checks/disclosures; non-ROP does not): **DoD #3 verified**.
+- Controlled-tester pass through production stack, synthetic only, transcript recorded: **DoD #5 verified**.
+- Client-data safety: `client-raw/` blanket-gitignored (git check-ignore confirmed), zero PII/secrets committed: **DoD #6 verified**.

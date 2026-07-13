@@ -2,7 +2,7 @@
 
 Runtime source-of-truth for the **MTU BOR-generation** PA agent (Melody Tan Unit, Finexis financial advisory), deployed as a **Studio-local hermes pilot on Telegram**. Second Finexis PA deployment; reuses the `amelia-finexis` shared standard. Patterned on `deploy/tgg/christopher/`.
 
-**Status (2026-07-13):** built + stack-validated; **BLOCKED on a free Telegram bot** (see OPS-NOTE → What remains). Everything except a reachable bot token is done and proven: the gateway boots, loads the constitution + SOUL knowledge, and authenticates a Telegram token — the pilot went live-to-`getUpdates` and only stopped on a bot-token conflict.
+**Status (2026-07-13):** **DEPLOYED + synthetic-E2E tested** on Telegram bot **@pcl_mtu_bor_bot** (READY, not DEBUT). Bot-cap blocker resolved (deleted one retired throwaway, minted the MTU bot). Gateway running + telegram connected; ROP and non-ROP synthetic cases pass through the production stack. See `test-transcripts/2026-07-13-synthetic-e2e.md` + OPS-NOTE. Remaining before a real advisor: Amelia's DEBUT go + Melody's BOR-table confirm + persistence (launchd/VPS).
 
 ## What this agent does
 Advisor DMs a rough case (existing plan, proposed plan, is-it-a-replacement) → the agent classifies the replacement path, runs the required BOR checks, asks for anything missing, then **drafts a copy-pasteable BOR (Basis of Recommendation)** from the template with the right compliance disclosures inserted. It DRAFTS for advisor review — never advises or signs off compliance. See `mtu_constitution.yaml` + `knowledge/`.

@@ -73,3 +73,8 @@ models-dev-upstream/
 hermes_cli/tui_dist/*
 hermes_cli/scripts/
 docs/superpowers/*
+# Client raw data — blanket gate. Real client PII/PDFs/case data (e.g. MTU/Finexis
+# advisor cases, Melody's OneDrive PDFs) live under any deploy/**/client-raw/ and MUST
+# never be committed. See deploy/finexis/mtu CLIENT-DATA GATE.
+client-raw/
+**/client-raw/
