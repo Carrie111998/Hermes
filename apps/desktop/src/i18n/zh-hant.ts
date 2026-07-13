@@ -88,9 +88,14 @@ export const zhHant = defineLocale({
       retry: '重試',
       repairInstall: '修復安裝',
       useLocalGateway: '使用本機閘道',
+      gatewaySettings: '閘道設定',
+      back: '返回',
       openLogs: '開啟記錄',
       repairHint: '修復會重新執行安裝程式，在新機器上可能需要幾分鐘。',
-      remoteSignInHint: '開啟閘道登入視窗。使用本機閘道可切換至內建後端。',
+      remoteSignInHint: signInLabel =>
+        `先登出已儲存的遠端瀏覽器工作階段，然後開啟${signInLabel}。使用本機閘道可切換至內建後端。`,
+      signOutAndSignIn: '登出並重新登入',
+      remoteFailureHint: '在「閘道設定」中檢查閘道 URL 與登入，或切換至本機閘道。',
       hideRecentLogs: '隱藏最近記錄',
       showRecentLogs: '顯示最近記錄',
       signedInTitle: '已登入',
@@ -1940,6 +1945,16 @@ export const zhHant = defineLocale({
       viewAllLogs: '查看全部記錄 →',
       messagingPlatforms: '訊息平台'
     },
+    approvalMode: {
+      title: '核准模式',
+      ariaLabel: mode => `核准模式：${mode}`,
+      manual: '手動',
+      manualDescription: '執行需要核准的操作前詢問',
+      smart: '智慧',
+      smartDescription: '自動評估操作，並在需要時詢問',
+      off: '關閉',
+      offDescription: '不顯示核准提示，直接執行'
+    },
     statusbar: {
       unknown: '未知',
       restart: '重新啟動',
@@ -2192,6 +2207,7 @@ export const zhHant = defineLocale({
       other: '其他（輸入您的答案）',
       placeholder: '輸入您的答案…',
       skip: '略過',
+      skipped: '已略過',
       continueLabel: '繼續'
     },
     tool: {

@@ -90,9 +90,14 @@ export const en: Translations = {
       retry: 'Retry',
       repairInstall: 'Repair install',
       useLocalGateway: 'Use local gateway',
+      gatewaySettings: 'Gateway settings',
+      back: 'Back',
       openLogs: 'Open logs',
       repairHint: 'Repair re-runs the installer and can take a few minutes on a fresh machine.',
-      remoteSignInHint: 'Opens the gateway login window. Use local gateway to switch to the bundled backend instead.',
+      remoteSignInHint: signInLabel =>
+        `Signs out of the saved remote browser session, then opens ${signInLabel}. Use local gateway to switch to the bundled backend instead.`,
+      signOutAndSignIn: 'Sign out & sign in',
+      remoteFailureHint: 'Check the gateway URL and sign-in under Gateway settings, or switch to the local gateway.',
       hideRecentLogs: 'Hide recent logs',
       showRecentLogs: 'Show recent logs',
       signedInTitle: 'Signed in',
@@ -702,6 +707,9 @@ export const en: Translations = {
       change: 'Change',
       autoUseMain: 'auto · use main model',
       providerDefault: '(provider default)',
+      fallbackAdd: 'Add fallback',
+      fallbackEmpty: 'No fallback models — the default model is used unless it fails.',
+      notInCatalog: "isn't in this provider's model list — calls may fall back to a backup.",
       tasks: {
         vision: { label: 'Vision', hint: 'Image analysis' },
         web_extract: { label: 'Web extract', hint: 'Page summarization' },
@@ -2060,6 +2068,16 @@ export const en: Translations = {
       viewAllLogs: 'View all logs →',
       messagingPlatforms: 'Messaging platforms'
     },
+    approvalMode: {
+      title: 'Approval mode',
+      ariaLabel: mode => `Approval mode: ${mode}`,
+      manual: 'Manual',
+      manualDescription: 'Ask before actions that require approval',
+      smart: 'Smart',
+      smartDescription: 'Automatically assess actions and ask when needed',
+      off: 'Off',
+      offDescription: 'Run without approval prompts'
+    },
     statusbar: {
       unknown: 'unknown',
       restart: 'restart',
@@ -2319,6 +2337,7 @@ export const en: Translations = {
       other: 'Other (type your answer)',
       placeholder: 'Type your answer…',
       skip: 'Skip',
+      skipped: 'Skipped',
       continueLabel: 'Continue'
     },
     tool: {
