@@ -93,14 +93,30 @@ def _resolve_install_target(root: Path) -> tuple[list[str], dict | None]:
     """
     uv_bin = _er._find_uv_binary()
     if uv_bin:
-        from hermes_constants import project_venv_dir
-
-        env = {**os.environ, "VIRTUAL_ENV": str(project_venv_dir(root) or root / "venv")}
+        env = _project_uv_install_env(root)
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
         return [uv_bin, "pip"], env
     return [sys.executable, "-m", "pip"], None
+
+
+def _project_uv_install_env(
+    root: Path, env: dict | None = None
+) -> dict[str, str]:
+    """Sanitize uv selectors for the canonical project venv."""
+    from hermes_constants import project_venv_dir, venv_python_path
+
+    env_dir = project_venv_dir(root) or root / "venv"
+    install_env = {**(env if env is not None else os.environ)}
+    install_env["UV_PROJECT_ENVIRONMENT"] = str(env_dir)
+    install_env["VIRTUAL_ENV"] = str(env_dir)
+    env_python = venv_python_path(env_dir, windows=_is_windows())
+    if env_python.exists():
+        install_env["UV_PYTHON"] = str(env_python)
+    else:
+        install_env.pop("UV_PYTHON", None)
+    return install_env
 
 
 def _venv_scripts_dir(root: Path) -> Path | None:
@@ -270,15 +286,15 @@ def _load_installable_optional_extras(root: Path, group: str) -> list[str]:
 
 
 def run_core_install(root: Path) -> None:
-    """Full core ``.[all]`` editable reinstall — the recovery install.
+    """Full core dependency recovery from the lockfile or editable fallback.
 
     Equal in behavior to the install half of
     ``main.py::_recover_core_update_marker_locked``:
 
     - bootstrap pip via ensurepip (a killed install can leave the venv with no
       pip module at all)
-    - prefer ``uv pip`` with VIRTUAL_ENV pointed at the project venv; fall back
-      to ``python -m pip`` when no uv binary is available
+    - prefer ``uv sync --locked --inexact`` against the project venv; fall back
+      to ``uv pip`` and then ``python -m pip`` when uv is unavailable
     - target ``.[all]`` (or ``.[termux-all]`` on Termux) with the per-extra
       fallback ladder when the combined extras resolve fails
     - quarantine live ``hermes*.exe`` shims on Windows so they can be replaced
@@ -292,6 +308,23 @@ def run_core_install(root: Path) -> None:
     group = "termux-all" if _is_termux_env(env) else "all"
 
     with _stdout_to_stderr():
+        uv_caller = len(prefix) == 2 and prefix[1] == "pip"
+        if uv_caller and not _is_termux_env(env) and (root / "uv.lock").is_file():
+            print("  → Syncing dependencies from uv.lock (hash-verified)...")
+            try:
+                _run_install_cmd(
+                    prefix[0:1]
+                    + ["sync", "--locked", "--inexact", "--extra", group],
+                    env=env,
+                    root=root,
+                )
+                return
+            except (subprocess.CalledProcessError, OSError):
+                print(
+                    "  ⚠ Lockfile sync failed or unavailable — falling back "
+                    "to editable install..."
+                )
+
         try:
             subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
