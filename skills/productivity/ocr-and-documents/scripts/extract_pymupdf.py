@@ -66,6 +66,44 @@ def show_metadata(path):
         "format": doc.metadata.get("format", ""),
     }, indent=2))
 
+def parse_pages(args):
+    if "--pages" not in args:
+        return None
+
+    # Reject duplicate --pages flags instead of silently using the first one
+    indices = [i for i, a in enumerate(args) if a == "--pages"]
+    if len(indices) > 1:
+        raise ValueError("--pages can only be specified once")
+
+    idx = indices[0]
+    if idx + 1 >= len(args):
+        raise ValueError("--pages requires a value")
+
+    value = args[idx + 1]
+    try:
+        if "-" not in value:
+            page = int(value)
+            if page < 1:
+                raise ValueError(f"page number must be >= 1, got {page}")
+            return range(page, page + 1)
+
+        parts = value.split("-")
+        if len(parts) != 2 or not all(parts):
+            raise ValueError
+        start, end = map(int, parts)
+        if start < 1 or end < 1:
+            raise ValueError(f"page numbers must be >= 1, got {start}-{end}")
+        if start > end:
+            raise ValueError(f"start page ({start}) must not exceed end page ({end})")
+        return range(start, end + 1)
+    except ValueError as exc:
+        # Re-raise our own messages; wrap parser failures
+        if "page" in str(exc).lower():
+            raise
+        raise ValueError(
+            f"invalid --pages value {value!r}; expected N or START-END"
+        ) from None
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args or args[0] in {"-h", "--help"}:
@@ -73,21 +111,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     path = args[0]
-    pages = None
-
-    if "--pages" in args:
-        idx = args.index("--pages")
-        p = args[idx + 1]
-        if "-" in p:
-            parts = p.split("-")
-            if len(parts) == 2:
-                start, end = parts
-                pages = list(range(int(start), int(end) + 1))
-            else:
-                print(f"ERROR: Invalid page range format: {p}", file=sys.stderr)
-                sys.exit(1)
-        else:
-            pages = [int(p)]
+    try:
+        pages = parse_pages(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if "--metadata" in args:
         show_metadata(path)
