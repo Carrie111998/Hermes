@@ -16,9 +16,12 @@ from events.paths import (
     telegram_topics_path, telegram_verbosity_path,
 )
 
+# telegram-mirror retired 2026-04-28 (scribe_daily topic cutover made it
+# duplicate every mailbox_message); checking it produced a permanent false
+# FAIL on every doctor run until 2026-07-12.
 REQUIRED_SUBSCRIBERS = [
     "audit-logger", "telegram-notifier", "whatsapp-escalator",
-    "digest-composer", "memory-writer", "telegram-mirror",
+    "digest-composer", "memory-writer",
     "mailbox-translator",
 ]
 
