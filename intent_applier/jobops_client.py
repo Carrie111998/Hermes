@@ -101,5 +101,22 @@ class JobOpsClient:
             raise JobOpsClientPermanentError(msg) from exc
         except URLError as exc:
             raise JobOpsClientTransientError(f"JobOps API {url} unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            # Socket READ-timeout: ``urlopen(req, timeout=N)`` raises a *bare*
+            # ``TimeoutError`` (== ``socket.timeout`` on 3.10+) from
+            # ``getresponse()`` when the server accepts the TCP connection but
+            # hangs on the response — e.g. :4100 under a Temporal-down 500-storm.
+            # ``TimeoutError`` is an ``OSError`` subclass but NOT a ``URLError``,
+            # so without this branch it escaped ``_post`` uncaught and crashed
+            # the applier's ``poll()`` tick (2026-07-12: reprocess loop + dup
+            # PIPELINE_UPDATE mirror). Retry-eligible.
+            raise JobOpsClientTransientError(
+                f"JobOps API {url} timed out after {self.timeout_seconds}s"
+            ) from exc
+        except OSError as exc:
+            # Other socket-level failures (connection reset, broken pipe, etc.).
+            # Below URLError/TimeoutError so those keep their specific messages;
+            # this is the catch-all for the remaining retry-eligible OSErrors.
+            raise JobOpsClientTransientError(f"JobOps API {url} socket error: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise JobOpsClientTransientError(f"JobOps API {url} returned invalid JSON: {exc}") from exc

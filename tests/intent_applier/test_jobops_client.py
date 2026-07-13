@@ -89,3 +89,37 @@ class TestJobOpsClient:
                     job_id="job-1", stage="approved",
                     actor_id="tracker", source="tracker_mailbox", notes="",
                 )
+
+    def test_read_timeout_raises_transient(self):
+        """A socket READ-timeout must map to transient, not escape uncaught.
+
+        Regression for 2026-07-12: ``urlopen(req, timeout=N)`` raises a *bare*
+        ``TimeoutError`` from ``getresponse()`` (the response-read phase) when
+        the server accepts the connection but hangs — e.g. :4100 under a
+        Temporal-down 500-storm. ``TimeoutError`` (== ``socket.timeout`` on
+        3.10+) is an ``OSError`` subclass but NOT a ``URLError``, so the old
+        handler chain (HTTPError / URLError / JSONDecodeError) missed it. The
+        uncaught error propagated up through ``apply_one`` -> ``scan_inbox`` ->
+        the subscriber ``poll()``, crashing the gateway poll tick, leaving the
+        intent in the inbox for reprocessing, and emitting a duplicate
+        PIPELINE_UPDATE mirror on the retry.
+        """
+        client = JobOpsClient(base_url="http://stub:4100", timeout_seconds=5)
+        with patch("intent_applier.jobops_client.urlopen") as mock_urlopen:
+            mock_urlopen.side_effect = TimeoutError("timed out")
+            with pytest.raises(JobOpsClientTransientError, match="timed out"):
+                client.post_legacy_stage(
+                    job_id="job-1", stage="approved",
+                    actor_id="tracker", source="tracker_mailbox", notes="",
+                )
+
+    def test_socket_oserror_raises_transient(self):
+        """Other socket-level OSErrors (conn reset, broken pipe) are transient too."""
+        client = JobOpsClient(base_url="http://stub:4100", timeout_seconds=5)
+        with patch("intent_applier.jobops_client.urlopen") as mock_urlopen:
+            mock_urlopen.side_effect = ConnectionResetError("connection reset by peer")
+            with pytest.raises(JobOpsClientTransientError, match="reset by peer"):
+                client.post_legacy_stage(
+                    job_id="job-1", stage="approved",
+                    actor_id="tracker", source="tracker_mailbox", notes="",
+                )
