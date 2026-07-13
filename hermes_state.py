@@ -1795,22 +1795,24 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
-    def _insert_session_row(
+    def _upsert_session_row(
         self,
+        conn: sqlite3.Connection,
         session_id: str,
         source: str,
-        model: str = None,
-        model_config: Dict[str, Any] = None,
-        system_prompt: str = None,
-        user_id: str = None,
-        session_key: str = None,
-        chat_id: str = None,
-        chat_type: str = None,
-        thread_id: str = None,
-        parent_session_id: str = None,
-        cwd: str = None,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
+        user_id: Optional[str] = None,
+        session_key: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
+        cwd: Optional[str] = None,
+        started_at: Optional[float] = None,
     ) -> None:
-        """Insert a session row, enriching NULL metadata on conflict.
+        """Upsert a session row using the caller's active transaction.
 
         The gateway's ``get_or_create_session`` creates a bare row (source +
         user_id) *before* the agent exists; the agent's later
@@ -1828,39 +1830,73 @@ class SessionDB:
         switching to it (IDOR scoping — without them the ``sessions`` table has
         no chat/thread to compare).
         """
-        def _do(conn):
-            conn.execute(
-                """INSERT INTO sessions (
-                   id, source, user_id, session_key, chat_id, chat_type, thread_id,
-                   model, model_config, system_prompt, parent_session_id, cwd, started_at
-                )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       model = COALESCE(sessions.model, excluded.model),
-                       model_config = COALESCE(sessions.model_config, excluded.model_config),
-                       system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
-                       session_key = COALESCE(sessions.session_key, excluded.session_key),
-                       chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
-                       chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
-                       thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
-                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
-                       cwd = COALESCE(sessions.cwd, excluded.cwd)""",
-                (
-                    session_id,
-                    source,
-                    user_id,
-                    session_key,
-                    chat_id,
-                    chat_type,
-                    thread_id,
-                    model,
-                    json.dumps(model_config) if model_config else None,
-                    system_prompt,
-                    parent_session_id,
-                    cwd,
-                    time.time(),
-                ),
+        conn.execute(
+            """INSERT INTO sessions (
+               id, source, user_id, session_key, chat_id, chat_type, thread_id,
+               model, model_config, system_prompt, parent_session_id, cwd, started_at
             )
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   model = COALESCE(sessions.model, excluded.model),
+                   model_config = COALESCE(sessions.model_config, excluded.model_config),
+                   system_prompt = COALESCE(sessions.system_prompt, excluded.system_prompt),
+                   session_key = COALESCE(sessions.session_key, excluded.session_key),
+                   chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
+                   chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
+                   thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                   parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                   cwd = COALESCE(sessions.cwd, excluded.cwd)""",
+            (
+                session_id,
+                source,
+                user_id,
+                session_key,
+                chat_id,
+                chat_type,
+                thread_id,
+                model,
+                json.dumps(model_config) if model_config else None,
+                system_prompt,
+                parent_session_id,
+                cwd,
+                time.time() if started_at is None else started_at,
+            ),
+        )
+
+    def _insert_session_row(
+        self,
+        session_id: str,
+        source: str,
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        user_id: str = None,
+        session_key: str = None,
+        chat_id: str = None,
+        chat_type: str = None,
+        thread_id: str = None,
+        parent_session_id: str = None,
+        cwd: str = None,
+    ) -> None:
+        """Insert a session row, enriching NULL metadata on conflict."""
+
+        def _do(conn):
+            self._upsert_session_row(
+                conn,
+                session_id,
+                source,
+                model=model,
+                model_config=model_config,
+                system_prompt=system_prompt,
+                user_id=user_id,
+                session_key=session_key,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                parent_session_id=parent_session_id,
+                cwd=cwd,
+            )
+
         self._execute_write(_do)
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
@@ -3712,17 +3748,22 @@ class SessionDB:
 
         return self._execute_write(_do)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def _insert_message_rows_with_ids(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[list[int], int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
         :meth:`archive_and_compact` (soft-archive-then-insert). Runs inside the
         caller's write transaction (takes the live ``conn``). Returns
-        ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
+        ``(inserted_ids, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
         now_ts = time.time()
-        inserted = 0
+        inserted_ids: list[int] = []
         tool_calls_total = 0
         for msg in messages:
             role = msg.get("role", "unknown")
@@ -3760,7 +3801,7 @@ class SessionDB:
                 msg.get("platform_message_id") or msg.get("message_id")
             )
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -3786,13 +3827,25 @@ class SessionDB:
                     1,
                 ),
             )
-            inserted += 1
+            inserted_ids.append(cursor.lastrowid)
             if tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
             now_ts = max(now_ts + 1e-6, message_timestamp + 1e-6)
-        return inserted, tool_calls_total
+        return inserted_ids, tool_calls_total
+
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Compatibility wrapper returning counts for existing callers."""
+        inserted_ids, tool_calls_total = self._insert_message_rows_with_ids(
+            conn, session_id, messages
+        )
+        return len(inserted_ids), tool_calls_total
 
     def replace_messages(
         self,
