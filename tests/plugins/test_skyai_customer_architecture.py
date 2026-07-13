@@ -36,18 +36,23 @@ def test_skyai_prompt_treats_prior_turns_as_shared_context() -> None:
     prompt = dev_gateway.build_skyai_system_prompt()
     architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
 
-    assert "клиентът помни вече казаното" in prompt
-    assert "новото в последната реплика" in prompt
-    assert "контакти само защото остават свързани с темата" in prompt
-    assert "При поправка или недоволство" in prompt
-    assert "без да обобщаваш стария отговор" in prompt
-    assert "изрично я поиска" in prompt
-    assert "само необходимата част" in prompt
+    assert "Историята е общ контекст" in prompt
+    assert "Отговаряй само с новото" in prompt
+    assert "сравни всяко твърдение и стъпка" in prompt
+    assert "ако смисълът вече е даден, изтрий го" in prompt
+    assert "последната реплика" in prompt
+    assert "Полезността или свързаността не оправдава повторение" in prompt
+    assert "поправка/недоволство" in prompt
+    assert "поправи само новото" in prompt
+    assert "изрично искане или корекция" in prompt
+    assert "само нужната част" in prompt
     assert "Conversation history is shared reasoning context" in architecture
     assert "prior information is" in architecture
     assert "presumed known" in architecture
     assert "delta in the latest" in architecture
     assert "summarizing the old answer" in architecture
+    assert "compare every claim and next step in its draft" in architecture
+    assert "Usefulness or relevance does not justify" in architecture
     assert "prompt-and-evaluation principle" in architecture
     assert "backend deduplication" in architecture
     assert "keyword rule" in architecture
