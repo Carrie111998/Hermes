@@ -139,7 +139,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -836,6 +836,100 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
 
+BRIDGE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS external_sessions (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'codex')),
+    native_id TEXT NOT NULL,
+    native_path TEXT,
+    native_status TEXT NOT NULL DEFAULT 'unknown',
+    last_native_cursor TEXT,
+    last_native_hash TEXT,
+    first_indexed_at REAL NOT NULL,
+    last_indexed_at REAL NOT NULL,
+    parser_version INTEGER NOT NULL,
+    origin_kind TEXT NOT NULL CHECK (
+        origin_kind IN ('native', 'bridge_placeholder', 'bridge_continuation')
+    ),
+    origin_bridge_id TEXT,
+    sync_error TEXT,
+    UNIQUE(provider, native_id)
+);
+
+CREATE TABLE IF NOT EXISTS external_message_map (
+    session_id TEXT NOT NULL REFERENCES external_sessions(session_id) ON DELETE CASCADE,
+    native_event_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY(session_id, native_event_id, ordinal),
+    UNIQUE(message_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_links (
+    id TEXT PRIMARY KEY,
+    from_session_id TEXT NOT NULL REFERENCES sessions(id),
+    to_session_id TEXT NOT NULL REFERENCES sessions(id),
+    relation TEXT NOT NULL CHECK (relation IN ('mirrors', 'continues', 'forks')),
+    bridge_id TEXT NOT NULL,
+    source_cursor TEXT,
+    source_hash TEXT,
+    created_at REAL NOT NULL,
+    hydrated_at REAL,
+    diverged_at REAL,
+    UNIQUE(bridge_id, from_session_id, to_session_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS session_mirror_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id),
+    target_provider TEXT NOT NULL CHECK (target_provider IN ('claude', 'codex')),
+    state TEXT NOT NULL CHECK (
+        state IN ('queued', 'running', 'retry', 'succeeded', 'manual_failure')
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL,
+    target_native_id TEXT,
+    error_code TEXT,
+    error_detail TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_context_packs (
+    id TEXT PRIMARY KEY,
+    bridge_id TEXT NOT NULL,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id),
+    target_session_id TEXT REFERENCES sessions(id),
+    source_cursor TEXT NOT NULL,
+    source_hash TEXT NOT NULL,
+    budget_chars INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    immutable_at REAL,
+    UNIQUE(bridge_id, source_cursor, source_hash, budget_chars)
+);
+
+CREATE TABLE IF NOT EXISTS session_bridge_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_external_sessions_last_indexed_at
+    ON external_sessions(last_indexed_at);
+CREATE INDEX IF NOT EXISTS idx_external_sessions_origin_bridge_id
+    ON external_sessions(origin_bridge_id);
+CREATE INDEX IF NOT EXISTS idx_session_links_bridge_id
+    ON session_links(bridge_id);
+CREATE INDEX IF NOT EXISTS idx_session_links_from_session_id
+    ON session_links(from_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_links_to_session_id
+    ON session_links(to_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_mirror_jobs_state_next_attempt_at
+    ON session_mirror_jobs(state, next_attempt_at);
+"""
+
 # Indexes that reference columns added in later schema versions must be
 # created AFTER _reconcile_columns() has had a chance to ADD them on
 # existing databases. SCHEMA_SQL above is run by sqlite executescript
@@ -1438,6 +1532,19 @@ class SessionDB:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+
+        # ``executescript`` commits before executing its SQL, so explicitly
+        # put the complete bridge DDL in one transaction. This keeps a v19
+        # database at v19 with none of the additive bridge objects if any
+        # statement fails partway through the script.
+        try:
+            cursor.executescript(
+                "BEGIN IMMEDIATE;\n" + BRIDGE_SCHEMA_SQL + "\nCOMMIT;"
+            )
+        except Exception:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
