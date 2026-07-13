@@ -232,3 +232,94 @@ class TestScanInbox:
         # Dead-letter dir should be empty (no false positives)
         if mailbox["dead_letter"].exists():
             assert list(mailbox["dead_letter"].iterdir()) == []
+
+
+def _pipeline_updates(inbox: Path) -> list[Path]:
+    return sorted(inbox.glob("*_PIPELINE_UPDATE_*.json"))
+
+
+class TestCanonicalEmission:
+    """Step 3b: every intent is mirrored as a PIPELINE_UPDATE into the tracker
+    mailbox inbox, so the tracker LLM applies it to its canonical
+    profiles/tracker/workspace/pipeline.json (2026-07-12 approval-loop fix)."""
+
+    def test_happy_path_emits_pipeline_update(self, mailbox, applier):
+        a, jobops, _mgr = applier
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "applied"
+
+        files = _pipeline_updates(mailbox["inbox"])
+        assert len(files) == 1
+        body = json.loads(files[0].read_text(encoding="utf-8"))
+        assert body["type"] == "PIPELINE_UPDATE"
+        assert body["from"] == "operator"
+        assert body["to"] == "tracker"
+        assert body["job_id"] == "linkedin-1"
+        assert body["correlation_id"] == VALID_INTENT_PAYLOAD["message_id"]
+        assert body["payload"]["to_stage"] == "approved"
+        md = body["payload"]["metadata"]
+        assert md["actor_id"] == "diego"
+        assert md["original_source"] == "legacy_dashboard"
+        assert md["idempotency_key"] == VALID_INTENT_PAYLOAD["idempotency_key"]
+        assert md["emitted_by"] == "tracker-intent-applier"
+        assert "pipeline_manager_error" not in md
+
+    def test_emission_is_not_reconsumed_by_applier(self, mailbox, applier):
+        """The emitted filename must never match the *_INTENT_* glob — Windows
+        globbing is case-insensitive, so this also guards the infix choice."""
+        a, _jobops, _mgr = applier
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        a.apply_one(f)
+        emitted = _pipeline_updates(mailbox["inbox"])
+        assert len(emitted) == 1
+        assert "_intent_" not in emitted[0].name.lower()
+
+        outcomes = a.scan_inbox()
+        assert outcomes == {}
+        assert emitted[0].exists()
+
+    def test_partial_jobops_failure_still_emits(self, mailbox, applier):
+        a, jobops, _mgr = applier
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("boom")
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "partial"
+        assert len(_pipeline_updates(mailbox["inbox"])) == 1
+
+    def test_pipeline_manager_failure_emits_flagged(self, tmp_path, mailbox):
+        mgr = MagicMock()
+        mgr.update_stage.side_effect = RuntimeError("disk full")
+        jobops = MagicMock()
+        tracker = IdempotencyTracker(tmp_path / "applier_state.db")
+        a = IntentApplier(
+            inbox_dir=mailbox["inbox"],
+            processed_dir=mailbox["processed"],
+            partial_dir=mailbox["partial"],
+            dead_letter_dir=mailbox["dead_letter"],
+            pipeline_manager=mgr,
+            jobops_client=jobops,
+            idempotency=tracker,
+        )
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "dead_lettered"
+
+        files = _pipeline_updates(mailbox["inbox"])
+        assert len(files) == 1
+        body = json.loads(files[0].read_text(encoding="utf-8"))
+        assert "disk full" in body["payload"]["metadata"]["pipeline_manager_error"]
+        # JobOps must not have been reached after the dead-letter
+        jobops.post_legacy_stage.assert_not_called()
+
+    def test_emission_failure_never_raises(self, tmp_path, mailbox, applier):
+        """_emit is best-effort by contract: a broken mailbox path must be
+        swallowed (logged), never propagated into the intent outcome."""
+        from intent_applier.parser import parse_intent_file
+
+        a, _jobops, _mgr = applier
+        f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
+        msg = parse_intent_file(f)
+
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        a.inbox_dir = blocker / "sub"  # parent is a file -> any write fails
+
+        a._emit_canonical_pipeline_update(msg)  # must not raise
