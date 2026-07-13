@@ -8,7 +8,7 @@ This is the concise narrative structure used per recommended product / need-buck
 - Derive coverage movement, premium movement, and the 50% sustainability result from the figures provided.
 - Insert the category-specific alternatives sentence below. Do not ask which alternatives were considered unless the path is novel, the advisor names an exception, or the standard wording conflicts with the case.
 - Do not ask about comparison-list freshness or reference numbers by default. Reference numbers are outside the BOR narrative unless the advisor explicitly requests one or names a workflow that requires one.
-- If irreducible facts are missing, ask for all of them once in one compact message. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement and replacement-options confirmation; and ILP-only suitability facts when an ILP is involved.
+- If irreducible facts are missing, ask for all of them once in one compact message instead of drafting. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement; and ILP-only suitability facts when an ILP is involved. Do not output a partial BOR, placeholders, or an unresolved list in that turn.
 - If the missing fact is non-blocking, draft with a clear [[MISSING: ...]] placeholder instead of conducting another question round.
 
 ## Category-specific standard alternatives sentences
@@ -55,7 +55,7 @@ State the before/after amounts and durations directly. If the premium is higher,
 
 6. Conditional blocks
 
-- ROP only: insert replacement disclosures from standard-disclosures.md only after the advisor confirms the client was advised, understood the disadvantages, wishes to proceed, and the standard replacement options were explored or not applicable.
+- ROP only: insert replacement disclosures from standard-disclosures.md only after the advisor confirms the client was advised, understood the disadvantages, and wishes to proceed. The replacement-options declaration is standard template text; insert it without asking the advisor to reconfirm it.
 - Non-ROP: exclude every ROP acknowledgement and replacement disclosure.
 - ILP only: include CKA, risk profile, fund/objective alignment, and the ILP disclosure block. Fill product-specific disclosure values from supplied product documents only.
 - Non-ILP: exclude every ILP-specific question and disclosure.

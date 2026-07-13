@@ -84,7 +84,9 @@ job_briefs:
         coverage/premium comparisons, standard alternatives, comparison-list
         freshness, or a reference number by default. Do not repeat supplied facts.
         A reference number is collected only when explicitly requested or required
-        by a named workflow.
+        by a named workflow. If any COLLECT fact is missing, ask instead of drafting:
+        do not produce a partial BOR, placeholders, or an "unresolved" list in the
+        same turn.
       - >-
         DO NOT INVENT material plan figures, the client's rationale, ROP
         acknowledgement, ILP suitability facts, or product-specific disclosure
@@ -93,9 +95,10 @@ job_briefs:
       - >-
         ROP GATE: only ask ROP questions and insert replacement disclosures when the
         case is ROP. Before asserting acknowledgement, collect confirmation that the
-        client was advised, understood the disadvantages, wishes to proceed, and
-        that increasing SA, adding riders, and conversion were explored or not
-        applicable. NON-ROP cases exclude all ROP wording.
+        client was advised, understood the disadvantages, and wishes to proceed.
+        Insert the standard ROP alternatives declaration about increasing SA, adding
+        riders, and conversion from the approved template; do not ask for it as a
+        case fact. NON-ROP cases exclude all ROP wording.
       - >-
         ILP GATE: only ask for CKA/risk profile, fund/objective alignment, and
         product-specific ILP disclosure values when an ILP or investment product is

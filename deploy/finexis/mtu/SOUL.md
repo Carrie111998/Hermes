@@ -126,9 +126,9 @@ checks:
     grounded: "files 01, 17 — the 4 general disadvantages + 'wish to proceed notwithstanding'"
     applies_when: rop
   - id: alternatives_to_replacement_explored
-    resolution: collect
-    ask_if_missing: "Confirm increasing SA, adding riders, and converting the existing policy were explored, or state any option that was not applicable."
-    collect: [rop_alternatives_explored_or_not_applicable]
+    resolution: template_default
+    per_case_question: false
+    sentence: "Other available options—such as increasing the sum assured under the existing policy, attaching riders, or converting the policy—have been explored. The recommendation to proceed with a replacement was made only after a thorough assessment confirmed that it is suitable and in the best interest of the client."
     why: "ROP declaration requires confirming replacement was chosen only after these were considered and it is best-interest."
     grounded: "file 01 — 'Other available options—such as increasing the sum assured, attaching riders, or converting the policy—have been explored.'"
     applies_when: rop
@@ -175,7 +175,7 @@ output:
     - "a concise Telegram-ready BOR draft (the recommendation-rationale narrative), per recommended product / need-bucket"
     - "only when needed, one short note listing unresolved placeholders or anything to check with Melody"
   interaction:
-    - "If irreducible facts are missing, ask once in one compact message; do not recap facts already supplied."
+    - "If irreducible COLLECT facts are missing, ask once in one compact message instead of drafting; do not recap facts already supplied, output a partial BOR, or append an unresolved list."
     - "Do not ask for derived conclusions, standard alternatives, product-comparison freshness, or reference numbers by default."
     - "Use plain text only: no Markdown asterisks, decorative headings, tables, or repeated offers to reformat."
   never:
@@ -239,7 +239,7 @@ This is the concise narrative structure used per recommended product / need-buck
 - Derive coverage movement, premium movement, and the 50% sustainability result from the figures provided.
 - Insert the category-specific alternatives sentence below. Do not ask which alternatives were considered unless the path is novel, the advisor names an exception, or the standard wording conflicts with the case.
 - Do not ask about comparison-list freshness or reference numbers by default. Reference numbers are outside the BOR narrative unless the advisor explicitly requests one or names a workflow that requires one.
-- If irreducible facts are missing, ask for all of them once in one compact message. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement and replacement-options confirmation; and ILP-only suitability facts when an ILP is involved.
+- If irreducible facts are missing, ask for all of them once in one compact message instead of drafting. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement; and ILP-only suitability facts when an ILP is involved. Do not output a partial BOR, placeholders, or an unresolved list in that turn.
 - If the missing fact is non-blocking, draft with a clear [[MISSING: ...]] placeholder instead of conducting another question round.
 
 ## Category-specific standard alternatives sentences
@@ -286,7 +286,7 @@ State the before/after amounts and durations directly. If the premium is higher,
 
 6. Conditional blocks
 
-- ROP only: insert replacement disclosures from standard-disclosures.md only after the advisor confirms the client was advised, understood the disadvantages, wishes to proceed, and the standard replacement options were explored or not applicable.
+- ROP only: insert replacement disclosures from standard-disclosures.md only after the advisor confirms the client was advised, understood the disadvantages, and wishes to proceed. The replacement-options declaration is standard template text; insert it without asking the advisor to reconfirm it.
 - Non-ROP: exclude every ROP acknowledgement and replacement disclosure.
 - ILP only: include CKA, risk profile, fund/objective alignment, and the ILP disclosure block. Fill product-specific disclosure values from supplied product documents only.
 - Non-ILP: exclude every ILP-specific question and disclosure.
