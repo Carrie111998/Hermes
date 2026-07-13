@@ -16,8 +16,57 @@ def test_version_string_no_v_prefix():
     assert not __version__.startswith("v"), f"__version__ should not start with 'v', got {__version__!r}"
 
 
+def test_check_for_updates_invalidates_on_git_identity_change(tmp_path, monkeypatch):
+    """A fresh cache must not survive a source-checkout HEAD/origin change.
+
+    Regression: a successful source merge changes neither VERSION nor
+    HERMES_REVISION, so the old cache key reused an obsolete "15 behind" result
+    for six hours even though HEAD already contained origin/main.
+    """
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    (repo_dir / ".git").mkdir(parents=True)
+    fake_banner = repo_dir / "hermes_cli" / "banner.py"
+    fake_banner.parent.mkdir()
+    fake_banner.touch()
+    monkeypatch.setattr(banner, "__file__", str(fake_banner))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps(
+            {
+                "ts": time.time(),
+                "behind": 15,
+                "rev": None,
+                "ver": banner.VERSION,
+                "head": "pre-merge-head",
+                "upstream": "pre-merge-origin",
+            }
+        )
+    )
+
+    # The test introduces the desired source-checkout cache identity. Before
+    # the fix, check_for_updates ignores it and returns the stale 15 instead.
+    monkeypatch.setattr(
+        banner,
+        "_local_git_cache_identity",
+        lambda _repo: ("post-merge-head", "post-merge-origin"),
+        raising=False,
+    )
+    monkeypatch.setattr(banner, "_check_via_local_git", lambda _repo: 0)
+
+    assert banner.check_for_updates() == 0
+    written = json.loads(cache_file.read_text())
+    assert written["head"] == "post-merge-head"
+    assert written["upstream"] == "post-merge-origin"
+
+
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
+    """When cache identity is unchanged, return it without a git fetch."""
+    import hermes_cli.banner as banner
     from hermes_cli.banner import check_for_updates
     from hermes_cli import __version__
 
@@ -30,6 +79,9 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     cache_file.write_text(json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}))
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    # None/None is a stable identity when refs cannot be resolved; it must keep
+    # the no-fetch cache fast path available.
+    monkeypatch.setattr(banner, "_local_git_cache_identity", lambda _repo: (None, None))
     with patch("hermes_cli.banner.subprocess.run") as mock_run:
         result = check_for_updates()
 
@@ -92,8 +144,9 @@ def test_check_for_updates_expired_cache(tmp_path, monkeypatch):
         result = check_for_updates()
 
     assert result == 5
-    # origin probe + is-shallow probe + git fetch + git rev-list
-    assert mock_run.call_count == 4
+    # cache identity (HEAD + origin) + origin probe + is-shallow probe +
+    # git fetch + git rev-list
+    assert mock_run.call_count == 6
 
 
 def test_check_for_updates_official_ssh_origin_uses_https_probe(tmp_path):

@@ -175,6 +175,16 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
+def _local_git_cache_identity(repo_dir: Optional[Path]) -> tuple[Optional[str], Optional[str]]:
+    """Return refs whose change makes a source-install update cache stale."""
+    if repo_dir is None:
+        return None, None
+    return (
+        _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir),
+        _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir),
+    )
+
+
 def _check_via_rev(local_rev: str) -> Optional[int]:
     """Compare an embedded git revision to upstream main via ls-remote.
 
@@ -287,18 +297,30 @@ def check_for_updates() -> Optional[int]:
     except Exception:
         pass
 
-    # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check.
+    # Read cache — invalidate if the embedded rev, installed version, or active
+    # source-checkout identity changed. The version guard matters for pip installs;
+    # the HEAD/upstream guard matters for source installs: a merge changes neither
+    # VERSION nor HERMES_REVISION, so reusing the old count would report a phantom
+    # update until the six-hour TTL elapsed. See #34491 and source-merge regression.
     now = time.time()
+    repo_dir: Optional[Path] = None
+    cache_head: Optional[str] = None
+    cache_upstream: Optional[str] = None
     try:
         if cache_file.exists():
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            if (
-                now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
-                and cached.get("rev") == embedded_rev
+            cached = json.loads(cache_file.read_text())
+            cache_base_matches = (
+                cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
-            ):
-                return cached.get("behind")
+            )
+            if now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS and cache_base_matches:
+                repo_dir = _resolve_repo_dir()
+                cache_head, cache_upstream = _local_git_cache_identity(repo_dir)
+                if (
+                    cached.get("head") == cache_head
+                    and cached.get("upstream") == cache_upstream
+                ):
+                    return cached.get("behind")
     except Exception:
         pass
 
@@ -308,21 +330,25 @@ def check_for_updates() -> Optional[int]:
         # Prefer the running code's location over the profile-scoped path.
         # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
         # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
-        if not (repo_dir / ".git").exists():
-            # No git checkout and no embedded revision — can't determine
-            # update status. This is the Docker path (already short-circuited
-            # above) or an unsupported install without a source tree.
-            behind = None
+        repo_dir = repo_dir or _resolve_repo_dir()
+        cache_head, cache_upstream = _local_git_cache_identity(repo_dir)
+        if repo_dir is None:
+            behind = check_via_pypi()
         else:
             behind = _check_via_local_git(repo_dir)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
-            encoding="utf-8",
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "head": cache_head,
+                    "upstream": cache_upstream,
+                }
+            )
         )
     except Exception:
         pass
