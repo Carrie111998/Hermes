@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import threading
 import time
 
 import pytest
@@ -11,6 +12,7 @@ from events.producers.resource_monitor import ResourcePressureMonitor
 from events.paths import gateway_heartbeat_path
 from events.schema import EventType
 from events.subscribers.mailbox_translator import MailboxTranslator
+from events.subscribers.tracker_intent_applier import TrackerIntentApplierSubscriber
 
 
 SCHEDULE = [8, 13, 18]
@@ -389,3 +391,151 @@ class TestResourceMonitorWiring:
         from events.producers.resource_monitor import sample_resources
         bus = EventBus(db_path=tmp_path / "events" / "event_bus.db")
         assert ResourcePressureMonitor(bus)._sampler is sample_resources
+
+
+class TestDedicatedApplierThread:
+    """The tracker-intent-applier must run on its OWN daemon thread, decoupled
+    from the shared serial subscriber poll loop.
+
+    Motivation (2026-07-13 starvation, proven live): all 13 subscribers poll
+    serially in one thread. During a gateway restart the WhatsApp connect
+    blocks ~30s and Telegram reconnects with ConnectionReset storms — both
+    registered AHEAD of the 8th-registered applier — so the applier's ~1s
+    filesystem scan was starved for MINUTES (intents posted 10:19-10:20 didn't
+    apply until 10:25). A mutation stranded in that window can exceed even the
+    90s dashboard fast-revert window, reviving the old-stage/revert bug.
+
+    IntentApplier is single-threaded by design (is_applied/mark_applied and
+    _move_to are not race-free), so it must be driven by EXACTLY ONE caller:
+    the dedicated thread, never also the serial loop.
+    """
+
+    def test_startup_starts_dedicated_applier_thread(self):
+        gi.startup()
+        try:
+            assert gi._applier_thread is not None, (
+                "startup() must start a dedicated applier poll thread"
+            )
+            assert gi._applier_thread.is_alive(), (
+                "the dedicated applier thread must be running after startup"
+            )
+            assert gi._applier_thread is not gi._subscriber_thread, (
+                "the applier thread must be distinct from the shared serial "
+                "subscriber thread — that separation is the whole fix"
+            )
+            # The applier subscriber must remain REGISTERED (startup() builds
+            # its IntentApplier via startup_all); it is only skipped in the
+            # serial *iteration*, not unregistered.
+            assert any(
+                isinstance(s, TrackerIntentApplierSubscriber)
+                for s in gi._registry.subscribers
+            ), "the applier subscriber must stay registered"
+        finally:
+            gi.shutdown()
+
+    def test_shutdown_stops_dedicated_applier_thread(self):
+        # A gateway restart calls startup() after shutdown(); if shutdown()
+        # doesn't join+clear the applier thread, each restart leaks one.
+        gi.startup()
+        applier_thread = gi._applier_thread
+        gi.shutdown()
+        assert applier_thread is not None
+        assert not applier_thread.is_alive(), (
+            "shutdown() must stop the dedicated applier thread"
+        )
+        assert gi._applier_thread is None, (
+            "shutdown() must clear the _applier_thread global so the next "
+            "startup() doesn't join a dead thread"
+        )
+
+    def test_serial_loop_does_not_poll_the_applier(self):
+        # Double-driving the single-threaded IntentApplier from both the
+        # serial loop AND the dedicated thread would race is_applied/
+        # mark_applied and _move_to. Attribute every poll() call to its
+        # thread and assert none came from the serial subscriber thread.
+        gi.startup()
+        try:
+            applier_sub = next(
+                s for s in gi._registry.subscribers
+                if isinstance(s, TrackerIntentApplierSubscriber)
+            )
+            callers = []
+            lock = threading.Lock()
+
+            def _recording_poll():
+                with lock:
+                    callers.append(threading.current_thread())
+                return 0
+
+            applier_sub.poll = _recording_poll
+
+            # Let several ~1s ticks of both loops elapse.
+            time.sleep(2.5)
+
+            with lock:
+                snapshot = list(callers)
+            assert snapshot, (
+                "applier was never polled — the dedicated thread is not "
+                "driving it"
+            )
+            serial_calls = [t for t in snapshot if t is gi._subscriber_thread]
+            assert not serial_calls, (
+                f"the serial poll loop drove the applier {len(serial_calls)} "
+                "time(s); it must be skipped in the serial iteration so the "
+                "single-threaded IntentApplier has exactly one caller"
+            )
+        finally:
+            gi.shutdown()
+
+    def test_applier_not_starved_when_serial_loop_blocks(self):
+        # Headline regression: poison the serial loop's subscriber iteration
+        # so its whole tick blocks — the moral equivalent of a 30s WhatsApp
+        # connect ahead of the applier. The dedicated thread must keep the
+        # applier ticking because it holds a DIRECT reference to the
+        # subscriber, not the registry list.
+        gi.startup()
+        release = threading.Event()
+        entered_block = threading.Event()
+        try:
+            applier_sub = next(
+                s for s in gi._registry.subscribers
+                if isinstance(s, TrackerIntentApplierSubscriber)
+            )
+            count = {"n": 0}
+            lock = threading.Lock()
+
+            def _counting_poll():
+                with lock:
+                    count["n"] += 1
+                return 0
+
+            applier_sub.poll = _counting_poll
+
+            class _BlockingIterable:
+                def __iter__(self):
+                    entered_block.set()
+                    release.wait(timeout=30)
+                    return iter([])
+
+            gi._registry.subscribers = _BlockingIterable()
+
+            # Only start counting once the serial loop is provably wedged, so
+            # a pre-block serial poll can't be mistaken for an independent tick.
+            assert entered_block.wait(timeout=5), (
+                "serial loop never reached the blocking iterable"
+            )
+            with lock:
+                count["n"] = 0
+            time.sleep(3.5)
+            with lock:
+                observed = count["n"]
+
+            assert observed >= 2, (
+                f"applier polled only {observed} time(s) while the serial loop "
+                "was blocked — it is still starved by the shared loop"
+            )
+        finally:
+            release.set()
+            if gi._registry is not None:
+                gi._registry.subscribers = []
+            gi.shutdown()

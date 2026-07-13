@@ -62,6 +62,11 @@ HEARTBEAT_INTERVAL_SECONDS = 60
 # Retries are throttled to this interval so a persistently-down bridge can't
 # hammer _deliver (which blocks ~5s per failed send) on every 1s poll tick.
 FLUSH_RETRY_INTERVAL_SECONDS = 900  # 15 min
+# Tick cadence for the tracker-intent-applier's DEDICATED poll thread. Mirrors
+# TrackerIntentApplierSubscriber.poll_interval_seconds; the applier runs off
+# the shared serial loop (2026-07-13 starvation fix) so this is its real,
+# uncontended floor rather than a best-case the serial loop rarely hits.
+APPLIER_POLL_INTERVAL_SECONDS = 1
 
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
@@ -69,6 +74,12 @@ _health_monitor: Optional[GatewayHealthMonitor] = None
 _resource_monitor: Optional[ResourcePressureMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
+# Dedicated poll thread + its subscriber for the tracker-intent-applier. The
+# applier is filesystem-driven and latency-sensitive and MUST NOT share the
+# serial _subscriber_poll_loop (where a slow subscriber ahead of it starves
+# its ~1s scan). See _applier_poll_loop.
+_applier_thread: Optional[threading.Thread] = None
+_applier_subscriber: Optional[TrackerIntentApplierSubscriber] = None
 _stop_event = threading.Event()
 _startup_monotonic: float = 0.0
 
@@ -85,7 +96,7 @@ _gateway_started_at_monotonic: Optional[float] = None
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _resource_monitor, _mailbox_watcher, _subscriber_thread, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -114,7 +125,13 @@ def startup(adapters: Optional[Dict] = None) -> None:
     # TelegramMirror registered duplicated every mailbox_message delivery.
     # _registry.register(TelegramMirror(_bus))
     _registry.register(MailboxTranslator(_bus))
-    _registry.register(TrackerIntentApplierSubscriber(_bus))
+    # Registered like any other subscriber (so startup_all() builds its
+    # IntentApplier and shutdown_all()/lag_report() still cover it), but it is
+    # driven by a DEDICATED thread below and SKIPPED in _subscriber_poll_loop's
+    # serial iteration — never polled from both, since IntentApplier is
+    # single-threaded by design.
+    _applier_subscriber = TrackerIntentApplierSubscriber(_bus)
+    _registry.register(_applier_subscriber)
     _registry.register(CriticSubscriber(_bus))
     _registry.register(ScribeRealtime(_bus))
     _registry.register(ScribeActionTelemetry(_bus))
@@ -156,17 +173,33 @@ def startup(adapters: Optional[Dict] = None) -> None:
     )
     _subscriber_thread.start()
 
+    # Start the dedicated tracker-intent-applier thread. Separate from the
+    # serial loop so the WhatsApp/Telegram reconnect blocks during a gateway
+    # restart can't starve operator-approval application (2026-07-13 fix).
+    _applier_thread = threading.Thread(
+        target=_applier_poll_loop,
+        daemon=True,
+        name="tracker-intent-applier",
+    )
+    _applier_thread.start()
+
     logger.info("EventBus: %d subscribers registered, polling started",
                 len(_registry.subscribers))
 
 
 def shutdown() -> None:
     """Stop polling and clean up."""
-    global _subscriber_thread, _bus
+    global _subscriber_thread, _applier_thread, _applier_subscriber, _bus
     _stop_event.set()
     if _subscriber_thread:
         _subscriber_thread.join(timeout=5)
         _subscriber_thread = None
+    # Join+clear the dedicated applier thread too, or a gateway restart
+    # (shutdown() then startup()) leaks one applier thread per cycle.
+    if _applier_thread:
+        _applier_thread.join(timeout=5)
+        _applier_thread = None
+    _applier_subscriber = None
     if _registry:
         _registry.shutdown_all()
     if _bus:
@@ -525,6 +558,16 @@ def _subscriber_poll_loop() -> None:
             # Poll each subscriber at its own interval
             if _registry:
                 for sub in _registry.subscribers:
+                    # The tracker-intent-applier is driven by its OWN dedicated
+                    # thread (_applier_poll_loop) so a slow subscriber ahead of
+                    # it here can't starve its latency-sensitive ~1s filesystem
+                    # scan (2026-07-13 restart-starvation fix). It stays
+                    # registered for startup/shutdown/lag, but must NOT be
+                    # polled here too — the single-threaded IntentApplier
+                    # (is_applied/mark_applied, _move_to) is not race-free
+                    # against a second concurrent caller.
+                    if isinstance(sub, TrackerIntentApplierSubscriber):
+                        continue
                     last = last_poll_times.get(sub.subscriber_id, 0)
                     if now - last >= sub.poll_interval_seconds:
                         try:
@@ -740,3 +783,45 @@ def _subscriber_poll_loop() -> None:
                 last_outer_error_emit = time.monotonic()
 
         _stop_event.wait(timeout=1)  # tick every 1 second
+
+
+def _applier_poll_loop() -> None:
+    """Dedicated poll thread for the tracker-intent-applier subscriber.
+
+    The applier is filesystem-driven and latency-sensitive: an operator
+    approval lands as an intent file that must be applied within the
+    dashboard's ~90s fast-revert window, or postgres-sync reverts the stage
+    and the old-stage/revert bug reappears. Running it inside the shared
+    ``_subscriber_poll_loop`` starved it for MINUTES during gateway restarts
+    (proven live 2026-07-13): WhatsApp connect blocks ~30s and Telegram
+    reconnects with ConnectionReset storms, and both subscribers are
+    registered AHEAD of the applier, so they monopolise the single serial
+    thread while intents sit unapplied. This dedicated thread guarantees the
+    applier's ~1s scan cadence independent of the other 12 subscribers and the
+    periodic maintenance blocks (health check, mailbox scan, WhatsApp flush).
+
+    ``IntentApplier`` is single-threaded by design (``is_applied`` /
+    ``mark_applied`` and ``_move_to`` are not race-free against concurrent
+    callers). This thread is the SOLE driver of the applier —
+    ``_subscriber_poll_loop`` skips the applier subscriber precisely so the
+    two never both poll it. The direct ``_applier_subscriber`` reference (not
+    a ``_registry`` scan) also keeps this loop ticking even if the serial loop
+    is wedged iterating a slow subscriber.
+
+    Mirrors ``_subscriber_poll_loop``'s outer-try safety net: any exception
+    from a single scan is logged and swallowed so the thread keeps ticking
+    rather than dying silently (the 2026-04-16 silent-failure mode).
+    """
+    interval = APPLIER_POLL_INTERVAL_SECONDS
+    if _applier_subscriber is not None:
+        interval = getattr(
+            _applier_subscriber, "poll_interval_seconds", interval
+        ) or interval
+
+    while not _stop_event.is_set():
+        try:
+            if _applier_subscriber is not None:
+                _applier_subscriber.poll()
+        except Exception:
+            logger.exception("tracker-intent-applier dedicated poll failed")
+        _stop_event.wait(timeout=interval)
