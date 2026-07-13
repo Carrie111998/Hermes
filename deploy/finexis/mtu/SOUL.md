@@ -7,6 +7,8 @@ the BOR checks table, replacement-path taxonomy, draft template, and the approve
 
 ---
 
+---
+
 ## bor-required-checks.yaml
 
 # MTU P0 — BOR Required Checks ("the BOR table")
@@ -15,14 +17,21 @@ the BOR checks table, replacement-path taxonomy, draft template, and the approve
 # 18 real cases + the amelia-finexis bor-scraper encoded standard (see GROUNDING.md).
 # HELD for Amelia; Melody confirms/edits this table before the agent drafts live.
 #
+# resolution values:
+#   collect          - an irreducible case fact; ask only when missing
+#   derive           - compute from supplied case facts; never ask for the conclusion
+#   template_default - insert the corpus-grounded category template; ask only for an explicit exception or novel path
+#   operational      - maintained outside the case; never ask the advisor per case
+#
 # applies_when values:
 #   always     - every BOR
 #   rop        - only when it is a replacement of policy (switch)
 #   ilp        - only when an investment-linked / investment product is involved
 #   accident   - only for personal-accident product recommendations
 #
-# collect: what the agent must obtain from the advisor before drafting
-# derive:  what the agent computes / states from collected inputs
+# collect: what the agent must obtain from the advisor when needed for a truthful draft
+# derive:  what the agent computes / states from supplied inputs
+# template_default: corpus-grounded standard wording selected by product category
 # never:   guardrail — the agent must not do this
 
 meta:
@@ -36,17 +45,20 @@ meta:
 # ── Intake: the three things the advisor states up front ──────────────────────
 intake:
   - id: existing_plan
-    ask: "What plan(s) does the client currently have? (insurer, plan name, and category)"
+    resolution: collect
+    ask_if_missing: "Existing plan(s): insurer, plan name/category, SA by benefit, premium, and coverage end age. Say 'none' for a first purchase."
     collect: [insurer, plan_name, category, sum_assured_by_benefit, premium, coverage_till_age]
     why: "The BOR must refer to the client's starting position clearly."
     applies_when: always
   - id: proposed_plan
-    ask: "What plan is being proposed? (insurer, plan name + riders, and category)"
+    resolution: collect
+    ask_if_missing: "Proposed plan: insurer, plan name/riders/category, SA by benefit, premium, and term; for ILP include MIP."
     collect: [insurer, plan_name, riders, category, sum_assured_by_benefit, premium_first_year, premium_subsequent, policy_term, min_investment_period]
     why: "The recommended product with its specifics anchors the whole BOR."
     applies_when: always
   - id: is_replacement
-    ask: "Is this a replacement of policy (ROP)? If yes — what is being replaced, and with what?"
+    resolution: collect
+    ask_if_missing: "ROP or new purchase? If ROP, identify each replaced and replacing product."
     collect: [is_rop, replaced_products, replacing_products, replaced_type_investment_or_insurance]
     why: "ROP cases need the extra replacement checks + more careful wording."
     applies_when: always
@@ -54,20 +66,25 @@ intake:
 # ── Required checks (the compliant-BOR must-covers) ───────────────────────────
 checks:
   - id: coverage_comparison
-    ask: "How does coverage change for Death, TI, TPD, and CI — amount AND duration, before vs after?"
+    resolution: derive
+    inputs: [existing_plan.sum_assured_by_benefit, existing_plan.coverage_till_age, proposed_plan.sum_assured_by_benefit, proposed_plan.coverage_till_age]
     derive: coverage_delta_statement   # "meets/does not meet client's needs for protection of family/assets, disability, CI"
     why: "The BOR must show the actual change in protection, not just product names. Shortfalls are stated, not hidden."
     grounded: "files 01, 17 — 'Total coverage of the plan meets/does not meet client's needs for…'"
     applies_when: always
   - id: premium_comparison
-    ask: "Is the new plan cheaper or more expensive than the old plan? If higher, why is the increase justified?"
+    resolution: derive
+    inputs: [existing_plan.premium, proposed_plan.premium_first_year, proposed_plan.premium_subsequent]
     derive: premium_movement_statement
+    collect_if_needed: "client-stated reason for a higher premium when supplied benefits/term do not explain it"
     why: "The recommendation must explain the trade-off clearly."
     grounded: "files 01, 17 — 'premiums are lowered compared to previous planning' / justification when higher"
     applies_when: always
   - id: income_sustainability_threshold
-    ask: "Is the new premium / investment budget more than 50% of the client's income (net worth / surplus)?"
+    resolution: derive
+    inputs: [proposed_plan.premium_first_year, proposed_plan.premium_subsequent, income_or_surplus]
     derive: sustainability_flag
+    missing_input_rule: "Ask for income or surplus only when the draft needs a sustainability conclusion; otherwise flag the conclusion as unavailable without blocking the rest of the draft."
     why: >-
       Key affordability check before finalising. The YFB carries a standing note:
       'If the budget you set aside is more than 50% of your net worth / surplus,
@@ -75,57 +92,78 @@ checks:
     grounded: "files 03, 13, 17 — the 50% sustainability note"
     applies_when: always
   - id: alternatives_considered
-    ask: "Were other products / methods considered? Which, and why were they not selected?"
-    collect: [alternatives_considered, reason_recommended_over_alternatives]
+    resolution: template_default
+    select_by_recommended_category:
+      term_whole_life_or_ilp_protection:
+        categories: [term_life, whole_life, investment_linked_protection]
+        standard_alternatives: [whole_life, term_life, investment_linked_plan]
+        sentence: "After discussing the pros and cons of whole life, term life and investment-linked plans, the client preferred {{RECOMMENDED_CATEGORY}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}."
+      ilp_or_wealth:
+        categories: [investment_linked_plan, investment_platform, endowment, retirement_annuity, indexed_universal_life]
+        standard_alternatives: [endowment, investment, annuity]
+        sentence: "After discussing the pros and cons of endowment, investment and annuity solutions, the client preferred {{RECOMMENDED_CATEGORY}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}."
+      shield:
+        categories: [integrated_shield_plan, shield, health_medical]
+        standard_alternatives: [other_insurers_shield_plans]
+        sentence: "After comparing Shield plans from other insurers, the client preferred {{RECOMMENDED_PLAN}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}."
+    exception_rule: "Do not ask for alternatives by default. Ask only when the path is novel, the advisor states different alternatives, or the standard sentence would conflict with supplied facts."
     why: "The BOR must explain why the recommended product was chosen over alternatives."
     grounded: "files 01, 17 — 'After discussing the pros and cons of [WL/term/ILP/endowment/…], the client preferred X because…'"
     applies_when: always
   - id: reason_for_change
-    ask: "Why is the client changing / why this recommendation? (in the client's own terms)"
+    resolution: collect
+    ask_if_missing: "Client's reason for the change/recommendation, in the client's own terms."
     collect: [client_stated_rationale]
     why: "The draft must reflect the client's ACTUAL rationale — the agent must not invent one."
     grounded: "every readable ROP case — 'the reason for the switch/replacement is highlighted below:'"
     never: "invent a rationale the advisor did not state"
     applies_when: always
   - id: rop_disadvantages_acknowledged
-    ask: "Confirm the client was advised of the replacement disadvantages and wishes to proceed."
-    derive: rop_disadvantage_acknowledgement   # inserts the standard 4-point disadvantage disclosure (see standard-disclosures.md)
+    resolution: collect
+    ask_if_missing: "Confirm the client was advised of the replacement disadvantages, understood them, and wishes to proceed."
+    collect: [rop_disadvantages_acknowledged, client_wishes_to_proceed]
     why: "ROP compliance — client must be shown the downside of switching before proceeding."
     grounded: "files 01, 17 — the 4 general disadvantages + 'wish to proceed notwithstanding'"
     applies_when: rop
   - id: alternatives_to_replacement_explored
-    ask: "Were other options to a full replacement explored — increasing sum assured, adding riders, converting the existing policy?"
-    collect: [alternatives_to_replacement]
+    resolution: collect
+    ask_if_missing: "Confirm increasing SA, adding riders, and converting the existing policy were explored, or state any option that was not applicable."
+    collect: [rop_alternatives_explored_or_not_applicable]
     why: "ROP declaration requires confirming replacement was chosen only after these were considered and it is best-interest."
     grounded: "file 01 — 'Other available options—such as increasing the sum assured, attaching riders, or converting the policy—have been explored.'"
     applies_when: rop
   - id: product_comparison_freshness
-    ask: "Are the comparison products still available in market and is the comparison list current?"
-    derive: freshness_flag
+    resolution: operational
+    per_case_question: false
+    derive: "Use the maintained approved comparison knowledge; escalate only if the named product/path is absent or visibly stale."
     why: "Comparisons must not be against outdated products. Melody flags a ~monthly refresh of the comparison list."
     grounded: "spec + Melody note"
     applies_when: always
   - id: reference_numbers
-    ask: "Does this BOR need an application / reference number (e.g. ECIM)? If so, where does the advisor get it?"
-    collect: [reference_numbers]
+    resolution: collect_on_explicit_request
+    per_case_question: false
+    collect: [reference_numbers_if_requested_or_required_by_named_workflow]
     why: "Some BOR flows require reference numbers."
     never: "invent a reference number — ask the advisor, or leave a clearly-marked placeholder"
     applies_when: always
   # ── ILP-specific checks (only when an investment-linked product is involved) ──
   - id: ilp_cka_risk_profile
-    ask: "For the ILP: what was the CKA result (passed / not passed) and the client's risk profile?"
+    resolution: collect
+    ask_if_missing: "ILP only: CKA result and client risk profile."
     collect: [cka_result, risk_profile]
     why: "ILP recommendations must reference CKA + risk profile for fund suitability."
     grounded: "file 01 — 'Client did not pass CKA and has a risk profile of aggressive.'"
     applies_when: ilp
   - id: ilp_fund_justification
-    ask: "Which fund(s), and why does the fund's objective align with the client's goals?"
-    collect: [fund_name, fund_objective_alignment]
+    resolution: collect
+    ask_if_missing: "ILP only: fund name, objective, and the client's goal/horizon it aligns with."
+    collect: [fund_name, fund_objective, client_goal_or_horizon]
     why: "Fund choice must be justified against the client's investment horizon and goals."
     grounded: "file 01 — fund recommended as objective aligns with long-term horizon"
     applies_when: ilp
   - id: ilp_risk_disclosures
-    ask: "Confirm the ILP risk disclosures apply (non-guaranteed returns, market volatility, surrender charges timeline, premium holiday, welcome/start-up bonus)."
+    resolution: derive
+    inputs: [product_summary.surrender_charge_timeline, product_summary.premium_holiday_year, product_summary.bonus_terms]
     derive: ilp_disclosure_block   # see standard-disclosures.md
     why: "ILP-specific caveats are mandatory in the BOR narrative."
     grounded: "files 01, 03, 13, 18"
@@ -134,12 +172,16 @@ checks:
 # ── Output contract ───────────────────────────────────────────────────────────
 output:
   produce:
-    - "a WhatsApp-ready BOR draft (the recommendation-rationale narrative), per recommended product / need-bucket"
-    - "a short note listing: which details were used, which fields were still missing, and anything to check with Melody"
+    - "a concise Telegram-ready BOR draft (the recommendation-rationale narrative), per recommended product / need-bucket"
+    - "only when needed, one short note listing unresolved placeholders or anything to check with Melody"
+  interaction:
+    - "If irreducible facts are missing, ask once in one compact message; do not recap facts already supplied."
+    - "Do not ask for derived conclusions, standard alternatives, product-comparison freshness, or reference numbers by default."
+    - "Use plain text only: no Markdown asterisks, decorative headings, tables, or repeated offers to reformat."
   never:
     - "make product recommendations by itself"
     - "invent missing facts (SA, premium, reference numbers, client rationale)"
-    - "treat an incomplete case as ready — ask for the missing checklist items first"
+    - "invent a missing material case fact; ask once for irreducible facts or leave an explicit placeholder when the draft can still be useful"
     - "give compliance sign-off — the draft is for ADVISOR review; unclear/sensitive cases escalate to Melody"
 
 ---
@@ -189,58 +231,83 @@ The "old category → new category" replacement paths the BOR must handle, deriv
 
 # MTU P0 — BOR Draft Template (recommendation-rationale narrative)
 
-The structure the MTU agent fills when drafting a BOR. **Grounded in real cases (files 01, 17 read in full; pattern confirmed across the 10 text-readable cases).** The BOR is written **per recommended product / need-bucket** — a case with three recommendations (e.g. term + shield + ILP) produces three narrative blocks in this shape.
+This is the concise narrative structure used per recommended product / need-bucket. It is grounded in files 01 and 17 and confirmed across the ten text-readable OneDrive cases. Variable case facts are never invented. Corpus-standard alternatives wording is selected by product category rather than collected from the advisor each time.
 
-The template maps to the amelia-finexis bor-scraper's **boilerplate-vs-variable** model: `{{VARIABLE}}` slots are collected from the advisor (never invented); *[boilerplate]* lines are inserted from `standard-disclosures.md`.
+## Interaction before drafting
 
----
+- Use every fact already supplied. Do not repeat it back as an intake recap.
+- Derive coverage movement, premium movement, and the 50% sustainability result from the figures provided.
+- Insert the category-specific alternatives sentence below. Do not ask which alternatives were considered unless the path is novel, the advisor names an exception, or the standard wording conflicts with the case.
+- Do not ask about comparison-list freshness or reference numbers by default. Reference numbers are outside the BOR narrative unless the advisor explicitly requests one or names a workflow that requires one.
+- If irreducible facts are missing, ask for all of them once in one compact message. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement and replacement-options confirmation; and ILP-only suitability facts when an ILP is involved.
+- If the missing fact is non-blocking, draft with a clear [[MISSING: ...]] placeholder instead of conducting another question round.
 
-## Block structure (per recommended product)
+## Category-specific standard alternatives sentences
 
-**1. Need being addressed.**
-> To address client's {{NEED}} [e.g. protection needs for Death, TI, TPD and Critical Illness / hospitalisation protection with deductible & co-insurance / developing savings & investment needs] …
+Protection path — recommended Term, Whole Life, or protection ILP:
 
-**2. Existing position + reason for the change** (the "reason for switch/replacement").
-> Client currently has {{N}} plan(s) with {{INSURER(S)}}: {{EXISTING_PLANS with SA + premium + coverage-till-age}}.
-> After a recent review, client felt {{CLIENT_STATED_RATIONALE}} [e.g. premiums are expensive for the coverage provided / coverage duration is insufficient and wants it extended / a needed feature is missing / no longer wants cash value in protection planning / wants premium flexibility].
+> After discussing the pros and cons of whole life, term life and investment-linked plans, the client preferred {{RECOMMENDED_CATEGORY}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}.
 
-**3. Alternatives considered → why the recommended product.**
-> After discussing the pros and cons of {{ALTERNATIVES_CONSIDERED}} [e.g. whole life, term, and investment-linked plans / various insurers' shield plans / different personal-accident plans / endowment, investment, and annuity], the client preferred {{RECOMMENDED_CATEGORY}} due to {{REASON_OVER_ALTERNATIVES}}.
+ILP / wealth path — recommended ILP, investment platform, endowment, annuity, or IUL:
 
-**4. Recommended product with specifics.**
-> Client has chosen {{PROPOSED_PLAN_NAME + RIDERS}} as it matches client's affordability requirement.
-> Sum Assured: {{SA_BY_BENEFIT}} (Death/TI/TPD; CI/ECI; multipay; etc.)
-> Premiums: {{PREMIUM_FIRST_YEAR}} first year / {{PREMIUM_SUBSEQUENT}} subsequent [GST-inclusive where applicable]
-> Coverage term: {{TERM}} (till age {{AGE}}, payable till age {{AGE}}) [ILP: Minimum Investment Period {{MIP}}]
+> After discussing the pros and cons of endowment, investment and annuity solutions, the client preferred {{RECOMMENDED_CATEGORY}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}.
 
-**5. Coverage comparison (before → after).**
-> {{COVERAGE_DELTA_STATEMENT}} [e.g. new coverage term is extended and now includes multipay CI; coverage is lowered but client does not require such high coverage after review].
-> Total coverage of the plan {{MEETS / DOES NOT MEET}} client's needs for "protection of family and/or assets in the event of death", "protection for disability", and "protection for critical illness". {{IF_SHORTFALL: Shortfalls will be addressed in future.}}
+Shield path — recommended Integrated Shield Plan / medical plan:
 
-**6. Premium comparison + justification.**
-> {{PREMIUM_MOVEMENT_STATEMENT}} [e.g. premiums are lowered compared to previous planning] {{IF_HIGHER: justification}}.
-> {{IF_SUSTAINABILITY_FLAG: note that budget exceeds 50% of surplus — advisor to confirm sustainability}}.
+> After comparing Shield plans from other insurers, the client preferred {{RECOMMENDED_PLAN}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}.
 
-**7. ILP block (only when an investment product is recommended).**
-> Client {{PASSED / DID NOT PASS}} CKA and has a risk profile of {{RISK_PROFILE}}.
-> Fund: {{FUND_NAME}} — recommended as its investment objective aligns with the client's {{HORIZON/GOAL}}.
-> *[welcome/start-up bonus note; premium-holiday note; surrender-charge timeline; non-guaranteed-returns + market-volatility caveat — from standard-disclosures.md]*
+The reason slot may use only the client's stated rationale or an objective product fit directly supported by supplied figures/features. Do not invent alternatives outside the approved template, a product preference not supplied by the advisor, or a rationale. For an unknown category, ask one short clarification instead of forcing a template.
 
-**8. Standard replacement disclosures** *(boilerplate — inserted, not written per-case; see `standard-disclosures.md`).*
-> *[non-disclosure of pre-existing conditions; recommended after fact-find + needs-analysis + product comparison; FC may receive additional commission; cost-benefit comparison performed as this is a replacement of policy; 90-day waiting period may apply; may incur losses on premiums already paid; will lose existing coverage; pre-existing conditions may not be covered under the new policy]*
+## Narrative order per recommended product
 
----
+1. Need and existing position
 
-## Output the agent returns
+> To address the client's {{NEED}}, the client currently has {{EXISTING_PLANS_OR_NO_EXISTING_COVER}}.
 
-1. The BOR draft (one or more narrative blocks in the shape above) — **copy-pasteable into the YFB "recommendation" section**.
-2. A **coverage note** stating: fields used, fields still missing, and anything to check with Melody before use.
+2. Client's reason
 
-## Hard rules for the draft (from Melody's spec + the checks table)
-- Do **not** invent SA, premiums, reference numbers, or the client's rationale. Missing → ask, or leave a clearly-marked `[[MISSING: …]]` placeholder.
-- Do **not** make the product recommendation — the advisor decides; the agent drafts the justification for the advisor's chosen product.
-- Draft is for **advisor review**; sensitive/unclear cases escalate to Melody.
-- The narrative must give the advisor everything needed to complete the YFB "For Switching / Replacement of Policies" declaration (old→new mapping, disadvantages acknowledged, alternatives explored, suitability) — see `../GROUNDING.md`.
+> After a recent review, the client stated {{CLIENT_STATED_RATIONALE}}.
+
+3. Standard alternatives sentence
+
+Insert exactly one category-specific sentence from the section above.
+
+4. Recommended product and material figures
+
+> The client has chosen {{PROPOSED_PLAN_NAME_AND_RIDERS}}. The plan provides {{SA_BY_BENEFIT}}, costs {{PREMIUM_FIRST_YEAR_AND_SUBSEQUENT}}, and covers the client {{POLICY_TERM_OR_TO_AGE}}. {{ILP_ONLY: Minimum Investment Period {{MIP}}.}}
+
+Do not claim the plan matches affordability unless the supplied figures support that conclusion.
+
+5. Derived comparison
+
+> {{COVERAGE_DELTA_STATEMENT}} {{PREMIUM_MOVEMENT_STATEMENT}} {{SUSTAINABILITY_STATEMENT_IF_DERIVABLE}}
+
+State the before/after amounts and durations directly. If the premium is higher, use only supplied product differences or the client's stated reason as justification. If income/surplus was not supplied, omit the sustainability conclusion or mark it unavailable; do not guess.
+
+6. Conditional blocks
+
+- ROP only: insert replacement disclosures from standard-disclosures.md only after the advisor confirms the client was advised, understood the disadvantages, wishes to proceed, and the standard replacement options were explored or not applicable.
+- Non-ROP: exclude every ROP acknowledgement and replacement disclosure.
+- ILP only: include CKA, risk profile, fund/objective alignment, and the ILP disclosure block. Fill product-specific disclosure values from supplied product documents only.
+- Non-ILP: exclude every ILP-specific question and disclosure.
+
+7. General disclosures
+
+Insert the approved general disclosure block from standard-disclosures.md without paraphrasing it.
+
+## Output contract
+
+- Return the BOR draft directly. Keep it copy-pasteable, short, and in plain text.
+- Add a short "Check before use:" note only for unresolved placeholders or a Melody escalation. Do not list every field used.
+- Do not add a reference-number placeholder unless the advisor requested it or the named workflow requires it.
+- Do not end with an offer to shorten, reformat, or produce another version.
+- Do not emit Markdown asterisks anywhere in the Telegram response. Use plain headings and hyphens only when needed.
+
+## Hard rules
+
+- Do not invent SA, premiums, reference numbers, client rationale, ROP acknowledgement, CKA/risk profile, fund alignment, or product-specific disclosure values.
+- Do not make the product recommendation. The advisor chooses the product; the agent drafts the justification.
+- The draft is for advisor review, not compliance sign-off. Escalate sensitive or unclear cases to Melody.
 
 ---
 
@@ -287,4 +354,3 @@ Plus the standard acknowledgements seen in the narratives:
 - The agent **inserts** the relevant blocks (A for ROP, B always, C for ILP); it does **not** paraphrase compliance language.
 - `{{…}}` slots inside C are filled from collected facts (surrender-charge year, premium-holiday year) — never invented.
 - If Melody's approved wording differs from this starter library, **her wording wins** — this file is replaced with her confirmed text before live use.
-
