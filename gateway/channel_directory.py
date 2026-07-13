@@ -6,6 +6,7 @@ Built on gateway startup, refreshed periodically (every 5 min), and saved to
 action="list" and for resolving human-friendly channel names to numeric IDs.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -142,7 +143,9 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
             or plat_name not in adapter_platform_names
         ):
             continue
-        platforms[plat_name] = _build_from_sessions(plat_name)
+        # _build_from_sessions issues a synchronous state.db scan; offload it
+        # so the query can't freeze the gateway's event loop (P0 2026-07-13).
+        platforms[plat_name] = await asyncio.to_thread(_build_from_sessions, plat_name)
 
     # Include plugin-registered platforms (dynamic enum members aren't in
     # Platform.__members__, so the loop above misses them). Same
@@ -156,7 +159,7 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 and entry.name not in platforms
                 and entry.name in adapter_platform_names
             ):
-                platforms[entry.name] = _build_from_sessions(entry.name)
+                platforms[entry.name] = await asyncio.to_thread(_build_from_sessions, entry.name)
     except Exception:
         pass
 
