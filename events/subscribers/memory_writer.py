@@ -49,10 +49,6 @@ MEMORY_ROUTING: Dict[EventType, Dict[str, Any]] = {
         "targets": ["memory_md"],
         "action": "operational_note",
     },
-    EventType.GATEWAY_HEALTH: {
-        "targets": ["memory_md"],
-        "action": "operational_note",
-    },
     EventType.FOLLOWUP_DUE: {
         "targets": ["mempalace", "honcho"],
         "action": "add_drawer",
@@ -171,9 +167,6 @@ class MemoryWriter(BaseSubscriber):
                 return (f"{p.get('job_name', '?')} failing since {event.timestamp[:10]} "
                         f"({p.get('consecutive_errors', '?')} consecutive) — "
                         f"{p.get('error', 'investigate')}")
-            if et == EventType.GATEWAY_HEALTH:
-                return (f"{p.get('platform', '?')} gateway went {p.get('status', '?')} "
-                        f"at {event.timestamp[:19]}")
             if et == EventType.APPLICATION_FAILED:
                 return (f"Application to {p.get('company', '?')} failed: "
                         f"{p.get('error', 'unknown')} — investigate {p.get('platform', '?')} compatibility")
