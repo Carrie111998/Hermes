@@ -28,6 +28,7 @@ from .claude_adapter import (
     AmbiguousPlaceholderCreation,
     PlaceholderCreationError,
     PlaceholderResult,
+    _same_filesystem_location,
 )
 
 
@@ -54,6 +55,8 @@ class _RequestClient(Protocol):
     def request(
         self, method: str, params: dict[str, Any], timeout: float
     ) -> dict[str, Any]: ...
+
+    def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None: ...
 
 
 @dataclass(frozen=True)
@@ -94,13 +97,19 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return changed
 
-    def project_thread(self, summary: CodexThreadSummary) -> SessionProjection:
+    def project_thread(
+        self,
+        summary: CodexThreadSummary,
+        *,
+        response: dict[str, Any] | None = None,
+    ) -> SessionProjection:
         self._ensure_initialized()
-        response = self._client.request(
-            "thread/read",
-            {"threadId": summary.native_id, "includeTurns": True},
-            timeout=_REQUEST_TIMEOUT,
-        )
+        if response is None:
+            response = self._client.request(
+                "thread/read",
+                {"threadId": summary.native_id, "includeTurns": True},
+                timeout=_REQUEST_TIMEOUT,
+            )
         thread = _thread_from_response(response)
         response_native_id = _nonempty_string(
             _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
@@ -274,6 +283,27 @@ class CodexSourceAdapter:
         archived: bool,
         source_kinds: tuple[str, ...] | None = None,
     ) -> list[CodexThreadSummary]:
+        if source_kinds is None:
+            return self._fetch_inventory_pages(
+                archived=archived, source_kinds=None
+            )
+        try:
+            return self._fetch_inventory_pages(
+                archived=archived, source_kinds=source_kinds
+            )
+        except Exception as exc:
+            retry_without_filter = _is_source_kinds_schema_error(exc)
+            failure = exc
+        if not retry_without_filter:
+            raise failure
+        return self._fetch_inventory_pages(archived=archived, source_kinds=None)
+
+    def _fetch_inventory_pages(
+        self,
+        *,
+        archived: bool,
+        source_kinds: tuple[str, ...] | None,
+    ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
@@ -334,7 +364,7 @@ class CodexTargetAdapter:
         monotonic=time.monotonic,
         sleep=time.sleep,
         request_timeout: float = _REQUEST_TIMEOUT,
-        require_registration_turn: bool | None = False,
+        require_registration_turn: bool | None = True,
         verification_timeout: float = 60.0,
         verification_poll_interval: float = 0.1,
     ) -> None:
@@ -405,7 +435,15 @@ class CodexTargetAdapter:
             source_session_id=source_session_id,
             bridge_id=bridge_id,
         )
-        self._source_adapter._ensure_initialized()
+        initialization_failure: PlaceholderCreationError | None = None
+        try:
+            self._source_adapter._ensure_initialized()
+        except Exception:
+            initialization_failure = PlaceholderCreationError(
+                "codex_initialization_failed"
+            )
+        if initialization_failure is not None:
+            raise initialization_failure
         start_params: dict[str, Any] = {
             "baseInstructions": hydration,
             "developerInstructions": hydration,
@@ -413,20 +451,33 @@ class CodexTargetAdapter:
         existing_cwd = _codex_existing_directory(cwd)
         if existing_cwd is not None:
             start_params["cwd"] = existing_cwd
+        start_failure: PlaceholderCreationError | None = None
         try:
             started = self._client.request(
                 "thread/start", start_params, timeout=self._request_timeout
             )
-        except TimeoutError as exc:
-            raise AmbiguousPlaceholderCreation("codex_creation_ambiguous") from exc
-        except Exception as exc:
-            raise PlaceholderCreationError("codex_thread_start_failed") from exc
+        except TimeoutError:
+            started = None
+            start_failure = AmbiguousPlaceholderCreation(
+                "codex_creation_ambiguous"
+            )
+        except Exception:
+            started = None
+            start_failure = PlaceholderCreationError("codex_thread_start_failed")
+        if start_failure is not None:
+            raise start_failure
+        assert started is not None
+        identity_failure: AmbiguousPlaceholderCreation | None = None
         try:
             native_id = _started_thread_id(started)
         except PlaceholderCreationError as exc:
-            raise AmbiguousPlaceholderCreation(exc.code) from exc
+            native_id = ""
+            identity_failure = AmbiguousPlaceholderCreation(exc.code)
+        if identity_failure is not None:
+            raise identity_failure
 
         name_ambiguous = False
+        name_failure: AmbiguousPlaceholderCreation | None = None
         try:
             self._client.request(
                 "thread/name/set",
@@ -435,34 +486,47 @@ class CodexTargetAdapter:
             )
         except TimeoutError:
             name_ambiguous = True
-        except Exception as exc:
-            raise AmbiguousPlaceholderCreation(
+        except Exception:
+            name_failure = AmbiguousPlaceholderCreation(
                 "codex_thread_name_failed", native_id=native_id
-            ) from exc
+            )
+        if name_failure is not None:
+            raise name_failure
 
         used_registration_turn = False
+        registration_turn_id: str | None = None
         if self._require_registration_turn is True:
             used_registration_turn = True
-            self._start_registration_turn(native_id=native_id, hydration=hydration)
+            registration_turn_id = self._start_registration_turn(
+                native_id=native_id, hydration=hydration
+            )
 
+        verification_failure: AmbiguousPlaceholderCreation | None = None
         try:
             if self._require_registration_turn is True:
                 projection = self._poll_authenticated_projection(
                     native_id=native_id,
                     title=title,
+                    cwd=existing_cwd,
                     bridge_id=bridge_id,
+                    marker=marker,
+                    registration_turn_id=registration_turn_id,
                 )
             else:
                 try:
                     summary = self._verify_inventory_target(
-                        native_id=native_id, title=title
+                        native_id=native_id,
+                        title=title,
+                        cwd=existing_cwd,
                     )
                 except PlaceholderCreationError as exc:
                     if self._require_registration_turn is False:
                         if self._verification_timeout == 0:
                             raise
                         summary = self._poll_inventory_target(
-                            native_id=native_id, title=title
+                            native_id=native_id,
+                            title=title,
+                            cwd=existing_cwd,
                         )
                     elif exc.code == "codex_target_not_found":
                         try:
@@ -476,13 +540,16 @@ class CodexTargetAdapter:
                                     error_code
                                 ) from read_exc
                         used_registration_turn = True
-                        self._start_registration_turn(
+                        registration_turn_id = self._start_registration_turn(
                             native_id=native_id, hydration=hydration
                         )
                         projection = self._poll_authenticated_projection(
                             native_id=native_id,
                             title=title,
+                            cwd=existing_cwd,
                             bridge_id=bridge_id,
+                            marker=marker,
+                            registration_turn_id=registration_turn_id,
                         )
                     else:
                         raise
@@ -499,35 +566,49 @@ class CodexTargetAdapter:
                         ) from exc
             if projection.native_id != native_id:
                 raise PlaceholderCreationError("codex_target_mismatch")
-            if not _codex_projection_is_authenticated(projection, bridge_id=bridge_id):
-                if projection.origin_kind is not OriginKind.NATIVE:
+            if not _codex_projection_is_authenticated(
+                projection, bridge_id=bridge_id, marker=marker
+            ):
+                if (
+                    _projection_has_authenticated_marker(
+                        projection, marker_secret=self._marker_secret
+                    )
+                    or projection.origin_kind is not OriginKind.NATIVE
+                ):
                     raise PlaceholderCreationError("codex_target_marker_mismatch")
                 if used_registration_turn:
                     raise PlaceholderCreationError("codex_target_marker_mismatch")
                 used_registration_turn = True
-                self._start_registration_turn(
+                registration_turn_id = self._start_registration_turn(
                     native_id=native_id, hydration=hydration
                 )
                 projection = self._poll_authenticated_projection(
                     native_id=native_id,
                     title=title,
+                    cwd=existing_cwd,
                     bridge_id=bridge_id,
+                    marker=marker,
+                    registration_turn_id=registration_turn_id,
                 )
-        except TimeoutError as exc:
-            raise AmbiguousPlaceholderCreation(
+        except TimeoutError:
+            verification_failure = AmbiguousPlaceholderCreation(
                 "codex_verification_ambiguous", native_id=native_id
-            ) from exc
+            )
         except PlaceholderCreationError as exc:
-            raise AmbiguousPlaceholderCreation(
+            verification_failure = AmbiguousPlaceholderCreation(
                 exc.code, native_id=native_id
-            ) from exc
-        except Exception as exc:
+            )
+        except Exception:
             code = (
                 "codex_name_outcome_ambiguous"
                 if name_ambiguous
                 else "codex_target_inventory_unreadable"
             )
-            raise AmbiguousPlaceholderCreation(code, native_id=native_id) from exc
+            verification_failure = AmbiguousPlaceholderCreation(
+                code, native_id=native_id
+            )
+        if verification_failure is not None:
+            raise verification_failure
         return PlaceholderResult(
             native_id=native_id,
             canonical_session_id=canonical_session_id(Provider.CODEX, native_id),
@@ -548,13 +629,14 @@ class CodexTargetAdapter:
         if observed != native_id:
             raise PlaceholderCreationError("codex_target_mismatch")
 
-    def _start_registration_turn(self, *, native_id: str, hydration: str) -> None:
+    def _start_registration_turn(self, *, native_id: str, hydration: str) -> str:
         registration = (
             "Hermes Session Bridge registration only. "
             f"{hydration} Do not perform project work; reply READY."
         )
+        request_failure: AmbiguousPlaceholderCreation | None = None
         try:
-            self._client.request(
+            response = self._client.request(
                 "turn/start",
                 {
                     "threadId": native_id,
@@ -563,14 +645,69 @@ class CodexTargetAdapter:
                 timeout=self._request_timeout,
             )
         except TimeoutError:
-            pass
-        except Exception as exc:
-            raise AmbiguousPlaceholderCreation(
+            response = None
+            request_failure = AmbiguousPlaceholderCreation(
+                "codex_registration_turn_ambiguous", native_id=native_id
+            )
+        except Exception:
+            response = None
+            request_failure = AmbiguousPlaceholderCreation(
                 "codex_registration_turn_failed", native_id=native_id
-            ) from exc
+            )
+        if request_failure is not None:
+            raise request_failure
+        assert response is not None
+
+        identity_failure: AmbiguousPlaceholderCreation | None = None
+        try:
+            turn_id = _started_turn_id(response)
+        except PlaceholderCreationError as exc:
+            turn_id = ""
+            identity_failure = AmbiguousPlaceholderCreation(
+                exc.code, native_id=native_id
+            )
+        if identity_failure is not None:
+            raise identity_failure
+
+        self._wait_for_registration_completion(
+            native_id=native_id, turn_id=turn_id
+        )
+        return turn_id
+
+    def _wait_for_registration_completion(
+        self, *, native_id: str, turn_id: str
+    ) -> None:
+        deadline = self._monotonic() + max(
+            self._verification_timeout, self._request_timeout
+        )
+        while True:
+            notification_failure: AmbiguousPlaceholderCreation | None = None
+            try:
+                notification = self._client.take_notification(timeout=0.25)
+            except Exception:
+                notification = None
+                notification_failure = AmbiguousPlaceholderCreation(
+                    "codex_registration_completion_failed", native_id=native_id
+                )
+            if notification_failure is not None:
+                raise notification_failure
+            if isinstance(notification, dict) and notification.get("method") == "turn/completed":
+                params = notification.get("params")
+                turn = params.get("turn") if isinstance(params, dict) else None
+                observed_turn_id = (
+                    _nonempty_string(_first(turn, "id", "turnId", "turn_id"))
+                    if isinstance(turn, dict)
+                    else None
+                )
+                if observed_turn_id == turn_id:
+                    return
+            if self._monotonic() >= deadline:
+                raise AmbiguousPlaceholderCreation(
+                    "codex_registration_completion_timeout", native_id=native_id
+                )
 
     def _verify_inventory_target(
-        self, *, native_id: str, title: str
+        self, *, native_id: str, title: str, cwd: str | None
     ) -> CodexThreadSummary:
         summaries = self._source_adapter._fetch_inventory(
             archived=False, source_kinds=_TARGET_SOURCE_KINDS
@@ -581,16 +718,18 @@ class CodexTargetAdapter:
         summary = matches[0]
         if summary.title != title:
             raise PlaceholderCreationError("codex_target_title_mismatch")
+        if cwd is not None and not _same_filesystem_location(summary.cwd, cwd):
+            raise PlaceholderCreationError("codex_target_cwd_mismatch")
         return summary
 
     def _poll_inventory_target(
-        self, *, native_id: str, title: str
+        self, *, native_id: str, title: str, cwd: str | None
     ) -> CodexThreadSummary:
         deadline = self._monotonic() + self._verification_timeout
         while True:
             try:
                 return self._verify_inventory_target(
-                    native_id=native_id, title=title
+                    native_id=native_id, title=title, cwd=cwd
                 )
             except PlaceholderCreationError:
                 if self._monotonic() >= deadline:
@@ -598,16 +737,33 @@ class CodexTargetAdapter:
                 self._sleep(self._verification_poll_interval)
 
     def _poll_authenticated_projection(
-        self, *, native_id: str, title: str, bridge_id: str
+        self,
+        *,
+        native_id: str,
+        title: str,
+        cwd: str | None,
+        bridge_id: str,
+        marker: str,
+        registration_turn_id: str | None = None,
     ) -> SessionProjection:
         deadline = self._monotonic() + self._verification_timeout
         while True:
             try:
                 summary = self._verify_inventory_target(
-                    native_id=native_id, title=title
+                    native_id=native_id, title=title, cwd=cwd
                 )
-                projection = self._source_adapter.project_thread(summary)
-            except PlaceholderCreationError:
+                if registration_turn_id is None:
+                    projection = self._source_adapter.project_thread(summary)
+                else:
+                    projection = self._read_registration_projection(
+                        summary,
+                        native_id=native_id,
+                        turn_id=registration_turn_id,
+                        marker=marker,
+                    )
+            except PlaceholderCreationError as exc:
+                if exc.code == "codex_registration_turn_not_completed":
+                    raise
                 if self._monotonic() >= deadline:
                     raise
                 self._sleep(self._verification_poll_interval)
@@ -623,13 +779,62 @@ class CodexTargetAdapter:
                 continue
             if projection.native_id != native_id:
                 raise PlaceholderCreationError("codex_target_mismatch")
-            if _codex_projection_is_authenticated(projection, bridge_id=bridge_id):
+            if _codex_projection_is_authenticated(
+                projection, bridge_id=bridge_id, marker=marker
+            ):
                 return projection
-            if projection.origin_kind is not OriginKind.NATIVE:
+            if (
+                _projection_has_authenticated_marker(
+                    projection, marker_secret=self._marker_secret
+                )
+                or projection.origin_kind is not OriginKind.NATIVE
+            ):
                 raise PlaceholderCreationError("codex_target_marker_mismatch")
             if self._monotonic() >= deadline:
                 raise PlaceholderCreationError("codex_target_marker_mismatch")
             self._sleep(self._verification_poll_interval)
+
+    def _read_registration_projection(
+        self,
+        summary: CodexThreadSummary,
+        *,
+        native_id: str,
+        turn_id: str,
+        marker: str,
+    ) -> SessionProjection:
+        response = self._client.request(
+            "thread/read",
+            {"threadId": native_id, "includeTurns": True},
+            timeout=self._request_timeout,
+        )
+        thread = _thread_from_response(response)
+        observed_native_id = _nonempty_string(
+            _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
+        )
+        if observed_native_id != native_id:
+            raise PlaceholderCreationError("codex_target_mismatch")
+        matches = [
+            turn
+            for turn in thread["turns"]
+            if isinstance(turn, dict)
+            and _nonempty_string(_first(turn, "id", "turnId", "turn_id"))
+            == turn_id
+        ]
+        if not matches:
+            raise PlaceholderCreationError("codex_registration_turn_not_found")
+        if len(matches) != 1:
+            raise PlaceholderCreationError("codex_registration_turn_conflict")
+        exact_turn = matches[0]
+        status = _nonempty_string(exact_turn.get("status"))
+        if status == "inProgress":
+            raise PlaceholderCreationError("codex_registration_turn_in_progress")
+        if status != "completed":
+            raise PlaceholderCreationError(
+                "codex_registration_turn_not_completed"
+            )
+        if not _codex_turn_has_exact_marker(exact_turn, marker=marker):
+            raise PlaceholderCreationError("codex_target_marker_mismatch")
+        return self._source_adapter.project_thread(summary, response=response)
 
 
 def _codex_hydration_contract(
@@ -645,13 +850,59 @@ def _codex_hydration_contract(
 
 
 def _codex_projection_is_authenticated(
-    projection: SessionProjection, *, bridge_id: str
+    projection: SessionProjection, *, bridge_id: str, marker: str
 ) -> bool:
     return (
         projection.origin_kind
         in (OriginKind.BRIDGE_PLACEHOLDER, OriginKind.BRIDGE_CONTINUATION)
         and projection.origin_bridge_id == bridge_id
+        and _projection_has_exact_marker(projection, marker=marker)
     )
+
+
+def _projection_has_exact_marker(
+    projection: SessionProjection, *, marker: str
+) -> bool:
+    return any(
+        message.role == "user"
+        and bool(message.content)
+        and any(
+            match.group(0) == marker
+            for match in _MARKER_CANDIDATE_RE.finditer(message.content or "")
+        )
+        for message in projection.messages
+    )
+
+
+def _codex_turn_has_exact_marker(turn: dict[str, Any], *, marker: str) -> bool:
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            continue
+        content = _message_content(item.get("content"))
+        if content is not None and any(
+            match.group(0) == marker
+            for match in _MARKER_CANDIDATE_RE.finditer(content)
+        ):
+            return True
+    return False
+
+
+def _projection_has_authenticated_marker(
+    projection: SessionProjection, *, marker_secret: bytes
+) -> bool:
+    for message in projection.messages:
+        if message.role != "user" or not message.content:
+            continue
+        for match in _MARKER_CANDIDATE_RE.finditer(message.content):
+            try:
+                decode_bridge_marker(match.group(0), marker_secret)
+            except InvalidBridgeMarker:
+                continue
+            return True
+    return False
 
 
 def _started_thread_id(response: Any) -> str:
@@ -667,6 +918,18 @@ def _started_thread_id(response: Any) -> str:
     if native_id is None:
         raise PlaceholderCreationError("codex_thread_start_missing_id")
     return native_id
+
+
+def _started_turn_id(response: Any) -> str:
+    if not isinstance(response, dict):
+        raise PlaceholderCreationError("codex_turn_start_malformed")
+    turn = response.get("turn")
+    if not isinstance(turn, dict):
+        raise PlaceholderCreationError("codex_turn_start_malformed")
+    turn_id = _nonempty_string(_first(turn, "id", "turnId", "turn_id"))
+    if turn_id is None:
+        raise PlaceholderCreationError("codex_turn_start_missing_id")
+    return turn_id
 
 
 def _target_required_text(value: Any, *, label: str) -> str:
@@ -708,6 +971,27 @@ def classify_codex_empty_read_error(
     if missing_thread:
         return True, "codex_empty_read_missing_thread"
     return False, "codex_empty_read_unexpected"
+
+
+def _is_source_kinds_schema_error(exc: Exception) -> bool:
+    if getattr(exc, "code", None) != -32602:
+        return False
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str):
+        return False
+    normalized = message.casefold()
+    if "sourcekinds" not in normalized:
+        return False
+    return any(
+        phrase in normalized
+        for phrase in (
+            "invalid param",
+            "invalid argument",
+            "schema",
+            "unknown field",
+            "unknown variant",
+        )
+    )
 
 
 def _thread_from_response(response: dict[str, Any]) -> dict[str, Any]:

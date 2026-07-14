@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 import json
 import math
@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -19,13 +20,16 @@ from agent.transports.codex_app_server import CodexAppServerClient
 
 from .claude_adapter import (
     CLAUDE_PLACEHOLDER_MAX_BUDGET_USD,
+    ClaudeMarkerSource,
+    ClaudeReadableSource,
     ClaudeSourceAdapter,
     ClaudeTargetAdapter,
     PlaceholderCreationError,
     classify_claude_process_failure,
+    resolve_claude_command,
 )
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter
-from .models import OriginKind, SessionProjection
+from .models import BridgeMarkerPayload, OriginKind, Provider, SessionProjection
 
 
 _REPORT_ROOT = Path.home() / ".hermes" / "session-bridge" / "characterization"
@@ -70,10 +74,12 @@ def write_characterization_report(
     characterization_id: str,
 ) -> Path:
     record_id = _canonical_uuid(characterization_id)
-    root = Path(report_root).expanduser()
-    root.mkdir(parents=True, exist_ok=True)
+    root = _safe_directory_root(
+        Path(report_root).expanduser(), error_code="unsafe_characterization_report"
+    )
     report_path = root / f"{record_id}.json"
-    temporary = root / f".{record_id}.tmp"
+    if report_path.exists() or _path_is_redirect(report_path):
+        raise RuntimeError("unsafe_characterization_report:final_exists")
     sanitized = _sanitize_report_value(dict(report))
     payload = json.dumps(
         sanitized,
@@ -82,22 +88,81 @@ def write_characterization_report(
         ensure_ascii=False,
         allow_nan=False,
     )
-    temporary.write_text(payload + "\n", encoding="utf-8")
-    temporary.replace(report_path)
+    descriptor = -1
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{record_id}.", suffix=".tmp", dir=root
+        )
+        temporary = Path(temporary_name)
+        if temporary.parent.resolve() != root.resolve() or _path_is_redirect(temporary):
+            raise RuntimeError("unsafe_characterization_report:temp_redirect")
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if report_path.exists() or _path_is_redirect(report_path):
+            raise RuntimeError("unsafe_characterization_report:final_exists")
+        os.link(temporary, report_path, follow_symlinks=False)
+        temporary.unlink()
+    except RuntimeError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RuntimeError("unsafe_characterization_report:write_failed") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary is not None and temporary.exists():
+            temporary.unlink(missing_ok=True)
     return report_path
 
 
+def _safe_directory_root(path: Path, *, error_code: str) -> Path:
+    root = path.absolute()
+    for candidate in (root, *root.parents):
+        if _path_is_redirect(candidate):
+            raise RuntimeError(f"{error_code}:redirect_parent")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        raise RuntimeError(f"{error_code}:root_unavailable") from None
+    if _path_is_redirect(root) or not root.is_dir():
+        raise RuntimeError(f"{error_code}:unsafe_root")
+    return root
+
+
+def _path_is_redirect(path: Path) -> bool:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+
+
 def quarantine_claude_transcript(
-    source_adapter: ClaudeSourceAdapter,
+    source_adapter: ClaudeMarkerSource,
     *,
     native_id: str,
     bridge_id: str,
+    source_session_id: str,
+    policy_generation: int,
     projects_root: Path = _CLAUDE_PROJECTS_ROOT,
     quarantine_root: Path | None = None,
 ) -> Path:
     expected_id = _canonical_uuid(native_id)
     if not isinstance(bridge_id, str) or not bridge_id.strip():
         raise UnsafeCharacterizationCleanup("bridge identity is missing")
+    expected_payload = BridgeMarkerPayload(
+        bridge_id=bridge_id.strip(),
+        source_session_id=source_session_id,
+        target_provider=Provider.CLAUDE,
+        policy_generation=policy_generation,
+    )
     path = source_adapter.find_native_session(expected_id)
     if path is None:
         raise UnsafeCharacterizationCleanup("exact Claude transcript was not found")
@@ -121,6 +186,9 @@ def quarantine_claude_transcript(
         projection.origin_kind
         not in (OriginKind.BRIDGE_PLACEHOLDER, OriginKind.BRIDGE_CONTINUATION)
         or projection.origin_bridge_id != bridge_id.strip()
+        or not source_adapter.projection_has_marker_payload(
+            projection, expected_payload
+        )
     ):
         raise UnsafeCharacterizationCleanup("Claude signed marker mismatch")
 
@@ -129,11 +197,37 @@ def quarantine_claude_transcript(
         if quarantine_root is not None
         else _REPORT_ROOT / "quarantine"
     )
-    destination_root.mkdir(parents=True, exist_ok=True)
+    try:
+        destination_root = _safe_directory_root(
+            destination_root, error_code="unsafe_claude_quarantine"
+        )
+    except RuntimeError:
+        raise UnsafeCharacterizationCleanup(
+            "Claude quarantine parent is a symlink or unsafe"
+        ) from None
     destination = destination_root / f"{expected_id}.jsonl"
-    if destination.exists():
+    if destination.exists() or _path_is_redirect(destination):
         raise UnsafeCharacterizationCleanup("Claude quarantine target already exists")
-    shutil.move(str(candidate), str(destination))
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        with candidate.open("rb") as source, os.fdopen(descriptor, "wb") as target:
+            descriptor = -1
+            shutil.copyfileobj(source, target)
+            target.flush()
+            os.fsync(target.fileno())
+        candidate.unlink()
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        destination.unlink(missing_ok=True)
+        raise UnsafeCharacterizationCleanup(
+            "Claude quarantine move failed safely"
+        ) from None
     return destination
 
 
@@ -147,8 +241,14 @@ def run_live_characterization(
 ) -> Path:
     if os.environ.get("HERMES_SESSION_BRIDGE_LIVE_TESTS") != "1":
         raise RuntimeError("live_characterization_not_enabled")
-    claude_executable = resolve_cli_executable(claude_executable)
-    codex_executable = resolve_cli_executable(codex_executable)
+    claude_command = resolve_cli_executable(claude_executable)
+    codex_command = resolve_cli_executable(codex_executable)
+    claude_version = _cli_version([*claude_command, "--version"])
+    codex_version = _cli_version([*codex_command, "--version"])
+    if claude_version is None:
+        raise RuntimeError("claude_cli_preflight_failed")
+    if codex_version is None:
+        raise RuntimeError("codex_cli_preflight_failed")
     characterization_id = str(uuid.uuid4())
     title = f"[Hermes Bridge Characterization] {characterization_id}"
     marker_secret = secrets.token_bytes(32)
@@ -159,8 +259,8 @@ def run_live_characterization(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "automatic_mirroring_enabled": False,
         "versions": {
-            "claude": _cli_version([claude_executable, "--version"]),
-            "codex": _cli_version([codex_executable, "--version"]),
+            "claude": claude_version,
+            "codex": codex_version,
         },
         "providers": {
             "claude": _provider_report(),
@@ -176,7 +276,7 @@ def run_live_characterization(
             marker_secret=marker_secret,
             projects_root=Path(claude_projects_root),
             report_root=Path(report_root),
-            executable=claude_executable,
+            executable=claude_command,
             cwd=working_directory,
         )
     except Exception as exc:
@@ -193,7 +293,7 @@ def run_live_characterization(
             characterization_id=characterization_id,
             title=title,
             marker_secret=marker_secret,
-            executable=codex_executable,
+            executable=codex_command,
             cwd=working_directory,
         )
     except Exception as exc:
@@ -219,11 +319,12 @@ def _characterize_claude(
     marker_secret: bytes,
     projects_root: Path,
     report_root: Path,
-    executable: str,
+    executable: str | Sequence[str],
     cwd: Path,
 ) -> None:
     native_id = str(uuid.uuid4())
     bridge_id = f"characterization-{characterization_id}-claude"
+    source_session_id = f"codex:characterization-{characterization_id}"
     status["native_id"] = native_id
     source = ClaudeSourceAdapter(projects_root, marker_secret=marker_secret)
     creation_processes: list[subprocess.CompletedProcess[str]] = []
@@ -247,7 +348,7 @@ def _characterize_claude(
         ).create_placeholder(
             native_id=native_id,
             title=title,
-            source_session_id=f"codex:characterization-{characterization_id}",
+            source_session_id=source_session_id,
             bridge_id=bridge_id,
             policy_generation=1,
             cwd=cwd,
@@ -324,6 +425,8 @@ def _characterize_claude(
                 source,
                 native_id=native_id,
                 bridge_id=bridge_id,
+                source_session_id=source_session_id,
+                policy_generation=1,
                 projects_root=projects_root,
                 quarantine_root=report_root / "quarantine",
             )
@@ -333,13 +436,13 @@ def _characterize_claude(
 
 
 def _resume_claude_characterization(
-    source: ClaudeSourceAdapter,
+    source: ClaudeReadableSource,
     *,
     baseline_projection: SessionProjection,
     native_id: str,
     bridge_id: str,
     resume_nonce: str,
-    executable: str,
+    executable: str | Sequence[str],
     cwd: Path,
     runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     process_timeout: float = 180.0,
@@ -368,7 +471,7 @@ def _resume_claude_characterization(
         f"{resume_nonce}. Reply READY."
     )
     args = [
-        executable,
+        *_immutable_argv_prefix(executable, label="Claude executable"),
         "--print",
         "--resume",
         native_id,
@@ -384,6 +487,7 @@ def _resume_claude_characterization(
     ]
     completed: subprocess.CompletedProcess[str] | None = None
     process_failure: PlaceholderCreationError | None = None
+    runner_failure: PlaceholderCreationError | None = None
     metrics: dict[str, int | float] = {}
     try:
         completed = runner(
@@ -398,10 +502,12 @@ def _resume_claude_characterization(
         )
     except subprocess.TimeoutExpired:
         process_failure = PlaceholderCreationError("claude_resume_timeout")
-    except FileNotFoundError as exc:
-        raise PlaceholderCreationError("claude_resume_executable_not_found") from exc
-    except Exception as exc:
-        raise PlaceholderCreationError("claude_resume_process_failed") from exc
+    except FileNotFoundError:
+        runner_failure = PlaceholderCreationError(
+            "claude_resume_executable_not_found"
+        )
+    except Exception:
+        runner_failure = PlaceholderCreationError("claude_resume_process_failed")
     else:
         metrics = _claude_result_metrics(completed)
         if completed.returncode != 0:
@@ -410,18 +516,25 @@ def _resume_claude_characterization(
             process_failure = _claude_resume_error(
                 f"claude_resume_{suffix}", metrics
             )
+    if runner_failure is not None:
+        raise runner_failure
 
     deadline = monotonic() + verification_timeout
     last_code = "claude_resume_target_not_found"
     while True:
         path = source.find_native_session(native_id)
         if path is not None:
+            parse_failure: PlaceholderCreationError | None = None
             try:
                 projection = source.parse(path).projection
-            except Exception as exc:
-                raise _claude_resume_error(
+            except Exception:
+                projection = None
+                parse_failure = _claude_resume_error(
                     "claude_resume_target_unreadable", metrics
-                ) from exc
+                )
+            if parse_failure is not None:
+                raise parse_failure
+            assert projection is not None
             if projection.native_id != native_id:
                 raise _claude_resume_error(
                     "claude_resume_identity_mismatch", metrics
@@ -516,11 +629,12 @@ def _characterize_codex(
     characterization_id: str,
     title: str,
     marker_secret: bytes,
-    executable: str,
+    executable: Sequence[str],
     cwd: Path,
 ) -> None:
     characterization_started = time.monotonic()
-    client = CodexAppServerClient(codex_bin=executable)
+    codex_bin = _single_native_executable(executable, label="Codex")
+    client = CodexAppServerClient(codex_bin=codex_bin)
     native_id: str | None = None
     try:
         source = CodexSourceAdapter(client, marker_secret=marker_secret)
@@ -551,8 +665,6 @@ def _characterize_codex(
         status["native_id"] = native_id
         status["create"] = True
         status["used_registration_turn"] = result.used_registration_turn
-        if result.used_registration_turn:
-            _wait_for_turn_completion(client, expected_turn_id=None, timeout=180.0)
         summary = source.find_native_thread(
             native_id, source_kinds=("vscode", "appServer")
         )
@@ -609,47 +721,136 @@ def _resume_codex_characterization(
 ) -> str:
     if not re.fullmatch(r"[0-9a-f]{32}", resume_nonce):
         raise ValueError("Codex resume nonce must be 32 lowercase hex characters")
+    baseline_turns = _read_codex_turns(
+        client,
+        native_id=native_id,
+        request_timeout=request_timeout,
+        stage="baseline",
+    )
+    baseline_ids = {
+        turn_id
+        for turn in baseline_turns
+        if (turn_id := _nonempty_mapping_text(turn, "id")) is not None
+    }
     prompt = (
         "Hermes Bridge live characterization resume verification tag "
         f"{resume_nonce}. Reply READY."
     )
-    turn = client.request(
-        "turn/start",
-        {
-            "threadId": native_id,
-            "input": [{"type": "text", "text": prompt}],
-        },
-        timeout=request_timeout,
-    )
-    turn_id = _turn_id(turn)
+    start_failure: RuntimeError | None = None
+    try:
+        turn = client.request(
+            "turn/start",
+            {
+                "threadId": native_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+            timeout=request_timeout,
+        )
+    except Exception:
+        turn = None
+        start_failure = RuntimeError("codex_resume_turn_start_failed")
+    if start_failure is not None:
+        raise start_failure
+    turn_id = _turn_identity(turn)
+    if turn_id in baseline_ids:
+        raise RuntimeError("codex_resume_turn_preexisting")
     if completion_waiter is None:
         _wait_for_turn_completion(
-            client, expected_turn_id=turn_id, timeout=180.0
+            client,
+            expected_thread_id=native_id,
+            expected_turn_id=turn_id,
+            timeout=180.0,
         )
     else:
-        completion_waiter(client, turn_id, 180.0)
+        completion_waiter(client, native_id, turn_id, 180.0)
 
     deadline = monotonic() + verification_timeout
     while True:
+        turns = _read_codex_turns(
+            client,
+            native_id=native_id,
+            request_timeout=request_timeout,
+            stage="post_resume",
+        )
+        exact_turns = [
+            observed
+            for observed in turns
+            if _nonempty_mapping_text(observed, "id") == turn_id
+        ]
+        if len(exact_turns) > 1:
+            raise RuntimeError("codex_resume_turn_conflict")
+        if exact_turns:
+            durable_status = _nonempty_mapping_text(exact_turns[0], "status")
+            if durable_status not in {"completed", "inProgress"}:
+                raise RuntimeError("codex_resume_turn_not_completed")
+            if durable_status == "completed":
+                if not _codex_turn_user_input_has_nonce(
+                    exact_turns[0], nonce=resume_nonce
+                ):
+                    raise RuntimeError("codex_resume_nonce_mismatch")
+                return turn_id
+        if monotonic() >= deadline:
+            raise RuntimeError("codex_resume_turn_not_found")
+        sleep(verification_poll_interval)
+
+
+def _read_codex_turns(
+    client: Any,
+    *,
+    native_id: str,
+    request_timeout: float,
+    stage: str,
+) -> list[dict[str, Any]]:
+    read_failure: RuntimeError | None = None
+    try:
         read = client.request(
             "thread/read",
             {"threadId": native_id, "includeTurns": True},
             timeout=request_timeout,
         )
-        thread = read.get("thread") if isinstance(read, dict) else None
-        if not isinstance(thread, dict) or thread.get("id") != native_id:
-            raise RuntimeError("codex_resume_identity_mismatch")
-        turns = thread.get("turns")
-        if not isinstance(turns, list):
-            raise RuntimeError("codex_resume_read_malformed")
-        if any(
-            isinstance(observed, dict) and observed.get("id") == turn_id
-            for observed in turns
-        ):
-            return turn_id
-        if monotonic() >= deadline:
-            raise RuntimeError("codex_resume_turn_not_found")
-        sleep(verification_poll_interval)
+    except Exception:
+        read = None
+        read_failure = RuntimeError(f"codex_resume_{stage}_read_failed")
+    if read_failure is not None:
+        raise read_failure
+    thread = read.get("thread") if isinstance(read, dict) else None
+    if not isinstance(thread, dict) or thread.get("id") != native_id:
+        raise RuntimeError("codex_resume_identity_mismatch")
+    turns = thread.get("turns")
+    if not isinstance(turns, list) or not all(
+        isinstance(turn, dict) for turn in turns
+    ):
+        raise RuntimeError("codex_resume_read_malformed")
+    return turns
+
+
+def _nonempty_mapping_text(value: Any, key: str) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    observed = value.get(key)
+    return observed if isinstance(observed, str) and observed else None
+
+
+def _codex_turn_user_input_has_nonce(
+    turn: dict[str, Any], *, nonce: str
+) -> bool:
+    items = turn.get("items")
+    if not isinstance(items, list):
+        return False
+    occurrences = 0
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if isinstance(text, str):
+                occurrences += text.count(nonce)
+    return occurrences == 1
 
 
 def _provider_report() -> dict[str, Any]:
@@ -717,17 +918,49 @@ def resolve_cli_executable(
     executable: str,
     *,
     which=shutil.which,
-) -> str:
+) -> tuple[str, ...]:
     if not isinstance(executable, str) or not executable.strip():
         raise ValueError("CLI executable must not be empty")
     normalized = executable.strip()
-    resolved = which(normalized)
-    return str(resolved) if resolved else normalized
+    resolved = str(which(normalized) or normalized)
+    candidate = Path(resolved).expanduser()
+    suffix = candidate.suffix.casefold()
+    if candidate.stem.casefold() == "claude":
+        return resolve_claude_command(normalized, which=which)
+    if suffix not in {".cmd", ".ps1", ".bat"}:
+        return (str(candidate.resolve()) if candidate.exists() else resolved,)
+
+    command_name = candidate.stem.casefold()
+    if command_name == "codex":
+        if suffix == ".cmd" and candidate.is_file():
+            return (str(candidate.resolve()),)
+        raise RuntimeError("unsupported_shell_shim")
+    raise RuntimeError("unsupported_shell_shim")
+
+
+def _immutable_argv_prefix(
+    command: str | Sequence[str], *, label: str
+) -> tuple[str, ...]:
+    entries: Sequence[str] = (command,) if isinstance(command, str) else command
+    if not entries:
+        raise ValueError(f"{label} must not be empty")
+    normalized: list[str] = []
+    for entry in entries:
+        if (
+            not isinstance(entry, str)
+            or not entry.strip()
+            or "\r" in entry
+            or "\n" in entry
+        ):
+            raise ValueError(f"{label} entries must be non-empty and single-line")
+        normalized.append(entry.strip())
+    return tuple(normalized)
 
 
 def _wait_for_turn_completion(
     client: CodexAppServerClient,
     *,
+    expected_thread_id: str,
     expected_turn_id: str | None,
     timeout: float,
 ) -> None:
@@ -746,22 +979,33 @@ def _wait_for_turn_completion(
     raise TimeoutError("codex_turn_completion_timeout")
 
 
-def _turn_id(response: Any) -> str:
+def _turn_identity(response: Any) -> str:
     if not isinstance(response, dict):
         raise RuntimeError("codex_turn_start_malformed")
     turn = response.get("turn")
-    native_id = turn.get("id") if isinstance(turn, dict) else None
-    if not isinstance(native_id, str) or not native_id:
+    turn_id = turn.get("id") if isinstance(turn, dict) else None
+    if not isinstance(turn_id, str) or not turn_id:
         raise RuntimeError("codex_turn_start_missing_id")
-    return native_id
+    return turn_id
 
 
-def _codex_schema_advertises_archive(executable: str) -> bool:
+def _single_native_executable(
+    command: Sequence[str], *, label: str
+) -> str:
+    if len(command) != 1:
+        raise RuntimeError(f"{label.casefold()}_direct_runtime_required")
+    executable = command[0]
+    if not isinstance(executable, str) or not executable.strip():
+        raise RuntimeError(f"{label.casefold()}_executable_invalid")
+    return executable
+
+
+def _codex_schema_advertises_archive(executable: Sequence[str]) -> bool:
     try:
         with tempfile.TemporaryDirectory(prefix="hermes-codex-schema-") as directory:
             completed = subprocess.run(
                 [
-                    executable,
+                    *executable,
                     "app-server",
                     "generate-json-schema",
                     "--out",

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import time
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO, Callable, Protocol
 import uuid
 
 from .models import (
@@ -64,6 +67,22 @@ class ClaudeParseResult:
     rebuild: bool
     malformed_lines: int
     unknown_records: int
+
+
+class ClaudeReadableSource(Protocol):
+    def find_native_session(self, native_id: str) -> Path | None: ...
+
+    def parse(self, path: Path) -> ClaudeParseResult: ...
+
+
+class ClaudeMarkerSource(ClaudeReadableSource, Protocol):
+    def projection_has_exact_marker(
+        self, projection: SessionProjection, marker: str
+    ) -> bool: ...
+
+    def projection_has_marker_payload(
+        self, projection: SessionProjection, payload: BridgeMarkerPayload
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -274,14 +293,33 @@ class ClaudeSourceAdapter:
                 return path
         return None
 
+    def projection_has_exact_marker(
+        self, projection: SessionProjection, marker: str
+    ) -> bool:
+        for message in projection.messages:
+            if message.role not in {"user", "assistant"} or not message.content:
+                continue
+            if any(
+                match.group(0) == marker
+                for match in _MARKER_CANDIDATE_RE.finditer(message.content)
+            ):
+                return True
+        return False
+
+    def projection_has_marker_payload(
+        self, projection: SessionProjection, payload: BridgeMarkerPayload
+    ) -> bool:
+        marker = encode_bridge_marker(payload, self._marker_secret)
+        return self.projection_has_exact_marker(projection, marker)
+
 
 class ClaudeTargetAdapter:
     def __init__(
         self,
-        source_adapter: ClaudeSourceAdapter,
+        source_adapter: ClaudeMarkerSource,
         *,
         marker_secret: bytes,
-        claude_executable: str = "claude",
+        claude_executable: str | Sequence[str] = "claude",
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         clock: Callable[[], float] = time.time,
         monotonic: Callable[[], float] = time.monotonic,
@@ -292,9 +330,7 @@ class ClaudeTargetAdapter:
     ) -> None:
         self._source_adapter = source_adapter
         self._marker_secret = marker_secret
-        self._claude_executable = _required_text(
-            claude_executable, label="Claude executable"
-        )
+        self._claude_command = resolve_claude_command(claude_executable)
         self._runner = runner
         self._clock = clock
         self._monotonic = monotonic
@@ -321,10 +357,10 @@ class ClaudeTargetAdapter:
     ) -> PlaceholderResult:
         native_id = _canonical_uuid(native_id)
         title = _required_text(title, label="title")
-        source_session_id = _required_text(
+        source_session_id = _single_line_required_text(
             source_session_id, label="source session ID"
         )
-        bridge_id = _required_text(bridge_id, label="bridge ID")
+        bridge_id = _single_line_required_text(bridge_id, label="bridge ID")
         if (
             not isinstance(policy_generation, int)
             or isinstance(policy_generation, bool)
@@ -346,7 +382,7 @@ class ClaudeTargetAdapter:
             bridge_id=bridge_id,
         )
         args = [
-            self._claude_executable,
+            *self._claude_command,
             "--print",
             "--session-id",
             native_id,
@@ -374,15 +410,22 @@ class ClaudeTargetAdapter:
         if run_cwd is not None:
             run_kwargs["cwd"] = run_cwd
         timed_out = False
+        provider_failure: PlaceholderCreationError | None = None
         try:
             completed = self._runner(args, **run_kwargs)
         except subprocess.TimeoutExpired:
             timed_out = True
             completed = None
-        except FileNotFoundError as exc:
-            raise PlaceholderCreationError("claude_executable_not_found") from exc
-        except Exception as exc:
-            raise PlaceholderCreationError("claude_process_failed") from exc
+        except FileNotFoundError:
+            completed = None
+            provider_failure = PlaceholderCreationError(
+                "claude_executable_not_found"
+            )
+        except Exception:
+            completed = None
+            provider_failure = PlaceholderCreationError("claude_process_failed")
+        if provider_failure is not None:
+            raise provider_failure
 
         process_failure: PlaceholderCreationError | None = None
         if completed is not None and completed.returncode != 0:
@@ -396,7 +439,13 @@ class ClaudeTargetAdapter:
                 num_turns=num_turns,
             )
 
-        verified = self._poll_exact_target(native_id=native_id, bridge_id=bridge_id)
+        verified = self._poll_exact_target(
+            native_id=native_id,
+            bridge_id=bridge_id,
+            marker=marker,
+            title=title,
+            cwd=run_cwd,
+        )
         if not verified:
             if process_failure is not None:
                 raise process_failure
@@ -413,17 +462,40 @@ class ClaudeTargetAdapter:
             verified_at=float(self._clock()),
         )
 
-    def _poll_exact_target(self, *, native_id: str, bridge_id: str) -> bool:
+    def _poll_exact_target(
+        self,
+        *,
+        native_id: str,
+        bridge_id: str,
+        marker: str,
+        title: str,
+        cwd: str | None,
+    ) -> bool:
         deadline = self._monotonic() + self._discovery_timeout
         while True:
             path = self._source_adapter.find_native_session(native_id)
             if path is not None:
+                parse_failure: PlaceholderCreationError | None = None
                 try:
                     projection = self._source_adapter.parse(path).projection
-                except Exception as exc:
-                    raise PlaceholderCreationError("claude_target_unreadable") from exc
+                except Exception:
+                    projection = None
+                    parse_failure = PlaceholderCreationError(
+                        "claude_target_unreadable"
+                    )
+                if parse_failure is not None:
+                    raise parse_failure
+                assert projection is not None
                 if projection.native_id != native_id:
                     raise PlaceholderCreationError("claude_target_mismatch")
+                if projection.title != title:
+                    raise PlaceholderCreationError(
+                        "claude_target_title_mismatch"
+                    )
+                if cwd is not None and not _same_filesystem_location(
+                    projection.cwd, cwd
+                ):
+                    raise PlaceholderCreationError("claude_target_cwd_mismatch")
                 if (
                     projection.origin_kind
                     not in (
@@ -431,6 +503,9 @@ class ClaudeTargetAdapter:
                         OriginKind.BRIDGE_CONTINUATION,
                     )
                     or projection.origin_bridge_id != bridge_id
+                    or not self._source_adapter.projection_has_exact_marker(
+                        projection, marker
+                    )
                 ):
                     raise PlaceholderCreationError("claude_target_marker_mismatch")
                 return True
@@ -502,6 +577,87 @@ def _required_text(value: Any, *, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{label} must not be empty")
     return value.strip()
+
+
+def _single_line_required_text(value: Any, *, label: str) -> str:
+    normalized = _required_text(value, label=label)
+    if "\r" in normalized or "\n" in normalized:
+        raise ValueError(f"{label} must be single-line")
+    return normalized
+
+
+def _command_prefix(
+    value: str | Sequence[str], *, label: str
+) -> tuple[str, ...]:
+    values: Sequence[str] = (value,) if isinstance(value, str) else value
+    if not values:
+        raise ValueError(f"{label} must not be empty")
+    normalized: list[str] = []
+    for entry in values:
+        item = _single_line_required_text(entry, label=f"{label} argv entry")
+        normalized.append(item)
+    return tuple(normalized)
+
+
+def resolve_claude_command(
+    value: str | Sequence[str],
+    *,
+    which: Callable[[str], str | None] | None = None,
+) -> tuple[str, ...]:
+    """Return a shell-free Claude argv prefix safe for direct subprocess use."""
+
+    if not isinstance(value, str):
+        command = _command_prefix(value, label="Claude executable")
+        if Path(command[0]).suffix.casefold() in {".cmd", ".ps1", ".bat"}:
+            raise RuntimeError("unsupported_shell_shim")
+        return command
+
+    normalized = _single_line_required_text(value, label="Claude executable")
+    find = which or shutil.which
+    resolved = str(find(normalized) or normalized)
+    candidate = Path(resolved).expanduser()
+    suffix = candidate.suffix.casefold()
+    if suffix not in {".cmd", ".ps1", ".bat"}:
+        return (str(candidate.resolve()) if candidate.exists() else resolved,)
+    if candidate.stem.casefold() != "claude" or suffix == ".bat":
+        raise RuntimeError("unsupported_shell_shim")
+
+    npm_root = candidate.parent
+    cli = (
+        npm_root
+        / "node_modules"
+        / "@anthropic-ai"
+        / "claude-code"
+        / "cli.js"
+    )
+    local_node = npm_root / "node.exe"
+    resolved_node = (
+        local_node
+        if local_node.is_file()
+        else Path(str(find("node.exe") or find("node") or ""))
+    )
+    if not cli.is_file() or not resolved_node.is_file():
+        raise RuntimeError("unsupported_shell_shim")
+    return (str(resolved_node.resolve()), str(cli.resolve()))
+
+
+def _same_filesystem_location(observed: str | None, expected: str) -> bool:
+    if not isinstance(observed, str) or not observed.strip():
+        return False
+    try:
+        observed_path = Path(observed).expanduser()
+        expected_path = Path(expected).expanduser()
+        if observed_path.exists() and expected_path.exists():
+            return os.path.samefile(observed_path, expected_path)
+        observed_normalized = os.path.normcase(
+            os.path.realpath(os.path.abspath(observed_path))
+        )
+        expected_normalized = os.path.normcase(
+            os.path.realpath(os.path.abspath(expected_path))
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    return observed_normalized == expected_normalized
 
 
 def _positive_number(value: Any, *, label: str) -> float:
