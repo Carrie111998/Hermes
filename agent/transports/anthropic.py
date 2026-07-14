@@ -217,6 +217,8 @@ class AnthropicTransport(ProviderTransport):
             return False
         if not content_blocks:
             return getattr(response, "stop_reason", None) in {"end_turn", "refusal"}
+        if getattr(response, "stop_reason", None) == "tool_use":
+            return any(getattr(block, "type", None) == "tool_use" for block in content_blocks)
         return True
 
     def extract_cache_stats(self, response: Any) -> Optional[Dict[str, int]]:

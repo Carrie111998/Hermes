@@ -1901,6 +1901,18 @@ class TestNormalizeResponse:
         assert nr.content is None
         assert len(nr.tool_calls) == 1
 
+    def test_validate_rejects_tool_use_stop_without_structured_tool_block(self):
+        block = SimpleNamespace(
+            type="text",
+            text=(
+                'call\n<invoke name="mcp__claude-proxy__terminal">\n'
+                '<parameter name="command">echo ok</parameter>\n</invoke>'
+            ),
+        )
+        response = self._make_response([block], "tool_use")
+
+        assert get_transport("anthropic_messages").validate_response(response) is False
+
 
 # ---------------------------------------------------------------------------
 # Role alternation
