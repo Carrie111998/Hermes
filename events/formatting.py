@@ -128,6 +128,9 @@ EVENT_TYPE_EMOJI = {
     # from every other watchdog_alerts icon and (deliberately) not a priority
     # dot, so it doesn't render adjacent to its own HIGH 🟠 dot in the header.
     EventType.RESOURCE_PRESSURE:        "🧯",
+    # Tracker partial/ backlog alert (2026-07-14) — a growing queue of intents
+    # whose Postgres mirror is stuck; the inbox-tray icon reads as "pile-up".
+    EventType.TRACKER_PARTIAL_BACKLOG:  "📥",
 }
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)

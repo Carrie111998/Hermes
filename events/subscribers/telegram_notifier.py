@@ -56,6 +56,9 @@ TOPIC_ROUTING: Dict[str, str] = {
     # Mirror scribe_realtime.py:34-38 so narrated and structured copies
     # land on the same topic; CROSS_POST_TO_ALERTS still cross-posts at HIGH+.
     'job_high_score': 'jobflow_decisions',
+    # Tracker partial-backlog alert (2026-07-14) — operator must re-drive or
+    # investigate a growing partial/ queue; same human-action lane as approvals.
+    'tracker_partial_backlog': 'jobflow_decisions',
     # -> devflow_firehose
     'run_started': 'devflow_firehose',
     'run_completed': 'devflow_firehose',

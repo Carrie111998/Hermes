@@ -1,4 +1,6 @@
 import json
+import os
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -396,3 +398,109 @@ class TestPartialDoesNotBurnIdempotencyKey:
         f = write_intent(mailbox["inbox"], "intent.json", VALID_INTENT_PAYLOAD)
         assert a.apply_one(f) == "applied"
         assert a.idempotency.is_applied(self.KEY)
+
+
+def _write_partial(partial_dir: Path, name: str, payload: dict, age_seconds: float) -> Path:
+    """Write a synthetic partial intent whose mtime is ``age_seconds`` in the past."""
+    partial_dir.mkdir(parents=True, exist_ok=True)
+    p = partial_dir / name
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    past = time.time() - age_seconds
+    os.utime(p, (past, past))
+    return p
+
+
+class TestRedriveMarkerParsing:
+    def test_no_marker_is_attempt_zero(self, applier):
+        a, _j, _m = applier
+        assert a._parse_redrive_attempt(Path("20260713T1_APPROVAL_INTENT_main.json")) == 0
+
+    def test_rd1_marker_parses(self, applier):
+        a, _j, _m = applier
+        assert a._parse_redrive_attempt(Path("x_INTENT_main.rd1.json")) == 1
+
+    def test_rd12_marker_parses(self, applier):
+        a, _j, _m = applier
+        assert a._parse_redrive_attempt(Path("x_INTENT_main.rd12.json")) == 12
+
+    def test_bump_from_zero_appends_rd1(self, applier):
+        a, _j, _m = applier
+        assert a._bump_redrive_marker("x_INTENT_main.json", 1) == "x_INTENT_main.rd1.json"
+
+    def test_bump_replaces_existing_marker(self, applier):
+        a, _j, _m = applier
+        assert a._bump_redrive_marker("x_INTENT_main.rd1.json", 2) == "x_INTENT_main.rd2.json"
+
+
+class TestRedrivePartials:
+    def test_eligible_partial_moves_to_inbox_with_bumped_marker(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=0 -> backoff 120s; age 200s -> eligible.
+        _write_partial(mailbox["partial"], "20260713T1_APPROVAL_INTENT_main.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=200)
+        result = a.redrive_partials()
+        assert result == {"20260713T1_APPROVAL_INTENT_main.json": "redriven"}
+        assert not (mailbox["partial"] / "20260713T1_APPROVAL_INTENT_main.json").exists()
+        assert (mailbox["inbox"] / "20260713T1_APPROVAL_INTENT_main.rd1.json").exists()
+
+    def test_not_yet_eligible_partial_stays(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=0 -> backoff 120s; age 30s -> too young.
+        _write_partial(mailbox["partial"], "20260713T2_APPROVAL_INTENT_main.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=30)
+        result = a.redrive_partials()
+        assert result == {"20260713T2_APPROVAL_INTENT_main.json": "waiting"}
+        assert (mailbox["partial"] / "20260713T2_APPROVAL_INTENT_main.json").exists()
+        assert list(mailbox["inbox"].glob("*")) == []
+
+    def test_backoff_grows_with_attempt(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=1 -> backoff 240s; age 200s -> still waiting (proves 2^N spacing).
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd1.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=200)
+        assert a.redrive_partials() == {"x_APPROVAL_INTENT_main.rd1.json": "waiting"}
+
+    def test_capped_partial_is_left_in_place(self, mailbox, applier):
+        a, _j, _m = applier
+        # N=5 == max_redrive_attempts -> capped, even if ancient.
+        _write_partial(mailbox["partial"], "x_APPROVAL_INTENT_main.rd5.json",
+                       VALID_INTENT_PAYLOAD, age_seconds=99999)
+        result = a.redrive_partials()
+        assert result == {"x_APPROVAL_INTENT_main.rd5.json": "capped"}
+        assert (mailbox["partial"] / "x_APPROVAL_INTENT_main.rd5.json").exists()
+        assert list(mailbox["inbox"].glob("*")) == []
+
+    def test_move_to_partial_resets_mtime(self, mailbox, applier):
+        a, jobops, _m = applier
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("boom")
+        # Write intent with an OLD mtime; landing in partial must reset it to now,
+        # else the per-attempt backoff would measure from intent creation time.
+        f = write_intent(mailbox["inbox"], "20260713T3_APPROVAL_INTENT_main.json",
+                         VALID_INTENT_PAYLOAD)
+        old = time.time() - 5000
+        os.utime(f, (old, old))
+        assert a.apply_one(f) == "partial"
+        landed = mailbox["partial"] / "20260713T3_APPROVAL_INTENT_main.json"
+        assert landed.exists()
+        assert time.time() - landed.stat().st_mtime < 60  # reset to ~now
+
+    def test_redriven_intent_reapplies_end_to_end(self, mailbox, applier):
+        a, jobops, _m = applier
+        # 1) transient failure -> partial (key unburned, mtime reset to now).
+        jobops.post_legacy_stage.side_effect = JobOpsClientTransientError("read timeout")
+        f = write_intent(mailbox["inbox"], "20260713T4_APPROVAL_INTENT_main.json",
+                         VALID_INTENT_PAYLOAD)
+        assert a.apply_one(f) == "partial"
+        key = VALID_INTENT_PAYLOAD["idempotency_key"]
+        assert not a.idempotency.is_applied(key)
+        # 2) age the partial past its 120s backoff, then re-drive.
+        landed = mailbox["partial"] / "20260713T4_APPROVAL_INTENT_main.json"
+        past = time.time() - 200
+        os.utime(landed, (past, past))
+        assert a.redrive_partials() == {"20260713T4_APPROVAL_INTENT_main.json": "redriven"}
+        # 3) :4100 recovers; the re-driven file re-applies on the next scan.
+        jobops.post_legacy_stage.side_effect = None
+        jobops.post_legacy_stage.return_value = {"success": True}
+        outcomes = a.scan_inbox()
+        assert outcomes == {"20260713T4_APPROVAL_INTENT_main.rd1.json": "applied"}
+        assert a.idempotency.is_applied(key)

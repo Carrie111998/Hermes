@@ -36,6 +36,43 @@ from pipeline_state import PipelineManager
 logger = logging.getLogger(__name__)
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _redrive_enabled_from_env() -> bool:
+    """The HARD-GATE feature flag. Default OFF until :4100 runs 8d7b5f5's dist.
+
+    Auto-re-drive must stay disabled until jobflow-api :4100 is restarted with
+    the idempotent no-op guard + lock/statement timeouts LIVE, or re-driving an
+    already-applied intent could double-write / re-fire notifications.
+    """
+    return os.environ.get(
+        "TRACKER_APPLIER_REDRIVE_ENABLED", "0"
+    ).strip().lower() in _TRUTHY
+
+
+def _redrive_config_from_env() -> dict:
+    """Backoff/attempt tuning for IntentApplier.redrive_partials(), env-overridable."""
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ[name])
+        except (KeyError, ValueError):
+            return default
+
+    def _i(name: str, default: int) -> int:
+        try:
+            return int(os.environ[name])
+        except (KeyError, ValueError):
+            return default
+
+    return {
+        "redrive_base_backoff": _f("TRACKER_APPLIER_REDRIVE_BASE_SECONDS", 120.0),
+        "redrive_multiplier": _f("TRACKER_APPLIER_REDRIVE_MULTIPLIER", 2.0),
+        "redrive_max_backoff": _f("TRACKER_APPLIER_REDRIVE_MAX_BACKOFF_SECONDS", 1800.0),
+        "max_redrive_attempts": _i("TRACKER_APPLIER_REDRIVE_MAX_ATTEMPTS", 5),
+    }
+
+
 def _hermes_root() -> Path:
     return Path(os.environ.get("HERMES_ROOT", str(Path.home() / ".hermes")))
 
@@ -48,6 +85,11 @@ def _tracker_mailbox(root: Path) -> Dict[str, Path]:
         "partial": base / "partial",
         "dead_letter": base / "dead-letter",
     }
+
+
+def tracker_partial_dir() -> Path:
+    """The tracker mailbox partial/ dir — read-only counted by PartialBacklogMonitor."""
+    return _tracker_mailbox(_hermes_root())["partial"]
 
 
 class TrackerIntentApplierSubscriber(BaseSubscriber):
@@ -75,6 +117,8 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             "HERMES_JOBOPS_URL", "http://127.0.0.1:4100"
         )
         self._applier: IntentApplier | None = None
+        self._redrive_enabled = _redrive_enabled_from_env()
+        self._redrive_config = _redrive_config_from_env()
 
     def startup(self) -> None:
         """Build the applier with rehydrated idempotency state."""
@@ -104,11 +148,13 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
             jobops_client=JobOpsClient(base_url=self._jobops_url),
             idempotency=idempotency,
             resume_full=_resume_full,
+            **self._redrive_config,
         )
         logger.info(
-            "tracker-intent-applier: ready (inbox=%s, jobops=%s)",
+            "tracker-intent-applier: ready (inbox=%s, jobops=%s, redrive_enabled=%s)",
             self._mailbox["inbox"],
             self._jobops_url,
+            self._redrive_enabled,
         )
 
     def handle(self, event: Event) -> None:
@@ -148,3 +194,19 @@ class TrackerIntentApplierSubscriber(BaseSubscriber):
                 len(outcomes), applied, partial, dead, skipped,
             )
         return len(outcomes)
+
+    def redrive_partials(self) -> int:
+        """Flag-gated wrapper: re-drive eligible partials iff the feature is enabled.
+
+        The HARD GATE. Returns the number of partials re-driven this sweep (0 when
+        disabled or nothing eligible). IntentApplier.redrive_partials() itself is
+        pure/always-acts; THIS method is the feature flag — it must stay OFF until
+        :4100 runs 8d7b5f5's dist (idempotent no-op guard live).
+        """
+        if not self._redrive_enabled or self._applier is None:
+            return 0
+        results = self._applier.redrive_partials()
+        redriven = sum(1 for v in results.values() if v == "redriven")
+        if redriven:
+            logger.info("tracker-intent-applier: re-drove %d partial(s)", redriven)
+        return redriven

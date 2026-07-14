@@ -23,6 +23,7 @@ from events.paths import (
 from events.producers.health_monitor import GatewayHealthMonitor
 from events.producers.mailbox_watcher import MailboxWatcher
 from events.producers.resource_monitor import ResourcePressureMonitor
+from events.producers.partial_backlog_monitor import PartialBacklogMonitor
 from events.state import load_state, save_state
 from events.subscribers.base import SubscriberRegistry
 from events.subscribers.audit_logger import AuditLogger
@@ -34,7 +35,10 @@ from events.subscribers.memory_writer import MemoryWriter
 from events.subscribers.telegram_mirror import TelegramMirror
 from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.cron_stale_monitor import CronStaleMonitor
-from events.subscribers.tracker_intent_applier import TrackerIntentApplierSubscriber
+from events.subscribers.tracker_intent_applier import (
+    TrackerIntentApplierSubscriber,
+    tracker_partial_dir,
+)
 from events.subscribers.critic_trigger import CriticSubscriber
 from events.subscribers.scribe_realtime import ScribeRealtime
 from events.subscribers.scribe_action_telemetry import ScribeActionTelemetry
@@ -76,11 +80,18 @@ FLUSH_RETRY_INTERVAL_SECONDS = 900  # 15 min
 # the shared serial loop (2026-07-13 starvation fix) so this is its real,
 # uncontended floor rather than a best-case the serial loop rarely hits.
 APPLIER_POLL_INTERVAL_SECONDS = 1
+# Auto-re-drive eligible partials at most once/min, on the dedicated applier
+# thread (single-writer). Flag-gated at the subscriber (default off — the :4100
+# hard gate). See docs/superpowers/specs/2026-07-14-tracker-applier-auto-redrive-design.md.
+REDRIVE_INTERVAL_SECONDS = 60
+# Read-only partial/ backlog count on the shared subscriber loop, once/min.
+PARTIAL_BACKLOG_CHECK_INTERVAL_SECONDS = 60
 
 _bus: Optional[EventBus] = None
 _registry: Optional[SubscriberRegistry] = None
 _health_monitor: Optional[GatewayHealthMonitor] = None
 _resource_monitor: Optional[ResourcePressureMonitor] = None
+_partial_backlog_monitor: Optional[PartialBacklogMonitor] = None
 _mailbox_watcher: Optional[MailboxWatcher] = None
 _subscriber_thread: Optional[threading.Thread] = None
 # Dedicated poll thread + its subscriber for the tracker-intent-applier. The
@@ -105,7 +116,7 @@ _gateway_started_at_monotonic: Optional[float] = None
 
 def startup(adapters: Optional[Dict] = None) -> None:
     """Initialize EventBus, register all subscribers, start polling thread."""
-    global _bus, _registry, _health_monitor, _resource_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
+    global _bus, _registry, _health_monitor, _resource_monitor, _partial_backlog_monitor, _mailbox_watcher, _subscriber_thread, _applier_thread, _applier_subscriber, _startup_monotonic
 
     if _bus is not None:
         shutdown()
@@ -117,6 +128,11 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _registry = SubscriberRegistry()
     _health_monitor = GatewayHealthMonitor(_bus)
     _resource_monitor = ResourcePressureMonitor(_bus)
+    # Always-on tracker partial/ backlog alert (independent of the re-drive flag).
+    # Construction is side-effect-free (stores the path; counts only on check()).
+    _partial_backlog_monitor = PartialBacklogMonitor(
+        _bus, partial_dir=tracker_partial_dir(),
+    )
     _mailbox_watcher = MailboxWatcher(_bus)
 
     # Register subscribers
@@ -316,6 +332,11 @@ def get_health_monitor() -> Optional[GatewayHealthMonitor]:
 def get_resource_monitor() -> Optional[ResourcePressureMonitor]:
     """Get the resource-pressure monitor (commit/pagefile/disk sampling)."""
     return _resource_monitor
+
+
+def get_partial_backlog_monitor() -> Optional[PartialBacklogMonitor]:
+    """Get the tracker partial-backlog monitor (counts mailbox/tracker/partial/)."""
+    return _partial_backlog_monitor
 
 
 def _check_subscriber_lag(
@@ -533,6 +554,10 @@ def _subscriber_poll_loop() -> None:
     # reads the real host (kernel32 + disk stat) and fires real emits, which
     # gi.startup()-based tests would otherwise pay on every startup.
     last_resource_check: float = time.monotonic()
+    # Skip the boot tick like last_resource_check: reconnect storms make the
+    # first sample noisy, and the edge state is in-process so a crash-loop under
+    # a sustained backlog would re-fire the rising edge on every restart.
+    last_partial_backlog_check: float = time.monotonic()
     last_lag_check: float = 0
     last_cleanup: float = 0
     last_checkpoint: float = 0
@@ -727,6 +752,18 @@ def _subscriber_poll_loop() -> None:
                     logger.exception("Resource pressure check failed")
                 last_resource_check = now
 
+            # Tracker partial-backlog check every 60s — counts
+            # mailbox/tracker/partial/ and emits TRACKER_PARTIAL_BACKLOG on the
+            # rising edge of count > threshold (2026-07-14; the 07-13 pileup sat
+            # ~a day unnoticed). Read-only, so it runs here in the shared loop
+            # rather than the latency-sensitive applier thread.
+            if _partial_backlog_monitor and now - last_partial_backlog_check >= PARTIAL_BACKLOG_CHECK_INTERVAL_SECONDS:
+                try:
+                    _partial_backlog_monitor.check()
+                except Exception:
+                    logger.exception("Partial backlog check failed")
+                last_partial_backlog_check = now
+
             # Scan mailbox every 60 seconds
             if _mailbox_watcher and now - last_mailbox_scan >= 60:
                 try:
@@ -850,10 +887,24 @@ def _applier_poll_loop() -> None:
             _applier_subscriber, "poll_interval_seconds", interval
         ) or interval
 
+    # Skip the boot tick (reconnect-storm window); first re-drive one interval in.
+    last_redrive = time.monotonic()
+
     while not _stop_event.is_set():
         try:
             if _applier_subscriber is not None:
                 _applier_subscriber.poll()
         except Exception:
             logger.exception("tracker-intent-applier dedicated poll failed")
+        # Auto-re-drive eligible partials at most once/min, on THIS single-writer
+        # thread (never the shared loop) so it can't race scan_inbox's
+        # is_applied/mark_applied/_move_to. Flag-gated inside the subscriber
+        # (TRACKER_APPLIER_REDRIVE_ENABLED, default off — the :4100 hard gate).
+        now = time.monotonic()
+        if _applier_subscriber is not None and now - last_redrive >= REDRIVE_INTERVAL_SECONDS:
+            try:
+                _applier_subscriber.redrive_partials()
+            except Exception:
+                logger.exception("tracker-intent-applier redrive failed")
+            last_redrive = now
         _stop_event.wait(timeout=interval)

@@ -13,3 +13,11 @@ def test_resource_pressure_routes_to_watchdog_alerts():
     # stream the operator already watches for infrastructure trouble.
     from events.subscribers.telegram_notifier import TOPIC_ROUTING
     assert TOPIC_ROUTING["resource_pressure"] == "watchdog_alerts"
+
+
+def test_tracker_partial_backlog_routes_to_jobflow_decisions():
+    # The partial-backlog alert (2026-07-14) is a human-action signal: an
+    # operator must re-drive or investigate a growing partial/ queue — same lane
+    # as approvals/apply-packets.
+    from events.subscribers.telegram_notifier import TOPIC_ROUTING
+    assert TOPIC_ROUTING["tracker_partial_backlog"] == "jobflow_decisions"

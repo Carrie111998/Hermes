@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +55,12 @@ logger = logging.getLogger(__name__)
 
 # Intents whose protected stages must be mirrored to Postgres via tracker_only-allowed source.
 PROTECTED_STAGES = {"approved", "final_submission", "applied"}
+
+
+# Re-drive attempt marker: original intent stems never end in ``.rd<digits>``
+# (they end in the poster tag, e.g. ``_main`` or a job8 hex), so a trailing
+# ``.rdN`` on the stem is unambiguously the applier's own re-drive counter.
+_REDRIVE_MARKER_RE = re.compile(r"\.rd(\d+)$")
 
 
 class IntentApplier:
@@ -79,6 +88,10 @@ class IntentApplier:
         idempotency: IdempotencyTracker,
         circuit_breaker: Optional[SimpleCircuitBreaker] = None,
         resume_full: Optional[Callable[[str, dict], object]] = None,
+        redrive_base_backoff: float = 120.0,
+        redrive_multiplier: float = 2.0,
+        redrive_max_backoff: float = 1800.0,
+        max_redrive_attempts: int = 5,
     ):
         self.inbox_dir = Path(inbox_dir)
         self.processed_dir = Path(processed_dir)
@@ -91,6 +104,10 @@ class IntentApplier:
             failure_threshold=5, reset_timeout_seconds=300.0,
         )
         self.resume_full = resume_full
+        self.redrive_base_backoff = redrive_base_backoff
+        self.redrive_multiplier = redrive_multiplier
+        self.redrive_max_backoff = redrive_max_backoff
+        self.max_redrive_attempts = max_redrive_attempts
         for d in (self.inbox_dir, self.processed_dir, self.partial_dir, self.dead_letter_dir):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -188,7 +205,7 @@ class IntentApplier:
             # (job, stage) transition to be silently skipped_idempotent
             # (observed 2026-07-13, job 4de4f9fb :withdrawn). The key is
             # committed only on a confirmed 2xx at step 6.
-            self._move_to(intent_path, self.partial_dir)
+            self._move_to_partial(intent_path)
             return "partial"
         except JobOpsClientTransientError as exc:
             logger.warning("intent-applier: JobOps transient error for %s: %s", msg.job_id, exc)
@@ -202,7 +219,7 @@ class IntentApplier:
             # downstream by idempotency_key, and gating only the mirror would
             # desync the legacy vs tracker-canonical projections. See the
             # _emit_canonical_pipeline_update docstring.
-            self._move_to(intent_path, self.partial_dir)
+            self._move_to_partial(intent_path)
             return "partial"
         except JobOpsClientPermanentError as exc:
             logger.error("intent-applier: JobOps permanent error for %s: %s", msg.job_id, exc)
@@ -318,3 +335,85 @@ class IntentApplier:
         dest = dest_dir / src.name
         src.replace(dest)
         return dest
+
+    def _move_to_partial(self, src: Path) -> Path:
+        """Move an intent into partial/ and stamp its mtime to NOW.
+
+        rename/replace PRESERVE mtime, so without this the file's mtime would be
+        the intent's *creation* time and the per-attempt exponential backoff in
+        redrive_partials() would never space retries. Stamping on landing makes
+        partial mtime mean "when it last entered partial/".
+        """
+        dest = self._move_to(src, self.partial_dir)
+        os.utime(dest, None)
+        return dest
+
+    def _parse_redrive_attempt(self, path: Path) -> int:
+        """Parse the re-drive attempt count N from a ``.rdN`` filename marker.
+
+        ``Path.stem`` has already stripped ``.json``. No marker => attempt 0.
+        """
+        m = _REDRIVE_MARKER_RE.search(path.stem)
+        return int(m.group(1)) if m else 0
+
+    def _bump_redrive_marker(self, name: str, new_n: int) -> str:
+        """Return ``name`` (a ``*.json`` filename) with any ``.rdN`` marker
+        replaced by ``.rd{new_n}``."""
+        stem = name[:-5] if name.endswith(".json") else name
+        stem = _REDRIVE_MARKER_RE.sub("", stem)
+        return f"{stem}.rd{new_n}.json"
+
+    def redrive_partials(self) -> dict[str, str]:
+        """Move backoff-eligible partials back to inbox/ for reprocessing.
+
+        Pure filesystem logic; ALWAYS acts (the feature flag lives at the
+        subscriber layer). MUST be called on the single-writer applier thread —
+        it shares _move_to/glob semantics with scan_inbox and is not race-free
+        against a concurrent scan.
+
+        For each ``*_INTENT_*.json`` in partial/:
+          * attempt N = ``.rdN`` marker (absent => 0);
+          * if N >= max_redrive_attempts => leave in place ("capped") for the
+            PartialBacklogMonitor alert (partials are not dead: step-3 succeeded,
+            key unburned, still manually re-drivable);
+          * else eligible iff ``now - mtime >= min(base * mult**N, max_backoff)``,
+            where mtime is the "entered-partial" clock set by _move_to_partial;
+          * eligible => rename to ``.rd{N+1}`` and move to inbox/; the next 1s
+            scan_inbox re-runs steps 3/3b/4 (key unburned => it re-applies).
+
+        Returns {original_filename: "redriven" | "waiting" | "capped"}.
+        """
+        results: dict[str, str] = {}
+        now = time.time()
+        for path in sorted(self.partial_dir.glob("*_INTENT_*.json")):
+            n = self._parse_redrive_attempt(path)
+            if n >= self.max_redrive_attempts:
+                results[path.name] = "capped"
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                # File vanished mid-sweep (raced by another mover) — skip.
+                continue
+            backoff = min(
+                self.redrive_base_backoff * (self.redrive_multiplier ** n),
+                self.redrive_max_backoff,
+            )
+            if age < backoff:
+                results[path.name] = "waiting"
+                continue
+            new_name = self._bump_redrive_marker(path.name, n + 1)
+            self.inbox_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                path.replace(self.inbox_dir / new_name)
+            except OSError:
+                logger.exception(
+                    "intent-applier: failed to re-drive partial %s", path.name
+                )
+                continue
+            results[path.name] = "redriven"
+            logger.info(
+                "intent-applier: re-driving partial %s -> inbox/%s (attempt %d)",
+                path.name, new_name, n + 1,
+            )
+        return results
