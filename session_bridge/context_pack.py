@@ -108,6 +108,11 @@ _GBRAIN_CONTEXT_RE = re.compile(
     r"(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)",
     re.IGNORECASE,
 )
+_GBRAIN_EXPLICIT_WIKI_RE = re.compile(
+    r"\bgbrain\s+wiki\s+"
+    r"\[\[(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)\]\]",
+    re.IGNORECASE,
+)
 _GBRAIN_WIKI_RE = re.compile(
     r"\[\[(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)\]\]"
 )
@@ -136,6 +141,12 @@ _ASSIGNMENT_START_RE = re.compile(
 )
 _GIT_STATUS_MAX_LINES = 200
 _GIT_STATUS_MAX_CHARS = 32_768
+_STALE_WARNING = (
+    "- [stale source] The source refresh did not reach a confirmed current snapshot."
+)
+_DIVERGED_WARNING = (
+    "- [diverged] Both linked descendants advanced; this pack does not merge them."
+)
 
 
 class ContextPackBuilder:
@@ -186,13 +197,9 @@ class ContextPackBuilder:
             snapshot.activity_value_json,
         )
         if request.stale:
-            warnings.append(
-                "- [stale source] The source refresh did not reach a confirmed current snapshot."
-            )
+            warnings.append(_STALE_WARNING)
         if request.diverged:
-            warnings.append(
-                "- [diverged] Both linked descendants advanced; this pack does not merge them."
-            )
+            warnings.append(_DIVERGED_WARNING)
         if snapshot_mismatch:
             warnings.append(
                 "- [snapshot identity mismatch] The requested cursor/hash differs from the latest indexed identity."
@@ -348,9 +355,10 @@ class ContextPackBuilder:
         if row["target_session_id"] != expected_target_session_id:
             raise ValueError("context pack target identity mismatch")
         warnings = _rendered_section_body(row["payload"], "Warnings")
-        if request.stale and (warnings is None or "[stale source]" not in warnings):
+        warning_lines = set(warnings.splitlines()) if warnings is not None else set()
+        if request.stale and _STALE_WARNING not in warning_lines:
             raise ValueError("context pack stale source warning missing")
-        if request.diverged and (warnings is None or "[diverged]" not in warnings):
+        if request.diverged and _DIVERGED_WARNING not in warning_lines:
             raise ValueError("context pack diverged warning missing")
 
     def _persist_pack_once(
@@ -578,15 +586,22 @@ class ContextPackBuilder:
                     "- [repository unavailable] Git status could not be executed."
                 )
             else:
-                stdout = completed.stdout if isinstance(completed.stdout, str) else ""
-                bounded_stdout = stdout[: _GIT_STATUS_MAX_CHARS + 1]
-                output_truncated = len(stdout) > _GIT_STATUS_MAX_CHARS
+                returncode = completed.returncode
+                full_stdout = (
+                    completed.stdout if isinstance(completed.stdout, str) else ""
+                )
+                bounded_stdout = full_stdout[: _GIT_STATUS_MAX_CHARS + 1]
+                output_truncated = len(full_stdout) > _GIT_STATUS_MAX_CHARS
+                # The mandated subprocess contract captures complete output. Drop
+                # those full strings immediately after retaining the bounded copy.
                 try:
                     completed.stdout = ""
                     completed.stderr = ""
                 except (AttributeError, TypeError):
                     pass
-                if completed.returncode != 0:
+                del full_stdout
+                del completed
+                if returncode != 0:
                     warnings.append(
                         "- [repository unavailable] The recorded cwd is not an accessible git repository."
                     )
@@ -875,6 +890,7 @@ def _memory_references(value: str) -> list[str]:
     for pattern, group in (
         (_MEMPALACE_DRAWER_RE, 0),
         (_MEMPALACE_CONTEXT_RE, "reference"),
+        (_GBRAIN_EXPLICIT_WIKI_RE, "reference"),
         (_GBRAIN_CONTEXT_RE, "reference"),
     ):
         for match in pattern.finditer(value):
@@ -919,35 +935,71 @@ def _redact_assignments(value: str) -> str:
 
 
 def _assignment_value_end(value: str, start: int) -> int:
-    line_end = value.find("\n", start)
-    if line_end < 0:
-        line_end = len(value)
-    if start >= line_end:
+    if start >= len(value):
         return start
 
-    escaped_quote = value[start : start + 2]
-    if escaped_quote in (r"\"", r"\'"):
-        close = value.find(escaped_quote, start + 2, line_end)
-        return close + 2 if close >= 0 else line_end
+    for delimiter in ('"""', "'''", r"\"\"\"", r"\'\'\'"):
+        if value.startswith(delimiter, start):
+            return _quoted_value_end(value, start, delimiter)
 
-    quote = value[start]
-    if quote in ('"', "'"):
-        index = start + 1
-        while index < line_end:
-            if value[index] == "\\":
-                index += 2
-                continue
-            if value[index] == quote:
-                return index + 1
-            index += 1
-        return line_end
+    for delimiter in ('"', "'", r"\"", r"\'"):
+        if value.startswith(delimiter, start):
+            return _quoted_value_end(value, start, delimiter)
+
+    if value[start] in "{[":
+        return _structured_value_end(value, start)
 
     index = start
-    while (
-        index < line_end and not value[index].isspace() and value[index] not in ",;}]"
-    ):
+    while index < len(value) and value[index] not in "\r\n,;}]":
         index += 1
     return index
+
+
+def _quoted_value_end(value: str, start: int, delimiter: str) -> int:
+    index = start + len(delimiter)
+    while index < len(value):
+        delimiter_is_unescaped = (
+            not delimiter.startswith("\\") or value[index - 1] != "\\"
+        )
+        if delimiter_is_unescaped and value.startswith(delimiter, index):
+            return index + len(delimiter)
+        if value[index] == "\\" and not delimiter.startswith("\\"):
+            index += 2
+        else:
+            index += 1
+    return len(value)
+
+
+def _structured_value_end(value: str, start: int) -> int:
+    closing_for = {"{": "}", "[": "]"}
+    stack = [closing_for[value[start]]]
+    index = start + 1
+    quoted_delimiters = ('"""', "'''", r"\"\"\"", r"\'\'\'", '"', "'", r"\"", r"\'")
+    while index < len(value):
+        delimiter = next(
+            (
+                candidate
+                for candidate in quoted_delimiters
+                if value.startswith(candidate, index)
+            ),
+            None,
+        )
+        if delimiter is not None:
+            index = _quoted_value_end(value, index, delimiter)
+            continue
+        character = value[index]
+        if character in closing_for:
+            stack.append(closing_for[character])
+        elif character in "}]":
+            if character != stack[-1]:
+                return len(value)
+            stack.pop()
+            if not stack:
+                return index + 1
+        elif character == "\\":
+            index += 1
+        index += 1
+    return len(value)
 
 
 def _render_sections(bodies: Mapping[str, str]) -> str:
@@ -1005,7 +1057,7 @@ def _select_recent(items: Sequence[_RecentItem], budget: int) -> list[_RecentIte
         remaining = budget - used - separator
         keep = remaining - len(marker)
         if keep > 0:
-            selected_reversed.append(_RecentItem(item.text[:keep].rstrip() + marker))
+            selected_reversed.append(_RecentItem(item.text[:keep] + marker))
         elif remaining > 0:
             selected_reversed.append(_RecentItem(item.text[:remaining]))
         break

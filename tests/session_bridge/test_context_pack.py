@@ -12,6 +12,7 @@ from session_bridge.context_pack import (
     ContextPackBuilder,
     ContextPackRequest,
     _RecentItem,
+    _format_turn,
     _select_recent,
     _stable_pack_id,
 )
@@ -510,6 +511,28 @@ def test_actual_gbrain_wikilink_namespaces_are_recognized(db: SessionDB):
     assert "foo/bar" not in links
 
 
+def test_explicit_gbrain_wiki_context_accepts_custom_namespaces(db: SessionDB):
+    store = _seed(
+        db,
+        [
+            _message(
+                "u1",
+                "user",
+                "GBrain wiki [[custom-space/custom-page]] and GBrain wiki [[foo/bar]].",
+                timestamp=101.0,
+            )
+        ],
+    )
+
+    links = _section(
+        ContextPackBuilder(db, store).build(_request()).payload,
+        SECTION_HEADINGS[7],
+    )
+
+    assert "custom-space/custom-page" in links
+    assert "foo/bar" in links
+
+
 def test_truncation_is_bounded_keeps_newest_turns_and_is_explicit(db: SessionDB):
     messages = [
         _message(
@@ -577,6 +600,23 @@ def test_tiny_recent_capacity_is_still_allocated(capacity: int):
 
     assert len(rendered) <= capacity
     assert len(rendered) >= math.ceil(capacity * 0.45)
+
+
+@pytest.mark.parametrize("capacity", [100, 200])
+def test_recent_truncation_preserves_whitespace_capacity(capacity: int):
+    formatted_turn = _format_turn(
+        "user",
+        "prefix" + (" " * 500) + "suffix",
+        101.0,
+    )
+    item = _RecentItem(formatted_turn + (" " * 500))
+
+    selected = _select_recent([item], capacity)
+    rendered = "\n".join(value.text for value in selected)
+
+    assert len(rendered) == capacity
+    assert len(rendered) >= math.ceil(capacity * 0.45)
+    assert rendered.endswith("\n  [turn truncated]")
 
 
 def test_build_is_repeatable_and_hydrated_pack_is_immutable(db: SessionDB):
@@ -758,8 +798,53 @@ def test_existing_pack_accepts_both_safety_markers_in_warnings_section(db: Sessi
     warnings = _section(replay.payload, SECTION_HEADINGS[8])
 
     assert replay == first
-    assert "[stale source]" in warnings
-    assert "[diverged]" in warnings
+    assert (
+        "- [stale source] The source refresh did not reach a confirmed current snapshot."
+        in warnings.splitlines()
+    )
+    assert (
+        "- [diverged] Both linked descendants advanced; this pack does not merge them."
+        in warnings.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("stale", "diverged", "marker", "error"),
+    [
+        (True, False, "[stale source]", "stale source warning missing"),
+        (False, True, "[diverged]", "diverged warning missing"),
+    ],
+)
+def test_safety_marker_substring_is_not_a_canonical_warning_line(
+    db: SessionDB,
+    stale: bool,
+    diverged: bool,
+    marker: str,
+    error: str,
+):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Safety warning snapshot", timestamp=101.0)],
+    )
+    builder = ContextPackBuilder(db, store)
+    request = replace(_request(), stale=stale, diverged=diverged)
+
+    first = builder.build(request)
+    decoy_payload = _replace_section(
+        first.payload,
+        "## Warnings",
+        f"- [integrity decoy] This line only mentions {marker}.",
+    )
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "UPDATE session_context_packs SET payload = ? WHERE id = ?",
+            (decoy_payload, first.id),
+        )
+
+    with pytest.raises(ValueError, match=error):
+        builder.build(request)
 
 
 def test_exact_mutable_snapshot_is_frozen_on_first_persisted_build(
@@ -1320,6 +1405,111 @@ def test_quoted_multiword_assignments_are_fully_redacted_everywhere(db: SessionD
     assert source_id in payload
 
 
+@pytest.mark.parametrize(
+    ("assignment", "secret_fragments"),
+    [
+        (
+            'password="DOUBLE LINE1\nDOUBLE LINE2"\nafter=visible',
+            ("DOUBLE LINE1", "DOUBLE LINE2"),
+        ),
+        (
+            "token='SINGLE LINE1\nSINGLE LINE2'\nafter=visible",
+            ("SINGLE LINE1", "SINGLE LINE2"),
+        ),
+        (
+            'password="""TRIPLE DOUBLE LINE1\nTRIPLE DOUBLE LINE2"""\nafter=visible',
+            ("TRIPLE DOUBLE LINE1", "TRIPLE DOUBLE LINE2"),
+        ),
+        (
+            "token='''TRIPLE SINGLE LINE1\nTRIPLE SINGLE LINE2'''\nafter=visible",
+            ("TRIPLE SINGLE LINE1", "TRIPLE SINGLE LINE2"),
+        ),
+        (
+            'password="UNTERMINATED DOUBLE LINE1\nUNTERMINATED DOUBLE LINE2',
+            ("UNTERMINATED DOUBLE LINE1", "UNTERMINATED DOUBLE LINE2"),
+        ),
+        (
+            "token='UNTERMINATED SINGLE LINE1\nUNTERMINATED SINGLE LINE2",
+            ("UNTERMINATED SINGLE LINE1", "UNTERMINATED SINGLE LINE2"),
+        ),
+        (
+            'password="""UNTERMINATED TRIPLE LINE1\nUNTERMINATED TRIPLE LINE2',
+            ("UNTERMINATED TRIPLE LINE1", "UNTERMINATED TRIPLE LINE2"),
+        ),
+        (
+            "token='''UNTERMINATED TRIPLE SINGLE LINE1\n"
+            "UNTERMINATED TRIPLE SINGLE LINE2",
+            (
+                "UNTERMINATED TRIPLE SINGLE LINE1",
+                "UNTERMINATED TRIPLE SINGLE LINE2",
+            ),
+        ),
+    ],
+)
+def test_multiline_and_unterminated_assignment_values_are_fully_redacted(
+    db: SessionDB,
+    assignment: str,
+    secret_fragments: tuple[str, ...],
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = f"ordinary_uuid={uuid}\nsource_id={source_id}\n{assignment}"
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    for fragment in secret_fragments:
+        assert fragment not in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
+@pytest.mark.parametrize(
+    ("assignment", "secret_fragments"),
+    [
+        (
+            'password={"nested":{"value":"OBJECT SUPER SECRET VALUE"},'
+            '"items":[1,2]}; after=visible',
+            ("SUPER SECRET VALUE",),
+        ),
+        (
+            'token=["ARRAY SUPER SECRET VALUE",{"deep":"ARRAY SECRET SUFFIX"}], '
+            "after=visible",
+            ("ARRAY SUPER SECRET VALUE", "ARRAY SECRET SUFFIX"),
+        ),
+        (
+            r"{\"password\":{\"nested\":\"ESCAPED SUPER SECRET VALUE\"}}",
+            ("SUPER SECRET VALUE",),
+        ),
+        (
+            r"{\"password\":{\"nested\":\"ESCAPED SUPER \\\"}\\\" SECRET SUFFIX\"},"
+            r"\"after\":1}",
+            ("SECRET SUFFIX",),
+        ),
+        (
+            "password=UNQUOTED SUPER SECRET VALUE; after=visible",
+            ("SUPER SECRET VALUE",),
+        ),
+    ],
+)
+def test_structured_and_unquoted_assignment_values_are_fully_redacted(
+    db: SessionDB,
+    assignment: str,
+    secret_fragments: tuple[str, ...],
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = f"ordinary_uuid={uuid}\nsource_id={source_id}\n{assignment}"
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    for fragment in secret_fragments:
+        assert fragment not in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
 def test_unterminated_json_and_escaped_assignments_are_redacted_in_turns_and_git(
     db: SessionDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1327,11 +1517,11 @@ def test_unterminated_json_and_escaped_assignments_are_redacted_in_turns_and_git
     cwd.mkdir()
     uuid = "123e4567-e89b-12d3-a456-426614174000"
     content = (
+        f"ordinary_uuid={uuid}\nsource_id=claude:source-1\n"
         'Decision: password="UNTERMINATED DOUBLE SECRET\n'
         "TODO: token='UNTERMINATED SINGLE SECRET\n"
         '{"token":"SUPERSECRET123"}\n'
         r"{\"password\":\"SUPER ESCAPED SECRET\"}"
-        f"\nordinary_uuid={uuid}\nsource_id=claude:source-1"
     )
     store = _seed(
         db,
@@ -1363,7 +1553,7 @@ def test_unterminated_json_and_escaped_assignments_are_redacted_in_turns_and_git
         "STDERRSECRET",
     ):
         assert secret not in payload
-    assert payload.count("[REDACTED]") >= 6
+    assert payload.count("[REDACTED]") >= 2
     assert uuid in payload
     assert "claude:source-1" in payload
 
