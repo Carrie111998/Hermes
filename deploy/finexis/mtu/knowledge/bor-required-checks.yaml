@@ -153,7 +153,7 @@ checks:
     per_case_question: false
     sentence: "The client was advised of the replacement disadvantages and wishes to proceed."
     contradiction_rule: "If the advisor explicitly states that the client was not advised, does not wish to proceed, or is uncertain, suppress the standard sentence and escalate to Melody. Do not ask routinely."
-    contradiction_output_rule: "Return only a concise Melody-escalation note. Do not produce a holding draft, partial BOR, disclosures, or placeholders."
+    contradiction_output_rule: "If the advisor explicitly states the client was not advised of the disadvantages, replace that one sentence with [[ESCALATE: client not yet advised of replacement disadvantages — confirm with Melody before use]] and still return the rest of the draft. Do not fabricate the acknowledgement."
     why: "ROP compliance — client must be shown the downside of switching before proceeding."
     grounded: "Amelia-approved standard template 2026-07-14; files 01, 17 — the 4 general disadvantages + 'wish to proceed notwithstanding'"
     applies_when: rop
@@ -207,7 +207,7 @@ output:
     - "a concise Telegram-ready BOR draft (the recommendation-rationale narrative), per recommended product / need-bucket"
     - "only when needed, one short note listing unresolved placeholders or anything to check with Melody"
   interaction:
-    - "If irreducible COLLECT facts are missing, ask once in one compact message instead of drafting; do not recap facts already supplied, output a partial BOR, or append an unresolved list."
+    - "DRAFT-FIRST: once ROP status is known, produce the full BOR in the same turn. Any missing COLLECT fact becomes a specific [[MISSING: ...]] placeholder in the draft, never a pre-draft question and never a reason to withhold the draft. Do not recap facts already supplied."
     - "Do not ask for derived conclusions, standard alternatives, product-comparison freshness, or reference numbers by default."
     - "For Shield/hospitalisation, ask for an exact/versioned rider name when missing or ambiguous; never ask for or print rider benefit limits, deductible, or coinsurance."
     - "For ROP, insert the standard replacement-disadvantages sentence without asking; explicit contradiction or uncertainty suppresses it and escalates to Melody."
