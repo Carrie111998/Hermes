@@ -2592,6 +2592,12 @@ class BasePlatformAdapter(ABC):
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
+        # Profile namespace for adapters owned by the multi-profile gateway.
+        # The primary adapter leaves this unset and SessionStore falls back to
+        # the active profile. Secondary adapters are stamped by GatewayRunner
+        # before they connect so pre-dispatch routing checks can build the same
+        # profile-aware session key as the eventual message handler.
+        self._session_profile: Optional[str] = None
         self._message_handler: Optional[MessageHandler] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
@@ -6149,6 +6155,8 @@ class BasePlatformAdapter(ABC):
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
                 )
+        if profile is None:
+            profile = getattr(self, "_session_profile", None)
 
         source = SessionSource(
             platform=self.platform,
@@ -6176,6 +6184,11 @@ class BasePlatformAdapter(ABC):
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
         return source
+
+    def set_session_profile(self, profile_name: Optional[str]) -> None:
+        """Stamp the fallback profile namespace for this adapter's sources."""
+        normalized = str(profile_name or "").strip()
+        self._session_profile = normalized or None
     
     @abstractmethod
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
