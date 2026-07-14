@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
+import sqlite3
 import threading
 
 import pytest
@@ -13,6 +14,7 @@ from session_bridge.mirror import (
     EligibilityContext,
     MirrorCandidate,
     MirrorPolicy,
+    claim_due_mirror_jobs,
     classify_mirror_eligibility,
     eligible_mirror_candidates,
     enqueue_mirror_job,
@@ -129,6 +131,20 @@ def _job_rows(db: SessionDB) -> list[dict[str, object]]:
             dict(row)
             for row in connection.execute(
                 "SELECT * FROM session_mirror_jobs ORDER BY id"
+            ).fetchall()
+        ]
+
+
+def _authority_rows(db: SessionDB) -> list[dict[str, object]]:
+    with db._lock:
+        connection = db._conn
+        assert connection is not None
+        return [
+            dict(row)
+            for row in connection.execute(
+                """SELECT * FROM session_bridge_state
+                   WHERE key LIKE 'session-bridge:mirror-authority:%'
+                   ORDER BY key"""
             ).fetchall()
         ]
 
@@ -769,6 +785,185 @@ def test_automatic_enqueue_requires_matching_candidate_context_and_policy(db):
     assert _job_rows(db) == []
 
 
+def test_continuous_enqueue_rechecks_current_durable_watermark_atomically(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection(
+        started_at=NOW - 50,
+        last_active=NOW - 10,
+    )
+    store.upsert_projection(projection)
+    persist_continuous_watermark(store, NOW - 100)
+    context = _context(
+        mode=DiscoveryMode.CONTINUOUS,
+        watermark=NOW - 100,
+        policy=policy,
+    )
+    candidate = _candidate(projection, policy=policy)
+    persist_continuous_watermark(store, NOW - 25)
+
+    with pytest.raises(PermissionError, match="before_watermark"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=policy,
+            candidate=candidate,
+            context=context,
+        )
+
+    assert _job_rows(db) == []
+    assert _authority_rows(db) == []
+
+
+def test_cross_generation_active_job_blocks_manual_and_automatic_duplicates(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    projection = _projection()
+    store.upsert_projection(projection)
+    first = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(generation=1),
+        manual_authorized=True,
+    )
+    assert (
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(generation=1),
+            manual_authorized=True,
+        )
+        == first
+    )
+
+    with pytest.raises(ValueError, match="different-generation"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(generation=2),
+            manual_authorized=True,
+        )
+    automatic_policy = MirrorPolicy(generation=2, automatic_creation=True)
+    with pytest.raises(ValueError, match="different-generation"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=automatic_policy,
+            candidate=_candidate(projection, policy=automatic_policy),
+            context=_context(policy=automatic_policy),
+        )
+
+    assert len(_job_rows(db)) == 1
+    assert len(_authority_rows(db)) == 1
+
+
+def test_new_generation_requires_explicit_retry_of_prior_manual_failure(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    first_policy = MirrorPolicy(generation=1, max_attempts=1)
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=first_policy,
+        manual_authorized=True,
+    )
+    claim = claim_due_mirror_jobs(store, limit=1)[0]
+    record_mirror_failure(
+        store,
+        claim,
+        policy=first_policy,
+        now=NOW,
+        code="target_down",
+        detail="temporary",
+    )
+
+    with pytest.raises(ValueError, match="retry_failed"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(generation=2),
+            manual_authorized=True,
+        )
+    second = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(generation=2),
+        manual_authorized=True,
+        retry_failed=True,
+    )
+
+    assert second["state"] == "queued"
+    assert len(_job_rows(db)) == 2
+
+
+def test_prior_succeeded_job_without_mapping_fails_closed_across_generations(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    first = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(generation=1),
+        manual_authorized=True,
+    )
+
+    def mark_succeeded(connection):
+        connection.execute(
+            "UPDATE session_mirror_jobs SET state = 'succeeded' WHERE id = ?",
+            (first["id"],),
+        )
+
+    db._execute_write(mark_succeeded)
+
+    with pytest.raises(ValueError, match="succeeded"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(generation=2),
+            manual_authorized=True,
+            retry_failed=True,
+        )
+
+    assert len(_job_rows(db)) == 1
+
+
+def test_enqueue_rolls_back_job_when_authority_sidecar_write_fails(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+
+    def install_failure_trigger(connection):
+        connection.execute(
+            """CREATE TRIGGER reject_mirror_authority
+               BEFORE INSERT ON session_bridge_state
+               WHEN NEW.key LIKE 'session-bridge:mirror-authority:%'
+               BEGIN
+                   SELECT RAISE(ABORT, 'authority blocked');
+               END"""
+        )
+
+    db._execute_write(install_failure_trigger)
+
+    with pytest.raises(sqlite3.IntegrityError, match="authority blocked"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=True,
+        )
+
+    assert _job_rows(db) == []
+    assert _authority_rows(db) == []
+
+
 def test_retry_delay_is_deterministic_bounded_exponential_with_keyed_jitter():
     key = mirror_idempotency_key("claude:source-1", Provider.CODEX, 1)
 
@@ -893,6 +1088,43 @@ def test_failure_callback_rejects_future_caller_time(db):
     assert _job_rows(db)[0]["state"] == "running"
 
 
+def test_failure_retry_clock_is_sampled_after_write_lock_acquisition(db, monkeypatch):
+    current_time = [NOW]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
+    store.upsert_projection(_projection())
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    claim = claim_due_mirror_jobs(store, limit=1)[0]
+    original_write = db._execute_write
+
+    def advance_before_write(operation):
+        current_time[0] = NOW + 100
+        return original_write(operation)
+
+    monkeypatch.setattr(db, "_execute_write", advance_before_write)
+
+    state = record_mirror_failure(
+        store,
+        claim,
+        policy=MirrorPolicy(),
+        now=NOW,
+        code="target_down",
+        detail="temporary",
+    )
+    durable = _job_rows(db)[0]
+
+    assert state is MirrorJobState.RETRY
+    assert durable["updated_at"] == NOW + 100
+    assert durable["next_attempt_at"] == NOW + 100 + retry_delay_seconds(
+        job["idempotency_key"], 1
+    )
+
+
 @pytest.mark.parametrize(
     "forged_fields",
     (
@@ -992,6 +1224,123 @@ def test_failure_callback_requires_strict_nonempty_diagnostics(db, code, detail)
         )
 
     assert _job_rows(db)[0]["state"] == "running"
+
+
+def test_automatic_job_cannot_be_claimed_after_durable_origin_changes(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection()
+    store.upsert_projection(projection)
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=policy,
+        candidate=_candidate(projection, policy=policy),
+        context=_context(policy=policy),
+    )
+    store.upsert_projection(
+        replace(
+            projection,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-late",
+        )
+    )
+
+    assert claim_due_mirror_jobs(store, limit=1) == []
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "manual_failure"
+    assert durable["attempts"] == 0
+    assert durable["error_code"] == "automatic_authority_revoked"
+
+
+def test_automatic_job_cannot_be_claimed_after_target_mapping_appears(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection()
+    store.upsert_projection(projection)
+    store.upsert_projection(_projection(provider=Provider.CODEX, native_id="target"))
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=policy,
+        candidate=_candidate(projection, policy=policy),
+        context=_context(policy=policy),
+    )
+    store.create_link(
+        SessionLink(
+            id="link-late",
+            from_session_id="claude:source-1",
+            to_session_id="codex:target",
+            relation=Relation.CONTINUES,
+            bridge_id="bridge-late",
+            source_cursor="cursor-1",
+            source_hash="hash-1",
+            created_at=NOW,
+        )
+    )
+
+    assert claim_due_mirror_jobs(store, limit=1) == []
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "manual_failure"
+    assert durable["error_code"] == "automatic_authority_revoked"
+
+
+def test_manual_job_authority_sidecar_intentionally_bypasses_origin_policy(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(
+        _projection(
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
+        )
+    )
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+
+    claimed = claim_due_mirror_jobs(store, limit=1)
+
+    assert len(claimed) == 1
+    assert claimed[0]["state"] == "running"
+    assert claimed[0]["attempts"] == 1
+    assert claim_due_mirror_jobs(store, limit=1) == []
+
+
+def test_claim_fails_closed_when_authority_sidecar_is_missing(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    store.enqueue_mirror_job("claude:source-1", Provider.CODEX, policy_generation=1)
+
+    assert claim_due_mirror_jobs(store, limit=1) == []
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "manual_failure"
+    assert durable["error_code"] == "authority_missing"
+
+
+def test_claim_fails_closed_when_authority_sidecar_is_malformed(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    authority = _authority_rows(db)[0]
+    authority_key = authority["key"]
+    assert isinstance(authority_key, str)
+    store.set_state(authority_key, {"authority": "bogus"})
+
+    assert claim_due_mirror_jobs(store, limit=1) == []
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "manual_failure"
+    assert durable["error_code"] == "authority_invalid"
 
 
 def test_provider_specific_concurrency_limits():

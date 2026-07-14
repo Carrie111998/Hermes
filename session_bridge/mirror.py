@@ -20,6 +20,7 @@ from .store import SessionBridgeStore
 
 _EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
 _CONTINUOUS_WATERMARK_STATE_KEY = "session-bridge:continuous-watermark"
+_MIRROR_AUTHORITY_KEY_PREFIX = "session-bridge:mirror-authority:"
 _SECONDS_PER_DAY = 24 * 60 * 60
 _RETRY_MAX_SECONDS = 300.0
 _RETRY_JITTER_MIN = 0.8
@@ -349,11 +350,14 @@ def enqueue_mirror_job(
     manual_authorized: bool = False,
     candidate: MirrorCandidate | None = None,
     context: EligibilityContext | None = None,
+    retry_failed: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(policy, MirrorPolicy):
         raise TypeError("policy must be a MirrorPolicy")
     if type(manual_authorized) is not bool:
         raise ValueError("manual_authorized must be a boolean")
+    if type(retry_failed) is not bool:
+        raise ValueError("retry_failed must be a boolean")
     source_provider = _canonical_source_provider(source_session_id)
     target = _external_provider(target_provider)
     if target is not _inverted_provider(source_provider):
@@ -363,33 +367,124 @@ def enqueue_mirror_job(
 
     expected_key = mirror_idempotency_key(source_session_id, target, policy.generation)
     if not manual_authorized:
-        enqueue_time = _finite_float("store clock", store._clock())
         _validate_automatic_candidate(
             source_session_id,
             target,
             policy=policy,
             candidate=candidate,
             context=context,
-            now=enqueue_time,
         )
-        return _enqueue_automatic_job(
-            store,
-            source_session_id,
-            source_provider,
-            target,
-            policy=policy,
-            idempotency_key=expected_key,
-            now=enqueue_time,
-        )
-
-    job = store.enqueue_mirror_job(
+    return _enqueue_authorized_job(
+        store,
         source_session_id,
+        source_provider,
         target,
-        policy_generation=policy.generation,
+        policy=policy,
+        idempotency_key=expected_key,
+        authority="manual" if manual_authorized else "automatic",
+        candidate=candidate,
+        context=context,
+        retry_failed=retry_failed,
     )
-    if job.get("idempotency_key") != expected_key:
-        raise RuntimeError("store returned an unexpected mirror idempotency key")
-    return job
+
+
+def claim_due_mirror_jobs(
+    store: SessionBridgeStore,
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    _nonnegative_integer("claim limit", limit)
+    if limit == 0:
+        return []
+
+    def _write(connection: Any) -> list[dict[str, Any]]:
+        now = _finite_float("store clock", store._clock())
+        due = connection.execute(
+            """SELECT * FROM session_mirror_jobs
+               WHERE state IN (?, ?) AND next_attempt_at <= ?
+               ORDER BY next_attempt_at, created_at, id
+               LIMIT ?""",
+            (
+                MirrorJobState.QUEUED.value,
+                MirrorJobState.RETRY.value,
+                now,
+                limit,
+            ),
+        ).fetchall()
+        claimed: list[dict[str, Any]] = []
+        for job in due:
+            try:
+                authority = _read_mirror_authority(connection, job)
+            except _MissingMirrorAuthority:
+                _terminalize_unclaimable_job(
+                    connection,
+                    job,
+                    now=now,
+                    code="authority_missing",
+                    detail="mirror authority metadata is missing",
+                )
+                continue
+            except _InvalidMirrorAuthority:
+                _terminalize_unclaimable_job(
+                    connection,
+                    job,
+                    now=now,
+                    code="authority_invalid",
+                    detail="mirror authority metadata is invalid",
+                )
+                continue
+
+            if authority["authority"] == "automatic":
+                try:
+                    source_provider = _canonical_source_provider(
+                        job["source_session_id"]
+                    )
+                    target_provider = _external_provider(job["target_provider"])
+                    denial = _automatic_authority_denial(
+                        connection,
+                        job["source_session_id"],
+                        source_provider,
+                        target_provider,
+                    )
+                except (TypeError, ValueError):
+                    denial = "automatic mirror authority is invalid"
+                if denial is not None:
+                    _terminalize_unclaimable_job(
+                        connection,
+                        job,
+                        now=now,
+                        code="automatic_authority_revoked",
+                        detail="automatic mirror authority is no longer valid",
+                    )
+                    continue
+
+            cursor = connection.execute(
+                """UPDATE session_mirror_jobs
+                   SET state = ?, attempts = attempts + 1, updated_at = ?
+                   WHERE id = ? AND state = ? AND attempts = ?
+                     AND idempotency_key = ?""",
+                (
+                    MirrorJobState.RUNNING.value,
+                    now,
+                    job["id"],
+                    job["state"],
+                    job["attempts"],
+                    job["idempotency_key"],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale mirror job claim")
+            claimed.append(
+                dict(
+                    connection.execute(
+                        "SELECT * FROM session_mirror_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                )
+            )
+        return claimed
+
+    return store.db._execute_write(_write)
 
 
 def record_mirror_failure(
@@ -420,9 +515,9 @@ def record_mirror_failure(
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts <= 0:
         raise ValueError("job attempts must be a positive integer")
     failure_time = _finite_float("now", now)
-    authoritative_now = _finite_float("store clock", store._clock())
 
     def _write(connection: Any) -> MirrorJobState:
+        authoritative_now = _finite_float("store clock", store._clock())
         durable = connection.execute(
             "SELECT * FROM session_mirror_jobs WHERE id = ?", (job_id,)
         ).fetchone()
@@ -664,34 +759,26 @@ def _validate_automatic_candidate(
     policy: MirrorPolicy,
     candidate: MirrorCandidate | None,
     context: EligibilityContext | None,
-    now: float,
 ) -> None:
     if not isinstance(candidate, MirrorCandidate) or not isinstance(
         context, EligibilityContext
     ):
         raise ValueError("automatic enqueue requires candidate and context")
-    if context.policy != policy or context.now > now:
-        raise ValueError("automatic enqueue context policy or time is stale")
+    if context.policy != policy:
+        raise ValueError("automatic enqueue context policy is stale")
     if (
         candidate.source_session_id != source_session_id
         or candidate.target_provider is not target
     ):
         raise ValueError("automatic enqueue candidate identity does not match")
-    current_context = EligibilityContext(
-        now=now,
-        discovery_mode=context.discovery_mode,
-        continuous_watermark=context.continuous_watermark,
-        existing_target_mappings=context.existing_target_mappings,
-        policy=policy,
-    )
-    eligibility = classify_mirror_eligibility(candidate.projection, current_context)
+    eligibility = classify_mirror_eligibility(candidate.projection, context)
     if not eligibility.eligible or eligibility.target_provider is not target:
         raise PermissionError(
             f"automatic enqueue is not eligible: {eligibility.reason}"
         )
 
 
-def _enqueue_automatic_job(
+def _enqueue_authorized_job(
     store: SessionBridgeStore,
     source_session_id: str,
     source_provider: Provider,
@@ -699,48 +786,89 @@ def _enqueue_automatic_job(
     *,
     policy: MirrorPolicy,
     idempotency_key: str,
-    now: float,
+    authority: Literal["automatic", "manual"],
+    candidate: MirrorCandidate | None,
+    context: EligibilityContext | None,
+    retry_failed: bool,
 ) -> dict[str, Any]:
     job_id = f"job:{idempotency_key}"
 
     def _write(connection: Any) -> dict[str, Any]:
-        source = connection.execute(
-            """SELECT s.source, e.provider, e.native_id, e.origin_kind,
-                      e.origin_bridge_id
-               FROM sessions AS s
-               JOIN external_sessions AS e ON e.session_id = s.id
-               WHERE s.id = ?""",
-            (source_session_id,),
-        ).fetchone()
-        expected_native_id = source_session_id.split(":", 1)[1]
-        if source is None or (
-            source["source"] != source_provider.value
-            or source["provider"] != source_provider.value
-            or source["native_id"] != expected_native_id
-        ):
-            raise PermissionError("automatic enqueue source identity is not durable")
-        if (
-            source["origin_kind"] != OriginKind.NATIVE.value
-            or source["origin_bridge_id"] is not None
-        ):
-            raise PermissionError(
-                "automatic enqueue durable source origin is not native"
+        now = _finite_float("store clock", store._clock())
+        if authority == "automatic":
+            assert candidate is not None
+            assert context is not None
+            continuous_watermark = context.continuous_watermark
+            if context.discovery_mode is DiscoveryMode.CONTINUOUS:
+                watermark_row = connection.execute(
+                    "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                    (_CONTINUOUS_WATERMARK_STATE_KEY,),
+                ).fetchone()
+                if watermark_row is None:
+                    raise PermissionError(
+                        "automatic enqueue is not eligible: before_watermark"
+                    )
+                continuous_watermark = _decode_watermark_state(
+                    watermark_row["value_json"]
+                )
+            current_context = EligibilityContext(
+                now=now,
+                discovery_mode=context.discovery_mode,
+                continuous_watermark=continuous_watermark,
+                existing_target_mappings=context.existing_target_mappings,
+                policy=policy,
             )
+            eligibility = classify_mirror_eligibility(
+                candidate.projection, current_context
+            )
+            if not eligibility.eligible:
+                raise PermissionError(
+                    f"automatic enqueue is not eligible: {eligibility.reason}"
+                )
+            denial = _automatic_authority_denial(
+                connection,
+                source_session_id,
+                source_provider,
+                target_provider,
+            )
+            if denial is not None:
+                raise PermissionError(denial)
 
-        mapped = connection.execute(
-            """SELECT 1
-               FROM session_links AS link
-               JOIN external_sessions AS target
-                 ON target.session_id = link.to_session_id
-               WHERE link.from_session_id = ? AND target.provider = ?
-               LIMIT 1""",
+        pair_jobs = connection.execute(
+            """SELECT * FROM session_mirror_jobs
+               WHERE source_session_id = ? AND target_provider = ?
+               ORDER BY created_at, id""",
             (source_session_id, target_provider.value),
+        ).fetchall()
+        exact_job = next(
+            (job for job in pair_jobs if job["idempotency_key"] == idempotency_key),
+            None,
+        )
+        if exact_job is not None:
+            _read_mirror_authority(connection, exact_job)
+            return dict(exact_job)
+        for prior in pair_jobs:
+            prior_state = MirrorJobState(prior["state"])
+            if prior_state is MirrorJobState.MANUAL_FAILURE:
+                if not retry_failed:
+                    raise ValueError(
+                        "different-generation manual failure requires retry_failed"
+                    )
+                continue
+            if prior_state is MirrorJobState.SUCCEEDED:
+                raise ValueError("prior different-generation job succeeded")
+            raise ValueError("different-generation mirror job is still active")
+
+        authority_key = _mirror_authority_state_key(job_id)
+        orphaned_authority = connection.execute(
+            "SELECT value_json FROM session_bridge_state WHERE key = ?",
+            (authority_key,),
         ).fetchone()
-        if mapped is not None:
-            raise PermissionError("automatic enqueue source is already mapped")
+        if orphaned_authority is not None:
+            raise ValueError("orphaned mirror authority state")
 
         connection.execute(
-            """INSERT OR IGNORE INTO session_mirror_jobs (
+            """INSERT INTO session_mirror_jobs (
                id, idempotency_key, source_session_id, target_provider,
                state, attempts, next_attempt_at, created_at, updated_at
                ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)""",
@@ -755,6 +883,18 @@ def _enqueue_automatic_job(
                 now,
             ),
         )
+        authority_value = _encode_mirror_authority(
+            authority=authority,
+            idempotency_key=idempotency_key,
+            source_session_id=source_session_id,
+            target_provider=target_provider,
+            policy_generation=policy.generation,
+        )
+        connection.execute(
+            """INSERT INTO session_bridge_state (key, value_json, updated_at)
+               VALUES (?, ?, ?)""",
+            (authority_key, authority_value, now),
+        )
         job = connection.execute(
             "SELECT * FROM session_mirror_jobs WHERE idempotency_key = ?",
             (idempotency_key,),
@@ -764,10 +904,160 @@ def _enqueue_automatic_job(
             or job["source_session_id"] != source_session_id
             or job["target_provider"] != target_provider.value
         ):
-            raise RuntimeError("conflicting automatic mirror job replay")
+            raise RuntimeError("conflicting mirror job replay")
         return dict(job)
 
     return store.db._execute_write(_write)
+
+
+def _automatic_authority_denial(
+    connection: Any,
+    source_session_id: str,
+    source_provider: Provider,
+    target_provider: Provider,
+) -> str | None:
+    source = connection.execute(
+        """SELECT s.source, e.provider, e.native_id, e.origin_kind,
+                  e.origin_bridge_id
+           FROM sessions AS s
+           JOIN external_sessions AS e ON e.session_id = s.id
+           WHERE s.id = ?""",
+        (source_session_id,),
+    ).fetchone()
+    expected_native_id = source_session_id.split(":", 1)[1]
+    if source is None or (
+        source["source"] != source_provider.value
+        or source["provider"] != source_provider.value
+        or source["native_id"] != expected_native_id
+    ):
+        return "automatic enqueue source identity is not durable"
+    if (
+        source["origin_kind"] != OriginKind.NATIVE.value
+        or source["origin_bridge_id"] is not None
+    ):
+        return "automatic enqueue durable source origin is not native"
+    mapped = connection.execute(
+        """SELECT 1
+           FROM session_links AS link
+           JOIN external_sessions AS target
+             ON target.session_id = link.to_session_id
+           WHERE link.from_session_id = ? AND target.provider = ?
+           LIMIT 1""",
+        (source_session_id, target_provider.value),
+    ).fetchone()
+    if mapped is not None:
+        return "automatic enqueue source is already mapped"
+    return None
+
+
+class _MissingMirrorAuthority(ValueError):
+    pass
+
+
+class _InvalidMirrorAuthority(ValueError):
+    pass
+
+
+def _mirror_authority_state_key(job_id: str) -> str:
+    return f"{_MIRROR_AUTHORITY_KEY_PREFIX}{job_id}"
+
+
+def _encode_mirror_authority(
+    *,
+    authority: Literal["automatic", "manual"],
+    idempotency_key: str,
+    source_session_id: str,
+    target_provider: Provider,
+    policy_generation: int,
+) -> str:
+    return json.dumps(
+        {
+            "authority": authority,
+            "idempotency_key": idempotency_key,
+            "policy_generation": policy_generation,
+            "source_session_id": source_session_id,
+            "target_provider": target_provider.value,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _read_mirror_authority(connection: Any, job: Mapping[str, Any]) -> dict[str, Any]:
+    row = connection.execute(
+        "SELECT value_json FROM session_bridge_state WHERE key = ?",
+        (_mirror_authority_state_key(job["id"]),),
+    ).fetchone()
+    if row is None:
+        raise _MissingMirrorAuthority("mirror authority metadata is missing")
+    try:
+        value = json.loads(row["value_json"])
+    except (TypeError, ValueError) as exc:
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata") from exc
+    expected_fields = {
+        "authority",
+        "idempotency_key",
+        "policy_generation",
+        "source_session_id",
+        "target_provider",
+    }
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata")
+    authority = value["authority"]
+    generation = value["policy_generation"]
+    if authority not in ("automatic", "manual"):
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata")
+    if (
+        not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 0
+    ):
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata")
+    try:
+        target = _external_provider(value["target_provider"])
+        expected_key = mirror_idempotency_key(
+            value["source_session_id"], target, generation
+        )
+    except (TypeError, ValueError) as exc:
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata") from exc
+    if (
+        value["idempotency_key"] != expected_key
+        or value["idempotency_key"] != job["idempotency_key"]
+        or value["source_session_id"] != job["source_session_id"]
+        or target.value != job["target_provider"]
+        or job["id"] != f"job:{expected_key}"
+    ):
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata")
+    return value
+
+
+def _terminalize_unclaimable_job(
+    connection: Any,
+    job: Mapping[str, Any],
+    *,
+    now: float,
+    code: str,
+    detail: str,
+) -> None:
+    cursor = connection.execute(
+        """UPDATE session_mirror_jobs
+           SET state = ?, error_code = ?, error_detail = ?, updated_at = ?
+           WHERE id = ? AND state = ? AND attempts = ?
+             AND idempotency_key = ?""",
+        (
+            MirrorJobState.MANUAL_FAILURE.value,
+            code,
+            detail,
+            now,
+            job["id"],
+            job["state"],
+            job["attempts"],
+            job["idempotency_key"],
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("stale mirror job authority transition")
 
 
 def _external_provider(provider: Provider | str) -> Provider:
@@ -834,6 +1124,7 @@ __all__ = [
     "EligibilityReason",
     "MirrorCandidate",
     "MirrorPolicy",
+    "claim_due_mirror_jobs",
     "classify_mirror_eligibility",
     "eligible_mirror_candidates",
     "enqueue_mirror_job",
