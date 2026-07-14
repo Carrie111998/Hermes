@@ -2169,6 +2169,25 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_user_id_header(
+        self, request: "web.Request"
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        """Extract and validate the ``X-Hermes-User-Id`` header."""
+        raw = request.headers.get("X-Hermes-User-Id", "").strip()
+        if not raw:
+            return None, None
+        if not self._api_key:
+            return None, web.json_response(
+                _openai_error("X-Hermes-User-Id requires API key authentication."),
+                status=403,
+            )
+        if re.search(r'[\r\n\x00]', raw) or len(raw) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                {"error": {"message": "Invalid user id", "type": "invalid_request_error"}},
+                status=400,
+            )
+        return raw, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -3727,6 +3746,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3803,6 +3825,7 @@ class APIServerAdapter(BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active,
+            user_id=user_id,
             **agent_overrides,
         )
         effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
@@ -3844,6 +3867,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3976,6 +4002,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     requested_runtime=runtime_request.get("requested") or {},
                     route_source=runtime_request.get("route_source") or "global",
                     confirmed_runtime_lock=lock_active,
+                    user_id=user_id,
                     **agent_overrides,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -4227,7 +4254,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
         #
@@ -4395,6 +4424,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=user_id
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4416,6 +4446,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=user_id
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5335,7 +5366,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         # Parse request body
         try:
             body = await request.json()
@@ -5506,6 +5539,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=user_id
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5541,6 +5575,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                user_id=user_id
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -6282,6 +6317,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        user_id: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6305,6 +6341,7 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            user_id=user_id,
             async_delivery=False,
             cron_session="",
         )
@@ -6330,6 +6367,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        user_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6374,6 +6412,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    user_id=user_id or "",
                 )
                 agent = None
                 try:
@@ -6677,7 +6716,9 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
             return key_err
-
+        user_id, uid_err = self._parse_user_id_header(request)
+        if uid_err is not None:
+            return uid_err
         # Enforce concurrency limit (shared across all agent-serving
         # endpoints; configurable via gateway.api_server.max_concurrent_runs).
         limited = self._concurrency_limited_response()
@@ -6896,6 +6937,7 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                user_id=user_id or "",
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
