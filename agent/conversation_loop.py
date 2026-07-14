@@ -38,6 +38,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent import turn_trace
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1284,6 +1285,16 @@ def _run_conversation_impl(
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
 
+    # Per-turn trace (None when tracing is disabled) — resolved once; every
+    # instrumentation site below is skipped/no-op when this is None.
+    _tt = turn_trace.get_bound(agent)
+    _iter_started = None  # start of the in-flight `iteration` span
+    # Monotonic pass ordinal for `iteration` spans. api_call_count is NOT
+    # unique per pass: the pre-API compression path refunds it (continue) and
+    # the interrupt check breaks before it increments, both of which would
+    # produce two spans tagged with the same i.
+    _iter_pass = 0
+
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
@@ -1349,6 +1360,20 @@ def _run_conversation_impl(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # Close the previous pass's `iteration` span and open the next one.
+        # Retrofitted from timestamps (no context manager) because the loop
+        # body exits through many continue/break/return paths.
+        if _tt is not None:
+            _iter_now = time.time()
+            if _iter_started is not None:
+                _tt.add_span("iteration", _iter_started, _iter_now, i=_iter_pass)
+            _iter_started = _iter_now
+            _iter_pass += 1
+            # Mirrored onto the trace so the run_conversation wrapper's
+            # finally can close the in-flight span on the loop's early
+            # `return` paths, which bypass the post-loop close below.
+            _tt._pending_iteration = (_iter_started, _iter_pass)
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1475,6 +1500,7 @@ def _run_conversation_impl(
         # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
         # However, providers like Moonshot AI require a separate 'reasoning_content' field
         # on assistant messages with tool_calls. We handle both cases here.
+        _ctx_asm_started = time.time() if _tt is not None else None
         request_logger = getattr(agent, "logger", None) or logging.getLogger(__name__)
         # Per-agent validation cursor: skips re-json.loads-ing tool_call
         # arguments on history messages already validated in a previous
@@ -1853,6 +1879,8 @@ def _run_conversation_impl(
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
         total_chars = approx_tokens * 4
+        if _ctx_asm_started is not None:
+            _tt.add_span("iteration.context_assemble", _ctx_asm_started, time.time())
 
         _runtime_context_error = _ollama_context_limit_error(
             agent, request_pressure_tokens
@@ -2086,6 +2114,7 @@ def _run_conversation_impl(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _llm_call_started = None  # trace: start of the in-flight llm.call attempt
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -2141,6 +2170,7 @@ def _run_conversation_impl(
                     pass  # Never let rate guard break the agent loop
 
             try:
+                _req_setup_started = time.time() if _tt is not None else None
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
@@ -2269,6 +2299,9 @@ def _run_conversation_impl(
                 if _moa_prepared_request is not None and agent.provider == "moa":
                     api_kwargs["_moa_prepared_request"] = _moa_prepared_request
 
+                if _req_setup_started is not None:
+                    _tt.add_span("iteration.request_setup", _req_setup_started, time.time())
+
                 # Always prefer the streaming path — even without stream
                 # consumers.  Streaming gives us fine-grained health
                 # checking (90s stale-stream detection, 60s read timeout)
@@ -2359,6 +2392,13 @@ def _run_conversation_impl(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                _llm_call_started = None
+                if _tt is not None:
+                    _llm_call_started = time.time()
+                    # Cleared per attempt so a stale diag from a previous
+                    # streaming call can't leak a wrong ttft_ms onto this one.
+                    agent._last_stream_diag = None
+
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -2414,7 +2454,24 @@ def _run_conversation_impl(
                     break
                 
                 api_duration = time.time() - api_start_time
-                
+
+                # The API call itself ran on a worker thread; retrofit the span
+                # from timings measured here to avoid adopt() plumbing there.
+                if _llm_call_started is not None:
+                    try:
+                        _llm_tags = {"api_request_id": api_request_id, "model": agent.model}
+                        _sd = getattr(agent, "_last_stream_diag", None)
+                        if isinstance(_sd, dict) and _sd.get("first_chunk_at"):
+                            _llm_tags["ttft_ms"] = round(
+                                (_sd["first_chunk_at"] - _sd["started_at"]) * 1000.0, 1
+                            )
+                        _tt.add_span("llm.call", _llm_call_started, time.time(), **_llm_tags)
+                    except Exception:
+                        pass
+                    # Consumed: a later exception in this try (post-response
+                    # processing) must not retrofit a second llm.call span.
+                    _llm_call_started = None
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
@@ -3163,6 +3220,7 @@ def _run_conversation_impl(
                         }
                 
                 # Track actual token usage from response for context management
+                _acct_started = time.time() if _tt is not None else None
                 if hasattr(response, 'usage') and response.usage:
                     canonical_usage = normalize_usage(
                         response.usage,
@@ -3398,6 +3456,18 @@ def _run_conversation_impl(
                             f"({hit_pct:.0f}% hit, {written:,} written)"
                         )
                 
+                if _acct_started is not None:
+                    try:
+                        _acct_tags = {}
+                        if (hasattr(response, "usage") and response.usage
+                                and canonical_usage.cache_read_tokens and prompt_tokens):
+                            _acct_tags["cache_pct"] = round(
+                                100.0 * canonical_usage.cache_read_tokens / prompt_tokens, 1
+                            )
+                    except Exception:
+                        _acct_tags = {}
+                    _tt.add_span("llm.accounting", _acct_started, time.time(), **_acct_tags)
+
                 _retry.has_retried_429 = False  # Reset on success
                 # Note: don't clear the retry buffer here — an "API call
                 # success" only means we got bytes back, not that we got
@@ -3423,6 +3493,17 @@ def _run_conversation_impl(
                 break  # Success, exit retry loop
 
             except InterruptedError:
+                # Retrofit the llm.call span for the interrupted attempt so
+                # its (possibly long) wall time isn't misread as hermes
+                # overhead in the waterfall.
+                if _llm_call_started is not None:
+                    try:
+                        _tt.add_span("llm.call", _llm_call_started, time.time(),
+                                     api_request_id=api_request_id, model=agent.model,
+                                     error="InterruptedError")
+                    except Exception:
+                        pass
+                    _llm_call_started = None
                 if thinking_spinner:
                     thinking_spinner.stop("")
                     thinking_spinner = None
@@ -3457,6 +3538,16 @@ def _run_conversation_impl(
                 break
 
             except Exception as api_error:
+                # Retrofit the llm.call span for the failed attempt (retried
+                # or not) so its wall time isn't misread as hermes overhead.
+                if _llm_call_started is not None:
+                    try:
+                        _tt.add_span("llm.call", _llm_call_started, time.time(),
+                                     api_request_id=api_request_id, model=agent.model,
+                                     error=type(api_error).__name__)
+                    except Exception:
+                        pass
+                    _llm_call_started = None
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -6827,6 +6918,7 @@ def _run_conversation_impl(
                 ):
                     messages.pop()
 
+                _verify_gate_started = time.time() if _tt is not None else None
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
@@ -6884,6 +6976,9 @@ def _run_conversation_impl(
                         agent._interim_content_was_streamed(final_response or "")
                     )
                     final_response = None
+                    if _verify_gate_started is not None:
+                        _tt.add_span("turn.verify_gate", _verify_gate_started, time.time(),
+                                     nudge_fired=True)
                     continue
 
                 # User verification-loop gate: when the agent edited code this
@@ -6946,6 +7041,9 @@ def _run_conversation_impl(
                         agent._interim_content_was_streamed(final_response or "")
                     )
                     final_response = None
+                    if _verify_gate_started is not None:
+                        _tt.add_span("turn.verify_gate", _verify_gate_started, time.time(),
+                                     nudge_fired=True)
                     continue
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
@@ -6997,6 +7095,9 @@ def _run_conversation_impl(
                     )
                     final_response = None
                     continue
+
+                if _verify_gate_started is not None:
+                    _tt.add_span("turn.verify_gate", _verify_gate_started, time.time())
 
                 messages.append(final_msg)
                 
@@ -7100,6 +7201,17 @@ def _run_conversation_impl(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    if _tt is not None:
+        if _iter_started is not None:
+            _tt.add_span("iteration", _iter_started, time.time(), i=_iter_pass)
+        _tt._pending_iteration = None
+        try:
+            # Trace-level tag; the run_conversation wrapper copies it onto the
+            # root `turn` span (exit reason is a local of this function).
+            _tt.tag(exit_reason=_turn_exit_reason)
+        except Exception:
+            pass
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
@@ -7122,6 +7234,10 @@ def _run_conversation_impl(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+
+# run_conversation is a thin tracing wrapper; expose the real body to
+# inspect.getsource/signature (source-inspecting tests count code in it).
+run_conversation.__wrapped__ = _run_conversation_impl
 
 
 __all__ = ["run_conversation"]

@@ -89,6 +89,9 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    # Per-turn trace begun by _handle_message_with_agent (None when
+    # HERMES_TURN_TRACE is unset — every use is guarded).
+    turn_trace_obj: Optional[Any] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
