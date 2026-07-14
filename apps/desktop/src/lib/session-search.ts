@@ -2,7 +2,7 @@ import { normalize } from '@/lib/text'
 import type { SessionInfo } from '@/types/hermes'
 
 import { sessionTitle } from './chat-runtime'
-import { sessionSourceSearchTerms } from './session-source'
+import { bridgeMirrorStateSearchTerms, bridgeProviderSearchTerms, sessionSourceSearchTerms } from './session-source'
 
 export function sessionMatchesSearch(session: SessionInfo, query: string): boolean {
   const needle = normalize(query)
@@ -17,6 +17,8 @@ export function sessionMatchesSearch(session: SessionInfo, query: string): boole
     sessionTitle(session),
     session.preview ?? '',
     session.cwd ?? '',
-    ...sessionSourceSearchTerms(session.source)
+    ...sessionSourceSearchTerms(session.source),
+    ...bridgeProviderSearchTerms(session.bridge_provider),
+    ...bridgeMirrorStateSearchTerms(session.bridge_mirror_state)
   ].some(value => value.toLowerCase().includes(needle))
 }

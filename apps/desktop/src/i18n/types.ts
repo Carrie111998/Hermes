@@ -1314,6 +1314,14 @@ export interface Translations {
       needsInput: string
       waitingForAnswer: string
       handoffOrigin: (platform: string) => string
+      bridgeProvider: (provider: string) => string
+      bridgeMirrorState: (state: string) => string
+      bridgeCatalogOnly: string
+      bridgeContinued: string
+      bridgeDiverged: string
+      bridgeFailed: string
+      bridgeMirrored: string
+      bridgeQueued: string
       renamed: string
       renameFailed: string
       renameTitle: string
