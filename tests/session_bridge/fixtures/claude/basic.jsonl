@@ -1,0 +1,7 @@
+{"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","timestamp":"2026-01-01T00:00:00Z","cwd":"C:/synthetic/project","gitBranch":"feature/synthetic","isSidechain":false,"message":{"role":"user","content":"First synthetic prompt"}}
+{"type":"assistant","sessionId":"11111111-1111-4111-8111-111111111111","uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","timestamp":"2026-01-01T00:00:01Z","cwd":"C:/synthetic/project","gitBranch":"feature/synthetic","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"Synthetic response"}]}}
+{"type":"system","sessionId":"11111111-1111-4111-8111-111111111111","uuid":"cccccccc-cccc-4ccc-8ccc-cccccccccccc","timestamp":"2026-01-01T00:00:01.250Z","cwd":"C:/synthetic/project","gitBranch":"feature/synthetic","isSidechain":false,"subtype":"hook_summary"}
+{"type":"mode","sessionId":"11111111-1111-4111-8111-111111111111","mode":"default"}
+{"type":"queue-operation","sessionId":"11111111-1111-4111-8111-111111111111","timestamp":1767225602.5,"operation":"enqueue","content":"Synthetic queued work"}
+{"type":"attachment","sessionId":"11111111-1111-4111-8111-111111111111","uuid":"dddddddd-dddd-4ddd-8ddd-dddddddddddd","timestamp":"2026-01-01T00:00:01.750Z","cwd":"C:/synthetic/project","gitBranch":"feature/synthetic","isSidechain":false,"attachment":{"fileName":"synthetic.txt"}}
+{"type":"last-prompt","sessionId":"11111111-1111-4111-8111-111111111111","leafUuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","lastPrompt":"Synthetic prompt summary"}

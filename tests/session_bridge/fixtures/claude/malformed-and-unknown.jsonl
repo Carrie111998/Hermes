@@ -1,0 +1,5 @@
+{"type":"user","sessionId":"33333333-3333-4333-8333-333333333333","uuid":"12121212-1212-4212-8212-121212121212","timestamp":"2026-01-03T00:00:00Z","cwd":"C:/synthetic/malformed","gitBranch":"feature/malformed","isSidechain":false,"message":{"role":"user","content":"Visible main-thread text"}}
+{"type":"user",
+{"type":"future-record","sessionId":"33333333-3333-4333-8333-333333333333","timestamp":"2026-01-03T00:00:01Z","payload":"Synthetic unknown record"}
+{"type":"assistant","sessionId":"33333333-3333-4333-8333-333333333333","uuid":"34343434-3434-4434-8434-343434343434","timestamp":"2026-01-03T00:00:02Z","cwd":"C:/synthetic/malformed","gitBranch":"feature/malformed","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"Hidden sidechain text"}]}}
+{"type":"custom-title","sessionId":"33333333-3333-4333-8333-333333333333","customTitle":"Synthetic malformed session"}
