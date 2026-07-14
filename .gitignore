@@ -69,7 +69,7 @@ hermes_cli/web_dist/
 apps/desktop/build/
 apps/desktop/dist/
 apps/desktop/release/
-apps/desktop/*.tsbuildinfo
+*.tsbuildinfo
 
 # Web UI assets — synced from @nous-research/ui at build time via
 # `npm run sync-assets` (see web/package.json).
@@ -123,6 +123,9 @@ docs/superpowers/*
 # It describes the local runtime install, not the source tree, and must not keep
 # every bootstrapped checkout dirty.
 .install_method
+
+# Persistent dev sandbox dir (scripts/dev-sandbox.sh --persistent)
+.hermes-sandbox/
 
 # Interrupted-update breadcrumb + recovery lock written next to the shared venv
 # by `hermes update` / launch-time self-heal. Runtime state, never a code change

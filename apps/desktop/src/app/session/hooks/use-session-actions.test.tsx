@@ -1,4 +1,4 @@
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -6,15 +6,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $activeGatewayProfile, $newChatProfile } from '@/store/profile'
+import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
   $currentCwd,
   $currentFastMode,
   $messages,
+  $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   setActiveSessionId,
   setCurrentFastMode,
+  setCurrentCwd,
   setMessages,
+  setNewChatWorkspaceTarget,
   setResumeFailedSessionId,
   setSessions
 } from '@/store/session'
@@ -33,6 +37,7 @@ vi.mock('@/hermes', async importOriginal => ({
 }))
 
 const RUNTIME_SESSION_ID = 'rt-new-001'
+type HarnessHandle = Pick<ReturnType<typeof useSessionActions>, 'createBackendSessionForSend' | 'startFreshSessionDraft'>
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
   return {
@@ -57,7 +62,7 @@ function Harness({
   onReady,
   requestGateway
 }: {
-  onReady: (create: (preview?: string | null) => Promise<string | null>) => void
+  onReady: (handle: HarnessHandle) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
 }) {
   const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
@@ -71,6 +76,7 @@ function Harness({
     getRouteToken: () => 'token',
     navigate: vi.fn() as never,
     requestGateway,
+    resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
@@ -80,13 +86,16 @@ function Harness({
   })
 
   useEffect(() => {
-    onReady(actions.createBackendSessionForSend)
-  }, [actions.createBackendSessionForSend, onReady])
+    onReady(actions)
+  }, [actions, onReady])
 
   return null
 }
 
-async function createWith(profileSetup: () => void): Promise<Record<string, unknown> | undefined> {
+async function createWith(
+  profileSetup: () => void,
+  beforeCreate?: (handle: HarnessHandle) => Promise<void> | void
+): Promise<Record<string, unknown> | undefined> {
   let createParams: Record<string, unknown> | undefined
 
   const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
@@ -99,13 +108,23 @@ async function createWith(profileSetup: () => void): Promise<Record<string, unkn
     return {} as never
   })
 
-  $currentCwd.set('')
+  setCurrentCwd('')
+  setNewChatWorkspaceTarget(undefined)
   profileSetup()
 
-  let create: ((preview?: string | null) => Promise<string | null>) | null = null
-  render(<Harness onReady={c => (create = c)} requestGateway={requestGateway} />)
-  await waitFor(() => expect(create).not.toBeNull())
-  await create!()
+  let handle: HarnessHandle | null = null
+  render(<Harness onReady={h => (handle = h)} requestGateway={requestGateway} />)
+  await waitFor(() => expect(handle).not.toBeNull())
+
+  if (beforeCreate) {
+    await act(async () => {
+      await beforeCreate(handle!)
+    })
+  }
+
+  await act(async () => {
+    await handle!.createBackendSessionForSend()
+  })
 
   return createParams
 }
@@ -115,8 +134,11 @@ describe('createBackendSessionForSend profile routing', () => {
     cleanup()
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
+    $projectScope.set(ALL_PROJECTS)
+    $projectTree.set([])
     $currentCwd.set('')
     setCurrentFastMode(false)
+    setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
   })
 
@@ -151,6 +173,12 @@ describe('createBackendSessionForSend profile routing', () => {
     expect(params).toMatchObject({ profile: 'default' })
   })
 
+  it('tags new desktop chats as desktop sessions', async () => {
+    const params = await createWith(() => {})
+
+    expect(params).toMatchObject({ source: 'desktop' })
+  })
+
   it('passes the current workspace cwd into session.create', async () => {
     const params = await createWith(() => {
       $currentCwd.set('/remote/worktree')
@@ -174,12 +202,8 @@ describe('createBackendSessionForSend profile routing', () => {
     setCurrentFastMode(true)
     expect($currentFastMode.get()).toBe(true)
 
-    let actions: ReturnType<typeof useSessionActions> | null = null
-    render(<Harness onReady={create => (actions = { createBackendSessionForSend: create } as ReturnType<typeof useSessionActions>)} requestGateway={requestGateway} />)
-    await waitFor(() => expect(actions).not.toBeNull())
-
-    // startFreshSessionDraft is not exposed through this harness, so call the full hook harness inline.
-    cleanup()
+    // startFreshSessionDraft is not exposed through the shared harness, so use
+    // the full hook harness inline.
     const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
     function FullHarness({ onReady }: { onReady: (next: ReturnType<typeof useSessionActions>) => void }) {
       const next = useSessionActions({
@@ -191,6 +215,7 @@ describe('createBackendSessionForSend profile routing', () => {
         getRouteToken: () => 'token',
         navigate: vi.fn() as never,
         requestGateway,
+        resetViewSync: vi.fn(),
         runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
         selectedStoredSessionId: null,
         selectedStoredSessionIdRef: ref<string | null>(null),
@@ -217,6 +242,24 @@ describe('createBackendSessionForSend profile routing', () => {
 
     expect(createParams).toBeTruthy()
     expect(createParams).not.toHaveProperty('fast')
+  })
+
+  it('falls back to the entered project cwd when the current cwd is blank', async () => {
+    const params = await createWith(() => {
+      $projectTree.set([
+        {
+          id: 'p_app',
+          label: 'App',
+          path: '/repo/app',
+          repos: [{ groups: [], id: '/repo/app', label: 'app', path: '/repo/app', sessionCount: 0 }],
+          sessionCount: 0
+        }
+      ])
+      $projectScope.set('p_app')
+      $currentCwd.set('')
+    })
+
+    expect(params).toMatchObject({ cwd: '/repo/app' })
   })
 })
 
@@ -247,6 +290,7 @@ function ResumeHarness({
     getRouteToken: () => 'token',
     navigate: vi.fn() as never,
     requestGateway,
+    resetViewSync: vi.fn(),
     runtimeIdByStoredSessionIdRef: runtimeIdByStoredSessionIdRef ?? ref(new Map<string, string>()),
     selectedStoredSessionId: null,
     selectedStoredSessionIdRef: ref<string | null>(null),
@@ -391,6 +435,7 @@ describe('resumeSession failure recovery', () => {
 
     expect(resumeParams).not.toHaveProperty('lazy')
     expect(resumeParams).not.toHaveProperty('eager_build')
+    expect(resumeParams).toMatchObject({ source: 'desktop' })
   })
 
   it('arms the failure latch when resume succeeds with an empty transcript for a non-empty stored session', async () => {
@@ -472,6 +517,79 @@ describe('resumeSession failure recovery', () => {
     expect(sessionStateByRuntimeIdRef.current.has('runtime-stale')).toBe(false)
     expect($activeSessionId.get()).toBe('runtime-1')
     expect($messages.get().length).toBe(1)
+  })
+})
+
+function BranchHarness({
+  onReady,
+  requestGateway
+}: {
+  onReady: (branchStoredSession: (storedSessionId: string, sessionProfile?: string | null) => Promise<boolean>) => void
+  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+}) {
+  const ref = <T,>(value: T): MutableRefObject<T> => ({ current: value })
+
+  const actions = useSessionActions({
+    activeSessionId: null,
+    activeSessionIdRef: ref<string | null>(null),
+    busyRef: ref(false),
+    creatingSessionRef: ref(false),
+    ensureSessionState: () => ({}) as ClientSessionState,
+    getRouteToken: () => 'token',
+    navigate: vi.fn() as never,
+    requestGateway,
+    resetViewSync: vi.fn(),
+    runtimeIdByStoredSessionIdRef: ref(new Map<string, string>()),
+    selectedStoredSessionId: null,
+    selectedStoredSessionIdRef: ref<string | null>(null),
+    sessionStateByRuntimeIdRef: ref(new Map<string, ClientSessionState>()),
+    syncSessionStateToView: vi.fn(),
+    updateSessionState: () => ({}) as ClientSessionState
+  })
+
+  useEffect(() => {
+    onReady(actions.branchStoredSession)
+  }, [actions.branchStoredSession, onReady])
+
+  return null
+}
+
+describe('branchStoredSession desktop source tagging', () => {
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    vi.restoreAllMocks()
+  })
+
+  it('tags desktop branch sessions as desktop sessions', async () => {
+    let createParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.create') {
+        createParams = params
+
+        return { session_id: 'branch-runtime', stored_session_id: 'branch-stored' } as never
+      }
+
+      return {} as never
+    })
+
+    setSessions([storedSession({ id: 'stored-parent', message_count: 1 })])
+    vi.mocked(getSessionMessages).mockResolvedValue({
+      messages: [{ content: 'branch me', role: 'user', timestamp: 1 }],
+      session_id: 'stored-parent'
+    } as never)
+
+    let branchStoredSession: ((storedSessionId: string) => Promise<boolean>) | null = null
+    render(<BranchHarness onReady={branch => (branchStoredSession = branch)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(branchStoredSession).not.toBeNull())
+
+    await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
+
+    expect(createParams).toMatchObject({
+      parent_session_id: 'stored-parent',
+      source: 'desktop'
+    })
   })
 })
 
@@ -575,4 +693,45 @@ describe('resumeSession warm-cache mapping integrity', () => {
     expect(methods).not.toContain('session.resume')
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
   })
+})
+
+describe('createBackendSessionForSend workspace target', () => {
+  afterEach(() => {
+    cleanup()
+    $newChatProfile.set(null)
+    $activeGatewayProfile.set('default')
+    setCurrentCwd('')
+    setNewChatWorkspaceTarget(undefined)
+    vi.restoreAllMocks()
+  })
+
+  it('omits cwd for an explicit no-workspace draft even when global cwd changes before send', async () => {
+    const params = await createWith(
+      () => {
+        $activeGatewayProfile.set('default')
+      },
+      handle => {
+        handle.startFreshSessionDraft({ workspaceTarget: null })
+        $currentCwd.set('/project-open-in-file-browser')
+      }
+    )
+
+    expect(params).not.toHaveProperty('cwd')
+    expect($newChatWorkspaceTarget.get()).toBeUndefined()
+  })
+
+  it('uses the clicked workspace target instead of a later global cwd value', async () => {
+    const params = await createWith(
+      () => {
+        $activeGatewayProfile.set('default')
+      },
+      handle => {
+        handle.startFreshSessionDraft({ workspaceTarget: '/clicked-workspace' })
+        $currentCwd.set('/project-open-in-file-browser')
+      }
+    )
+
+    expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+
 })
