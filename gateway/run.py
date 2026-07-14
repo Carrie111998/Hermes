@@ -3092,27 +3092,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # hermes_state.get_last_init_error() for slash-command error strings.
             logger.warning("SQLite session store not available: %s", e)
 
-        # Opportunistic state.db maintenance: prune ended sessions older
-        # than sessions.retention_days + optional VACUUM. Tracks last-run
-        # in state_meta so it only actually executes once per
-        # sessions.min_interval_hours.  Gateway is long-lived so blocking
-        # a few seconds once per day is acceptable; failures are logged
-        # but never raised.
-        if self._session_db is not None:
-            try:
-                from hermes_cli.config import load_config as _load_full_config
-                _sess_cfg = (_load_full_config().get("sessions") or {})
-                if _sess_cfg.get("auto_prune", False):
-                    # Construction-time, before the loop serves traffic; sync DB is fine.
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
-                        retention_days=int(_sess_cfg.get("retention_days", 90)),
-                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
-                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir,
-                    )
-            except Exception as exc:
-                logger.debug("state.db auto-maintenance skipped: %s", exc)
-
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
@@ -7488,6 +7467,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+        self._statedb_maint_task = asyncio.create_task(
+            self._state_db_maintenance_watcher()
+        )
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
@@ -7816,6 +7798,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(result, "success", True):
             err = getattr(result, "error", "send returned success=False")
             raise RuntimeError(f"adapter.send failed: {err}")
+
+    async def _state_db_maintenance_watcher(self, poll_hours: float = 6.0) -> None:
+        """Periodic ONLINE state.db prune (never VACUUM — needs exclusivity).
+
+        Relocated out of gateway construction, which raced the startup write
+        storm and error-looped 'database is locked' without ever recording
+        last_auto_prune. Runs after a 120 s settle delay, then every
+        ``poll_hours``; ``maybe_auto_prune_and_vacuum`` self-gates on
+        ``sessions.min_interval_hours`` so the actual prune happens ~daily.
+        """
+        if self._session_db is None:
+            return
+        await asyncio.sleep(120)  # let the startup write storm settle
+        from hermes_cli.config import load_config as _load_full_config
+        while self._running:
+            try:
+                cfg = (_load_full_config().get("sessions") or {})
+                if cfg.get("auto_prune", False):
+                    self._session_db._db.maybe_auto_prune_and_vacuum(
+                        retention_days=int(cfg.get("retention_days", 90)),
+                        min_interval_hours=int(cfg.get("min_interval_hours", 24)),
+                        vacuum=False,  # online: cannot get exclusive lock
+                        max_batch=int(cfg.get("prune_batch", 200)),
+                        sessions_dir=self.config.sessions_dir,
+                    )
+            except Exception as exc:
+                logger.debug("state.db maintenance watcher pass failed: %s", exc)
+            await asyncio.sleep(max(1.0, poll_hours) * 3600.0)
 
     async def _session_expiry_watcher(self, interval: int = 300):
         """Background task that finalizes expired sessions.
