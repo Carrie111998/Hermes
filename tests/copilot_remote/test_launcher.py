@@ -1,4 +1,10 @@
-"""Tests for copilot_remote.launcher — command building, output parsing, and launch."""
+"""Tests for copilot_remote.launcher — command building, output parsing, and launch.
+
+Every test in this module runs with COPILOT_HOME redirected to a per-test
+tmp_path (see the autouse `_isolate_copilot_home` fixture below), so no test
+can read or write the real ~/.copilot/settings.json on the host running the
+suite.
+"""
 
 import json
 import os
@@ -10,6 +16,8 @@ import pytest
 
 from copilot_remote.launcher import (
     _attempt_initial_prompt_delivery,
+    _copilot_settings_path,
+    _ensure_folder_trusted,
     _ensure_initial_prompt_delivered,
     _parse_remote_task_id,
     _remote_task_has_user_message,
@@ -19,6 +27,13 @@ from copilot_remote.launcher import (
     parse_copilot_output,
 )
 from copilot_remote.models import RepoEntry
+
+
+@pytest.fixture(autouse=True)
+def _isolate_copilot_home(monkeypatch, tmp_path):
+    """Redirect COPILOT_HOME so _ensure_folder_trusted never touches the
+    real ~/.copilot/settings.json while running this test module."""
+    monkeypatch.setenv("COPILOT_HOME", str(tmp_path / ".copilot-test-home"))
 
 
 # ---------------------------------------------------------------------------
@@ -387,3 +402,81 @@ class TestLaunchCopilot:
         assert result["connect_id"] == "task-123"
         assert result["prompt_delivery_status"] == "unverified"
         assert "steer failed" in result["prompt_delivery_warning"]
+
+
+# ---------------------------------------------------------------------------
+# _ensure_folder_trusted
+# ---------------------------------------------------------------------------
+
+class TestEnsureFolderTrusted:
+    def test_creates_settings_file_when_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+        assert not settings_path.exists()
+
+        _ensure_folder_trusted("/some/repo/path")
+
+        data = json.loads(settings_path.read_text())
+        assert data["trustedFolders"] == [str(Path("/some/repo/path").resolve())]
+
+    def test_appends_to_existing_trusted_folders_without_dropping_other_keys(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            '// user comment\n{"theme": "dark", "trustedFolders": ["/existing/root"]}\n'
+        )
+
+        _ensure_folder_trusted("/brand/new/repo")
+
+        data = json.loads(settings_path.read_text())
+        assert data["theme"] == "dark"
+        assert "/existing/root" in data["trustedFolders"]
+        assert str(Path("/brand/new/repo").resolve()) in data["trustedFolders"]
+
+    def test_noop_when_path_is_under_an_already_trusted_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        root = str(tmp_path / "workspace")
+        settings_path.write_text(json.dumps({"trustedFolders": [root]}))
+        before = settings_path.read_text()
+
+        _ensure_folder_trusted(str(Path(root) / "repos" / "some-repo"))
+
+        assert settings_path.read_text() == before
+
+    def test_repeat_calls_do_not_duplicate_entries(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+
+        _ensure_folder_trusted("/repo/one")
+        _ensure_folder_trusted("/repo/one")
+
+        data = json.loads(settings_path.read_text())
+        assert data["trustedFolders"].count(str(Path("/repo/one").resolve())) == 1
+
+    def test_dry_run_launch_does_not_touch_settings_file(self, tmp_path, monkeypatch):
+        """dry_run must stay a pure preview: no trust pre-seed side effect."""
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+        repo = RepoEntry(slug="test-repo", path="/test")
+
+        launch_copilot(repo, "test prompt", session_id=_TEST_SID, dry_run=True)
+
+        assert not settings_path.exists()
+
+    def test_real_launch_pre_seeds_trust_before_spawning(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+        repo = RepoEntry(slug="test-repo", path=str(tmp_path / "some-repo"))
+
+        launch_copilot(
+            repo, "test prompt", session_id=_TEST_SID,
+            _spawn=lambda cmd, cwd: _make_fake_proc("output\n", returncode=0),
+        )
+
+        data = json.loads(settings_path.read_text())
+        assert str((tmp_path / "some-repo").resolve()) in data["trustedFolders"]

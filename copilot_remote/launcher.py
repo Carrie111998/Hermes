@@ -234,6 +234,81 @@ def _log_dir() -> Path:
     return d
 
 
+def _copilot_settings_path() -> Path:
+    """Return the path to Copilot CLI's user settings.json."""
+    return Path(os.environ.get("COPILOT_HOME", str(Path.home() / ".copilot"))) / "settings.json"
+
+
+def _ensure_folder_trusted(repo_path: str) -> None:
+    """Pre-seed ``trustedFolders`` in Copilot's settings.json for *repo_path*.
+
+    Without this, a fresh (never-before-launched) repo path triggers an
+    interactive "Confirm folder trust" prompt on first ``copilot -i`` run.
+    That prompt has no ``--allow-all``/``--no-ask-user`` bypass and is not
+    answerable via the ``--remote`` remote-control channel (remote control
+    only supports *responding* to prompts on an already-running local
+    session, not injecting an initial answer into a stalled startup
+    prompt) -- so an untrusted folder silently hangs a
+    ``/copilot_remote launch`` job forever with no ``connect_handle``.
+
+    Trust is inherited by subdirectories, so seeding each known workspace
+    root (rather than every individual repo) is sufficient, but this helper
+    is defensive and adds the specific *repo_path* too in case a repo lives
+    outside the discovered workspace roots (e.g. a path passed directly via
+    ``repo_path=``).
+
+    Best-effort: any failure to read/write settings.json is logged and
+    swallowed rather than blocking the launch -- a missed trust pre-seed
+    just means the user may see the one-time interactive prompt as before,
+    not a broken launch.
+    """
+    settings_path = _copilot_settings_path()
+    try:
+        resolved = str(Path(repo_path).expanduser().resolve())
+    except OSError:
+        resolved = repo_path
+
+    try:
+        if settings_path.exists():
+            raw = settings_path.read_text(encoding="utf-8")
+            # Strip // line comments Copilot tolerates in this file before
+            # parsing as JSON (json.loads does not support them).
+            data = json.loads(
+                "\n".join(
+                    line for line in raw.splitlines()
+                    if not line.strip().startswith("//")
+                )
+                or "{}"
+            )
+        else:
+            data = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read Copilot settings.json for trust pre-seed: %s", exc)
+        return
+
+    trusted = data.get("trustedFolders")
+    if not isinstance(trusted, list):
+        trusted = []
+
+    already_trusted = any(
+        resolved == entry or resolved.startswith(entry.rstrip("/") + "/")
+        for entry in trusted
+        if isinstance(entry, str)
+    )
+    if already_trusted:
+        return
+
+    trusted.append(resolved)
+    data["trustedFolders"] = trusted
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        logger.info("Pre-seeded Copilot folder trust for %s", resolved)
+    except OSError as exc:
+        logger.warning("Could not write Copilot settings.json for trust pre-seed: %s", exc)
+
+
 def _copilot_api_url() -> str:
     """Return the Copilot API base URL used for remote task steering."""
     return os.environ.get("COPILOT_API_URL", _DEFAULT_COPILOT_API_URL).rstrip("/")
@@ -451,6 +526,13 @@ def launch_copilot(
             "prompt_delivery_status": None,
             "prompt_delivery_warning": None,
         }
+
+    # Real (non-dry-run) launch: pre-seed folder trust so a never-before-seen
+    # repo path doesn't stall on the interactive "Confirm folder trust"
+    # prompt (see _ensure_folder_trusted docstring). Done here, after the
+    # dry_run early-return, so dry_run stays a pure preview with no disk
+    # side effects.
+    _ensure_folder_trusted(repo.path)
 
     try:
         connect_id = None
