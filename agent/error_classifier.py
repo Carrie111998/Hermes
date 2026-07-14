@@ -689,6 +689,7 @@ _TRANSPORT_ERROR_TYPES = frozenset({
     # OpenAI SDK errors (not subclasses of Python builtins)
     "APIConnectionError",
     "APITimeoutError",
+    "WebSocketNotStartedError",
 })
 
 # Server disconnect patterns (no status code, but transport-level).
@@ -863,6 +864,12 @@ def classify_api_error(
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
+
+    # A WebSocket transport failure after ``response.create`` has ambiguous
+    # execution state: the backend may still be running the request. Automatic
+    # retry, credential rotation, or provider fallback could duplicate work.
+    if getattr(error, "request_replay_safe", True) is False:
+        return _result(FailoverReason.unknown, retryable=False)
 
     # ── 0. Plugin classifiers (first valid result wins) ─────────────
     #

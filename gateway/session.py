@@ -751,9 +751,14 @@ def build_session_context_prompt(
 # Keys of a /model session override that are safe to persist to disk.
 # ``api_key`` (and anything else, e.g. ``api_mode`` which is re-derived from
 # provider resolution) is intentionally excluded: credentials must NEVER be
-# written to sessions.json.  On rehydration after a gateway restart the
-# runner re-resolves credentials via the normal runtime provider resolution.
-PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+# written to sessions.json. ``responses_transport`` is a non-secret user
+# preference and must survive the same restart as the selected model.
+PERSISTABLE_MODEL_OVERRIDE_KEYS = (
+    "model",
+    "provider",
+    "base_url",
+    "responses_transport",
+)
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -862,7 +867,7 @@ class SessionEntry:
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
 
-    # Session-scoped /model override (model/provider/base_url ONLY — never
+    # Session-scoped /model override (model/provider/base_url/transport — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
     # every session to the global default model.  api_key/api_mode are
@@ -3086,7 +3091,7 @@ class SessionStore:
     ) -> None:
         """Persist (or clear) the session-scoped /model override.
 
-        Only non-secret keys (model/provider/base_url — see
+        Only non-secret keys (model/provider/base_url/responses_transport — see
         ``sanitize_model_override``) are written; ``api_key``/``api_mode``
         are re-resolved at rehydration time via the normal runtime provider
         resolution.  Pass ``None`` (or a dict with no persistable values)

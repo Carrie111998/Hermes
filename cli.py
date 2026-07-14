@@ -11225,6 +11225,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_transport": getattr(self, "responses_transport", "sse"),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11240,6 +11241,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        self.responses_transport = result.responses_transport
 
         if self.agent is not None:
             try:
@@ -11249,6 +11251,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    responses_transport=result.responses_transport,
                 )
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
@@ -11614,6 +11617,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "responses_transport": getattr(self, "responses_transport", "sse"),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11629,6 +11633,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.base_url = result.base_url
         if result.api_mode:
             self.api_mode = result.api_mode
+        self.responses_transport = result.responses_transport
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
@@ -11639,6 +11644,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    responses_transport=result.responses_transport,
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
