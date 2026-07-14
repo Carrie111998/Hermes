@@ -375,13 +375,25 @@ class EventBus:
                                r["event_id"], e)
         return events
 
-    def checkpoint(self) -> None:
-        """Run a passive WAL checkpoint so external readers see recent data."""
+    def checkpoint(self, mode: str = "PASSIVE") -> Optional[tuple]:
+        """Run a WAL checkpoint; returns (busy, log_frames, checkpointed_frames).
+
+        PASSIVE backfills pages but by definition never RESETS the WAL, so
+        journal_size_limit (ADR-0018) never applies through this path.
+        TRUNCATE additionally resets the WAL to zero bytes when it wins; when
+        readers block it the PRAGMA RETURNS busy=1 rather than raising, so
+        callers must inspect the tuple. Returns None on hard SQLite errors.
+        """
+        if mode not in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+            raise ValueError(f"invalid checkpoint mode: {mode}")
         with self._lock:
             try:
-                self._get_conn().execute("PRAGMA wal_checkpoint(PASSIVE)")
+                return self._get_conn().execute(
+                    f"PRAGMA wal_checkpoint({mode})"
+                ).fetchone()
             except sqlite3.Error as e:
-                logger.warning("WAL checkpoint failed: %s", e)
+                logger.warning("WAL checkpoint(%s) failed: %s", mode, e)
+                return None
 
     def close(self) -> None:
         """Close the thread-local SQLite connection."""

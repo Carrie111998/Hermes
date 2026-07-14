@@ -55,6 +55,15 @@ POLL_LOOP_ERROR_COOLDOWN_SECONDS = 900
 # and alert on staleness > a few minutes, so this cadence must be tight
 # enough that a single missed write stays under the alert threshold.
 HEARTBEAT_INTERVAL_SECONDS = 60
+# Hourly TRUNCATE-checkpoint attempt. The 60s PASSIVE checkpoint keeps the WAL
+# backfilled but can never RESET it, and journal_size_limit only truncates on
+# a reset - under the subscribers' 1-2s read cadence a reset almost never
+# happens on its own, which is how event_bus.db-wal reached 1.44 GB on
+# 2026-07-13. A TRUNCATE that loses to a reader returns busy=1 (no exception);
+# we just try again next hour. The nightly event-bus-retention cron (04:52)
+# is the backstop and the reporting surface.
+WAL_TRUNCATE_INTERVAL_SECONDS = 3600
+WAL_WARN_BYTES = 512 * 1024 * 1024
 # WhatsApp morning-flush retry throttle. The flush delivers the overnight queue
 # OVER WhatsApp, so when the WhatsApp bridge is itself down at 7am (2026-07-10:
 # a 0/105 flush stranded the whole overnight queue) the flush fails and must
@@ -527,6 +536,9 @@ def _subscriber_poll_loop() -> None:
     last_lag_check: float = 0
     last_cleanup: float = 0
     last_checkpoint: float = 0
+    # NOT 0: skip the boot tick (reconnect storms make TRUNCATE lose anyway);
+    # first attempt comes one interval in, mirroring last_resource_check.
+    last_wal_truncate: float = time.monotonic()
     last_heartbeat: float = 0
     last_batch_flush: float = 0
     _state = load_state(digest_state_path(), default={})
@@ -738,6 +750,26 @@ def _subscriber_poll_loop() -> None:
                 except Exception:
                     logger.exception("WAL checkpoint failed")
                 last_checkpoint = now
+
+            # Hourly WAL TRUNCATE attempt (see WAL_TRUNCATE_INTERVAL_SECONDS)
+            if _bus and now - last_wal_truncate >= WAL_TRUNCATE_INTERVAL_SECONDS:
+                try:
+                    result = _bus.checkpoint("TRUNCATE")
+                    wal_path = _bus.db_path.parent / (_bus.db_path.name + "-wal")
+                    wal_bytes = wal_path.stat().st_size if wal_path.exists() else 0
+                    if result is not None and result[0]:
+                        logger.info(
+                            "event_bus WAL TRUNCATE lost to readers (wal %.0f MB); retrying in 1h",
+                            wal_bytes / 1e6,
+                        )
+                    if wal_bytes > WAL_WARN_BYTES:
+                        logger.warning(
+                            "event_bus WAL at %.0f MB despite hourly TRUNCATE attempts",
+                            wal_bytes / 1e6,
+                        )
+                except Exception:
+                    logger.exception("event_bus WAL truncate attempt failed")
+                last_wal_truncate = now
 
             # Liveness heartbeat file — external watchers stat mtime and alert
             # on staleness, so we must always attempt to write even when other

@@ -593,3 +593,27 @@ class TestSubscribeUnknownEventType:
         assert any("some_future_type" in m for m in warning_msgs), (
             f"Expected warning mentioning unknown event_type; got: {warning_msgs}"
         )
+
+
+class TestCheckpointModes:
+    def test_truncate_resets_wal_and_reports(self, tmp_path):
+        bus = EventBus(tmp_path / "bus.db")
+        for i in range(50):
+            bus.emit(EventType.GATEWAY_STARTED, "test", {"i": i})
+        wal = tmp_path / "bus.db-wal"
+        assert wal.stat().st_size > 0
+        result = bus.checkpoint("TRUNCATE")
+        assert result is not None
+        assert result[0] == 0            # busy flag clear - reset happened
+        assert wal.stat().st_size == 0   # WAL truncated to zero bytes
+
+    def test_invalid_mode_rejected(self, tmp_path):
+        bus = EventBus(tmp_path / "bus.db")
+        with pytest.raises(ValueError):
+            bus.checkpoint("EVIL")
+
+    def test_passive_default_returns_tuple(self, tmp_path):
+        bus = EventBus(tmp_path / "bus.db")
+        bus.emit(EventType.GATEWAY_STARTED, "test", {})
+        result = bus.checkpoint()
+        assert result is not None and len(result) == 3
