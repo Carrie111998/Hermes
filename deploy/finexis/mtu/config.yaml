@@ -28,4 +28,13 @@ platforms:
   telegram:
     enabled: true
     extra:
-      require_mention: false               # advisor DMs the bot directly; no @mention needed
+      # DMs are never gated by require_mention (the adapter excludes DMs from the
+      # mention check), so advisors still DM the bot directly with no @mention.
+      # In GROUP chats, require_mention gates responses: the bot only replies when
+      # @mentioned or replied-to — it does not answer every message in the group.
+      require_mention: true
+# Who may use the bot (DM or group) is gated by TELEGRAM_ALLOWED_USERS in .env —
+# add advisors' Telegram IDs there as the pilot widens.
+# Each participant in a group gets an isolated BOR session — two advisors'
+# cases never mix. (Gateway default is true; set explicitly for clarity.)
+group_sessions_per_user: true
