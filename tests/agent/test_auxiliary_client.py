@@ -3208,6 +3208,51 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert time.monotonic() - started < 0.14
 
 
+class TestRuntimeRouteLogging:
+    def test_redacts_a_malformed_base_url(self):
+        from agent.auxiliary_client import _sanitize_url_for_logging
+
+        assert _sanitize_url_for_logging("secret-token-without-a-url") == "<url-redacted>"
+
+    def test_logs_a_sanitized_route_once_per_session_and_route(self, caplog):
+        import agent.auxiliary_client as aux
+
+        aux.clear_runtime_main()
+        try:
+            with caplog.at_level("INFO", logger="agent.auxiliary_client"):
+                aux.set_runtime_main(
+                    "custom",
+                    "first-model",
+                    base_url="https://user:secret@example.test/v1?token=secret#fragment",
+                    session_id="session-a",
+                )
+                aux.set_runtime_main(
+                    "custom",
+                    "first-model",
+                    base_url="https://user:secret@example.test/v1?token=secret#fragment",
+                    session_id="session-a",
+                )
+                aux.set_runtime_main(
+                    "custom",
+                    "second-model",
+                    base_url="https://user:secret@example.test/v1?token=secret#fragment",
+                    session_id="session-a",
+                )
+
+            messages = [
+                record.getMessage()
+                for record in caplog.records
+                if "Runtime: main route set" in record.getMessage()
+            ]
+            assert len(messages) == 2
+            assert all("https://example.test/v1" in message for message in messages)
+            assert all("secret" not in message for message in messages)
+            assert all("token=" not in message for message in messages)
+            assert all("fragment" not in message for message in messages)
+        finally:
+            aux.clear_runtime_main()
+
+
 class TestCodexAuxiliaryAdapterCacheScope:
     """Regression for issue #78941: auxiliary Codex calls (compression,
     flush_memories, MoA, session_search) must not bucket-share a prompt

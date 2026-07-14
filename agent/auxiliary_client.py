@@ -3526,6 +3526,8 @@ def _sanitize_url_for_logging(url: str) -> str:
         return ""
     try:
         parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return "<url-redacted>"
         netloc = parsed.netloc.rsplit("@", 1)[-1]
         return urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
     except Exception:
