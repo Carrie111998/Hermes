@@ -252,6 +252,80 @@ class TestAgentIterationRouting:
         assert TOPIC_ROUTING["agent_failure_cluster"] == "watchdog_alerts"
 
 
+class TestStatusBlackoutSelfDegradedRouting:
+    """watchdog_self_degraded normally routes to watchdog_alerts, but the
+    'monitoring has gone dark' reasons (status.json stale / unreadable) route
+    to security_and_system instead.
+
+    2026-07-13 incident: a 3h16m prober blackout's one HIGH status-stale alert
+    was buried under gateway_health / WhatsApp flap on watchdog_alerts and went
+    unactioned for 3h. security_and_system (thread 106 in the fixture, 9680 in
+    prod) is the low-traffic operator topic (credential_loss, secret_detected,
+    backend_contract_drift already land there) so the monitoring-dark alert is
+    actually seen. The LaptopMonitor-Canary scheduled task is the primary
+    auto-fix; this reroute is the complementary visibility half.
+    """
+
+    def _event(self, reason):
+        return Event.create(
+            EventType.WATCHDOG_SELF_DEGRADED, "watchdog", {"reason": reason},
+        )
+
+    def test_status_stale_routes_to_security_and_system(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event("laptop-monitor status.json stale"))
+        assert target[2] == "106"  # security_and_system, NOT watchdog_alerts(100)
+
+    def test_status_unreadable_routes_to_security_and_system(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event("status.json unreadable"))
+        assert target[2] == "106"
+
+    def test_over_budget_reason_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # "monitor pass over budget" means the writer is ALIVE (just slow) --
+        # a normal operator watchdog signal, so it stays on watchdog_alerts.
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event("monitor pass over budget"))
+        assert target[2] == "100"
+
+    def test_self_degraded_without_reason_stays_on_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        target = notifier.resolve_target(self._event(""))
+        assert target[2] == "100"
+
+    def test_status_blackout_not_cross_posted_to_watchdog_alerts(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # WATCHDOG_SELF_DEGRADED is HIGH priority but NOT in CROSS_POST_TO_ALERTS,
+        # so the re-routed primary must be the ONLY target -- it must not also
+        # cross-post back to the flap-saturated watchdog_alerts topic.
+        notifier = TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+        targets = notifier.resolve_all_targets(
+            self._event("laptop-monitor status.json stale")
+        )
+        threads = [t[2] for t in targets]
+        assert threads == ["106"]
+        assert "100" not in threads
+
+
 class TestTelegramNotifier:
     def test_formats_message(self, bus, topics_config, verbosity_config):
         notifier = TelegramNotifier(

@@ -225,6 +225,22 @@ CROSS_POST_TO_ALERTS = {
     'offer_signal',
 }
 
+# watchdog_self_degraded payload reasons that mean the laptop-monitor
+# status.json writer has gone DARK (a monitoring blackout) -- as opposed to
+# "monitor pass over budget", where the writer is alive but slow. These route
+# to security_and_system instead of the default watchdog_alerts: the
+# 2026-07-13 3h16m prober blackout's single HIGH status-stale alert was buried
+# under gateway_health / WhatsApp flap on watchdog_alerts and went unactioned
+# for 3h. security_and_system is the low-traffic operator topic (credential_
+# loss, secret_detected, backend_contract_drift already land there) so a
+# "monitoring is blind" alert is actually seen. Reason strings must match
+# watchdog_sweep.py's _emit_self_degraded() EXACTLY. The LaptopMonitor-Canary
+# scheduled task is the primary auto-fix; this reroute is the visibility half.
+STATUS_BLACKOUT_SELF_DEGRADED_REASONS = frozenset({
+    'laptop-monitor status.json stale',
+    'status.json unreadable',
+})
+
 # Event types treated as "digest-class" — once-a-day aggregate summaries
 # that carry no incident urgency on their own but whose absence is meaningful
 # (a missing daily heartbeat = the producer might be dead). Used by the
@@ -466,6 +482,21 @@ class TelegramNotifier(BaseSubscriber):
             topic = self.topics.get(topic_key, {})
             thread_id = str(topic.get("thread_id", ""))
             return ("telegram", self.group_chat_id, thread_id)
+
+        # watchdog_self_degraded is normally an operator watchdog signal
+        # (-> watchdog_alerts), but the "monitoring has gone dark" reasons
+        # (see STATUS_BLACKOUT_SELF_DEGRADED_REASONS) must NOT share the
+        # flap-saturated watchdog_alerts topic -- route them to the low-traffic
+        # security_and_system topic so the blackout alert is actually seen.
+        if event.event_type == EventType.WATCHDOG_SELF_DEGRADED:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            if payload.get("reason", "") in STATUS_BLACKOUT_SELF_DEGRADED_REASONS:
+                topic = self.topics.get("security_and_system", {})
+                thread_id = str(topic.get("thread_id", ""))
+                if not thread_id:  # topics.json lacks the topic -> don't drop it
+                    topic = self.topics.get("watchdog_alerts", {})
+                    thread_id = str(topic.get("thread_id", ""))
+                return ("telegram", self.group_chat_id, thread_id)
 
         topic_key = TOPIC_ROUTING.get(event.event_type.type_string, "system")
 
