@@ -73,6 +73,150 @@ def _native_voice_payload(request):
 
 
 @pytest.mark.asyncio
+async def test_send_voice_native_payload_preserves_reply_reference(tmp_path):
+    reference = object()
+    adapter, channel, request = _voice_adapter(reference)
+    audio_path = tmp_path / "reply.ogg"
+    audio_path.write_bytes(b"fake ogg")
+
+    result = await adapter.send_voice("555", str(audio_path), reply_to="99")
+
+    assert result.success
+    assert result.message_id == "777"
+    assert _native_voice_payload(request)["message_reference"] == {
+        "message_id": "99",
+        "fail_if_not_exists": False,
+    }
+    channel.fetch_message.assert_awaited_once_with(99)
+    channel.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_voice_file_fallback_preserves_reply_reference(tmp_path):
+    reference = object()
+    adapter, channel, _request = _voice_adapter(
+        reference,
+        native_error=RuntimeError("native voice unavailable"),
+    )
+    audio_path = tmp_path / "reply.ogg"
+    audio_path.write_bytes(b"fake ogg")
+
+    result = await adapter.send_voice("555", str(audio_path), reply_to="99")
+
+    assert result.success
+    assert result.message_id == "888"
+    assert channel.send.await_args.kwargs["reference"] is reference
+
+
+@pytest.mark.asyncio
+async def test_send_voice_reply_mode_off_omits_reference(tmp_path):
+    reference = object()
+    adapter, channel, request = _voice_adapter(reference)
+    adapter._reply_to_mode = "off"
+    audio_path = tmp_path / "reply.ogg"
+    audio_path.write_bytes(b"fake ogg")
+
+    result = await adapter.send_voice("555", str(audio_path), reply_to="99")
+
+    assert result.success
+    assert "message_reference" not in _native_voice_payload(request)
+    channel.fetch_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_voice_missing_reply_target_sends_without_reference(tmp_path):
+    adapter, channel, request = _voice_adapter(object())
+    channel.fetch_message.side_effect = RuntimeError("Unknown Message")
+    audio_path = tmp_path / "reply.ogg"
+    audio_path.write_bytes(b"fake ogg")
+
+    result = await adapter.send_voice("555", str(audio_path), reply_to="99")
+
+    assert result.success
+    assert "message_reference" not in _native_voice_payload(request)
+
+
+def test_format_message_converts_markdown_table_to_fenced_ascii_table():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    formatted = adapter.format_message(
+        "Here is a table:\n\n"
+        "| Name  | Score | Grade |\n"
+        "|-------|-------|-------|\n"
+        "| Alice | 95    | A     |\n"
+        "| Bob   | 82    | B     |\n\n"
+        "Done."
+    )
+
+    assert "|-------|" not in formatted
+    assert "```\n┌" in formatted
+    assert "│ Alice │ 95    │ A     │" in formatted
+    assert formatted.endswith("Done.")
+
+
+def test_truncate_message_preserves_generated_table_codeblock_boundaries():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    rows = "\n".join(
+        f"| row-{index:03d} | {'값' * 20} | {'x' * 30} |"
+        for index in range(80)
+    )
+    formatted = adapter.format_message(
+        "| Row | Korean | ASCII |\n"
+        "|-----|--------|-------|\n"
+        f"{rows}"
+    )
+
+    assert len(formatted) > adapter.MAX_MESSAGE_LENGTH
+    chunks = adapter.truncate_message(formatted, adapter.MAX_MESSAGE_LENGTH)
+
+    assert len(chunks) > 1
+    assert all(len(chunk) <= adapter.MAX_MESSAGE_LENGTH for chunk in chunks)
+    assert all(chunk.count("```") % 2 == 0 for chunk in chunks)
+    assert chunks[0].startswith("```\n┌")
+    assert chunks[1].startswith("```\n")
+
+
+@pytest.mark.asyncio
+async def test_send_retries_without_reference_when_reply_target_is_system_message():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    reference_obj = object()
+    ref_msg = SimpleNamespace(id=99, to_reference=MagicMock(return_value=reference_obj))
+    sent_msg = SimpleNamespace(id=1234)
+    send_calls = []
+
+    async def fake_send(*, content, reference=None):
+        send_calls.append({"content": content, "reference": reference})
+        if len(send_calls) == 1:
+            raise RuntimeError(
+                "400 Bad Request (error code: 50035): Invalid Form Body\n"
+                "In message_reference: Cannot reply to a system message"
+            )
+        return sent_msg
+
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(return_value=ref_msg),
+        send=AsyncMock(side_effect=fake_send),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "hello", reply_to="99")
+
+    assert result.success is True
+    assert result.message_id == "1234"
+    assert channel.fetch_message.await_count == 1
+    assert channel.send.await_count == 2
+    ref_msg.to_reference.assert_called_once_with(fail_if_not_exists=False)
+    assert send_calls[0]["reference"] is reference_obj
+    assert send_calls[1]["reference"] is None
+
+
+@pytest.mark.asyncio
+
+
 async def test_send_retries_without_reference_when_reply_target_is_deleted():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
 
