@@ -5,14 +5,28 @@ giving operators a focused, easy-to-grep artifact for postmortem
 attribution of off-schedule cron fires.
 
 Storage: events/cron_triggers.jsonl (canonical root, cross-profile)
-Rotation: weekly into events/audit/cron_triggers-YYYY-MM-DD.jsonl
-Retention: 30 days
+
+The live file is append-only and is never rotated. A weekly age-rotation
+arm existed f6c823e24 (2026-04-30) .. 2026-07-13 but was dead code from
+birth — handle() appends (refreshing st_mtime) microseconds before every
+hourly-gated check, so ``time.time() - st_mtime`` was always ~0 and no
+cron_triggers-* archive was ever produced. It was removed rather than
+fixed (AuditLogger precedent, edfed44c8): the file only receives
+cron_triggered events (~KB/week; 4.7 KB after its first 10 weeks), so
+append-only keeps the full fire history greppable in one place and is
+decades from being a size concern. If the growth rate ever changes, fold
+the file into the external audit-rotate cron
+(~/.hermes/scripts/audit_rotate.py) rather than resurrecting in-process
+rotation.
+
+The 30-day retention sweep of cron_triggers-*.jsonl under events/audit/
+remains (hourly-gated) for anything manually placed there — nothing
+creates such archives anymore.
 """
 
 import json
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -22,7 +36,6 @@ from events.subscribers.base import BaseSubscriber
 
 logger = logging.getLogger(__name__)
 
-ROTATION_INTERVAL = 604800  # 7 days
 RETENTION_DAYS = 30
 
 
@@ -38,7 +51,7 @@ class CronTriggerLog(BaseSubscriber):
             log_path = cron_trigger_log_path()
         self.log_path = Path(log_path)
         self._archive_dir = self.log_path.parent / "audit"
-        self._last_rotation_check: float = 0
+        self._last_cleanup_check: float = 0
 
     def handle(self, event: Event) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -47,35 +60,9 @@ class CronTriggerLog(BaseSubscriber):
             f.write(line + "\n")
 
         now = time.monotonic()
-        if now - self._last_rotation_check > 3600:
-            self._rotate_if_needed()
+        if now - self._last_cleanup_check > 3600:
             self._cleanup_old_archives()
-            self._last_rotation_check = now
-
-    def _rotate_if_needed(self) -> None:
-        if not self.log_path.exists():
-            return
-        try:
-            stat = self.log_path.stat()
-            age = time.time() - stat.st_mtime
-            if age < ROTATION_INTERVAL:
-                return
-            if stat.st_size == 0:
-                return
-
-            self._archive_dir.mkdir(parents=True, exist_ok=True)
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            dest = self._archive_dir / f"cron_triggers-{date_str}.jsonl"
-
-            counter = 1
-            while dest.exists():
-                dest = self._archive_dir / f"cron_triggers-{date_str}-{counter}.jsonl"
-                counter += 1
-
-            self.log_path.rename(dest)
-            logger.info("CronTriggerLog: rotated to %s", dest.name)
-        except Exception:
-            logger.exception("CronTriggerLog: rotation failed")
+            self._last_cleanup_check = now
 
     def _cleanup_old_archives(self) -> None:
         if not self._archive_dir.exists():

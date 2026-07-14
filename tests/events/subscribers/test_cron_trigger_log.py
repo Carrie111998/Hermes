@@ -78,68 +78,73 @@ def test_ignores_other_event_types(bus, log_path):
             assert json.loads(line)["event_type"] != "cron_started"
 
 
-def test_rotation_creates_dated_archive_after_age_threshold(bus, log_path):
-    """When the active file is older than ROTATION_INTERVAL, rotate it into an archive dir.
+def test_age_does_not_trigger_rotation(bus, log_path):
+    """Age alone must NOT rotate the live file — it is append-only.
 
-    Tests `_rotate_if_needed()` directly because the natural flow in handle()
-    writes to the file BEFORE checking rotation, which updates mtime back to
-    now and prevents the age check from triggering. In production, rotation
-    fires only when the log goes a full week without any writes — unusual
-    but acceptable for a cron-trigger audit log.
+    A weekly age arm existed f6c823e24..2026-07-13 but was dead code from
+    birth: handle() appends (refreshing st_mtime) microseconds before every
+    hourly-gated check, so age was always ~0 and no cron_triggers-* archive
+    was ever produced. It was removed rather than fixed (AuditLogger
+    precedent, edfed44c8) — the file grows ~KB/week and operators want the
+    full fire history greppable in one place. If a legacy rotation hook is
+    ever reintroduced, invoking it on a stale file must leave it in place.
     """
+    sub = CronTriggerLog(bus, log_path=log_path)
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text('{"event_type":"cron_triggered"}\n', encoding="utf-8")
+
+    thirty_days_ago = time.time() - 30 * 86400
+    os.utime(log_path, (thirty_days_ago, thirty_days_ago))
+
+    rotate = getattr(sub, "_rotate_if_needed", None)
+    if rotate is not None:  # removed 2026-07-13; guards against reintroduction
+        rotate()
+
+    assert log_path.exists(), "age alone must not rotate the live file"
+    archive_dir = log_path.parent / "audit"
+    archives = list(archive_dir.glob("cron_triggers-*.jsonl")) if archive_dir.exists() else []
+    assert archives == []
+
+
+def test_poll_appends_to_aged_file_without_rotation(bus, log_path):
+    """Production path: an event landing on a stale (30-day-old) live file
+    appends to it in place — prior lines preserved, no archive created —
+    even with the hourly cleanup gate forced open."""
     sub = CronTriggerLog(bus, log_path=log_path)
     _seed_cursor_at_zero(bus, sub.subscriber_id)
 
-    # Write one line so the file exists with non-zero size
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text('{"event_type":"cron_triggered"}\n', encoding="utf-8")
+    log_path.write_text(
+        '{"event_type":"cron_triggered","marker":"old-line"}\n', encoding="utf-8"
+    )
+    thirty_days_ago = time.time() - 30 * 86400
+    os.utime(log_path, (thirty_days_ago, thirty_days_ago))
 
-    eight_days_ago = time.time() - 8 * 86400
-    os.utime(log_path, (eight_days_ago, eight_days_ago))
+    sub._last_cleanup_check = float("-inf")  # force the hourly gate open
+    bus.emit(
+        event_type=EventType.CRON_TRIGGERED,
+        source="stale-file-test",
+        payload={"job_id": "z9", "job_name": "stale-file-test", "caller": "test"},
+        job_id="z9",
+    )
+    sub.poll()
 
-    sub._rotate_if_needed()
-
-    archive_dir = log_path.parent / "audit"
-    assert archive_dir.exists()
-    archives = list(archive_dir.glob("cron_triggers-*.jsonl"))
-    assert len(archives) >= 1
-    # Active log is gone (rotated)
-    assert not log_path.exists()
-
-
-def test_rotation_skips_fresh_file(bus, log_path):
-    """Rotation must NOT fire when the file is fresh."""
-    sub = CronTriggerLog(bus, log_path=log_path)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text('{"event_type":"cron_triggered"}\n', encoding="utf-8")
-
-    sub._rotate_if_needed()
-
-    # File is still in place — not rotated
     assert log_path.exists()
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2, "append must land in the same file"
+    assert json.loads(lines[0])["marker"] == "old-line"
     archive_dir = log_path.parent / "audit"
-    assert not archive_dir.exists() or not list(archive_dir.glob("cron_triggers-*.jsonl"))
-
-
-def test_rotation_skips_empty_file(bus, log_path):
-    """Rotation must NOT fire when the file is empty (size 0), even if old."""
-    sub = CronTriggerLog(bus, log_path=log_path)
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_path.write_text("", encoding="utf-8")
-
-    eight_days_ago = time.time() - 8 * 86400
-    os.utime(log_path, (eight_days_ago, eight_days_ago))
-
-    sub._rotate_if_needed()
-
-    # Empty file kept in place — pointless to archive an empty file
-    assert log_path.exists()
+    archives = list(archive_dir.glob("cron_triggers-*.jsonl")) if archive_dir.exists() else []
+    assert archives == []
 
 
 def test_cleanup_removes_old_archives(bus, log_path):
-    """Archives older than RETENTION_DAYS must be deleted."""
+    """Archives older than RETENTION_DAYS must be deleted.
+
+    Nothing creates cron_triggers-*.jsonl archives anymore (the weekly
+    age-rotation arm was removed 2026-07-13 — dead code from birth), but
+    the retention sweep stays for anything manually placed in audit/."""
     sub = CronTriggerLog(bus, log_path=log_path)
 
     archive_dir = log_path.parent / "audit"

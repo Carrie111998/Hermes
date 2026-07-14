@@ -109,8 +109,9 @@ def failure_cluster_state_path() -> Path:
 def cron_trigger_log_path() -> Path:
     """Per-job rolling log of off-schedule cron fires (cron_triggered events).
 
-    Maintained by the CronTriggerLog subscriber. JSONL format, weekly
-    rotation into events/audit/, 30-day retention. Operators grep this
-    by job_id during postmortems instead of scanning audit.jsonl in full.
+    Maintained by the CronTriggerLog subscriber. JSONL format, append-only —
+    never rotated (grows ~KB/week; the weekly-rotation promise was dead code
+    from birth and was removed 2026-07-13). Operators grep this by job_id
+    during postmortems instead of scanning audit.jsonl in full.
     """
     return events_dir() / "cron_triggers.jsonl"
