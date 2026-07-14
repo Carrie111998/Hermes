@@ -560,6 +560,7 @@ class BaseEnvironment(ABC):
         self._session_id = uuid.uuid4().hex[:12]
         temp_dir = self.get_temp_dir().rstrip("/") or "/"
         self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
+        self._snapshot_lock = f"{temp_dir}/hermes-snap-{self._session_id}.lock"
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
@@ -648,13 +649,15 @@ class BaseEnvironment(ABC):
         # Without this the snapshot bootstrap ``cd`` below fails on Windows and
         # ``pwd -P`` captures the login shell's directory, not ``terminal.cwd``.
         _quoted_cwd = self._quote_cwd_for_cd(self.cwd)
-        # Quote snapshot / cwd-file paths via ``_quote_shell_path`` so the
-        # LocalEnvironment override can rewrite ``C:/...`` (and mixed
+        # Quote snapshot / lock / cwd-file paths via ``_quote_shell_path`` so
+        # the LocalEnvironment override can rewrite ``C:/...`` (and mixed
         # ``/c/Users\\...``) to ``/c/...`` before quoting — bare drive paths
         # in the bootstrap script trip MSYS into the
         # ``Directory \\drivers\\etc does not exist`` failure class.
         # On POSIX this is plain ``shlex.quote``.
         _quoted_snap = self._quote_shell_path(self._snapshot_path)
+        _quoted_lock = self._quote_shell_path(self._snapshot_lock)
+        _quoted_cwd_file = self._quote_shell_path(self._cwd_file)
         # Use atomic file replacement: assemble the snapshot in a temp file,
         # then mv it over the final path.  This prevents concurrent source()
         # calls from reading a half-written snapshot when another terminal
@@ -675,11 +678,24 @@ class BaseEnvironment(ABC):
         # bash versions.  The template is shell-quoted (Windows/Git-Bash drive
         # letters, spaces) and the resulting path lives in a shell variable so
         # every later expansion is consistent.
+        #
+        # On macOS/APFS, even an atomic mv can race with concurrent source()
+        # reads: the rename can expose a torn old/new stream.  Use flock when
+        # available: exclusive lock for writers, shared lock for readers (see
+        # _wrap_command).  Silently fall back to the unlocked behavior if flock
+        # is unavailable (macOS default, some minimal containers).
         _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
         _snap_tmp = '"$__hermes_snap_tmp"'
         snapshot_excluded = self._snapshot_excluded_passthrough_names()
+        # flock -x wraps the entire write sequence; fallback silently
+        # on systems without flock (command -v fails -> run unlocked).
+        # Pattern: open lock file on fd 9, then flock that fd.  The `|| true`
+        # after flock ensures we proceed even if flock is missing or fails.
         bootstrap = (
             f"umask 077\n"
+            f"touch {_quoted_lock}\n"
+            f"exec 9>{_quoted_lock}\n"
+            f"command -v flock >/dev/null 2>&1 && flock -x 9 || true\n"
             f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
             f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
@@ -704,6 +720,7 @@ class BaseEnvironment(ABC):
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
             f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"exec 9>&-\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -783,9 +800,12 @@ class BaseEnvironment(ABC):
         re-dumps env vars, and emits CWD markers."""
         escaped = command.replace("'", "'\\''")
 
-        # Quote the snapshot path (see init_session — LocalEnvironment
-        # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle it).
+        # Quote the snapshot / lock / cwd-file paths (see init_session —
+        # LocalEnvironment rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't
+        # mangle it).
         _quoted_snap = self._quote_shell_path(self._snapshot_path)
+        _quoted_lock = self._quote_shell_path(self._snapshot_lock)
+        _quoted_cwd_file = self._quote_shell_path(self._cwd_file)
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
@@ -794,6 +814,12 @@ class BaseEnvironment(ABC):
         # expands empty, collapsing every writer onto one temp name) and ``$$``
         # is shared by ``&``-launched subshells.  Template shell-quoted
         # (Windows/spaces); the allocated path lives in a shell variable.
+        #
+        # On macOS/APFS, even an atomic mv can race with concurrent source()
+        # reads: the rename can expose a torn old/new stream.  Use flock when
+        # available: shared lock for readers (source), exclusive lock for
+        # writers (export + mv).  Silently fall back to the unlocked behavior
+        # if flock is unavailable (macOS default, some minimal containers).
         _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
         _snap_tmp = '"$__hermes_snap_tmp"'
 
@@ -820,9 +846,19 @@ class BaseEnvironment(ABC):
         # can emit the declarations to stdout, leaking ~60 lines of env
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
+        #
+        # Take a shared flock (fd 8) if flock is available — this coordinates
+        # with the exclusive lock taken by the writer below, preventing readers
+        # from seeing a torn stream during rename on macOS/APFS.  This must run
+        # in the parent shell: source inside a subshell would discard the
+        # restored environment before the user command runs.  Close fd 8 after
+        # source so the lock is released promptly.
         if self._snapshot_ready:
             parts.append(
-                f"source {_quoted_snap} >/dev/null 2>&1 || true"
+                f"exec 8<{_quoted_lock} 2>/dev/null || true\n"
+                f"{{ command -v flock >/dev/null 2>&1 && flock -s 8 || true; }}\n"
+                f"source {_quoted_snap} >/dev/null 2>&1 || true\n"
+                f"exec 8<&- 2>/dev/null || true"
             )
 
         for name, present, value in saved_names:
@@ -853,12 +889,20 @@ class BaseEnvironment(ABC):
         # first — the redirection inside _export_dump_excluding_session_vars is
         # attached to a brace group so the variable expands in the same shell
         # that later expands the ``mv`` operand, keeping both consistent.
+        #
+        # Wrap in an exclusive flock (fd 9) if flock is available — this
+        # coordinates with the shared lock taken by the reader above.  The
+        # subshell isolates the fd so it closes after mv completes; the mktemp
+        # assignment happens inside that same subshell, so every later
+        # expansion of the temp path stays consistent.
         if self._snapshot_ready:
             parts.append(
+                f"( exec 9>{_quoted_lock} 2>/dev/null && "
+                f"{{ command -v flock >/dev/null 2>&1 && flock -x 9 || true; }}; "
                 f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) && "
                 f"{{ {_export_dump_excluding_session_vars(_snap_tmp, passthrough_names)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true )"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since

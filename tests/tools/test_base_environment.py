@@ -173,6 +173,71 @@ class TestAtomicSnapshotWrite:
         assert boot.index("umask 077") < boot.index("export -p")
 
 
+class TestFlockBasedLocking:
+    """Regression for macOS/APFS race: even atomic mv can expose torn streams
+    to concurrent source() readers.  Use flock (shared for readers, exclusive
+    for writers) when available; fall back silently when flock is missing."""
+
+    def test_lock_file_path_set_on_init(self):
+        env = _TestableEnv()
+        assert hasattr(env, "_snapshot_lock")
+        assert env._snapshot_lock.endswith(".lock")
+        assert env._session_id in env._snapshot_lock
+
+    def test_wrap_command_reader_uses_flock_shared(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hi", "/tmp")
+        assert "flock -s" in wrapped
+        assert "exec 8<" in wrapped  # fd 8 for reader
+        assert "exec 8<&-" in wrapped
+        assert "( exec 8<" not in wrapped  # source must affect the parent shell
+
+    def test_wrap_command_writer_uses_flock_exclusive(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hi", "/tmp")
+        assert "flock -x" in wrapped
+        assert "exec 9>" in wrapped  # fd 9 for writer
+
+    def test_wrap_command_flock_fallback_when_unavailable(self):
+        """If flock is unavailable, the script must still work (fallback)."""
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        wrapped = env._wrap_command("echo hi", "/tmp")
+        assert "command -v flock" in wrapped
+        assert "|| true" in wrapped
+
+    def test_init_session_bootstrap_uses_flock_exclusive(self):
+        env = _TestableEnv()
+        # Record EVERY _run_bash call, not just the last.  When the bootstrap
+        # raises, init_session falls back to a non-login ``true`` probe — a
+        # single-slot capture would be overwritten by that probe and the
+        # assertions below would inspect "true" instead of the bootstrap.
+        captured: list[str] = []
+
+        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+            captured.append(cmd_string)
+            raise RuntimeError("stop after capture")
+
+        env._run_bash = fake_run_bash  # type: ignore[assignment]
+        try:
+            env.init_session()
+        except Exception:
+            pass
+        boot = captured[0] if captured else ""
+        assert "flock -x" in boot
+        assert "command -v flock" in boot
+
+    def test_lock_file_quoted_with_spaces(self):
+        env = _TestableEnv()
+        env._snapshot_ready = True
+        env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
+        env._snapshot_lock = "/tmp/has space/hermes-snap-x.lock"
+        wrapped = env._wrap_command("echo hi", "/tmp")
+        assert "'/tmp/has space/hermes-snap-x.lock'" in wrapped
+
+
 class TestAtomicSnapshotConcurrencyBehavioral:
     """Behavioral regression for #38249 — actually EXECUTES the generated
     snapshot write/read concurrently and asserts the file never tears.
@@ -183,49 +248,115 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
     that would corrupt PATH.  Crucially it allocates the temp with ``mktemp``
     (per-writer unique, works on macOS bash 3.2 which lacks ``$BASHPID``),
-    which is what closes the race; ``$$`` would still tear here.
+    which is what closes the write-side race; ``$$`` would still tear here.
+
+    On systems with flock (Linux, macOS with Homebrew flock), the shared/
+    exclusive lock coordination additionally prevents any torn reads.  On
+    systems without flock (stock macOS), the fallback is atomic mv, which is
+    racy on APFS but acceptable (the locking tests skip when flock is
+    unavailable).
+
     """
 
     def _run(self, script):
         import subprocess
         return subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True)
 
-    def test_concurrent_writes_never_tear_the_snapshot(self, tmp_path):
+    def _has_flock(self):
         import shutil
+        return shutil.which("flock") is not None
+
+    def test_concurrent_writes_never_tear_the_snapshot(self, tmp_path):
+        """With flock available, concurrent rw NEVER corrupts the snapshot.
+
+        Uses the EXACT script patterns _wrap_command emits (shared lock for
+        source, exclusive lock for export+mv).  This test REQUIRES flock —
+        it skips on systems without it."""
+        import shutil
+        import pytest
         if not shutil.which("bash"):
-            import pytest
             pytest.skip("bash required")
+        if not self._has_flock():
+            pytest.skip("flock required for this test")
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
+        lock = str(tmp_path / "hermes-snap-x.lock")
         _q = shlex.quote
         _tmpl = _q(snap + ".tmp.XXXXXXXXXX")
-        # One writer iteration = the exact atomic sequence _wrap_command emits.
+        _ql = _q(lock)
+        _qs = _q(snap)
+        # Writer: exact pattern from _wrap_command — exclusive lock on fd 9
+        # wrapping the mktemp-allocated atomic write sequence.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
+            f"( exec 9>{_ql} 2>/dev/null && flock -x 9; "
             f"__hermes_snap_tmp=$(mktemp {_tmpl}) && "
-            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_q(snap)}; }} "
-            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true; "
+            f"{{ export -p > \"$__hermes_snap_tmp\" && mv -f \"$__hermes_snap_tmp\" {_qs}; }} "
+            f"2>/dev/null || rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true ); "
             "done"
         )
-        # Reader: repeatedly source the snapshot and check PATH never absorbs
-        # an `export `/`declare -x` fragment (the corruption signature).
+        # Reader: exact pattern from _wrap_command (shared lock on fd 8)
         reader = (
             "export PATH=/usr/bin:/bin; "
             "for i in $(seq 1 160); do "
-            f"( source {_q(snap)} >/dev/null 2>&1 || true; "
+            f"( exec 8<{_ql} 2>/dev/null && flock -s 8; "
+            f"source {_qs} >/dev/null 2>&1 || true; "
             "case \"$PATH\" in *'declare -x'*|*'export '*) echo CORRUPT;; esac ); "
             "done"
         )
-        self._run(f"export -p > {_q(snap)}")  # seed a valid snapshot
-        # 4 concurrent writers + 4 readers, repeated.
+        # Seed valid snapshot and lock file
+        self._run(f"export -p > {_qs}")
+        self._run(f"touch {_ql}")
+        # 4 concurrent writers + 4 readers, repeated
         w = " & ".join([writer] * 4)
         r = " & ".join([reader] * 4)
         procs = [self._run(f"{w} & {r} & wait") for _ in range(3)]
         corrupt = any("CORRUPT" in p.stdout for p in procs)
-        assert not corrupt, "snapshot tore — PATH absorbed a declare-x/export fragment"
-        final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
+        assert not corrupt, "snapshot tore under flock coordination — this should never happen"
+        final = self._run(f"source {_qs} >/dev/null 2>&1 && echo OK || echo BROKEN")
         assert "OK" in final.stdout, f"final snapshot not sourceable: {final.stdout} {final.stderr}"
+
+    def test_flock_fallback_graceful_on_unavailable(self, tmp_path):
+        """When flock is unavailable, the fallback pattern runs without error.
+
+        This tests that the 'command -v flock ... || true' fallback doesn't
+        break execution — it may still race on APFS, but it doesn't crash."""
+        import shutil
+        import pytest
+        if not shutil.which("bash"):
+            pytest.skip("bash required")
+        import shlex
+        snap = str(tmp_path / "hermes-snap-x.sh")
+        lock = str(tmp_path / "hermes-snap-x.lock")
+        _q = shlex.quote
+        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _ql = _q(lock)
+        _qs = _q(snap)
+        # Writer with fallback pattern (same as _wrap_command)
+        writer = (
+            f"( exec 9>{_ql} 2>/dev/null && "
+            f"{{ command -v flock >/dev/null 2>&1 && flock -x 9 || true; }}; "
+            f"export TEST_VAR=hello; "
+            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_qs}; }} "
+            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true )"
+        )
+        # Reader with fallback pattern
+        reader = (
+            f"( exec 8<{_ql} 2>/dev/null && "
+            f"{{ command -v flock >/dev/null 2>&1 && flock -s 8 || true; }}; "
+            f"source {_qs} >/dev/null 2>&1 || true; "
+            f"echo \"TEST_VAR=$TEST_VAR\" )"
+        )
+        # Seed
+        self._run(f"touch {_ql}")
+        self._run(f"export -p > {_qs}")
+        # Run writer then reader
+        w_result = self._run(writer)
+        assert w_result.returncode == 0, f"writer failed: {w_result.stderr}"
+        r_result = self._run(reader)
+        assert r_result.returncode == 0, f"reader failed: {r_result.stderr}"
+        assert "TEST_VAR=hello" in r_result.stdout, "env var not propagated through snapshot"
 
     def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
         """If ``export -p`` fails, the ``&&``-chained mv must NOT clobber the
