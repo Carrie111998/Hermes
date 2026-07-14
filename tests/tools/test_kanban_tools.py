@@ -40,6 +40,51 @@ def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     )
 
 
+def test_worker_graph_tools_remain_visible_by_default(monkeypatch, tmp_path):
+    """The opt-in restriction must not change existing worker schemas."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+
+    assert {"kanban_create", "kanban_link"} <= names
+
+
+def test_worker_graph_policy_hides_schema_and_updates_prompt(monkeypatch, tmp_path):
+    """Restricted workers see neither graph tools nor instructions to call them."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "kanban:\n  worker_graph_mutations: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from agent.prompt_builder import kanban_guidance_for_tools
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    guidance = kanban_guidance_for_tools(names)
+
+    assert {"kanban_create", "kanban_link"}.isdisjoint(names)
+    assert {"kanban_show", "kanban_comment", "kanban_complete"} <= names
+    assert "followup-request:" in guidance
+    assert "use `kanban_create` to fan out" not in guidance
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -67,6 +112,86 @@ def worker_env(monkeypatch, tmp_path):
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     return tid
+
+
+def test_worker_graph_policy_rejects_create_and_link_without_db_mutation(worker_env):
+    """Handler checks enforce the policy even if a caller bypasses schema hiding."""
+    from hermes_constants import get_hermes_home
+    from hermes_cli import config as cfg_mod
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    (get_hermes_home() / "config.yaml").write_text(
+        "kanban:\n  worker_graph_mutations: false\n",
+        encoding="utf-8",
+    )
+    setattr(cfg_mod, "_cached_config", None)
+
+    conn = kb.connect()
+    try:
+        other = kb.create_task(conn, title="existing", assignee="peer")
+        before_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    created = json.loads(kt._handle_create({"title": "forbidden", "assignee": "peer"}))
+    linked = json.loads(kt._handle_link({"parent_id": worker_env, "child_id": other}))
+
+    assert "followup-request" in created.get("error", "")
+    assert "followup-request" in linked.get("error", "")
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == before_tasks
+        assert conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=?", (other,)
+        ).fetchall() == []
+    finally:
+        conn.close()
+
+
+def test_orchestrator_retains_graph_mutations_when_worker_policy_is_disabled(
+    monkeypatch, tmp_path
+):
+    """The worker restriction must not remove the configured control plane."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "toolsets:\n  - kanban\nkanban:\n  worker_graph_mutations: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import config as cfg_mod
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    setattr(cfg_mod, "_cached_config", None)
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("kanban")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert {"kanban_create", "kanban_link"} <= names
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="orchestrator")
+    finally:
+        conn.close()
+
+    created = json.loads(kt._handle_create({"title": "child", "assignee": "dev"}))
+    assert created.get("ok") is True
+    linked = json.loads(kt._handle_link({
+        "parent_id": parent,
+        "child_id": created["task_id"],
+    }))
+    assert linked.get("ok") is True
 
 
 def test_show_defaults_to_env_task_id(worker_env):

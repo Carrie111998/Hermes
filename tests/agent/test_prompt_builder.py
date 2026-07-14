@@ -5,6 +5,7 @@ import importlib
 import logging
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,6 +55,19 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_kanban_fallback_guidance_matches_restricted_tool_schema(self):
+        """Rare callers bypassing agent_init must still get tool-aware guidance."""
+        from agent.system_prompt import _resolve_kanban_guidance
+
+        agent = SimpleNamespace(
+            valid_tool_names={"kanban_show", "kanban_comment", "kanban_complete"},
+        )
+
+        guidance = _resolve_kanban_guidance(agent)
+
+        assert "followup-request:" in guidance
+        assert "use `kanban_create` to fan out" not in guidance
 
 
 # =========================================================================

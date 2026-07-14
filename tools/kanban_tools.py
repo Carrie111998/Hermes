@@ -135,6 +135,42 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _worker_graph_mutations_enabled() -> bool:
+    """Resolve the task-worker graph policy, preserving the legacy default."""
+    try:
+        return bool(cfg_get(
+            load_config(), "kanban", "worker_graph_mutations", default=True,
+        ))
+    except Exception:
+        # A config read failure must not silently revoke a previously available
+        # worker capability. load_config itself reports malformed config.
+        return True
+
+
+def _check_kanban_graph_mutation_mode() -> bool:
+    """Expose create/link to orchestrators and, when allowed, task workers."""
+    if _is_delegated_child_context():
+        return False
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
+        return _worker_graph_mutations_enabled()
+    return _profile_has_kanban_toolset()
+
+
+def _enforce_worker_graph_mutation_policy() -> Optional[str]:
+    """Enforce schema policy again at the handler security boundary."""
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and _is_dispatcher_owned_worker()
+        and not _worker_graph_mutations_enabled()
+    ):
+        return tool_error(
+            "kanban graph mutations are reserved for an orchestrator on this "
+            "installation; add a followup-request: comment to your current task "
+            "instead of creating or linking cards"
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1349,6 +1385,9 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    policy_err = _enforce_worker_graph_mutation_policy()
+    if policy_err:
+        return policy_err
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1642,6 +1681,9 @@ def _handle_link(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_link")
     if delegated_err:
         return delegated_err
+    policy_err = _enforce_worker_graph_mutation_policy()
+    if policy_err:
+        return policy_err
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -2453,7 +2495,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_graph_mutation_mode,
     emoji="➕",
 )
 
@@ -2471,6 +2513,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_graph_mutation_mode,
     emoji="🔗",
 )

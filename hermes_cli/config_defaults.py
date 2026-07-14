@@ -2340,6 +2340,11 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Allow dispatcher-scoped workers to create cards and add dependency
+        # links. True preserves the historical worker surface. Set false when
+        # one or more unscoped profiles with the `kanban` toolset own graph
+        # mutation; restricted workers use `followup-request:` comments instead.
+        "worker_graph_mutations": True,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

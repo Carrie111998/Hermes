@@ -34,7 +34,6 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
-    KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
@@ -47,12 +46,23 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    kanban_guidance_for_tools,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_kanban_guidance(agent: Any) -> str:
+    """Return cached guidance or derive a tool-aware fallback."""
+    guidance = getattr(agent, "_kanban_worker_guidance", None)
+    if guidance is not None:
+        return guidance
+    if "kanban_show" not in agent.valid_tool_names:
+        return ""
+    return kanban_guidance_for_tools(set(agent.valid_tool_names))
 
 
 def _ra():
@@ -235,12 +245,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
     # this block. Resolved once at __init__ (see _kanban_worker_guidance).
-    _kanban_guidance = getattr(agent, "_kanban_worker_guidance", None)
+    _kanban_guidance = _resolve_kanban_guidance(agent)
     if _kanban_guidance:
         tool_guidance.append(_kanban_guidance)
-    elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
-        # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 

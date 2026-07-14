@@ -612,6 +612,19 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `worker_graph_mutations` | `true` | Whether dispatcher-scoped workers receive and may call `kanban_create` / `kanban_link`. Set to `false` to reserve graph writes for unscoped orchestrator profiles that enable the `kanban` toolset. Restricted worker prompts direct follow-up proposals to `followup-request:` comments instead. |
+
+`worker_graph_mutations: true` preserves the historical behavior. In an
+orchestrator-owned installation, use:
+
+```yaml
+kanban:
+  worker_graph_mutations: false
+```
+
+The restriction is enforced both when model-tool schemas are assembled and
+again in the mutation handlers. It does not affect human CLI/dashboard actions
+or an unscoped profile with `toolsets: [kanban]`.
 
 And the two auxiliary LLM slots:
 
