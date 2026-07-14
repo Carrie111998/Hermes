@@ -4659,6 +4659,16 @@ class FeishuAdapter(BasePlatformAdapter):
             file_path=display_name,
             requested_message_type=outbound_message_type,
         )
+        upload_duration = None
+        try:
+            import subprocess
+            probe = await asyncio.to_thread(subprocess.run,
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                capture_output=True, text=True, timeout=10)
+            if probe.returncode == 0 and probe.stdout.strip():
+                upload_duration = int(float(probe.stdout.strip()) * 1000)
+        except Exception: pass
         try:
             duration_ms = 0
             if upload_file_type == "opus":
@@ -4668,7 +4678,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     file_type=upload_file_type,
                     file_name=display_name,
                     file=file_obj,
-                    duration=duration_ms,
+                    duration=upload_duration or duration_ms,
                 )
                 request = self._build_file_upload_request(body)
                 upload_response = await self._run_blocking(self._client.im.v1.file.create, request)
@@ -4694,10 +4704,13 @@ class FeishuAdapter(BasePlatformAdapter):
                     metadata=metadata,
                 )
             else:
+                payload_dict = {"file_key": file_key}
+                if resolved_message_type == "audio" and upload_duration is not None:
+                    payload_dict["duration"] = upload_duration
                 message_response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
                     msg_type=resolved_message_type,
-                    payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                    payload=json.dumps(payload_dict, ensure_ascii=False),
                     reply_to=reply_to,
                     metadata=metadata,
                 )
@@ -4718,7 +4731,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         message_response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
                             msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                            payload=json.dumps(payload_dict, ensure_ascii=False),
                             reply_to=thread_msg_id,
                             metadata=metadata,
                         )
@@ -4727,7 +4740,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         message_response = await self._feishu_send_with_retry(
                             chat_id=chat_id,
                             msg_type=resolved_message_type,
-                            payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                            payload=json.dumps(payload_dict, ensure_ascii=False),
                             reply_to=None,
                             metadata=None,
                         )
