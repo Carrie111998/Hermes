@@ -80,9 +80,18 @@ _FILE_RE = re.compile(
     r"|(?<![\w/\\])[A-Za-z0-9_-]+\.(?:py|pyi|js|jsx|ts|tsx|md|mdx|toml|yaml|yml|json|jsonl|sql|sh|ps1|css|scss|html|txt)\b",
     re.IGNORECASE,
 )
-_MEMORY_LINK_RE = re.compile(
+_MEMORY_URI_RE = re.compile(
     r"(?:mempalace|gbrain)://[^\s<>{}\[\]]+|https?://[^\s<>{}\[\]]*(?:mempalace|gbrain)[^\s<>{}\[\]]*",
     re.IGNORECASE,
+)
+_MEMPALACE_DRAWER_RE = re.compile(r"\bdrawer_[A-Za-z0-9][A-Za-z0-9_.-]*")
+_GBRAIN_CONTEXT_RE = re.compile(
+    r"\bgbrain(?:\s+(?:page|wiki))?\s*(?::|=|at)?\s+"
+    r"(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)",
+    re.IGNORECASE,
+)
+_GBRAIN_WIKI_RE = re.compile(
+    r"\[\[(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)\]\]"
 )
 
 _BEARER_RE = re.compile(
@@ -94,7 +103,8 @@ _GITHUB_TOKEN_RE = re.compile(
 )
 _AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 _GENERIC_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b(?:password|token)\s*=\s*)(?:['\"]?)[^\s'\";,]+(?:['\"]?)"
+    r"(?i)(\b(?:password|token)\s*=\s*)"
+    r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s;,]+)'
 )
 
 
@@ -111,13 +121,14 @@ class ContextPackBuilder:
         if session is None:
             raise KeyError(request.source_session_id)
 
+        expected_pack_id = _stable_pack_id(request)
         existing = self._get_exact_pack(request)
-        if (
-            existing is not None
-            and existing["source_session_id"] != request.source_session_id
-        ):
-            raise ValueError("context pack source identity mismatch")
-        if existing is not None and existing["immutable_at"] is not None:
+        if existing is not None:
+            self._validate_persisted_identity(
+                existing,
+                request=request,
+                expected_pack_id=expected_pack_id,
+            )
             return _context_pack_from_row(existing)
 
         messages = self.db.get_messages(request.source_session_id)
@@ -132,12 +143,11 @@ class ContextPackBuilder:
             if target_session_id is not None
             else None
         )
-        snapshot_timestamp = max([
-            float(session["started_at"]),
-            *[float(row["timestamp"]) for row in messages],
-        ])
-
-        warnings: list[str] = []
+        snapshot_timestamp, warnings = self._snapshot_timestamp(
+            request.source_session_id,
+            session,
+            messages,
+        )
         if request.stale:
             warnings.append(
                 "- [stale source] The source refresh did not reach a confirmed current snapshot."
@@ -181,7 +191,7 @@ class ContextPackBuilder:
         )
 
         pack = ContextPack(
-            id=(existing["id"] if existing is not None else _stable_pack_id(request)),
+            id=expected_pack_id,
             bridge_id=request.bridge_id,
             source_session_id=request.source_session_id,
             target_session_id=target_session_id,
@@ -189,14 +199,16 @@ class ContextPackBuilder:
             source_hash=request.source_hash,
             budget_chars=request.budget_chars,
             payload=payload,
-            created_at=(
-                float(existing["created_at"])
-                if existing is not None
-                else snapshot_timestamp
-            ),
+            created_at=snapshot_timestamp,
             immutable_at=None,
         )
-        return _context_pack_from_row(self.store.put_context_pack(pack))
+        persisted = self.store.put_context_pack(pack)
+        self._validate_persisted_identity(
+            persisted,
+            request=request,
+            expected_pack_id=expected_pack_id,
+        )
+        return _context_pack_from_row(persisted)
 
     @staticmethod
     def _validate_request(request: ContextPackRequest) -> None:
@@ -236,6 +248,24 @@ class ContextPackBuilder:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def _validate_persisted_identity(
+        self,
+        row: Mapping[str, Any],
+        *,
+        request: ContextPackRequest,
+        expected_pack_id: str,
+    ) -> None:
+        if row["source_session_id"] != request.source_session_id:
+            raise ValueError("context pack source identity mismatch")
+        if row["id"] != expected_pack_id:
+            raise ValueError("context pack target-provider/snapshot identity mismatch")
+        target_session_id = row["target_session_id"]
+        if target_session_id is None:
+            return
+        target = self.store.get_external_session(target_session_id)
+        if target is None or target["provider"] != request.target_provider.value:
+            raise ValueError("context pack target identity mismatch")
+
     def _find_target_session(self, request: ContextPackRequest) -> str | None:
         with self.db._lock:
             conn = self.db._conn
@@ -272,6 +302,48 @@ class ContextPackBuilder:
                 ),
             ).fetchone()
         return row["target_session_id"] if row is not None else None
+
+    def _snapshot_timestamp(
+        self,
+        source_session_id: str,
+        session: Mapping[str, Any],
+        messages: Sequence[Mapping[str, Any]],
+    ) -> tuple[float, list[str]]:
+        candidates = [float(session["started_at"])]
+        ended_at = session.get("ended_at")
+        if ended_at is not None:
+            ended_timestamp = float(ended_at)
+            if math.isfinite(ended_timestamp):
+                candidates.append(ended_timestamp)
+        candidates.extend(
+            timestamp
+            for row in messages
+            if math.isfinite(timestamp := float(row["timestamp"]))
+        )
+
+        warnings: list[str] = []
+        try:
+            activity = self.store.get_state(
+                f"session-bridge:external-activity:{source_session_id}"
+            )
+        except (TypeError, ValueError):
+            activity = None
+            warnings.append(
+                "- [invalid activity watermark] The persisted source activity state is malformed and was ignored."
+            )
+        if activity is not None:
+            last_active = activity.get("last_active")
+            if (
+                not isinstance(last_active, (int, float))
+                or isinstance(last_active, bool)
+                or not math.isfinite(float(last_active))
+            ):
+                warnings.append(
+                    "- [invalid activity watermark] The persisted source activity timestamp is not finite numeric data and was ignored."
+                )
+            else:
+                candidates.append(float(last_active))
+        return max(candidates), warnings
 
     @staticmethod
     def _identity_section(
@@ -430,8 +502,7 @@ class ContextPackBuilder:
                 stats = file_stats.setdefault(path, [0, 0])
                 stats[0] += 1
                 stats[1] = occurrence
-            for match in _MEMORY_LINK_RE.finditer(searchable):
-                link = match.group(0).rstrip(".,;:!?)")
+            for link in _memory_references(searchable):
                 occurrence += 1
                 memory_links[link] = occurrence
 
@@ -596,6 +667,26 @@ def _format_turn(role: str, content: str, timestamp: Any) -> str:
 
 def _compact(value: str) -> str:
     return " ".join(value.split())
+
+
+def _memory_references(value: str) -> list[str]:
+    matches: list[tuple[int, str]] = []
+    uri_spans: list[tuple[int, int]] = []
+    for match in _MEMORY_URI_RE.finditer(value):
+        uri_spans.append(match.span())
+        matches.append((match.start(), match.group(0).rstrip(".,;:!?)")))
+
+    for pattern, group in (
+        (_MEMPALACE_DRAWER_RE, 0),
+        (_GBRAIN_CONTEXT_RE, "reference"),
+        (_GBRAIN_WIKI_RE, "reference"),
+    ):
+        for match in pattern.finditer(value):
+            if any(start <= match.start() < end for start, end in uri_spans):
+                continue
+            reference = match.group(group).rstrip(".,;:!?)")
+            matches.append((match.start(), reference))
+    return [reference for _, reference in sorted(matches, key=lambda item: item[0])]
 
 
 def _redact(value: str) -> str:

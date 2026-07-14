@@ -69,6 +69,7 @@ def _projection(
     cursor: str = "cursor-exact",
     source_hash: str = "sha256:exact",
     git_branch: str | None = "feature/handoff",
+    last_active: float | None = None,
 ) -> SessionProjection:
     return SessionProjection(
         provider=Provider.CLAUDE,
@@ -76,7 +77,11 @@ def _projection(
         title="Build the bridge",
         cwd=cwd,
         started_at=100.0,
-        last_active=max((message.timestamp for message in messages), default=100.0),
+        last_active=(
+            max((message.timestamp for message in messages), default=100.0)
+            if last_active is None
+            else last_active
+        ),
         messages=messages,
         native_path=f"C:/claude/{native_id}.jsonl",
         native_status="active",
@@ -405,6 +410,38 @@ def test_memory_references_are_copied_without_requiring_backends(db: SessionDB):
     assert "example.com" not in links
 
 
+def test_canonical_mempalace_and_gbrain_references_are_rendered(db: SessionDB):
+    drawer_id = (
+        "drawer_hermes_cross-harness-session-bridge-implementation_342310dfdf666a"
+    )
+    store = _seed(
+        db,
+        [
+            _message(
+                "u1",
+                "user",
+                f"MemPalace drawer {drawer_id}. "
+                "GBrain page systems/cross-harness-session-bridge. "
+                "GBrain wiki [[projects/hermes]]. "
+                "Ignore src/context_pack.py and "
+                "https://example.com/docs/systems/unrelated.",
+                timestamp=101.0,
+            )
+        ],
+    )
+
+    links = _section(
+        ContextPackBuilder(db, store).build(_request()).payload,
+        SECTION_HEADINGS[7],
+    )
+
+    assert drawer_id in links
+    assert "systems/cross-harness-session-bridge" in links
+    assert "projects/hermes" in links
+    assert "src/context_pack.py" not in links
+    assert "example.com" not in links
+
+
 def test_truncation_is_bounded_keeps_newest_turns_and_is_explicit(db: SessionDB):
     messages = [
         _message(
@@ -526,6 +563,171 @@ def test_build_is_repeatable_and_hydrated_pack_is_immutable(db: SessionDB):
     assert after_hydration.immutable_at == 900.0
 
 
+def test_exact_mutable_snapshot_is_frozen_on_first_persisted_build(
+    db: SessionDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+    store = _seed(
+        db,
+        [_message("u1", "user", "Persist this snapshot", timestamp=101.0)],
+        cwd=str(cwd),
+    )
+    git_outputs = iter(("## first-state\n", "## changed-live-state\n"))
+    calls: list[list[str]] = []
+
+    def changing_git(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=next(git_outputs), stderr="")
+
+    monkeypatch.setattr("session_bridge.context_pack.subprocess.run", changing_git)
+    builder = ContextPackBuilder(db, store)
+
+    first = builder.build(_request())
+    replay = builder.build(_request())
+
+    assert replay == first
+    assert "first-state" in replay.payload
+    assert "changed-live-state" not in replay.payload
+    assert calls == [["git", "-C", str(cwd), "status", "--short", "--branch"]]
+    persisted = store.get_context_pack("bridge-7", budget_chars=8000)
+    assert persisted is not None
+    assert persisted["payload"] == first.payload
+
+
+@pytest.mark.parametrize("immutable", [False, True], ids=["mutable", "hydrated"])
+def test_snapshot_key_fails_closed_across_target_providers(
+    db: SessionDB, immutable: bool
+):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Provider-specific snapshot", timestamp=101.0)],
+    )
+    store.upsert_projection(
+        SessionProjection(
+            provider=Provider.CODEX,
+            native_id="provider-target",
+            title="Provider target",
+            cwd=None,
+            started_at=100.0,
+            last_active=101.0,
+            messages=[],
+            native_cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="provider-link",
+            from_session_id="claude:source-1",
+            to_session_id="codex:provider-target",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-7",
+            source_cursor="cursor-exact",
+            source_hash="sha256:exact",
+            created_at=110.0,
+        )
+    )
+    builder = ContextPackBuilder(db, store)
+    first = builder.build(_request())
+    if immutable:
+        store.mark_hydrated(
+            "bridge-7",
+            source_cursor="cursor-exact",
+            source_hash="sha256:exact",
+            pack_id=first.id,
+        )
+
+    with pytest.raises(ValueError, match="target-provider/snapshot identity mismatch"):
+        builder.build(replace(_request(), target_provider=Provider.CLAUDE))
+
+    persisted = store.get_context_pack("bridge-7", budget_chars=8000)
+    assert persisted is not None
+    assert persisted["id"] == first.id
+    assert persisted["payload"] == first.payload
+
+
+def test_existing_pack_rejects_a_corrupted_target_provider(db: SessionDB):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Validate target identity", timestamp=101.0)],
+    )
+    builder = ContextPackBuilder(db, store)
+    first = builder.build(_request())
+    store.upsert_projection(
+        _projection(
+            [_message("u2", "user", "Wrong provider target", timestamp=102.0)],
+            native_id="wrong-target",
+        )
+    )
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "UPDATE session_context_packs SET target_session_id = ? WHERE id = ?",
+            ("claude:wrong-target", first.id),
+        )
+
+    with pytest.raises(ValueError, match="target identity mismatch"):
+        builder.build(_request())
+
+
+def test_post_put_identity_is_validated_against_a_racing_row(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Validate race result", timestamp=101.0)],
+    )
+    real_put = store.put_context_pack
+
+    def racing_put(pack):
+        row = real_put(pack)
+        return {**row, "id": "pack:other-target-provider"}
+
+    monkeypatch.setattr(store, "put_context_pack", racing_put)
+
+    with pytest.raises(ValueError, match="target-provider/snapshot identity mismatch"):
+        ContextPackBuilder(db, store).build(_request())
+
+
+def test_empty_imported_session_uses_persisted_activity_watermark(db: SessionDB):
+    store = _seed(db, [], last_active=500.0)
+
+    pack = ContextPackBuilder(db, store).build(_request())
+
+    assert pack.created_at == 500.0
+    assert "Snapshot timestamp: 500.000000" in pack.payload
+
+
+@pytest.mark.parametrize(
+    "value_json",
+    ['{"last_active":"later"}', '{"last_active":1e999}', "not-json"],
+    ids=["non-numeric", "non-finite", "invalid-json"],
+)
+def test_malformed_activity_watermark_warns_and_falls_back(
+    db: SessionDB, value_json: str
+):
+    store = _seed(db, [], last_active=500.0)
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            """UPDATE session_bridge_state SET value_json = ?
+               WHERE key = ?""",
+            (
+                value_json,
+                "session-bridge:external-activity:claude:source-1",
+            ),
+        )
+
+    pack = ContextPackBuilder(db, store).build(_request())
+
+    assert pack.created_at == 100.0
+    assert "Snapshot timestamp: 100.000000" in pack.payload
+    assert "[invalid activity watermark]" in _section(pack.payload, SECTION_HEADINGS[8])
+
+
 def test_immutable_pack_lookup_never_crosses_source_identity(db: SessionDB):
     store = _seed(
         db,
@@ -579,6 +781,28 @@ def test_secrets_are_redacted_but_ordinary_ids_are_preserved(db: SessionDB):
     for secret in secrets:
         assert secret not in payload
     assert payload.count("[REDACTED]") >= 6
+    assert uuid in payload
+    assert source_id in payload
+
+
+def test_quoted_multiword_assignments_are_fully_redacted_everywhere(db: SessionDB):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = (
+        'Decision: password="correct horse battery staple" must remain private.\n'
+        "TODO: token='secret value here' must be removed.\n"
+        f"ordinary_uuid={uuid}\nsource_id={source_id}"
+    )
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "correct horse battery staple" not in payload
+    assert "secret value here" not in payload
+    assert "horse battery staple" not in payload
+    assert "value here" not in payload
+    assert "password=[REDACTED]" in payload
+    assert "token=[REDACTED]" in payload
     assert uuid in payload
     assert source_id in payload
 
