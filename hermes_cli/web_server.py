@@ -9963,10 +9963,13 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
 def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
-    cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
-    from the process HERMES_HOME at import time. The dashboard is a single
-    process that can inspect many profiles, so temporarily retarget those
-    globals while holding a lock and restore them immediately after the call.
+    cron.jobs resolves its store dynamically from the active HERMES_HOME at
+    call time (per-profile, #4707). The dashboard is a single process that can
+    inspect many profiles, so set the context-local HERMES_HOME override (which
+    drives that resolution) while holding a lock, and restore it immediately
+    after the call. The CRON_DIR/JOBS_FILE/OUTPUT_DIR swap is retained only to
+    keep the backward-compat module-level snapshots consistent for any external
+    reader; internal cron.jobs code reads the override, not those globals.
     """
     profile_name, home = _cron_profile_home(target_profile)
     with _CRON_PROFILE_LOCK:
@@ -10254,10 +10257,21 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     with _CRON_PROFILE_LOCK:
         from cron import jobs as cron_jobs
         from cron.scheduler_provider import resolve_cron_scheduler
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
+        # cron.jobs resolves its store dynamically from the active HERMES_HOME
+        # (per-profile, #4707), so the context-local override — not the legacy
+        # module-global swap — is what redirects the CAS claim and run to THIS
+        # profile's jobs.json instead of the dashboard process's own home. Set
+        # both (matching _call_cron_for_profile): the override drives resolution,
+        # the swap keeps any compat-snapshot reader consistent, restored below.
         old_cron_dir = cron_jobs.CRON_DIR
         old_jobs_file = cron_jobs.JOBS_FILE
         old_output_dir = cron_jobs.OUTPUT_DIR
+        token = set_hermes_home_override(str(home))
         cron_jobs.CRON_DIR = home / "cron"
         cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
         cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
@@ -10268,6 +10282,7 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
             cron_jobs.CRON_DIR = old_cron_dir
             cron_jobs.JOBS_FILE = old_jobs_file
             cron_jobs.OUTPUT_DIR = old_output_dir
+            reset_hermes_home_override(token)
 
 
 @app.post("/api/cron/fire")

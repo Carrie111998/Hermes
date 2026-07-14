@@ -27,6 +27,50 @@ from cron.jobs import (
 
 
 # =========================================================================
+# Dynamic storage-path resolution
+# =========================================================================
+# Regression guard for the import-pinned-constants pollution class
+# (memory: cron_jobs_paths_import_pinned_real_store_pollution). cron.jobs is
+# imported ONCE per process — often before a test's hermetic HERMES_HOME is in
+# place — so freezing the storage paths at import made create_job() write to
+# whatever home existed at import, historically the real ~/.hermes/cron.
+
+def test_storage_follows_hermes_home_set_after_import(tmp_path, monkeypatch):
+    """Storage must resolve from the CURRENT HERMES_HOME at call time.
+
+    A HERMES_HOME set (or changed) AFTER cron.jobs was imported must win over
+    any stale module-level path snapshot, so a job never lands in the home that
+    merely happened to be active at import time.
+    """
+    import cron.jobs as jobs
+
+    # Simulate the buggy import-time snapshot pointing at a *different* home —
+    # exactly the state that caused live-store pollution.
+    stale = tmp_path / "stale_import_home"
+    monkeypatch.setattr(jobs, "HERMES_DIR", stale)
+    monkeypatch.setattr(jobs, "CRON_DIR", stale / "cron")
+    monkeypatch.setattr(jobs, "JOBS_FILE", stale / "cron" / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", stale / "cron" / "output")
+
+    # The active HERMES_HOME points somewhere else entirely.
+    home = tmp_path / "active_home"
+    (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    job = jobs.create_job(prompt="dynamic path check", schedule="every 30m", name="dyn")
+
+    # Dynamic resolution wins: the job lands under the active HERMES_HOME,
+    # NOT the stale import-time snapshot.
+    assert (home / "cron" / "jobs.json").exists()
+    assert not (stale / "cron" / "jobs.json").exists()
+
+    # And it round-trips through the same dynamic resolution.
+    fetched = jobs.get_job(job["id"])
+    assert fetched is not None
+    assert fetched["name"] == "dyn"
+
+
+# =========================================================================
 # parse_duration
 # =========================================================================
 
