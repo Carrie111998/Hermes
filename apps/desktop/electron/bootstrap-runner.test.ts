@@ -98,6 +98,27 @@ test('fresh bootstrap args prefer the durable commit over a stale packaged branc
   )
 })
 
+test('fresh bootstrap args fall back to a packaged branch when no commit is available', () => {
+  const installStamp = { branch: 'release-branch' }
+
+  assert.deepEqual(buildPinArgs(installStamp), ['-Branch', 'release-branch'])
+  assert.deepEqual(
+    buildPosixPinArgs({
+      installStamp,
+      activeRoot: '/tmp/hermes-agent',
+      hermesHome: '/tmp/hermes'
+    }),
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--branch',
+      'release-branch'
+    ]
+  )
+})
+
 test('existing-checkout bootstrap args ignore stale packaged commit and branch pins', () => {
   const installStamp = { commit: 'a'.repeat(40), branch: 'deleted-build-branch' }
 
