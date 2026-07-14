@@ -4391,6 +4391,43 @@ class TestAutoMaintenance:
         # Active session's transcript is untouched
         assert (sessions_dir / "new.jsonl").exists()
 
+    def test_marker_recorded_even_when_prune_raises(self, db, monkeypatch):
+        """Defect #1 fix: a transient prune failure must still record the
+        last-run marker so it can't error-loop on every startup."""
+        def _boom(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        monkeypatch.setattr(db, "prune_sessions", _boom)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+        assert result.get("error") is not None
+        assert db.get_meta("last_auto_prune") is not None
+
+    def test_marker_not_recorded_when_skipped(self, db):
+        """A skip (within min_interval) must NOT rewrite the marker."""
+        self._make_old_ended(db, "old", days_old=100)
+        db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
+        first_marker = db.get_meta("last_auto_prune")
+        second = db.maybe_auto_prune_and_vacuum(retention_days=90, min_interval_hours=24)
+        assert second["skipped"] is True
+        assert db.get_meta("last_auto_prune") == first_marker  # unchanged
+
+    def test_max_batch_passed_through_to_prune(self, db, monkeypatch):
+        seen = {}
+        real = db.prune_sessions
+        def _spy(*a, **k):
+            seen.update(k)
+            return real(*a, **k)
+        monkeypatch.setattr(db, "prune_sessions", _spy)
+        db.maybe_auto_prune_and_vacuum(retention_days=90, max_batch=200)
+        assert seen.get("max_batch") == 200
+
+    def test_online_style_no_vacuum_even_with_prunes(self, db):
+        """vacuum=False path used by online callers never VACUUMs."""
+        self._make_old_ended(db, "old", days_old=100)
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90, vacuum=False)
+        assert result["pruned"] == 1
+        assert result["vacuumed"] is False
+        assert db.get_meta("last_auto_prune") is not None
+
     def test_auto_prune_without_sessions_dir_preserves_files(self, db, tmp_path):
         """Backward-compat: no sessions_dir = DB-only cleanup (legacy behavior)."""
         sessions_dir = tmp_path / "sessions"

@@ -6333,6 +6333,7 @@ class SessionDB:
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
+        max_batch: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune old sessions + optional VACUUM.
 
@@ -6352,16 +6353,19 @@ class SessionDB:
           - ``"pruned"`` (int)   — number of sessions deleted
           - ``"vacuumed"`` (bool) — true if VACUUM ran
           - ``"error"`` (str, optional) — present only on failure
+
+        Note: online callers pass ``vacuum=False`` — an in-gateway VACUUM
+        cannot get the exclusive lock a live multi-process gateway holds.
+        The last-run marker is recorded in a ``finally`` so a transient
+        prune failure never error-loops.
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
+        now = time.time()
         try:
-            # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
-            now = time.time()
             if last_raw:
                 try:
-                    last_ts = float(last_raw)
-                    if now - last_ts < min_interval_hours * 3600:
+                    if now - float(last_raw) < min_interval_hours * 3600:
                         result["skipped"] = True
                         return result
                 except (TypeError, ValueError):
@@ -6370,21 +6374,16 @@ class SessionDB:
             pruned = self.prune_sessions(
                 older_than_days=retention_days,
                 sessions_dir=sessions_dir,
+                max_batch=max_batch,
             )
             result["pruned"] = pruned
 
-            # Only VACUUM if we actually freed rows — VACUUM on a tight DB
-            # is wasted I/O. Threshold keeps small DBs from paying the cost.
             if vacuum and pruned > 0:
                 try:
                     self.vacuum()
                     result["vacuumed"] = True
                 except Exception as exc:
                     logger.warning("state.db VACUUM failed: %s", exc)
-
-            # Record the attempt even if pruned == 0, so we don't retry
-            # every startup within the min_interval_hours window.
-            self.set_meta("last_auto_prune", str(now))
 
             if pruned > 0:
                 logger.info(
@@ -6394,10 +6393,16 @@ class SessionDB:
                     " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:
-            # Maintenance must never block startup. Log and return error marker.
             logger.warning("state.db auto-maintenance failed: %s", exc)
             result["error"] = str(exc)
-
+        finally:
+            # Record the attempt (success OR failure) unless we early-skipped,
+            # so a transient 'database is locked' can't re-trigger every startup.
+            if not result["skipped"]:
+                try:
+                    self.set_meta("last_auto_prune", str(now))
+                except Exception as exc:
+                    logger.debug("could not record last_auto_prune: %s", exc)
         return result
 
     # ── Handoff (cross-platform session transfer) ──────────────────────────
