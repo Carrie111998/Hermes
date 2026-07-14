@@ -890,7 +890,9 @@ def test_exact_automatic_replay_with_manual_authority_promotes_sidecar(db):
         policy=policy,
         manual_authorized=True,
     )
-    authority = json.loads(_authority_rows(db)[0]["value_json"])
+    authority_json = _authority_rows(db)[0]["value_json"]
+    assert isinstance(authority_json, str)
+    authority = json.loads(authority_json)
     claimed = claim_due_mirror_jobs(store, limit=1, policy=MirrorPolicy())
 
     assert replay == automatic
@@ -986,7 +988,9 @@ def test_exact_manual_authority_is_never_downgraded_by_automatic_replay(db):
         candidate=_candidate(projection, policy=automatic_policy),
         context=_context(policy=automatic_policy),
     )
-    authority = json.loads(_authority_rows(db)[0]["value_json"])
+    authority_json = _authority_rows(db)[0]["value_json"]
+    assert isinstance(authority_json, str)
+    authority = json.loads(authority_json)
 
     assert replay["id"] == manual["id"]
     assert authority["authority"] == "manual"
@@ -1517,7 +1521,7 @@ def test_guarded_claim_requires_current_policy(db):
     store = SessionBridgeStore(db, clock=lambda: NOW)
 
     with pytest.raises(TypeError, match="policy"):
-        claim_due_mirror_jobs(store, limit=1)
+        claim_due_mirror_jobs(store, limit=1)  # type: ignore[missing-argument]
 
 
 def test_disabled_automatic_creation_pauses_auto_without_starving_manual(db):

@@ -770,7 +770,9 @@ def test_low_level_mirror_job_is_idempotent_but_public_claim_fails_closed(db):
     assert replay == first
     assert len(_rows(db, "SELECT * FROM session_mirror_jobs")) == 1
     with pytest.raises(TypeError, match="policy"):
-        store.claim_due_jobs(now=100.0, limit=10)
+        store.claim_due_jobs(  # type: ignore[missing-argument]
+            now=100.0, limit=10
+        )
     assert _rows(db, "SELECT * FROM session_mirror_jobs")[0]["state"] == "queued"
 
     assert (
