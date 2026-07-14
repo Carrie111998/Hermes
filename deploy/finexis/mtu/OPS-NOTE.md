@@ -42,3 +42,13 @@ No data-loss risk: synthetic-only pilot; no client data ingested.
 - Config-driving-behaviour (ROP fires ROP checks/disclosures; non-ROP does not): **DoD #3 verified**.
 - Controlled-tester pass through production stack, synthetic only, transcript recorded: **DoD #5 verified**.
 - Client-data safety: `client-raw/` blanket-gitignored (git check-ignore confirmed), zero PII/secrets committed: **DoD #6 verified**.
+
+## Update 2026-07-15 — persistence DONE + allowlist widened (edna)
+
+**Outage + fix (2026-07-14 ~23:00):** gateway ran as an unsupervised worker-session child; the ~22:44 fleet restart dropped it → silent outage (8 undelivered updates, no alert). **Root cause = missing supervision (this OPS-NOTE's step 5).**
+
+**Step 5 (persistence) — RESOLVED.** hermes-mtu now runs as a `marshal daemon` (launchd `com.teren.hermes-mtu`, `keep_alive: true`). Source: `~/pcl/marshal/daemons/{agents/hermes-mtu.yaml, scripts/hermes-mtu.sh}` (marshal commit 9094ace7). Survives reboot / kill / fleet restart. Restart via `marshal daemon restart --name hermes-mtu`; verify via `marshal daemon verify --name hermes-mtu`. NOTE: the gateway exits 1 on shutdown by design (expects a supervisor to revive) — `exit=1` in verify is normal, `running=true` is what matters. Systemic gap (no liveness pager + fleet-restart-drops-runtimes) filed as infra bug 5388ad5c (rasim).
+
+**Allowlist widened.** `TELEGRAM_ALLOWED_USERS` now = teren(tester) + amelia + Melody(388010100, confirmed by amelia 2026-07-15, id sourced from her rejected inbound at 18:47). **Durability caveat:** the daemon execs hermes directly and never regenerates `.env`, so allowlist edits persist across daemon restarts. BUT `bootstrap_local.sh` takes the allowlist as its `$2` CLI arg — a future manual re-bootstrap with the old arg WOULD clobber the added IDs. Fix-forward (deferred, small): make bootstrap default `$2` to the existing `.env` allowlist when omitted. Until then: pass ALL current IDs to any re-bootstrap.
+
+**Still open:** step 6 (register in PA runtime registry so `pcl service locate --system mtu` resolves) — do next now that it's persistently running.
