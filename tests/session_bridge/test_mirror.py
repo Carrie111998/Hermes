@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
+import threading
 
 import pytest
 
@@ -300,6 +301,86 @@ def test_continuous_watermark_is_durable_and_monotonic_across_store_restart(db):
         persist_continuous_watermark(restarted, NOW - 61)
 
 
+def test_concurrent_watermark_writers_cannot_commit_a_late_lower_value(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "state.db"
+    seed_db = SessionDB(path)
+    persist_continuous_watermark(SessionBridgeStore(seed_db, clock=lambda: 1.0), 100.0)
+    seed_db.close()
+
+    lower_db = SessionDB(path)
+    higher_db = SessionDB(path)
+    lower_store = SessionBridgeStore(lower_db, clock=lambda: 2.0)
+    higher_store = SessionBridgeStore(higher_db, clock=lambda: 3.0)
+    lower_entered_write = threading.Event()
+    higher_finished_write = threading.Event()
+    original_lower_write = lower_db._execute_write
+    original_higher_write = higher_db._execute_write
+
+    def delay_lower_write(operation):
+        lower_entered_write.set()
+        assert higher_finished_write.wait(timeout=5.0)
+        return original_lower_write(operation)
+
+    def signal_higher_write(operation):
+        try:
+            return original_higher_write(operation)
+        finally:
+            higher_finished_write.set()
+
+    monkeypatch.setattr(lower_db, "_execute_write", delay_lower_write)
+    monkeypatch.setattr(higher_db, "_execute_write", signal_higher_write)
+    errors: dict[str, BaseException] = {}
+
+    def write(name: str, store: SessionBridgeStore, value: float) -> None:
+        try:
+            persist_continuous_watermark(store, value)
+        except BaseException as exc:  # pragma: no branch - captured for the assertion
+            errors[name] = exc
+
+    lower = threading.Thread(target=write, args=("lower", lower_store, 150.0))
+    higher = threading.Thread(target=write, args=("higher", higher_store, 200.0))
+    lower.start()
+    assert lower_entered_write.wait(timeout=5.0)
+    higher.start()
+    lower.join(timeout=5.0)
+    higher.join(timeout=5.0)
+
+    try:
+        assert not lower.is_alive()
+        assert not higher.is_alive()
+        assert "higher" not in errors
+        assert isinstance(errors.get("lower"), ValueError)
+        assert "cannot move backwards" in str(errors["lower"])
+        restarted = SessionBridgeStore(SessionDB(path), clock=lambda: 4.0)
+        try:
+            assert load_continuous_watermark(restarted) == 200.0
+        finally:
+            restarted.db.close()
+    finally:
+        lower_db.close()
+        higher_db.close()
+
+
+def test_malformed_continuous_watermark_state_fails_closed(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    persist_continuous_watermark(store, 100.0)
+
+    def corrupt(connection):
+        connection.execute(
+            "UPDATE session_bridge_state SET value_json = ?",
+            ('{"continuous_watermark":"200"}',),
+        )
+
+    db._execute_write(corrupt)
+
+    with pytest.raises(ValueError, match="finite number"):
+        load_continuous_watermark(store)
+    with pytest.raises(ValueError, match="finite number"):
+        persist_continuous_watermark(store, 300.0)
+
+
 def test_initial_backfill_candidates_are_newest_first_with_stable_ties():
     projections = (
         _projection(native_id="older", last_active=NOW - 30),
@@ -357,6 +438,7 @@ def test_retry_delay_is_deterministic_bounded_exponential_with_keyed_jitter():
     for attempts, delay in enumerate(delays, start=1):
         base = min(300.0, 2.0 ** (attempts - 1))
         assert base * 0.8 <= delay <= base * 1.2
+        assert delay <= 300.0
 
 
 def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
@@ -483,6 +565,90 @@ def test_creation_batch_obeys_rolling_creates_per_minute_limit():
     ]
 
 
+def test_creation_batch_reserves_only_remaining_batch_attempts():
+    policy = MirrorPolicy(
+        automatic_creation=True,
+        stop_after_attempts=20,
+        creates_per_minute=10,
+        codex_concurrency=5,
+    )
+    candidates = tuple(
+        _candidate(
+            _projection(native_id=f"source-{index}", last_active=NOW - index),
+            policy=policy,
+        )
+        for index in range(1, 6)
+    )
+
+    selected = select_creation_batch(
+        candidates,
+        policy=policy,
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(attempts=19, errors=0),
+    )
+    exhausted = select_creation_batch(
+        candidates,
+        policy=policy,
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(attempts=20, errors=0),
+    )
+
+    assert [candidate.source_session_id for candidate in selected] == [
+        "claude:source-1"
+    ]
+    assert exhausted == ()
+
+
+def test_creation_batch_rejects_unknown_in_flight_provider_keys():
+    policy = MirrorPolicy(automatic_creation=True)
+    candidate = _candidate(_projection(), policy=policy)
+
+    with pytest.raises(ValueError, match="Claude or Codex"):
+        select_creation_batch(
+            (candidate,),
+            policy=policy,
+            now=NOW,
+            in_flight_by_provider={"other": 1},
+            recent_creation_times=(),
+            progress=BatchProgress(),
+        )
+
+
+def test_creation_batch_normalizes_known_string_in_flight_provider_keys():
+    policy = MirrorPolicy(automatic_creation=True, codex_concurrency=1)
+    candidate = _candidate(_projection(), policy=policy)
+
+    selected = select_creation_batch(
+        (candidate,),
+        policy=policy,
+        now=NOW,
+        in_flight_by_provider={"codex": 1},
+        recent_creation_times=(),
+        progress=BatchProgress(),
+    )
+
+    assert selected == ()
+
+
+def test_creation_batch_rejects_future_creation_timestamps():
+    policy = MirrorPolicy(automatic_creation=True)
+    candidate = _candidate(_projection(), policy=policy)
+
+    with pytest.raises(ValueError, match="future"):
+        select_creation_batch(
+            (candidate,),
+            policy=policy,
+            now=NOW,
+            in_flight_by_provider={},
+            recent_creation_times=(NOW + 0.001,),
+            progress=BatchProgress(),
+        )
+
+
 def test_safe_default_disables_automatic_creation_selection():
     policy = MirrorPolicy()
     candidate = _candidate(_projection(), policy=policy)
@@ -532,6 +698,39 @@ def test_policy_and_progress_reject_unsafe_values():
         MirrorPolicy(stop_error_rate=1.1)
     with pytest.raises(ValueError, match="errors cannot exceed attempts"):
         BatchProgress(attempts=1, errors=2)
+
+
+@pytest.mark.parametrize("value", ("false", 0, 1, None))
+def test_automatic_creation_requires_an_exact_boolean(value):
+    with pytest.raises((TypeError, ValueError), match="automatic_creation"):
+        MirrorPolicy(automatic_creation=value)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("debounce_seconds", "5.0"),
+        ("debounce_seconds", True),
+        ("debounce_seconds", float("nan")),
+        ("debounce_seconds", float("inf")),
+        ("stop_error_rate", "0.25"),
+        ("stop_error_rate", False),
+        ("stop_error_rate", float("nan")),
+        ("stop_error_rate", float("-inf")),
+    ),
+)
+def test_float_policy_fields_require_real_finite_numbers(field_name: str, value):
+    with pytest.raises(ValueError, match=field_name):
+        replace(MirrorPolicy(), **{field_name: value})
+
+
+def test_float_policy_fields_are_normalized_in_frozen_policy():
+    policy = MirrorPolicy(debounce_seconds=5, stop_error_rate=0)
+
+    assert policy.debounce_seconds == 5.0
+    assert type(policy.debounce_seconds) is float
+    assert policy.stop_error_rate == 0.0
+    assert type(policy.stop_error_rate) is float
 
 
 def test_eligibility_value_objects_are_frozen():

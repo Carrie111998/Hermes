@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 import hashlib
+import json
 import math
 from typing import Any, Literal
 
@@ -54,9 +55,14 @@ class MirrorPolicy:
     stop_error_rate: float = 0.25
 
     def __post_init__(self) -> None:
+        if type(self.automatic_creation) is not bool:
+            raise ValueError("automatic_creation must be a boolean")
         _nonnegative_integer("generation", self.generation)
         _nonnegative_integer("backfill_days", self.backfill_days)
-        _nonnegative_float("debounce_seconds", self.debounce_seconds)
+        debounce_seconds = _finite_float("debounce_seconds", self.debounce_seconds)
+        if debounce_seconds < 0:
+            raise ValueError("debounce_seconds must be non-negative")
+        object.__setattr__(self, "debounce_seconds", debounce_seconds)
         _positive_integer("claude_concurrency", self.claude_concurrency)
         _positive_integer("codex_concurrency", self.codex_concurrency)
         _positive_integer("creates_per_minute", self.creates_per_minute)
@@ -65,6 +71,7 @@ class MirrorPolicy:
         error_rate = _finite_float("stop_error_rate", self.stop_error_rate)
         if not 0.0 <= error_rate <= 1.0:
             raise ValueError("stop_error_rate must be between zero and one")
+        object.__setattr__(self, "stop_error_rate", error_rate)
 
 
 @dataclass(frozen=True)
@@ -178,7 +185,7 @@ def retry_delay_seconds(idempotency_key: str, attempts: int) -> float:
     ).digest()
     jitter_unit = int.from_bytes(jitter_digest[:8], "big") / ((1 << 64) - 1)
     jitter = _RETRY_JITTER_MIN + _RETRY_JITTER_WIDTH * jitter_unit
-    return base * jitter
+    return min(_RETRY_MAX_SECONDS, base * jitter)
 
 
 def classify_mirror_eligibility(
@@ -253,22 +260,40 @@ def eligible_mirror_candidates(
 
 def persist_continuous_watermark(store: SessionBridgeStore, watermark: float) -> None:
     normalized = _finite_float("continuous_watermark", watermark)
-    existing = load_continuous_watermark(store)
-    if existing is not None and normalized < existing:
-        raise ValueError("continuous watermark cannot move backwards")
-    store.set_state(
-        _CONTINUOUS_WATERMARK_STATE_KEY,
+    value_json = json.dumps(
         {"continuous_watermark": normalized},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
+    updated_at = _finite_float("store clock", store._clock())
+
+    def _write(connection: Any) -> None:
+        row = connection.execute(
+            "SELECT value_json FROM session_bridge_state WHERE key = ?",
+            (_CONTINUOUS_WATERMARK_STATE_KEY,),
+        ).fetchone()
+        if row is not None:
+            existing = _decode_watermark_state(row["value_json"])
+            if normalized < existing:
+                raise ValueError("continuous watermark cannot move backwards")
+        connection.execute(
+            """INSERT INTO session_bridge_state (key, value_json, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                   value_json = excluded.value_json,
+                   updated_at = excluded.updated_at""",
+            (_CONTINUOUS_WATERMARK_STATE_KEY, value_json, updated_at),
+        )
+
+    store.db._execute_write(_write)
 
 
 def load_continuous_watermark(store: SessionBridgeStore) -> float | None:
     state = store.get_state(_CONTINUOUS_WATERMARK_STATE_KEY)
     if state is None:
         return None
-    if set(state) != {"continuous_watermark"}:
-        raise ValueError("invalid continuous watermark state")
-    return _finite_float("continuous_watermark", state["continuous_watermark"])
+    return _decode_watermark_mapping(state)
 
 
 def enqueue_mirror_job(
@@ -346,7 +371,7 @@ def select_creation_batch(
     *,
     policy: MirrorPolicy,
     now: float,
-    in_flight_by_provider: Mapping[Provider, int],
+    in_flight_by_provider: Mapping[Provider | str, int],
     recent_creation_times: Sequence[float],
     progress: BatchProgress,
 ) -> tuple[MirrorCandidate, ...]:
@@ -354,22 +379,35 @@ def select_creation_batch(
     if not policy.automatic_creation or should_halt_batch(progress, policy):
         return ()
 
+    normalized_creation_times: list[float] = []
+    for created_at in recent_creation_times:
+        normalized_created_at = _finite_float("creation time", created_at)
+        if normalized_created_at > selection_time:
+            raise ValueError("creation time cannot be in the future")
+        normalized_creation_times.append(normalized_created_at)
     recent_count = sum(
-        selection_time - 60.0
-        < _finite_float("creation time", created_at)
-        <= selection_time
-        for created_at in recent_creation_times
+        selection_time - 60.0 < created_at for created_at in normalized_creation_times
     )
-    rate_capacity = max(0, policy.creates_per_minute - recent_count)
+    remaining_attempts = policy.stop_after_attempts - progress.attempts
+    rate_capacity = min(
+        remaining_attempts,
+        max(0, policy.creates_per_minute - recent_count),
+    )
     if rate_capacity == 0:
         return ()
 
+    normalized_in_flight = {provider: 0 for provider in _EXTERNAL_PROVIDERS}
+    for raw_provider, raw_in_flight in in_flight_by_provider.items():
+        provider = _external_provider(raw_provider)
+        _nonnegative_integer(f"{provider.value} in-flight count", raw_in_flight)
+        normalized_in_flight[provider] += raw_in_flight
+
     available: dict[Provider, int] = {}
     for provider in _EXTERNAL_PROVIDERS:
-        raw_in_flight = in_flight_by_provider.get(provider, 0)
-        _nonnegative_integer(f"{provider.value} in-flight count", raw_in_flight)
         available[provider] = max(
-            0, provider_concurrency_limit(policy, provider) - raw_in_flight
+            0,
+            provider_concurrency_limit(policy, provider)
+            - normalized_in_flight[provider],
         )
 
     selected: list[MirrorCandidate] = []
@@ -418,7 +456,7 @@ def _inverted_provider(provider: Provider) -> Provider:
     return Provider.CLAUDE
 
 
-def _external_provider(provider: Provider) -> Provider:
+def _external_provider(provider: Provider | str) -> Provider:
     try:
         normalized = Provider(provider)
     except (TypeError, ValueError) as exc:
@@ -437,21 +475,31 @@ def _stable_id(*parts: str) -> str:
     return digest.hexdigest()
 
 
-def _finite_float(name: str, value: object) -> float:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must be a finite number")
+def _decode_watermark_state(value_json: object) -> float:
+    if not isinstance(value_json, str):
+        raise ValueError("invalid continuous watermark state")
     try:
-        normalized = float(value)  # type: ignore[arg-type]
+        state = json.loads(value_json)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{name} must be a finite number") from exc
+        raise ValueError("invalid continuous watermark state") from exc
+    if not isinstance(state, dict):
+        raise ValueError("invalid continuous watermark state")
+    return _decode_watermark_mapping(state)
+
+
+def _decode_watermark_mapping(state: Mapping[str, Any]) -> float:
+    if set(state) != {"continuous_watermark"}:
+        raise ValueError("invalid continuous watermark state")
+    return _finite_float("continuous_watermark", state["continuous_watermark"])
+
+
+def _finite_float(name: str, value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    normalized = float(value)
     if not math.isfinite(normalized):
         raise ValueError(f"{name} must be a finite number")
     return normalized
-
-
-def _nonnegative_float(name: str, value: object) -> None:
-    if _finite_float(name, value) < 0:
-        raise ValueError(f"{name} must be non-negative")
 
 
 def _nonnegative_integer(name: str, value: object) -> None:
