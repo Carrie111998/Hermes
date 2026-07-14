@@ -76,10 +76,23 @@ def _is_memory_provider_dir(path: Path) -> bool:
 
     Checks for ``register_memory_provider`` or ``MemoryProvider`` in the
     ``__init__.py`` source.  Cheap text scan — no import needed.
+
+    Pip-installed packages often put their module in a subdirectory
+    (e.g. plugins/mimir/hermes_mimir/__init__.py instead of
+    plugins/mimir/__init__.py).  Probe subdirectories when the root
+    ``__init__.py`` is missing.
     """
     init_file = path / "__init__.py"
     if not init_file.exists():
-        return False
+        for sub in sorted(path.iterdir()):
+            if not sub.is_dir() or sub.name.startswith("."):
+                continue
+            sub_init = sub / "__init__.py"
+            if sub_init.exists():
+                init_file = sub_init
+                break
+        else:
+            return False
     try:
         source = init_file.read_text(errors="replace", encoding="utf-8")[:8192]
         return "register_memory_provider" in source or "MemoryProvider" in source
@@ -230,8 +243,23 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
     module_name = f"plugins.memory.{name}" if _is_bundled else f"{_USER_NAMESPACE}.{name}"
     init_file = provider_dir / "__init__.py"
 
+    # Pip-installed packages often put their module in a subdirectory
+    # (e.g. plugins/mimir/hermes_mimir/__init__.py instead of
+    # plugins/mimir/__init__.py).  Probe subdirectories when the root
+    # __init__.py is missing.
     if not init_file.exists():
-        return None
+        for sub in sorted(provider_dir.iterdir()):
+            if not sub.is_dir() or sub.name.startswith("."):
+                continue
+            sub_init = sub / "__init__.py"
+            if sub_init.exists():
+                init_file = sub_init
+                # submodule_search_locations should include the subdirectory
+                # so relative imports inside the plugin resolve correctly
+                provider_dir = sub
+                break
+        else:
+            return None
 
     # Check if already loaded.  A synthetic package shell registered by
     # discover_plugin_cli_commands() for relative-import support has no
