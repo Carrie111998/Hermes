@@ -1568,6 +1568,79 @@ def test_indented_mapping_assignment_is_redacted_to_next_peer_key(db: SessionDB)
 
 
 @pytest.mark.parametrize(
+    ("sequence_indent", "body_indent", "line_ending"),
+    [
+        ("  ", "      ", "\n"),
+        ("\t", "\t   ", "\r\n"),
+    ],
+)
+def test_yaml_block_in_nested_sequence_preserves_following_items(
+    sequence_indent: str,
+    body_indent: str,
+    line_ending: str,
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    ordinary_peer = f"{sequence_indent}- ordinary_uuid: {uuid}"
+    source_peer = f"{sequence_indent}- source_id: {source_id}"
+    content = line_ending.join((
+        f"{sequence_indent}- password: |",
+        f"{body_indent}NESTED SEQUENCE SECRET",
+        ordinary_peer,
+        source_peer,
+    ))
+
+    redacted = _redact(content)
+
+    assert "NESTED SEQUENCE SECRET" not in redacted
+    assert (
+        f"{sequence_indent}- password: [REDACTED]"
+        f"{line_ending}{ordinary_peer}{line_ending}{source_peer}"
+    ) == redacted
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_yaml_block_in_sequence_mapping_preserves_sibling_semantics(
+    db: SessionDB,
+    line_ending: str,
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    memory_reference = "mempalace://drawer/hermes-sequence-peer"
+    content = line_ending.join((
+        "- password: |",
+        "    SEQUENCE MAPPING SECRET",
+        f"  ordinary_uuid: {uuid}",
+        f"  source_id: {source_id}",
+        "  note: Decision: preserve sequence mapping peers.",
+        "  work: TODO: keep sibling extraction intact.",
+        "  file: src/session_bridge/sequence_peer.py",
+        f"  memory: {memory_reference}",
+    ))
+
+    redacted = _redact(content)
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "SEQUENCE MAPPING SECRET" not in redacted
+    assert f"- password: [REDACTED]{line_ending}  ordinary_uuid: {uuid}" in redacted
+    assert source_id in redacted
+    assert "Decision: preserve sequence mapping peers." in _section(
+        payload,
+        SECTION_HEADINGS[2],
+    )
+    assert "TODO: keep sibling extraction intact." in _section(
+        payload,
+        SECTION_HEADINGS[3],
+    )
+    assert "src/session_bridge/sequence_peer.py" in _section(
+        payload,
+        SECTION_HEADINGS[5],
+    )
+    assert memory_reference in _section(payload, SECTION_HEADINGS[7])
+
+
+@pytest.mark.parametrize(
     ("opener", "body_prefix", "terminator", "line_ending"),
     [
         ("password=<<EOF", "", "EOF", "\n"),

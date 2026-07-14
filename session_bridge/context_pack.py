@@ -145,6 +145,7 @@ _HEREDOC_HEADER_RE = re.compile(
     r"(?P<delimiter>[A-Za-z0-9_.-]+)(?P=quote)"
 )
 _POWERSHELL_HERE_STRING_HEADER_RE = re.compile(r"^@(?P<quote>[\"'])[ \t]*$")
+_YAML_SEQUENCE_ITEM_PREFIX_RE = re.compile(r"^[ \t]*-[ \t]+$")
 _PEER_KEY_RE = re.compile(
     r"^(?:-[ \t]+)?(?:"
     r"(?P<quote>[\"'])[A-Za-z_][A-Za-z0-9_.-]*(?P=quote)"
@@ -1012,7 +1013,11 @@ def _assignment_key_indent(value: str, assignment_start: int) -> int:
         + 1
     )
     prefix = value[line_start:assignment_start]
-    return _indent_width(prefix) if not prefix.strip(" \t") else 0
+    if not prefix.strip(" \t"):
+        return _indent_width(prefix)
+    if _YAML_SEQUENCE_ITEM_PREFIX_RE.fullmatch(prefix):
+        return len(prefix.expandtabs(8))
+    return 0
 
 
 def _line_end_and_next(value: str, start: int) -> tuple[int, int]:
