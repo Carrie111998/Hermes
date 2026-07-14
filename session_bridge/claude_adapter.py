@@ -7,7 +7,10 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, BinaryIO
+import subprocess
+import time
+from typing import Any, BinaryIO, Callable
+import uuid
 
 from .models import (
     InvalidBridgeMarker,
@@ -15,7 +18,10 @@ from .models import (
     ProjectedMessage,
     Provider,
     SessionProjection,
+    BridgeMarkerPayload,
+    canonical_session_id,
     decode_bridge_marker,
+    encode_bridge_marker,
 )
 
 
@@ -41,6 +47,7 @@ _NATIVE_ID_RE = re.compile(rb'"sessionId"\s*:\s*("(?:\\.|[^"\\])*")')
 _RECORD_TYPE_RE = re.compile(rb'"type"\s*:\s*("(?:\\.|[^"\\])*")')
 _CURSOR_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _DESCRIPTOR_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._/+;-]+")
+CLAUDE_PLACEHOLDER_MAX_BUDGET_USD = "0.50"
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,38 @@ class ClaudeParseResult:
     rebuild: bool
     malformed_lines: int
     unknown_records: int
+
+
+@dataclass(frozen=True)
+class PlaceholderResult:
+    native_id: str
+    canonical_session_id: str
+    used_registration_turn: bool
+    verified_at: float
+
+
+class PlaceholderCreationError(RuntimeError):
+    """A sanitized provider placeholder creation failure."""
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        native_id: str | None = None,
+        observed_cost_usd: int | float | None = None,
+        duration_ms: int | float | None = None,
+        num_turns: int | None = None,
+    ) -> None:
+        self.code = code
+        self.native_id = native_id
+        self.observed_cost_usd = _optional_nonnegative_float(observed_cost_usd)
+        self.duration_ms = _optional_nonnegative_float(duration_ms)
+        self.num_turns = _optional_nonnegative_int(num_turns)
+        super().__init__(code)
+
+
+class AmbiguousPlaceholderCreation(PlaceholderCreationError):
+    """Creation may have happened; callers must reconcile before retrying."""
 
 
 @dataclass(frozen=True)
@@ -234,6 +273,282 @@ class ClaudeSourceAdapter:
             if probed_native_id == wanted:
                 return path
         return None
+
+
+class ClaudeTargetAdapter:
+    def __init__(
+        self,
+        source_adapter: ClaudeSourceAdapter,
+        *,
+        marker_secret: bytes,
+        claude_executable: str = "claude",
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        process_timeout: float = 120.0,
+        discovery_timeout: float = 15.0,
+        poll_interval: float = 0.1,
+    ) -> None:
+        self._source_adapter = source_adapter
+        self._marker_secret = marker_secret
+        self._claude_executable = _required_text(
+            claude_executable, label="Claude executable"
+        )
+        self._runner = runner
+        self._clock = clock
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._process_timeout = _positive_number(
+            process_timeout, label="Claude process timeout"
+        )
+        self._discovery_timeout = _nonnegative_number(
+            discovery_timeout, label="Claude discovery timeout"
+        )
+        self._poll_interval = _nonnegative_number(
+            poll_interval, label="Claude poll interval"
+        )
+
+    def create_placeholder(
+        self,
+        *,
+        native_id: str,
+        title: str,
+        source_session_id: str,
+        bridge_id: str,
+        policy_generation: int,
+        cwd: Path | str | None = None,
+    ) -> PlaceholderResult:
+        native_id = _canonical_uuid(native_id)
+        title = _required_text(title, label="title")
+        source_session_id = _required_text(
+            source_session_id, label="source session ID"
+        )
+        bridge_id = _required_text(bridge_id, label="bridge ID")
+        if (
+            not isinstance(policy_generation, int)
+            or isinstance(policy_generation, bool)
+            or policy_generation < 0
+        ):
+            raise ValueError("policy generation must be a non-negative integer")
+        marker = encode_bridge_marker(
+            BridgeMarkerPayload(
+                bridge_id=bridge_id,
+                source_session_id=source_session_id,
+                target_provider=Provider.CLAUDE,
+                policy_generation=policy_generation,
+            ),
+            self._marker_secret,
+        )
+        registration_prompt = _registration_prompt(
+            marker=marker,
+            source_session_id=source_session_id,
+            bridge_id=bridge_id,
+        )
+        args = [
+            self._claude_executable,
+            "--print",
+            "--session-id",
+            native_id,
+            "--name",
+            title,
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--max-budget-usd",
+            CLAUDE_PLACEHOLDER_MAX_BUDGET_USD,
+            "--output-format",
+            "json",
+            registration_prompt,
+        ]
+        run_kwargs: dict[str, Any] = {
+            "capture_output": True,
+            "text": True,
+            "timeout": self._process_timeout,
+            "stdin": subprocess.DEVNULL,
+            "shell": False,
+            "check": False,
+        }
+        run_cwd = _existing_directory(cwd)
+        if run_cwd is not None:
+            run_kwargs["cwd"] = run_cwd
+        timed_out = False
+        try:
+            completed = self._runner(args, **run_kwargs)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            completed = None
+        except FileNotFoundError as exc:
+            raise PlaceholderCreationError("claude_executable_not_found") from exc
+        except Exception as exc:
+            raise PlaceholderCreationError("claude_process_failed") from exc
+
+        process_failure: PlaceholderCreationError | None = None
+        if completed is not None and completed.returncode != 0:
+            code, observed_cost_usd, duration_ms, num_turns = (
+                _claude_process_failure_details(completed)
+            )
+            process_failure = PlaceholderCreationError(
+                code,
+                observed_cost_usd=observed_cost_usd,
+                duration_ms=duration_ms,
+                num_turns=num_turns,
+            )
+
+        verified = self._poll_exact_target(native_id=native_id, bridge_id=bridge_id)
+        if not verified:
+            if process_failure is not None:
+                raise process_failure
+            code = (
+                "claude_creation_ambiguous"
+                if timed_out or completed is not None
+                else "claude_target_not_found"
+            )
+            raise AmbiguousPlaceholderCreation(code)
+        return PlaceholderResult(
+            native_id=native_id,
+            canonical_session_id=canonical_session_id(Provider.CLAUDE, native_id),
+            used_registration_turn=False,
+            verified_at=float(self._clock()),
+        )
+
+    def _poll_exact_target(self, *, native_id: str, bridge_id: str) -> bool:
+        deadline = self._monotonic() + self._discovery_timeout
+        while True:
+            path = self._source_adapter.find_native_session(native_id)
+            if path is not None:
+                try:
+                    projection = self._source_adapter.parse(path).projection
+                except Exception as exc:
+                    raise PlaceholderCreationError("claude_target_unreadable") from exc
+                if projection.native_id != native_id:
+                    raise PlaceholderCreationError("claude_target_mismatch")
+                if (
+                    projection.origin_kind
+                    not in (
+                        OriginKind.BRIDGE_PLACEHOLDER,
+                        OriginKind.BRIDGE_CONTINUATION,
+                    )
+                    or projection.origin_bridge_id != bridge_id
+                ):
+                    raise PlaceholderCreationError("claude_target_marker_mismatch")
+                return True
+            if self._monotonic() >= deadline:
+                return False
+            self._sleep(self._poll_interval)
+
+
+def _registration_prompt(
+    *, marker: str, source_session_id: str, bridge_id: str
+) -> str:
+    return (
+        "Hermes Session Bridge registration metadata. "
+        f"Signed marker: {marker}. "
+        f"Canonical source session: {source_session_id}. "
+        "This registration message is metadata, not a substantive user message. "
+        "Do not call any tool now. "
+        "Reply exactly REGISTERED and nothing else. "
+        "On the first subsequent substantive user message, call "
+        f"session_continue with bridge ID {bridge_id} before answering."
+    )
+
+
+def classify_claude_process_failure(
+    completed: subprocess.CompletedProcess[str],
+) -> str:
+    code, _, _, _ = _claude_process_failure_details(completed)
+    return code
+
+
+def _claude_process_failure_details(
+    completed: subprocess.CompletedProcess[str],
+) -> tuple[str, float | None, float | None, int | None]:
+    try:
+        payload = json.loads(completed.stdout)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    subtype = payload.get("subtype") if isinstance(payload, dict) else None
+    if (
+        isinstance(subtype, str)
+        and subtype.startswith("error_")
+        and re.fullmatch(r"[a-z0-9_]{1,64}", subtype)
+    ):
+        code = f"claude_process_{subtype}"
+    else:
+        code = f"claude_process_exit_{int(completed.returncode)}"
+    if not isinstance(payload, dict):
+        return code, None, None, None
+    return (
+        code,
+        _optional_nonnegative_float(payload.get("total_cost_usd")),
+        _optional_nonnegative_float(payload.get("duration_ms")),
+        _optional_nonnegative_int(payload.get("num_turns")),
+    )
+
+
+def _canonical_uuid(value: str) -> str:
+    normalized = _required_text(value, label="native ID")
+    try:
+        parsed = uuid.UUID(normalized)
+    except (AttributeError, ValueError) as exc:
+        raise ValueError("native ID must be a UUID") from exc
+    if str(parsed) != normalized.lower():
+        raise ValueError("native ID must use canonical UUID syntax")
+    return str(parsed)
+
+
+def _required_text(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must not be empty")
+    return value.strip()
+
+
+def _positive_number(value: Any, *, label: str) -> float:
+    normalized = _nonnegative_number(value, label=label)
+    if normalized == 0:
+        raise ValueError(f"{label} must be positive")
+    return normalized
+
+
+def _nonnegative_number(value: Any, *, label: str) -> float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        raise ValueError(f"{label} must be a non-negative finite number")
+    return float(value)
+
+
+def _optional_nonnegative_float(value: Any) -> float | None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0
+    ):
+        return None
+    return float(value)
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _existing_directory(value: Path | str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        path = Path(value).expanduser()
+        if path.is_dir():
+            return str(path.resolve())
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:

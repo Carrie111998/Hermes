@@ -6,23 +6,34 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+from pathlib import Path
 import re
+import time
 from typing import Any, Protocol
 
 from agent.transports.codex_event_projector import CodexEventProjector
 
 from .models import (
+    BridgeMarkerPayload,
     InvalidBridgeMarker,
     OriginKind,
     ProjectedMessage,
     Provider,
     SessionProjection,
+    canonical_session_id,
     decode_bridge_marker,
+    encode_bridge_marker,
+)
+from .claude_adapter import (
+    AmbiguousPlaceholderCreation,
+    PlaceholderCreationError,
+    PlaceholderResult,
 )
 
 
 _PARSER_VERSION = 1
 _REQUEST_TIMEOUT = 30.0
+_TARGET_SOURCE_KINDS = ("vscode", "appServer")
 _SUPPORTED_ITEM_TYPES = frozenset({
     "agentMessage",
     "commandExecution",
@@ -195,13 +206,20 @@ class CodexSourceAdapter:
             origin_bridge_id=origin_bridge_id,
         )
 
-    def find_native_thread(self, native_id: str) -> CodexThreadSummary | None:
+    def find_native_thread(
+        self,
+        native_id: str,
+        *,
+        source_kinds: tuple[str, ...] | None = None,
+    ) -> CodexThreadSummary | None:
         if not isinstance(native_id, str) or not native_id.strip():
             return None
         self._ensure_initialized()
         wanted = native_id.strip()
 
-        active = self._fetch_inventory(archived=False)
+        active = self._fetch_inventory(
+            archived=False, source_kinds=source_kinds
+        )
         found = next(
             (summary for summary in active if summary.native_id == wanted), None
         )
@@ -209,14 +227,15 @@ class CodexSourceAdapter:
             self._inventory_cache[wanted] = found
             return found
 
-        archived = self._fetch_inventory(archived=True)
+        archived = self._fetch_inventory(
+            archived=True, source_kinds=source_kinds
+        )
         found = next(
             (summary for summary in archived if summary.native_id == wanted), None
         )
         if found is not None:
             self._inventory_cache[wanted] = found
         return found
-
     def _ensure_initialized(self) -> None:
         if self._initialization_failed:
             raise RuntimeError(
@@ -249,7 +268,12 @@ class CodexSourceAdapter:
             )
         self._initialized = True
 
-    def _fetch_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+    def _fetch_inventory(
+        self,
+        *,
+        archived: bool,
+        source_kinds: tuple[str, ...] | None = None,
+    ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
@@ -257,6 +281,8 @@ class CodexSourceAdapter:
         raw_entry_count = 0
         while True:
             params: dict[str, Any] = {"archived": archived}
+            if source_kinds is not None:
+                params["sourceKinds"] = list(source_kinds)
             if cursor is not None:
                 params["cursor"] = cursor
             response = self._client.request(
@@ -295,6 +321,393 @@ class CodexSourceAdapter:
         if raw_entry_count and not normalized:
             raise ValueError("Codex thread/list contained no valid inventory entries")
         return [normalized[native_id] for native_id in sorted(normalized)]
+
+
+class CodexTargetAdapter:
+    def __init__(
+        self,
+        client: _RequestClient,
+        *,
+        source_adapter: CodexSourceAdapter,
+        marker_secret: bytes,
+        clock=time.time,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+        request_timeout: float = _REQUEST_TIMEOUT,
+        require_registration_turn: bool | None = False,
+        verification_timeout: float = 60.0,
+        verification_poll_interval: float = 0.1,
+    ) -> None:
+        if require_registration_turn is not None and not isinstance(
+            require_registration_turn, bool
+        ):
+            raise TypeError("require_registration_turn must be boolean or None")
+        if (
+            isinstance(request_timeout, bool)
+            or not isinstance(request_timeout, (int, float))
+            or not math.isfinite(float(request_timeout))
+            or float(request_timeout) <= 0
+        ):
+            raise ValueError("request timeout must be a positive finite number")
+        for label, value in (
+            ("verification timeout", verification_timeout),
+            ("verification poll interval", verification_poll_interval),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(f"{label} must be a non-negative finite number")
+        self._client = client
+        self._source_adapter = source_adapter
+        self._marker_secret = marker_secret
+        self._clock = clock
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._request_timeout = float(request_timeout)
+        self._require_registration_turn = require_registration_turn
+        self._verification_timeout = float(verification_timeout)
+        self._verification_poll_interval = float(verification_poll_interval)
+
+    def create_placeholder(
+        self,
+        *,
+        title: str,
+        source_session_id: str,
+        bridge_id: str,
+        policy_generation: int,
+        cwd: Path | str | None = None,
+    ) -> PlaceholderResult:
+        title = _target_required_text(title, label="title")
+        source_session_id = _target_required_text(
+            source_session_id, label="source session ID"
+        )
+        bridge_id = _target_required_text(bridge_id, label="bridge ID")
+        if (
+            not isinstance(policy_generation, int)
+            or isinstance(policy_generation, bool)
+            or policy_generation < 0
+        ):
+            raise ValueError("policy generation must be a non-negative integer")
+        marker = encode_bridge_marker(
+            BridgeMarkerPayload(
+                bridge_id=bridge_id,
+                source_session_id=source_session_id,
+                target_provider=Provider.CODEX,
+                policy_generation=policy_generation,
+            ),
+            self._marker_secret,
+        )
+        hydration = _codex_hydration_contract(
+            marker=marker,
+            source_session_id=source_session_id,
+            bridge_id=bridge_id,
+        )
+        self._source_adapter._ensure_initialized()
+        start_params: dict[str, Any] = {
+            "baseInstructions": hydration,
+            "developerInstructions": hydration,
+        }
+        existing_cwd = _codex_existing_directory(cwd)
+        if existing_cwd is not None:
+            start_params["cwd"] = existing_cwd
+        try:
+            started = self._client.request(
+                "thread/start", start_params, timeout=self._request_timeout
+            )
+        except TimeoutError as exc:
+            raise AmbiguousPlaceholderCreation("codex_creation_ambiguous") from exc
+        except Exception as exc:
+            raise PlaceholderCreationError("codex_thread_start_failed") from exc
+        try:
+            native_id = _started_thread_id(started)
+        except PlaceholderCreationError as exc:
+            raise AmbiguousPlaceholderCreation(exc.code) from exc
+
+        name_ambiguous = False
+        try:
+            self._client.request(
+                "thread/name/set",
+                {"threadId": native_id, "name": title},
+                timeout=self._request_timeout,
+            )
+        except TimeoutError:
+            name_ambiguous = True
+        except Exception as exc:
+            raise AmbiguousPlaceholderCreation(
+                "codex_thread_name_failed", native_id=native_id
+            ) from exc
+
+        used_registration_turn = False
+        if self._require_registration_turn is True:
+            used_registration_turn = True
+            self._start_registration_turn(native_id=native_id, hydration=hydration)
+
+        try:
+            if self._require_registration_turn is True:
+                projection = self._poll_authenticated_projection(
+                    native_id=native_id,
+                    title=title,
+                    bridge_id=bridge_id,
+                )
+            else:
+                try:
+                    summary = self._verify_inventory_target(
+                        native_id=native_id, title=title
+                    )
+                except PlaceholderCreationError as exc:
+                    if self._require_registration_turn is False:
+                        if self._verification_timeout == 0:
+                            raise
+                        summary = self._poll_inventory_target(
+                            native_id=native_id, title=title
+                        )
+                    elif exc.code == "codex_target_not_found":
+                        try:
+                            self._verify_exact_thread_read(native_id)
+                        except Exception as read_exc:
+                            missing_rollout, error_code = (
+                                classify_codex_empty_read_error(read_exc, native_id)
+                            )
+                            if not missing_rollout:
+                                raise PlaceholderCreationError(
+                                    error_code
+                                ) from read_exc
+                        used_registration_turn = True
+                        self._start_registration_turn(
+                            native_id=native_id, hydration=hydration
+                        )
+                        projection = self._poll_authenticated_projection(
+                            native_id=native_id,
+                            title=title,
+                            bridge_id=bridge_id,
+                        )
+                    else:
+                        raise
+                if not used_registration_turn:
+                    try:
+                        projection = self._source_adapter.project_thread(summary)
+                    except TimeoutError as exc:
+                        raise AmbiguousPlaceholderCreation(
+                            "codex_target_read_ambiguous", native_id=native_id
+                        ) from exc
+                    except Exception as exc:
+                        raise AmbiguousPlaceholderCreation(
+                            "codex_target_read_unreadable", native_id=native_id
+                        ) from exc
+            if projection.native_id != native_id:
+                raise PlaceholderCreationError("codex_target_mismatch")
+            if not _codex_projection_is_authenticated(projection, bridge_id=bridge_id):
+                if projection.origin_kind is not OriginKind.NATIVE:
+                    raise PlaceholderCreationError("codex_target_marker_mismatch")
+                if used_registration_turn:
+                    raise PlaceholderCreationError("codex_target_marker_mismatch")
+                used_registration_turn = True
+                self._start_registration_turn(
+                    native_id=native_id, hydration=hydration
+                )
+                projection = self._poll_authenticated_projection(
+                    native_id=native_id,
+                    title=title,
+                    bridge_id=bridge_id,
+                )
+        except TimeoutError as exc:
+            raise AmbiguousPlaceholderCreation(
+                "codex_verification_ambiguous", native_id=native_id
+            ) from exc
+        except PlaceholderCreationError as exc:
+            raise AmbiguousPlaceholderCreation(
+                exc.code, native_id=native_id
+            ) from exc
+        except Exception as exc:
+            code = (
+                "codex_name_outcome_ambiguous"
+                if name_ambiguous
+                else "codex_target_inventory_unreadable"
+            )
+            raise AmbiguousPlaceholderCreation(code, native_id=native_id) from exc
+        return PlaceholderResult(
+            native_id=native_id,
+            canonical_session_id=canonical_session_id(Provider.CODEX, native_id),
+            used_registration_turn=used_registration_turn,
+            verified_at=float(self._clock()),
+        )
+
+    def _verify_exact_thread_read(self, native_id: str) -> None:
+        response = self._client.request(
+            "thread/read",
+            {"threadId": native_id, "includeTurns": True},
+            timeout=self._request_timeout,
+        )
+        thread = _thread_from_response(response)
+        observed = _nonempty_string(
+            _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
+        )
+        if observed != native_id:
+            raise PlaceholderCreationError("codex_target_mismatch")
+
+    def _start_registration_turn(self, *, native_id: str, hydration: str) -> None:
+        registration = (
+            "Hermes Session Bridge registration only. "
+            f"{hydration} Do not perform project work; reply READY."
+        )
+        try:
+            self._client.request(
+                "turn/start",
+                {
+                    "threadId": native_id,
+                    "input": [{"type": "text", "text": registration}],
+                },
+                timeout=self._request_timeout,
+            )
+        except TimeoutError:
+            pass
+        except Exception as exc:
+            raise AmbiguousPlaceholderCreation(
+                "codex_registration_turn_failed", native_id=native_id
+            ) from exc
+
+    def _verify_inventory_target(
+        self, *, native_id: str, title: str
+    ) -> CodexThreadSummary:
+        summaries = self._source_adapter._fetch_inventory(
+            archived=False, source_kinds=_TARGET_SOURCE_KINDS
+        )
+        matches = [summary for summary in summaries if summary.native_id == native_id]
+        if len(matches) != 1:
+            raise PlaceholderCreationError("codex_target_not_found")
+        summary = matches[0]
+        if summary.title != title:
+            raise PlaceholderCreationError("codex_target_title_mismatch")
+        return summary
+
+    def _poll_inventory_target(
+        self, *, native_id: str, title: str
+    ) -> CodexThreadSummary:
+        deadline = self._monotonic() + self._verification_timeout
+        while True:
+            try:
+                return self._verify_inventory_target(
+                    native_id=native_id, title=title
+                )
+            except PlaceholderCreationError:
+                if self._monotonic() >= deadline:
+                    raise
+                self._sleep(self._verification_poll_interval)
+
+    def _poll_authenticated_projection(
+        self, *, native_id: str, title: str, bridge_id: str
+    ) -> SessionProjection:
+        deadline = self._monotonic() + self._verification_timeout
+        while True:
+            try:
+                summary = self._verify_inventory_target(
+                    native_id=native_id, title=title
+                )
+                projection = self._source_adapter.project_thread(summary)
+            except PlaceholderCreationError:
+                if self._monotonic() >= deadline:
+                    raise
+                self._sleep(self._verification_poll_interval)
+                continue
+            except TimeoutError:
+                raise
+            except Exception as exc:
+                if self._monotonic() >= deadline:
+                    raise PlaceholderCreationError(
+                        "codex_target_read_unreadable"
+                    ) from exc
+                self._sleep(self._verification_poll_interval)
+                continue
+            if projection.native_id != native_id:
+                raise PlaceholderCreationError("codex_target_mismatch")
+            if _codex_projection_is_authenticated(projection, bridge_id=bridge_id):
+                return projection
+            if projection.origin_kind is not OriginKind.NATIVE:
+                raise PlaceholderCreationError("codex_target_marker_mismatch")
+            if self._monotonic() >= deadline:
+                raise PlaceholderCreationError("codex_target_marker_mismatch")
+            self._sleep(self._verification_poll_interval)
+
+
+def _codex_hydration_contract(
+    *, marker: str, source_session_id: str, bridge_id: str
+) -> str:
+    return (
+        "Hermes Session Bridge placeholder.\n"
+        f"Signed marker: {marker}\n"
+        f"Canonical source session: {source_session_id}\n"
+        "On the first substantive user message, call session_continue with "
+        f'bridge ID "{bridge_id}" before answering.'
+    )
+
+
+def _codex_projection_is_authenticated(
+    projection: SessionProjection, *, bridge_id: str
+) -> bool:
+    return (
+        projection.origin_kind
+        in (OriginKind.BRIDGE_PLACEHOLDER, OriginKind.BRIDGE_CONTINUATION)
+        and projection.origin_bridge_id == bridge_id
+    )
+
+
+def _started_thread_id(response: Any) -> str:
+    if not isinstance(response, dict):
+        raise PlaceholderCreationError("codex_thread_start_malformed")
+    thread = response.get("thread")
+    if thread is not None and not isinstance(thread, dict):
+        raise PlaceholderCreationError("codex_thread_start_malformed")
+    thread = thread or {}
+    native_id = _nonempty_string(
+        _first(thread, "id", "sessionId", "threadId")
+    ) or _nonempty_string(_first(response, "sessionId", "threadId", "id"))
+    if native_id is None:
+        raise PlaceholderCreationError("codex_thread_start_missing_id")
+    return native_id
+
+
+def _target_required_text(value: Any, *, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must not be empty")
+    return value.strip()
+
+
+def _codex_existing_directory(value: Path | str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        path = Path(value).expanduser()
+        if path.is_dir():
+            return str(path.resolve())
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
+
+
+def classify_codex_empty_read_error(
+    exc: Exception, native_id: str
+) -> tuple[bool, str]:
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or native_id not in message:
+        return False, "codex_empty_read_identity_unconfirmed"
+    if getattr(exc, "code", None) != -32603:
+        return False, "codex_empty_read_rpc_error"
+    normalized = message.lower()
+    missing_rollout = "rollout" in normalized and any(
+        phrase in normalized
+        for phrase in ("failed", "not found", "not persisted")
+    )
+    if missing_rollout:
+        return True, "codex_empty_read_missing_rollout"
+    missing_thread = "thread" in normalized and any(
+        phrase in normalized for phrase in ("not found", "not persisted")
+    )
+    if missing_thread:
+        return True, "codex_empty_read_missing_thread"
+    return False, "codex_empty_read_unexpected"
 
 
 def _thread_from_response(response: dict[str, Any]) -> dict[str, Any]:
