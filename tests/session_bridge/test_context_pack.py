@@ -477,6 +477,31 @@ def test_memory_reference_detection_rejects_lookalikes(db: SessionDB):
     assert "evil.example" not in links
 
 
+def test_actual_gbrain_wikilink_namespaces_are_recognized(db: SessionDB):
+    store = _seed(
+        db,
+        [
+            _message(
+                "u1",
+                "user",
+                "Keep [[tools/codegraph]], [[hermes/unified-pipeline-state]], and "
+                "[[sessions/2026-07-13-bridge]]. Ignore [[foo/bar]].",
+                timestamp=101.0,
+            )
+        ],
+    )
+
+    links = _section(
+        ContextPackBuilder(db, store).build(_request()).payload,
+        SECTION_HEADINGS[7],
+    )
+
+    assert "tools/codegraph" in links
+    assert "hermes/unified-pipeline-state" in links
+    assert "sessions/2026-07-13-bridge" in links
+    assert "foo/bar" not in links
+
+
 def test_truncation_is_bounded_keeps_newest_turns_and_is_explicit(db: SessionDB):
     messages = [
         _message(
@@ -605,6 +630,79 @@ def test_build_is_repeatable_and_hydrated_pack_is_immutable(db: SessionDB):
     assert after_hydration.payload == first.payload
     assert "Unexpected mutation" not in after_hydration.payload
     assert after_hydration.immutable_at == 900.0
+
+
+def test_existing_pack_replay_rechecks_current_snapshot_identity(db: SessionDB):
+    old_message = _message("u1", "user", "C1 snapshot", timestamp=101.0)
+    store = _seed(
+        db,
+        [old_message],
+        cursor="cursor-c1",
+        source_hash="hash-c1",
+    )
+    builder = ContextPackBuilder(db, store)
+    request = _request(cursor="cursor-c1", source_hash="hash-c1")
+
+    first = builder.build(request)
+    store.upsert_projection(
+        _projection(
+            [
+                old_message,
+                _message("u2", "user", "C2 snapshot", timestamp=202.0),
+            ],
+            cursor="cursor-c2",
+            source_hash="hash-c2",
+        )
+    )
+
+    with pytest.raises(ValueError, match="snapshot identity mismatch"):
+        builder.build(request)
+
+    persisted = store.get_context_pack("bridge-7", budget_chars=8000)
+    assert persisted is not None
+    assert persisted["id"] == first.id
+    assert persisted["payload"] == first.payload
+
+
+def test_existing_explicitly_stale_pack_replay_keeps_visible_warning(db: SessionDB):
+    old_message = _message("u1", "user", "C1 snapshot", timestamp=101.0)
+    store = _seed(
+        db,
+        [old_message],
+        cursor="cursor-c1",
+        source_hash="hash-c1",
+    )
+    builder = ContextPackBuilder(db, store)
+    stale_request = replace(
+        _request(cursor="cursor-c1", source_hash="hash-c1"), stale=True
+    )
+
+    first = builder.build(stale_request)
+    store.upsert_projection(
+        _projection(
+            [
+                old_message,
+                _message("u2", "user", "C2 snapshot", timestamp=202.0),
+            ],
+            cursor="cursor-c2",
+            source_hash="hash-c2",
+        )
+    )
+    replay = builder.build(stale_request)
+
+    assert replay == first
+    assert replay.id == _stable_pack_id(stale_request)
+    assert "[stale source]" in replay.payload
+
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "UPDATE session_context_packs SET payload = ? WHERE id = ?",
+            ("persisted pack without its safety marker", first.id),
+        )
+    with pytest.raises(ValueError, match="stale source warning missing"):
+        builder.build(stale_request)
 
 
 def test_exact_mutable_snapshot_is_frozen_on_first_persisted_build(
@@ -1126,6 +1224,21 @@ def test_secrets_are_redacted_but_ordinary_ids_are_preserved(db: SessionDB):
     assert payload.count("[REDACTED]") >= 6
     assert uuid in payload
     assert source_id in payload
+
+
+@pytest.mark.parametrize("credential", ["x", "short", "standard.header-token_123"])
+def test_any_nonempty_bearer_credential_is_redacted(db: SessionDB, credential: str):
+    content = (
+        f"Authorization: Bearer {credential}\n"
+        "The final standalone word has no credential: bearer"
+    )
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert f"Bearer {credential}" not in payload
+    assert "Authorization: Bearer [REDACTED]" in payload
+    assert "standalone word has no credential: bearer" in payload
 
 
 def test_quoted_multiword_assignments_are_fully_redacted_everywhere(db: SessionDB):

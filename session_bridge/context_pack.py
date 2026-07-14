@@ -116,14 +116,15 @@ _GBRAIN_WIKI_NAMESPACES = frozenset({
     "concepts",
     "decisions",
     "events",
+    "hermes",
     "people",
     "projects",
+    "sessions",
     "systems",
+    "tools",
 })
 
-_BEARER_RE = re.compile(
-    r"(?i)(\b(?:authorization\s*:\s*)?bearer\s+)[A-Za-z0-9._~+/-]{8,}"
-)
+_BEARER_RE = re.compile(r"(?i)(\b(?:authorization\s*:\s*)?bearer\s+)[A-Za-z0-9._~+/-]+")
 _OPENAI_KEY_RE = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b")
 _GITHUB_TOKEN_RE = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"
@@ -151,6 +152,20 @@ class ContextPackBuilder:
         if session is None:
             raise KeyError(request.source_session_id)
 
+        external = snapshot.external
+        snapshot_mismatch = external is not None and (
+            (
+                external["last_native_cursor"] is not None
+                and external["last_native_cursor"] != request.source_cursor
+            )
+            or (
+                external["last_native_hash"] is not None
+                and external["last_native_hash"] != request.source_hash
+            )
+        )
+        if snapshot_mismatch and not request.stale:
+            raise ValueError("source snapshot identity mismatch")
+
         expected_pack_id = _stable_pack_id(request)
         existing = snapshot.existing_pack
         if existing is not None:
@@ -163,7 +178,6 @@ class ContextPackBuilder:
             return _context_pack_from_row(existing)
 
         messages = snapshot.messages
-        external = snapshot.external
         target_session_id = snapshot.target_session_id
         target_external = snapshot.target_external
         snapshot_timestamp, warnings = self._snapshot_timestamp(
@@ -179,18 +193,6 @@ class ContextPackBuilder:
             warnings.append(
                 "- [diverged] Both linked descendants advanced; this pack does not merge them."
             )
-        snapshot_mismatch = external is not None and (
-            (
-                external["last_native_cursor"] is not None
-                and external["last_native_cursor"] != request.source_cursor
-            )
-            or (
-                external["last_native_hash"] is not None
-                and external["last_native_hash"] != request.source_hash
-            )
-        )
-        if snapshot_mismatch and not request.stale:
-            raise ValueError("source snapshot identity mismatch")
         if snapshot_mismatch:
             warnings.append(
                 "- [snapshot identity mismatch] The requested cursor/hash differs from the latest indexed identity."
@@ -345,6 +347,8 @@ class ContextPackBuilder:
             raise ValueError("context pack target-provider/snapshot identity mismatch")
         if row["target_session_id"] != expected_target_session_id:
             raise ValueError("context pack target identity mismatch")
+        if request.stale and "[stale source]" not in row["payload"]:
+            raise ValueError("context pack stale source warning missing")
 
     def _persist_pack_once(
         self,
