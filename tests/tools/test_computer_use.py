@@ -1468,6 +1468,40 @@ class TestCuaDriverSessionReconnect:
         # Exactly one attempt, no reconnect.
         assert len(bridge.calls) == 1
 
+    def test_call_tool_revives_ended_driver_session_before_retry(self):
+        class FakeBridge:
+            def __init__(self):
+                self.calls = []
+                self.effects = [
+                    {
+                        "data": (
+                            "session 'hermes-deadbeef' has ended; tool call "
+                            "'list_windows' was rejected. Call start_session "
+                            "with this id to revive it"
+                        ),
+                        "isError": True,
+                    },
+                    {"data": "session started", "isError": False},
+                    {"structuredContent": {"windows": []}, "isError": False},
+                ]
+
+            def run(self, value, timeout=None):
+                self.calls.append((value, timeout))
+                return self.effects.pop(0)
+
+        bridge = FakeBridge()
+        session = self._make_session(bridge)
+        args = {"on_screen_only": True, "session": "hermes-deadbeef"}
+
+        result = session.call_tool("list_windows", args)
+
+        assert result == {"structuredContent": {"windows": []}, "isError": False}
+        assert [call[0] for call in bridge.calls] == [
+            ("call", "list_windows", args),
+            ("call", "start_session", {"session": "hermes-deadbeef"}),
+            ("call", "list_windows", args),
+        ]
+
 
 class TestCaptureAppFilterNoMatch:
     """capture(app=X) must not silently fall back to the frontmost window

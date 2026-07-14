@@ -785,6 +785,15 @@ class _CuaDriverSession:
             or isinstance(exc, (BrokenPipeError, EOFError))
         )
 
+    @staticmethod
+    def _is_ended_driver_session_result(result: Any) -> bool:
+        if not isinstance(result, dict) or not result.get("isError"):
+            return False
+        data = result.get("data")
+        text = data if isinstance(data, str) else json.dumps(data, default=str)
+        lowered = text.casefold()
+        return "session " in lowered and " has ended" in lowered and "start_session" in lowered
+
     def _restart_session_locked(self) -> None:
         """Recreate the MCP session after the daemon/stdin transport was closed.
         Caller must hold self._lock (the reconnect-once retry path holds it)."""
@@ -803,7 +812,23 @@ class _CuaDriverSession:
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         self._require_started()
         try:
-            return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            result = self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            session_id = args.get("session")
+            if (
+                name not in {"start_session", "end_session"}
+                and isinstance(session_id, str)
+                and session_id
+                and self._is_ended_driver_session_result(result)
+            ):
+                logger.warning("cua-driver logical session ended during %s; reviving once", name)
+                revived = self._bridge.run(
+                    self._call_tool_async("start_session", {"session": session_id}),
+                    timeout=timeout,
+                )
+                if not isinstance(revived, dict) or revived.get("isError"):
+                    return result
+                return self._bridge.run(self._call_tool_async(name, args), timeout=timeout)
+            return result
         except Exception as e:
             if not self._is_closed_session_error(e):
                 raise
