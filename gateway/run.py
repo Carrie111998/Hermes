@@ -7811,12 +7811,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._session_db is None:
             return
         await asyncio.sleep(120)  # let the startup write storm settle
-        from hermes_cli.config import load_config as _load_full_config
         while self._running:
             try:
+                from hermes_cli.config import load_config as _load_full_config
                 cfg = (_load_full_config().get("sessions") or {})
                 if cfg.get("auto_prune", False):
-                    self._session_db._db.maybe_auto_prune_and_vacuum(
+                    # await the AsyncSessionDB wrapper so the blocking prune runs
+                    # via asyncio.to_thread and never freezes the event loop.
+                    await self._session_db.maybe_auto_prune_and_vacuum(
                         retention_days=int(cfg.get("retention_days", 90)),
                         min_interval_hours=int(cfg.get("min_interval_hours", 24)),
                         vacuum=False,  # online: cannot get exclusive lock

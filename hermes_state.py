@@ -5668,6 +5668,8 @@ class SessionDB:
         ``request_dump_*``) for every pruned session, outside the DB
         transaction.
         """
+        if max_batch is not None:
+            max_batch = max(1, int(max_batch))  # <=0 would infinite-loop the chunk drain
         if filters.get("started_before") is None and older_than_days is not None:
             filters["started_before"] = time.time() - (older_than_days * 86400)
         where, where_params = self._prune_filter_where(source=source, **filters)

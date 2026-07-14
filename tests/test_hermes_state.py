@@ -2086,6 +2086,15 @@ class TestPruneSessions:
         assert pruned == 4
         assert calls["n"] == 1
 
+    def test_prune_max_batch_zero_terminates_and_prunes(self, db):
+        """A misconfigured max_batch<=0 must not infinite-loop; it clamps to
+        chunk size 1 and still prunes the whole backlog."""
+        self._make_old_ended_n(db, 3)
+        pruned = db.prune_sessions(older_than_days=90, max_batch=0)
+        assert pruned == 3
+        for i in range(3):
+            assert db.get_session(f"batch_old_{i}") is None
+
 
 class TestPruneSessionFilters:
     """Extended filter surface shared by prune/archive/list_prune_candidates."""
