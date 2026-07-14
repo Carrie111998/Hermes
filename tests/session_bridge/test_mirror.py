@@ -66,20 +66,25 @@ def _projection(
     *,
     provider: Provider = Provider.CLAUDE,
     native_id: str = "source-1",
-    started_at: float = NOW - 60.0,
+    started_at: float | None = None,
     last_active: float = NOW - 10.0,
     messages: tuple[ProjectedMessage, ...] | None = None,
     origin_kind: OriginKind = OriginKind.NATIVE,
     origin_bridge_id: str | None = None,
 ) -> SessionProjection:
+    effective_started_at = last_active - 50.0 if started_at is None else started_at
     return SessionProjection(
         provider=provider,
         native_id=native_id,
         title="A real session",
         cwd="C:/workspace/project",
-        started_at=started_at,
+        started_at=effective_started_at,
         last_active=last_active,
-        messages=messages if messages is not None else (_message(),),
+        messages=(
+            messages
+            if messages is not None
+            else (_message(timestamp=min(NOW - 10.0, last_active)),)
+        ),
         native_cursor="cursor-1",
         native_hash="hash-1",
         origin_kind=origin_kind,
@@ -189,14 +194,69 @@ def test_empty_and_non_user_only_sessions_are_debounced():
 
 def test_meaningful_first_message_must_be_stable_for_debounce_period():
     still_debouncing = classify_mirror_eligibility(
-        _projection(messages=(_message(timestamp=NOW - 4.999),)), _context()
+        _projection(
+            last_active=NOW,
+            messages=(_message(timestamp=NOW - 4.999),),
+        ),
+        _context(),
     )
     stable = classify_mirror_eligibility(
-        _projection(messages=(_message(timestamp=NOW - 5.0),)), _context()
+        _projection(
+            last_active=NOW,
+            messages=(_message(timestamp=NOW - 5.0),),
+        ),
+        _context(),
     )
 
     assert (still_debouncing.eligible, still_debouncing.reason) == (False, "empty")
     assert (stable.eligible, stable.reason) == (True, "eligible")
+
+
+@pytest.mark.parametrize(
+    "projection",
+    (
+        replace(_projection(), started_at=True),
+        replace(_projection(), started_at=float("nan")),
+        replace(_projection(), last_active=False),
+        replace(_projection(), last_active=float("inf")),
+        _projection(started_at=NOW - 5, last_active=NOW - 10),
+        _projection(started_at=NOW + 1, last_active=NOW + 2),
+        _projection(last_active=NOW + 1),
+        _projection(messages=(_message(timestamp=True),)),
+        _projection(
+            started_at=NOW - 20,
+            last_active=NOW - 10,
+            messages=(_message(timestamp=NOW - 21),),
+        ),
+        _projection(
+            started_at=NOW - 20,
+            last_active=NOW - 10,
+            messages=(_message(timestamp=NOW - 9),),
+        ),
+    ),
+)
+def test_invalid_projection_timeline_is_unstable_identity(projection):
+    eligibility = classify_mirror_eligibility(projection, _context())
+
+    assert (eligibility.eligible, eligibility.reason) == (
+        False,
+        "unstable_identity",
+    )
+
+
+def test_pre_start_message_cannot_bypass_debounce_for_just_created_session():
+    projection = _projection(
+        started_at=NOW - 1,
+        last_active=NOW,
+        messages=(_message(timestamp=NOW - 100),),
+    )
+
+    eligibility = classify_mirror_eligibility(projection, _context())
+
+    assert (eligibility.eligible, eligibility.reason) == (
+        False,
+        "unstable_identity",
+    )
 
 
 @pytest.mark.parametrize("native_id", ("", "   "))
@@ -399,6 +459,54 @@ def test_initial_backfill_candidates_are_newest_first_with_stable_ties():
     ]
 
 
+def test_mirror_candidate_rejects_inconsistent_or_nonfinite_identity_fields():
+    projection = _projection()
+
+    with pytest.raises(ValueError, match="source session identity"):
+        MirrorCandidate(
+            source_session_id="claude:other",
+            target_provider=Provider.CODEX,
+            last_active=projection.last_active,
+            projection=projection,
+        )
+    with pytest.raises(ValueError, match="inverse"):
+        MirrorCandidate(
+            source_session_id="claude:source-1",
+            target_provider=Provider.CLAUDE,
+            last_active=projection.last_active,
+            projection=projection,
+        )
+    with pytest.raises(ValueError, match="finite number"):
+        MirrorCandidate(
+            source_session_id="claude:source-1",
+            target_provider=Provider.CODEX,
+            last_active=float("nan"),
+            projection=projection,
+        )
+    with pytest.raises(ValueError, match="last activity"):
+        MirrorCandidate(
+            source_session_id="claude:source-1",
+            target_provider=Provider.CODEX,
+            last_active=projection.last_active - 1,
+            projection=projection,
+        )
+
+
+def test_mirror_candidate_rejects_bridge_origin_projection():
+    projection = _projection(
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id="bridge-1",
+    )
+
+    with pytest.raises(ValueError, match="native projection"):
+        MirrorCandidate(
+            source_session_id="claude:source-1",
+            target_provider=Provider.CODEX,
+            last_active=projection.last_active,
+            projection=projection,
+        )
+
+
 def test_mirror_idempotency_key_matches_store_unique_key(db):
     store = SessionBridgeStore(db, clock=lambda: NOW)
     projection = _projection()
@@ -409,12 +517,14 @@ def test_mirror_idempotency_key_matches_store_unique_key(db):
         canonical_session_id(projection.provider, projection.native_id),
         Provider.CODEX,
         policy=MirrorPolicy(generation=7),
+        manual_authorized=True,
     )
     replay = enqueue_mirror_job(
         store,
         canonical_session_id(projection.provider, projection.native_id),
         Provider.CODEX,
         policy=MirrorPolicy(generation=7),
+        manual_authorized=True,
     )
 
     assert replay == first
@@ -422,6 +532,92 @@ def test_mirror_idempotency_key_matches_store_unique_key(db):
         "claude:source-1", Provider.CODEX, 7
     )
     assert len(_job_rows(db)) == 1
+
+
+def test_default_policy_cannot_enqueue_without_explicit_manual_authority(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+
+    with pytest.raises(PermissionError, match="authority"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+        )
+
+    assert _job_rows(db) == []
+
+
+def test_enqueue_requires_exact_inverse_provider_and_canonical_external_source(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection(provider=Provider.CODEX))
+
+    with pytest.raises(ValueError, match="inverse"):
+        enqueue_mirror_job(
+            store,
+            "codex:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=True,
+        )
+    for malformed in (
+        "source-1",
+        "hermes:source-1",
+        "claude:",
+        " claude:source-1",
+    ):
+        with pytest.raises(ValueError, match="canonical Claude or Codex"):
+            enqueue_mirror_job(
+                store,
+                malformed,
+                Provider.CODEX,
+                policy=MirrorPolicy(),
+                manual_authorized=True,
+            )
+
+    assert _job_rows(db) == []
+
+
+def test_explicit_manual_and_automatic_authority_enqueue_only_inverse_jobs(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection(provider=Provider.CLAUDE, native_id="manual"))
+    store.upsert_projection(_projection(provider=Provider.CODEX, native_id="auto"))
+
+    manual = enqueue_mirror_job(
+        store,
+        "claude:manual",
+        Provider.CODEX,
+        policy=MirrorPolicy(generation=2),
+        manual_authorized=True,
+    )
+    automatic = enqueue_mirror_job(
+        store,
+        "codex:auto",
+        Provider.CLAUDE,
+        policy=MirrorPolicy(generation=2, automatic_creation=True),
+    )
+
+    assert manual["target_provider"] == "codex"
+    assert automatic["target_provider"] == "claude"
+    assert len(_job_rows(db)) == 2
+
+
+@pytest.mark.parametrize("manual_authorized", ("true", 0, 1, None))
+def test_manual_enqueue_authority_requires_an_exact_boolean(db, manual_authorized):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+
+    with pytest.raises(ValueError, match="manual_authorized"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=manual_authorized,
+        )
+
+    assert _job_rows(db) == []
 
 
 def test_retry_delay_is_deterministic_bounded_exponential_with_keyed_jitter():
@@ -446,7 +642,13 @@ def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
     projection = _projection()
     store.upsert_projection(projection)
     policy = MirrorPolicy(max_attempts=2)
-    job = enqueue_mirror_job(store, "claude:source-1", Provider.CODEX, policy=policy)
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=policy,
+        manual_authorized=True,
+    )
     first_claim = store.claim_due_jobs(now=NOW, limit=1)[0]
 
     first_state = record_mirror_failure(
@@ -472,6 +674,107 @@ def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
     assert second_claim["attempts"] == 2
     assert final_state is MirrorJobState.MANUAL_FAILURE
     assert _job_rows(db)[0]["state"] == "manual_failure"
+
+
+@pytest.mark.parametrize(
+    "forged_fields",
+    (
+        {"attempts": 5},
+        {"idempotency_key": "forged-key"},
+    ),
+)
+def test_failure_callback_rejects_forged_claim_snapshot_without_mutation(
+    db, forged_fields
+):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    claim = store.claim_due_jobs(now=NOW, limit=1)[0]
+    forged = {**claim, **forged_fields}
+
+    with pytest.raises(ValueError, match="stale mirror job claim"):
+        record_mirror_failure(
+            store,
+            forged,
+            policy=MirrorPolicy(),
+            now=NOW,
+            code="target_down",
+            detail="temporary",
+        )
+
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "running"
+    assert durable["attempts"] == 1
+    assert durable["error_code"] is None
+
+
+def test_stale_failure_callback_after_retry_is_rejected_without_mutation(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    claim = store.claim_due_jobs(now=NOW, limit=1)[0]
+    record_mirror_failure(
+        store,
+        claim,
+        policy=MirrorPolicy(),
+        now=NOW,
+        code="target_down",
+        detail="temporary",
+    )
+    before = _job_rows(db)[0]
+
+    with pytest.raises(ValueError, match="stale mirror job claim"):
+        record_mirror_failure(
+            store,
+            claim,
+            policy=MirrorPolicy(),
+            now=NOW + 1,
+            code="second",
+            detail="must not overwrite",
+        )
+
+    assert _job_rows(db)[0] == before
+
+
+@pytest.mark.parametrize(
+    ("code", "detail"),
+    ((1, "detail"), ("code", 1), ("", "detail"), ("code", "")),
+)
+def test_failure_callback_requires_strict_nonempty_diagnostics(db, code, detail):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    claim = store.claim_due_jobs(now=NOW, limit=1)[0]
+
+    with pytest.raises(ValueError, match="code and detail"):
+        record_mirror_failure(
+            store,
+            claim,
+            policy=MirrorPolicy(),
+            now=NOW,
+            code=code,
+            detail=detail,
+        )
+
+    assert _job_rows(db)[0]["state"] == "running"
 
 
 def test_provider_specific_concurrency_limits():
@@ -535,6 +838,22 @@ def test_creation_batch_is_newest_first_and_respects_provider_concurrency():
         "codex:codex-newest",
         "claude:claude-second",
     ]
+
+
+def test_creation_batch_deduplicates_repeated_candidate_mapping():
+    policy = MirrorPolicy(automatic_creation=True)
+    candidate = _candidate(_projection(), policy=policy)
+
+    selected = select_creation_batch(
+        (candidate, candidate),
+        policy=policy,
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(),
+    )
+
+    assert selected == (candidate,)
 
 
 def test_creation_batch_obeys_rolling_creates_per_minute_limit():
@@ -649,6 +968,46 @@ def test_creation_batch_rejects_future_creation_timestamps():
         )
 
 
+@pytest.mark.parametrize(
+    "projection",
+    (
+        _projection(messages=()),
+        _projection(
+            started_at=NOW + 1,
+            last_active=NOW + 10,
+            messages=(_message(timestamp=NOW + 5),),
+        ),
+        _projection(
+            last_active=NOW,
+            messages=(_message(timestamp=NOW - 4.999),),
+        ),
+    ),
+)
+def test_creation_batch_revalidates_handcrafted_candidate_at_selection_time(
+    projection,
+):
+    policy = MirrorPolicy(automatic_creation=True)
+    candidate = MirrorCandidate(
+        source_session_id=canonical_session_id(
+            projection.provider, projection.native_id
+        ),
+        target_provider=Provider.CODEX,
+        last_active=projection.last_active,
+        projection=projection,
+    )
+
+    selected = select_creation_batch(
+        (candidate,),
+        policy=policy,
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(),
+    )
+
+    assert selected == ()
+
+
 def test_safe_default_disables_automatic_creation_selection():
     policy = MirrorPolicy()
     candidate = _candidate(_projection(), policy=policy)
@@ -671,6 +1030,14 @@ def test_batch_halts_at_attempt_cap_or_error_rate_threshold():
     assert should_halt_batch(BatchProgress(attempts=20, errors=0), policy) is True
     assert should_halt_batch(BatchProgress(attempts=4, errors=1), policy) is True
     assert should_halt_batch(BatchProgress(attempts=3, errors=0), policy) is False
+
+
+def test_zero_error_rate_threshold_means_stop_on_first_error_not_first_success():
+    policy = MirrorPolicy(stop_error_rate=0)
+
+    assert should_halt_batch(BatchProgress(attempts=1, errors=0), policy) is False
+    assert should_halt_batch(BatchProgress(attempts=20, errors=0), policy) is True
+    assert should_halt_batch(BatchProgress(attempts=1, errors=1), policy) is True
 
 
 def test_halted_batch_selects_no_jobs():

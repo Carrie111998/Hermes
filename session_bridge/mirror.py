@@ -145,6 +145,48 @@ class MirrorCandidate:
     last_active: float
     projection: SessionProjection
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.projection, SessionProjection):
+            raise TypeError("mirror candidate projection must be a SessionProjection")
+        try:
+            expected_source = canonical_session_id(
+                self.projection.provider, self.projection.native_id
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "mirror candidate source session identity is invalid"
+            ) from exc
+        if self.source_session_id != expected_source:
+            raise ValueError("mirror candidate source session identity does not match")
+
+        expected_target = _inverted_provider(self.projection.provider)
+        target = _external_provider(self.target_provider)
+        if target is not expected_target:
+            raise ValueError(
+                "mirror candidate target must be the exact inverse provider"
+            )
+
+        candidate_activity = _finite_float(
+            "mirror candidate last_active", self.last_active
+        )
+        projection_activity = _finite_float(
+            "projection.last_active", self.projection.last_active
+        )
+        if candidate_activity != projection_activity:
+            raise ValueError("mirror candidate last activity does not match projection")
+        try:
+            origin_kind = OriginKind(self.projection.origin_kind)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("mirror candidate requires a native projection") from exc
+        if (
+            origin_kind is not OriginKind.NATIVE
+            or self.projection.origin_bridge_id is not None
+        ):
+            raise ValueError("mirror candidate requires a native projection")
+
+        object.__setattr__(self, "target_provider", target)
+        object.__setattr__(self, "last_active", candidate_activity)
+
 
 @dataclass(frozen=True)
 class BatchProgress:
@@ -206,6 +248,10 @@ def classify_mirror_eligibility(
     if (source_session_id, target) in context.existing_target_mappings:
         return Eligibility(False, target, "already_mapped")
 
+    timeline = _validated_projection_timeline(projection, context.now)
+    if timeline is None:
+        return Eligibility(False, target, "unstable_identity")
+    started_at, last_active = timeline
     first_meaningful_at = _first_meaningful_user_timestamp(projection)
     if (
         first_meaningful_at is None
@@ -213,8 +259,6 @@ def classify_mirror_eligibility(
     ):
         return Eligibility(False, target, "empty")
 
-    started_at = _finite_float("projection.started_at", projection.started_at)
-    last_active = _finite_float("projection.last_active", projection.last_active)
     if context.discovery_mode is DiscoveryMode.INITIAL_BACKFILL:
         oldest = context.now - context.policy.backfill_days * _SECONDS_PER_DAY
         if last_active < oldest:
@@ -302,13 +346,23 @@ def enqueue_mirror_job(
     target_provider: Provider,
     *,
     policy: MirrorPolicy,
+    manual_authorized: bool = False,
 ) -> dict[str, Any]:
-    expected_key = mirror_idempotency_key(
-        source_session_id, target_provider, policy.generation
-    )
+    if not isinstance(policy, MirrorPolicy):
+        raise TypeError("policy must be a MirrorPolicy")
+    if type(manual_authorized) is not bool:
+        raise ValueError("manual_authorized must be a boolean")
+    source_provider = _canonical_source_provider(source_session_id)
+    target = _external_provider(target_provider)
+    if target is not _inverted_provider(source_provider):
+        raise ValueError("mirror target must be the exact inverse provider")
+    if not policy.automatic_creation and not manual_authorized:
+        raise PermissionError("mirror enqueue requires automatic or manual authority")
+
+    expected_key = mirror_idempotency_key(source_session_id, target, policy.generation)
     job = store.enqueue_mirror_job(
         source_session_id,
-        target_provider,
+        target,
         policy_generation=policy.generation,
     )
     if job.get("idempotency_key") != expected_key:
@@ -325,6 +379,15 @@ def record_mirror_failure(
     code: str,
     detail: str,
 ) -> MirrorJobState:
+    if not isinstance(policy, MirrorPolicy):
+        raise TypeError("policy must be a MirrorPolicy")
+    if (
+        not isinstance(code, str)
+        or not code.strip()
+        or not isinstance(detail, str)
+        or not detail.strip()
+    ):
+        raise ValueError("mirror failure code and detail must be nonempty strings")
     job_id = job.get("id")
     idempotency_key = job.get("idempotency_key")
     attempts = job.get("attempts")
@@ -335,19 +398,77 @@ def record_mirror_failure(
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts <= 0:
         raise ValueError("job attempts must be a positive integer")
     failure_time = _finite_float("now", now)
+    updated_at = _finite_float("store clock", store._clock())
 
-    if attempts >= policy.max_attempts:
-        store.fail_job_manually(job_id, code=code, detail=detail)
-        return MirrorJobState.MANUAL_FAILURE
+    def _write(connection: Any) -> MirrorJobState:
+        durable = connection.execute(
+            "SELECT * FROM session_mirror_jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if durable is None:
+            raise KeyError(job_id)
+        durable_attempts = durable["attempts"]
+        durable_key = durable["idempotency_key"]
+        if (
+            durable["state"] != MirrorJobState.RUNNING.value
+            or durable_attempts != attempts
+            or durable_key != idempotency_key
+        ):
+            raise ValueError("stale mirror job claim")
+        if (
+            not isinstance(durable_attempts, int)
+            or isinstance(durable_attempts, bool)
+            or durable_attempts <= 0
+            or not isinstance(durable_key, str)
+            or not durable_key
+        ):
+            raise ValueError("invalid durable mirror job claim")
 
-    next_attempt_at = failure_time + retry_delay_seconds(idempotency_key, attempts)
-    store.retry_job(
-        job_id,
-        code=code,
-        detail=detail,
-        next_attempt_at=next_attempt_at,
-    )
-    return MirrorJobState.RETRY
+        if durable_attempts >= policy.max_attempts:
+            next_state = MirrorJobState.MANUAL_FAILURE
+            cursor = connection.execute(
+                """UPDATE session_mirror_jobs
+                   SET state = ?, error_code = ?, error_detail = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND attempts = ?
+                     AND idempotency_key = ?""",
+                (
+                    next_state.value,
+                    code,
+                    detail,
+                    updated_at,
+                    job_id,
+                    MirrorJobState.RUNNING.value,
+                    durable_attempts,
+                    durable_key,
+                ),
+            )
+        else:
+            next_state = MirrorJobState.RETRY
+            next_attempt_at = failure_time + retry_delay_seconds(
+                durable_key, durable_attempts
+            )
+            cursor = connection.execute(
+                """UPDATE session_mirror_jobs
+                   SET state = ?, error_code = ?, error_detail = ?,
+                       next_attempt_at = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND attempts = ?
+                     AND idempotency_key = ?""",
+                (
+                    next_state.value,
+                    code,
+                    detail,
+                    next_attempt_at,
+                    updated_at,
+                    job_id,
+                    MirrorJobState.RUNNING.value,
+                    durable_attempts,
+                    durable_key,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("stale mirror job claim")
+        return next_state
+
+    return store.db._execute_write(_write)
 
 
 def provider_concurrency_limit(policy: MirrorPolicy, provider: Provider) -> int:
@@ -361,7 +482,7 @@ def should_halt_batch(progress: BatchProgress, policy: MirrorPolicy) -> bool:
     if progress.attempts >= policy.stop_after_attempts:
         return True
     return (
-        progress.attempts > 0
+        progress.errors > 0
         and progress.errors / progress.attempts >= policy.stop_error_rate
     )
 
@@ -421,6 +542,10 @@ def select_creation_batch(
         ),
     )
     for candidate in ordered:
+        if not _candidate_is_current_and_meaningful(
+            candidate, now=selection_time, policy=policy
+        ):
+            continue
         target = _external_provider(candidate.target_provider)
         key = mirror_idempotency_key(
             candidate.source_session_id, target, policy.generation
@@ -443,10 +568,43 @@ def _first_meaningful_user_timestamp(projection: SessionProjection) -> float | N
             and isinstance(message.content, str)
             and bool(message.content.strip())
         ):
-            timestamp = float(message.timestamp)
-            if math.isfinite(timestamp):
-                timestamps.append(timestamp)
+            timestamps.append(_finite_float("message timestamp", message.timestamp))
     return min(timestamps) if timestamps else None
+
+
+def _validated_projection_timeline(
+    projection: SessionProjection, now: float
+) -> tuple[float, float] | None:
+    try:
+        started_at = _finite_float("projection.started_at", projection.started_at)
+        last_active = _finite_float("projection.last_active", projection.last_active)
+    except ValueError:
+        return None
+    if started_at > last_active or started_at > now or last_active > now:
+        return None
+    for message in projection.messages:
+        try:
+            timestamp = _finite_float("message timestamp", message.timestamp)
+        except (AttributeError, ValueError):
+            return None
+        if timestamp < started_at or timestamp > last_active or timestamp > now:
+            return None
+    return started_at, last_active
+
+
+def _candidate_is_current_and_meaningful(
+    candidate: MirrorCandidate,
+    *,
+    now: float,
+    policy: MirrorPolicy,
+) -> bool:
+    if _validated_projection_timeline(candidate.projection, now) is None:
+        return False
+    first_meaningful_at = _first_meaningful_user_timestamp(candidate.projection)
+    return (
+        first_meaningful_at is not None
+        and now - first_meaningful_at >= policy.debounce_seconds
+    )
 
 
 def _inverted_provider(provider: Provider) -> Provider:
@@ -454,6 +612,28 @@ def _inverted_provider(provider: Provider) -> Provider:
     if normalized is Provider.CLAUDE:
         return Provider.CODEX
     return Provider.CLAUDE
+
+
+def _canonical_source_provider(source_session_id: str) -> Provider:
+    if (
+        not isinstance(source_session_id, str)
+        or not source_session_id
+        or source_session_id != source_session_id.strip()
+    ):
+        raise ValueError("source must be a canonical Claude or Codex session ID")
+    prefix, separator, native_id = source_session_id.partition(":")
+    if not separator or not native_id or native_id != native_id.strip():
+        raise ValueError("source must be a canonical Claude or Codex session ID")
+    try:
+        provider = _external_provider(prefix)
+        canonical = canonical_session_id(provider, native_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "source must be a canonical Claude or Codex session ID"
+        ) from exc
+    if canonical != source_session_id:
+        raise ValueError("source must be a canonical Claude or Codex session ID")
+    return provider
 
 
 def _external_provider(provider: Provider | str) -> Provider:
