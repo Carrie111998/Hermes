@@ -9,6 +9,8 @@ from typing import Any
 
 import pytest
 
+from agent.transports.codex_app_server import CodexAppServerClient
+import session_bridge.codex_adapter as codex_adapter_module
 from session_bridge.codex_adapter import CodexSourceAdapter, CodexThreadSummary
 from session_bridge.models import (
     BridgeMarkerPayload,
@@ -44,6 +46,14 @@ class FakeInitializingClient(FakeRequestClient):
 
     def initialize(self) -> dict[str, Any]:
         self.initialize_calls += 1
+        return {"userAgent": "synthetic"}
+
+
+class FakeRetryingInitializeClient(FakeInitializingClient):
+    def initialize(self) -> dict[str, Any]:
+        self.initialize_calls += 1
+        if self.initialize_calls == 1:
+            raise RuntimeError("synthetic initialization failure")
         return {"userAgent": "synthetic"}
 
 
@@ -105,17 +115,45 @@ class TestInventory:
         assert "cursor" not in list_calls[0][1]
         assert list_calls[1][1]["cursor"] == "active-page-2"
 
-    def test_request_only_client_uses_single_initialize_fallback(self) -> None:
+    def test_request_only_client_is_rejected_without_a_complete_handshake(self) -> None:
         client = FakeRequestClient({
             "initialize": [{}],
-            "thread/list": [{"data": []}, {"threads": []}],
+            "thread/list": [{"data": []}],
         })
         adapter = CodexSourceAdapter(client, marker_secret=SECRET)
 
-        adapter.list_inventory(archived=False)
-        adapter.list_inventory(archived=True)
+        with pytest.raises(TypeError, match="initialize"):
+            adapter.list_inventory(archived=False)
 
-        assert [method for method, _, _ in client.calls].count("initialize") == 1
+        assert client.calls == []
+
+    def test_already_initialized_real_client_is_reused_safely(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = object.__new__(CodexAppServerClient)
+        client._initialized = True
+        calls: list[tuple[str, dict[str, Any], float]] = []
+
+        def request(
+            method: str, params: dict[str, Any], timeout: float
+        ) -> dict[str, Any]:
+            calls.append((method, params, timeout))
+            return {"data": []}
+
+        monkeypatch.setattr(client, "request", request)
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        assert adapter.list_inventory(archived=False) == []
+        assert [method for method, _, _ in calls] == ["thread/list"]
+
+    def test_initialize_failure_is_retryable_and_never_silently_succeeds(self) -> None:
+        client = FakeRetryingInitializeClient({"thread/list": [{"data": []}]})
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        with pytest.raises(RuntimeError, match="retry or replace"):
+            adapter.list_inventory(archived=False)
+        assert adapter.list_inventory(archived=False) == []
+        assert client.initialize_calls == 2
 
     def test_archived_pass_is_explicit_and_normalizes_inventory(self) -> None:
         pages = _fixture("thread-list-pages.json")
@@ -245,6 +283,52 @@ class TestInventory:
             "two",
         ]
 
+    def test_reused_explicit_revision_does_not_hide_supported_metadata_changes(
+        self,
+    ) -> None:
+        first = {
+            "id": "one",
+            "title": "Before",
+            "cwd": "C:/before",
+            "createdAt": 100,
+            "updatedAt": 200,
+            "revision": "reused",
+        }
+        changed = {
+            **first,
+            "title": "After",
+            "cwd": "C:/after",
+            "createdAt": 90,
+            "updatedAt": 210,
+        }
+        client = FakeInitializingClient({
+            "thread/list": [{"data": [first]}, {"data": [changed]}]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        assert adapter.list_inventory(archived=False)[0].title == "Before"
+        result = adapter.list_inventory(archived=False)
+
+        assert len(result) == 1
+        assert result[0].title == "After"
+        assert result[0].cwd == "C:/after"
+        assert (result[0].started_at, result[0].last_active) == (90.0, 210.0)
+
+    def test_inverted_inventory_activity_is_normalized_deterministically(self) -> None:
+        row = {
+            "id": "inverted",
+            "createdAt": 300,
+            "updatedAt": 100,
+            "revision": "r1",
+        }
+        client = FakeInitializingClient({"thread/list": [{"data": [row]}]})
+
+        summary = CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+            archived=False
+        )[0]
+
+        assert (summary.started_at, summary.last_active) == (100.0, 300.0)
+
     def test_archive_move_is_changed_even_when_explicit_revision_is_unchanged(
         self,
     ) -> None:
@@ -318,6 +402,24 @@ class TestInventory:
         )
 
         assert [row.native_id for row in result] == ["valid"]
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"data": [{"id": "missing-timestamps"}]},
+            {"threads": ["not-an-object"]},
+        ],
+    )
+    def test_malformed_or_all_invalid_inventory_pages_raise(
+        self, response: dict[str, Any]
+    ) -> None:
+        client = FakeInitializingClient({"thread/list": [response]})
+
+        with pytest.raises(ValueError, match="thread/list"):
+            CodexSourceAdapter(client, marker_secret=SECRET).list_inventory(
+                archived=False
+            )
 
     def test_repeated_cursor_fails_without_committing(self) -> None:
         client = FakeInitializingClient({
@@ -438,9 +540,31 @@ class TestProjection:
         assert len(set(first_ids)) == 2
         assert first_ids == second_ids
 
+    def test_unrelated_earlier_item_does_not_change_idless_event_identities(
+        self,
+    ) -> None:
+        duplicate = {"type": "agentMessage", "text": "same"}
+        unrelated = {"type": "agentMessage", "text": "unrelated"}
+        before = _read_with_items(duplicate, duplicate)
+        after = _read_with_items(unrelated, duplicate, duplicate)
+        client = FakeInitializingClient({"thread/read": [before, after]})
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        before_projection = adapter.project_thread(_summary())
+        after_projection = adapter.project_thread(_summary())
+        before_ids = [message.native_event_id for message in before_projection.messages]
+        after_ids = [
+            message.native_event_id
+            for message in after_projection.messages
+            if message.content == "same"
+        ]
+
+        assert before_ids == after_ids
+
     def test_item_then_turn_then_summary_timestamp_fallbacks(self) -> None:
         response = {
             "thread": {
+                "id": "thread-active",
                 "turns": [
                     {
                         "createdAt": "2026-07-12T10:00:10Z",
@@ -463,7 +587,7 @@ class TestProjection:
                             }
                         ]
                     },
-                ]
+                ],
             }
         }
         client = FakeInitializingClient({"thread/read": [response]})
@@ -479,9 +603,81 @@ class TestProjection:
             1783850400.0,
         ]
 
+    def test_projection_activity_reconciles_inverted_summary_and_message_times(
+        self,
+    ) -> None:
+        response = _read_with_items(
+            {
+                "type": "agentMessage",
+                "id": "early",
+                "createdAt": 50,
+                "text": "early",
+            },
+            {
+                "type": "agentMessage",
+                "id": "late",
+                "createdAt": 350,
+                "text": "late",
+            },
+        )
+        client = FakeInitializingClient({"thread/read": [response]})
+        summary = CodexThreadSummary(
+            native_id="thread-active",
+            title=None,
+            cwd=None,
+            started_at=300,
+            last_active=100,
+            archived=False,
+            revision="r1",
+        )
+
+        projection = CodexSourceAdapter(client, marker_secret=SECRET).project_thread(
+            summary
+        )
+
+        assert (projection.started_at, projection.last_active) == (50.0, 350.0)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"thread": {}},
+            {"thread": {"id": "thread-active"}},
+            {"thread": {"id": "thread-active", "turns": {}}},
+            {"thread": {"id": "different", "turns": []}},
+            {"thread": {"id": "thread-active", "turns": [None]}},
+            {"thread": {"id": "thread-active", "turns": [{"id": "turn"}]}},
+            {
+                "thread": {
+                    "id": "thread-active",
+                    "turns": [{"id": "turn", "items": {}}],
+                }
+            },
+        ],
+    )
+    def test_malformed_thread_read_shapes_raise_for_retry(
+        self, response: dict[str, Any]
+    ) -> None:
+        client = FakeInitializingClient({"thread/read": [response]})
+
+        with pytest.raises(ValueError, match="thread/read"):
+            CodexSourceAdapter(client, marker_secret=SECRET).project_thread(_summary())
+
+    def test_explicit_empty_thread_is_a_valid_empty_projection(self) -> None:
+        client = FakeInitializingClient({
+            "thread/read": [{"thread": {"id": "thread-active", "turns": []}}]
+        })
+
+        projection = CodexSourceAdapter(client, marker_secret=SECRET).project_thread(
+            _summary()
+        )
+
+        assert list(projection.messages) == []
+
     def test_malformed_item_is_skipped_without_losing_valid_neighbors(self) -> None:
         response = {
             "thread": {
+                "id": "thread-active",
                 "turns": [
                     {
                         "items": [
@@ -490,7 +686,7 @@ class TestProjection:
                             {"type": "agentMessage", "id": "after", "text": "after"},
                         ]
                     }
-                ]
+                ],
             }
         }
         client = FakeInitializingClient({"thread/read": [response]})
@@ -554,6 +750,56 @@ class TestProjection:
             _summary(archived=True)
         )
         assert projection.native_status == "archived"
+
+    def test_unknown_private_items_never_enter_searchable_projection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "password=hunter2"
+        marker = _marker("private-marker")
+        unknown = {
+            "type": "internalPrompt",
+            "internalPrompt": f"{secret} {marker} " + ("x" * 1_000_000),
+        }
+        response = _read_with_items(
+            unknown,
+            {
+                "type": "agentMessage",
+                "text": "safe answer",
+                "internalPrompt": secret,
+            },
+        )
+        original_canonical_json = codex_adapter_module._canonical_json
+
+        def contains_secret(value: Any) -> bool:
+            if isinstance(value, str):
+                return secret in value
+            if isinstance(value, dict):
+                return any(
+                    contains_secret(key) or contains_secret(item)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple)):
+                return any(contains_secret(item) for item in value)
+            return False
+
+        def bounded_canonical_json(value: Any) -> str:
+            assert not contains_secret(value)
+            return original_canonical_json(value)
+
+        monkeypatch.setattr(
+            codex_adapter_module, "_canonical_json", bounded_canonical_json
+        )
+        client = FakeInitializingClient({"thread/read": [response]})
+
+        projection = CodexSourceAdapter(client, marker_secret=SECRET).project_thread(
+            _summary()
+        )
+
+        assert [message.content for message in projection.messages] == ["safe answer"]
+        assert all(
+            secret not in (message.content or "") for message in projection.messages
+        )
+        assert projection.origin_kind is OriginKind.NATIVE
 
 
 class TestBridgeMarkers:

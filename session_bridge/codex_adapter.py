@@ -23,7 +23,15 @@ from .models import (
 
 _PARSER_VERSION = 1
 _REQUEST_TIMEOUT = 30.0
-_INITIALIZE_TIMEOUT = 10.0
+_SUPPORTED_ITEM_TYPES = frozenset({
+    "agentMessage",
+    "commandExecution",
+    "dynamicToolCall",
+    "fileChange",
+    "mcpToolCall",
+    "reasoning",
+    "userMessage",
+})
 _MARKER_CANDIDATE_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
     r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
@@ -53,7 +61,7 @@ class CodexSourceAdapter:
         self._client = client
         self._marker_secret = marker_secret
         self._initialized = False
-        self._seen_revisions: dict[str, tuple[str, bool]] = {}
+        self._seen_inventory: dict[str, CodexThreadSummary] = {}
         self._inventory_cache: dict[str, CodexThreadSummary] = {}
 
     def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
@@ -63,15 +71,14 @@ class CodexSourceAdapter:
         changed = [
             summary
             for summary in summaries
-            if self._seen_revisions.get(summary.native_id)
-            != (summary.revision, summary.archived)
+            if self._seen_inventory.get(summary.native_id) != summary
         ]
-        next_seen = dict(self._seen_revisions)
+        next_seen = dict(self._seen_inventory)
         next_cache = dict(self._inventory_cache)
         for summary in summaries:
-            next_seen[summary.native_id] = (summary.revision, summary.archived)
+            next_seen[summary.native_id] = summary
             next_cache[summary.native_id] = summary
-        self._seen_revisions = next_seen
+        self._seen_inventory = next_seen
         self._inventory_cache = next_cache
         return changed
 
@@ -86,27 +93,33 @@ class CodexSourceAdapter:
         response_native_id = _nonempty_string(
             _first(thread, "id", "threadId", "thread_id", "sessionId", "session_id")
         )
-        if response_native_id is not None and response_native_id != summary.native_id:
+        if response_native_id is None:
+            raise ValueError("Codex thread/read response has no thread identity")
+        if response_native_id != summary.native_id:
             raise ValueError("Codex thread/read returned a different thread identity")
+
+        summary_started_at, summary_last_active = _normalized_activity(
+            summary.started_at, summary.last_active, context="Codex thread summary"
+        )
 
         projector = CodexEventProjector()
         projected: list[ProjectedMessage] = []
-        turns = thread.get("turns") or []
-        if not isinstance(turns, list):
-            raise ValueError("Codex thread/read turns must be a list")
-        for turn_index, turn in enumerate(turns):
+        fallback_occurrences: dict[str, int] = {}
+        turns = thread["turns"]
+        for turn in turns:
             if not isinstance(turn, dict):
-                continue
+                raise ValueError("Codex thread/read turn must be an object")
             turn_timestamp = _timestamp_from(turn)
-            turn_identity = (
-                _nonempty_string(_first(turn, "id", "turnId", "turn_id"))
-                or f"index:{turn_index}"
-            )
-            items = turn.get("items") or []
+            if "items" not in turn:
+                raise ValueError("Codex thread/read turn has no items list")
+            items = turn["items"]
             if not isinstance(items, list):
-                continue
-            for item_index, item in enumerate(items):
+                raise ValueError("Codex thread/read turn items must be a list")
+            for item in items:
                 if not isinstance(item, dict):
+                    continue
+                item_type = _nonempty_string(item.get("type"))
+                if item_type not in _SUPPORTED_ITEM_TYPES:
                     continue
                 candidate = deepcopy(projector)
                 try:
@@ -121,19 +134,28 @@ class CodexSourceAdapter:
                     if item_timestamp is not None
                     else turn_timestamp
                     if turn_timestamp is not None
-                    else summary.started_at
+                    else summary_started_at
                 )
                 try:
+                    fallback_identity, fallback_digest = _fallback_identity(
+                        item,
+                        result.messages,
+                        occurrences=fallback_occurrences,
+                    )
                     item_messages = _project_messages(
                         item,
                         result.messages,
                         timestamp=timestamp,
-                        fallback_context=(turn_identity, item_index),
+                        fallback_identity=fallback_identity,
                     )
                 except (TypeError, ValueError):
                     continue
                 projector = candidate
                 projected.extend(item_messages)
+                if fallback_digest is not None:
+                    fallback_occurrences[fallback_digest] = (
+                        fallback_occurrences.get(fallback_digest, 0) + 1
+                    )
 
         origin_kind, origin_bridge_id = _detect_origin(
             projected, marker_secret=self._marker_secret
@@ -141,14 +163,26 @@ class CodexSourceAdapter:
         native_path = _nonempty_string(
             _first(thread, "rolloutPath", "rollout_path")
         ) or _nonempty_string(_first(response, "rolloutPath", "rollout_path"))
-        native_hash = _projection_hash(summary, projected)
+        message_timestamps = [message.timestamp for message in projected]
+        started_at = min([summary_started_at, *message_timestamps])
+        last_active = max([summary_last_active, *message_timestamps])
+        normalized_summary = CodexThreadSummary(
+            native_id=summary.native_id,
+            title=summary.title,
+            cwd=summary.cwd,
+            started_at=started_at,
+            last_active=last_active,
+            archived=summary.archived,
+            revision=summary.revision,
+        )
+        native_hash = _projection_hash(normalized_summary, projected)
         return SessionProjection(
             provider=Provider.CODEX,
             native_id=summary.native_id,
             title=summary.title,
             cwd=summary.cwd,
-            started_at=summary.started_at,
-            last_active=summary.last_active,
+            started_at=started_at,
+            last_active=last_active,
             messages=projected,
             native_path=native_path,
             native_status="archived" if summary.archived else "active",
@@ -184,21 +218,28 @@ class CodexSourceAdapter:
     def _ensure_initialized(self) -> None:
         if self._initialized:
             return
+        if getattr(self._client, "_initialized", False) is True:
+            self._initialized = True
+            return
         initialize = getattr(self._client, "initialize", None)
-        if callable(initialize):
+        if not callable(initialize):
+            raise TypeError(
+                "CodexSourceAdapter client must provide initialize() for the complete "
+                "app-server handshake"
+            )
+        try:
             initialize()
-        else:
-            self._client.request(
-                "initialize",
-                {
-                    "clientInfo": {
-                        "name": "hermes-session-bridge",
-                        "title": "Hermes Session Bridge",
-                        "version": "0.1",
-                    },
-                    "capabilities": {},
-                },
-                timeout=_INITIALIZE_TIMEOUT,
+        except Exception as exc:
+            raise RuntimeError(
+                "Codex app-server initialization failed; retry or replace the client "
+                "if the handshake partially completed"
+            ) from exc
+        if hasattr(self._client, "_initialized") and not getattr(
+            self._client, "_initialized"
+        ):
+            raise RuntimeError(
+                "Codex app-server initialization did not complete; replace or retry "
+                "the client"
             )
         self._initialized = True
 
@@ -207,6 +248,7 @@ class CodexSourceAdapter:
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
         conflicts: set[str] = set()
+        raw_entry_count = 0
         while True:
             params: dict[str, Any] = {"archived": archived}
             if cursor is not None:
@@ -214,11 +256,14 @@ class CodexSourceAdapter:
             response = self._client.request(
                 "thread/list", params, timeout=_REQUEST_TIMEOUT
             )
+            if not isinstance(response, dict):
+                raise ValueError("Codex thread/list response must be an object")
             entries = _first(response, "data", "threads")
             if entries is None:
-                entries = []
+                raise ValueError("Codex thread/list response has no entries list")
             if not isinstance(entries, list):
                 raise ValueError("Codex thread/list entries must be a list")
+            raw_entry_count += len(entries)
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
@@ -241,6 +286,8 @@ class CodexSourceAdapter:
                 raise ValueError("Codex thread/list returned a repeated cursor")
             seen_cursors.add(cursor_key)
             cursor = next_cursor
+        if raw_entry_count and not normalized:
+            raise ValueError("Codex thread/list contained no valid inventory entries")
         return [normalized[native_id] for native_id in sorted(normalized)]
 
 
@@ -251,8 +298,12 @@ def _thread_from_response(response: dict[str, Any]) -> dict[str, Any]:
     if nested is not None:
         if not isinstance(nested, dict):
             raise ValueError("Codex thread/read thread must be an object")
-        return nested
-    return response
+        thread = nested
+    else:
+        thread = response
+    if "turns" not in thread or not isinstance(thread["turns"], list):
+        raise ValueError("Codex thread/read response must include a turns list")
+    return thread
 
 
 def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadSummary:
@@ -295,6 +346,9 @@ def _normalize_summary(entry: dict[str, Any], *, archived: bool) -> CodexThreadS
     if last_active is None:
         last_active = started_at
     assert started_at is not None and last_active is not None
+    started_at, last_active = _normalized_activity(
+        started_at, last_active, context="Codex inventory"
+    )
 
     archived_value = entry.get("archived", archived)
     if not isinstance(archived_value, bool):
@@ -346,19 +400,12 @@ def _project_messages(
     messages: list[dict],
     *,
     timestamp: float,
-    fallback_context: tuple[str, int],
+    fallback_identity: str | None,
 ) -> list[ProjectedMessage]:
     item_id = _nonempty_string(item.get("id"))
-    base_identity = (
-        item_id
-        or hashlib.sha256(
-            _canonical_json({
-                "item": item,
-                "turn": fallback_context[0],
-                "item_index": fallback_context[1],
-            }).encode("utf-8")
-        ).hexdigest()
-    )
+    base_identity = item_id or fallback_identity
+    if base_identity is None:
+        return []
     multiple = len(messages) > 1
     projected: list[ProjectedMessage] = []
     for ordinal, message in enumerate(messages):
@@ -385,6 +432,24 @@ def _project_messages(
             )
         )
     return projected
+
+
+def _fallback_identity(
+    item: dict[str, Any],
+    messages: list[dict],
+    *,
+    occurrences: dict[str, int],
+) -> tuple[str | None, str | None]:
+    if _nonempty_string(item.get("id")) is not None or not messages:
+        return None, None
+    digest = hashlib.sha256(
+        _canonical_json({"type": item.get("type"), "messages": messages}).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    occurrence = occurrences.get(digest, 0)
+    identity = digest if occurrence == 0 else f"{digest}:occ:{occurrence}"
+    return identity, digest
 
 
 def _message_content(value: Any) -> str | None:
@@ -451,9 +516,7 @@ def _projection_hash(
     summary: CodexThreadSummary, messages: list[ProjectedMessage]
 ) -> str:
     supported = {
-        "native_id": summary.native_id,
-        "revision": summary.revision,
-        "archived": summary.archived,
+        "summary": asdict(summary),
         "messages": [asdict(message) for message in messages],
     }
     return hashlib.sha256(_canonical_json(supported).encode("utf-8")).hexdigest()
@@ -492,6 +555,25 @@ def _inventory_timestamp(
             raise ValueError(f"Codex inventory timestamp {key!r} is invalid")
         return parsed
     return None
+
+
+def _normalized_activity(
+    started_at: Any, last_active: Any, *, context: str
+) -> tuple[float, float]:
+    if (
+        isinstance(started_at, bool)
+        or isinstance(last_active, bool)
+        or not isinstance(started_at, (int, float))
+        or not isinstance(last_active, (int, float))
+    ):
+        raise ValueError(f"{context} activity timestamps must be numeric")
+    normalized_start = float(started_at)
+    normalized_last = float(last_active)
+    if not math.isfinite(normalized_start) or not math.isfinite(normalized_last):
+        raise ValueError(f"{context} activity timestamps must be finite")
+    return min(normalized_start, normalized_last), max(
+        normalized_start, normalized_last
+    )
 
 
 def _parse_timestamp(value: Any, *, milliseconds: bool) -> float | None:
