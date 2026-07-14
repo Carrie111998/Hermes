@@ -75,6 +75,18 @@ def _epoch(value: str) -> float:
     )
 
 
+def _bridge_marker(bridge_id: str) -> str:
+    return encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id="codex:synthetic-source",
+            target_provider=Provider.CLAUDE,
+            policy_generation=4,
+        ),
+        SECRET,
+    )
+
+
 class _RecordingBinaryStream:
     def __init__(self, stream: BinaryIO, reads: list[tuple[int, int, int]]) -> None:
         self._stream = stream
@@ -159,6 +171,197 @@ def test_parse_prefers_record_session_id_and_extracts_custom_title(tmp_path):
     assert projection.last_active == _epoch("2026-01-02T00:00:01Z")
 
 
+def test_full_parse_rejects_mixed_native_session_ids(tmp_path):
+    path = tmp_path / "mixed-identities.jsonl"
+    path.write_bytes(
+        b"".join([
+            _json_line(_message_record("first", session_id=BASIC_SESSION_ID)),
+            _json_line(
+                _message_record(
+                    "second",
+                    session_id=TOOLS_SESSION_ID,
+                    event_id="30303030-3030-4303-8303-303030303030",
+                )
+            ),
+        ])
+    )
+
+    with pytest.raises(ValueError, match="native identity"):
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+
+def test_warm_increment_rejects_changed_native_id_without_mutating_cache(tmp_path):
+    path = tmp_path / "warm-identity.jsonl"
+    original = _json_line(_message_record("first"))
+    path.write_bytes(original)
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    first = adapter.parse(path)
+    bad_tail = _json_line(
+        _message_record(
+            "wrong identity",
+            session_id=TOOLS_SESSION_ID,
+            event_id="31313131-3131-4313-8313-313131313131",
+        )
+    )
+    path.write_bytes(original + bad_tail)
+
+    with pytest.raises(ValueError, match="native identity"):
+        adapter.parse(path, first.cursor)
+
+    good_tail = _json_line(
+        _message_record(
+            "right identity",
+            event_id="32323232-3232-4323-8323-323232323232",
+        )
+    )
+    path.write_bytes(original + good_tail)
+    recovered = adapter.parse(path, first.cursor)
+    assert recovered.projection.native_id == BASIC_SESSION_ID
+
+
+def test_cold_increment_rejects_tail_with_different_native_id(tmp_path):
+    path = tmp_path / "cold-mismatch.jsonl"
+    path.write_bytes(_json_line(_message_record("first")))
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    with path.open("ab") as stream:
+        stream.write(
+            _json_line(
+                _message_record(
+                    "wrong identity",
+                    session_id=TOOLS_SESSION_ID,
+                    event_id="33333333-3333-4333-8333-333333333334",
+                )
+            )
+        )
+
+    with pytest.raises(ValueError, match="native identity"):
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
+
+
+def test_cold_increment_recovers_record_identity_when_stem_differs(tmp_path):
+    path = tmp_path / "not-the-native-id.jsonl"
+    path.write_bytes(_json_line(_message_record("first")))
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    tail_record = _message_record(
+        "same identity",
+        event_id="34343434-3434-4434-8434-343434343435",
+    )
+    tail_record.pop("sessionId")
+    with path.open("ab") as stream:
+        stream.write(_json_line(tail_record))
+
+    cold = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
+
+    assert cold.projection.native_id == BASIC_SESSION_ID
+
+
+def test_cold_identity_head_ignores_unknown_record_session_ids(tmp_path):
+    path = tmp_path / "cold-unknown-record.jsonl"
+    path.write_bytes(
+        _json_line({
+            "type": "synthetic-unknown",
+            "sessionId": TOOLS_SESSION_ID,
+        })
+        + _json_line(_message_record("first"))
+    )
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    tail_record = _message_record(
+        "same identity",
+        event_id="34343434-3434-4434-8434-343434343436",
+    )
+    tail_record.pop("sessionId")
+    with path.open("ab") as stream:
+        stream.write(_json_line(tail_record))
+
+    cold = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
+
+    assert cold.projection.native_id == BASIC_SESSION_ID
+
+
+def test_cold_identity_outside_head_falls_back_to_stem(tmp_path):
+    path = tmp_path / "cold-prefix-identity.jsonl"
+    initial = _message_record("first")
+    initial = {
+        "type": initial.pop("type"),
+        "syntheticPadding": "x" * 5000,
+        **initial,
+    }
+    path.write_bytes(_json_line(initial))
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    tail_record = _message_record(
+        "same identity",
+        event_id="34343434-3434-4434-8434-343434343437",
+    )
+    tail_record.pop("sessionId")
+    with path.open("ab") as stream:
+        stream.write(_json_line(tail_record))
+
+    cold = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
+
+    assert cold.projection.native_id == "cold-prefix-identity"
+
+
+def test_cold_stem_fallback_does_not_reopen_or_reread_history(tmp_path, monkeypatch):
+    path = tmp_path / "cold-stem-fallback.jsonl"
+    initial = _message_record("first")
+    initial.pop("sessionId")
+    initial_bytes = _json_line(initial)
+    path.write_bytes(initial_bytes)
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    tail_record = _message_record(
+        "same identity",
+        event_id="34343434-3434-4434-8434-343434343438",
+    )
+    tail_record.pop("sessionId")
+    tail_bytes = _json_line(tail_record)
+    with path.open("ab") as stream:
+        stream.write(tail_bytes)
+
+    reads: list[tuple[int, int, int]] = []
+    opens: list[Path] = []
+    original_open = Path.open
+
+    def recording_open(self, mode="r", *args, **kwargs):
+        stream = original_open(self, mode, *args, **kwargs)
+        if self == path and mode == "rb":
+            opens.append(self)
+            return _RecordingBinaryStream(stream, reads)
+        return stream
+
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    cold = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
+
+    assert cold.projection.native_id == "cold-stem-fallback"
+    assert opens == [path]
+    assert reads == [
+        (0, len(initial_bytes), len(initial_bytes)),
+        (len(initial_bytes) - 1, 1, 1),
+        (len(initial_bytes), -1, len(tail_bytes)),
+    ]
+
+
+def test_cold_stem_baseline_rejects_a_different_delta_session_id(tmp_path):
+    path = tmp_path / "cold-stem-baseline.jsonl"
+    initial = _message_record("first")
+    initial.pop("sessionId")
+    path.write_bytes(_json_line(initial))
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    with path.open("ab") as stream:
+        stream.write(
+            _json_line(
+                _message_record(
+                    "different identity",
+                    session_id=BASIC_SESSION_ID,
+                    event_id="34343434-3434-4434-8434-343434343439",
+                )
+            )
+        )
+
+    with pytest.raises(ValueError, match="native identity"):
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
+
+
 def test_normalizes_user_assistant_text_and_tool_call_result(tmp_path):
     path = _copy_fixture(tmp_path, "tools-and-title.jsonl")
 
@@ -190,6 +393,71 @@ def test_normalizes_user_assistant_text_and_tool_call_result(tmp_path):
         }
     ]
     assert messages[2].tool_call_id == "tool-1"
+
+
+def test_mixed_media_tool_result_redacts_binary_payloads_through_store(tmp_path):
+    secret_payload = "SYNTHETIC_BASE64_SECRET_" + "A" * 200
+    record = {
+        "type": "user",
+        "sessionId": BASIC_SESSION_ID,
+        "uuid": "35353535-3535-4535-8535-353535353535",
+        "timestamp": "2026-01-02T00:00:01Z",
+        "isSidechain": False,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-media",
+                    "content": [
+                        {"type": "text", "text": "Visible synthetic result"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": secret_payload,
+                            },
+                        },
+                        {
+                            "type": "document",
+                            "media_type": "application/pdf",
+                            "data": secret_payload,
+                        },
+                        {
+                            "type": "future_binary",
+                            "media_type": "application/octet-stream",
+                            "payload": secret_payload,
+                        },
+                    ],
+                }
+            ],
+        },
+    }
+    path = tmp_path / "mixed-media.jsonl"
+    path.write_bytes(_json_line(record))
+    projection = (
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path).projection
+    )
+    content = projection.messages[0].content
+
+    assert content is not None
+    assert "Visible synthetic result" in content
+    assert "image" in content and "image/png" in content
+    assert "document" in content and "application/pdf" in content
+    assert "future_binary" in content and "application/octet-stream" in content
+    assert "omitted" in content
+    assert secret_payload not in content
+    assert len(content) < 500
+
+    database = SessionDB(tmp_path / "mixed-media.db")
+    try:
+        SessionBridgeStore(database, clock=lambda: 100.0).upsert_projection(projection)
+        persisted = database.get_messages(f"claude:{BASIC_SESSION_ID}")[0]["content"]
+        assert secret_payload not in persisted
+        assert "Visible synthetic result" in persisted
+    finally:
+        database.close()
 
 
 def test_hidden_thinking_is_excluded(tmp_path):
@@ -319,9 +587,20 @@ def test_incremental_parse_physically_reads_only_head_validation_and_tail(
     )
 
 
-def test_cold_increment_uses_stem_and_mtime_without_full_read(tmp_path, monkeypatch):
+def test_cold_increment_uses_head_identity_and_mtime_without_full_read(
+    tmp_path, monkeypatch
+):
     path = tmp_path / "cold-native-id.jsonl"
-    path.write_bytes(_json_line(_message_record("x" * 6000)))
+    initial_bytes = (
+        json.dumps(
+            _message_record("x" * 6000),
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+    assert b'"sessionId"' in initial_bytes[:4096]
+    path.write_bytes(initial_bytes)
     first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
     os.utime(path, (321.0, 321.0))
     reads: list[tuple[int, int, int]] = []
@@ -338,11 +617,59 @@ def test_cold_increment_uses_stem_and_mtime_without_full_read(tmp_path, monkeypa
     cold = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path, first.cursor)
 
     assert cold.rebuild is False
-    assert cold.projection.native_id == "cold-native-id"
+    assert cold.projection.native_id == BASIC_SESSION_ID
     assert cold.projection.messages == []
     assert cold.projection.started_at == 321.0
     assert cold.projection.last_active == 321.0
     assert not any(offset == 0 and requested == -1 for offset, requested, _ in reads)
+
+
+@pytest.mark.parametrize(
+    "invalid_cursor",
+    [
+        ClaudeCursor(offset=-1, head_length=1, head_hash="0" * 64),
+        ClaudeCursor(offset=0, head_length=-1, head_hash="0" * 64),
+        ClaudeCursor(offset=0, head_length=10**9, head_hash="0" * 64),
+        ClaudeCursor(offset=True, head_length=1, head_hash="0" * 64),
+        ClaudeCursor(offset=0, head_length=False, head_hash="0" * 64),
+        ClaudeCursor(offset=0, head_length=1, head_hash="A" * 64),
+        ClaudeCursor(offset=0, head_length=1, head_hash="not-a-hash"),
+    ],
+    ids=[
+        "negative-offset",
+        "negative-head",
+        "huge-head",
+        "bool-offset",
+        "bool-head",
+        "uppercase-hash",
+        "short-hash",
+    ],
+)
+def test_invalid_cursor_shape_rebuilds_before_bounded_reads(
+    tmp_path, monkeypatch, invalid_cursor
+):
+    path = _copy_fixture(tmp_path, "basic.jsonl")
+    reads: list[tuple[int, int, int]] = []
+    original_open = Path.open
+
+    def recording_open(self, mode="r", *args, **kwargs):
+        stream = original_open(self, mode, *args, **kwargs)
+        if self == path and mode == "rb":
+            return _RecordingBinaryStream(stream, reads)
+        return stream
+
+    monkeypatch.setattr(Path, "open", recording_open)
+
+    rebuilt = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(
+        path, invalid_cursor
+    )
+
+    assert rebuilt.rebuild is True
+    assert [message.content for message in rebuilt.projection.messages] == [
+        "First synthetic prompt",
+        "Synthetic response",
+    ]
+    assert reads == [(0, -1, path.stat().st_size)]
 
 
 def test_partial_trailing_multibyte_line_waits_for_newline_completion(tmp_path):
@@ -558,6 +885,84 @@ def test_valid_claude_signed_marker_with_later_user_is_continuation(tmp_path):
     assert projection.origin_bridge_id == "bridge-continued"
 
 
+def test_distinct_valid_bridge_markers_in_one_parse_are_rejected(tmp_path):
+    records = [
+        _message_record(_bridge_marker("bridge-first")),
+        _message_record(
+            _bridge_marker("bridge-second"),
+            event_id="36363636-3636-4636-8636-363636363636",
+        ),
+    ]
+    path = tmp_path / "conflicting-markers.jsonl"
+    path.write_bytes(b"".join(_json_line(record) for record in records))
+
+    with pytest.raises(ValueError, match="bridge marker"):
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+
+def test_repeated_same_marker_records_do_not_count_as_human_turns(tmp_path):
+    marker = _bridge_marker("bridge-repeated")
+    records = [
+        _message_record(marker),
+        _message_record(
+            marker,
+            event_id="37373737-3737-4737-8737-373737373737",
+            timestamp="2026-01-01T00:00:01Z",
+        ),
+    ]
+    path = tmp_path / "repeated-marker.jsonl"
+    path.write_bytes(b"".join(_json_line(record) for record in records))
+
+    projection = (
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path).projection
+    )
+
+    assert projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+    assert projection.origin_bridge_id == "bridge-repeated"
+
+
+def test_warm_increment_rejects_a_different_valid_bridge_marker(tmp_path):
+    path = tmp_path / "warm-marker-conflict.jsonl"
+    original = _json_line(_message_record(_bridge_marker("bridge-original")))
+    path.write_bytes(original)
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    first = adapter.parse(path)
+    path.write_bytes(
+        original
+        + _json_line(
+            _message_record(
+                _bridge_marker("bridge-conflict"),
+                event_id="38383838-3838-4838-8838-383838383838",
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="bridge marker"):
+        adapter.parse(path, first.cursor)
+
+
+def test_meta_local_command_is_excluded_from_delta_activity_and_provenance(tmp_path):
+    path = tmp_path / "meta-local-command.jsonl"
+    path.write_bytes(_json_line(_message_record(_bridge_marker("bridge-original"))))
+    adapter = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET)
+    first = adapter.parse(path)
+    meta_record = _message_record(
+        f"/synthetic-local-command {_bridge_marker('bridge-meta-ignored')}",
+        event_id="39393939-3939-4939-8939-393939393939",
+        timestamp="2026-01-01T00:00:10Z",
+    )
+    meta_record["isMeta"] = True
+    with path.open("ab") as stream:
+        stream.write(_json_line(meta_record))
+
+    second = adapter.parse(path, first.cursor)
+
+    assert second.projection.messages == []
+    assert second.projection.last_active == first.projection.last_active
+    assert second.projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+    assert second.projection.origin_bridge_id == "bridge-original"
+
+
 def test_appended_user_turn_promotes_cached_placeholder_to_continuation(tmp_path):
     marker = encode_bridge_marker(
         BridgeMarkerPayload(
@@ -753,6 +1158,31 @@ def test_find_native_session_uses_record_id_without_writes(tmp_path):
 
     assert adapter.find_native_session(BASIC_SESSION_ID) == expected
     assert adapter.find_native_session("missing-synthetic-id") is None
+
+
+def test_find_native_session_skips_corrupt_probe_before_valid_target(tmp_path):
+    corrupt = tmp_path / "a-corrupt-mixed-id.jsonl"
+    corrupt.write_bytes(
+        _json_line(_message_record("first", session_id=BASIC_SESSION_ID))
+        + _json_line(
+            _message_record(
+                "second",
+                session_id=TOOLS_SESSION_ID,
+                event_id="52525252-5252-4252-8252-525252525252",
+            )
+        )
+    )
+    target_native_id = "53535353-5353-4353-8353-535353535353"
+    target = tmp_path / "z-valid-mismatched-stem.jsonl"
+    target.write_bytes(
+        _json_line(_message_record("target", session_id=target_native_id))
+    )
+
+    found = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).find_native_session(
+        target_native_id
+    )
+
+    assert found == target
 
 
 def test_find_native_session_uses_stem_fast_path_and_bounded_prefix_probe(

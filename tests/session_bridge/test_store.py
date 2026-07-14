@@ -80,6 +80,25 @@ def _rows(db: SessionDB, sql: str, params=()):
         return [dict(row) for row in db._conn.execute(sql, params).fetchall()]
 
 
+def _capture_mapping_selects(db: SessionDB, operation) -> list[str]:
+    statements: list[str] = []
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.set_trace_callback(statements.append)
+    try:
+        operation()
+    finally:
+        with db._lock:
+            conn.set_trace_callback(None)
+    return [
+        statement
+        for statement in statements
+        if "FROM external_message_map" in statement
+        and statement.lstrip().upper().startswith("SELECT")
+    ]
+
+
 def test_first_import_is_idempotent_and_append_only(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     first = _projection(_message("e1", "first"), _message("e2", "second"))
@@ -115,6 +134,80 @@ def test_first_import_is_idempotent_and_append_only(db):
         store.get_external_session("claude:native-1")["last_native_cursor"]
         == "cursor-2"
     )
+
+
+def test_delta_mapping_lookup_queries_only_incoming_composite_identity(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(*(_message(f"history-{index}", "old") for index in range(25)))
+    )
+
+    selects = _capture_mapping_selects(
+        db,
+        lambda: store.upsert_projection(
+            _projection(
+                _message("delta-1", "new"),
+                cursor="delta-cursor",
+                native_hash="delta-hash",
+            )
+        ),
+    )
+
+    assert len(selects) == 1
+    assert "(native_event_id, ordinal) IN" in selects[0]
+    assert "delta-1" in selects[0]
+    assert "history-1" not in selects[0]
+
+
+def test_empty_delta_skips_message_mapping_lookup(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("history", "old")))
+
+    selects = _capture_mapping_selects(
+        db,
+        lambda: store.upsert_projection(
+            _projection(
+                cursor="empty-cursor",
+                native_hash="empty-hash",
+            )
+        ),
+    )
+
+    assert selects == []
+
+
+def test_rebuild_skips_message_mapping_lookup(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("history", "old")))
+
+    selects = _capture_mapping_selects(
+        db,
+        lambda: store.upsert_projection(
+            _projection(
+                _message("rebuilt", "new"),
+                cursor="rebuilt-cursor",
+                native_hash="rebuilt-hash",
+            ),
+            rebuild=True,
+        ),
+    )
+
+    assert selects == []
+
+
+def test_mapping_lookup_chunks_large_incoming_projection(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    incoming = tuple(
+        _message(f"incoming-{index}", "new", role="assistant") for index in range(401)
+    )
+
+    selects = _capture_mapping_selects(
+        db,
+        lambda: store.upsert_projection(_projection(*incoming)),
+    )
+
+    assert len(selects) == 2
+    assert all("(native_event_id, ordinal) IN" in statement for statement in selects)
 
 
 def test_projection_persists_updates_and_preserves_git_branch_on_none(db):

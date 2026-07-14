@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any, BinaryIO, Iterable
+from typing import Any, BinaryIO
 
 from .models import (
     InvalidBridgeMarker,
@@ -38,6 +38,9 @@ _MARKER_CANDIDATE_RE = re.compile(
     r"(?![A-Za-z0-9_-])"
 )
 _NATIVE_ID_RE = re.compile(rb'"sessionId"\s*:\s*("(?:\\.|[^"\\])*")')
+_RECORD_TYPE_RE = re.compile(rb'"type"\s*:\s*("(?:\\.|[^"\\])*")')
+_CURSOR_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_DESCRIPTOR_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._/+;-]+")
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,7 @@ class _TranscriptLine:
 @dataclass(frozen=True)
 class _ReadSlice:
     data: bytes
+    head_data: bytes
     base_offset: int
     completed_length: int
     cursor: ClaudeCursor
@@ -122,7 +126,8 @@ class ClaudeSourceAdapter:
             base_offset=read_slice.base_offset,
         )
         records = [line.record for line in lines if line.record is not None]
-        metadata_delta = _metadata_delta(records)
+        delta_native_id = _validated_record_native_id(records)
+        metadata_delta = _metadata_delta(records, native_id=delta_native_id)
         cache_key = str(transcript_path.absolute())
         cached = self._cache.get(cache_key)
         warm_increment = (
@@ -132,11 +137,30 @@ class ClaudeSourceAdapter:
             and cached.cursor == previous
         )
         if warm_increment and cached is not None:
+            if (
+                delta_native_id is not None
+                and delta_native_id != cached.metadata.native_id
+            ):
+                raise ValueError("Claude transcript native identity changed")
             metadata = _merge_metadata(cached.metadata, metadata_delta)
             prior_origin_kind = cached.origin_kind
             prior_origin_bridge_id = cached.origin_bridge_id
         else:
-            metadata = _materialize_metadata(metadata_delta, transcript_path)
+            if previous is not None and not read_slice.rebuild:
+                baseline_native_id = _native_id_from_bytes(read_slice.head_data)
+                baseline_native_id = baseline_native_id or transcript_path.stem
+                if (
+                    delta_native_id is not None
+                    and delta_native_id != baseline_native_id
+                ):
+                    raise ValueError("Claude transcript native identity changed")
+            else:
+                baseline_native_id = delta_native_id or transcript_path.stem
+            metadata = _materialize_metadata(
+                metadata_delta,
+                transcript_path,
+                native_id=baseline_native_id,
+            )
             prior_origin_kind = OriginKind.NATIVE
             prior_origin_bridge_id = None
 
@@ -151,8 +175,8 @@ class ClaudeSourceAdapter:
             if record_type not in _RECOGNIZED_RECORD_TYPES:
                 unknown_records += 1
                 continue
-            if record_type in {"user", "assistant"} and not line.record.get(
-                "isSidechain", False
+            if record_type in {"user", "assistant"} and _is_eligible_record(
+                line.record
             ):
                 messages.extend(_project_record(line))
 
@@ -203,7 +227,11 @@ class ClaudeSourceAdapter:
             if path.stem == wanted:
                 return path
         for path in paths:
-            if _probe_native_id(path) == wanted:
+            try:
+                probed_native_id = _probe_native_id(path)
+            except (OSError, ValueError):
+                continue
+            if probed_native_id == wanted:
                 return path
         return None
 
@@ -212,6 +240,8 @@ def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:
     with path.open("rb") as stream:
         if previous is None:
             return _read_full(stream, rebuild=False)
+        if not _valid_cursor_shape(previous):
+            return _read_full(stream, rebuild=True)
 
         stream.seek(0, 2)
         file_size = stream.tell()
@@ -238,6 +268,7 @@ def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:
         completed_length = _completed_byte_length(tail)
         return _ReadSlice(
             data=tail,
+            head_data=previous_head,
             base_offset=previous.offset,
             completed_length=completed_length,
             cursor=ClaudeCursor(
@@ -252,15 +283,17 @@ def _read_for_parse(path: Path, previous: ClaudeCursor | None) -> _ReadSlice:
 def _read_full(stream: BinaryIO, *, rebuild: bool) -> _ReadSlice:
     data = stream.read()
     head_length = min(len(data), _HEAD_SAMPLE_BYTES)
+    head_data = data[:head_length]
     completed_length = _completed_byte_length(data)
     return _ReadSlice(
         data=data,
+        head_data=head_data,
         base_offset=0,
         completed_length=completed_length,
         cursor=ClaudeCursor(
             offset=completed_length,
             head_length=head_length,
-            head_hash=_sha256(data[:head_length]),
+            head_hash=_sha256(head_data),
         ),
         rebuild=rebuild,
     )
@@ -269,14 +302,54 @@ def _read_full(stream: BinaryIO, *, rebuild: bool) -> _ReadSlice:
 def _probe_native_id(path: Path) -> str | None:
     with path.open("rb") as stream:
         prefix = stream.read(_NATIVE_ID_PROBE_BYTES)
-    match = _NATIVE_ID_RE.search(prefix)
-    if match is None:
-        return None
-    try:
-        value = json.loads(match.group(1))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    return _nonempty_string(value)
+    return _native_id_from_bytes(prefix)
+
+
+def _valid_cursor_shape(cursor: ClaudeCursor) -> bool:
+    return (
+        type(cursor.offset) is int
+        and cursor.offset >= 0
+        and type(cursor.head_length) is int
+        and 0 <= cursor.head_length <= _HEAD_SAMPLE_BYTES
+        and isinstance(cursor.head_hash, str)
+        and _CURSOR_HASH_RE.fullmatch(cursor.head_hash) is not None
+    )
+
+
+def _native_id_from_bytes(value: bytes) -> str | None:
+    native_ids: set[str] = set()
+    fragments = value.splitlines()
+    for index, fragment in enumerate(fragments):
+        try:
+            decoded = json.loads(fragment)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            is_truncated_tail = index == len(fragments) - 1 and not value.endswith(
+                b"\n"
+            )
+            if not is_truncated_tail:
+                continue
+            record_type_match = _RECORD_TYPE_RE.search(fragment)
+            native_id_match = _NATIVE_ID_RE.search(fragment)
+            if record_type_match is None or native_id_match is None:
+                continue
+            try:
+                record_type = json.loads(record_type_match.group(1))
+                decoded_native_id = json.loads(native_id_match.group(1))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if record_type not in _RECOGNIZED_RECORD_TYPES:
+                continue
+            native_id = _nonempty_string(decoded_native_id)
+        else:
+            if (
+                not isinstance(decoded, dict)
+                or decoded.get("type") not in _RECOGNIZED_RECORD_TYPES
+            ):
+                continue
+            native_id = _nonempty_string(decoded.get("sessionId"))
+        if native_id is not None:
+            native_ids.add(native_id)
+    return _single_native_id(native_ids)
 
 
 def _sha256(value: bytes) -> str:
@@ -304,8 +377,9 @@ def _parse_complete_lines(
     return lines
 
 
-def _metadata_delta(records: list[dict[str, Any]]) -> _MetadataDelta:
-    native_id = _first_native_id(records)
+def _metadata_delta(
+    records: list[dict[str, Any]], *, native_id: str | None
+) -> _MetadataDelta:
     title: str | None = None
     cwd: str | None = None
     git_branch: str | None = None
@@ -314,20 +388,21 @@ def _metadata_delta(records: list[dict[str, Any]]) -> _MetadataDelta:
     for record in records:
         if record.get("type") not in _RECOGNIZED_RECORD_TYPES:
             continue
+        if not _is_eligible_record(record):
+            continue
         if record.get("type") == "custom-title":
             candidate_title = _nonempty_string(record.get("customTitle"))
             if candidate_title is not None:
                 title = candidate_title
-        if not record.get("isSidechain", False):
-            candidate_cwd = _nonempty_string(record.get("cwd"))
-            if candidate_cwd is not None:
-                cwd = candidate_cwd
-            candidate_branch = _nonempty_string(record.get("gitBranch"))
-            if candidate_branch is not None:
-                git_branch = candidate_branch
-            timestamp = _parse_timestamp(record.get("timestamp"))
-            if timestamp is not None:
-                timestamps.append(timestamp)
+        candidate_cwd = _nonempty_string(record.get("cwd"))
+        if candidate_cwd is not None:
+            cwd = candidate_cwd
+        candidate_branch = _nonempty_string(record.get("gitBranch"))
+        if candidate_branch is not None:
+            git_branch = candidate_branch
+        timestamp = _parse_timestamp(record.get("timestamp"))
+        if timestamp is not None:
+            timestamps.append(timestamp)
 
     return _MetadataDelta(
         native_id=native_id,
@@ -338,7 +413,9 @@ def _metadata_delta(records: list[dict[str, Any]]) -> _MetadataDelta:
     )
 
 
-def _materialize_metadata(delta: _MetadataDelta, path: Path) -> _Metadata:
+def _materialize_metadata(
+    delta: _MetadataDelta, path: Path, *, native_id: str
+) -> _Metadata:
     if delta.timestamps:
         started_at = min(delta.timestamps)
         last_active = max(delta.timestamps)
@@ -346,7 +423,7 @@ def _materialize_metadata(delta: _MetadataDelta, path: Path) -> _Metadata:
         started_at = path.stat().st_mtime
         last_active = started_at
     return _Metadata(
-        native_id=delta.native_id or path.stem,
+        native_id=native_id,
         title=delta.title,
         cwd=delta.cwd,
         git_branch=delta.git_branch,
@@ -362,7 +439,7 @@ def _merge_metadata(baseline: _Metadata, delta: _MetadataDelta) -> _Metadata:
         started_at = min(started_at, min(delta.timestamps))
         last_active = max(last_active, max(delta.timestamps))
     return _Metadata(
-        native_id=delta.native_id or baseline.native_id,
+        native_id=baseline.native_id,
         title=delta.title or baseline.title,
         cwd=delta.cwd or baseline.cwd,
         git_branch=delta.git_branch or baseline.git_branch,
@@ -371,14 +448,27 @@ def _merge_metadata(baseline: _Metadata, delta: _MetadataDelta) -> _Metadata:
     )
 
 
-def _first_native_id(records: Iterable[dict[str, Any]]) -> str | None:
+def _validated_record_native_id(records: list[dict[str, Any]]) -> str | None:
+    native_ids: set[str] = set()
     for record in records:
         if record.get("type") not in _RECOGNIZED_RECORD_TYPES:
             continue
         native_id = _nonempty_string(record.get("sessionId"))
         if native_id is not None:
-            return native_id
-    return None
+            native_ids.add(native_id)
+    return _single_native_id(native_ids)
+
+
+def _single_native_id(native_ids: set[str]) -> str | None:
+    if len(native_ids) > 1:
+        raise ValueError("Claude transcript native identity conflict")
+    return next(iter(native_ids), None)
+
+
+def _is_eligible_record(record: dict[str, Any]) -> bool:
+    return not bool(record.get("isSidechain", False)) and not bool(
+        record.get("isMeta", False)
+    )
 
 
 def _nonempty_string(value: Any) -> str | None:
@@ -505,16 +595,57 @@ def _visible_tool_result(value: Any) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        text_parts = [
-            block["text"]
-            for block in value
-            if isinstance(block, dict)
-            and block.get("type") == "text"
-            and isinstance(block.get("text"), str)
-        ]
-        if text_parts and len(text_parts) == len(value):
-            return "\n".join(text_parts)
+        visible_parts: list[str] = []
+        for block in value:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                visible_parts.append(block["text"])
+            elif isinstance(block, dict):
+                visible_parts.append(_omitted_content_descriptor(block))
+            else:
+                visible_parts.append("[content omitted]")
+        return "\n".join(visible_parts)
+    if isinstance(value, dict) and _contains_binary_content(value):
+        return _omitted_content_descriptor(value)
     return _canonical_json(value)
+
+
+def _omitted_content_descriptor(block: dict[str, Any]) -> str:
+    content_type = _safe_descriptor_token(block.get("type"), fallback="content")
+    media_type = block.get("media_type") or block.get("mime_type")
+    source = block.get("source")
+    if media_type is None and isinstance(source, dict):
+        media_type = source.get("media_type") or source.get("mime_type")
+    normalized_media_type = _safe_descriptor_token(media_type, fallback="")
+    if normalized_media_type:
+        return f"[{content_type} omitted: {normalized_media_type}]"
+    return f"[{content_type} omitted]"
+
+
+def _safe_descriptor_token(value: Any, *, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    normalized = _DESCRIPTOR_UNSAFE_RE.sub("-", value.strip())[:64].strip("-")
+    return normalized or fallback
+
+
+def _contains_binary_content(value: Any) -> bool:
+    if isinstance(value, dict):
+        content_type = _nonempty_string(value.get("type"))
+        if content_type is not None and content_type != "text":
+            return True
+        if any(
+            key in value
+            for key in ("source", "data", "payload", "media_type", "mime_type")
+        ):
+            return True
+        return any(_contains_binary_content(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_binary_content(item) for item in value)
+    return False
 
 
 def _canonical_json(value: Any) -> str:
@@ -537,16 +668,11 @@ def _detect_origin(
     prior_kind: OriginKind,
     prior_bridge_id: str | None,
 ) -> tuple[OriginKind, str | None]:
-    if prior_bridge_id is not None:
-        if prior_kind is OriginKind.BRIDGE_PLACEHOLDER and any(
-            _is_human_user(record) for record in records
-        ):
-            return OriginKind.BRIDGE_CONTINUATION, prior_bridge_id
-        return prior_kind, prior_bridge_id
-
+    marker_records: set[int] = set()
+    marker_occurrences: list[tuple[int, str]] = []
     for index, record in enumerate(records):
-        if record.get("type") not in {"user", "assistant"} or record.get(
-            "isSidechain", False
+        if record.get("type") not in {"user", "assistant"} or not _is_eligible_record(
+            record
         ):
             continue
         for text in _record_text_blocks(record):
@@ -556,21 +682,43 @@ def _detect_origin(
                 except InvalidBridgeMarker:
                     continue
                 if payload.target_provider is Provider.CLAUDE:
-                    continued = any(
-                        _is_human_user(later_record)
-                        for later_record in records[index + 1 :]
-                    )
-                    kind = (
-                        OriginKind.BRIDGE_CONTINUATION
-                        if continued
-                        else OriginKind.BRIDGE_PLACEHOLDER
-                    )
-                    return kind, payload.bridge_id
+                    marker_records.add(index)
+                    marker_occurrences.append((index, payload.bridge_id))
+
+    marker_ids = {bridge_id for _, bridge_id in marker_occurrences}
+    if len(marker_ids) > 1:
+        raise ValueError("Claude transcript has conflicting bridge markers")
+    marker_bridge_id = next(iter(marker_ids), None)
+
+    if prior_bridge_id is not None:
+        if marker_bridge_id is not None and marker_bridge_id != prior_bridge_id:
+            raise ValueError("Claude transcript bridge marker changed")
+        if prior_kind is OriginKind.BRIDGE_PLACEHOLDER and any(
+            index not in marker_records and _is_human_user(record)
+            for index, record in enumerate(records)
+        ):
+            return OriginKind.BRIDGE_CONTINUATION, prior_bridge_id
+        return prior_kind, prior_bridge_id
+
+    if marker_bridge_id is not None:
+        first_marker_index = min(index for index, _ in marker_occurrences)
+        continued = any(
+            index > first_marker_index
+            and index not in marker_records
+            and _is_human_user(record)
+            for index, record in enumerate(records)
+        )
+        kind = (
+            OriginKind.BRIDGE_CONTINUATION
+            if continued
+            else OriginKind.BRIDGE_PLACEHOLDER
+        )
+        return kind, marker_bridge_id
     return OriginKind.NATIVE, None
 
 
 def _is_human_user(record: dict[str, Any]) -> bool:
-    if record.get("type") != "user" or record.get("isSidechain", False):
+    if record.get("type") != "user" or not _is_eligible_record(record):
         return False
     message = record.get("message")
     if not isinstance(message, dict):

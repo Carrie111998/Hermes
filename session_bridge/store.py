@@ -23,6 +23,7 @@ from .models import (
 
 
 _EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
+_MESSAGE_KEY_QUERY_CHUNK = 400
 
 
 class SessionBridgeStore:
@@ -47,9 +48,7 @@ class SessionBridgeStore:
         session_id = canonical_session_id(provider, projection.native_id)
         native_id = projection.native_id.strip()
         git_branch = (
-            projection.git_branch.strip()
-            if projection.git_branch is not None
-            else None
+            projection.git_branch.strip() if projection.git_branch is not None else None
         )
         git_branch = git_branch or None
         now = float(self._clock())
@@ -112,18 +111,11 @@ class SessionBridgeStore:
             ):
                 raise ValueError(f"stale projection for session {session_id!r}")
 
-            existing_keys = {
-                (row["native_event_id"], row["ordinal"])
-                for row in conn.execute(
-                    """SELECT native_event_id, ordinal
-                       FROM external_message_map WHERE session_id = ?""",
-                    (session_id,),
-                ).fetchall()
-            }
             if rebuild:
                 pending = projected_messages
                 has_new_human_user = False
             else:
+                existing_keys = _existing_message_keys(conn, session_id, projected_keys)
                 pending = [
                     (message, row)
                     for message, row in projected_messages
@@ -851,6 +843,29 @@ def _external_provider(provider: Provider | str) -> Provider:
     if normalized not in _EXTERNAL_PROVIDERS:
         raise ValueError("bridge provider must be Claude or Codex")
     return normalized
+
+
+def _existing_message_keys(
+    conn: Any,
+    session_id: str,
+    projected_keys: list[tuple[str, int]],
+) -> set[tuple[str, int]]:
+    existing: set[tuple[str, int]] = set()
+    for start in range(0, len(projected_keys), _MESSAGE_KEY_QUERY_CHUNK):
+        chunk = projected_keys[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+        placeholders = ",".join("(?, ?)" for _ in chunk)
+        params: list[Any] = [session_id]
+        for native_event_id, ordinal in chunk:
+            params.extend((native_event_id, ordinal))
+        rows = conn.execute(
+            f"""SELECT native_event_id, ordinal
+                FROM external_message_map
+                WHERE session_id = ?
+                  AND (native_event_id, ordinal) IN ({placeholders})""",
+            params,
+        ).fetchall()
+        existing.update((row["native_event_id"], row["ordinal"]) for row in rows)
+    return existing
 
 
 def _external_activity_state_key(session_id: str) -> str:
