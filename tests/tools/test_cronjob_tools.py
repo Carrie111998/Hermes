@@ -577,6 +577,64 @@ class TestCronjobRunCallerTraceability:
         assert events[0].payload["caller"] == "hermes_cli:cron_run"
         assert events[0].payload["reason"] == "manual investigation"
 
+    def test_run_action_emits_even_when_execution_raises(self, monkeypatch):
+        """The audit record must be written once the fire is claimed, BEFORE
+        execution — a hung or crashed run must not lose the trigger's
+        attribution (the point of the traceability spec). Also covers the
+        hermetic-sandbox case where the run always fails on the no-model
+        guard: the trigger event must land regardless of run outcome."""
+        from cron.jobs import create_job
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=self._tmp_path / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        def boom(job, **kwargs):
+            raise RuntimeError("execution exploded")
+
+        monkeypatch.setattr("cron.scheduler.run_one_job", boom)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = json.loads(
+            cronjob(
+                action="run",
+                job_id=job["id"],
+                caller="hermes_cli:cron_run",
+                reason="crash-run audit",
+            )
+        )
+        assert result["success"] is True
+        assert result["job"]["executed"] is True
+        assert result["job"]["execution_success"] is False
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        assert events[0].payload["caller"] == "hermes_cli:cron_run"
+        assert events[0].payload["reason"] == "crash-run audit"
+        assert events[0].payload["new_next_run_at"]
+
+    def test_run_action_claim_lost_emits_no_trigger_event(self, monkeypatch):
+        """A lost claim means no off-schedule fire happened (another fire is
+        already in flight) — emitting cron_triggered would fabricate an audit
+        record for a fire this caller never made."""
+        from cron.jobs import create_job
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=self._tmp_path / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+        monkeypatch.setattr(
+            "tools.cronjob_tools.claim_job_for_fire", lambda job_id: False
+        )
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = json.loads(cronjob(action="run", job_id=job["id"]))
+        assert result["success"] is True
+        assert result["job"]["execution_skipped"]
+
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
+
 
 class TestValidateCronBaseUrl:
     """The cron base_url guard must not let a NAMED custom provider's stored

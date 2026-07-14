@@ -23,6 +23,7 @@ from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
     create_job,
+    emit_cron_triggered_safe,
     get_job,
     list_jobs,
     mark_job_run,
@@ -603,7 +604,12 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
+def _execute_job_now(
+    job: Dict[str, Any],
+    *,
+    caller: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
     Atomically claims the job first via ``claim_job_for_fire`` — the same
@@ -611,6 +617,11 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     concurrently-running gateway ticker cannot also fire it (the claim both
     blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
     If the claim is lost (another fire is in flight), this is a no-op.
+
+    A won claim is an off-schedule fire, so it emits the CRON_TRIGGERED
+    audit event (caller/reason attribution, spec 2026-04-30) BEFORE the run:
+    a hung or crashed run must not lose the trigger's attribution. A lost
+    claim emits nothing — no fire happened on this caller's behalf.
 
     The actual firing is delegated to ``run_one_job`` — the single shared
     execute→save→deliver→mark body the ticker and external providers use — so
@@ -623,10 +634,25 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from cron.scheduler import run_one_job
 
+        previous_next_run_at = job.get("next_run_at")
+
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
             return {"claimed": False, "success": False,
                     "error": "Job is already being fired by the scheduler; not run again."}
+
+        # The claim already advanced next_run_at for recurring jobs, so the
+        # refreshed job carries the post-fire schedule state for the audit
+        # record (new_next_run_at = the next SCHEDULED run after this fire).
+        claimed_job = get_job(job_id) or {}
+        emit_cron_triggered_safe(
+            job_id=job_id,
+            job_name=claimed_job.get("name") or job.get("name") or job_id,
+            caller=caller,
+            reason=reason,
+            previous_next_run_at=previous_next_run_at,
+            new_next_run_at=claimed_job.get("next_run_at"),
+        )
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
@@ -835,8 +861,11 @@ def cronjob(
             # next scheduler tick — a manual `run` should actually run, even when
             # no gateway/ticker is active (the #41037 case). The claim inside
             # _execute_job_now advances next_run_at and blocks a concurrent tick
-            # from double-firing.
-            exec_result = _execute_job_now(job)
+            # from double-firing. No explicit caller means the model invoked the
+            # tool itself (CLI/HTTP surfaces always pass their own caller).
+            exec_result = _execute_job_now(
+                job, caller=caller or "llm:cronjob_tool", reason=reason
+            )
             # Re-read so the response reflects the post-run last_run_at/last_status.
             result = _format_job(get_job(job_id) or {"id": job_id})
             result["executed"] = exec_result.get("claimed", False)

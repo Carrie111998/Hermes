@@ -1394,6 +1394,44 @@ def _get_event_bus():
     return EventBus()
 
 
+def emit_cron_triggered_safe(
+    *,
+    job_id: str,
+    job_name: str,
+    caller: Optional[str],
+    reason: Optional[str],
+    previous_next_run_at: Optional[str],
+    new_next_run_at: Optional[str],
+) -> None:
+    """Best-effort CRON_TRIGGERED emit shared by every off-schedule trigger path.
+
+    Both ``trigger_job`` (schedule-for-next-tick) and the cronjob tool's
+    execute-now path route through here so the audit contract can't drift
+    between them again (the 0.18.2 upstream merge dropped the emit from the
+    run path when it stopped calling ``trigger_job``). Defensive on purpose:
+    any import/bus failure is logged and swallowed — the trigger or run must
+    never break because audit emission failed. The state mutation has already
+    been persisted by the caller; the audit gap is a known degradation, not a
+    correctness regression.
+    """
+    try:
+        from events.producers.cron_trigger_emitter import emit_cron_triggered
+        bus = _get_event_bus()
+        emit_cron_triggered(
+            bus,
+            job_id=job_id,
+            job_name=job_name,
+            caller=caller,
+            reason=reason,
+            previous_next_run_at=previous_next_run_at,
+            new_next_run_at=new_next_run_at,
+        )
+    except Exception:
+        logger.exception(
+            "cron_triggered emit failed for job_id=%s", job_id
+        )
+
+
 def trigger_job(
     job_id: str,
     caller: Optional[str] = None,
@@ -1437,26 +1475,14 @@ def trigger_job(
     )
 
     if updated is not None:
-        try:
-            from events.producers.cron_trigger_emitter import emit_cron_triggered
-            bus = _get_event_bus()
-            emit_cron_triggered(
-                bus,
-                job_id=job["id"],
-                job_name=updated.get("name") or job.get("name") or job["id"],
-                caller=caller,
-                reason=reason,
-                previous_next_run_at=previous_next_run_at,
-                new_next_run_at=updated["next_run_at"],
-            )
-        except Exception:
-            # Defensive: any bus/import failure must not break trigger_job.
-            # The state mutation has already been persisted; the audit gap
-            # is a known degradation, not a correctness regression.
-            logger.exception(
-                "trigger_job: cron_triggered emit failed for job_id=%s",
-                job_id,
-            )
+        emit_cron_triggered_safe(
+            job_id=job["id"],
+            job_name=updated.get("name") or job.get("name") or job["id"],
+            caller=caller,
+            reason=reason,
+            previous_next_run_at=previous_next_run_at,
+            new_next_run_at=updated["next_run_at"],
+        )
 
     return updated
 
