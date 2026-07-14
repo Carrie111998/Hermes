@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+from dataclasses import dataclass, field
 import importlib
 import json
 import logging
@@ -89,6 +90,8 @@ _HINDSIGHT_GLYPH = "👁️"
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
+_PREFETCH_WAIT_SECONDS = 3.0
+_MAX_PREFETCH_WORKERS = 2
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -312,6 +315,29 @@ _loop_lock = threading.Lock()
 # Sentinel pushed to the per-provider retain queue to wake the writer for a
 # clean exit. A unique object so it can never collide with a real job.
 _WRITER_SENTINEL = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchRequest:
+    """Immutable request-time identity for one prefetch operation."""
+
+    request_id: int
+    epoch: int
+    session_id: str
+    bank_id: str
+    query: str
+    cache_key: tuple[int, str, str, str]
+    inflight_key: tuple[int, int, str, str, str]
+
+
+@dataclass(slots=True)
+class _PrefetchOperation:
+    """Tracks worker and async-future ownership for one exact request."""
+
+    request: _PrefetchRequest
+    thread: threading.Thread | None = None
+    futures: dict[int, Any] = field(default_factory=dict)
+    worker_done: bool = False
 
 
 def _get_loop() -> asyncio.AbstractEventLoop:
@@ -771,8 +797,6 @@ class HindsightMemoryProvider(MemoryProvider):
         # _prefetch_result so the deterministic recall indicator can report an
         # accurate count without re-parsing the formatted text.
         self._prefetch_count = 0
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_thread = None
         # State for the model-independent recall indicator (see recall_status()).
         # _last_recall_returned tracks whether the most recent prefetch() handed
         # any memory to the agent this turn; _last_recall_count is how many.
@@ -784,6 +808,29 @@ class HindsightMemoryProvider(MemoryProvider):
         # the agent's status channel, injected via initialize(status_callback=).
         self._retain_indicator = True
         self._status_callback: Optional[Callable[[str], None]] = None
+        self._prefetch_result_request: _PrefetchRequest | None = None
+        self._prefetch_completed_request: _PrefetchRequest | None = None
+        self._prefetch_lock = threading.RLock()
+        self._prefetch_condition = threading.Condition(self._prefetch_lock)
+        self._prefetch_epoch = 0
+        self._prefetch_sequence = 0
+        self._prefetch_session_id = ""
+        self._prefetch_bank_id = "hermes"
+        self._prefetch_bank_fallback = "hermes"
+        self._prefetch_latest_request: _PrefetchRequest | None = None
+        self._prefetch_pending_request: _PrefetchRequest | None = None
+        self._prefetch_inflight: dict[
+            tuple[int, int, str, str, str], _PrefetchOperation
+        ] = {}
+        self._prefetch_operations: dict[
+            tuple[int, int, str, str, str], _PrefetchOperation
+        ] = {}
+        self._prefetch_threads: set[threading.Thread] = set()
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_client_owners: dict[int, tuple[Any, int]] = {}
+        self._prefetch_deferred_clients: dict[int, Any] = {}
+        self._prefetch_close_threads: set[threading.Thread] = set()
+        self._prefetch_closing_client_ids: set[int] = set()
         # Single-writer model for retain. sync_turn() enqueues; the writer
         # thread drains sequentially. Avoids spawning ad-hoc threads that
         # can race the interpreter shutdown and emit "cannot schedule new
@@ -1647,17 +1694,23 @@ class HindsightMemoryProvider(MemoryProvider):
         self._llm_base_url = self._config.get("llm_base_url", "")
 
         banks = cfg_get(self._config, "banks", "hermes", default={})
-        static_bank_id = self._config.get("bank_id") or banks.get("bankId", "hermes")
+        self._prefetch_bank_fallback = (
+            self._config.get("bank_id") or banks.get("bankId", "hermes")
+        )
         self._bank_id_template = self._config.get("bank_id_template", "") or ""
         self._bank_id = _resolve_bank_id_template(
             self._bank_id_template,
-            fallback=static_bank_id,
+            fallback=self._prefetch_bank_fallback,
             profile=self._agent_identity,
             workspace=self._agent_workspace,
             platform=self._platform,
             user=self._user_id,
             session=self._session_id,
         )
+        with self._prefetch_condition:
+            self._prefetch_epoch += 1
+            self._prefetch_session_id = self._session_id
+            self._prefetch_bank_id = self._bank_id
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
@@ -1839,6 +1892,462 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
+    def _ensure_prefetch_state(self) -> None:
+        """Lazily initialize prefetch state for constructor-bypassing callers."""
+        if not hasattr(self, "_shutting_down"):
+            self._shutting_down = threading.Event()
+        if not hasattr(self, "_prefetch_lock"):
+            self._prefetch_lock = threading.RLock()
+        if not hasattr(self, "_prefetch_condition"):
+            self._prefetch_condition = threading.Condition(self._prefetch_lock)
+
+        current_session_id = str(getattr(self, "_session_id", "") or "").strip()
+        current_bank_id = str(getattr(self, "_bank_id", "hermes") or "hermes")
+        defaults = {
+            "_prefetch_result": "",
+            "_prefetch_result_request": None,
+            "_prefetch_completed_request": None,
+            "_prefetch_epoch": 0,
+            "_prefetch_sequence": 0,
+            "_prefetch_session_id": current_session_id,
+            "_prefetch_bank_id": current_bank_id,
+            "_prefetch_bank_fallback": current_bank_id,
+            "_prefetch_latest_request": None,
+            "_prefetch_pending_request": None,
+            "_prefetch_inflight": {},
+            "_prefetch_operations": {},
+            "_prefetch_threads": set(),
+            "_prefetch_thread": None,
+            "_prefetch_client_owners": {},
+            "_prefetch_deferred_clients": {},
+            "_prefetch_close_threads": set(),
+            "_prefetch_closing_client_ids": set(),
+            "_bank_id_template": "",
+        }
+        for name, value in defaults.items():
+            if not hasattr(self, name):
+                setattr(self, name, value)
+
+    def _normalize_prefetch_query(self, query: str) -> str:
+        normalized = str(query or "").strip()
+        if (
+            self._recall_max_input_chars
+            and len(normalized) > self._recall_max_input_chars
+        ):
+            normalized = normalized[: self._recall_max_input_chars]
+        return normalized
+
+    def _prefetch_enabled(self) -> bool:
+        self._ensure_prefetch_state()
+        if self._memory_mode == "tools":
+            logger.debug("Prefetch: skipped (tools-only mode)")
+            return False
+        if not self._auto_recall:
+            logger.debug("Prefetch: skipped (auto_recall disabled)")
+            return False
+        if self._shutting_down.is_set():
+            logger.debug("Prefetch: skipped (shutting down)")
+            return False
+        return True
+
+    def _resolve_prefetch_bank_id(self, session_id: str) -> str:
+        return _resolve_bank_id_template(
+            self._bank_id_template,
+            fallback=self._prefetch_bank_fallback,
+            profile=self._agent_identity,
+            workspace=self._agent_workspace,
+            platform=self._platform,
+            user=self._user_id,
+            session=session_id,
+        )
+
+    def _new_prefetch_request_locked(
+        self,
+        query: str,
+        session_id: str,
+        bank_id: str,
+    ) -> _PrefetchRequest:
+        self._prefetch_sequence += 1
+        request_id = self._prefetch_sequence
+        cache_key = (
+            self._prefetch_epoch,
+            session_id,
+            bank_id,
+            query,
+        )
+        return _PrefetchRequest(
+            request_id=request_id,
+            epoch=self._prefetch_epoch,
+            session_id=session_id,
+            bank_id=bank_id,
+            query=query,
+            cache_key=cache_key,
+            inflight_key=(request_id, *cache_key),
+        )
+
+    def _request_is_current_locked(self, request: _PrefetchRequest) -> bool:
+        return (
+            not self._shutting_down.is_set()
+            and request.epoch == self._prefetch_epoch
+            and request.session_id == self._prefetch_session_id
+            and request.bank_id == self._prefetch_bank_id
+            and self._prefetch_latest_request is request
+        )
+
+    def _publish_prefetch_result_locked(
+        self,
+        request: _PrefetchRequest,
+        text: str,
+        count: int = 0,
+    ) -> None:
+        if not self._request_is_current_locked(request):
+            return
+        self._prefetch_completed_request = request
+        self._prefetch_result = text
+        # Feeds the deterministic recall indicator alongside the result, so the
+        # count survives the upstream pipeline swap without re-parsing text.
+        self._prefetch_count = count if text else 0
+        self._prefetch_result_request = request if text else None
+        self._prefetch_condition.notify_all()
+
+    def _start_prefetch_worker_locked(self, request: _PrefetchRequest) -> None:
+        operation = _PrefetchOperation(request=request)
+        thread = threading.Thread(
+            target=self._prefetch_worker,
+            args=(request,),
+            daemon=True,
+            name=f"hindsight-prefetch-{request.request_id}",
+        )
+        operation.thread = thread
+        self._prefetch_operations[request.inflight_key] = operation
+        self._prefetch_inflight[request.inflight_key] = operation
+        self._prefetch_threads.add(thread)
+        self._prefetch_thread = thread
+        thread.start()
+
+    def _maybe_start_pending_prefetch_locked(self) -> None:
+        if self._shutting_down.is_set():
+            self._prefetch_pending_request = None
+            return
+        request = self._prefetch_pending_request
+        if request is None or len(self._prefetch_operations) >= _MAX_PREFETCH_WORKERS:
+            return
+        self._prefetch_pending_request = None
+        if not self._request_is_current_locked(request):
+            return
+        self._start_prefetch_worker_locked(request)
+
+    def _admit_prefetch_locked(
+        self,
+        query: str,
+        session_id: str,
+    ) -> _PrefetchRequest:
+        effective_session_id = str(
+            session_id or self._prefetch_session_id or self._session_id or ""
+        ).strip()
+        bank_id = self._resolve_prefetch_bank_id(effective_session_id)
+        cache_key = (
+            self._prefetch_epoch,
+            effective_session_id,
+            bank_id,
+            query,
+        )
+
+        if (
+            self._prefetch_result
+            and self._prefetch_result_request is not None
+            and self._prefetch_result_request.cache_key == cache_key
+        ):
+            return self._prefetch_result_request
+
+        for operation in self._prefetch_operations.values():
+            if operation.request.cache_key == cache_key:
+                return operation.request
+        if (
+            self._prefetch_pending_request is not None
+            and self._prefetch_pending_request.cache_key == cache_key
+        ):
+            return self._prefetch_pending_request
+
+        request = self._new_prefetch_request_locked(
+            query,
+            effective_session_id,
+            bank_id,
+        )
+        self._prefetch_latest_request = request
+        self._prefetch_result = ""
+        self._prefetch_count = 0
+        self._prefetch_result_request = None
+        self._prefetch_completed_request = None
+        if len(self._prefetch_operations) < _MAX_PREFETCH_WORKERS:
+            self._start_prefetch_worker_locked(request)
+        else:
+            self._prefetch_pending_request = request
+        self._prefetch_condition.notify_all()
+        return request
+
+    def _bind_legacy_prefetch_result_locked(
+        self,
+        query: str,
+        session_id: str,
+    ) -> None:
+        if not self._prefetch_result or self._prefetch_result_request is not None:
+            return
+        effective_session_id = str(
+            session_id or self._prefetch_session_id or self._session_id or ""
+        ).strip()
+        request = self._new_prefetch_request_locked(
+            query,
+            effective_session_id,
+            self._resolve_prefetch_bank_id(effective_session_id),
+        )
+        self._prefetch_latest_request = request
+        self._prefetch_completed_request = request
+        self._prefetch_result_request = request
+
+    def _register_prefetch_future_locked(
+        self,
+        request: _PrefetchRequest,
+        client: Any,
+        future: Any,
+    ) -> int:
+        operation = self._prefetch_operations.get(request.inflight_key)
+        if operation is None:
+            raise RuntimeError("Hindsight prefetch operation was retired")
+        token = id(future)
+        operation.futures[token] = future
+        client_key = id(client)
+        _, owner_count = self._prefetch_client_owners.get(
+            client_key,
+            (client, 0),
+        )
+        self._prefetch_client_owners[client_key] = (client, owner_count + 1)
+        return token
+
+    def _take_ready_deferred_clients_locked(self) -> list[Any]:
+        if self._prefetch_operations:
+            return []
+        ready = []
+        for client_key, client in list(self._prefetch_deferred_clients.items()):
+            if client_key not in self._prefetch_client_owners:
+                ready.append(client)
+                self._prefetch_deferred_clients.pop(client_key, None)
+        return ready
+
+    def _schedule_prefetch_client_close(self, client: Any) -> None:
+        client_key = id(client)
+        with self._prefetch_condition:
+            if client_key in self._prefetch_closing_client_ids:
+                return
+            self._prefetch_closing_client_ids.add(client_key)
+
+        def _close() -> None:
+            try:
+                self._close_hindsight_client(client)
+            finally:
+                with self._prefetch_condition:
+                    if self._client is client:
+                        self._client = None
+                    self._prefetch_closing_client_ids.discard(client_key)
+                    self._prefetch_close_threads.discard(
+                        threading.current_thread()
+                    )
+                    self._prefetch_condition.notify_all()
+
+        thread = threading.Thread(
+            target=_close,
+            daemon=True,
+            name="hindsight-prefetch-client-close",
+        )
+        with self._prefetch_condition:
+            self._prefetch_close_threads.add(thread)
+        thread.start()
+
+    def _prefetch_future_done(
+        self,
+        request: _PrefetchRequest,
+        client: Any,
+        token: int,
+        future: Any,
+    ) -> None:
+        text = ""
+        succeeded = False
+        try:
+            text = future.result() or ""
+            succeeded = True
+        except Exception:
+            pass
+
+        clients_to_close: list[Any] = []
+        with self._prefetch_condition:
+            operation = self._prefetch_operations.get(request.inflight_key)
+            if operation is not None:
+                operation.futures.pop(token, None)
+
+            client_key = id(client)
+            owner = self._prefetch_client_owners.get(client_key)
+            if owner is not None:
+                owner_count = owner[1] - 1
+                if owner_count > 0:
+                    self._prefetch_client_owners[client_key] = (
+                        client,
+                        owner_count,
+                    )
+                else:
+                    self._prefetch_client_owners.pop(client_key, None)
+
+            if succeeded:
+                self._publish_prefetch_result_locked(request, text)
+            elif self._request_is_current_locked(request):
+                self._publish_prefetch_result_locked(request, "")
+
+            if (
+                operation is not None
+                and operation.worker_done
+                and not operation.futures
+            ):
+                self._prefetch_operations.pop(request.inflight_key, None)
+            self._maybe_start_pending_prefetch_locked()
+            clients_to_close = self._take_ready_deferred_clients_locked()
+            self._prefetch_condition.notify_all()
+
+        for deferred_client in clients_to_close:
+            self._schedule_prefetch_client_close(deferred_client)
+
+    def _execute_prefetch_request(self, request, operation) -> str:
+        from agent.async_utils import safe_schedule_threadsafe
+
+        client = self._get_client()
+        coroutine = operation(client)
+        future = safe_schedule_threadsafe(coroutine, _get_loop())
+        if future is None:
+            raise RuntimeError("Hindsight loop unavailable")
+        with self._prefetch_condition:
+            token = self._register_prefetch_future_locked(
+                request,
+                client,
+                future,
+            )
+        future.add_done_callback(
+            lambda done: self._prefetch_future_done(
+                request,
+                client,
+                token,
+                done,
+            )
+        )
+        return future.result(timeout=self._timeout)
+
+    def _prefetch_worker(self, request: _PrefetchRequest) -> None:
+        current_thread = threading.current_thread()
+        text = ""
+        result_count = 0
+        try:
+            # Read-after-write (retain→recall) guarantee grafted from upstream:
+            # async retain returns on acceptance rather than durability, so the
+            # background worker waits for the local writer queue AND the
+            # server-side retain op(s) before recalling. Never runs on the
+            # reply path, so it adds no response latency.
+            if getattr(self, "_prefetch_waits_for_retain", False):
+                self._wait_for_retains_drained(
+                    getattr(self, "_prefetch_retain_drain_timeout", 5.0)
+                )
+            if self._prefetch_method == "reflect":
+                logger.debug(
+                    "Prefetch: calling reflect (bank=%s, query_len=%d)",
+                    request.bank_id,
+                    len(request.query),
+                )
+
+                async def _reflect(client):
+                    response = await client.areflect(
+                        bank_id=request.bank_id,
+                        query=request.query,
+                        budget=self._budget,
+                    )
+                    return response.text or ""
+
+                text = self._execute_prefetch_request(request, _reflect)
+            else:
+                recall_kwargs: dict[str, Any] = {
+                    "bank_id": request.bank_id,
+                    "query": request.query,
+                    "budget": self._budget,
+                    "max_tokens": self._recall_max_tokens,
+                }
+                if self._recall_tags:
+                    recall_kwargs["tags"] = self._recall_tags
+                    recall_kwargs["tags_match"] = self._recall_tags_match
+                if self._recall_types:
+                    recall_kwargs["types"] = self._recall_types
+                logger.debug(
+                    "Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
+                    request.bank_id,
+                    len(request.query),
+                    self._budget,
+                )
+
+                async def _recall(client):
+                    response = await client.arecall(**recall_kwargs)
+                    results = response.results or []
+                    logger.debug(
+                        "Prefetch: recall returned %d results",
+                        len(results),
+                    )
+                    nonlocal result_count
+                    result_count = len(results)
+                    return "\n".join(
+                        f"- {result.text}"
+                        for result in results
+                        if result.text
+                    )
+
+                text = self._execute_prefetch_request(request, _recall)
+        except Exception as exc:
+            logger.debug(
+                "Hindsight prefetch failed: %s",
+                exc,
+                exc_info=True,
+            )
+        finally:
+            clients_to_close: list[Any] = []
+            with self._prefetch_condition:
+                operation_state = self._prefetch_operations.get(
+                    request.inflight_key
+                )
+                self._prefetch_inflight.pop(request.inflight_key, None)
+                if operation_state is not None:
+                    operation_state.worker_done = True
+                    if not operation_state.futures:
+                        if self._prefetch_completed_request is not request:
+                            self._publish_prefetch_result_locked(
+                                request, text, result_count,
+                            )
+                        elif text and result_count:
+                            # The future's done-callback may have published the
+                            # first text with count=0 before result() returned
+                            # the joined body here — backfill the true count so
+                            # the recall indicator stays accurate.
+                            self._prefetch_count = result_count
+                        self._prefetch_operations.pop(
+                            request.inflight_key,
+                            None,
+                        )
+                self._prefetch_threads.discard(current_thread)
+                if self._prefetch_thread is current_thread:
+                    self._prefetch_thread = next(
+                        iter(self._prefetch_threads),
+                        None,
+                    )
+                self._maybe_start_pending_prefetch_locked()
+                clients_to_close = self._take_ready_deferred_clients_locked()
+                self._prefetch_condition.notify_all()
+
+            for deferred_client in clients_to_close:
+                self._schedule_prefetch_client_close(deferred_client)
+
+
+
     def _recall_disabled(self) -> bool:
         """Guards shared by the async and synchronous recall paths."""
         if self._memory_mode == "tools":
@@ -1852,26 +2361,28 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
-    def _do_recall(self, query: str) -> _RecallResult:
+    def _do_recall(self, query: str, *, bank_id: str | None = None) -> _RecallResult:
         """Run one recall/reflect for *query*.
 
         Returns the formatted memory text plus the number of discrete memories
         recalled (0 for a reflect synthesis or on error), so the deterministic
         recall indicator can report an accurate count without re-parsing the
-        text. Shared by the background prefetch worker (``queue_prefetch``) and
-        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
+        text. Used by the synchronous ``recall_sync`` path; when *bank_id* is
+        given it wins over the provider default, binding the recall to the
+        requesting session's resolved bank (#64745).
         """
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
+        effective_bank = bank_id or self._bank_id
         try:
             if self._prefetch_method == "reflect":
-                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", effective_bank, len(query))
+                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=effective_bank, query=query, budget=self._budget))
                 # Reflect synthesizes across many memories -> no discrete count.
                 return _RecallResult(resp.text or "", 0)
             recall_kwargs: dict = {
-                "bank_id": self._bank_id, "query": query,
+                "bank_id": effective_bank, "query": query,
                 "budget": self._budget, "max_tokens": self._recall_max_tokens,
             }
             if self._recall_tags:
@@ -1880,7 +2391,7 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._recall_types:
                 recall_kwargs["types"] = self._recall_types
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
-                         self._bank_id, len(query), self._budget)
+                         effective_bank, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
             num_results = len(resp.results) if resp.results else 0
             logger.debug("Recall: returned %d results", num_results)
@@ -1919,20 +2430,70 @@ class HindsightMemoryProvider(MemoryProvider):
             if self._recall_disabled():
                 self._record_recall_indicator(returned=False, count=0)
                 return ""
-            recalled = self._do_recall(query)
+            self._ensure_prefetch_state()
+            normalized_sync = self._normalize_prefetch_query(query)
+            if not normalized_sync:
+                self._record_recall_indicator(returned=False, count=0)
+                return ""
+            effective_session_id = str(
+                session_id or self._prefetch_session_id or self._session_id or ""
+            ).strip()
+            recalled = self._do_recall(
+                normalized_sync,
+                bank_id=self._resolve_prefetch_bank_id(effective_session_id),
+            )
             self._record_recall_indicator(returned=bool(recalled.text), count=recalled.count)
             return self._format_recall(recalled.text)
 
-        # Default: return the result the background worker prefetched for the
-        # previous turn (cheap buffer read, capped join).
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            count = self._prefetch_count
-            self._prefetch_result = ""
-            self._prefetch_count = 0
+        # Default: consult the request-scoped prefetch buffer (#64745). Every
+        # request is bound to the session identity and bank that were current
+        # when it was admitted, so a session change can never hand this turn
+        # another conversation's warmed context.
+        if not self._prefetch_enabled():
+            return ""
+        normalized_query = self._normalize_prefetch_query(query)
+        if not normalized_query:
+            self._record_recall_indicator(returned=False, count=0)
+            return ""
+
+        deadline = time.monotonic() + _PREFETCH_WAIT_SECONDS
+        with self._prefetch_condition:
+            self._bind_legacy_prefetch_result_locked(
+                normalized_query,
+                session_id,
+            )
+            request = self._admit_prefetch_locked(
+                normalized_query,
+                session_id,
+            )
+            while True:
+                if (
+                    self._prefetch_result
+                    and self._prefetch_result_request is request
+                ):
+                    result = self._prefetch_result
+                    count = self._prefetch_count
+                    self._prefetch_result = ""
+                    self._prefetch_count = 0
+                    self._prefetch_result_request = None
+                    break
+                if self._prefetch_completed_request is request:
+                    result, count = "", 0
+                    break
+                if not self._request_is_current_locked(request):
+                    logger.debug("Prefetch: request superseded")
+                    self._record_recall_indicator(returned=False, count=0)
+                    return ""
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.debug(
+                        "Prefetch: request timed out after %.1fs",
+                        _PREFETCH_WAIT_SECONDS,
+                    )
+                    self._record_recall_indicator(returned=False, count=0)
+                    return ""
+                self._prefetch_condition.wait(timeout=remaining)
+
         self._record_recall_indicator(returned=bool(result), count=count)
         return self._format_recall(result)
 
@@ -1952,27 +2513,14 @@ class HindsightMemoryProvider(MemoryProvider):
         # there's nothing to prime in the background.
         if self._recall_sync:
             return
-        if self._recall_disabled():
+        if not self._prefetch_enabled():
             return
+        normalized_query = self._normalize_prefetch_query(query)
+        if not normalized_query:
+            return
+        with self._prefetch_condition:
+            self._admit_prefetch_locked(normalized_query, session_id)
 
-        def _run():
-            # Ensure the just-completed turn's retain is recall-visible on the
-            # server before we recall, so the warmed context for the next turn
-            # includes it. This waits for the local writer queue to drain AND
-            # for the server-side async retain op(s) to complete (an explicit
-            # read-after-write signal), because async retain returns on
-            # acceptance rather than durability. Runs on the background prefetch
-            # thread, never the reply path, so it adds no response latency.
-            if self._prefetch_waits_for_retain:
-                self._wait_for_retains_drained(self._prefetch_retain_drain_timeout)
-            recalled = self._do_recall(query)
-            if recalled.text:
-                with self._prefetch_lock:
-                    self._prefetch_result = recalled.text
-                    self._prefetch_count = recalled.count
-
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
-        self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()
@@ -2245,6 +2793,27 @@ class HindsightMemoryProvider(MemoryProvider):
 
         return tool_error(f"Unknown tool: {tool_name}")
 
+    def _close_hindsight_client(self, client: Any) -> None:
+        try:
+            if self._mode == "local_embedded":
+                # HindsightEmbedded.close() delegates to its sync client.close().
+                # Close the inner async client on the shared loop first.
+                inner_client = getattr(client, "_client", None)
+                if inner_client is not None and hasattr(inner_client, "aclose"):
+                    _run_sync(inner_client.aclose())
+                    try:
+                        client._client = None
+                    except Exception:
+                        pass
+                try:
+                    client.close()
+                except RuntimeError:
+                    pass
+            else:
+                self._run_sync(client.aclose())
+        except Exception:
+            pass
+
     def on_session_switch(
         self,
         new_session_id: str,
@@ -2276,9 +2845,9 @@ class HindsightMemoryProvider(MemoryProvider):
         moment of switch — the same data-loss class as the shutdown race,
         just at a different lifecycle event.
 
-        Also wait for any in-flight prefetch from the old session and drop
-        its cached result; otherwise the new session's first ``prefetch()``
-        could read stale recall text from before the switch.
+        Prefetch identity rotates atomically with the session. In-flight work
+        from the old epoch may finish later, but its completion is fenced from
+        the new session's cache and never delays the switch.
 
         ``parent_session_id`` is recorded for lineage tags on future retains.
         ``reset`` is accepted but not needed for Hindsight's state model —
@@ -2287,6 +2856,7 @@ class HindsightMemoryProvider(MemoryProvider):
         new_id = str(new_session_id or "").strip()
         if not new_id:
             return
+        self._ensure_prefetch_state()
 
         # 1. Flush any buffered turns under the OLD identifiers. Snapshot
         # everything before mutating self._* so metadata + tags + doc_id
@@ -2352,23 +2922,30 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._register_atexit()
                 self._retain_queue.put(_flush)
 
-        # 2. Drain any in-flight prefetch from the old session and drop
-        # its cached result so the new session doesn't see stale recall.
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            self._prefetch_result = ""
+        # 2. Rotate the session and prefetch identity under the admission
+        # lock. Existing workers keep their immutable request snapshot; their
+        # completion fence rejects the now-stale epoch without delaying the
+        # switch or occupying the new session's cache.
+        with self._prefetch_condition:
+            if parent_session_id:
+                self._parent_session_id = str(parent_session_id).strip()
+            self._session_id = new_id
+            start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            self._document_id = f"{self._session_id}-{start_ts}"
+            self._session_turns = []
+            self._turn_counter = 0
+            self._turn_index = 0
+            self._last_retained_turn_count = 0
 
-        # 3. Now rotate to the new session.
-        if parent_session_id:
-            self._parent_session_id = str(parent_session_id).strip()
-        self._session_id = new_id
-        start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self._document_id = f"{self._session_id}-{start_ts}"
-        self._session_turns = []
-        self._turn_counter = 0
-        self._turn_index = 0
-        self._last_retained_turn_count = 0
+            self._prefetch_epoch += 1
+            self._prefetch_session_id = new_id
+            self._prefetch_bank_id = self._resolve_prefetch_bank_id(new_id)
+            self._prefetch_latest_request = None
+            self._prefetch_pending_request = None
+            self._prefetch_result = ""
+            self._prefetch_result_request = None
+            self._prefetch_completed_request = None
+            self._prefetch_condition.notify_all()
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,
@@ -2376,9 +2953,18 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
+        self._ensure_prefetch_state()
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
-        self._shutting_down.set()
+        with self._prefetch_condition:
+            self._shutting_down.set()
+            self._prefetch_epoch += 1
+            self._prefetch_latest_request = None
+            self._prefetch_pending_request = None
+            self._prefetch_result = ""
+            self._prefetch_result_request = None
+            self._prefetch_completed_request = None
+            self._prefetch_condition.notify_all()
         # Drain the writer: it will finish in-flight work, then exit on
         # the sentinel. Bounded join keeps shutdown predictable even if
         # the daemon is wedged.
@@ -2395,33 +2981,35 @@ class HindsightMemoryProvider(MemoryProvider):
                     "abandoning %d pending retain(s)",
                     self._retain_queue.qsize(),
                 )
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            self._prefetch_thread.join(timeout=5.0)
-        if self._client is not None:
-            try:
-                if self._mode == "local_embedded":
-                    # HindsightEmbedded.close() delegates to its sync client.close().
-                    # When Hermes created/used that client on the shared async loop,
-                    # closing it from this thread can raise "attached to a different
-                    # loop" before aiohttp releases the session. Close the embedded
-                    # inner async client on the shared loop first, then let the
-                    # wrapper clean up daemon/UI bookkeeping.
-                    inner_client = getattr(self._client, "_client", None)
-                    if inner_client is not None and hasattr(inner_client, "aclose"):
-                        _run_sync(inner_client.aclose())
-                        try:
-                            self._client._client = None
-                        except Exception:
-                            pass
-                    try:
-                        self._client.close()
-                    except RuntimeError:
-                        pass
+        with self._prefetch_condition:
+            prefetch_threads = set(self._prefetch_threads)
+        deadline = time.monotonic() + 5.0
+        for thread in prefetch_threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if thread.is_alive():
+                thread.join(timeout=remaining)
+
+        client = self._client
+        close_now = False
+        if client is not None:
+            with self._prefetch_condition:
+                client_key = id(client)
+                if client_key in self._prefetch_closing_client_ids:
+                    pass
+                elif (
+                    client_key in self._prefetch_client_owners
+                    or self._prefetch_operations
+                ):
+                    self._prefetch_deferred_clients[client_key] = client
                 else:
-                    self._run_sync(self._client.aclose())
-            except Exception:
-                pass
-            self._client = None
+                    close_now = True
+            if close_now:
+                self._close_hindsight_client(client)
+                with self._prefetch_condition:
+                    if self._client is client:
+                        self._client = None
         # The module-global background event loop (_loop / _loop_thread)
         # is intentionally NOT stopped here. It is shared across every
         # HindsightMemoryProvider instance in the process — the plugin
