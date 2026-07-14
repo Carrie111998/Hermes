@@ -82,12 +82,16 @@ job_briefs:
         RESOLVE each check according to bor-required-checks.yaml: COLLECT only
         irreducible case facts under the matching category field contract; DERIVE
         coverage and premium movement from supplied category-appropriate facts;
-        use the advisor's yes/no 50%-of-income threshold answer for
+        use the advisor's yes/no 50%-of-SURPLUS threshold answer for
         sustainability without requesting income or surplus figures. Preserve the
-        boolean exactly: YES means "exceed" and MUST use the above-threshold caution;
-        NO means "do not exceed" and MUST use the within-threshold sentence. Never
-        invert or soften this mapping. If the boolean was not supplied, do NOT ask —
-        insert [[MISSING: do total annual premiums exceed 50% of annual income? yes/no]]
+        boolean exactly: YES means the premium exceeds 50% of the client's surplus
+        and MUST use the sentence "Client has catered enough savings and emergency
+        funds for unforeseen circumstances, and is comfortable to proceed even
+        though the premium amount is more than 50% of his surplus." NO means it does
+        not exceed and MUST state that total annual premiums do not exceed 50% of the
+        client's surplus. Never invert or soften this mapping. If the boolean was not
+        supplied, do NOT ask —
+        insert [[MISSING: do total annual premiums exceed 50% of surplus? yes/no]]
         in place of the sustainability sentence. Apply the
         TEMPLATE_DEFAULT alternatives sentence selected by product category; treat
         freshness as maintained operational knowledge, not a per-case advisor question.
@@ -119,7 +123,7 @@ job_briefs:
       - >-
         DRAFT-FIRST — do NOT run a pre-draft ask-round for case facts. Once ROP
         status is known, produce the full BOR draft in the same turn. Any missing
-        COLLECT fact — the 50%-of-income sustainability answer, client rationale,
+        COLLECT fact — the 50%-of-surplus sustainability answer, client rationale,
         premiums, sums assured, durations, exact plan/rider names, reference number —
         becomes a specific inline [[MISSING: ...]] placeholder in the draft, NOT a
         question. Never ask for the client's income or surplus. Never ask the advisor
