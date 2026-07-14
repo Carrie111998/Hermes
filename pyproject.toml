@@ -333,6 +333,15 @@ hermes_cli = ["observability/schemas/*.json"]
 # topic-setup image disappears. Loaded via Path(__file__).parent / "assets"
 # in gateway/status_phrases.py and gateway/run.py.
 gateway = ["assets/**/*"]
+# Research Protocol ships versioned runtime contracts and operational data.
+# Keep these scoped to this plugin rather than broadening package-data for
+# every bundled plugin.
+plugins = [
+    "research_protocol/**/*.json",
+    "research_protocol/**/*.yaml",
+    "research_protocol/**/*.sql",
+    "research_protocol/**/*.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
