@@ -27,6 +27,7 @@ the BOR checks table, replacement-path taxonomy, draft template, and the approve
 #   always     - every BOR
 #   rop        - only when it is a replacement of policy (switch)
 #   ilp        - only when an investment-linked / investment product is involved
+#   shield     - only for Integrated Shield Plan / hospitalisation cases
 #   accident   - only for personal-accident product recommendations
 #
 # collect: what the agent must obtain from the advisor when needed for a truthful draft
@@ -46,14 +47,14 @@ meta:
 intake:
   - id: existing_plan
     resolution: collect
-    ask_if_missing: "Existing plan(s): insurer, plan name/category, SA by benefit, premium, and coverage end age. Say 'none' for a first purchase."
-    collect: [insurer, plan_name, category, sum_assured_by_benefit, premium, coverage_till_age]
+    ask_if_missing: "Existing plan(s): supply the facts required by the matching category contract below. Say 'none' for a first purchase."
+    collect: [fields_from_matching_category_contract]
     why: "The BOR must refer to the client's starting position clearly."
     applies_when: always
   - id: proposed_plan
     resolution: collect
-    ask_if_missing: "Proposed plan: insurer, plan name/riders/category, SA by benefit, premium, and term; for ILP include MIP."
-    collect: [insurer, plan_name, riders, category, sum_assured_by_benefit, premium_first_year, premium_subsequent, policy_term, min_investment_period]
+    ask_if_missing: "Proposed plan: supply the facts required by the matching category contract below."
+    collect: [fields_from_matching_category_contract]
     why: "The recommended product with its specifics anchors the whole BOR."
     applies_when: always
   - id: is_replacement
@@ -63,20 +64,60 @@ intake:
     why: "ROP cases need the extra replacement checks + more careful wording."
     applies_when: always
 
+# Category is a field contract, not a prose label. Do not apply one category's
+# required fields to another category.
+field_contracts:
+  protection_life:
+    categories: [term_life, whole_life, investment_linked_protection, critical_illness]
+    collect_existing: [insurer, plan_name, category, sum_assured_by_benefit, premium, coverage_till_age]
+    collect_proposed: [insurer, plan_name, riders, category, sum_assured_by_benefit, premium_first_year, premium_subsequent, policy_term]
+    ilp_additional_collect: [min_investment_period]
+    comparison: "State supplied before/after sums assured and coverage durations."
+  shield_hospitalisation:
+    categories: [integrated_shield_plan, shield, hospitalisation]
+    collect_existing: [insurer, exact_base_plan_name, exact_versioned_rider_name, material_premium]
+    collect_proposed: [insurer, exact_base_plan_name, exact_versioned_rider_name, material_premium]
+    collect_for_rop: [is_rop, replaced_products, replacing_products]
+    collect_rationale: [client_stated_rationale]
+    derive: "A qualitative before/after statement using the exact supplied base-plan and rider names plus the supplied client rationale."
+    rider_name_rule: "The exact/versioned rider name identifies the arrangement only. It never establishes or licenses a numeric benefit claim."
+    missing_rider_rule: "If the rider is missing or ambiguous, ask only for the exact/versioned rider name."
+    never_collect: [rider_benefit_limits, deductible, coinsurance]
+    never_print: [rider_benefit_limits, deductible, coinsurance]
+    supplied_exception_rule: "If the advisor explicitly supplies an exceptional or nonstandard fact that is material to the rationale, preserve it accurately in case context; never solicit it and never print the prohibited value in the BOR."
+    excluded_categories: [health_medical, careshield, eldershield, personal_accident, accident, accident_and_health]
+  other_or_unknown:
+    resolution: operational_escalation
+    rule: "Do not force protection/life or Shield fields onto a different category. If the category itself is unclear, ask one short category clarification. If the category is known but has no approved field contract here—including CareShield/ElderShield, accident, or other A&H—do not draft or invent its required fields; escalate to Melody for the category contract."
+
 # ── Required checks (the compliant-BOR must-covers) ───────────────────────────
 checks:
   - id: coverage_comparison
     resolution: derive
-    inputs: [existing_plan.sum_assured_by_benefit, existing_plan.coverage_till_age, proposed_plan.sum_assured_by_benefit, proposed_plan.coverage_till_age]
-    derive: coverage_delta_statement   # "meets/does not meet client's needs for protection of family/assets, disability, CI"
-    why: "The BOR must show the actual change in protection, not just product names. Shortfalls are stated, not hidden."
-    grounded: "files 01, 17 — 'Total coverage of the plan meets/does not meet client's needs for…'"
+    select_by_category:
+      protection_life:
+        categories: [term_life, whole_life, investment_linked_protection, critical_illness]
+        inputs: [existing_plan.sum_assured_by_benefit, existing_plan.coverage_till_age, proposed_plan.sum_assured_by_benefit, proposed_plan.coverage_till_age]
+        derive: "State the supplied before/after sums assured and coverage durations; shortfalls are stated, not hidden."
+      shield_hospitalisation:
+        categories: [integrated_shield_plan, shield, hospitalisation]
+        inputs: [existing_plan.exact_base_plan_name, existing_plan.exact_versioned_rider_name, proposed_plan.exact_base_plan_name, proposed_plan.exact_versioned_rider_name, client_stated_rationale]
+        derive: "State the qualitative before/after arrangement using exact plan and rider names plus the supplied rationale. Do not infer or state numeric benefits, deductible, or coinsurance."
+    why: "The comparison must match the product category instead of importing life-plan fields into Shield cases."
+    grounded_by_category:
+      protection_life: "files 01, 17 — supplied sums assured and coverage durations drive the comparison"
+      shield_hospitalisation: "preserved build grounding records Shield→Shield examples in files 01 and 16; Amelia approved the exact-name qualitative contract on 2026-07-14"
     applies_when: always
   - id: premium_comparison
     resolution: derive
-    inputs: [existing_plan.premium, proposed_plan.premium_first_year, proposed_plan.premium_subsequent]
-    derive: premium_movement_statement
-    collect_if_needed: "client-stated reason for a higher premium when supplied benefits/term do not explain it"
+    select_by_category:
+      protection_life:
+        inputs: [existing_plan.premium, proposed_plan.premium_first_year, proposed_plan.premium_subsequent]
+        derive: premium_movement_statement
+      shield_hospitalisation:
+        inputs: [existing_plan.material_premium, proposed_plan.material_premium]
+        derive: "State the movement between the supplied material premiums without inferring an unprovided premium component."
+    collect_if_needed: "client-stated reason for a higher premium when the supplied category-appropriate facts do not explain it"
     why: "The recommendation must explain the trade-off clearly."
     grounded: "files 01, 17 — 'premiums are lowered compared to previous planning' / justification when higher"
     applies_when: always
@@ -104,9 +145,10 @@ checks:
         standard_alternatives: [endowment, investment, annuity]
         sentence: "After discussing the pros and cons of endowment, investment and annuity solutions, the client preferred {{RECOMMENDED_CATEGORY}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}."
       shield:
-        categories: [integrated_shield_plan, shield, health_medical]
+        categories: [integrated_shield_plan, shield, hospitalisation]
         standard_alternatives: [other_insurers_shield_plans]
         sentence: "After comparing Shield plans from other insurers, the client preferred {{RECOMMENDED_PLAN}} because {{CLIENT_STATED_RATIONALE_OR_SUPPLIED_PRODUCT_FIT}}."
+    per_case_question: false
     exception_rule: "Do not ask for alternatives by default. Ask only when the path is novel, the advisor states different alternatives, or the standard sentence would conflict with supplied facts."
     why: "The BOR must explain why the recommended product was chosen over alternatives."
     grounded: "files 01, 17 — 'After discussing the pros and cons of [WL/term/ILP/endowment/…], the client preferred X because…'"
@@ -120,11 +162,13 @@ checks:
     never: "invent a rationale the advisor did not state"
     applies_when: always
   - id: rop_disadvantages_acknowledged
-    resolution: collect
-    ask_if_missing: "Confirm the client was advised of the replacement disadvantages, understood them, and wishes to proceed."
-    collect: [rop_disadvantages_acknowledged, client_wishes_to_proceed]
+    resolution: template_default
+    per_case_question: false
+    sentence: "The client was advised of the replacement disadvantages and wishes to proceed."
+    contradiction_rule: "If the advisor explicitly states that the client was not advised, does not wish to proceed, or is uncertain, suppress the standard sentence and escalate to Melody. Do not ask routinely."
+    contradiction_output_rule: "Return only a concise Melody-escalation note. Do not produce a holding draft, partial BOR, disclosures, or placeholders."
     why: "ROP compliance — client must be shown the downside of switching before proceeding."
-    grounded: "files 01, 17 — the 4 general disadvantages + 'wish to proceed notwithstanding'"
+    grounded: "Amelia-approved standard template 2026-07-14; files 01, 17 — the 4 general disadvantages + 'wish to proceed notwithstanding'"
     applies_when: rop
   - id: alternatives_to_replacement_explored
     resolution: template_default
@@ -178,9 +222,13 @@ output:
   interaction:
     - "If irreducible COLLECT facts are missing, ask once in one compact message instead of drafting; do not recap facts already supplied, output a partial BOR, or append an unresolved list."
     - "Do not ask for derived conclusions, standard alternatives, product-comparison freshness, or reference numbers by default."
+    - "For Shield/hospitalisation, ask for an exact/versioned rider name when missing or ambiguous; never ask for or print rider benefit limits, deductible, or coinsurance."
+    - "For ROP, insert the standard replacement-disadvantages sentence without asking; explicit contradiction or uncertainty suppresses it and escalates to Melody."
+    - "A known product category with no approved field contract is a Melody escalation, not permission to draft from generic fields."
     - "For affordability, ask only the 50%-of-income yes/no question. Never request or print the client's income or surplus figures."
     - "Preserve the affordability boolean exactly: YES = exceeds threshold and caution; NO = does not exceed threshold."
     - "Use plain text only: no Markdown asterisks, decorative headings, tables, or repeated offers to reformat."
+    - "FINAL RESPONSE CHECK: before sending, remove every Markdown marker (`*`, `#`, `---`), any intake recap, and any closing offer such as 'if you want'. If any remain, rewrite once in concise plain text."
   never:
     - "make product recommendations by itself"
     - "invent missing facts (SA, premium, reference numbers, client rationale)"
@@ -239,10 +287,12 @@ This is the concise narrative structure used per recommended product / need-buck
 ## Interaction before drafting
 
 - Use every fact already supplied. Do not repeat it back as an intake recap.
-- Derive coverage and premium movement from the plan figures provided. For sustainability, use only the advisor's yes/no answer to whether total annual premiums exceed 50% of annual income; never request or print income or surplus figures.
+- Derive coverage and premium movement from the category-appropriate facts provided. For sustainability, use only the advisor's yes/no answer to whether total annual premiums exceed 50% of annual income; never request or print income or surplus figures.
 - Insert the category-specific alternatives sentence below. Do not ask which alternatives were considered unless the path is novel, the advisor names an exception, or the standard wording conflicts with the case.
+- Match intake and comparison fields to the product category. For Shield/hospitalisation, collect exact base-plan and exact/versioned rider names, material premium, ROP mapping/status, and the client's rationale. Never ask for or print rider benefit limits, deductible, or coinsurance. If a rider is missing or ambiguous, ask only for its exact/versioned name.
+- If a known category has no approved field contract in bor-required-checks.yaml—including CareShield/ElderShield, accident, or other A&H—do not draft from generic assumptions. Escalate to Melody for that category contract.
 - Do not ask about comparison-list freshness or reference numbers by default. Reference numbers are outside the BOR narrative unless the advisor explicitly requests one or names a workflow that requires one.
-- If irreducible facts are missing, ask for all of them once in one compact message instead of drafting. Irreducible facts are: material plan figures needed for a truthful comparison; the client's stated rationale; ROP acknowledgement; and ILP-only suitability facts when an ILP is involved. Do not output a partial BOR, placeholders, or an unresolved list in that turn.
+- If irreducible facts are missing, ask for all of them once in one compact message instead of drafting. Irreducible facts are: category-appropriate material plan facts needed for a truthful comparison; the client's stated rationale; old→new mapping and ROP status; and ILP-only suitability facts when an ILP is involved. ROP acknowledgement wording is a template default, not an intake question. Do not output a partial BOR, placeholders, or an unresolved list in that turn.
 - If the missing fact is non-blocking, draft with a clear [[MISSING: ...]] placeholder instead of conducting another question round.
 
 ## Category-specific standard alternatives sentences
@@ -275,9 +325,17 @@ The reason slot may use only the client's stated rationale or an objective produ
 
 Insert exactly one category-specific sentence from the section above.
 
-4. Recommended product and material figures
+4. Recommended product and material facts
+
+Protection / life path:
 
 > The client has chosen {{PROPOSED_PLAN_NAME_AND_RIDERS}}. The plan provides {{SA_BY_BENEFIT}}, costs {{PREMIUM_FIRST_YEAR_AND_SUBSEQUENT}}, and covers the client {{POLICY_TERM_OR_TO_AGE}}. {{ILP_ONLY: Minimum Investment Period {{MIP}}.}}
+
+Shield / hospitalisation path:
+
+> The client has chosen {{EXACT_PROPOSED_BASE_PLAN_NAME}} with {{EXACT_VERSIONED_RIDER_NAME}}, at a material premium of {{MATERIAL_PREMIUM}}.
+
+For Shield, the plan and rider names identify the arrangement, not numeric benefits. Do not ask for or print rider benefit limits, deductible, or coinsurance. If an advisor volunteers an exceptional or nonstandard fact material to the rationale, preserve it accurately in case context without printing the prohibited value in the BOR.
 
 Do not claim the plan matches affordability unless the supplied figures support that conclusion.
 
@@ -285,11 +343,11 @@ Do not claim the plan matches affordability unless the supplied figures support 
 
 > {{COVERAGE_DELTA_STATEMENT}} {{PREMIUM_MOVEMENT_STATEMENT}} {{SUSTAINABILITY_STATEMENT_FROM_50_PERCENT_BOOLEAN}}
 
-State the before/after amounts and durations directly. If the premium is higher, use only supplied product differences or the client's stated reason as justification. Copy the exact sentence for the supplied boolean: NO → "The client's total annual premiums do not exceed 50% of annual income." YES → "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment." Never invert, recalculate, infer, or soften this mapping. Never request or expose the client's income or surplus.
+For protection/life, state supplied before/after sums assured and durations directly. For Shield/hospitalisation, state a qualitative before/after arrangement using the exact existing and proposed plan/rider names plus the supplied rationale; do not infer numeric benefits. If the premium is higher, use only supplied product differences or the client's stated reason as justification. Copy the exact sentence for the supplied boolean: NO → "The client's total annual premiums do not exceed 50% of annual income." YES → "The client's total annual premiums exceed 50% of annual income, and the client was advised to consider the sustainability of the premium commitment." Never invert, recalculate, infer, or soften this mapping. Never request or expose the client's income or surplus.
 
 6. Conditional blocks
 
-- ROP only: insert replacement disclosures from standard-disclosures.md only after the advisor confirms the client was advised, understood the disadvantages, and wishes to proceed. The replacement-options declaration is standard template text; insert it without asking the advisor to reconfirm it.
+- ROP only: insert "The client was advised of the replacement disadvantages and wishes to proceed." as standard template text without asking the advisor to reconfirm it. If the advisor explicitly contradicts this or expresses uncertainty, suppress it and return only a concise Melody-escalation note—no holding draft, partial BOR, disclosures, or placeholders. The replacement-options declaration is also standard template text; insert it without asking.
 - Non-ROP: exclude every ROP acknowledgement and replacement disclosure.
 - ILP only: include CKA, risk profile, fund/objective alignment, and the ILP disclosure block. Fill product-specific disclosure values from supplied product documents only.
 - Non-ILP: exclude every ILP-specific question and disclosure.
@@ -305,10 +363,11 @@ Insert the approved general disclosure block from standard-disclosures.md withou
 - Do not add a reference-number placeholder unless the advisor requested it or the named workflow requires it.
 - Do not end with an offer to shorten, reformat, or produce another version.
 - Do not emit Markdown asterisks anywhere in the Telegram response. Use plain headings and hyphens only when needed.
+- Before sending, remove every Markdown marker (`*`, `#`, `---`), intake recap, and closing offer such as "if you want". If any remain, rewrite once in concise plain text.
 
 ## Hard rules
 
-- Do not invent SA, premiums, reference numbers, client rationale, ROP acknowledgement, CKA/risk profile, fund alignment, or product-specific disclosure values.
+- Do not invent SA, premiums, reference numbers, client rationale, CKA/risk profile, fund alignment, or product-specific disclosure values. The approved ROP acknowledgement and alternatives declarations are template defaults; suppress them on explicit contradiction or uncertainty.
 - Do not make the product recommendation. The advisor chooses the product; the agent drafts the justification.
 - The draft is for advisor review, not compliance sign-off. Escalate sensitive or unclear cases to Melody.
 

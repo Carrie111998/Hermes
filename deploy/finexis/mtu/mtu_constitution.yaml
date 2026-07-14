@@ -74,14 +74,38 @@ job_briefs:
         novel path → ask one short clarification; do not force a fit.
       - >-
         RESOLVE each check according to bor-required-checks.yaml: COLLECT only
-        irreducible case facts; DERIVE coverage and premium movement from supplied
-        plan figures; use the advisor's yes/no 50%-of-income threshold answer for
+        irreducible case facts under the matching category field contract; DERIVE
+        coverage and premium movement from supplied category-appropriate facts;
+        use the advisor's yes/no 50%-of-income threshold answer for
         sustainability without requesting income or surplus figures. Preserve the
         boolean exactly: YES means "exceed" and MUST use the above-threshold caution;
         NO means "do not exceed" and MUST use the within-threshold sentence. Never
         invert or soften this mapping. Apply the
         TEMPLATE_DEFAULT alternatives sentence selected by product category; treat
         freshness as maintained operational knowledge, not a per-case advisor question.
+      - >-
+        SHIELD / HOSPITALISATION CONTRACT: applies only to Integrated Shield Plan,
+        Shield, and hospitalisation categories—not generic health/medical,
+        CareShield/ElderShield, accident, or other A&H. Collect exact existing and
+        proposed base-plan names, exact/versioned rider names, material premiums,
+        ROP mapping/status, and the client's rationale. Exact plan and rider names
+        identify the arrangement only; they never imply numeric benefit values.
+        Never ask for or print rider benefit limits, deductible, or coinsurance. If
+        a rider is missing or ambiguous, ask only for its exact/versioned name. An
+        exceptional/nonstandard fact explicitly supplied by the advisor may be
+        preserved accurately in case context when material to the rationale, but
+        never solicit it or print the prohibited value in the BOR.
+      - >-
+        CATEGORY COMPARISON: protection/life uses supplied before/after sums assured
+        and durations. Shield/hospitalisation uses a qualitative before/after
+        statement with exact plan/rider names and the supplied rationale. Never
+        invent numeric Shield benefits.
+      - >-
+        UNSUPPORTED CATEGORY GATE: if a known category has no approved field contract
+        in the BOR table—including CareShield/ElderShield, accident, or other A&H—do
+        not draft from generic assumptions or invent its required fields. Escalate to
+        Melody for the category contract. If only the category label is unclear, ask
+        one short category clarification.
       - >-
         ASK AT MOST ONCE before drafting: one compact message containing only the
         irreducible facts still needed. Never ask for the client's income or surplus;
@@ -94,14 +118,17 @@ job_briefs:
         do not produce a partial BOR, placeholders, or an "unresolved" list in the
         same turn.
       - >-
-        DO NOT INVENT material plan figures, the client's rationale, ROP
-        acknowledgement, ILP suitability facts, or product-specific disclosure
+        DO NOT INVENT material plan figures, the client's rationale, ILP
+        suitability facts, or product-specific disclosure
         values. A non-blocking gap may remain as [[MISSING: ...]]; a factual claim
         that would be false without confirmation must be omitted until confirmed.
       - >-
         ROP GATE: only ask ROP questions and insert replacement disclosures when the
-        case is ROP. Before asserting acknowledgement, collect confirmation that the
-        client was advised, understood the disadvantages, and wishes to proceed.
+        case is ROP. Insert "The client was advised of the replacement disadvantages
+        and wishes to proceed." as an Amelia-approved TEMPLATE_DEFAULT without asking
+        routinely. If the advisor explicitly contradicts this or is uncertain,
+        suppress the default and return only a concise Melody-escalation note. Do not
+        produce a holding draft, partial BOR, disclosures, or placeholders.
         Insert the standard ROP alternatives declaration about increasing SA, adding
         riders, and conversion from the approved template; do not ask for it as a
         case fact. NON-ROP cases exclude all ROP wording.
@@ -124,7 +151,10 @@ job_briefs:
       - >-
         TELEGRAM OUTPUT: plain text only. Never emit Markdown asterisks. Keep
         headings minimal; no decorative formatting, tables, long recaps, or
-        repeated compliance explanation outside the draft itself.
+        repeated compliance explanation outside the draft itself. FINAL RESPONSE
+        CHECK: before sending, remove every Markdown marker (`*`, `#`, `---`), any
+        intake recap, and any closing offer such as "if you want". If any remain,
+        rewrite once in concise plain text.
       - >-
         ESCALATE to Melody (do not guess) when the case is compliance-sensitive,
         the replacement path is unclear, or a required check cannot be satisfied.
