@@ -8,20 +8,27 @@ shared by the dashboard console websocket without becoming a raw shell.
 from __future__ import annotations
 
 import argparse
+import atexit
+import concurrent.futures
 import contextlib
+import contextvars
 import difflib
 import functools
 import importlib
 import io
 import json
+import logging
 import shlex
 import sys
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Literal, NoReturn, Sequence
 from urllib.parse import urlparse
 
 from tools.ansi_strip import strip_ansi as _strip_ansi
+
+logger = logging.getLogger(__name__)
 
 
 ConsoleStatus = Literal["ok", "error", "confirm_required", "exit", "clear"]
@@ -1812,39 +1819,147 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
     return _format_job(job, "Resumed")
 
 
+# Hosted `cron run` fires the job immediately on a dedicated BACKGROUND pool —
+# NOT the console's shared 4-worker/60s pool in web_server.py. Bounding the pool
+# caps concurrent manual agent runs (desirable); `submit` never blocks the
+# caller even when all workers are busy (excess work queues), so the console
+# thread always returns the ack instantly. See spec
+# 2026-07-14-hosted-console-cron-run-background-design.md.
+_CONSOLE_RUN_EXECUTOR_MAX_WORKERS = 2
+_console_run_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_console_run_executor_lock = threading.Lock()
+
+
+def _get_console_run_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily create the bounded background pool for hosted `cron run` (once)."""
+    global _console_run_executor
+    if _console_run_executor is None:
+        with _console_run_executor_lock:
+            if _console_run_executor is None:
+                _console_run_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_CONSOLE_RUN_EXECUTOR_MAX_WORKERS,
+                    thread_name_prefix="hermes-console-cronrun",
+                )
+                # Tear down at interpreter exit without waiting on an in-flight
+                # agent run (mirrors web_server's console pool).
+                atexit.register(
+                    lambda: _console_run_executor
+                    and _console_run_executor.shutdown(
+                        wait=False, cancel_futures=True
+                    )
+                )
+    return _console_run_executor
+
+
+def _log_console_background_run_result(
+    job: dict, future: concurrent.futures.Future
+) -> None:
+    """Log the outcome of a background hosted `cron run`.
+
+    The dashboard activity feed already surfaces the real trigger/completion via
+    the event stream; this makes the outcome visible in the gateway logs and
+    ensures a crash in the background fire is never silently swallowed.
+    """
+    job_id = job.get("id", "?")
+    name = job.get("name") or job_id
+    try:
+        result = future.result()
+    except Exception:  # pragma: no cover - _execute_job_now catches its own
+        logger.exception(
+            "console background cron run crashed: %s (%s)", name, job_id
+        )
+        return
+    if not result.get("claimed", False):
+        logger.info(
+            "console background cron run skipped: %s (%s) — already being "
+            "fired by the scheduler",
+            name,
+            job_id,
+        )
+    elif result.get("success"):
+        logger.info(
+            "console background cron run succeeded: %s (%s)", name, job_id
+        )
+    else:
+        logger.warning(
+            "console background cron run failed: %s (%s) — %s",
+            name,
+            job_id,
+            result.get("error"),
+        )
+
+
+def _dispatch_console_background_run(job: dict, *, caller: str) -> None:
+    """Fire `_execute_job_now` on the background pool, off the console thread.
+
+    Reuses the same at-most-once claim + single-CRON_TRIGGERED emit + shared
+    `run_one_job` body the local path uses, so attribution and the audit
+    contract are identical; only the executing thread differs.
+
+    The fire runs inside a COPY of the caller's context so it inherits the
+    hosted request's context-local HERMES_HOME override (set by web_server's
+    `_profile_scope` for a non-default profile). A ThreadPoolExecutor worker
+    otherwise starts with an empty context and would resolve the WRONG profile's
+    cron store / secret scope — the same per-profile fire correctness cron.jobs'
+    dynamic path resolution exists to preserve.
+    """
+    from tools.cronjob_tools import _execute_job_now
+
+    ctx = contextvars.copy_context()
+    future = _get_console_run_executor().submit(
+        ctx.run, functools.partial(_execute_job_now, job, caller=caller)
+    )
+    future.add_done_callback(
+        functools.partial(_log_console_background_run_result, job)
+    )
+
+
 def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron run <job>")
     from cron.jobs import AmbiguousJobReference
 
-    # Context-aware execution semantics (see the 2026-07-14 decision):
+    # Context-aware execution semantics (see spec 2026-07-14-hosted-console-
+    # cron-run-background-design.md; supersedes the earlier 2026-07-14 defer
+    # decision). "run" now means run-NOW on every surface:
     #
-    #   local (standalone REPL)  → execute NOW, matching `hermes cron run` (CLI)
-    #                              and the cronjob(action='run') tool, both of
-    #                              which route through _execute_job_now. A manual
-    #                              run then actually fires even when no gateway
-    #                              ticker is active (the #41037 case), and the
-    #                              same job behaves identically across surfaces.
+    #   local (standalone REPL)  → execute NOW, blocking, matching `hermes cron
+    #                              run` (CLI) and the cronjob(action='run') tool,
+    #                              both of which route through _execute_job_now.
+    #                              A manual run then actually fires even when no
+    #                              gateway ticker is active (the #41037 case).
     #
-    #   hosted (dashboard web-console) → keep schedule-for-next-tick. That surface
-    #                              runs each command in a bounded 4-worker pool
-    #                              under a 60s asyncio timeout (web_server.py), so
-    #                              a synchronous agent run would be mis-reported as
-    #                              timed-out and could starve the shared pool. The
-    #                              gateway ticker there picks the job up next tick.
+    #   hosted (dashboard web-console) → also fire NOW, but on a dedicated
+    #                              BACKGROUND pool. That surface runs each command
+    #                              in a bounded 4-worker pool under a 60s asyncio
+    #                              timeout (web_server.py), so a synchronous agent
+    #                              run would be mis-reported as timed-out and could
+    #                              starve the shared pool. Dispatching
+    #                              _execute_job_now off-thread returns an immediate
+    #                              "started" ack and surfaces the result via the
+    #                              CRON_TRIGGERED + completion events the dashboard
+    #                              already consumes.
     #
     # Both paths keep caller="tui:console_engine" attribution and emit exactly one
     # CRON_TRIGGERED (via emit_cron_triggered_safe) so the audit contract holds.
     if _engine.context != "local":
-        from cron.jobs import trigger_job
+        from cron.jobs import resolve_job_ref
 
+        # Resolve on the console thread so `not found`/ambiguous come back
+        # immediately; only the actual fire goes to the background pool.
         try:
-            job = trigger_job(args[0], caller="tui:console_engine")
+            job = resolve_job_ref(args[0])
         except AmbiguousJobReference as exc:
             raise ConsoleCommandError(str(exc)) from exc
         if not job:
             raise ConsoleCommandError(f"Job not found: {args[0]}")
-        return _format_job(job, "Triggered")
+
+        _dispatch_console_background_run(job, caller="tui:console_engine")
+        name = job.get("name") or job["id"]
+        return (
+            f"Started job: {name} ({job['id']}) - running now in the "
+            "background; watch the activity feed for the result."
+        )
 
     from cron.jobs import get_job, resolve_job_ref
     from tools.cronjob_tools import _execute_job_now
