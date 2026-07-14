@@ -63,15 +63,21 @@ job_briefs:
       - knowledge/standard-disclosures.md      # compliance boilerplate library
     instructions:
       - >-
-        INTAKE: use all facts already supplied. The three anchors are existing
-        plan(s), proposed plan, and ROP/new-purchase status. Do not recap them. If
-        material anchor facts are missing, include them in one compact missing-facts
-        question with any other irreducible gaps.
+        INTAKE (DRAFT-FIRST): use all facts already supplied. The three anchors are
+        existing plan(s), proposed plan, and ROP/new-purchase status. Do not recap
+        them. Determine ROP status first (see ROP GATE). ROP-vs-not is the ONLY thing
+        you may ask before drafting. Every other missing fact becomes a specific
+        [[MISSING: ...]] placeholder inside the draft — never a pre-draft question,
+        never a reason to withhold the draft. The objective is on-the-spot close:
+        the advisor gets a full copy-pasteable BOR immediately and fills any blank
+        inline. Do not stall for completeness.
       - >-
         CLASSIFY the replacement path (old category → new category) from
         replacement-path-taxonomy.md. The path selects the ROP wording and which
         conditional checks fire (ILP path → CKA / fund / risk checks). Unknown or
-        novel path → ask one short clarification; do not force a fit.
+        novel path → draft using the closest matching template and flag the path
+        assumption in the "Check before use" note (or escalate to Melody only if
+        genuinely unclassifiable); do not add a pre-draft question to resolve it.
       - >-
         RESOLVE each check according to bor-required-checks.yaml: COLLECT only
         irreducible case facts under the matching category field contract; DERIVE
@@ -80,7 +86,9 @@ job_briefs:
         sustainability without requesting income or surplus figures. Preserve the
         boolean exactly: YES means "exceed" and MUST use the above-threshold caution;
         NO means "do not exceed" and MUST use the within-threshold sentence. Never
-        invert or soften this mapping. Apply the
+        invert or soften this mapping. If the boolean was not supplied, do NOT ask —
+        insert [[MISSING: do total annual premiums exceed 50% of annual income? yes/no]]
+        in place of the sustainability sentence. Apply the
         TEMPLATE_DEFAULT alternatives sentence selected by product category; treat
         freshness as maintained operational knowledge, not a per-case advisor question.
       - >-
@@ -101,37 +109,47 @@ job_briefs:
         statement with exact plan/rider names and the supplied rationale. Never
         invent numeric Shield benefits.
       - >-
-        UNSUPPORTED CATEGORY GATE: if a known category has no approved field contract
-        in the BOR table—including CareShield/ElderShield, accident, or other A&H—do
-        not draft from generic assumptions or invent its required fields. Escalate to
-        Melody for the category contract. If only the category label is unclear, ask
-        one short category clarification.
+        UNSUPPORTED CATEGORY GATE: if a category has no approved field contract in
+        the BOR table—including CareShield/ElderShield, accident, or other A&H—do not
+        draft from generic assumptions or invent its required fields. Return a concise
+        Melody-escalation note for the category contract instead of a guessed draft
+        (this overrides DRAFT-FIRST — an unsupported category has no template to
+        draft against). This is distinct from a missing FACT in a supported category,
+        which is always a [[MISSING: ...]] placeholder, not an escalation.
       - >-
-        ASK AT MOST ONCE before drafting: one compact message containing only the
-        irreducible facts still needed. Never ask for the client's income or surplus;
-        ask only whether total annual premiums exceed 50% of annual income. Never ask
-        the advisor to confirm other arithmetic, coverage/premium comparisons,
-        standard alternatives, comparison-list freshness, or a reference number by
-        default. Do not repeat supplied facts.
-        A reference number is collected only when explicitly requested or required
-        by a named workflow. If any COLLECT fact is missing, ask instead of drafting:
-        do not produce a partial BOR, placeholders, or an "unresolved" list in the
-        same turn.
+        DRAFT-FIRST — do NOT run a pre-draft ask-round for case facts. Once ROP
+        status is known, produce the full BOR draft in the same turn. Any missing
+        COLLECT fact — the 50%-of-income sustainability answer, client rationale,
+        premiums, sums assured, durations, exact plan/rider names, reference number —
+        becomes a specific inline [[MISSING: ...]] placeholder in the draft, NOT a
+        question. Never ask for the client's income or surplus. Never ask the advisor
+        to confirm arithmetic, coverage/premium comparisons, standard alternatives,
+        comparison-list freshness, or a reference number. A reference number is never
+        minted; leave [[MISSING: reference no.]] if required and absent. Do not repeat
+        supplied facts. The ONLY permitted pre-draft question is ROP-vs-not, and only
+        when it cannot be inferred from the case.
       - >-
         DO NOT INVENT material plan figures, the client's rationale, ILP
-        suitability facts, or product-specific disclosure
-        values. A non-blocking gap may remain as [[MISSING: ...]]; a factual claim
-        that would be false without confirmation must be omitted until confirmed.
+        suitability facts, or product-specific disclosure values. This is the
+        guardrail that makes DRAFT-FIRST safe: a missing fact ALWAYS becomes a
+        specific [[MISSING: ...]] placeholder — never a fabricated figure, rationale,
+        or disclosure value to fill the gap. A factual claim that would be false
+        without confirmation must be replaced by the placeholder, never stated as
+        fact.
       - >-
-        ROP GATE: only ask ROP questions and insert replacement disclosures when the
-        case is ROP. Insert "The client was advised of the replacement disadvantages
-        and wishes to proceed." as an Amelia-approved TEMPLATE_DEFAULT without asking
-        routinely. If the advisor explicitly contradicts this or is uncertain,
-        suppress the default and return only a concise Melody-escalation note. Do not
-        produce a holding draft, partial BOR, disclosures, or placeholders.
-        Insert the standard ROP alternatives declaration about increasing SA, adding
-        riders, and conversion from the approved template; do not ask for it as a
-        case fact. NON-ROP cases exclude all ROP wording.
+        ROP GATE: determine ROP status from the case ("replacing X with Y" = ROP).
+        If it genuinely cannot be inferred, ask the single conversational question —
+        e.g. "Quick check: is this replacing an existing policy? (yes/no)" — this is
+        the ONLY permitted pre-draft question. Once known, ROP cases insert the
+        replacement disclosures and the Amelia-approved TEMPLATE_DEFAULT "The client
+        was advised of the replacement disadvantages and wishes to proceed." without
+        asking, plus the standard ROP alternatives declaration (increasing SA, adding
+        riders, conversion) from the approved template — do not ask for it as a case
+        fact. If the advisor EXPLICITLY contradicts the disadvantages default (client
+        not yet advised), do not fabricate it: replace that line with
+        [[ESCALATE: client not yet advised of replacement disadvantages — confirm
+        with Melody before use]] and still return the rest of the draft. NON-ROP
+        cases exclude all ROP wording.
       - >-
         ILP GATE: only ask for CKA/risk profile, fund/objective alignment, and
         product-specific ILP disclosure values when an ILP or investment product is
