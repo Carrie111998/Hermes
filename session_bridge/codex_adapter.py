@@ -141,6 +141,7 @@ class CodexSourceAdapter:
                     fallback_identity, fallback_digest = _fallback_identity(
                         item,
                         result.messages,
+                        timestamp=timestamp,
                         occurrences=fallback_occurrences,
                     )
                     item_messages = _project_messages(
@@ -443,14 +444,17 @@ def _fallback_identity(
     item: dict[str, Any],
     messages: list[dict],
     *,
+    timestamp: float,
     occurrences: dict[str, int],
 ) -> tuple[str | None, str | None]:
     if _nonempty_string(item.get("id")) is not None or not messages:
         return None, None
     digest = hashlib.sha256(
-        _canonical_json({"type": item.get("type"), "messages": messages}).encode(
-            "utf-8"
-        )
+        _canonical_json({
+            "type": item.get("type"),
+            "messages": messages,
+            "timestamp": timestamp,
+        }).encode("utf-8")
     ).hexdigest()
     occurrence = occurrences.get(digest, 0)
     identity = digest if occurrence == 0 else f"{digest}:occ:{occurrence}"

@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from agent.transports.codex_app_server import CodexAppServerClient
+from hermes_state import SessionDB
 import session_bridge.codex_adapter as codex_adapter_module
 from session_bridge.codex_adapter import CodexSourceAdapter, CodexThreadSummary
 from session_bridge.models import (
@@ -18,6 +19,7 @@ from session_bridge.models import (
     Provider,
     encode_bridge_marker,
 )
+from session_bridge.store import SessionBridgeStore
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "codex"
@@ -563,6 +565,45 @@ class TestProjection:
         ]
 
         assert before_ids == after_ids
+
+    def test_idless_timestamp_identity_survives_incremental_store_replay(
+        self, tmp_path: Path
+    ) -> None:
+        first_response = _read_with_items({
+            "type": "agentMessage",
+            "text": "same",
+            "createdAt": 200,
+        })
+        expanded_response = _read_with_items(
+            {"type": "agentMessage", "text": "same", "createdAt": 100},
+            {"type": "agentMessage", "text": "same", "createdAt": 200},
+        )
+        client = FakeInitializingClient({
+            "thread/read": [first_response, expanded_response]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+        first = adapter.project_thread(_summary())
+        expanded = adapter.project_thread(_summary())
+
+        original_id = first.messages[0].native_event_id
+        expanded_by_timestamp = {
+            message.timestamp: message.native_event_id for message in expanded.messages
+        }
+        assert expanded_by_timestamp[200.0] == original_id
+
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            store = SessionBridgeStore(db, clock=lambda: 500.0)
+            store.upsert_projection(first)
+            store.upsert_projection(expanded)
+
+            persisted_timestamps = sorted(
+                message["timestamp"]
+                for message in db.get_messages("codex:thread-active")
+            )
+            assert persisted_timestamps == [100.0, 200.0]
+        finally:
+            db.close()
 
     def test_item_then_turn_then_summary_timestamp_fallbacks(self) -> None:
         response = {
