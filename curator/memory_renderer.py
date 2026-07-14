@@ -27,6 +27,40 @@ _MAIN_APPEND_HEADER = "# Curator-Bootstrapped Sections"
 # Confidence threshold below which a skill is flagged for review.
 _FLAG_THRESHOLD = 0.5
 
+# Markers that begin curator-generated content in a rendered MEMORY.md.
+_CURATOR_BANNERS = (_MAIN_APPEND_HEADER, "# MEMORY — ")
+
+
+def _stable_prefix(content: str) -> str:
+    """Human-authored head of a MEMORY.md, for bounded carry-forward.
+
+    Returns everything before the first curator-generated banner
+    (``_MAIN_APPEND_HEADER`` or ``# MEMORY — <agent>``), with accumulated
+    ``## Prior Notes (pre-…)`` wrapper headers (preserve_with_prior artifacts)
+    and any trailing blank / ``---`` separator lines stripped. ``main`` keeps
+    its ``# Jaum Memory`` top matter; non-main files are 100% curator-generated
+    so this returns ``""`` → the caller collapses to a clean replace.
+
+    Stripping the trailing separator makes re-rendering idempotent: feeding a
+    rendered file back in yields the same stable prefix, so nothing accumulates.
+    """
+    if not content:
+        return ""
+    cut = len(content)
+    for banner in _CURATOR_BANNERS:
+        pos = content.find(banner)
+        if pos != -1 and pos < cut:
+            cut = pos
+    kept = [
+        line for line in content[:cut].splitlines()
+        if not line.startswith("## Prior Notes (pre-")
+    ]
+    # Drop trailing blank / horizontal-rule ('---') separator lines.
+    while kept and (not kept[-1].strip() or set(kept[-1].strip()) == {"-"}):
+        kept.pop()
+    text = "\n".join(kept).strip()
+    return text + "\n" if text else ""
+
 
 def _format_operating_stats(agent: str, audit: Dict[str, Any], drawer: Dict[str, Any]) -> str:
     runs_total = audit.get("runs_total", 0)
@@ -238,18 +272,23 @@ def render(
     )
 
     if mode == "append":
-        prior = existing_content or ""
+        # Carry forward ONLY the stable human prefix, not the entire prior file,
+        # so nightly runs don't stack stale rendered blocks (unbounded growth).
+        prefix = _stable_prefix(existing_content or "")
+        if not prefix:
+            return rendered_block
         sep = (
             f"\n\n---\n\n{_MAIN_APPEND_HEADER} ({generated_at.date().isoformat()})\n\n"
         )
-        return prior + sep + rendered_block
+        return prefix + sep + rendered_block
     if mode == "preserve_with_prior":
-        prior = existing_content or ""
-        prior_lines = prior.splitlines()
-        if len(prior_lines) > 30:
+        # Same bounding: preserve genuine human content if any, else collapse to
+        # a clean replace (non-main files are 100% curator-generated).
+        prefix = _stable_prefix(existing_content or "")
+        if prefix:
             preserved = (
                 f"## Prior Notes (pre-{generated_at.date().isoformat()})\n\n"
-                + prior
+                + prefix
                 + "\n\n---\n\n"
             )
             return preserved + rendered_block
