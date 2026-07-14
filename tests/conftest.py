@@ -360,6 +360,20 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # Modules imported during collection may have cached paths before this
+    # per-test HERMES_HOME existed. Repoint those caches so a monolithic test
+    # run cannot read or write the developer's live config/state database.
+    hermes_state_mod = sys.modules.get("hermes_state")
+    if hermes_state_mod is not None:
+        monkeypatch.setattr(
+            hermes_state_mod,
+            "DEFAULT_DB_PATH",
+            fake_hermes_home / "state.db",
+        )
+    gateway_run_mod = sys.modules.get("gateway.run")
+    if gateway_run_mod is not None:
+        monkeypatch.setattr(gateway_run_mod, "_hermes_home", fake_hermes_home)
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")

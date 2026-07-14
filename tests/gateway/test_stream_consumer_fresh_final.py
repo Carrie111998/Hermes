@@ -545,7 +545,7 @@ class TestFinalCleanupEditFloodControl:
     """Regression for duplicate final sends when the cursor-strip edit fails."""
 
     @pytest.mark.asyncio
-    async def test_failed_final_cleanup_edit_marks_visible_content_delivered(self):
+    async def test_failed_final_cleanup_edit_sends_withheld_tail(self):
         adapter = _make_adapter()
         adapter.edit_message = AsyncMock(return_value=SimpleNamespace(
             success=False,
@@ -563,17 +563,20 @@ class TestFinalCleanupEditFloodControl:
         consumer.on_delta(final_text)
         task = asyncio.create_task(consumer.run())
         await asyncio.sleep(0.05)  # streaming preview lands with cursor
-        assert consumer._last_sent_text == f"{final_text} ▉"
+        assert consumer._last_sent_text == "The complete answer is already visible before ▉"
 
         consumer.finish()
         await task
 
-        # The final cosmetic edit failed, so final_response_sent stays false;
-        # the important signal is that content_delivered suppresses the
-        # gateway's normal full final send and prevents a duplicate answer.
-        assert consumer.final_response_sent is False
+        # The final edit failed. Because the security holdback intentionally
+        # kept the trailing word out of the preview, fallback sends only that
+        # unsent tail rather than duplicating the full answer.
+        assert consumer.final_response_sent is True
         assert consumer.final_content_delivered is True
-        assert adapter.send.call_count == 1
+        assert [call.kwargs["content"] for call in adapter.send.await_args_list] == [
+            "The complete answer is already visible before ▉",
+            "cleanup.",
+        ]
         assert adapter.edit_message.call_count >= 1
 
     @pytest.mark.asyncio

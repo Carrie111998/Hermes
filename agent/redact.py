@@ -7,6 +7,7 @@ Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
 """
 
+import json
 import logging
 import os
 import re
@@ -223,6 +224,162 @@ _cookie_header_re = re.compile(
     re.IGNORECASE,
 )
 
+# Embedded JSON is attacker/model-controlled output, so recursive decoding is
+# allowed only after a bounded lexical pass has proved the candidate shallow
+# and complete. Candidates beyond any bound are never handed to ``json``.
+_COOKIE_JSON_MAX_DEPTH = 64
+_COOKIE_JSON_MAX_CANDIDATE_CHARS = 256 * 1024
+_COOKIE_JSON_MAX_CANDIDATES = 256
+_COOKIE_JSON_MAX_EMBEDDED_DEPTH = 8
+_COOKIE_JSON_STRING_PROBE_CHARS = 64
+_COOKIE_JSON_REDACTED_SENTINEL = "[REDACTED COOKIE JSON]"
+
+
+class _JSONObjectPairs(list):
+    """Distinguish raw JSON object pairs from ordinary JSON arrays."""
+
+
+class _CookieJSONAmbiguous(Exception):
+    """A Cookie-bearing JSON candidate cannot be reserialized safely."""
+
+
+class _EmbeddedJSONEvidenceProbe:
+    """Bounded lexical evidence for a JSON container encoded inside a string."""
+
+    _OUTSIDE_CHARS = frozenset(
+        " \t\r\n{}[],:-+0123456789.eEtruefalsn"
+    )
+    _ESCAPES = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+
+    def __init__(self):
+        self.state = "unknown"
+        self.stack: list[str] = []
+        self.depth = 0
+        self.untracked_depth = False
+        self.in_string = False
+        self.escape_pending = False
+        self.unicode_digits: str | None = None
+        self.string_probe: list[str] = []
+        self.string_overflow = False
+        self.cookie_evidence = False
+
+    def _append_string_char(self, ch: str) -> None:
+        if len(self.string_probe) < _COOKIE_JSON_STRING_PROBE_CHARS:
+            self.string_probe.append(ch)
+        else:
+            self.string_overflow = True
+
+    def _close_string(self) -> None:
+        if not self.string_overflow and (
+            "".join(self.string_probe).lower() in {"cookie", "set-cookie"}
+        ):
+            self.cookie_evidence = True
+        self.in_string = False
+        self.escape_pending = False
+        self.unicode_digits = None
+        self.string_probe = []
+        self.string_overflow = False
+
+    def feed(self, ch: str) -> None:
+        if self.state == "invalid":
+            return
+        if self.in_string:
+            if self.unicode_digits is not None:
+                if ch not in "0123456789abcdefABCDEF":
+                    self.state = "invalid"
+                    return
+                self.unicode_digits += ch
+                if len(self.unicode_digits) == 4:
+                    self._append_string_char(chr(int(self.unicode_digits, 16)))
+                    self.unicode_digits = None
+                return
+            if self.escape_pending:
+                self.escape_pending = False
+                if ch == "u":
+                    self.unicode_digits = ""
+                    return
+                decoded = self._ESCAPES.get(ch)
+                if decoded is None:
+                    self.state = "invalid"
+                    return
+                self._append_string_char(decoded)
+                return
+            if ch == "\\":
+                self.escape_pending = True
+                return
+            if ch == '"':
+                self._close_string()
+                return
+            if ord(ch) < 0x20:
+                self.state = "invalid"
+                return
+            self._append_string_char(ch)
+            return
+
+        if self.state == "complete":
+            if ch not in " \t\r\n":
+                self.state = "invalid"
+            return
+        if self.state == "unknown":
+            if ch in " \t\r\n":
+                return
+            if ch not in "[{":
+                self.state = "invalid"
+                return
+            self.state = "active"
+            self.stack = [ch]
+            self.depth = 1
+            return
+
+        if ch == '"':
+            self.in_string = True
+            self.string_probe = []
+            self.string_overflow = False
+        elif ch in "[{":
+            self.depth += 1
+            if self.untracked_depth:
+                return
+            if self.depth > _COOKIE_JSON_MAX_DEPTH:
+                self.untracked_depth = True
+            else:
+                self.stack.append(ch)
+        elif ch in "]}":
+            if self.untracked_depth:
+                self.depth -= 1
+                if self.depth <= _COOKIE_JSON_MAX_DEPTH:
+                    self.untracked_depth = False
+            elif not self.stack or (ch == "]" and self.stack[-1] != "[") or (
+                ch == "}" and self.stack[-1] != "{"
+            ):
+                self.state = "invalid"
+                return
+            else:
+                self.stack.pop()
+                self.depth -= 1
+            if self.depth == 0:
+                self.state = "complete"
+        elif ch not in self._OUTSIDE_CHARS:
+            # Reject ordinary prose before treating a quoted alias as embedded
+            # JSON evidence. The real decoder still decides validity for every
+            # candidate within the normal size/depth bounds.
+            self.state = "invalid"
+
+    def has_cookie_evidence(self) -> bool:
+        return (
+            self.state == "complete"
+            and not self.in_string
+            and self.cookie_evidence
+        )
+
 # Discord bot/user tokens are otherwise bare: unlike most credentials they do
 # not carry a vendor prefix.  Their three URL-safe-base64-ish segments are very
 # distinctive.  Keep the first segment deliberately narrow (24-26 chars), the
@@ -245,9 +402,23 @@ _TELEGRAM_RE = re.compile(
     r"(bot)?(\d{8,}):([-A-Za-z0-9_]{30,})",
 )
 
-# Private key blocks: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----
-_PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
+# Private-key blocks are redacted only when a line-anchored, dashed BEGIN-ish
+# private-key header is followed by substantial PEM/base64 material.  The
+# private-key word may be severely partial (``P`` through ``PRIVATE``), as may
+# the trailing ``KEY`` word, because a truncated stream frame is still a secret
+# boundary.  Requiring material avoids masking marker-only documentation.  The
+# match remains line-bounded and stops after the last material/END line so
+# ordinary prose following an unterminated block survives.
+_PRIVATE_KEY_MATERIAL_RE = re.compile(
+    r"^[ \t]*-{3,}[ \t]*BEGIN"
+    r"(?:[ \t]+[A-Z0-9-]+)*[ \t]+P(?:R(?:I(?:V(?:A(?:T(?:E)?)?)?)?)?)?"
+    r"(?:[ \t]+K(?:E(?:Y)?)?)?[ \t]*-*[ \t]*\r?\n"
+    r"(?:(?:[ \t]*(?:PROC-TYPE|DEK-INFO)[ \t]*:[^\r\n]*|[ \t]*)\r?\n)*"
+    r"[ \t]*[A-Z0-9+/]{24,}={0,2}[ \t]*(?=\r?$)"
+    r"(?:\r?\n[ \t]*[A-Z0-9+/]{4,}={0,2}[ \t]*(?=\r?$))*"
+    r"(?:\r?\n[ \t]*-{3,}[ \t]*END"
+    r"(?:[ \t]+[A-Z0-9-]+)*[ \t]+PRIVATE(?:[ \t]+KEY)?[ \t]*-*[ \t]*(?=\r?$))?",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 # Database connection strings: protocol://user:PASSWORD@host
@@ -541,7 +712,13 @@ def _split_cookie_value(value: str) -> list[str]:
 def _mask_cookie_assignment(segment: str) -> str:
     """Fully mask one ``name=value`` cookie pair without changing its syntax."""
     if "=" not in segment:
-        return segment
+        # A request Cookie field without ``=`` is malformed, but may still be
+        # an opaque reusable credential. Fail closed while preserving only
+        # surrounding whitespace. Set-Cookie attributes never reach this path:
+        # that caller masks only the leading cookie pair in each field-value.
+        leading = segment[: len(segment) - len(segment.lstrip())]
+        trailing = segment[len(segment.rstrip()):]
+        return f"{leading}***{trailing}" if segment.strip() else segment
     name, equals, raw_value = segment.partition("=")
 
     leading_len = len(raw_value) - len(raw_value.lstrip())
@@ -569,18 +746,43 @@ def _mask_cookie_assignment(segment: str) -> str:
     return f"{name}{equals}{leading}{masked}{trailing}"
 
 
-def _mask_cookie_header_value(value: str, *, set_cookie: bool) -> str:
-    """Mask request Cookie pairs or only Set-Cookie's leading cookie pair."""
-    parts = _split_cookie_value(value)
-    if set_cookie:
-        # Set-Cookie attributes (Path, Domain, HttpOnly, Secure, SameSite,
-        # Expires, Max-Age, extensions) are operational metadata, not cookie
-        # values. Mask only the first name=value segment and preserve every
-        # subsequent byte.
-        if parts:
-            parts[0] = _mask_cookie_assignment(parts[0])
-        return "".join(parts)
+def _split_combined_set_cookie(value: str) -> list[str]:
+    """Split comma-combined Set-Cookie values without splitting Expires dates."""
+    parts: list[str] = []
+    start = 0
+    quote: str | None = None
+    i = 0
+    cookie_name_re = re.compile(r"\s*[!#$%&'*+.^_`|~0-9A-Za-z-]+\s*=")
+    while i < len(value):
+        ch = value[i]
+        if ch == "\\" and i + 1 < len(value):
+            i += 2
+            continue
+        if ch in {"\"", "'"}:
+            if quote is None:
+                quote = ch
+            elif quote == ch:
+                quote = None
+        elif ch == "," and quote is None and cookie_name_re.match(value, i + 1):
+            parts.extend((value[start:i], ","))
+            start = i + 1
+        i += 1
+    parts.append(value[start:])
+    return parts
 
+
+def _mask_cookie_header_value(value: str, *, set_cookie: bool) -> str:
+    """Mask request Cookie pairs or each Set-Cookie leading cookie pair."""
+    if set_cookie:
+        combined = _split_combined_set_cookie(value)
+        for combined_idx in range(0, len(combined), 2):
+            fields = _split_cookie_value(combined[combined_idx])
+            if fields:
+                fields[0] = _mask_cookie_assignment(fields[0])
+            combined[combined_idx] = "".join(fields)
+        return "".join(combined)
+
+    parts = _split_cookie_value(value)
     # Request Cookie headers carry multiple cookies. Every name=value segment
     # is sensitive; delimiters, whitespace, names, and quotes remain unchanged.
     for i in range(0, len(parts), 2):
@@ -588,34 +790,276 @@ def _mask_cookie_header_value(value: str, *, set_cookie: bool) -> str:
     return "".join(parts)
 
 
-def _redact_cookie_headers(text: str) -> str:
-    """Redact all Cookie/Set-Cookie headers in plain, shell, or JSON text."""
-    chunks: list[str] = []
-    cursor = 0
-    search_at = 0
+def _bounded_json_container_status(text: str) -> tuple[bool, bool]:
+    """Return ``(valid_container, exceeded_bound)`` for decoded JSON text."""
+    if not text:
+        return False, False
+    if len(text) > _COOKIE_JSON_MAX_CANDIDATE_CHARS:
+        return False, True
+    start = 0
+    end = len(text)
+    while start < end and text[start] in " \t\r\n":
+        start += 1
+    while end > start and text[end - 1] in " \t\r\n":
+        end -= 1
+    if start == end or text[start] not in "[{":
+        return False, False
+
+    stack: list[str] = []
+    in_string = False
+    i = start
+    while i < end:
+        ch = text[i]
+        if in_string:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            stack.append(ch)
+            if len(stack) > _COOKIE_JSON_MAX_DEPTH:
+                return False, True
+        elif ch in "]}":
+            if not stack or (ch == "]" and stack[-1] != "[") or (
+                ch == "}" and stack[-1] != "{"
+            ):
+                return False, False
+            stack.pop()
+            if not stack and i != end - 1:
+                return False, False
+        i += 1
+    return (not in_string and not stack), False
+
+
+def _redact_cookie_json_document(
+    text: str,
+    *,
+    cookie_bearing: bool = False,
+) -> str | None:
+    """Redact one bounded JSON candidate, failing closed on ambiguity/errors."""
+    try:
+        value = json.loads(text, object_pairs_hook=_JSONObjectPairs)
+    except Exception:
+        # The caller's lexical pass identifies Cookie-bearing strings without
+        # invoking the recursive decoder. A decoder failure must not leak a
+        # pair/list representation or escape a final streaming boundary.
+        return _COOKIE_JSON_REDACTED_SENTINEL if cookie_bearing else None
+
+    change_count = 0
+    embedded_count = 0
+    embedded_chars = 0
+
+    def mask_header_item(item, *, set_cookie: bool):
+        nonlocal change_count
+        change_count += 1
+        if isinstance(item, str):
+            return _mask_cookie_header_value(item, set_cookie=set_cookie)
+        if isinstance(item, list) and not isinstance(item, _JSONObjectPairs):
+            return [
+                _mask_cookie_header_value(entry, set_cookie=set_cookie)
+                if isinstance(entry, str)
+                else "***"
+                for entry in item
+            ]
+        return "***"
+
+    def walk(node, *, embedded_depth: int = 0):
+        nonlocal change_count, embedded_chars, embedded_count
+        if isinstance(node, _JSONObjectPairs):
+            pairs = list(node)
+            exact_key_counts: dict[str, int] = {}
+            for key, _item in pairs:
+                exact_key_counts[key] = exact_key_counts.get(key, 0) + 1
+
+            name_pairs = [
+                (key, item)
+                for key, item in pairs
+                if key.lower() in {"name", "header", "header_name"}
+            ]
+            value_keys = {
+                key
+                for key, _item in pairs
+                if key.lower() in {"value", "values"}
+            }
+            header_names = {
+                item.lower()
+                for _key, item in name_pairs
+                if isinstance(item, str)
+            }
+            structured_cookie = header_names & {"cookie", "set-cookie"}
+            direct_cookie_keys = {
+                key for key, _item in pairs if key.lower() in {"cookie", "set-cookie"}
+            }
+
+            # Raw duplicate pairs cannot be represented by a normal dict. Fail
+            # this top-level candidate closed whenever collapsing one could hide
+            # an earlier Cookie alias or value. Case-distinct aliases remain
+            # representable and continue to be masked independently.
+            ambiguous_keys = {
+                key
+                for key, count in exact_key_counts.items()
+                if count > 1
+                and key.lower()
+                in {"name", "header", "header_name", "value", "values", "cookie", "set-cookie"}
+            }
+            conflicting_names = bool(structured_cookie) and len(header_names) > 1
+            if direct_cookie_keys & ambiguous_keys or (
+                structured_cookie and (ambiguous_keys or conflicting_names)
+            ):
+                raise _CookieJSONAmbiguous
+
+            if value_keys and structured_cookie:
+                # Request-Cookie semantics are stricter than Set-Cookie, so a
+                # representable Cookie/Set-Cookie combination masks every pair.
+                set_cookie = "cookie" not in structured_cookie
+                out = {}
+                for key, item in pairs:
+                    key_lower = key.lower()
+                    if key in value_keys:
+                        item = mask_header_item(item, set_cookie=set_cookie)
+                    elif key_lower in {"cookie", "set-cookie"}:
+                        item = mask_header_item(
+                            item,
+                            set_cookie=key_lower == "set-cookie",
+                        )
+                    else:
+                        item = walk(item, embedded_depth=embedded_depth)
+                    out[key] = item
+                return out
+
+            out = {}
+            for key, item in pairs:
+                key_lower = key.lower()
+                if key_lower in {"cookie", "set-cookie"}:
+                    item = mask_header_item(
+                        item,
+                        set_cookie=key_lower == "set-cookie",
+                    )
+                else:
+                    item = walk(item, embedded_depth=embedded_depth)
+                out[key] = item
+            return out
+        if isinstance(node, list):
+            if len(node) >= 2 and isinstance(node[0], str):
+                header_name = node[0].lower()
+                if header_name in {"cookie", "set-cookie"}:
+                    out = list(node)
+                    out[1] = mask_header_item(
+                        node[1],
+                        set_cookie=header_name == "set-cookie",
+                    )
+                    for index in range(2, len(out)):
+                        out[index] = walk(
+                            out[index],
+                            embedded_depth=embedded_depth,
+                        )
+                    return out
+            return [walk(item, embedded_depth=embedded_depth) for item in node]
+        if isinstance(node, str):
+            # Recurse only into an entire decoded, bounded JSON object/array.
+            # The aggregate counters prevent nested encoded strings from
+            # multiplying decoder work beyond a fixed linear budget.
+            stripped = node.strip()
+            if stripped[:1] in {"[", "{"}:
+                if embedded_depth >= _COOKIE_JSON_MAX_EMBEDDED_DEPTH:
+                    raise _CookieJSONAmbiguous
+                bounded, exceeded_bound = _bounded_json_container_status(node)
+                if exceeded_bound:
+                    raise _CookieJSONAmbiguous
+                if not bounded:
+                    redacted = _redact_plain_cookie_headers(node)
+                    if redacted != node:
+                        change_count += 1
+                    return redacted
+                embedded_count += 1
+                embedded_chars += len(node)
+                if (
+                    embedded_count > _COOKIE_JSON_MAX_CANDIDATES
+                    or embedded_chars > _COOKIE_JSON_MAX_CANDIDATE_CHARS
+                ):
+                    raise _CookieJSONAmbiguous
+                try:
+                    embedded = json.loads(
+                        node,
+                        object_pairs_hook=_JSONObjectPairs,
+                    )
+                except Exception:
+                    redacted = _redact_plain_cookie_headers(node)
+                    if redacted != node:
+                        change_count += 1
+                    return redacted
+                before = change_count
+                embedded = walk(
+                    embedded,
+                    embedded_depth=embedded_depth + 1,
+                )
+                if change_count != before:
+                    return json.dumps(embedded, ensure_ascii=False)
+
+            # A JSON field may itself contain a literal wire header. Keep JSON
+            # valid by redacting the decoded value before re-encoding it.
+            redacted = _redact_plain_cookie_headers(node)
+            if redacted != node:
+                change_count += 1
+            return redacted
+        return node
+
+    try:
+        redacted = walk(value)
+    except _CookieJSONAmbiguous:
+        return _COOKIE_JSON_REDACTED_SENTINEL
+    if not change_count:
+        return None
+    return json.dumps(redacted, ensure_ascii=False)
+
+
+def _plain_cookie_header_records(
+    text: str,
+) -> list[tuple[re.Match, int, int]]:
+    """Locate plain Cookie values in one monotonic pass over matches/lines."""
+    records: list[tuple[re.Match, int, int]] = []
+    covered_until = 0
+    line_start = 0
+    physical_end = text.find("\n")
+    logical_end: int | None = None
     text_len = len(text)
 
-    while True:
-        match = _cookie_header_re.search(text, search_at)
-        if match is None:
-            break
+    for match in _cookie_header_re.finditer(text):
+        if match.start() < covered_until:
+            continue
 
-        line_start = text.rfind("\n", 0, match.start()) + 1
-        line_end = text.find("\n", match.end())
-        if line_end < 0:
-            line_end = text_len
-        cr = text.find("\r", match.end(), line_end)
-        if cr >= 0:
-            line_end = cr
+        while physical_end >= 0 and match.start() > physical_end:
+            line_start = physical_end + 1
+            physical_end = text.find("\n", line_start)
+            logical_end = None
+
+        if logical_end is None:
+            folded_end = physical_end
+            logical_end = text_len if folded_end < 0 else folded_end
+            # Compute a folded logical line once, not once per header match.
+            while (
+                folded_end >= 0
+                and folded_end + 1 < text_len
+                and text[folded_end + 1] in {" ", "\t"}
+            ):
+                folded_end = text.find("\n", folded_end + 1)
+                logical_end = text_len if folded_end < 0 else folded_end
+            if logical_end > match.end() and text[logical_end - 1] == "\r":
+                logical_end -= 1
 
         value_start = match.end()
-        value_end = line_end
+        value_end = logical_end
 
         # JSON/dict header map: {"Cookie": "a=b"}. The name quotes are part
         # of the regex; leave the value quotes outside the replacement span.
-        if value_start < line_end and text[value_start] in {"\"", "'"}:
+        if value_start < value_end and text[value_start] in {"\"", "'"}:
             quote = text[value_start]
-            closing = _find_unescaped_quote(text, value_start + 1, line_end, quote)
+            closing = _find_unescaped_quote(text, value_start + 1, value_end, quote)
             if closing is not None:
                 value_start += 1
                 value_end = closing
@@ -623,10 +1067,29 @@ def _redact_cookie_headers(text: str) -> str:
         # curl -H 'Cookie: a=b' / "Cookie: a=b".
         elif match.start() > line_start and text[match.start() - 1] in {"\"", "'"}:
             quote = text[match.start() - 1]
-            closing = _find_unescaped_quote(text, value_start, line_end, quote)
+            closing = _find_unescaped_quote(text, value_start, value_end, quote)
             if closing is not None:
                 value_end = closing
 
+        records.append((match, value_start, value_end))
+        covered_until = value_end
+
+    return records
+
+
+def _redact_plain_cookie_headers(
+    text: str,
+    records: list[tuple[re.Match, int, int]] | None = None,
+) -> str:
+    """Redact Cookie/Set-Cookie header syntax outside structured JSON."""
+    if records is None:
+        records = _plain_cookie_header_records(text)
+    if not records:
+        return text
+
+    chunks: list[str] = []
+    cursor = 0
+    for match, value_start, value_end in records:
         chunks.append(text[cursor:value_start])
         chunks.append(
             _mask_cookie_header_value(
@@ -635,13 +1098,389 @@ def _redact_cookie_headers(text: str) -> str:
             )
         )
         cursor = value_end
-        # If a surrounding closing quote was found, skip it for the next regex
-        # search while retaining it in the final untouched slice.
-        search_at = value_end + (1 if value_end < line_end else 0)
-
-    if not chunks:
-        return text
     chunks.append(text[cursor:])
+    return "".join(chunks)
+
+
+def _plain_cookie_header_value_spans(
+    records: list[tuple[re.Match, int, int]],
+) -> list[tuple[int, int]]:
+    """Select plain Cookie spans so JSON scanning cannot split a header."""
+    return [
+        (value_start, value_end)
+        for match, value_start, value_end in records
+        if not match.group("name_quote")
+    ]
+
+
+def _looks_like_json_candidate(text: str, start: int) -> bool:
+    """Recognize a JSON opener inside otherwise unmatched quoted prose."""
+    i = start + 1
+    while i < len(text) and text[i] in " \t\r\n":
+        i += 1
+    if i >= len(text):
+        return False
+    if text[start] == "{":
+        return text[i] in {'"', "}"}
+    return text[i] in '[{"-0123456789tfn]'
+
+
+def _scan_json_string_container_candidate(
+    text: str,
+    start: int,
+) -> tuple[int, bool, bool, bool] | None:
+    """Return ``(end, decoded_container, over_limit, valid)`` for a string span."""
+    over_limit = False
+    valid_json_string = True
+    decoded_container: bool | None = None
+    i = start + 1
+    text_len = len(text)
+
+    while i < text_len:
+        if i - start >= _COOKIE_JSON_MAX_CANDIDATE_CHARS:
+            over_limit = True
+
+        ch = text[i]
+        decoded = ""
+        if ch == "\\" and i + 1 < text_len:
+            escaped = text[i + 1]
+            if (
+                escaped == "u"
+                and i + 5 < text_len
+                and all(c in "0123456789abcdefABCDEF" for c in text[i + 2 : i + 6])
+            ):
+                decoded = chr(int(text[i + 2 : i + 6], 16))
+                i += 6
+            else:
+                decoded = _EmbeddedJSONEvidenceProbe._ESCAPES.get(escaped, "")
+                if not decoded:
+                    valid_json_string = False
+                i += 2
+        elif ch == '"':
+            end = i + 1
+            return (
+                end,
+                bool(decoded_container),
+                over_limit or end - start > _COOKIE_JSON_MAX_CANDIDATE_CHARS,
+                valid_json_string,
+            )
+        else:
+            if ord(ch) < 0x20:
+                valid_json_string = False
+            else:
+                decoded = ch
+            i += 1
+
+        if valid_json_string and decoded_container is None:
+            for decoded_ch in decoded:
+                if decoded_ch in " \t\r\n":
+                    continue
+                decoded_container = decoded_ch in "[{"
+                break
+
+    return None
+
+
+def _string_tail_has_plain_cookie_header(tail: str) -> bool:
+    """Recognize an explicit Cookie header ending at the latest decoded colon."""
+    if not tail.endswith(":"):
+        return False
+    before_colon = tail[:-1].rstrip(" \t")
+    for alias in ("set-cookie", "cookie"):
+        if not before_colon.endswith(alias):
+            continue
+        prefix_end = len(before_colon) - len(alias)
+        return prefix_end == 0 or before_colon[prefix_end - 1] not in (
+            "abcdefghijklmnopqrstuvwxyz0123456789-"
+        )
+    return False
+
+
+def _redact_cookie_headers(text: str) -> str:
+    """Redact plain and embedded JSON Cookie representations in bounded O(n)."""
+    # Replacement spans are disjoint top-level candidates. Bytes outside those
+    # spans are handled by the existing plain-header redactor after the lexical
+    # pass, preserving prose and malformed non-Cookie controls byte-for-byte.
+    replacements: list[tuple[int, int, str]] = []
+    plain_header_records = _plain_cookie_header_records(text)
+    plain_header_spans = _plain_cookie_header_value_spans(plain_header_records)
+    plain_span_index = 0
+    candidate_start: int | None = None
+    stack: list[str] = []
+    depth = 0
+    untracked_depth = False
+    candidate_count = 0
+    over_limit = False
+    malformed_candidate = False
+    in_string = False
+    cookie_bearing = False
+    string_probe: list[str] = []
+    string_probe_overflow = False
+    string_header_tail = ""
+    embedded_probe = _EmbeddedJSONEvidenceProbe()
+    outside_string = False
+    text_len = len(text)
+    i = 0
+
+    while i < text_len:
+        ch = text[i]
+
+        if candidate_start is None:
+            while (
+                plain_span_index < len(plain_header_spans)
+                and i >= plain_header_spans[plain_span_index][1]
+            ):
+                plain_span_index += 1
+            if (
+                plain_span_index < len(plain_header_spans)
+                and plain_header_spans[plain_span_index][0]
+                <= i
+                < plain_header_spans[plain_span_index][1]
+            ):
+                # Leave the entire plain field-value intact for one redaction
+                # pass; splitting it around a JSON-looking cookie value could
+                # expose later request-cookie pairs after the replacement.
+                outside_string = False
+                i += 1
+                continue
+
+            # Ignore braces inside ordinary balanced quoted prose/header values.
+            # A strong JSON opener can resynchronize after an unmatched prose
+            # quote; treating JSON-looking text inside prose as a candidate is
+            # conservative at this security boundary.
+            if outside_string:
+                if ch in "[{" and _looks_like_json_candidate(text, i):
+                    outside_string = False
+                elif ch == "\\" and i + 1 < text_len:
+                    i += 2
+                    continue
+                elif ch == '"':
+                    outside_string = False
+                    i += 1
+                    continue
+                else:
+                    i += 1
+                    continue
+            if ch == '"':
+                string_candidate = _scan_json_string_container_candidate(text, i)
+                if string_candidate is None:
+                    outside_string = True
+                    i += 1
+                    continue
+                end, decoded_container, string_over_limit, valid_json_string = (
+                    string_candidate
+                )
+                if valid_json_string and decoded_container:
+                    candidate_count += 1
+                    replacement: str | None
+                    if (
+                        string_over_limit
+                        or candidate_count > _COOKIE_JSON_MAX_CANDIDATES
+                    ):
+                        replacement = _COOKIE_JSON_REDACTED_SENTINEL
+                    else:
+                        replacement = _redact_cookie_json_document(
+                            text[i:end],
+                            cookie_bearing=False,
+                        )
+                    if replacement is not None:
+                        replacements.append((i, end, replacement))
+                elif not decoded_container:
+                    outside_string = True
+                    i += 1
+                    continue
+                outside_string = False
+                i = end
+                continue
+            if ch not in "[{":
+                i += 1
+                continue
+
+            candidate_start = i
+            candidate_count += 1
+            stack = [ch]
+            depth = 1
+            untracked_depth = False
+            over_limit = candidate_count > _COOKIE_JSON_MAX_CANDIDATES
+            malformed_candidate = False
+            in_string = False
+            cookie_bearing = False
+            string_probe = []
+            string_probe_overflow = False
+            string_header_tail = ""
+            embedded_probe = _EmbeddedJSONEvidenceProbe()
+            i += 1
+            continue
+
+        if i - candidate_start >= _COOKIE_JSON_MAX_CANDIDATE_CHARS:
+            over_limit = True
+
+        if in_string:
+            decoded = ""
+            if ch == "\\" and i + 1 < text_len:
+                escaped = text[i + 1]
+                if (
+                    escaped == "u"
+                    and i + 5 < text_len
+                    and all(
+                        c in "0123456789abcdefABCDEF"
+                        for c in text[i + 2 : i + 6]
+                    )
+                ):
+                    decoded = chr(int(text[i + 2 : i + 6], 16))
+                    i += 6
+                else:
+                    decoded = {
+                        '"': '"',
+                        "\\": "\\",
+                        "/": "/",
+                        "b": "\b",
+                        "f": "\f",
+                        "n": "\n",
+                        "r": "\r",
+                        "t": "\t",
+                    }.get(escaped, "")
+                    i += 2
+            elif ch == '"':
+                in_string = False
+                if not string_probe_overflow and (
+                    "".join(string_probe).lower() in {"cookie", "set-cookie"}
+                ):
+                    cookie_bearing = True
+                if embedded_probe.has_cookie_evidence():
+                    cookie_bearing = True
+                string_probe = []
+                string_probe_overflow = False
+                string_header_tail = ""
+                i += 1
+                continue
+            else:
+                decoded = ch
+                i += 1
+
+            # Retain only bounded lexical state for this decoded JSON string.
+            # Exact aliases are recognized at the closing quote; explicit wire
+            # headers are recognized at a decoded colon wherever they occur.
+            for decoded_ch in decoded:
+                embedded_probe.feed(decoded_ch)
+                if len(string_probe) < _COOKIE_JSON_STRING_PROBE_CHARS:
+                    string_probe.append(decoded_ch)
+                else:
+                    string_probe_overflow = True
+                string_header_tail = (string_header_tail + decoded_ch.lower())[-32:]
+                if decoded_ch == ":" and _string_tail_has_plain_cookie_header(
+                    string_header_tail
+                ):
+                    cookie_bearing = True
+            continue
+
+        if ch == '"':
+            in_string = True
+            string_probe = []
+            string_probe_overflow = False
+            string_header_tail = ""
+            embedded_probe = _EmbeddedJSONEvidenceProbe()
+            i += 1
+            continue
+
+        # A strong nested opener is a safe resynchronization point after malformed
+        # prose. Preserve the malformed prefix and scan the new container as its
+        # own candidate. A mismatched closer alone is not a reset point because
+        # later strings in that same candidate may carry exact Cookie evidence.
+        if (
+            malformed_candidate
+            and not untracked_depth
+            and depth == 1
+            and ch in "[{"
+            and _looks_like_json_candidate(text, i)
+        ):
+            if cookie_bearing:
+                replacements.append(
+                    (candidate_start, i, _COOKIE_JSON_REDACTED_SENTINEL)
+                )
+            candidate_start = None
+            stack = []
+            depth = 0
+            over_limit = False
+            malformed_candidate = False
+            cookie_bearing = False
+            outside_string = False
+            continue
+
+        complete = False
+        if ch in "[{":
+            depth += 1
+            if untracked_depth:
+                pass
+            elif depth > _COOKIE_JSON_MAX_DEPTH:
+                # Stop retaining recursive delimiter state at the exact depth
+                # bound. Numeric depth is sufficient to locate this candidate's
+                # end; it will never be passed to the recursive JSON decoder.
+                untracked_depth = True
+                over_limit = True
+            else:
+                stack.append(ch)
+        elif ch in "]}":
+            if untracked_depth:
+                depth -= 1
+                complete = depth == 0
+            elif not stack or (ch == "]" and stack[-1] != "[") or (
+                ch == "}" and stack[-1] != "{"
+            ):
+                malformed_candidate = True
+            else:
+                stack.pop()
+                depth -= 1
+                complete = depth == 0
+
+        i += 1
+        if not complete:
+            continue
+
+        end = i
+        replacement: str | None = None
+        if malformed_candidate or over_limit:
+            if cookie_bearing:
+                replacement = _COOKIE_JSON_REDACTED_SENTINEL
+        else:
+            # This is the only top-level recursive decode site: each completed,
+            # bounded candidate reaches it at most once.
+            replacement = _redact_cookie_json_document(
+                text[candidate_start:end],
+                cookie_bearing=cookie_bearing,
+            )
+        if replacement is not None:
+            replacements.append((candidate_start, end, replacement))
+
+        candidate_start = None
+        stack = []
+        depth = 0
+        untracked_depth = False
+        over_limit = False
+        malformed_candidate = False
+        in_string = False
+        cookie_bearing = False
+        string_probe = []
+        string_probe_overflow = False
+        string_header_tail = ""
+        outside_string = False
+
+    # An incomplete candidate is never decoded. If its own JSON strings carry
+    # exact Cookie aliases/header syntax, replace the unresolved tail rather than
+    # exposing a credential. A prose substring containing "cookie" is not enough.
+    if candidate_start is not None and cookie_bearing:
+        replacements.append((candidate_start, text_len, _COOKIE_JSON_REDACTED_SENTINEL))
+
+    if not replacements:
+        return _redact_plain_cookie_headers(text, plain_header_records)
+
+    chunks: list[str] = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        chunks.append(_redact_plain_cookie_headers(text[cursor:start]))
+        chunks.append(replacement)
+        cursor = end
+    chunks.append(_redact_plain_cookie_headers(text[cursor:]))
     return "".join(chunks)
 
 
@@ -801,9 +1640,13 @@ def redact_sensitive_text(
 
     # Cookie is a multi-value header and Set-Cookie has non-secret attributes,
     # so neither can use the opaque single-header-value rule. Header names are
-    # case-insensitive; all lines are processed. This is deliberately scoped to
-    # explicit headers and does NOT scan or blanket-mask URL query strings.
-    if "cookie" in text.lower():
+    # case-insensitive; all lines are processed. JSON aliases may encode any
+    # alias byte as ``\uXXXX``; gate those container-shaped texts into the
+    # bounded scanner without running it for arbitrary non-JSON prose.
+    cookie_gate_text = text.lower()
+    if "cookie" in cookie_gate_text or (
+        "\\u" in cookie_gate_text and ("{" in text or "[" in text)
+    ):
         text = _redact_cookie_headers(text)
 
     # API-key style headers (x-api-key, api-key, …). Header values are
@@ -822,9 +1665,10 @@ def redact_sensitive_text(
             return f"{prefix}{digits}:***"
         text = _TELEGRAM_RE.sub(_redact_telegram, text)
 
-    # Private key blocks
-    if "BEGIN" in text and "-----" in text:
-        text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
+    # Private-key blocks require a PEM-like BEGIN line plus substantial key
+    # material, including when the header/body is truncated at frame end.
+    if "BEGIN" in text.upper() and "---" in text:
+        text = _PRIVATE_KEY_MATERIAL_RE.sub("[REDACTED PRIVATE KEY]", text)
 
     # Database connection string passwords. With code_file=True, a password
     # group that is a pure ``{...}`` brace expression is an f-string template

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -194,6 +195,35 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
     return ctx
 
 
+_DIAGNOSTIC_RUNNER = r"""
+import os
+import signal
+import subprocess
+import sys
+
+timeout = max(float(sys.argv[1]), 0.1)
+command = sys.argv[2]
+child = subprocess.Popen(["sh", "-c", command], start_new_session=True)
+try:
+    return_code = child.wait(timeout=timeout)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+    return_code = 124
+sys.exit(return_code)
+"""
+
+
 def spawn_async_diagnostic(
     log_path: Path,
     signal_name: str,
@@ -204,8 +234,9 @@ def spawn_async_diagnostic(
 
     Runs as a detached subprocess so it can't block the asyncio event loop
     or compete with platform teardown.  The subprocess uses its own
-    ``timeout`` so a wedged ``ps`` still self-cleans within
-    ``timeout_seconds``.
+    Python watchdog so a wedged ``ps`` still self-cleans within
+    ``timeout_seconds``. This avoids depending on GNU ``timeout``, which is
+    not installed by default on macOS.
 
     Returns the subprocess PID on success, ``None`` on failure.  Never
     raises.
@@ -226,15 +257,17 @@ def spawn_async_diagnostic(
     if sys.platform == "win32":
         return None
 
+    quoted_signal_name = shlex.quote(str(signal_name))
     script = (
-        f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
+        f"echo '=== shutdown diagnostic @ ' {quoted_signal_name} ' ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
         "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+        "(ps auxf --sort=-pcpu 2>/dev/null || ps aux 2>/dev/null) | head -60; "
         "echo '--- pstree of self ---'; "
-        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
+        f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || "
+        f"ps -p {os.getpid()} -o pid=,ppid=,user=,command= 2>/dev/null || true; "
         "echo '--- /proc/loadavg ---'; "
-        "cat /proc/loadavg 2>/dev/null || true; "
+        "cat /proc/loadavg 2>/dev/null || uptime 2>/dev/null || true; "
         "echo '--- recent dmesg (oom/killed) ---'; "
         "dmesg -T 2>/dev/null | tail -20 || journalctl --user -n 20 --no-pager 2>/dev/null | tail -20 || true; "
         "echo '=== end ==='"
@@ -255,7 +288,13 @@ def spawn_async_diagnostic(
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            [
+                sys.executable,
+                "-c",
+                _DIAGNOSTIC_RUNNER,
+                str(timeout_seconds),
+                script,
+            ],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

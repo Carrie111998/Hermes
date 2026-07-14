@@ -1,6 +1,7 @@
 """Tests for GatewayStreamConsumer — media directive stripping in streaming."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -83,6 +84,257 @@ class TestCleanForDisplay:
         # "MEDIA:" in upper case without a path won't match \S+ (space follows)
         # But "media:" is lowercase so won't match either
         assert result == text
+
+
+class TestProgressiveSecretEgress:
+    def _consumer(self):
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        return GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+    def test_malformed_private_key_begin_is_quarantined_across_frames(self):
+        consumer = self._consumer()
+        frame_one = "Visible intro.\n-----BEGIN PRI"
+        frame_two = (
+            frame_one
+            + "VATE\n"
+            + "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\n"
+            + "c2Vjb25kbGluZW9mcHJpdmF0ZWtleW1hdGVyaWFs"
+        )
+
+        first_visible = consumer._clean_for_stream_egress(
+            frame_one + consumer.cfg.cursor,
+            final=False,
+        )
+        second_visible = consumer._clean_for_stream_egress(
+            frame_two + consumer.cfg.cursor,
+            final=False,
+        )
+        sealed = consumer._clean_for_stream_egress(frame_two, final=True)
+
+        assert "BEGIN" not in first_visible
+        assert "BEGIN" not in second_visible
+        assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj" not in second_visible
+        assert first_visible.startswith("Visible intro.")
+        assert second_visible.startswith("Visible intro.")
+        assert "BEGIN" not in sealed
+        assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj" not in sealed
+        assert "[REDACTED PRIVATE KEY]" in sealed
+
+    @pytest.mark.parametrize(
+        "pem",
+        [
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "Proc-Type: 4,ENCRYPTED\n"
+                "DEK-Info: AES-128-CBC,0123456789ABCDEF\n\n"
+                + "A" * 40
+            ),
+            "-----BEGIN RSA P\n" + "A" * 40,
+        ],
+    )
+    def test_unterminated_private_key_edge_cases_are_held_then_sealed(self, pem):
+        consumer = self._consumer()
+
+        progressive = consumer._clean_for_stream_egress(
+            pem + consumer.cfg.cursor,
+            final=False,
+        )
+        sealed = consumer._clean_for_stream_egress(pem, final=True)
+
+        assert "BEGIN" not in progressive
+        assert "A" * 40 not in progressive
+        assert "BEGIN" not in sealed
+        assert "A" * 40 not in sealed
+        assert sealed == "[REDACTED PRIVATE KEY]"
+
+    def test_marker_only_private_key_documentation_survives_final_sealing(self):
+        consumer = self._consumer()
+        begin = "-----BEGIN PRIVATE KEY-----"
+        end = "-----END PRIVATE KEY-----"
+        text = begin + "\n" + end
+
+        assert consumer._clean_for_stream_egress(text, final=True) == text
+
+    @pytest.mark.parametrize(
+        "pem",
+        [
+            (
+                "-----BEGIN RSA PRIVATE K\n"
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\n"
+                "c2Vjb25kbGluZW9mcHJpdmF0ZWtleW1hdGVyaWFs"
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "Proc-Type: 4,ENCRYPTED\n"
+                "DEK-Info: AES-128-CBC,0123456789ABCDEF\n"
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj"
+            ),
+        ],
+    )
+    def test_sealed_frames_redact_unterminated_private_key_variants(self, pem):
+        consumer = self._consumer()
+
+        sealed = consumer._clean_for_stream_egress(pem, final=True)
+
+        assert sealed == "[REDACTED PRIVATE KEY]"
+
+    @pytest.mark.asyncio
+    async def test_final_redaction_happens_before_overflow_split_boundary(self):
+        token = f"{'A' * 24}.{'B' * 6}.{'C' * 30}"
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 620
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1"),
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        adapter.truncate_message = MagicMock(
+            side_effect=lambda text, limit, **_kwargs: [text[:limit], text[limit:]],
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+        # The raw credential crosses the platform split point. Splitting first
+        # would leave two individually unrecognizable credential fragments.
+        text = "x" * 499 + " " + token + " y" * 200
+
+        consumer.on_delta(text)
+        consumer.finish()
+        await consumer.run()
+
+        split_input = adapter.truncate_message.call_args.args[0]
+        sent = "".join(call.kwargs["content"] for call in adapter.send.await_args_list)
+        assert token not in split_input
+        assert token not in sent
+        assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_deep_malformed_json_final_is_delivered_exactly_once(self):
+        text = "cookie documentation " + "[" * 1000
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1"),
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta(text)
+        consumer.finish()
+        await consumer.run()
+
+        assert adapter.send.await_count == 1
+        assert adapter.send.await_args.kwargs["content"] == text
+        adapter.edit_message.assert_not_awaited()
+        assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_unicode_escaped_cookie_final_is_sealed_and_delivered_once(self):
+        text = r'{"\u0043ookie":"sid=ALPHA_SECRET"}'
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1"),
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta(text)
+        consumer.finish()
+        await consumer.run()
+
+        assert adapter.send.await_count == 1
+        sealed = adapter.send.await_args.kwargs["content"]
+        assert "ALPHA_SECRET" not in sealed
+        assert json.loads(sealed)["Cookie"] == "sid=***"
+        adapter.edit_message.assert_not_awaited()
+        assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_top_level_escaped_cookie_json_string_final_is_sealed(self):
+        text = json.dumps(
+            json.dumps({"Cookie": "sid=ALPHA_SECRET"}, separators=(",", ":"))
+        )
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1"),
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta(text)
+        consumer.finish()
+        await consumer.run()
+
+        assert adapter.send.await_count == 1
+        sealed = adapter.send.await_args.kwargs["content"]
+        assert "ALPHA_SECRET" not in sealed
+        assert json.loads(json.loads(sealed)) == {"Cookie": "sid=***"}
+        adapter.edit_message.assert_not_awaited()
+        assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_nested_encoded_cookie_json_string_final_is_sealed(self):
+        inner = json.dumps({"Cookie": "sid=ALPHA_SECRET"}, separators=(",", ":"))
+        middle = json.dumps({"payload": inner}, separators=(",", ":"))
+        text = json.dumps(middle)
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        adapter.send = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="msg_1"),
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta(text)
+        consumer.finish()
+        await consumer.run()
+
+        assert adapter.send.await_count == 1
+        sealed = adapter.send.await_args.kwargs["content"]
+        assert "ALPHA_SECRET" not in sealed
+        middle_out = json.loads(json.loads(sealed))
+        assert json.loads(middle_out["payload"]) == {"Cookie": "sid=***"}
+        adapter.edit_message.assert_not_awaited()
+        assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
 
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
@@ -801,9 +1053,13 @@ class TestSegmentBreakOnToolBoundary:
 
         sent_texts = [call[1]["content"] for call in adapter.send.call_args_list]
         assert len(sent_texts) == 3
-        assert sent_texts[0].startswith(prefix)
-        assert sum(len(t) for t in sent_texts[1:]) == len(tail)
-
+        # Streaming withholds the unfinished trailing word until a boundary.
+        # Reconstructing the visible prefix plus fallback chunks must preserve
+        # every byte of the final response without duplicating the prefix.
+        first_visible = sent_texts[0].removesuffix(" ▉")
+        assert first_visible == "Hello"
+        assert first_visible + " " + "".join(sent_texts[1:]) == prefix + tail
+        assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in sent_texts)
     @pytest.mark.asyncio
     async def test_fallback_final_sends_full_text_at_tool_boundary(self):
         """After a tool call, the streamed prefix is stale (from the pre-tool
@@ -1008,9 +1264,8 @@ class TestFinalResponseDeliveryGuard:
         )
 
     @pytest.mark.asyncio
-    async def test_split_overflow_partial_send_marks_final_sent(self):
-        """Split-overflow path: if at least one chunk lands on done frame,
-        we did deliver the final answer — _final_response_sent must be True."""
+    async def test_split_overflow_all_chunks_sent_marks_final_sent(self):
+        """Split-overflow path marks final delivery after every chunk lands."""
         adapter = MagicMock()
         adapter.send = AsyncMock(side_effect=[
             SimpleNamespace(success=True, message_id="msg_1"),
@@ -1035,6 +1290,129 @@ class TestFinalResponseDeliveryGuard:
         await task
 
         assert consumer._final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_split_overflow_success_without_message_ids_sends_each_chunk_once(self):
+        """Successful Signal-style sends are delivery even without editable IDs."""
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            side_effect=[
+                SimpleNamespace(success=True, message_id=None),
+                SimpleNamespace(success=True, message_id=None),
+            ]
+        )
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        adapter.MAX_MESSAGE_LENGTH = 620
+        adapter.truncate_message = MagicMock(
+            return_value=["first chunk", "second chunk"],
+        )
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta("z" * 900)
+        consumer.finish()
+        await consumer.run()
+
+        assert [
+            call.kwargs["content"] for call in adapter.send.await_args_list
+        ] == ["first chunk", "second chunk"]
+        adapter.edit_message.assert_not_awaited()
+        assert consumer._final_response_sent is True
+        assert consumer._final_content_delivered is True
+
+    @pytest.mark.asyncio
+    async def test_split_overflow_no_id_success_then_failure_preserves_unsent_suffix(self):
+        """A no-ID success is not retried when a later chunk truly fails."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 620
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        adapter.truncate_message = MagicMock(
+            return_value=["first chunk", "second chunk", "third chunk"],
+        )
+        sent_contents = []
+
+        async def send_side_effect(**kwargs):
+            content = kwargs["content"]
+            sent_contents.append(content)
+            if content == "first chunk":
+                return SimpleNamespace(success=True, message_id=None)
+            return SimpleNamespace(success=False, error="network down")
+
+        adapter.send = AsyncMock(side_effect=send_side_effect)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta("z" * 900)
+        consumer.finish()
+        await consumer.run()
+
+        assert sent_contents == [
+            "first chunk",
+            "second chunk",
+            "second chunk\nthird chunk",
+        ]
+        assert consumer._accumulated == "second chunk\nthird chunk"
+        assert consumer._final_response_sent is False
+        assert consumer._final_content_delivered is False
+
+    @pytest.mark.asyncio
+    async def test_split_overflow_later_failure_retries_only_unsent_suffix(self):
+        """A first-chunk success cannot hide a later overflow failure."""
+        adapter = MagicMock()
+        adapter.MAX_MESSAGE_LENGTH = 620
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=True),
+        )
+        adapter.truncate_message = MagicMock(
+            return_value=["first chunk", "second chunk", "third chunk"],
+        )
+
+        sent_contents = []
+
+        async def send_side_effect(**kwargs):
+            content = kwargs["content"]
+            sent_contents.append(content)
+            if content == "first chunk":
+                return SimpleNamespace(success=True, message_id="msg_1")
+            if content == "second chunk":
+                return SimpleNamespace(success=False, error="network down")
+            if content == "third chunk":
+                return SimpleNamespace(success=True, message_id="msg_3")
+            # The final-delivery retry receives the preserved failed chunk plus
+            # every chunk that followed it. Keep that retry failed so the final
+            # flags must remain false.
+            return SimpleNamespace(success=False, error="network down")
+
+        adapter.send = AsyncMock(side_effect=send_side_effect)
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor=" ▉"),
+        )
+
+        consumer.on_delta("z" * 900)
+        consumer.finish()
+        await consumer.run()
+
+        assert "third chunk" not in sent_contents
+        assert any(
+            "second chunk" in content and "third chunk" in content
+            for content in sent_contents
+        )
+        assert "second chunk" in consumer._accumulated
+        assert "third chunk" in consumer._accumulated
+        assert consumer._final_response_sent is False
+        assert consumer._final_content_delivered is False
 
 
 class TestFinalContentDeliveredGuard:

@@ -451,6 +451,7 @@ def test_list_authenticated_providers_groups_same_endpoint(monkeypatch):
              "api_key": "ollama", "model": "qwen3-coder"},
         ],
         max_models=50,
+        probe_custom_providers=False,
     )
 
     custom_groups = [p for p in providers if p.get("is_user_defined")]
@@ -535,6 +536,7 @@ def test_list_authenticated_providers_distinct_endpoints_stay_separate(monkeypat
              "api_key": "ollama", "model": "qwen3-coder"},
         ],
         max_models=50,
+        probe_custom_providers=False,
     )
 
     custom_groups = [p for p in providers if p.get("is_user_defined")]
@@ -628,6 +630,7 @@ def test_list_authenticated_providers_total_models_reflects_grouped_count(monkey
         user_providers={},
         custom_providers=entries,
         max_models=4,
+        probe_custom_providers=False,
     )
 
     groups = [p for p in providers if p.get("is_user_defined")]

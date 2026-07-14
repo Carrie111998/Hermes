@@ -118,11 +118,14 @@ def agent_env():
     prev_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
-    # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # Keep one process-wide module graph. Purging ``run_agent``/``agent.*``/
+    # ``tools.*`` from sys.modules leaves already-collected tests holding stale
+    # function objects while later mocks patch a different module instance.
+    # Reset only logging so AIAgent binds its handlers to this fixture's home.
+    import hermes_logging as fixture_logging
+    fixture_logging._reset_queued_handlers()
+    setattr(fixture_logging, "_logging_initialized", False)
+
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -132,17 +135,25 @@ def agent_env():
         quiet_mode=True, skip_context_files=True, skip_memory=True,
         save_trajectories=False, platform="cli",
     )
+    fresh_hermes_logging = fixture_logging
     agent.valid_tool_names = {"terminal", "read_file", "write_file", "execute_code", "session_search"}
 
     try:
         yield agent, _MockHandler
     finally:
         srv.shutdown()
-        shutil.rmtree(test_home, ignore_errors=True)
+        # Stop and close this fixture's process-wide async file handlers before
+        # deleting their temporary log directory. Without this, each parameter
+        # case leaves a QueueListener writing into a removed HERMES_HOME and can
+        # corrupt unrelated tests later in the same pytest process.
+        if fresh_hermes_logging is not None:
+            fresh_hermes_logging._reset_queued_handlers()
+            setattr(fresh_hermes_logging, "_logging_initialized", False)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        shutil.rmtree(test_home, ignore_errors=True)
 
 
 def _tool_results(handler) -> list[str]:

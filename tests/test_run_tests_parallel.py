@@ -225,6 +225,43 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_runner_isolates_hermes_home_before_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Collection-time imports must never see the developer's Hermes home."""
+    inherited_home = tmp_path / "developer-hermes-home"
+    inherited_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(inherited_home))
+
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "collection-home.txt"
+    (probe_dir / "test_collection_home.py").write_text(
+        textwrap.dedent(
+            f"""
+            import os
+            from pathlib import Path
+
+            COLLECTION_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+            Path({str(handoff)!r}).write_text(COLLECTION_HERMES_HOME)
+
+            def test_collection_home_is_isolated():
+                assert COLLECTION_HERMES_HOME
+                assert COLLECTION_HERMES_HOME != {str(inherited_home)!r}
+                assert Path(COLLECTION_HERMES_HOME).name.startswith("hermes-test-home-")
+            """
+        ).strip()
+        + "\n"
+    )
+
+    proc = _run_runner(probe_dir, "-q")
+
+    assert proc.returncode == 0, proc.stdout
+    collection_home = Path(handoff.read_text())
+    assert collection_home != inherited_home
+    assert not collection_home.exists(), "runner leaked its temporary Hermes home"
+
+
 def test_bare_q_flag_passes_through(tmp_path: Path) -> None:
     """A bare ``-q`` (no ``--``) runs clean instead of erroring out."""
     probe_dir = _make_probe_dir(tmp_path)

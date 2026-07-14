@@ -35,6 +35,28 @@ from tools.send_message_tool import (
     _send_to_platform,
     send_message_tool,
 )
+
+
+@pytest.mark.asyncio
+async def test_send_message_discord_force_redacts_before_standalone_sender():
+    token = f"{'A' * 24}.{'B' * 6}.{'C' * 30}"
+    sender = AsyncMock(return_value={"success": True, "message_id": "1"})
+    pconfig = SimpleNamespace(token="test-token", extra={})
+
+    with _patch_discord_sender(sender):
+        result = await _send_to_platform(
+            Platform.DISCORD,
+            pconfig,
+            "123",
+            f"Credential: {token}\nCookie: sid=alpha",
+        )
+
+    assert result["success"] is True
+    sent = sender.await_args.args[2]
+    assert token not in sent
+    assert "alpha" not in sent
+
+
 # Discord helpers moved to the plugin in #24325.  Import from the new path
 # and provide a thin ``_send_discord(token, ...)`` shim that mirrors the
 # pre-migration signature so the existing test bodies keep working.
@@ -283,6 +305,46 @@ class TestSendMessageTool:
         assert chat_id == "alerts-channel"
         assert thread_id is None
         assert is_explicit is True
+
+    def test_direct_media_message_redacts_platform_and_session_mirror(
+        self, tmp_path,
+    ):
+        token = f"{'A' * 24}.{'B' * 6}.{'C' * 30}"
+        image_path = tmp_path / "caption.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        config, _telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch(
+                 "tools.send_message_tool._send_to_platform",
+                 new=AsyncMock(return_value={"success": True}),
+             ) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:-1001",
+                        "message": f"MEDIA:{image_path}\nCredential: {token}",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_call = send_mock.await_args
+        mirror_call = mirror_mock.call_args
+        assert send_call is not None
+        assert mirror_call is not None
+        outbound_text = send_call.args[3]
+        mirrored_text = mirror_call.args[2]
+        assert token not in outbound_text
+        assert token not in mirrored_text
+        assert outbound_text.strip() == mirrored_text
+        assert send_call.kwargs["media_files"] == [
+            (str(image_path), False),
+        ]
 
     def test_ntfy_topic_target_bypasses_channel_directory(self):
         ntfy_platform = Platform("ntfy")
@@ -728,6 +790,26 @@ class TestSendToPlatformChunking:
         assert send.await_count >= 3
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
+
+    def test_credential_crossing_split_boundary_is_redacted_before_chunking(self):
+        token = f"{'A' * 24}.{'B' * 6}.{'C' * 30}"
+        message = "x" * 1979 + " " + token + " y" * 200
+        send = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with _patch_discord_sender(send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "ch",
+                    message,
+                )
+            )
+
+        assert result["success"] is True
+        sent_text = "".join(call.args[2] for call in send.await_args_list)
+        assert send.await_count >= 2
+        assert token not in sent_text
 
     def test_slack_messages_are_formatted_before_send(self, monkeypatch):
         _ensure_slack_mock(monkeypatch)

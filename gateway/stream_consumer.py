@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from agent.redact import redact_sensitive_text
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -281,6 +282,7 @@ class GatewayStreamConsumer:
         finalize: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
+        content = self._clean_for_display(content)
         kwargs = {
             "chat_id": self.chat_id,
             "message_id": message_id,
@@ -649,10 +651,17 @@ class GatewayStreamConsumer:
                 ):
                     should_edit = False
                 if should_edit and self._accumulated:
+                    sealed_frame = bool(got_done or got_segment_break or commentary_text is not None)
+                    # Finalize redaction before chunk sizing/splitting. Splitting
+                    # raw text can divide one credential across two messages so
+                    # neither half matches a token pattern.
+                    if sealed_frame:
+                        self._accumulated = self._clean_for_display(self._accumulated)
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
-                        _len_fn(self._accumulated) > _safe_limit
+                        sealed_frame
+                        and _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
@@ -663,26 +672,50 @@ class GatewayStreamConsumer:
                         chunks = self.adapter.truncate_message(
                             self._accumulated, _safe_limit, len_fn=_len_fn,
                         )
-                        chunks_delivered = False
+                        all_chunks_delivered = True
+                        failed_at: int | None = None
                         reply_to = self._message_id or self._initial_reply_to_id
-                        for chunk in chunks:
-                            new_id = await self._send_new_chunk(
+                        for index, chunk in enumerate(chunks):
+                            chunk_sent, new_id = await self._send_new_chunk(
                                 chunk,
                                 reply_to,
                                 final=got_done,
                             )
-                            if new_id is not None and new_id != reply_to:
-                                chunks_delivered = True
+                            if not chunk_sent:
+                                all_chunks_delivered = False
+                                failed_at = index
+                                break
+                            if new_id is not None:
+                                reply_to = new_id
+
+                        self._last_edit_time = time.monotonic()
+                        if not all_chunks_delivered and failed_at is not None:
+                            # Stop at the first failed send and preserve that
+                            # chunk plus every unsent successor. On a done frame,
+                            # the fallback seam retries only this suffix; the
+                            # already-visible prefix remains intact.
+                            self._accumulated = "\n".join(chunks[failed_at:])
+                            self._fallback_prefix = ""
+                            self._fallback_final_send = True
+                            self._fallback_preserve_partial_messages = failed_at > 0
+                            if got_done:
+                                await self._send_fallback_final(self._accumulated)
+                                return
+                            if got_segment_break or commentary_text is not None:
+                                await self._flush_segment_tail_on_edit_failure()
+                                self._reset_segment_state()
+                                if commentary_text is not None:
+                                    await self._send_commentary(commentary_text)
+                                    self._reset_segment_state()
+                                continue
+
                         self._accumulated = ""
                         self._last_sent_text = ""
-                        self._last_edit_time = time.monotonic()
                         if got_done:
-                            # Only claim final delivery if THESE chunks actually
-                            # landed.  ``_already_sent`` may be True from prior
-                            # tool-progress edits or fallback-mode promotion (#10748)
-                            # — that doesn't mean the final answer reached the user.
-                            self._final_response_sent = chunks_delivered
-                            if chunks_delivered:
+                            # Final delivery is confirmed only after EVERY
+                            # initial overflow chunk lands.
+                            self._final_response_sent = all_chunks_delivered
+                            if all_chunks_delivered:
                                 self._final_content_delivered = True
                             return
                         if got_segment_break:
@@ -694,7 +727,8 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        _len_fn(self._accumulated) > _safe_limit
+                        sealed_frame
+                        and _len_fn(self._accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
@@ -742,6 +776,10 @@ class GatewayStreamConsumer:
                     current_update_visible = await self._send_or_edit(
                         display_text,
                         finalize=(got_done or got_segment_break),
+                        # Only incomplete progressive frames need trailing-token
+                        # holdback. Sealed segments and final responses are
+                        # fully redacted and delivered without display lag.
+                        partial=not sealed_frame,
                         # A segment-break finalize closes a preamble, not the
                         # turn-final answer — only got_done marks delivered (#29346).
                         is_turn_final=got_done,
@@ -804,7 +842,10 @@ class GatewayStreamConsumer:
                                 # not duplicate the visible prefix.
                                 await self._send_fallback_final(self._accumulated)
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(
+                                self._accumulated,
+                                finalize=True,
+                            )
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                     return
@@ -889,17 +930,92 @@ class GatewayStreamConsumer:
     _MEDIA_RE = MEDIA_TAG_CLEANUP_RE
 
     @staticmethod
-    def _clean_for_display(text: str) -> str:
-        """Strip MEDIA: directives and internal markers from text before display.
+    def _private_key_holdback_start(text: str) -> int | None:
+        """Return the latest progressive BEGIN line that may be a private key."""
+        candidates = list(
+            re.finditer(r"(?im)^[ \t]*-{3,}[ \t]*BEGIN\b[^\r\n]*", text)
+        )
+        private_qualifiers = {"RSA", "EC", "DSA", "OPENSSH", "ENCRYPTED"}
+        for match in reversed(candidates):
+            header = match.group(0).upper()
+            after_begin = header.split("BEGIN", 1)[1].strip()
+            words = re.findall(r"[A-Z0-9-]+", after_begin)
+            if "PRIVATE" in words:
+                return match.start()
+            # A closed, explicitly non-private PEM header (CERTIFICATE, PUBLIC
+            # KEY, etc.) is resolved and need not be quarantined.
+            if header.rstrip().endswith("-----"):
+                continue
+            if not words:
+                return match.start()
+            # During token streaming the type may currently be only ``PRI`` or
+            # ``RSA P``. Hold recognized private-key qualifiers and prefixes
+            # until the header resolves instead of exposing the marker/body.
+            prior, last = words[:-1], words[-1]
+            if all(word in private_qualifiers for word in prior) and (
+                "PRIVATE".startswith(last)
+                or any(qualifier.startswith(last) for qualifier in private_qualifiers)
+                or last in private_qualifiers
+            ):
+                return match.start()
+        return None
 
-        The streaming path delivers raw text chunks that may include
-        ``MEDIA:<path>`` tags and ``[[audio_as_voice]]`` directives meant for
-        the platform adapter's post-processing.  The actual media files are
-        delivered separately via ``_deliver_media_from_response()`` after the
-        stream finishes — we just need to hide the raw directives from the
-        user.
+    @staticmethod
+    def _clean_for_display(text: str) -> str:
+        """Strip internal directives and force-redact completed visible text."""
+        visible = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        return redact_sensitive_text(visible, force=True)
+
+    def _clean_for_stream_egress(self, text: str, *, final: bool) -> str:
+        """Redact stream output without exposing an unfinished credential token.
+
+        Mid-stream, retain the trailing non-whitespace run until a delimiter
+        arrives. Credential syntaxes are token-like; once delimited, the full
+        run is available to the redactor before it becomes visible. Completed
+        frames are fully redacted immediately. An open private-key block is held
+        from its BEGIN marker until the matching END marker arrives.
         """
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        visible = _BasePlatformAdapter.strip_media_directives_for_display(text)
+        cursor = ""
+        if self.cfg.cursor and visible.endswith(self.cfg.cursor):
+            cursor = self.cfg.cursor
+            visible = visible[:-len(self.cfg.cursor)]
+        if final:
+            return redact_sensitive_text(visible, force=True) + cursor
+
+        holdback_start = self._private_key_holdback_start(visible)
+        if holdback_start is not None:
+            candidate = visible[holdback_start:]
+            complete_end = re.search(
+                r"-----END[A-Z0-9 ]*PRIVATE KEY-----",
+                candidate,
+                re.IGNORECASE,
+            )
+            if complete_end is None:
+                # Quarantine from the first BEGIN-like byte. This also handles a
+                # progressively split/malformed header such as
+                # ``-----BEGIN PRI`` → ``VATE`` before any body can escape.
+                visible = visible[:holdback_start]
+            else:
+                # A complete block is safe to redact atomically. Do this before
+                # trailing-word holdback; removing only the END marker would
+                # otherwise turn it back into an unmatched, leakable block.
+                return redact_sensitive_text(visible, force=True) + cursor
+
+        last_boundary = max(
+            (idx for idx, ch in enumerate(visible) if ch.isspace()),
+            default=-1,
+        )
+        # Never expose an unfinished trailing token. Waiting for a whitespace
+        # boundary costs at most one displayed word, while ensuring the full
+        # token is available to redaction before any part reaches a client,
+        # notification, audit trail, or cache.
+        safe_prefix = visible[: last_boundary + 1] if last_boundary >= 0 else ""
+        if cursor and safe_prefix.endswith(cursor[:1]):
+            # Cursor values commonly include a leading space (" ▉"). Avoid
+            # doubling it when the safe boundary already ends in that space.
+            safe_prefix = safe_prefix[:-1]
+        return redact_sensitive_text(safe_prefix, force=True) + cursor
 
     async def _send_new_chunk(
         self,
@@ -907,14 +1023,16 @@ class GatewayStreamConsumer:
         reply_to_id: Optional[str],
         *,
         final: bool = False,
-    ) -> Optional[str]:
+    ) -> tuple[bool, Optional[str]]:
         """Send a new message chunk, optionally threaded to a previous message.
 
-        Returns the message_id so callers can thread subsequent chunks.
+        Returns ``(success, message_id)``. Delivery success is independent of
+        editability: adapters such as Signal can confirm a send without
+        returning a message ID.
         """
         text = self._clean_for_display(text)
         if not text.strip():
-            return reply_to_id
+            return True, reply_to_id
         try:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
@@ -922,21 +1040,28 @@ class GatewayStreamConsumer:
                 reply_to=reply_to_id,
                 metadata=self._metadata_for_send(final=final, expect_edits=True),
             )
-            if result.success and result.message_id:
-                self._message_id = str(result.message_id)
-                self._track_preview_ids_from_result(result)
+            if result.success:
+                message_id = getattr(result, "message_id", None)
+                if message_id:
+                    self._message_id = str(message_id)
+                    self._track_preview_ids_from_result(result)
+                else:
+                    # The chunk is visible but cannot be edited or used as a
+                    # reply target. Preserve successful-delivery state with the
+                    # same sentinel used by the ordinary first-send path.
+                    self._message_id = "__no_edit__"
+                    self._edit_supported = False
                 self._already_sent = True
                 self._last_sent_text = text
                 # Fresh content bubble — close off any stale tool bubble
                 # above so the next tool starts a new bubble below.
                 self._notify_new_message()
-                return str(result.message_id)
-            else:
-                self._edit_supported = False
-                return reply_to_id
+                return True, str(message_id) if message_id else None
+            self._edit_supported = False
+            return False, None
         except Exception as e:
             logger.error("Stream send chunk error: %s", e)
-            return reply_to_id
+            return False, None
 
     def _visible_prefix(self) -> str:
         """Return the visible text already shown in the streamed message."""
@@ -1064,11 +1189,17 @@ class GatewayStreamConsumer:
                     self._last_sent_text = last_successful_chunk
                     self._fallback_prefix = ""
                     return
-                # No fallback chunk reached the user — allow the normal gateway
-                # final-send path to try one more time.
-                self._already_sent = False
-                self._message_id = None
-                self._last_sent_text = ""
+                # No fallback chunk reached the user. If this fallback is the
+                # retry of an initial-overflow suffix, keep the already-visible
+                # prefix state; only the suffix remains pending. Otherwise allow
+                # the normal gateway final-send path to retry the full response.
+                if self._fallback_preserve_partial_messages and stale_message_id:
+                    self._already_sent = True
+                    self._message_id = stale_message_id
+                else:
+                    self._already_sent = False
+                    self._message_id = None
+                    self._last_sent_text = ""
                 self._fallback_prefix = ""
                 return
             sent_any_chunk = True
@@ -1170,6 +1301,7 @@ class GatewayStreamConsumer:
         backoff, etc.).  Drafts have no message_id and clear naturally on
         the client when the response finalizes via a regular sendMessage.
         """
+        text = self._clean_for_display(text)
         if self._draft_id is None:
             # Defensive: should never happen — _use_draft_streaming gate is
             # set in tandem with _draft_id in run().  Disable to be safe.
@@ -1489,7 +1621,12 @@ class GatewayStreamConsumer:
         )
 
     async def _send_or_edit(
-        self, text: str, *, finalize: bool = False, is_turn_final: bool = True,
+        self,
+        text: str,
+        *,
+        finalize: bool = False,
+        is_turn_final: bool = True,
+        partial: bool = False,
     ) -> bool:
         """Send or edit the streaming message.
 
@@ -1503,7 +1640,11 @@ class GatewayStreamConsumer:
         # Strip MEDIA: directives so they don't appear as visible text.
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
-        text = self._clean_for_display(text)
+        text = (
+            self._clean_for_stream_egress(text, final=False)
+            if partial
+            else self._clean_for_display(text)
+        )
         # A bare streaming cursor is not meaningful user-visible content and
         # can render as a stray tofu/white-box message on some clients.
         visible_without_cursor = text
@@ -1708,6 +1849,17 @@ class GatewayStreamConsumer:
                             self._already_sent = True
                             if getattr(result, "continuation_message_ids", ()):
                                 self._notify_new_message()
+                            return False
+
+                        if finalize and is_turn_final:
+                            # A trailing-token holdback can leave a real unsent
+                            # tail even when the preview edit exists. If the
+                            # final edit fails, bypass ordinary flood backoff and
+                            # send that continuation immediately rather than
+                            # claiming delivery or dropping the final word.
+                            self._fallback_prefix = self._visible_prefix()
+                            self._fallback_final_send = True
+                            self._fallback_preserve_partial_messages = False
                             return False
 
                         # Edit failed.  If this looks like flood control / rate

@@ -118,6 +118,169 @@ class TestDraftTransportSelection:
         assert consumer._resolve_draft_streaming() is False
 
 
+class TestStreamingEgressRedaction:
+    @staticmethod
+    def _sensitive_text():
+        token = f"{'A' * 24}.{'B' * 6}.{'C' * 30}"
+        return token, f"Credential: {token}\nCookie: sid=alpha"
+
+    @pytest.mark.asyncio
+    async def test_new_stream_chunk_is_force_redacted(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(adapter, "12345", StreamConsumerConfig())
+        token, text = self._sensitive_text()
+        await consumer._send_new_chunk(text, None)
+        sent = adapter.send.await_args.kwargs["content"]
+        assert token not in sent
+        assert "alpha" not in sent
+
+    @pytest.mark.asyncio
+    async def test_stream_edit_is_force_redacted(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(adapter, "12345", StreamConsumerConfig())
+        token, text = self._sensitive_text()
+        await consumer._edit_message(message_id="m1", content=text)
+        sent = adapter.edit_message.await_args.kwargs["content"]
+        assert token not in sent
+        assert "alpha" not in sent
+
+    @pytest.mark.asyncio
+    async def test_draft_frame_is_force_redacted(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(adapter, "12345", StreamConsumerConfig())
+        consumer._draft_id = 1
+        token, text = self._sensitive_text()
+        assert await consumer._send_draft_frame(text) is True
+        sent = adapter.draft_calls[-1]["content"]
+        assert token not in sent
+        assert "alpha" not in sent
+
+    @pytest.mark.asyncio
+    async def test_progressive_frames_never_expose_partial_discord_token(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(cursor="▉"),
+        )
+        token, _ = self._sensitive_text()
+
+        for end in range(1, len(token) + 1):
+            await consumer._send_or_edit(
+                f"Result {token[:end]}▉",
+                finalize=False,
+                partial=True,
+            )
+
+        payloads = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        payloads += [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+        assert payloads
+        assert all("A" * 8 not in payload for payload in payloads)
+        assert all("B" * 6 not in payload for payload in payloads)
+        assert all("C" * 8 not in payload for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_progressive_frames_never_expose_lowercase_token_prefix(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(cursor="▉"),
+        )
+        token = "z" * 24 + "." + "y" * 6 + "." + "x" * 30
+
+        for end in range(1, len(token) + 1):
+            await consumer._send_or_edit(
+                f"Result {token[:end]}▉",
+                finalize=False,
+                partial=True,
+            )
+
+        payloads = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        payloads += [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+        assert payloads
+        assert all("z" not in payload for payload in payloads)
+        assert all("y" * 2 not in payload for payload in payloads)
+        assert all("x" * 2 not in payload for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_progressive_private_key_is_held_until_complete_end_marker(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(cursor="▉"),
+        )
+        body = "MIIE" + "Z" * 96
+        key = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            + body
+            + "\n-----END PRIVATE KEY-----"
+        )
+
+        for end in range(1, len(key) + 1):
+            await consumer._send_or_edit(
+                key[:end] + "▉",
+                finalize=False,
+                partial=True,
+            )
+
+        payloads = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        payloads += [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+        assert payloads
+        assert all(body not in payload for payload in payloads)
+        assert all("Z" * 16 not in payload for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_complete_private_key_in_one_partial_frame_is_redacted_atomically(self):
+        adapter = _make_draft_capable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(cursor="▉"),
+        )
+        body = "MIIE" + "Q" * 96
+        key = (
+            "-----BEGIN PRIVATE" + " KEY-----\n"
+            + body
+            + "\n-----END PRIVATE" + " KEY-----"
+        )
+
+        await consumer._send_or_edit(
+            key + "▉",
+            finalize=False,
+            partial=True,
+        )
+
+        payloads = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        payloads += [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+        assert payloads
+        assert all(body not in payload for payload in payloads)
+        assert all("Q" * 16 not in payload for payload in payloads)
+
+    @pytest.mark.asyncio
+    async def test_final_overflow_is_redacted_before_chunk_split(self):
+        adapter = _make_draft_capable_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 600
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "12345",
+            StreamConsumerConfig(cursor=""),
+        )
+        token, _ = self._sensitive_text()
+        consumer.on_delta("x" * 489 + " " + token + " finished")
+        consumer.finish()
+
+        await consumer.run()
+
+        payloads = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        payloads += [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+        joined = "".join(payloads)
+        assert token not in joined
+        assert "A" * 24 not in joined
+        assert "C" * 30 not in joined
+
+
 class TestDraftStreamingHappyPath:
     """End-to-end: stream a few deltas in a DM, verify drafts animated and
     the final message was delivered as a real sendMessage."""
@@ -143,8 +306,9 @@ class TestDraftStreamingHappyPath:
         assert len(adapter.draft_calls) >= 1, (
             "expected at least one send_draft frame"
         )
-        # Final draft frame held the full accumulated text.
-        assert adapter.draft_calls[-1]["content"] == "Hello world!"
+        # Mid-stream drafts hold the unfinished trailing word so a credential
+        # cannot leak before its full token shape is available to redaction.
+        assert adapter.draft_calls[-1]["content"] == "Hello "
         # All draft frames in this run shared a single draft_id (animation).
         draft_ids = {c["draft_id"] for c in adapter.draft_calls}
         assert len(draft_ids) == 1
@@ -388,8 +552,9 @@ class TestAdapterPrefersFreshFinal:
         assert adapter.send.await_count == 2
         first_content = adapter.send.call_args_list[0].kwargs.get("content")
         second_content = adapter.send.call_args_list[1].kwargs.get("content")
-        # First update delivered the preview via adapter.send.
-        assert first_content == "Full answer here"
+        # The preview intentionally holds the unfinished trailing word; the
+        # fresh final send below carries the complete answer.
+        assert first_content == "Full answer "
         # Finalization re-sent the same completed content as a fresh message.
         assert second_content == "Full answer here"
 

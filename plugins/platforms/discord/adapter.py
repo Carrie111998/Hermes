@@ -4941,8 +4941,11 @@ class DiscordAdapter(BasePlatformAdapter):
             confirmed=False,
         )
         if result.get("success"):
+            message = "No outstanding items found — deleted this thread."
+            if result.get("warning"):
+                message += " The audit record could not be written; operators were notified."
             await interaction.followup.send(
-                "No outstanding items found — deleted this thread.",
+                message,
                 ephemeral=True,
             )
         else:
@@ -4954,8 +4957,13 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _fetch_done_thread_messages(self, thread: Any, limit: int = 100) -> list[Any]:
         """Fetch recent messages from a thread in chronological order for /done checks."""
         collected: list[Any] = []
+        raw_seen = 0
         saw_contentless_user_message = False
-        async for msg in thread.history(limit=limit, oldest_first=False):
+        # Fetch one extra raw message so a capped API window cannot silently
+        # declare a long thread safe even when system or /done messages are
+        # filtered from the readable-message list.
+        async for msg in thread.history(limit=limit + 1, oldest_first=False):
+            raw_seen += 1
             # Ignore Discord system noise; test doubles may not expose ``type``.
             msg_type = getattr(msg, "type", None)
             if msg_type is not None:
@@ -4971,6 +4979,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if content.strip().lower().startswith("/done"):
                 continue
             collected.append(msg)
+            if len(collected) > limit:
+                raise RuntimeError(
+                    f"This thread has more than {limit} readable messages; "
+                    "the /done safety scan was truncated, so automatic deletion was blocked."
+                )
+        if raw_seen > limit:
+            raise RuntimeError(
+                f"This thread has more than {limit} raw messages; "
+                "the /done safety scan was truncated, so automatic deletion was blocked."
+            )
         if saw_contentless_user_message:
             # If Discord lets us see user messages but not their text, deleting
             # would silently bypass the safety check. Fail closed even when
@@ -5033,6 +5051,7 @@ class DiscordAdapter(BasePlatformAdapter):
             "Verification/risk not clearly resolved": "Needs verification",
             "Recent failure/blocker may still be open": "Failure/blocker",
             "Unanswered question": "Unanswered question",
+            "Unreadable/attachment-only request": "Unreadable request",
         }
         compact: list[str] = []
         seen_sources: set[str] = set()
@@ -5099,6 +5118,8 @@ class DiscordAdapter(BasePlatformAdapter):
             r"(?<!/)\b(done|fixed|resolved|complete(?:d)?|verified|tested|passes?|passed|"
             r"succeeded|success|confirmed|implemented|changed|updated|patched|"
             r"improved|added|removed|revised|no outstanding|nothing outstanding|"
+            r"refactored|reworked|renamed|optimized|deleted|migrated|configured|"
+            r"documented|created|built|written|sent|delivered|finished|handled|"
             r"closed|merged|deployed|shipped|all set|looks good|works now|working now)\b",
             re.IGNORECASE,
         )
@@ -5128,6 +5149,18 @@ class DiscordAdapter(BasePlatformAdapter):
             r"\b(?:todo|to do|follow[- ]?up|next steps?|remaining)\s*:|"
             r"\b(?:still need|unresolved|blocked|blocker|pending|left outstanding|remaining)\b",
         )
+        request_re = re.compile(
+            r"(?im)(?:^|\n)\s*(?:[-*]\s*)?(?:"
+            r"please\s+[a-z][a-z0-9_-]*\b|"
+            r"(?:can|could|would|will)\s+you\b|"
+            r"(?:add|archive|backfill|benchmark|build|bump|change|check|clean|clone|"
+            r"configure|convert|copy|create|debug|delete|deploy|diagnose|disable|"
+            r"document|download|draft|edit|enable|extract|fix|generate|harden|"
+            r"implement|import|install|investigate|merge|migrate|move|notify|open|"
+            r"optimize|publish|rebuild|refactor|release|remove|rename|replace|review|"
+            r"revert|rewrite|rework|rotate|run|schedule|secure|send|simplify|start|"
+            r"stop|sync|test|update|upgrade|upload|validate|verify|wire|write)\b)"
+        )
 
         contents = [self._done_message_content(m) for m in messages]
         lowered = [c.lower() for c in contents]
@@ -5147,6 +5180,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 outstanding.append(item)
 
         for idx, (msg, content, _lower) in enumerate(zip(messages, contents, lowered)):
+            if self._done_message_is_unreadable_user_request(msg, content):
+                add("Unreadable/attachment-only request", content or "(unreadable message)")
+                continue
             if not content:
                 continue
             if self._done_message_is_bot(msg) and self._done_is_tool_progress_message(content):
@@ -5160,9 +5196,16 @@ class DiscordAdapter(BasePlatformAdapter):
                 resolution_re=resolution_re,
                 failure_re=failure_re,
             )
+            request_detail = self._done_request_signal_text(content, request_re)
             in_progress_detail = self._done_first_matching_segment(content, in_progress_re)
             failure_detail = self._done_open_failure_signal_text(content, failure_re=failure_re)
             resolved_later = self._done_has_later_resolution(messages, idx, content, resolution_re)
+            answered_later = self._done_has_later_reply(
+                messages,
+                idx,
+                content,
+                require_completion=bool(request_detail),
+            )
             verify_detail = self._done_verification_risk_signal_text(content, verify_re)
 
             # A message that is itself clearly reporting completion/verification
@@ -5181,7 +5224,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Emit at most one blocking finding per source message. Pick the
             # highest-signal reason so /done does not show the same excerpt as
             # TODO + verification + blocker noise.
-            if question_like and not self._done_has_later_reply(messages, idx):
+            if question_like and not answered_later:
                 add("Unanswered question", content)
             elif failure_detail and not resolved_later:
                 add("Recent failure/blocker may still be open", failure_detail)
@@ -5189,6 +5232,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 add("Work/check still in progress", in_progress_detail)
             elif open_task_detail and not resolved_later:
                 add("Possible unresolved item", open_task_detail)
+            elif request_detail and not (resolved_later or answered_later):
+                add("Possible unresolved item", request_detail)
             elif verify_detail and not resolution_re.search(content) and not resolved_later:
                 add("Verification/risk not clearly resolved", verify_detail)
 
@@ -5196,6 +5241,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 break
 
         return outstanding
+
+    def _done_message_is_unreadable_user_request(self, msg: Any, content: str) -> bool:
+        """Fail closed when a user's request is represented only by an attachment marker."""
+        if self._done_message_is_bot(msg):
+            return False
+        raw_content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
+        return bool(getattr(msg, "attachments", None)) and (
+            not str(raw_content).strip() or content.strip().lower() == "(attachment)"
+        )
 
     def _done_has_open_task_signal(
         self,
@@ -5266,6 +5320,40 @@ class DiscordAdapter(BasePlatformAdapter):
             if pattern.search(segment):
                 return segment
         return content.strip() or None
+
+    def _done_request_signal_text(self, content: str, pattern: re.Pattern[str]) -> str | None:
+        """Return an imperative/request segment while rejecting common chat headings and nouns."""
+        if not pattern.search(content):
+            return None
+        ordinary_bare_action_re = re.compile(
+            r"^(?:update\s*:|change\s+(?:is|was|seems?|looks?)\b|"
+            r"(?:build|deployment)\s+status\b|release\s+notes?\b|review\s+summary\b|"
+            r"run\s+times?\b|test\s+results?\b)",
+            re.IGNORECASE,
+        )
+        for segment in self._done_signal_segments(content):
+            if not pattern.search(segment):
+                continue
+            stripped = re.sub(r"^\s*[-*]\s*", "", segment).strip()
+            if re.match(r"^(?:please\b|(?:can|could|would|will)\s+you\b)", stripped, re.IGNORECASE):
+                return segment
+            if ordinary_bare_action_re.search(stripped):
+                continue
+            # ``open`` is commonly an adjective or noun at the start of an
+            # ordinary declarative sentence ("Open source software is useful",
+            # "Open issues are tracked"). A bare command has an introduced or
+            # visibly delimited direct object; fail conservatively when that
+            # grammatical evidence is absent instead of treating every leading
+            # ``Open`` as an imperative.
+            if re.match(r"^open\b", stripped, re.IGNORECASE) and not re.match(
+                r"^open\s+(?:(?:the|a|an|this|that|these|those|my|your|our|their|"
+                r"his|her|its)\b|[`'\"/#~.])",
+                stripped,
+                re.IGNORECASE,
+            ):
+                continue
+            return segment
+        return None
 
     def _done_verification_risk_signal_text(self, content: str, pattern: re.Pattern[str]) -> str | None:
         """Return verification-risk text, excluding TDD/process proof."""
@@ -5438,13 +5526,43 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         )
 
-    def _done_has_later_reply(self, messages: list[Any], idx: int) -> bool:
+    def _done_has_later_reply(
+        self,
+        messages: list[Any],
+        idx: int,
+        content: str,
+        *,
+        require_completion: bool = False,
+    ) -> bool:
         asker_id = self._done_message_author_id(messages[idx])
+        completion_re = re.compile(
+            r"\b(?:done|completed?|implemented|updated|fixed|resolved|handled|"
+            r"finished|deployed|sent|created|added|removed|changed|verified|"
+            r"refactored|reworked|renamed|optimized|deleted|migrated|configured|"
+            r"documented|built|written|delivered|passed|succeeded)\b",
+            re.IGNORECASE,
+        )
         for later in messages[idx + 1:]:
-            content = self._done_message_content(later)
-            if not content or self._done_is_tool_progress_message(content):
+            later_content = self._done_message_content(later)
+            if not later_content or self._done_is_tool_progress_message(later_content):
                 continue
-            if self._done_message_author_id(later) != asker_id or self._done_message_is_bot(later):
+            if self._done_message_author_id(later) == asker_id and not self._done_message_is_bot(later):
+                continue
+            # Replies only close an earlier item when they explicitly resolve
+            # the thread or plausibly answer its subject. For imperative
+            # requests, topic overlap alone is insufficient: require a concrete
+            # completion signal, compatible action, and shared subject evidence.
+            if self._done_resolution_is_negated(later_content):
+                continue
+            if self._done_is_global_resolution_message(later_content):
+                return True
+            if require_completion:
+                if not completion_re.search(later_content):
+                    continue
+                if self._done_resolution_matches_open_item(content, later_content):
+                    return True
+                continue
+            if self._done_content_overlaps(content, later_content):
                 return True
         return False
 
@@ -5458,8 +5576,8 @@ class DiscordAdapter(BasePlatformAdapter):
         """Return True only when later text plausibly resolves this item.
 
         A generic later "done" message is not enough: it may refer to a
-        different subtask.  Either the resolution must be a global closeout
-        phrase or it must share meaningful words with the open item.
+        different subtask.  Either the resolution must be an unqualified global
+        closeout phrase or it must match both the requested action and subject.
         """
         for later in messages[idx + 1:]:
             later_content = self._done_message_content(later)
@@ -5467,9 +5585,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
             if not resolution_re.search(later_content):
                 continue
+            if self._done_resolution_is_negated(later_content):
+                continue
             if self._done_is_global_resolution_message(later_content):
                 return True
-            if self._done_content_overlaps(content, later_content):
+            if self._done_resolution_matches_open_item(content, later_content):
                 return True
         return False
 
@@ -5492,8 +5612,81 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         )
 
+    def _done_resolution_is_negated(self, content: str) -> bool:
+        """Reject completion words that are negated or followed by open-work qualifiers."""
+        return self._done_resolution_is_qualified(content) or bool(
+            re.search(
+                r"\b(?:not|never|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
+                r"hasn['’]?t|haven['’]?t|hadn['’]?t|didn['’]?t|doesn['’]?t|"
+                r"can['’]?t|cannot)\b.{0,40}\b(?:done|complete(?:d)?|implemented|"
+                r"updated|fixed|resolved|handled|finished|deployed|sent|created|"
+                r"added|removed|changed|verified|passed|succeeded|refactored|reworked|"
+                r"renamed|optimized|deleted|migrated|configured|documented|built|"
+                r"written|delivered)\b",
+                content,
+                re.IGNORECASE | re.DOTALL,
+            )
+        )
+
+    def _done_resolution_is_qualified(self, content: str) -> bool:
+        """Return True when a closeout carves out exceptions or remaining work."""
+        completion_re = re.compile(
+            r"(?<!/)\b(?:done|complete(?:d)?|fixed|resolved|implemented|updated|"
+            r"handled|finished|verified|passed|succeeded|refactored|reworked|renamed|"
+            r"optimized|deleted|removed|migrated|configured|documented|created|built|"
+            r"written|sent|delivered|deployed|shipped|no outstanding|"
+            r"nothing outstanding|nothing open|all set|works? now)\b",
+            re.IGNORECASE,
+        )
+        exception_re = re.compile(
+            r"\b(?:except(?:\s+for)?|apart\s+from|other\s+than|save\s+for|"
+            r"with\s+the\s+exception\s+of)\b",
+            re.IGNORECASE,
+        )
+        open_work_re = re.compile(
+            r"\b(?:still\s+(?:need(?:s)?\s+to|pending|open|unfinished|incomplete|"
+            r"unresolved|outstanding)|need(?:s)?\s+to|left\s+to\s+do|todo|"
+            r"follow[- ]?up|pending|remaining|outstanding|unfinished|incomplete|"
+            r"unresolved|remains?(?:\s+(?:pending|open|unfinished|incomplete|unresolved|"
+            r"outstanding|to\s+be\s+(?:done|complete(?:d)?|finished|handled|resolved)))?"
+            r"(?=[\s.!?]*$)|not\s+(?:actually\s+)?(?:done|complete(?:d)?|"
+            r"fixed|resolved|implemented|finished|refactored|reworked|renamed|optimized|"
+            r"deleted|migrated|configured|documented|built|written|delivered|deployed)|"
+            r"not\s+yet)\b",
+            re.IGNORECASE,
+        )
+        closed_open_work_re = re.compile(
+            r"\b(?:no\s+longer|not\s+anymore)\s+(?:blocked|pending|open|remaining|"
+            r"outstanding|unfinished|incomplete|unresolved)|"
+            r"\b(?:no|nothing|none)\s+(?:is\s+)?(?:pending|remaining|outstanding|open)|"
+            r"\b(?:no\s+(?:\w+\s+){0,2}|nothing\s+)remains?\b|"
+            r"\bnot\s+(?:blocked|pending)\b",
+            re.IGNORECASE,
+        )
+
+        # Qualifiers can precede or follow the closeout clause. Establish that
+        # the whole reply contains completion evidence first, then inspect every
+        # clause rather than only clauses after the first completion word.
+        if not completion_re.search(content):
+            return False
+        for segment in self._done_signal_segments(content):
+            if exception_re.search(segment):
+                return True
+            if re.search(r"\bwhat changed\b|\bchanged\s*:", segment, re.IGNORECASE):
+                continue
+            without_closed_phrases = closed_open_work_re.sub("", segment)
+            without_closed_phrases = re.sub(
+                r"\bremaining\s+(?:risk|caveats?)\s*:?",
+                "",
+                without_closed_phrases,
+                flags=re.IGNORECASE,
+            )
+            if open_work_re.search(without_closed_phrases):
+                return True
+        return False
+
     def _done_is_global_resolution_message(self, content: str) -> bool:
-        return bool(
+        return not self._done_resolution_is_negated(content) and bool(
             re.search(
                 r"\b(no outstanding|nothing outstanding|nothing open|all set|all done|"
                 r"everything (?:is )?(?:done|resolved|complete)|thread (?:is )?(?:done|resolved|complete))\b",
@@ -5502,8 +5695,118 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         )
 
+    def _done_resolution_matches_open_item(self, open_content: str, resolution_content: str) -> bool:
+        """Require compatible action and concrete subject evidence for a closeout."""
+        if self._done_resolution_is_negated(resolution_content):
+            return False
+
+        open_subjects = self._done_subject_keyword_set(open_content)
+        resolution_subjects = self._done_subject_keyword_set(resolution_content)
+        common_subjects = open_subjects & resolution_subjects
+        if any(word.startswith("slash:") for word in common_subjects):
+            has_subject_evidence = True
+        else:
+            # Broad overlap such as ``production database`` must not prove that
+            # a specific ``production database backup schedule`` was handled.
+            # The resolution may add detail, but it cannot silently substitute
+            # another object named by the request.
+            has_subject_evidence = bool(open_subjects) and open_subjects <= resolution_subjects
+        if not has_subject_evidence:
+            return False
+
+        requested_actions = self._done_governing_action_families(open_content)
+        resolution_actions = self._done_governing_action_families(resolution_content)
+        if not requested_actions or not resolution_actions:
+            # Generic "done/finished/handled" closeouts carry no contradictory
+            # action, so strong subject evidence is sufficient for them.
+            return True
+        return bool(requested_actions & resolution_actions)
+
     def _done_content_overlaps(self, open_content: str, resolution_content: str) -> bool:
-        return bool(self._done_keyword_set(open_content) & self._done_keyword_set(resolution_content))
+        common = self._done_keyword_set(open_content) & self._done_keyword_set(resolution_content)
+        return len(common) >= 2 or any(word.startswith("slash:") for word in common)
+
+    def _done_subject_keyword_set(self, content: str) -> set[str]:
+        """Return meaningful non-action words used to identify a request's subject."""
+        keywords = self._done_keyword_set(content)
+        for word in re.findall(r"[a-zA-Z0-9]+", content.lower()):
+            if self._done_action_families(word):
+                keywords.discard(self._done_normalize_keyword(word))
+        for word in (
+            "complete", "completed", "done", "finish", "finished", "handle", "handled",
+            "pass", "passed", "resolve", "resolved", "success", "succeeded",
+        ):
+            keywords.discard(self._done_normalize_keyword(word))
+        return keywords
+
+    def _done_governing_action_families(self, content: str) -> set[str]:
+        """Return action families for leading request or closeout verbs only."""
+        governing_action_re = re.compile(
+            r"^\s*(?:[-*]\s*)?"
+            r"(?:(?:all\s+)?(?:done|complete(?:d)?|finished|handled|resolved)\s*[-—:]\s*)?"
+            r"(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|"
+            r"(?:(?:i|we|you|they)\s+)?(?:need|needs|want|wants)\s+to\s+)*"
+            r"(?:successfully\s+)?(?P<action>[a-z]+)"
+            r"(?:\s+(?:and|then)\s+(?P<next_action>[a-z]+))?\b",
+            re.IGNORECASE,
+        )
+        for segment in self._done_signal_segments(content):
+            match = governing_action_re.match(segment)
+            if match is None:
+                continue
+            families: set[str] = set()
+            for group_name in ("action", "next_action"):
+                action = match.group(group_name)
+                if action:
+                    families.update(self._done_action_families(action))
+            if families:
+                return families
+        return set()
+
+    def _done_action_families(self, content: str) -> set[str]:
+        """Map common request/closeout action paraphrases into compatibility families."""
+        action_patterns = {
+            "construct": (
+                r"add(?:ed|ing)?|build(?:s|ing)?|built|creat(?:e|ed|ing)|implement(?:ed|ing)?"
+            ),
+            "modify": (
+                r"chang(?:e|ed|ing)|debug(?:ged|ging)?|edit(?:ed|ing)?|fix(?:ed|ing)?|"
+                r"implement(?:ed|ing)?|improv(?:e|ed|ing)|optim(?:ize|ized|izing)|"
+                r"patch(?:ed|ing)?|refactor(?:ed|ing)?|renam(?:e|ed|ing)|"
+                r"replac(?:e|ed|ing)|revis(?:e|ed|ing)|rewrit(?:e|ten|ing)|"
+                r"rework(?:ed|ing)?|updat(?:e|ed|ing)"
+            ),
+            "delete": (
+                r"delet(?:e|ed|ing|ion)|drop(?:ped|ping)?|eras(?:e|ed|ing)|"
+                r"purg(?:e|ed|ing)|remov(?:e|ed|ing|al)"
+            ),
+            "inspect": (
+                r"audit(?:ed|ing)?|benchmark(?:ed|ing)?|check(?:ed|ing)?|confirm(?:ed|ing)?|"
+                r"diagnos(?:e|ed|ing)|inspect(?:ed|ing)?|investigat(?:e|ed|ing)|"
+                r"review(?:ed|ing)?|test(?:ed|ing)?|validat(?:e|ed|ing)|verif(?:y|ied|ying)"
+            ),
+            "deploy": (
+                r"deploy(?:ed|ing)?|publish(?:ed|ing)?|releas(?:e|ed|ing)|"
+                r"ship(?:ped|ping)?|roll(?:ed|ing)?\s*out"
+            ),
+            "transfer": (
+                r"backfill(?:ed|ing)?|cop(?:y|ied|ying)|download(?:ed|ing)?|export(?:ed|ing)?|"
+                r"import(?:ed|ing)?|migrat(?:e|ed|ing|ion)|mov(?:e|ed|ing)|"
+                r"sync(?:ed|ing)?|upload(?:ed|ing)?"
+            ),
+            "configure": r"configur(?:e|ed|ing|ation)|install(?:ed|ing)?|set\s*up|wir(?:e|ed|ing)",
+            "document": r"document(?:ed|ing|ation)?|draft(?:ed|ing)?|writ(?:e|ten|ing)|wrote",
+            "communicate": r"deliver(?:ed|ing)?|notif(?:y|ied|ying)|send(?:ing)?|sent",
+            "execute": r"execut(?:e|ed|ing)|launch(?:ed|ing)?|run|running|ran|schedul(?:e|ed|ing)|start(?:ed|ing)?",
+            "enable": r"activat(?:e|ed|ing)|enable(?:d|ing)?",
+            "disable": r"deactivat(?:e|ed|ing)|disable(?:d|ing)?|stop(?:ped|ping)?",
+            "archive": r"archiv(?:e|ed|ing)",
+        }
+        return {
+            family
+            for family, pattern in action_patterns.items()
+            if re.search(rf"\b(?:{pattern})\b", content, re.IGNORECASE)
+        }
 
     def _done_keyword_set(self, content: str) -> set[str]:
         stopwords = {
@@ -5512,7 +5815,10 @@ class DiscordAdapter(BasePlatformAdapter):
             "please", "should", "that", "this", "thread", "want", "what", "when",
             "where", "whether", "with", "work", "works", "would", "you", "your",
         }
-        keywords: set[str] = set()
+        keywords: set[str] = {
+            f"slash:{command.lower()}"
+            for command in re.findall(r"/([a-zA-Z0-9_-]+)", content)
+        }
         for word in re.findall(r"[a-zA-Z0-9]+", content.lower()):
             if len(word) < 4 or word in stopwords:
                 continue
@@ -5541,7 +5847,19 @@ class DiscordAdapter(BasePlatformAdapter):
         outstanding_items: list[str],
         confirmed: bool,
     ) -> Dict[str, Any]:
-        """Write /done audit outside the target thread, then delete it."""
+        """Delete the thread, then write a truthful success audit outside it."""
+        try:
+            display_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
+            reason = (
+                "/done requested in private thread"
+                if self._done_thread_is_private(thread)
+                else f"/done requested by {display_name}"
+            )
+            await thread.delete(reason=reason)
+        except Exception as exc:
+            logger.warning("[%s] /done thread delete failed: %s", self.name, exc, exc_info=True)
+            return {"success": False, "error": str(exc)}
+
         try:
             await self._send_done_audit(
                 thread=thread,
@@ -5550,16 +5868,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 confirmed=confirmed,
             )
         except Exception as exc:
-            logger.warning("[%s] /done audit failed before delete: %s", self.name, exc, exc_info=True)
-            return {"success": False, "error": f"could not save /done audit: {exc}"}
-
-        try:
-            display_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
-            await thread.delete(reason=f"/done requested by {display_name}")
-            return {"success": True}
-        except Exception as exc:
-            logger.warning("[%s] /done thread delete failed: %s", self.name, exc, exc_info=True)
-            return {"success": False, "error": str(exc)}
+            # The requested deletion succeeded. Do not report that it failed or
+            # tempt the caller to retry an irreversible action; surface the
+            # audit failure separately for operators.
+            logger.warning("[%s] /done audit failed after delete: %s", self.name, exc, exc_info=True)
+            return {"success": True, "warning": f"thread deleted but audit failed: {exc}"}
+        return {"success": True}
 
     async def _send_done_audit(
         self,
@@ -5582,9 +5896,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
         text = self._format_done_audit(thread, acting_user, outstanding_items, confirmed)
         if self._is_forum_parent(parent):
+            audit_thread_name = (
+                "/done audit: private thread"
+                if self._done_thread_is_private(thread)
+                else f"/done audit: {getattr(thread, 'name', 'thread')}"
+            )
             result = await self._forum_post_file(
                 parent,
-                thread_name=f"/done audit: {getattr(thread, 'name', 'thread')}",
+                thread_name=audit_thread_name,
                 content=text,
             )
             if getattr(result, "success", False) is False:
@@ -5596,6 +5915,19 @@ class DiscordAdapter(BasePlatformAdapter):
             raise RuntimeError("parent channel cannot receive audit messages")
         await send(text)
 
+    def _done_thread_is_private(self, thread: Any) -> bool:
+        """Return whether a Discord thread has private-thread visibility."""
+        type_value = getattr(getattr(thread, "type", None), "value", getattr(thread, "type", None))
+        if type_value == 12 or str(type_value).lower() == "private_thread":
+            return True
+        probe = getattr(thread, "is_private", None)
+        if callable(probe):
+            try:
+                return bool(probe())
+            except Exception:
+                return False
+        return False
+
     def _format_done_audit(
         self,
         thread: Any,
@@ -5603,11 +5935,20 @@ class DiscordAdapter(BasePlatformAdapter):
         outstanding_items: list[str],
         confirmed: bool,
     ) -> str:
-        thread_name = getattr(thread, "name", None) or "thread"
-        thread_id = str(getattr(thread, "id", "?"))
         user_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
         user_id = str(getattr(acting_user, "id", "?"))
         ts = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
+        if self._done_thread_is_private(thread):
+            return "\n".join([
+                "`/done` deleted a private thread (details withheld)",
+                f"Deleted at: {ts}",
+                "Invoking member: withheld for private-thread confidentiality",
+                "Outstanding check: details withheld for private-thread confidentiality",
+                f"Deleted after confirmation: {'yes' if confirmed else 'not needed'}",
+            ])
+
+        thread_name = getattr(thread, "name", None) or "thread"
+        thread_id = str(getattr(thread, "id", "?") )
         compact_items = self._compact_done_outstanding_items(
             outstanding_items,
             detail_max_length=140,
@@ -6249,15 +6590,27 @@ class DiscordAdapter(BasePlatformAdapter):
             # returned private bot-owned threads for /architect even when the type
             # kwarg was set to public_thread. Create from a visible starter
             # message instead; Discord's message-thread endpoint creates public
-            # threads, which are listable in the channel sidebar.
+            # threads, which are listable in the channel sidebar. Forum channels
+            # create their public post and starter message atomically.
             try:
                 seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
-                seed_msg = await parent_channel.send(seed_content)
-                thread = await seed_msg.create_thread(
-                    name=name,
-                    auto_archive_duration=auto_archive_duration,
-                    reason=reason,
-                )
+                if self._is_forum_parent(parent_channel):
+                    created = await parent_channel.create_thread(
+                        name=name,
+                        content=seed_content,
+                        auto_archive_duration=auto_archive_duration,
+                        reason=reason,
+                    )
+                    thread = created if hasattr(created, "send") else getattr(created, "thread", None)
+                    if thread is None:
+                        raise RuntimeError("forum create_thread returned no thread object")
+                else:
+                    seed_msg = await parent_channel.send(seed_content)
+                    thread = await seed_msg.create_thread(
+                        name=name,
+                        auto_archive_duration=auto_archive_duration,
+                        reason=reason,
+                    )
                 await self._add_thread_requester(thread, interaction)
                 return {
                     "success": True,
@@ -8151,8 +8504,11 @@ def _define_discord_view_classes() -> None:
                 confirmed=True,
             )
             if result.get("success"):
+                message = "Deleted this thread."
+                if result.get("warning"):
+                    message += " The audit record could not be written; operators were notified."
                 try:
-                    await interaction.followup.send("Deleted this thread.", ephemeral=True)
+                    await interaction.followup.send(message, ephemeral=True)
                 except Exception:
                     pass
             else:

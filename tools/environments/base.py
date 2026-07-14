@@ -384,18 +384,15 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Let mktemp allocate a unique file in the snapshot's directory.
+        # BASHPID is unavailable in macOS's bundled Bash 3.2, while $$ is not
+        # unique in background subshells.  A six-X template works with both
+        # BSD and GNU mktemp and keeps the final mv on the same filesystem.
+        _snap_template = shlex.quote(self._snapshot_path + ".tmp.XXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
         bootstrap = (
             f"umask 077\n"
+            f"__hermes_snap_tmp=$(mktemp {_snap_template}) || exit 125\n"
             f"export -p > {_snap_tmp}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
@@ -475,11 +472,10 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shlex-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file. mktemp is portable to macOS Bash 3.2;
+        # BASHPID is not, and $$ is shared by background subshells.
+        _snap_template = shlex.quote(self._snapshot_path + ".tmp.XXXXXX")
+        _snap_tmp = '"$__hermes_snap_tmp"'
 
         parts = []
 
@@ -513,8 +509,10 @@ class BaseEnvironment(ABC):
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
         if self._snapshot_ready:
             parts.append(
-                f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"if __hermes_snap_tmp=$(mktemp {_snap_template}); then\n"
+                f"  {{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_quoted_snap}; }} "
+                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true\n"
+                "fi"
             )
 
         # Write CWD to file (local reads this) and stdout marker (remote parses this)

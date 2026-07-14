@@ -436,16 +436,19 @@ def test_s6_manager_kind_and_supports_registration() -> None:
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+def test_seed_supervise_skeleton_creates_expected_layout(tmp_path, monkeypatch) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
+    import os
     import stat
+    import hermes_cli.service_manager as service_manager
 
-    from hermes_cli.service_manager import _seed_supervise_skeleton
+    monkeypatch.setattr(service_manager, "_HERMES_UID", os.getuid())
+    monkeypatch.setattr(service_manager, "_HERMES_GID", os.getgid())
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
 
-    _seed_supervise_skeleton(svc_dir)
+    service_manager._seed_supervise_skeleton(svc_dir)
 
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
@@ -473,22 +476,25 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     assert stat.S_IMODE(control.stat().st_mode) == 0o660
 
 
-def test_seed_supervise_skeleton_handles_log_subservice(tmp_path) -> None:
+def test_seed_supervise_skeleton_handles_log_subservice(tmp_path, monkeypatch) -> None:
     """When a log/ subdir exists, its supervise tree also gets seeded.
 
     Without this, ``unregister_profile_gateway``'s rmtree would EACCES
     on the logger's root-owned supervise dir even after the parent
     slot's supervise/ was hermes-owned.
     """
+    import os
     import stat
+    import hermes_cli.service_manager as service_manager
 
-    from hermes_cli.service_manager import _seed_supervise_skeleton
+    monkeypatch.setattr(service_manager, "_HERMES_UID", os.getuid())
+    monkeypatch.setattr(service_manager, "_HERMES_GID", os.getgid())
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
     (svc_dir / "log").mkdir()  # logger subdir present
 
-    _seed_supervise_skeleton(svc_dir)
+    service_manager._seed_supervise_skeleton(svc_dir)
 
     # Logger's own supervise tree is seeded the same way.
     log_event = svc_dir / "log" / "event"

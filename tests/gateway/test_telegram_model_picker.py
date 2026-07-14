@@ -32,6 +32,7 @@ def _ensure_telegram_mock():
 _ensure_telegram_mock()
 
 from gateway.config import PlatformConfig
+from plugins.platforms.telegram import adapter as telegram_adapter_mod
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -67,7 +68,7 @@ class TestTelegramModelPicker:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        assert sent["parse_mode"] is telegram_adapter_mod.ParseMode.MARKDOWN_V2
         assert "provider\\_one" in sent["text"]
         assert "`model_1`" in sent["text"]
 
@@ -94,7 +95,7 @@ class TestTelegramModelPicker:
         await adapter._handle_model_picker_callback(query, "mb", "12345")
 
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        assert edit_kwargs["parse_mode"] is telegram_adapter_mod.ParseMode.MARKDOWN_V2
         assert "provider\\_one" in edit_kwargs["text"]
         assert "`model_1`" in edit_kwargs["text"]
 
@@ -132,7 +133,7 @@ class TestTelegramModelPicker:
         callback.assert_awaited_once()
         query.edit_message_text.assert_awaited()
         edit_kwargs = query.edit_message_text.call_args[1]
-        assert "MARKDOWN_V2" in repr(edit_kwargs["parse_mode"])
+        assert edit_kwargs["parse_mode"] is telegram_adapter_mod.ParseMode.MARKDOWN_V2
         assert "`gpt-5`" in edit_kwargs["text"]
         assert "12345" not in adapter._model_picker_state
 

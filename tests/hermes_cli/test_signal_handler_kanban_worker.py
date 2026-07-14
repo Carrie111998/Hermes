@@ -154,7 +154,9 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         # is immediate. Give generous headroom for slow CI runners.
         deadline = t0 + 2.0
         while time.time() < deadline:
-            if not _is_alive_like_dispatcher(proc.pid):
+            # poll() reaps an exited child on every POSIX platform.  A raw
+            # kill(pid, 0) probe reports an unreaped zombie as alive on macOS.
+            if proc.poll() is not None:
                 elapsed = time.time() - t0
                 assert elapsed < 2.0
                 return

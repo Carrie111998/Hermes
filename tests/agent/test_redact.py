@@ -1,9 +1,12 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import json
 import logging
+import time
 
 import pytest
 
+from agent import redact as redact_module
 from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 
@@ -622,6 +625,22 @@ class TestDiscordCredentialRedaction:
 
 
 class TestCookieHeaders:
+    @pytest.mark.parametrize(
+        ("text", "key"),
+        [
+            (r'{"\u0043ookie":"sid=ALPHA_SECRET"}', "Cookie"),
+            (
+                r'{"\u0053et-\u0043ookie":"sid=ALPHA_SECRET; Path=/"}',
+                "Set-Cookie",
+            ),
+        ],
+    )
+    def test_unicode_escaped_cookie_alias_reaches_json_scanner(self, text, key):
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert json.loads(out)[key].startswith("sid=***")
+
     def test_cookie_masks_every_value_and_preserves_names_and_delimiters(self):
         text = "Cookie: session=alpha; theme=dark; empty="
         assert redact_sensitive_text(text, force=True) == (
@@ -680,6 +699,458 @@ class TestCookieHeaders:
             "set-cookie: session=\"***\"; Path=/; SameSite=None; Secure"
         )
 
+    def test_set_cookie_masks_each_comma_combined_cookie_value(self):
+        text = (
+            "Set-Cookie: a=alpha; Path=/, b=beta; Path=/; "
+            "Expires=Wed, 09 Jul 2026 10:00:00 GMT"
+        )
+        out = redact_sensitive_text(text, force=True)
+        assert "alpha" not in out
+        assert "beta" not in out
+        assert out == (
+            "Set-Cookie: a=***; Path=/, b=***; Path=/; "
+            "Expires=Wed, 09 Jul 2026 10:00:00 GMT"
+        )
+
+    def test_cookie_json_value_may_start_on_following_line(self):
+        text = '{"Cookie":\n "session=alpha; theme=dark", "ok": true}'
+        out = redact_sensitive_text(text, force=True)
+        assert "alpha" not in out
+        assert "dark" not in out
+        assert json.loads(out)["Cookie"] == "session=***; theme=***"
+
+    def test_cookie_json_list_values_stay_valid_and_are_all_masked(self):
+        text = '{"Cookie": ["a=alpha", "b=beta"], "ok": true}'
+        out = redact_sensitive_text(text, force=True)
+        assert "alpha" not in out
+        assert "beta" not in out
+        assert json.loads(out)["Cookie"] == ["a=***", "b=***"]
+
+    def test_folded_cookie_continuation_is_masked(self):
+        text = "Cookie: a=alpha;\r\n b=beta"
+        out = redact_sensitive_text(text, force=True)
+        assert "alpha" not in out
+        assert "beta" not in out
+
+    def test_malformed_opaque_cookie_value_fails_closed(self):
+        text = "Cookie: opaque-secret-without-equals"
+        out = redact_sensitive_text(text, force=True)
+        assert "opaque-secret-without-equals" not in out
+
+    @pytest.mark.parametrize("value", [123456789, None, {"sid": "alpha"}])
+    def test_cookie_json_non_string_values_stay_valid_and_fail_closed(self, value):
+        text = json.dumps({"Cookie": value, "ok": True})
+        out = redact_sensitive_text(text, force=True)
+        parsed = json.loads(out)
+        assert parsed["Cookie"] == "***"
+        assert parsed["ok"] is True
+        assert "alpha" not in out
+
+    def test_cookie_json_list_non_string_values_fail_closed(self):
+        text = '{"Cookie": [123456789, "a=alpha"], "ok": true}'
+        out = redact_sensitive_text(text, force=True)
+        assert json.loads(out)["Cookie"] == ["***", "a=***"]
+
+    def test_cookie_header_object_also_walks_sibling_and_nested_fields(self):
+        text = (
+            '{"name":"Cookie","value":"sid=alpha",'
+            '"nested":{"Cookie":"admin=beta"}}'
+        )
+
+        parsed = json.loads(redact_sensitive_text(text, force=True))
+
+        assert parsed["value"] == "sid=***"
+        assert parsed["nested"]["Cookie"] == "admin=***"
+
+    def test_cookie_header_object_redacts_every_same_level_cookie_key(self):
+        text = (
+            '{"name":"Cookie","value":"sid=alpha","Cookie":"admin=beta",'
+            '"Set-Cookie":"refresh=gamma",'
+            '"nested":{"Cookie":"deep=delta"}}'
+        )
+
+        parsed = json.loads(redact_sensitive_text(text, force=True))
+
+        assert parsed["value"] == "sid=***"
+        assert parsed["Cookie"] == "admin=***"
+        assert parsed["Set-Cookie"] == "refresh=***"
+        assert parsed["nested"]["Cookie"] == "deep=***"
+
+    def test_embedded_cookie_header_object_preserves_surrounding_text(self):
+        text = 'prefix {"name":"Cookie","value":"sid=alpha"} suffix'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith("prefix ")
+        assert out.endswith(" suffix")
+        assert "alpha" not in out
+        assert json.loads(out.removeprefix("prefix ").removesuffix(" suffix")) == {
+            "name": "Cookie",
+            "value": "sid=***",
+        }
+
+    def test_cookie_header_object_masks_duplicate_case_value_aliases(self):
+        text = (
+            '{"name":"Cookie","value":"sid=alpha",'
+            '"Value":"sid=beta"}'
+        )
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "alpha" not in out
+        assert "beta" not in out
+        assert json.loads(out) == {
+            "name": "Cookie",
+            "value": "sid=***",
+            "Value": "sid=***",
+        }
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"name":"Cookie","name":"Other","value":"sid=ALPHA_SECRET"}',
+            '{"header":"Cookie","header":"Other","value":"sid=ALPHA_SECRET"}',
+            (
+                '{"outer":{"header_name":"Cookie","header_name":"Other",'
+                '"value":"sid=ALPHA_SECRET"}}'
+            ),
+            (
+                '[{"name":"Cookie","value":"sid=ALPHA_SECRET",'
+                '"value":"benign=ok"}]'
+            ),
+        ],
+    )
+    def test_duplicate_exact_header_aliases_fail_closed_per_candidate(self, text):
+        wrapped = f"before {text} after"
+
+        out = redact_sensitive_text(wrapped, force=True)
+
+        assert out.startswith("before ")
+        assert out.endswith(" after")
+        assert "ALPHA_SECRET" not in out
+        assert "redacted cookie json" in out.lower()
+
+    @pytest.mark.parametrize(
+        "embedded",
+        [
+            ["Cookie", "sid=ALPHA_SECRET"],
+            {"Cookie": "sid=ALPHA_SECRET"},
+        ],
+    )
+    def test_valid_json_string_value_is_recursively_redacted(self, embedded):
+        text = json.dumps({"payload": json.dumps(embedded)})
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        decoded = json.loads(json.loads(out)["payload"])
+        if isinstance(decoded, list):
+            assert decoded == ["Cookie", "sid=***"]
+        else:
+            assert decoded == {"Cookie": "sid=***"}
+
+    def test_top_level_json_string_value_is_recursively_redacted(self):
+        text = json.dumps(
+            json.dumps({"Cookie": "sid=ALPHA_SECRET"}, separators=(",", ":"))
+        )
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert json.loads(json.loads(out)) == {"Cookie": "sid=***"}
+
+    def test_top_level_json_string_with_unicode_escaped_opener_is_redacted(self):
+        text = r'"\u007b\"Cookie\":\"sid=ALPHA_SECRET\"}"'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert json.loads(json.loads(out)) == {"Cookie": "sid=***"}
+
+    def test_top_level_json_string_with_escaped_leading_whitespace_is_redacted(self):
+        text = r'"\n\t {\"Cookie\":\"sid=ALPHA_SECRET\"}"'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert json.loads(json.loads(out)) == {"Cookie": "sid=***"}
+
+    def test_top_level_json_string_finds_cookie_only_in_nested_encoded_layer(self):
+        inner = json.dumps({"Cookie": "sid=ALPHA_SECRET"}, separators=(",", ":"))
+        middle = json.dumps({"payload": inner}, separators=(",", ":"))
+        text = json.dumps(middle)
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        middle_out = json.loads(json.loads(out))
+        assert json.loads(middle_out["payload"]) == {"Cookie": "sid=***"}
+
+    def test_quoted_escaped_cookie_json_snippet_in_prose_is_redacted(self):
+        snippet = json.dumps(
+            json.dumps({"Cookie": "sid=ALPHA_SECRET"}, separators=(",", ":"))
+        )
+        text = f"before {snippet} after"
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith("before ")
+        assert out.endswith(" after")
+        assert "ALPHA_SECRET" not in out
+        redacted_snippet = out.removeprefix("before ").removesuffix(" after")
+        assert json.loads(json.loads(redacted_snippet)) == {"Cookie": "sid=***"}
+
+    def test_malformed_quoted_escaped_cookie_json_header_is_redacted(self):
+        text = r'before "{\"Cookie\":\"sid=ALPHA_SECRET\"" after'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert "sid=***" in out
+
+    def test_over_depth_valid_embedded_json_fails_closed(self):
+        embedded = "[" * (redact_module._COOKIE_JSON_MAX_DEPTH + 1)
+        embedded += '["Cookie","sid=ALPHA_SECRET"]'
+        embedded += "]" * (redact_module._COOKIE_JSON_MAX_DEPTH + 1)
+        text = json.dumps({"payload": embedded})
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert "redacted cookie json" in out.lower()
+
+    def test_oversized_valid_embedded_json_fails_closed_without_decoding(self):
+        padding = "x " * (
+            redact_module._COOKIE_JSON_MAX_CANDIDATE_CHARS // 2 + 1
+        )
+        embedded = json.dumps(
+            {"padding": padding, "header": ["Cookie", "sid=ALPHA_SECRET"]},
+        )
+        text = json.dumps({"payload": embedded})
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert "redacted cookie json" in out.lower()
+
+    def test_malformed_embedded_json_prose_remains_plain(self):
+        text = json.dumps(
+            {"payload": '[docs mention "Cookie" and sid=ALPHA_SECRET'},
+        )
+
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_incomplete_nested_encoded_cookie_header_is_redacted(self):
+        embedded = '{"Cookie":"sid=ALPHA_SECRET"'
+        text = json.dumps({"payload": embedded})
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "ALPHA_SECRET" not in out
+        assert json.loads(out)["payload"] == '{"Cookie":"sid=***"'
+
+    def test_embedded_json_depth_and_aggregate_count_are_bounded(self, monkeypatch):
+        monkeypatch.setattr(redact_module, "_COOKIE_JSON_MAX_EMBEDDED_DEPTH", 1)
+        nested = json.dumps({"payload": json.dumps(["Cookie", "sid=ALPHA_SECRET"])})
+        depth_out = redact_sensitive_text(json.dumps({"payload": nested}), force=True)
+        assert "ALPHA_SECRET" not in depth_out
+        assert "redacted cookie json" in depth_out.lower()
+
+        monkeypatch.setattr(redact_module, "_COOKIE_JSON_MAX_CANDIDATES", 2)
+        counted = json.dumps(
+            {
+                "payloads": [
+                    json.dumps({}),
+                    json.dumps([]),
+                    json.dumps(["Cookie", "sid=ALPHA_SECRET"]),
+                ],
+            }
+        )
+        count_out = redact_sensitive_text(counted, force=True)
+        assert "ALPHA_SECRET" not in count_out
+        assert "redacted cookie json" in count_out.lower()
+
+    def test_multiple_embedded_cookie_structures_handle_braces_in_strings(self):
+        text = (
+            'before {"name":"Cookie","value":"sid=alpha",'
+            '"note":"literal } and { braces"} middle '
+            '["Cookie","theme=beta"] after'
+        )
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith("before ")
+        assert " middle " in out
+        assert out.endswith(" after")
+        assert "literal } and { braces" in out
+        assert "alpha" not in out
+        assert "beta" not in out
+
+    def test_embedded_cookie_json_handles_quoted_braces_and_escapes(self):
+        text = (
+            'prefix {"Cookie":"sid=alpha",'
+            '"note":"escaped \\\" quote, slash \\\\ and } {"} suffix'
+        )
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "alpha" not in out
+        document = out.removeprefix("prefix ").removesuffix(" suffix")
+        assert json.loads(document) == {
+            "Cookie": "sid=***",
+            "note": 'escaped " quote, slash \\ and } {',
+        }
+
+    def test_deep_malformed_brackets_are_safe_and_not_blanket_redacted(self):
+        text = "cookie documentation " + "[" * 1000
+
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_incomplete_brace_heavy_input_never_invokes_json_decoder(self, monkeypatch):
+        calls = 0
+        raw_decode = json.JSONDecoder.raw_decode
+
+        def counted_raw_decode(decoder, document, idx=0):
+            nonlocal calls
+            calls += 1
+            return raw_decode(decoder, document, idx)
+
+        monkeypatch.setattr(json.JSONDecoder, "raw_decode", counted_raw_decode)
+
+        text = "cookie documentation " + "{x" * 20_000
+        assert redact_sensitive_text(text, force=True) == text
+        assert calls == 0
+
+    def test_completed_candidates_are_decoded_once_each(self, monkeypatch):
+        calls = 0
+        raw_decode = json.JSONDecoder.raw_decode
+
+        def counted_raw_decode(decoder, document, idx=0):
+            nonlocal calls
+            calls += 1
+            return raw_decode(decoder, document, idx)
+
+        monkeypatch.setattr(json.JSONDecoder, "raw_decode", counted_raw_decode)
+        documents = [
+            '{"Cookie":"sid=alpha"}',
+            '["Cookie","theme=beta"]',
+        ]
+
+        out = redact_sensitive_text(" before ".join(documents), force=True)
+
+        assert "alpha" not in out
+        assert "beta" not in out
+        assert calls == len(documents)
+
+    def test_brace_heavy_scan_has_generous_linear_time_bound(self):
+        text = "cookie documentation " + "{x" * 20_000
+
+        started = time.perf_counter()
+        out = redact_sensitive_text(text, force=True)
+        elapsed = time.perf_counter() - started
+
+        assert out == text
+        assert elapsed < 1.0
+
+    @pytest.mark.parametrize("complete", [False, True])
+    def test_over_depth_cookie_json_fails_closed_without_decoding(
+        self,
+        complete,
+        monkeypatch,
+    ):
+        def reject_recursive_decode(_document):
+            pytest.fail("over-depth candidate reached recursive JSON decoder")
+
+        monkeypatch.setattr(redact_module.json, "loads", reject_recursive_decode)
+        depth = 1000
+        text = "[" * depth + '{"Cookie":"sid=alpha"}'
+        if complete:
+            text += "]" * depth
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "alpha" not in out
+        assert "redacted" in out.lower()
+        assert len(out) < len(text)
+
+    def test_oversized_cookie_candidate_fails_closed(self):
+        padding = "x " * (
+            redact_module._COOKIE_JSON_MAX_CANDIDATE_CHARS // 2 + 1
+        )
+        text = f'prefix {{"padding":"{padding}","Cookie":"sid=alpha"}} suffix'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith("prefix ")
+        assert out.endswith(" suffix")
+        assert "alpha" not in out
+        assert "redacted" in out.lower()
+        assert len(out) < 100
+
+    def test_candidate_count_bound_fails_closed_on_later_cookie_document(self):
+        controls = " ".join(
+            "{}" for _ in range(redact_module._COOKIE_JSON_MAX_CANDIDATES)
+        )
+        text = controls + ' {"Cookie":"sid=alpha"}'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "alpha" not in out
+        assert "redacted" in out.lower()
+
+    def test_decoder_recursion_error_is_contained_and_fails_closed(self, monkeypatch):
+        def raise_recursion_error(_document):
+            raise RecursionError("synthetic decoder exhaustion")
+
+        monkeypatch.setattr(redact_module.json, "loads", raise_recursion_error)
+
+        out = redact_sensitive_text(
+            'before ["Cookie","sid=alpha"] after',
+            force=True,
+        )
+
+        assert "alpha" not in out
+        assert "redacted" in out.lower()
+
+    def test_malformed_candidate_recovers_for_later_cookie_document(self):
+        text = 'before {not-json] middle {"Cookie":"sid=alpha"} after'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith("before {not-json] middle ")
+        assert out.endswith(" after")
+        assert "alpha" not in out
+
+    def test_mismatched_closer_does_not_discard_later_cookie_evidence(self):
+        text = 'cookie docs {"x":1],"Cookie","sid=ALPHA_SECRET"}'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith("cookie docs ")
+        assert "ALPHA_SECRET" not in out
+        assert "redacted cookie json" in out.lower()
+
+    def test_benign_mismatched_candidate_without_exact_alias_is_preserved(self):
+        text = 'cookie docs {"x":1],"Cookie parsing example"}'
+
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_plain_cookie_json_shaped_value_redacts_every_pair(self):
+        text = 'Cookie: payload={"Cookie":"sid=alpha"}; theme=dark'
+
+        assert redact_sensitive_text(text, force=True) == (
+            "Cookie: payload=***; theme=***"
+        )
+
+    def test_unmatched_prose_quote_does_not_hide_later_cookie_json(self):
+        text = 'before unmatched " prose {"name":"Cookie","value":"sid=alpha"} after'
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert out.startswith('before unmatched " prose ')
+        assert out.endswith(" after")
+        assert "alpha" not in out
+
     def test_multiple_cookie_header_lines_are_all_processed(self):
         text = (
             "Cookie: first=alpha; second=beta\r\n"
@@ -692,6 +1163,47 @@ class TestCookieHeaders:
             "COOKIE: third=***\r\n"
         )
 
+    def test_plain_header_discovery_does_not_rescan_prefix_or_suffix_per_match(self):
+        class TrackingText(str):
+            def __new__(cls, value):
+                instance = super().__new__(cls, value)
+                instance.find_calls = 0
+                instance.rfind_calls = 0
+                return instance
+
+            def find(self, *args):
+                self.find_calls += 1
+                return super().find(*args)
+
+            def rfind(self, *args):
+                self.rfind_calls += 1
+                return super().rfind(*args)
+
+        header_count = 1_000
+        text = TrackingText(
+            " ".join(
+                f"curl -H 'Cookie: k{index}=ALPHA_SECRET'"
+                for index in range(header_count)
+            )
+        )
+
+        out = redact_module._redact_cookie_headers(text)
+
+        assert len(text) > 32_000
+        assert "ALPHA_SECRET" not in out
+        assert out.count("=***") == header_count
+        assert text.rfind_calls == 0
+        assert text.find_calls <= 4
+
+    def test_benign_python_dict_with_cookie_prose_is_preserved(self):
+        text = 'example = {"note": "Cookie parsing example", "valid": True}'
+
+        assert redact_sensitive_text(
+            text,
+            force=True,
+            code_file=True,
+        ) == text
+
     @pytest.mark.parametrize("mode", [{"code_file": True}, {"file_read": True}])
     def test_cookie_headers_apply_to_code_and_file_read_paths(self, mode):
         text = "Cookie: session=alpha; theme=dark"
@@ -701,6 +1213,94 @@ class TestCookieHeaders:
 
     def test_cookie_like_query_string_is_not_blanket_redacted(self):
         text = "https://example.test/cb?cookie=session%3Dalpha&theme=dark"
+        assert redact_sensitive_text(text, force=True) == text
+
+
+class TestPrivateKeyBlocks:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "Proc-Type: 4,ENCRYPTED\n"
+                "DEK-Info: AES-128-CBC,0123456789ABCDEF\n\n"
+                + "A" * 40
+            ),
+            "-----BEGIN RSA P\n" + "A" * 40,
+        ],
+    )
+    def test_unterminated_private_key_edge_cases_fail_closed(self, text):
+        assert redact_sensitive_text(text, force=True) == (
+            "[REDACTED PRIVATE KEY]"
+        )
+
+    def test_marker_only_private_key_documentation_is_unchanged(self):
+        begin = "-----BEGIN PRIVATE KEY-----"
+        end = "-----END PRIVATE KEY-----"
+        text = begin + "\n" + end
+
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_missing_end_marker_with_pem_material_fails_closed(self):
+        text = (
+            "before\n"
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\n"
+            "c2Vjb25kbGluZW9mcHJpdmF0ZWtleW1hdGVyaWFs\n"
+            "ordinary prose remains"
+        )
+
+        out = redact_sensitive_text(text, force=True)
+
+        assert "BEGIN PRIVATE KEY" not in out
+        assert "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj" not in out
+        assert "c2Vjb25kbGluZW9mcHJpdmF0ZWtleW1hdGVyaWFs" not in out
+        assert "[REDACTED PRIVATE KEY]" in out
+        assert "ordinary prose remains" in out
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            (
+                "-----BEGIN RSA PRIVATE K\n"
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj\n"
+                "c2Vjb25kbGluZW9mcHJpdmF0ZWtleW1hdGVyaWFs"
+            ),
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "Proc-Type: 4,ENCRYPTED\n"
+                "DEK-Info: AES-128-CBC,0123456789ABCDEF\n"
+                "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSj"
+            ),
+        ],
+    )
+    def test_partial_type_or_encrypted_unterminated_private_key_fails_closed(self, text):
+        out = redact_sensitive_text(text, force=True)
+
+        assert out == "[REDACTED PRIVATE KEY]"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "-----BEGIN RSA PRIVATE K",
+            (
+                "Private-key format documentation:\n"
+                "-----BEGIN RSA PRIVATE KEY-----\n"
+                "Proc-Type and DEK-Info metadata would be shown here."
+            ),
+        ],
+    )
+    def test_partial_private_key_documentation_without_material_is_unchanged(self, text):
+        assert redact_sensitive_text(text, force=True) == text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "We should begin private key rotation tomorrow.",
+            "The marker -----BEGIN PRIVATE KEY----- is documentation, not key material.",
+        ],
+    )
+    def test_private_key_prose_without_pem_material_is_unchanged(self, text):
         assert redact_sensitive_text(text, force=True) == text
 
 

@@ -34,6 +34,7 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
+from plugins.platforms.telegram import adapter as telegram_adapter_mod
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.config import PlatformConfig
 
@@ -71,7 +72,7 @@ class TestSendSlashConfirm:
         )
 
         assert result.success is True
-        assert "MARKDOWN_V2" in repr(sent["parse_mode"])
+        assert sent["parse_mode"] is telegram_adapter_mod.ParseMode.MARKDOWN_V2
         # Underscores and dots must be escaped by format_message
         assert "script\\_name" in sent["text"]
         assert "\\." in sent["text"]

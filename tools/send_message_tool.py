@@ -437,7 +437,11 @@ def _handle_send(args):
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
+    # Establish one force-redacted direct-message value before caption routing,
+    # platform splitting, or session persistence. Every downstream text
+    # representation is derived from this value, never from cleaned_message.
+    direct_message = redact_sensitive_text(cleaned_message or "", force=True)
+    mirror_text = direct_message.strip() or _describe_media_for_mirror(media_files)
 
     used_home_channel = False
     if not chat_id:
@@ -493,7 +497,7 @@ def _handle_send(args):
                 platform,
                 pconfig,
                 chat_id,
-                cleaned_message,
+                direct_message,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
@@ -783,6 +787,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     using the same smart-splitting algorithm as the gateway adapters
     (preserves code-block boundaries, adds part indicators).
     """
+    # ``send_message`` is a direct outbound path and can bypass the normal
+    # gateway final-response seam. Force redaction here so platform adapters
+    # and standalone senders never receive reusable credentials.
+    message = redact_sensitive_text(message or "", force=True)
     from gateway.config import Platform
 
     media_files = media_files or []

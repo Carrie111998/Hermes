@@ -422,6 +422,41 @@ async def test_create_thread_can_force_public_thread_and_invite_requesting_user(
 
 
 @pytest.mark.asyncio
+async def test_create_public_thread_in_forum_uses_forum_create_thread(adapter):
+    fake_thread = SimpleNamespace(id=778, name="Architect: Forum", add_user=AsyncMock())
+    forum_result = SimpleNamespace(
+        thread=fake_thread,
+        message=SimpleNamespace(id=900),
+    )
+    forum_channel = SimpleNamespace(
+        type=15,
+        create_thread=AsyncMock(return_value=forum_result),
+    )
+    adapter._resolve_interaction_channel = AsyncMock(return_value=forum_channel)
+    adapter._thread_parent_channel = MagicMock(return_value=forum_channel)
+    user = SimpleNamespace(id=42, display_name="Edward")
+
+    result = await adapter._create_thread(
+        SimpleNamespace(user=user),
+        name="Architect: Forum",
+        public=True,
+    )
+
+    assert result == {
+        "success": True,
+        "thread_id": "778",
+        "thread_name": "Architect: Forum",
+    }
+    forum_channel.create_thread.assert_awaited_once_with(
+        name="Architect: Forum",
+        content="🧵 Thread created by Hermes: **Architect: Forum**",
+        auto_archive_duration=1440,
+        reason="Requested by Edward via /thread",
+    )
+    fake_thread.add_user.assert_awaited_once_with(user)
+
+
+@pytest.mark.asyncio
 async def test_auto_registers_plugin_commands_for_discord(adapter):
     """Plugin slash commands should appear as native Discord app commands."""
     adapter._run_simple_slash = AsyncMock()
@@ -1438,7 +1473,7 @@ async def test_done_slash_deletes_thread_and_posts_parent_audit_when_clear(adapt
     thread = _FakeDoneThread(
         [
             _done_msg("Please update the slash command", author_id=1),
-            _done_msg("Done — implemented and verified in tests", author_id=999, bot=True, name="Hermes"),
+            _done_msg("Done — implemented and verified the slash command in tests", author_id=999, bot=True, name="Hermes"),
         ],
         parent=parent,
         channel_id=200,
@@ -1456,6 +1491,442 @@ async def test_done_slash_deletes_thread_and_posts_parent_audit_when_clear(adapt
     thread.delete.assert_awaited_once()
     interaction.followup.send.assert_awaited_once()
     assert "deleted this thread" in interaction.followup.send.await_args.args[0]
+
+
+def test_done_analysis_flags_plain_imperative_request(adapter):
+    outstanding = adapter._analyze_done_thread_messages(
+        [_done_msg("Please update the dashboard", author_id=1)]
+    )
+    assert outstanding
+    assert "update the dashboard" in outstanding[0]
+
+
+def test_done_analysis_does_not_treat_unrelated_reply_as_answer(adapter):
+    messages = [
+        _done_msg("What color should the button be?", author_id=1),
+        _done_msg("The deployment finished", author_id=2),
+    ]
+    outstanding = adapter._analyze_done_thread_messages(messages)
+    assert outstanding
+    assert any("Unanswered question" in item for item in outstanding)
+
+
+def test_done_analysis_does_not_treat_unrelated_bot_reply_as_answer(adapter):
+    messages = [
+        _done_msg("Please update the dashboard", author_id=1),
+        _done_msg("What's the weather?", author_id=2),
+        _done_msg("It is sunny.", author_id=999, bot=True, name="Hermes"),
+    ]
+    outstanding = adapter._analyze_done_thread_messages(messages)
+    assert any("update the dashboard" in item for item in outstanding)
+
+
+@pytest.mark.parametrize("bot", [False, True])
+def test_done_analysis_requires_more_than_one_generic_overlap_word(adapter, bot):
+    messages = [
+        _done_msg("Please update the dashboard colors", author_id=1),
+        _done_msg(
+            "The dashboard weather widget is sunny",
+            author_id=999 if bot else 2,
+            bot=bot,
+            name="Hermes" if bot else "Other",
+        ),
+    ]
+    outstanding = adapter._analyze_done_thread_messages(messages)
+    assert any("update the dashboard colors" in item for item in outstanding)
+
+
+@pytest.mark.parametrize("bot", [False, True])
+def test_done_analysis_same_topic_chatter_does_not_complete_request(adapter, bot):
+    messages = [
+        _done_msg("Please update the dashboard colors", author_id=1),
+        _done_msg(
+            "The dashboard colors are unpopular",
+            author_id=999 if bot else 2,
+            bot=bot,
+            name="Hermes" if bot else "Other",
+        ),
+    ]
+    outstanding = adapter._analyze_done_thread_messages(messages)
+    assert any("update the dashboard colors" in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Please delete the production database",
+        "Please migrate the production database",
+        "Please configure the alerts",
+        "Please document the API",
+    ],
+)
+def test_done_analysis_flags_broad_imperative_requests(adapter, request_text):
+    outstanding = adapter._analyze_done_thread_messages([_done_msg(request_text, author_id=1)])
+    assert outstanding
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "The dashboard update is not completed",
+        "The dashboard was not updated",
+        "Dashboard update has not succeeded",
+    ],
+)
+def test_done_analysis_negated_completion_does_not_clear_request(adapter, reply):
+    messages = [
+        _done_msg("Please update the production dashboard", author_id=1),
+        _done_msg(reply, author_id=999, bot=True, name="Hermes"),
+    ]
+    outstanding = adapter._analyze_done_thread_messages(messages)
+    assert any("update the production dashboard" in item for item in outstanding)
+
+
+def test_done_analysis_unrelated_completion_with_generic_overlap_does_not_clear(adapter):
+    messages = [
+        _done_msg("Please update the production dashboard", author_id=1),
+        _done_msg("The production deployment completed", author_id=999, bot=True, name="Hermes"),
+    ]
+    outstanding = adapter._analyze_done_thread_messages(messages)
+    assert any("update the production dashboard" in item for item in outstanding)
+
+
+def test_done_analysis_requires_compatible_action_and_subject_to_clear_request(adapter):
+    messages = [
+        _done_msg("Please delete the production database", author_id=1),
+        _done_msg(
+            "Updated the production database dashboard",
+            author_id=999,
+            bot=True,
+            name="Hermes",
+        ),
+    ]
+
+    outstanding = adapter._analyze_done_thread_messages(messages)
+
+    assert any("delete the production database" in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    ("request_text", "closeout"),
+    [
+        ("Create the production database", "Updated the production database"),
+        ("Enable the payment processor", "Disabled the payment processor"),
+    ],
+)
+def test_done_analysis_does_not_clear_request_with_incompatible_action(adapter, request_text, closeout):
+    messages = [
+        _done_msg(request_text, author_id=1),
+        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
+    ]
+
+    outstanding = adapter._analyze_done_thread_messages(messages)
+
+    assert any(request_text in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    ("request_text", "closeout"),
+    [
+        (
+            "Please delete the database update job",
+            "Updated the database update job",
+        ),
+        (
+            "Please delete the production database backup schedule",
+            "Deleted the production database metrics dashboard",
+        ),
+    ],
+)
+def test_done_analysis_matches_governing_action_and_specific_subject(
+    adapter,
+    request_text,
+    closeout,
+):
+    messages = [
+        _done_msg(request_text, author_id=1),
+        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
+    ]
+
+    outstanding = adapter._analyze_done_thread_messages(messages)
+
+    assert any(request_text in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    ("request_text", "closeout"),
+    [
+        ("Please update the slash command", "Implemented the slash command update"),
+        ("Delete the obsolete cache entries", "Removed the obsolete cache entries"),
+        ("Refactor the payment processor", "Reworked the payment processor"),
+    ],
+)
+def test_done_analysis_accepts_compatible_action_paraphrases(adapter, request_text, closeout):
+    messages = [
+        _done_msg(request_text, author_id=1),
+        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
+    ]
+
+    assert adapter._analyze_done_thread_messages(messages) == []
+
+
+@pytest.mark.parametrize(
+    "closeout",
+    [
+        "All done except database migration",
+        "Everything is complete, but the database migration remains pending",
+        "Thread is done; the database migration is not actually complete",
+        "All set — however, we still need to migrate the database",
+        "No outstanding work except the database migration",
+        "All done, but the database migration remains",
+        "All done; database migration pending",
+        "Everything is resolved, other than the database migration",
+    ],
+)
+def test_done_analysis_qualified_global_closeout_does_not_clear_request(adapter, closeout):
+    messages = [
+        _done_msg("Please migrate the database", author_id=1),
+        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
+    ]
+
+    outstanding = adapter._analyze_done_thread_messages(messages)
+
+    assert any("migrate the database" in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    "closeout",
+    [
+        "Except for database migration; all done.",
+        "All done, but database migration remains to be completed.",
+    ],
+)
+def test_done_analysis_checks_closeout_qualifiers_across_the_whole_reply(adapter, closeout):
+    messages = [
+        _done_msg("Please migrate the database", author_id=1),
+        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
+    ]
+
+    outstanding = adapter._analyze_done_thread_messages(messages)
+
+    assert any("migrate the database" in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    "closeout",
+    [
+        "All done; nothing remains",
+        "Everything is complete, and no work remains",
+        "All set. Remaining risk: no longer blocked",
+        "All done; behavior remains stable",
+    ],
+)
+def test_done_analysis_accepts_unqualified_global_closeout(adapter, closeout):
+    messages = [
+        _done_msg("Please migrate the database", author_id=1),
+        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
+    ]
+
+    assert adapter._analyze_done_thread_messages(messages) == []
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Refactor the payment processor",
+        "Rename the settlement worker",
+        "Optimize the invoice query",
+        "Rework the webhook handler",
+    ],
+)
+def test_done_analysis_flags_broad_bare_imperative_requests(adapter, request_text):
+    outstanding = adapter._analyze_done_thread_messages([_done_msg(request_text, author_id=1)])
+
+    assert any(request_text in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    "chat_text",
+    [
+        "I refactored the payment processor yesterday",
+        "The payment processor handles refunds",
+        "Refactoring the payment processor improved throughput",
+        "Our team discussed the payment processor refactor",
+        "Update: payment processor status",
+        "Run times improved after the payment processor change",
+        "Test results are green",
+        "Change is expected in the next release",
+    ],
+)
+def test_done_analysis_does_not_flag_ordinary_chat_as_bare_imperative(adapter, chat_text):
+    outstanding = adapter._analyze_done_thread_messages([_done_msg(chat_text, author_id=1)])
+
+    assert not any("Possible unresolved item" in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    "chat_text",
+    [
+        "Open source software is useful.",
+        "Open access publishing benefits researchers.",
+        "Open issues are tracked in Linear.",
+        "Open enrollment begins next week.",
+    ],
+)
+def test_done_analysis_does_not_flag_open_noun_or_adjective_chat(adapter, chat_text):
+    outstanding = adapter._analyze_done_thread_messages([_done_msg(chat_text, author_id=1)])
+
+    assert not any("Possible unresolved item" in item for item in outstanding)
+
+
+@pytest.mark.parametrize(
+    "request_text",
+    [
+        "Open the deployment dashboard",
+        "Refactor the payment processor",
+    ],
+)
+def test_done_analysis_keeps_clear_bare_action_commands(adapter, request_text):
+    outstanding = adapter._analyze_done_thread_messages([_done_msg(request_text, author_id=1)])
+
+    assert any(request_text in item for item in outstanding)
+
+
+@pytest.mark.asyncio
+async def test_done_slash_requires_confirmation_for_attachment_only_user_message(adapter, monkeypatch):
+    from plugins.platforms.discord import adapter as discord_adapter
+
+    created_views = []
+
+    class FakeDoneView:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created_views.append(self)
+
+    monkeypatch.setattr(discord_adapter, "DoneThreadDeleteConfirmView", FakeDoneView)
+    attachment_only = _done_msg("", author_id=1)
+    attachment_only.attachments = [SimpleNamespace(filename="request.txt")]
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
+    thread = _FakeDoneThread(
+        [attachment_only],
+        parent=parent,
+        channel_id=200,
+        name="Architect: attachment request",
+    )
+    interaction = _done_interaction(thread)
+
+    await adapter._handle_done_slash(interaction)
+
+    getattr(thread, "delete").assert_not_awaited()
+    parent.send.assert_not_awaited()
+    assert created_views
+    assert any("attachment" in item.lower() for item in created_views[0].kwargs["outstanding_items"])
+    assert "Delete anyway" in interaction.followup.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_done_history_fails_closed_when_raw_api_window_is_full(adapter):
+    class LimitedHistoryThread(_FakeDoneThread):
+        def history(self, *, limit, oldest_first=False):
+            async def _gen():
+                newest_first = list(reversed(self._messages))[:limit]
+                for msg in newest_first:
+                    yield msg
+            return _gen()
+
+    thread = LimitedHistoryThread(
+        [_done_msg("Please delete the production database", author_id=1)]
+        + [_done_msg(f"message {i}", author_id=1) for i in range(100)]
+        + [_done_msg("/done", author_id=1)],
+        channel_id=200,
+    )
+    with pytest.raises(RuntimeError, match="more than 100"):
+        await adapter._fetch_done_thread_messages(thread, limit=100)
+
+
+@pytest.mark.asyncio
+async def test_done_history_fails_closed_when_scan_limit_is_truncated(adapter):
+    thread = _FakeDoneThread(
+        [_done_msg(f"message {i}", author_id=1) for i in range(101)],
+        channel_id=200,
+    )
+    with pytest.raises(RuntimeError, match="more than 100"):
+        await adapter._fetch_done_thread_messages(thread, limit=100)
+
+
+def test_private_thread_audit_omits_name_id_and_outstanding_excerpts(adapter):
+    thread = SimpleNamespace(
+        name="secret acquisition",
+        id=987,
+        type=12,
+    )
+    user = SimpleNamespace(display_name="edward", name="edward", id=456)
+    text = adapter._format_done_audit(
+        thread,
+        user,
+        ["Possible unresolved item: confidential purchase terms"],
+        confirmed=True,
+    )
+    assert "secret acquisition" not in text
+    assert "987" not in text
+    assert "confidential purchase terms" not in text
+    assert "edward" not in text.lower()
+    assert "456" not in text
+
+
+@pytest.mark.asyncio
+async def test_done_delete_failure_never_posts_success_audit(adapter):
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
+    thread.delete.side_effect = RuntimeError("missing permission")
+    result = await adapter._complete_done_thread_delete(
+        thread=thread,
+        acting_user=SimpleNamespace(display_name="Edward", name="edward", id=1),
+        outstanding_items=[],
+        confirmed=False,
+    )
+    assert result["success"] is False
+    parent.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_done_private_thread_delete_reason_withholds_actor(adapter):
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="private")
+    thread.type = 12
+    actor = SimpleNamespace(display_name="SECRET_ACTOR", name="SECRET_ACTOR", id=456)
+
+    result = await adapter._complete_done_thread_delete(
+        thread=thread,
+        acting_user=actor,
+        outstanding_items=[],
+        confirmed=False,
+    )
+
+    assert result["success"] is True
+    reason = thread.delete.await_args.kwargs["reason"]
+    assert "SECRET_ACTOR" not in reason
+    assert "private" in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_done_reports_post_delete_audit_failure_without_suggesting_retry(adapter):
+    parent = SimpleNamespace(
+        id=100,
+        name="system-ops",
+        send=AsyncMock(side_effect=RuntimeError("audit unavailable")),
+    )
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
+    interaction = _done_interaction(thread)
+    adapter._fetch_done_thread_messages = AsyncMock(return_value=[])
+
+    await adapter._handle_done_slash(interaction)
+
+    thread.delete.assert_awaited_once()
+    text = interaction.followup.send.await_args.args[0]
+    assert "deleted" in text.lower()
+    assert "audit" in text.lower()
+    assert "retry" not in text.lower()
 
 
 @pytest.mark.asyncio
