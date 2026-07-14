@@ -28,6 +28,19 @@ import { randomBytes } from 'crypto';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 
+// --- Crash guards ---
+// A stray stream 'error' (e.g. undici ECONNRESET during media download) must
+// never kill the bridge process. Such an unhandled 'error' event crashed the
+// bridge in prod (2026-06-20); the gateway then failed to respawn it and
+// WhatsApp went silent for ~23 days. Log and keep running — Baileys
+// auto-reconnect and the HTTP endpoints stay alive.
+process.on('uncaughtException', (err) => {
+  console.error('[GUARD] uncaughtException (kept alive):', err?.stack || err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[GUARD] unhandledRejection (kept alive):', reason?.stack || reason?.message || reason);
+});
+
 // Parse CLI args
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -49,6 +62,26 @@ const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cac
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
+
+// Reply mode feature flag.
+//   'allowlist' (default, DEV): reply ONLY to WHATSAPP_ALLOWED_USERS.
+//   'all'       (PROD):         reply to all real 1:1 users (customers).
+// Switching to prod = set WHATSAPP_REPLY_MODE=all. No code change needed.
+// In BOTH modes, groups and system chats (status@broadcast / *@newsletter,
+// incl. pairing/system notifications) NEVER receive an automated reply.
+const REPLY_MODE = (process.env.WHATSAPP_REPLY_MODE || 'allowlist').toLowerCase();
+
+// Single source of truth for "may this JID receive an automated reply?".
+// Fail closed: unknown/empty config denies. isGroup passed from reception since a
+// group's participant JID looks like a normal user; /send targets carry @g.us directly.
+function canReply(jid, isGroup = false) {
+  const j = String(jid || '');
+  if (!j || isGroup) return false;
+  if (/@(g\.us|broadcast|newsletter)$/.test(j) || j === 'status@broadcast') return false;
+  if (REPLY_MODE === 'all') return true;
+  return ALLOWED_USERS.size > 0 && matchesAllowedUser(j.replace(/@.*/, ''), ALLOWED_USERS, SESSION_DIR);
+}
+
 const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
@@ -227,8 +260,10 @@ async function startSocket() {
         if (!isSelfChat) continue;
       }
 
-      // Check allowlist — non-allowed users are queued as readOnly (for CRM ingest)
-      const isAllowedUser = msg.key.fromMe || matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
+      // Reply gate — driven by WHATSAPP_REPLY_MODE (see canReply). readOnly=true
+      // means read/ingest only, no reply. Groups + system chats stay read-only
+      // in every mode (never auto-reply to pairing/system notifications).
+      const isAllowedUser = msg.key.fromMe || canReply(senderId, isGroup);
       const readOnly = !isAllowedUser;
 
       const messageContent = getMessageContent(msg);
@@ -381,12 +416,12 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
-  // Block replies to non-allowed users (read-only protection)
-  if (ALLOWED_USERS.length > 0) {
-    const targetNumber = chatId.replace(/@.*/, '');
-    if (!matchesAllowedUser(targetNumber, ALLOWED_USERS, SESSION_DIR)) {
-      return res.status(403).json({ error: 'Recipient not in allowlist (read-only)' });
-    }
+  // Reply gate (fail closed) — honors WHATSAPP_REPLY_MODE via canReply. Groups +
+  // system targets (broadcast/newsletter/status) are denied in every mode.
+  // NOTE: this replaces a dead check that used ALLOWED_USERS.length (a Set has no
+  // .length, so the guard never ran and /send would send to anyone).
+  if (!canReply(chatId)) {
+    return res.status(403).json({ error: `Reply blocked (mode=${REPLY_MODE}): recipient not allowed` });
   }
 
   try {
