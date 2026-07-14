@@ -351,6 +351,7 @@ def enqueue_mirror_job(
     candidate: MirrorCandidate | None = None,
     context: EligibilityContext | None = None,
     retry_failed: bool = False,
+    require_unmapped: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(policy, MirrorPolicy):
         raise TypeError("policy must be a MirrorPolicy")
@@ -358,8 +359,12 @@ def enqueue_mirror_job(
         raise ValueError("manual_authorized must be a boolean")
     if type(retry_failed) is not bool:
         raise ValueError("retry_failed must be a boolean")
+    if type(require_unmapped) is not bool:
+        raise ValueError("require_unmapped must be a boolean")
     if retry_failed and not manual_authorized:
         raise ValueError("retry_failed requires manual_authorized=True")
+    if require_unmapped and not manual_authorized:
+        raise ValueError("require_unmapped requires manual_authorized=True")
     source_provider = _canonical_source_provider(source_session_id)
     target = _external_provider(target_provider)
     if target is not _inverted_provider(source_provider):
@@ -387,6 +392,7 @@ def enqueue_mirror_job(
         candidate=candidate,
         context=context,
         retry_failed=retry_failed,
+        require_unmapped=require_unmapped,
     )
 
 
@@ -448,9 +454,10 @@ def claim_due_mirror_jobs(
                 )
                 continue
 
-            if authority["authority"] == "automatic":
-                if not policy.automatic_creation:
-                    continue
+            claim_authority = authority["authority"]
+            if claim_authority == "automatic" and not policy.automatic_creation:
+                continue
+            if claim_authority == "automatic" or authority["require_unmapped"]:
                 try:
                     source_provider = _canonical_source_provider(
                         job["source_session_id"]
@@ -465,12 +472,22 @@ def claim_due_mirror_jobs(
                 except (TypeError, ValueError):
                     denial = "automatic mirror authority is invalid"
                 if denial is not None:
+                    code = (
+                        "automatic_authority_revoked"
+                        if claim_authority == "automatic"
+                        else "manual_authority_revoked"
+                    )
+                    detail = (
+                        "automatic mirror authority is no longer valid"
+                        if claim_authority == "automatic"
+                        else "safe manual mirror authority is no longer valid"
+                    )
                     _terminalize_unclaimable_job(
                         connection,
                         job,
                         now=now,
-                        code="automatic_authority_revoked",
-                        detail="automatic mirror authority is no longer valid",
+                        code=code,
+                        detail=detail,
                     )
                     continue
 
@@ -806,6 +823,7 @@ def _enqueue_authorized_job(
     candidate: MirrorCandidate | None,
     context: EligibilityContext | None,
     retry_failed: bool,
+    require_unmapped: bool,
 ) -> dict[str, Any]:
     job_id = f"job:{idempotency_key}"
 
@@ -849,6 +867,15 @@ def _enqueue_authorized_job(
             )
             if denial is not None:
                 raise PermissionError(denial)
+        elif require_unmapped:
+            denial = _automatic_authority_denial(
+                connection,
+                source_session_id,
+                source_provider,
+                target_provider,
+            )
+            if denial is not None:
+                raise PermissionError(denial.replace("automatic", "safe manual", 1))
 
         pair_jobs = connection.execute(
             """SELECT * FROM session_mirror_jobs
@@ -862,13 +889,20 @@ def _enqueue_authorized_job(
         )
         if exact_job is not None:
             existing_authority = _read_mirror_authority(connection, exact_job)
-            if authority == "manual" and existing_authority["authority"] == "automatic":
+            if authority == "manual" and (
+                existing_authority["authority"] == "automatic"
+                or (require_unmapped and not existing_authority["require_unmapped"])
+            ):
                 promoted_value = _encode_mirror_authority(
                     authority="manual",
                     idempotency_key=exact_job["idempotency_key"],
                     source_session_id=exact_job["source_session_id"],
                     target_provider=_external_provider(exact_job["target_provider"]),
                     policy_generation=existing_authority["policy_generation"],
+                    require_unmapped=(
+                        bool(existing_authority["require_unmapped"])
+                        or require_unmapped
+                    ),
                 )
                 cursor = connection.execute(
                     """UPDATE session_bridge_state
@@ -951,6 +985,7 @@ def _enqueue_authorized_job(
             source_session_id=source_session_id,
             target_provider=target_provider,
             policy_generation=policy.generation,
+            require_unmapped=require_unmapped,
         )
         connection.execute(
             """INSERT INTO session_bridge_state (key, value_json, updated_at)
@@ -1031,12 +1066,14 @@ def _encode_mirror_authority(
     source_session_id: str,
     target_provider: Provider,
     policy_generation: int,
+    require_unmapped: bool = False,
 ) -> str:
     return json.dumps(
         {
             "authority": authority,
             "idempotency_key": idempotency_key,
             "policy_generation": policy_generation,
+            "require_unmapped": require_unmapped,
             "source_session_id": source_session_id,
             "target_provider": target_provider.value,
         },
@@ -1057,15 +1094,23 @@ def _read_mirror_authority(connection: Any, job: Mapping[str, Any]) -> dict[str,
         value = json.loads(row["value_json"])
     except (TypeError, ValueError) as exc:
         raise _InvalidMirrorAuthority("invalid mirror authority metadata") from exc
-    expected_fields = {
+    legacy_fields = {
         "authority",
         "idempotency_key",
         "policy_generation",
         "source_session_id",
         "target_provider",
     }
-    if not isinstance(value, dict) or set(value) != expected_fields:
+    current_fields = {*legacy_fields, "require_unmapped"}
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(legacy_fields),
+        frozenset(current_fields),
+    }:
         raise _InvalidMirrorAuthority("invalid mirror authority metadata")
+    require_unmapped = value.get("require_unmapped", False)
+    if type(require_unmapped) is not bool:
+        raise _InvalidMirrorAuthority("invalid mirror authority metadata")
+    value["require_unmapped"] = require_unmapped
     authority = value["authority"]
     generation = value["policy_generation"]
     if authority not in ("automatic", "manual"):

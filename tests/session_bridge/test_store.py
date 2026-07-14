@@ -989,6 +989,49 @@ def test_atomic_claim_keeps_manual_authority_when_automatic_breaker_halts(db):
     assert rows[automatic["id"]]["state"] == "queued"
 
 
+def test_atomic_store_claim_revokes_safe_manual_job_after_mapping_appears(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("source", "source")))
+    enqueue_mirror_job(
+        store,
+        "claude:native-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+        require_unmapped=True,
+    )
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="safe-manual-mapped",
+            from_session_id="claude:native-1",
+            to_session_id="codex:target",
+            relation=Relation.MIRRORS,
+            bridge_id="safe-manual-mapped",
+            source_cursor=None,
+            source_hash=None,
+            created_at=100.0,
+        )
+    )
+
+    claimed = store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(),
+    )
+
+    assert claimed == []
+    failed = store.list_mirror_jobs([MirrorJobState.MANUAL_FAILURE])
+    assert len(failed) == 1
+    assert failed[0]["error_code"] == "manual_authority_revoked"
+
+
 def test_atomic_claim_resets_completed_healthy_breaker_before_automatic_claim(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     projection = _projection(_message("auto", "automatic"))

@@ -646,6 +646,22 @@ def test_manual_enqueue_authority_requires_an_exact_boolean(db, manual_authorize
             manual_authorized=manual_authorized,
         )
 
+
+@pytest.mark.parametrize("require_unmapped", ("true", 0, 1, None))
+def test_safe_manual_constraint_requires_an_exact_boolean(db, require_unmapped):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+
+    with pytest.raises(ValueError, match="require_unmapped"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=True,
+            require_unmapped=require_unmapped,
+        )
+
     assert _job_rows(db) == []
 
 
@@ -757,6 +773,97 @@ def test_manual_enqueue_explicitly_overrides_durable_origin_and_mapping(db):
     )
 
     assert job["state"] == "queued"
+
+
+def test_safe_manual_enqueue_atomically_rejects_an_existing_mapping(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    store.upsert_projection(_projection(provider=Provider.CODEX, native_id="target"))
+    store.create_link(
+        SessionLink(
+            id="link-existing",
+            from_session_id="claude:source-1",
+            to_session_id="codex:target",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-existing",
+            source_cursor=None,
+            source_hash=None,
+            created_at=NOW,
+        )
+    )
+
+    with pytest.raises(PermissionError, match="already mapped"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=True,
+            require_unmapped=True,
+        )
+
+
+def test_safe_manual_job_cannot_be_claimed_after_mapping_appears(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+        require_unmapped=True,
+    )
+    store.upsert_projection(_projection(provider=Provider.CODEX, native_id="target"))
+    store.create_link(
+        SessionLink(
+            id="link-late-safe-manual",
+            from_session_id="claude:source-1",
+            to_session_id="codex:target",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-late-safe-manual",
+            source_cursor=None,
+            source_hash=None,
+            created_at=NOW,
+        )
+    )
+
+    assert claim_due_mirror_jobs(store, limit=1, policy=MirrorPolicy()) == []
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "manual_failure"
+    assert durable["error_code"] == "manual_authority_revoked"
+
+
+def test_legacy_manual_authority_sidecar_remains_an_unrestricted_admin_override(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+
+    def remove_new_field(conn):
+        key = f"session-bridge:mirror-authority:{job['id']}"
+        row = conn.execute(
+            "SELECT value_json FROM session_bridge_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+        value = json.loads(row["value_json"])
+        value.pop("require_unmapped")
+        conn.execute(
+            "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
+            (json.dumps(value, sort_keys=True, separators=(",", ":")), key),
+        )
+
+    db._execute_write(remove_new_field)
+
+    claimed = claim_due_mirror_jobs(store, limit=1, policy=MirrorPolicy())
+
+    assert [row["id"] for row in claimed] == [job["id"]]
+    assert claimed[0]["state"] == "running"
 
 
 def test_automatic_enqueue_requires_matching_candidate_context_and_policy(db):

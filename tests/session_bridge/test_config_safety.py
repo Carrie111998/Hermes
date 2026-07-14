@@ -99,3 +99,13 @@ def test_environment_cannot_grant_non_loopback_access(tmp_path: Path) -> None:
                 "HERMES_SESSION_BRIDGE_ALLOW_NON_LOOPBACK": "true",
             },
         )
+
+
+def test_mcp_token_is_whitelisted_but_not_persisted_in_config(tmp_path: Path) -> None:
+    config = _load(
+        tmp_path / "missing.toml",
+        environ={"HERMES_SESSION_BRIDGE_TOKEN": "x" * 32},
+    )
+
+    assert config == BridgeConfig()
+    assert not hasattr(config, "token")

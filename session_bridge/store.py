@@ -605,13 +605,24 @@ class SessionBridgeStore:
                 if claim_authority == "automatic":
                     if not automatic_allowed or automatic_reserved:
                         continue
+                if claim_authority == "automatic" or authority["require_unmapped"]:
                     if _automatic_claim_denial(conn, job) is not None:
+                        code = (
+                            "automatic_authority_revoked"
+                            if claim_authority == "automatic"
+                            else "manual_authority_revoked"
+                        )
+                        detail = (
+                            "automatic mirror authority is no longer valid"
+                            if claim_authority == "automatic"
+                            else "safe manual mirror authority is no longer valid"
+                        )
                         _terminalize_unclaimable_job(
                             conn,
                             job,
                             now=claim_time,
-                            code="automatic_authority_revoked",
-                            detail="automatic mirror authority is no longer valid",
+                            code=code,
+                            detail=detail,
                         )
                         continue
                 cursor = conn.execute(
@@ -1634,15 +1645,23 @@ def _read_claim_authority(conn: Any, job: Mapping[str, Any]) -> dict[str, Any]:
         value = json.loads(row["value_json"])
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("invalid mirror authority metadata") from exc
-    expected_fields = {
+    legacy_fields = {
         "authority",
         "idempotency_key",
         "policy_generation",
         "source_session_id",
         "target_provider",
     }
-    if not isinstance(value, dict) or set(value) != expected_fields:
+    current_fields = {*legacy_fields, "require_unmapped"}
+    if not isinstance(value, dict) or frozenset(value) not in {
+        frozenset(legacy_fields),
+        frozenset(current_fields),
+    }:
         raise ValueError("invalid mirror authority metadata")
+    require_unmapped = value.get("require_unmapped", False)
+    if type(require_unmapped) is not bool:
+        raise ValueError("invalid mirror authority metadata")
+    value["require_unmapped"] = require_unmapped
     authority = value["authority"]
     generation = value["policy_generation"]
     if authority not in ("automatic", "manual"):

@@ -31,6 +31,7 @@ _ENV_NAMES = frozenset({
         "RECONCILE_SECONDS",
         "STOP_AFTER_ATTEMPTS",
         "STOP_ERROR_RATE",
+        "TOKEN",
     )
 })
 _Result = TypeVar("_Result")
