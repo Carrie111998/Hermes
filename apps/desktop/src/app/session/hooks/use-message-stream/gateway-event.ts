@@ -191,6 +191,23 @@ interface GatewayEventDeps {
 }
 
 /** The gateway-event dispatcher, extracted from useMessageStream. */
+/** Process-status text that should appear as a durable transcript row. */
+export function isVisibleProcessResultText(text: string): boolean {
+  const t = text.trim()
+  if (!t) {
+    return false
+  }
+  return (
+    t.startsWith('[IMPORTANT: Background process') ||
+    t.startsWith('[ASYNC DELEGATION COMPLETE') ||
+    t.startsWith('[ASYNC DELEGATION BATCH COMPLETE') ||
+    t.includes('Hephaestus task ') ||
+    t.includes('verdict=PASS') ||
+    t.includes('verdict=FAIL') ||
+    t.includes('verdict=PASS_WEAK')
+  )
+}
+
 export function useGatewayEventHandler(deps: GatewayEventDeps) {
   const {
     appendAssistantDelta,
@@ -1051,8 +1068,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setSessionCompacting(sessionId, false)
           compactedTurnRef.current.delete(sessionId)
         } else if (sessionId && payload?.kind === 'process') {
-          // The gateway's notification poller announces background process
-          // completions / watch matches here — re-sync the status stack.
+          // Completions / watch matches refresh the process status stack. The
+          // gateway emits durable review.summary rows for user-visible outcomes,
+          // so do not append this text here as well.
           void refreshBackgroundProcesses(sessionId)
         } else if (sessionId && payload?.kind === 'goal') {
           applyGoalStatusText(sessionId, coerceGatewayText(payload?.text))

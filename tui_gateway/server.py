@@ -1627,6 +1627,20 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
 
+def _is_user_visible_process_result(text: str) -> bool:
+    """Whether a process outcome must also be a durable chat system row."""
+    t = (text or "").strip()
+    return bool(t) and (
+        t.startswith("[IMPORTANT: Background process")
+        or t.startswith("[ASYNC DELEGATION COMPLETE")
+        or t.startswith("[ASYNC DELEGATION BATCH COMPLETE")
+        or "Hephaestus task " in t
+        or "verdict=PASS" in t
+        or "verdict=FAIL" in t
+        or "verdict=PASS_WEAK" in t
+    )
+
+
 def _estimate_image_tokens(width: int, height: int) -> int:
     """Very rough UI estimate for image prompt cost.
 
@@ -8721,6 +8735,8 @@ def _notification_poller_loop(
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
+            if _is_user_visible_process_result(text):
+                _emit("review.summary", sid, {"text": text})
             _emitted.add(_dedup_key)
 
         _requeued = False
@@ -8807,6 +8823,8 @@ def _notification_poller_loop(
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
             _emit("status.update", sid, {"kind": "process", "text": text})
+            if _is_user_visible_process_result(text):
+                _emit("review.summary", sid, {"text": text})
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:
