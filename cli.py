@@ -1799,7 +1799,8 @@ def _run_state_db_auto_maintenance(session_db) -> None:
         session_db.maybe_auto_prune_and_vacuum(
             retention_days=int(cfg.get("retention_days", 90)),
             min_interval_hours=int(cfg.get("min_interval_hours", 24)),
-            vacuum=bool(cfg.get("vacuum_after_prune", True)),
+            vacuum=False,  # CLI shares the DB with the live gateway; VACUUM needs exclusivity
+            max_batch=int(cfg.get("prune_batch", 200)),
             sessions_dir=_hermes_home_maint / "sessions",
         )
     except Exception as exc:
