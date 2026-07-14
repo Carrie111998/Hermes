@@ -1818,7 +1818,7 @@ def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     from cron.jobs import AmbiguousJobReference, trigger_job
 
     try:
-        job = trigger_job(args[0])
+        job = trigger_job(args[0], caller="tui:console_engine")
     except AmbiguousJobReference as exc:
         raise ConsoleCommandError(str(exc)) from exc
     if not job:

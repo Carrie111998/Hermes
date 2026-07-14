@@ -601,7 +601,27 @@ def test_sessions_list_and_stats_use_isolated_session_store(_isolate_hermes_home
     assert "Listable sessions: 1" in stats.output
 
 
-def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
+@pytest.fixture()
+def _tmp_cron_store(tmp_path, monkeypatch):
+    """Redirect cron.jobs' module-pinned storage to a per-test tmp dir.
+
+    ``cron.jobs.CRON_DIR``/``JOBS_FILE``/``OUTPUT_DIR`` are constants resolved
+    from ``get_hermes_home()`` at *import* time — which, during collection,
+    is the real ``~/.hermes`` (the hermetic ``HERMES_HOME`` env override lands
+    after import). Without this, a console cron test creating a named job
+    writes it to the live cron store: it pollutes the user's real jobs.json
+    and, under xdist, goes ambiguous once a sibling reuses the same name.
+    Mirrors ``tests/cron/test_jobs.py::tmp_cron_dir``.
+    """
+    monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    return tmp_path
+
+
+def test_cron_pause_resume_and_run_require_confirmation(
+    _isolate_hermes_home, _tmp_cron_store
+):
     from cron.jobs import create_job, get_job
 
     job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
@@ -628,6 +648,31 @@ def test_cron_pause_resume_and_run_require_confirmation(_isolate_hermes_home):
     triggered = engine.execute("cron run alpha", confirmed=True)
     assert triggered.status == "ok"
     assert "Triggered job" in triggered.output
+
+
+def test_cron_run_attributes_trigger_to_console(
+    _isolate_hermes_home, _tmp_cron_store, monkeypatch: pytest.MonkeyPatch
+):
+    """`cron run` must emit CRON_TRIGGERED with an explicit console caller."""
+    from cron.jobs import create_job
+    from events.bus import EventBus
+    from events.schema import EventType
+
+    # ``_tmp_cron_store`` isolates the module-pinned cron paths (returning the
+    # tmp root); point the emit-side bus at a tmp DB in that same root.
+    bus = EventBus(db_path=_tmp_cron_store / "events.db")
+    monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+    job = create_job(prompt="say hello", schedule="every 1h", name="alpha")
+    engine = HermesConsoleEngine()
+
+    triggered = engine.execute("cron run alpha", confirmed=True)
+    assert triggered.status == "ok"
+
+    events = bus.query(event_type=EventType.CRON_TRIGGERED)
+    assert len(events) == 1
+    assert events[0].payload["caller"] == "tui:console_engine"
+    assert events[0].payload["job_id"] == job["id"]
 
 
 def test_repl_runs_non_interactive_lines_without_prompts(_isolate_hermes_home):
