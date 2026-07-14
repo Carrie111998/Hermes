@@ -18,8 +18,10 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $messages,
+  $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  type NewChatWorkspaceTarget,
   sessionPinId,
   setActiveSessionId,
   setAwaitingResponse,
@@ -27,11 +29,13 @@ import {
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
+  setCurrentCwdTransient,
   setCurrentServiceTier,
   setCurrentUsage,
   setFreshDraftReady,
   setIntroSeed,
   setMessages,
+  setNewChatWorkspaceTarget,
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
@@ -39,8 +43,7 @@ import {
   setSessionStartedAt,
   setSessionsTotal,
   setTurnStartedAt,
-  setYoloActive,
-  workspaceCwdForNewSession
+  setYoloActive
 } from '@/store/session'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
@@ -73,6 +76,7 @@ interface SessionActionsOptions {
   getRouteToken: () => string
   navigate: NavigateFunction
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  resetViewSync: () => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
@@ -85,6 +89,15 @@ interface SessionActionsOptions {
   ) => ClientSessionState
 }
 
+interface FreshSessionDraftOptions {
+  replaceRoute?: boolean
+  workspaceTarget?: NewChatWorkspaceTarget
+}
+
+function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewChatWorkspaceTarget {
+  return typeof target === 'string' ? target.trim() || null : target
+}
+
 export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
@@ -94,6 +107,7 @@ export function useSessionActions({
   getRouteToken,
   navigate,
   requestGateway,
+  resetViewSync,
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   selectedStoredSessionIdRef,
@@ -106,7 +120,18 @@ export function useSessionActions({
   const resumeRequestRef = useRef(0)
 
   const startFreshSessionDraft = useCallback(
-    (replaceRoute = false) => {
+    (options: boolean | FreshSessionDraftOptions = false) => {
+      const draftOptions = typeof options === 'boolean' ? { replaceRoute: options } : options
+      const replaceRoute = draftOptions.replaceRoute ?? false
+
+      const hasWorkspaceTarget =
+        Object.hasOwn(draftOptions, 'workspaceTarget') && draftOptions.workspaceTarget !== undefined
+
+      const workspaceTarget = hasWorkspaceTarget
+        ? normalizeNewChatWorkspaceTarget(draftOptions.workspaceTarget)
+        : undefined
+
+      resetViewSync()
       busyRef.current = false
       setBusy(false)
       setAwaitingResponse(false)
@@ -134,15 +159,23 @@ export function useSessionActions({
       setCurrentServiceTier('')
       setCurrentFastMode(false)
       setYoloActive(false)
-      // In a project → the repo's default-branch (main worktree) checkout; not in
-      // a project → detached. So cmd-n "knows" the project instead of inheriting
-      // whatever linked worktree the last session drifted into.
-      setCurrentCwd(resolveNewSessionCwd())
+      setNewChatWorkspaceTarget(hasWorkspaceTarget ? workspaceTarget : undefined)
+
+      if (!hasWorkspaceTarget) {
+        // In a project → the repo's default-branch checkout; not in a project →
+        // detached. So cmd-n does not inherit an unrelated linked worktree.
+        setCurrentCwd(resolveNewSessionCwd())
+      } else if (workspaceTarget === null) {
+        setCurrentCwdTransient('')
+      } else if (typeof workspaceTarget === 'string') {
+        setCurrentCwd(workspaceTarget)
+      }
+
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
     },
-    [activeSessionIdRef, busyRef, navigate, selectedStoredSessionIdRef]
+    [activeSessionIdRef, busyRef, navigate, resetViewSync, selectedStoredSessionIdRef]
   )
 
   const createBackendSessionForSend = useCallback(
@@ -164,7 +197,18 @@ export function useSessionActions({
         // a backend resolves its own launch profile to None (_profile_home).
         const newChatProfile = $newChatProfile.get() ?? normalizeProfileKey($activeGatewayProfile.get())
         await ensureGatewayProfile(newChatProfile)
-        const cwd = $currentCwd.get().trim() || workspaceCwdForNewSession()
+        // An explicit one-shot workspace target (null → detached, string → that
+        // folder) wins; otherwise fall through to the live cwd, then the
+        // project-aware default (resolveNewSessionCwd).
+        const workspaceTarget = $newChatWorkspaceTarget.get()
+
+        const cwd =
+          workspaceTarget === null
+            ? ''
+            : typeof workspaceTarget === 'string'
+              ? workspaceTarget.trim()
+              : $currentCwd.get().trim() || resolveNewSessionCwd()
+
         // The composer's model/effort/fast is sticky UI state ($currentModel,
         // $currentProvider, $currentReasoningEffort, $currentFastMode). Ship it
         // with every session.create so the new chat opens on whatever the picker
@@ -197,6 +241,7 @@ export function useSessionActions({
           return null
         }
 
+        resetViewSync()
         activeSessionIdRef.current = created.session_id
         selectedStoredSessionIdRef.current = stored
         ensureSessionState(created.session_id, stored)
@@ -214,6 +259,7 @@ export function useSessionActions({
         }
 
         setFreshDraftReady(false)
+        setNewChatWorkspaceTarget(undefined)
         setActiveSessionId(created.session_id)
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())
@@ -244,6 +290,7 @@ export function useSessionActions({
       getRouteToken,
       navigate,
       requestGateway,
+      resetViewSync,
       selectedStoredSessionIdRef,
       updateSessionState
     ]
@@ -296,6 +343,7 @@ export function useSessionActions({
       // resume entry").
       setFreshDraftReady(false)
       clearNotifications()
+      resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
       // Optimistically clear any prior resume-failure latch for this session:
@@ -626,6 +674,7 @@ export function useSessionActions({
       busyRef,
       copy,
       requestGateway,
+      resetViewSync,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionIdRef,
       sessionStateByRuntimeIdRef,

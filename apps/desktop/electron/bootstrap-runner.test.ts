@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import test from 'node:test'
+
+import { test } from 'vitest'
 
 import {
   buildPinArgs,
@@ -76,10 +77,10 @@ test('existing checkout detection requires git metadata', () => {
   }
 })
 
-test('fresh bootstrap args include the packaged commit pin', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
+test('fresh bootstrap args prefer the durable commit over a stale packaged branch', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'deleted-build-branch' }
 
-  assert.deepEqual(buildPinArgs(installStamp), ['-Commit', installStamp.commit, '-Branch', 'main'])
+  assert.deepEqual(buildPinArgs(installStamp), ['-Commit', installStamp.commit])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
@@ -91,18 +92,16 @@ test('fresh bootstrap args include the packaged commit pin', () => {
       '/tmp/hermes-agent',
       '--hermes-home',
       '/tmp/hermes',
-      '--branch',
-      'main',
       '--commit',
       installStamp.commit
     ]
   )
 })
 
-test('existing-checkout bootstrap args keep branch but skip the packaged commit pin', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
+test('existing-checkout bootstrap args ignore stale packaged commit and branch pins', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'deleted-build-branch' }
 
-  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), ['-Branch', 'main'])
+  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), [])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
@@ -110,7 +109,7 @@ test('existing-checkout bootstrap args keep branch but skip the packaged commit 
       hermesHome: '/tmp/hermes',
       pinCommit: false
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main']
+    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes']
   )
 })
 

@@ -6,7 +6,7 @@
  * the renderer.
  *
  * Wired from electron/main.ts:
- *   import { runBootstrap }from './bootstrap-runner.ts'
+ *   import { runBootstrap }from './bootstrap-runner'
  *   const result = await runBootstrap({
  *     installStamp,        // INSTALL_STAMP from main.ts (may be null in dev)
  *     activeRoot,          // ACTIVE_HERMES_ROOT
@@ -38,15 +38,9 @@ import fsp from 'node:fs/promises'
 import https from 'node:https'
 import path from 'node:path'
 
+import { hiddenWindowsChildOptions } from './windows-child-options'
+
 const IS_WINDOWS = process.platform === 'win32'
-
-function hiddenWindowsChildOptions(options = {}) {
-  if (!IS_WINDOWS || Object.prototype.hasOwnProperty.call(options, 'windowsHide')) {
-    return options
-  }
-
-  return { ...options, windowsHide: true }
-}
 
 const STAMP_COMMIT_RE = /^[0-9a-f]{7,40}$/i
 
@@ -73,6 +67,7 @@ function resolveLocalInstallScript(sourceRepoRoot) {
   if (!sourceRepoRoot) {
     return null
   }
+
   const candidate = path.join(sourceRepoRoot, 'scripts', installScriptName())
 
   try {
@@ -96,6 +91,7 @@ function installedAgentInstallScript(hermesHome) {
   if (!hermesHome) {
     return null
   }
+
   const candidate = path.join(hermesHome, 'hermes-agent', 'scripts', installScriptName())
 
   try {
@@ -425,6 +421,7 @@ function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, herme
       if (abortSignal) {
         abortSignal.removeEventListener('abort', onAbort)
       }
+
       reject(err)
     })
 
@@ -441,6 +438,7 @@ function spawnPowerShell(scriptPath, args, { emit, stageName, abortSignal, herme
       if (stderrBuf) {
         emit && emit({ type: 'log', stage: stageName, line: stderrBuf, stream: 'stderr' } as any)
       }
+
       resolve({ stdout, stderr, code, signal, killed } as any)
     })
   })
@@ -517,6 +515,7 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
       if (abortSignal) {
         abortSignal.removeEventListener('abort', onAbort)
       }
+
       reject(err)
     })
 
@@ -532,6 +531,7 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
       if (stderrBuf) {
         emit && emit({ type: 'log', stage: stageName, line: stderrBuf, stream: 'stderr' })
       }
+
       resolve({ stdout, stderr, code, signal, killed })
     })
   })
@@ -541,18 +541,21 @@ function spawnBash(scriptPath, args, { emit, stageName, abortSignal, hermesHome 
 // Manifest + stage dispatch
 // ---------------------------------------------------------------------------
 
-// Build the installer branch/pin args from the install stamp. The commit pin
-// is fresh-install only: once a managed checkout already exists, bootstrap is
-// a repair/update path and must not let an old packaged app detach the checkout
-// back to the commit baked into that app.
+// Build first-install provenance args from the packaged stamp. A commit is the
+// durable identity; the build branch may be ephemeral and already deleted by
+// the time a user launches the app. Once a managed checkout exists, bootstrap
+// must follow that checkout's own origin/default branch rather than repinning
+// it from an old app bundle.
 function buildPinArgs(installStamp, { pinCommit = true } = {}) {
   const args = []
 
-  if (pinCommit && installStamp && installStamp.commit) {
-    args.push('-Commit', installStamp.commit)
+  if (!pinCommit || !installStamp) {
+    return args
   }
 
-  if (installStamp && installStamp.branch) {
+  if (installStamp.commit) {
+    args.push('-Commit', installStamp.commit)
+  } else if (installStamp.branch) {
     args.push('-Branch', installStamp.branch)
   }
 
@@ -562,12 +565,14 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
 function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = true }) {
   const args = ['--dir', activeRoot, '--hermes-home', hermesHome]
 
-  if (installStamp && installStamp.branch) {
-    args.push('--branch', installStamp.branch)
+  if (!pinCommit || !installStamp) {
+    return args
   }
 
-  if (pinCommit && installStamp && installStamp.commit) {
+  if (installStamp.commit) {
     args.push('--commit', installStamp.commit)
+  } else if (installStamp.branch) {
+    args.push('--branch', installStamp.branch)
   }
 
   return args
