@@ -143,9 +143,19 @@ class EventBus:
         """Execute a write operation under the lock."""
         with self._lock:
             conn = self._get_conn()
-            cursor = conn.execute(sql, params)
-            conn.commit()
-            return cursor
+            try:
+                cursor = conn.execute(sql, params)
+                conn.commit()
+                return cursor
+            except Exception:
+                # A failed write must not leave this thread-local connection in an
+                # open transaction: the poll loop reuses the connection, a later
+                # SELECT would pin a stale read snapshot, and every subsequent write
+                # would then fail SQLITE_BUSY_SNAPSHOT until the connection is reset
+                # (the 2026-07-14 subscriber-ack wedge). Roll back so a transient
+                # BUSY cannot poison the connection.
+                conn.rollback()
+                raise
 
     def emit(
         self,

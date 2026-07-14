@@ -1,6 +1,7 @@
 """Tests for events.bus -- SQLite-backed EventBus."""
 
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -367,6 +368,37 @@ class TestWalPragmas:
             f"journal_mode must remain WAL; got {result[0]}. "
             f"Dropping WAL would lose at-least-once delivery semantics."
         )
+
+
+class TestExecuteRollsBackOnError:
+    """A failed write must roll back so the thread-local connection is not left
+    mid-transaction — otherwise a later SELECT pins a stale read snapshot and
+    every subsequent write fails SQLITE_BUSY_SNAPSHOT until the connection is
+    reset (the 2026-07-14 subscriber-ack wedge)."""
+
+    def test_execute_rolls_back_on_error(self, bus):
+        bus.emit(EventType.CRON_STARTED, "test", {})
+        conn = bus._get_conn()
+        conn.execute("PRAGMA busy_timeout=100")  # fail fast; don't wait the 5s default
+        holder = sqlite3.connect(str(bus.db_path))
+        try:
+            holder.execute("BEGIN IMMEDIATE")  # hold the write lock, uncommitted
+            holder.execute(
+                "INSERT INTO handled_events (subscriber_id, event_id) VALUES ('h', 'h1')"
+            )
+            with pytest.raises(sqlite3.OperationalError):
+                bus._execute(
+                    "INSERT OR IGNORE INTO handled_events (subscriber_id, event_id) "
+                    "VALUES (?, ?)",
+                    ("s", "e1"),
+                )
+            assert bus._get_conn().in_transaction is False, (
+                "a failed write left the connection mid-transaction; a later SELECT "
+                "would pin a stale snapshot and wedge every subsequent write"
+            )
+        finally:
+            holder.rollback()
+            holder.close()
 
 
 class TestDeadLetters:
