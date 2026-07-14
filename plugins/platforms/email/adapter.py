@@ -46,7 +46,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, _coerce_bool
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -564,6 +564,13 @@ class EmailAdapter(BasePlatformAdapter):
         #       skip_attachments: true
         self._skip_attachments = extra.get("skip_attachments", False)
 
+        # Use BODY.PEEK[] for IMAP fetch to avoid marking messages as read on
+        # the server.  Set to false to restore the legacy RFC822 behaviour.
+        #   platforms:
+        #     email:
+        #       imap_peek: false
+        self._imap_peek = _coerce_bool(extra.get("imap_peek"), True)
+
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
         # attacker-controlled and unauthenticated by IMAP, so an allowlist keyed
@@ -867,7 +874,8 @@ class EmailAdapter(BasePlatformAdapter):
                     if uid in self._seen_uids:
                         continue
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    fetch_cmd = "(BODY.PEEK[])" if self._imap_peek else "(RFC822)"
+                    status, msg_data = imap.uid("fetch", uid, fetch_cmd)
                     if status != "OK":
                         # Transient per-UID fetch refusal: leave the UID out of
                         # _seen_uids so the next poll retries it.
