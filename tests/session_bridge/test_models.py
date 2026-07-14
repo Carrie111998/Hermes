@@ -180,6 +180,7 @@ def test_domain_records_are_frozen_and_preserve_required_defaults():
     assert projection.native_status == "active"
     assert projection.native_cursor is None
     assert projection.native_hash is None
+    assert projection.git_branch is None
     assert projection.parser_version == 1
     assert projection.origin_kind is OriginKind.NATIVE
     assert projection.origin_bridge_id is None
@@ -189,6 +190,21 @@ def test_domain_records_are_frozen_and_preserve_required_defaults():
         field_name = fields(record)[0].name
         with pytest.raises(FrozenInstanceError):
             setattr(record, field_name, "changed")
+
+
+def test_session_projection_accepts_a_git_branch():
+    projection = SessionProjection(
+        provider=Provider.CLAUDE,
+        native_id="source-1",
+        title=None,
+        cwd=None,
+        started_at=1.0,
+        last_active=2.0,
+        messages=[],
+        git_branch="codex/session-bridge",
+    )
+
+    assert projection.git_branch == "codex/session-bridge"
 
 
 def test_stable_message_key_depends_only_on_native_event_id_and_ordinal():

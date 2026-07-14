@@ -66,6 +66,7 @@ class SessionProjection:
     parser_version: int = 1
     origin_kind: OriginKind = OriginKind.NATIVE
     origin_bridge_id: str | None = None
+    git_branch: str | None = None
 
 
 @dataclass(frozen=True)

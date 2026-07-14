@@ -49,6 +49,7 @@ def _projection(
     cursor: str = "cursor-1",
     native_hash: str = "hash-1",
     last_active: float = 20.0,
+    git_branch: str | None = None,
     origin_kind: OriginKind = OriginKind.NATIVE,
     origin_bridge_id: str | None = None,
 ) -> SessionProjection:
@@ -64,6 +65,7 @@ def _projection(
         native_status="active",
         native_cursor=cursor,
         native_hash=native_hash,
+        git_branch=git_branch,
         parser_version=3,
         origin_kind=origin_kind,
         origin_bridge_id=origin_bridge_id,
@@ -112,6 +114,66 @@ def test_first_import_is_idempotent_and_append_only(db):
     )
 
 
+def test_projection_persists_updates_and_preserves_git_branch_on_none(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+
+    store.upsert_projection(
+        _projection(_message("e1", "first"), git_branch="feature/first")
+    )
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/first"
+
+    store.upsert_projection(
+        _projection(
+            _message("e1", "first"),
+            cursor="cursor-2",
+            last_active=21.0,
+            git_branch="feature/second",
+        )
+    )
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/second"
+
+    store.upsert_projection(
+        _projection(
+            _message("e1", "first"),
+            cursor="cursor-3",
+            last_active=22.0,
+        )
+    )
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/second"
+
+
+@pytest.mark.parametrize("git_branch", ["", " \t "])
+def test_projection_preserves_git_branch_on_blank_delta(db, git_branch):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(_message("e1", "first"), git_branch="feature/current")
+    )
+
+    store.upsert_projection(
+        _projection(
+            _message("e1", "first"),
+            cursor="cursor-2",
+            last_active=21.0,
+            git_branch=git_branch,
+        )
+    )
+
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/current"
+
+
+def test_projection_strips_a_non_empty_git_branch(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+
+    store.upsert_projection(
+        _projection(
+            _message("e1", "first"),
+            git_branch="  feature/normalized\t",
+        )
+    )
+
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/normalized"
+
+
 def test_rebuild_replaces_only_mapped_messages_and_preserves_first_index_time(db):
     now = [100.0]
     store = SessionBridgeStore(db, clock=lambda: now[0])
@@ -151,7 +213,9 @@ def test_projection_rolls_back_every_bridge_write_on_mid_insert_failure(
     db, monkeypatch
 ):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
-    store.upsert_projection(_projection(_message("e1", "committed")))
+    store.upsert_projection(
+        _projection(_message("e1", "committed"), git_branch="feature/committed")
+    )
     original = db._insert_message_rows_with_ids
 
     def insert_then_fail(conn, session_id, messages):
@@ -167,6 +231,7 @@ def test_projection_rolls_back_every_bridge_write_on_mid_insert_failure(
                 _message("e2", "must roll back"),
                 cursor="cursor-uncommitted",
                 native_hash="hash-uncommitted",
+                git_branch="feature/must-roll-back",
             )
         )
 
@@ -176,6 +241,7 @@ def test_projection_rolls_back_every_bridge_write_on_mid_insert_failure(
         store.get_external_session("claude:native-1")["last_native_cursor"]
         == "cursor-1"
     )
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/committed"
 
 
 @pytest.mark.parametrize("existing_source", ["cli", "claude"])
@@ -298,6 +364,7 @@ def test_observably_stale_projection_cannot_regress_external_metadata(db):
             cursor="new-cursor",
             native_hash="new-hash",
             last_active=100.0,
+            git_branch="feature/newest",
         )
     )
 
@@ -309,6 +376,7 @@ def test_observably_stale_projection_cannot_regress_external_metadata(db):
                     cursor="old-cursor",
                     native_hash="old-hash",
                     last_active=90.0,
+                    git_branch="feature/stale",
                 ),
                 native_path="C:/claude/old-path.jsonl",
                 native_status="archived",
@@ -320,6 +388,7 @@ def test_observably_stale_projection_cannot_regress_external_metadata(db):
     assert external["last_native_cursor"] == "new-cursor"
     assert external["last_native_hash"] == "new-hash"
     assert external["native_status"] == "active"
+    assert db.get_session("claude:native-1")["git_branch"] == "feature/newest"
     assert [row["content"] for row in db.get_messages("claude:native-1")] == ["newest"]
 
 

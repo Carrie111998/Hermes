@@ -46,6 +46,12 @@ class SessionBridgeStore:
         provider = _external_provider(projection.provider)
         session_id = canonical_session_id(provider, projection.native_id)
         native_id = projection.native_id.strip()
+        git_branch = (
+            projection.git_branch.strip()
+            if projection.git_branch is not None
+            else None
+        )
+        git_branch = git_branch or None
         now = float(self._clock())
         activity_state_key = _external_activity_state_key(session_id)
         last_active = float(projection.last_active)
@@ -132,6 +138,7 @@ class SessionBridgeStore:
                            ELSE title
                        END,
                        cwd = COALESCE(?, cwd),
+                       git_branch = COALESCE(?, git_branch),
                        started_at = MIN(started_at, ?)
                    WHERE id = ?""",
                 (
@@ -141,6 +148,7 @@ class SessionBridgeStore:
                     session_id,
                     projection.title,
                     projection.cwd,
+                    git_branch,
                     float(projection.started_at),
                     session_id,
                 ),
