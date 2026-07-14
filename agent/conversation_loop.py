@@ -1094,6 +1094,99 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """Public entry — wraps ``_run_conversation_impl`` with per-turn tracing.
+
+    Trace ownership (see ``agent/turn_trace.py``): when a gateway already
+    began a trace and bound it to ``agent`` before dispatching here, this
+    function only adopts it for the current thread; the gateway finishes it
+    after delivery.  CLI/direct callers have no bound trace, so this function
+    begins and finishes one itself.  When tracing is disabled everything here
+    is a cheap no-op passthrough.
+    """
+    trace = turn_trace.get_bound(agent)
+    owner = False
+    if trace is None:
+        if turn_trace.enabled():
+            trace = turn_trace.begin(
+                key=agent.session_id or None,
+                platform=getattr(agent, "platform", None) or "cli",
+                session_key=agent.session_id or "",
+            )
+            owner = trace is not None
+            if owner:
+                turn_trace.bind(agent, trace)
+    else:
+        # Gateway-owned trace: make it current for THIS (run_sync worker) thread.
+        turn_trace.adopt(trace)
+    if trace is None:
+        return _run_conversation_impl(
+            agent, user_message, system_message, conversation_history, task_id,
+            stream_callback, persist_user_message, persist_user_timestamp,
+            moa_config,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+        )
+    _turn_started = time.time()
+    _result = None
+    try:
+        _result = _run_conversation_impl(
+            agent, user_message, system_message, conversation_history, task_id,
+            stream_callback, persist_user_message, persist_user_timestamp,
+            moa_config,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+        )
+        return _result
+    finally:
+        try:
+            # The loop body exits through many early `return` paths that skip
+            # its own post-loop close/tagging; close the in-flight iteration
+            # span and backfill exit_reason here so those turns still render.
+            _pending_iter = getattr(trace, "_pending_iteration", None)
+            if _pending_iter:
+                trace.add_span("iteration", _pending_iter[0], time.time(), i=_pending_iter[1])
+                trace._pending_iteration = None
+            if "exit_reason" not in trace.tags:
+                if _result is None:
+                    trace.tag(exit_reason="exception")
+                else:
+                    _err = _result.get("error") if isinstance(_result, dict) else None
+                    trace.tag(exit_reason=f"early_return({str(_err)[:80]})" if _err else "early_return")
+        except Exception:
+            pass
+        try:
+            _turn_tags = {
+                "model": agent.model,
+                "iterations": getattr(agent, "_api_call_count", 0),
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+            }
+            # tool_calls / exit_reason are accumulated as trace-level tags by
+            # the loop body (they are locals there); surface them on the span.
+            for _k in ("tool_calls", "exit_reason"):
+                if _k in trace.tags:
+                    _turn_tags[_k] = trace.tags[_k]
+            trace.add_span("turn", _turn_started, time.time(), **_turn_tags)
+        except Exception:
+            pass
+        if owner:
+            trace.finish()
+            turn_trace.bind(agent, None)
+            turn_trace.adopt(None)
+
+
+def _run_conversation_impl(
+    agent,
+    user_message: str,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[str] = None,
+    persist_user_timestamp: Optional[float] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
 
