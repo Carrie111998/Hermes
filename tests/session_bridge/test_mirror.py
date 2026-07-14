@@ -665,6 +665,75 @@ def test_safe_manual_constraint_requires_an_exact_boolean(db, require_unmapped):
     assert _job_rows(db) == []
 
 
+@pytest.mark.parametrize("rollout_limited", ("true", 0, 1, None))
+def test_rollout_limited_authority_requires_an_exact_boolean(db, rollout_limited):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+
+    with pytest.raises(ValueError, match="rollout_limited"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=True,
+            require_unmapped=True,
+            rollout_limited=rollout_limited,
+        )
+
+    assert _job_rows(db) == []
+
+
+def test_rollout_limited_authority_requires_safe_manual_constraint(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+
+    with pytest.raises(ValueError, match="require_unmapped"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=MirrorPolicy(),
+            manual_authorized=True,
+            rollout_limited=True,
+        )
+
+    assert _job_rows(db) == []
+
+
+def test_rollout_limited_manual_authority_is_persisted_and_claimable_with_auto_off(
+    db,
+):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+        require_unmapped=True,
+        rollout_limited=True,
+    )
+
+    authority_json = _authority_rows(db)[0]["value_json"]
+    assert isinstance(authority_json, str)
+    authority = json.loads(authority_json)
+    claimed = claim_due_mirror_jobs(
+        store,
+        limit=1,
+        policy=MirrorPolicy(automatic_creation=False),
+        job_ids=[job["id"]],
+    )
+
+    assert authority["authority"] == "manual"
+    assert authority["require_unmapped"] is True
+    assert authority["rollout_limited"] is True
+    assert [row["id"] for row in claimed] == [job["id"]]
+    assert claimed[0]["claim_authority"] == "manual"
+    assert claimed[0]["rollout_limited"] is True
+
+
 def test_automatic_enqueue_rejects_source_that_became_bridge_origin(db):
     store = SessionBridgeStore(db, clock=lambda: NOW)
     policy = MirrorPolicy(automatic_creation=True)
@@ -853,6 +922,7 @@ def test_legacy_manual_authority_sidecar_remains_an_unrestricted_admin_override(
         ).fetchone()
         value = json.loads(row["value_json"])
         value.pop("require_unmapped")
+        value.pop("rollout_limited")
         conn.execute(
             "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
             (json.dumps(value, sort_keys=True, separators=(",", ":")), key),
@@ -1619,6 +1689,42 @@ def test_claim_fails_closed_when_authority_sidecar_is_malformed(db):
     store.set_state(authority_key, {"authority": "bogus"})
 
     assert claim_due_mirror_jobs(store, limit=1, policy=MirrorPolicy()) == []
+    durable = _job_rows(db)[0]
+    assert durable["state"] == "manual_failure"
+    assert durable["error_code"] == "authority_invalid"
+
+
+def test_claim_rejects_rollout_limited_automatic_authority_sidecar(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection()
+    store.upsert_projection(projection)
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=policy,
+        candidate=_candidate(projection, policy=policy),
+        context=_context(policy=policy),
+    )
+
+    def forge_rollout_authority(conn):
+        key = f"session-bridge:mirror-authority:{job['id']}"
+        row = conn.execute(
+            "SELECT value_json FROM session_bridge_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+        value = json.loads(row["value_json"])
+        value["require_unmapped"] = True
+        value["rollout_limited"] = True
+        conn.execute(
+            "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
+            (json.dumps(value, sort_keys=True, separators=(",", ":")), key),
+        )
+
+    db._execute_write(forge_rollout_authority)
+
+    assert claim_due_mirror_jobs(store, limit=1, policy=policy) == []
     durable = _job_rows(db)[0]
     assert durable["state"] == "manual_failure"
     assert durable["error_code"] == "authority_invalid"

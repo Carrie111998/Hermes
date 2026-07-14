@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import math
@@ -17,6 +18,7 @@ from typing import Any
 import uuid
 
 from agent.transports.codex_app_server import CodexAppServerClient
+from hermes_constants import get_hermes_home
 
 from .claude_adapter import (
     CLAUDE_PLACEHOLDER_MAX_BUDGET_USD,
@@ -32,7 +34,6 @@ from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter
 from .models import BridgeMarkerPayload, OriginKind, Provider, SessionProjection
 
 
-_REPORT_ROOT = Path.home() / ".hermes" / "session-bridge" / "characterization"
 _CLAUDE_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 _SENSITIVE_REPORT_KEYS = frozenset({
     "context",
@@ -45,6 +46,57 @@ _SENSITIVE_REPORT_KEYS = frozenset({
     "transcript",
 })
 _MARKER_PREFIX = "HERMES_SESSION_BRIDGE_V1:"
+_MAX_CLI_VERSION_BYTES = 4096
+_PROVIDER_REQUIRED_FIELDS = frozenset({
+    "create",
+    "discover",
+    "read",
+    "resume",
+    "used_registration_turn",
+    "cleanup",
+    "error_code",
+})
+_PROVIDER_ALLOWED_FIELDS = {
+    "claude": _PROVIDER_REQUIRED_FIELDS
+    | {
+        "native_id",
+        "create_cost_usd",
+        "create_latency_ms",
+        "create_num_turns",
+        "resume_cost_usd",
+        "resume_latency_ms",
+        "resume_num_turns",
+        "total_cost_usd",
+        "total_latency_ms",
+        "total_num_turns",
+        "observed_cost_usd",
+        "duration_ms",
+        "num_turns",
+    },
+    "codex": _PROVIDER_REQUIRED_FIELDS
+    | {
+        "native_id",
+        "create_latency_ms",
+        "resume_latency_ms",
+        "total_latency_ms",
+    },
+}
+_PROVIDER_NUMBER_FIELDS = frozenset({
+    "create_cost_usd",
+    "create_latency_ms",
+    "resume_cost_usd",
+    "resume_latency_ms",
+    "total_cost_usd",
+    "total_latency_ms",
+    "observed_cost_usd",
+    "duration_ms",
+})
+_PROVIDER_INTEGER_FIELDS = frozenset({
+    "create_num_turns",
+    "resume_num_turns",
+    "total_num_turns",
+    "num_turns",
+})
 _SECRET_RE = re.compile(
     r"(?:sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{12,}|"
     r"(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{12,}|"
@@ -67,15 +119,358 @@ class LiveCharacterizationError(RuntimeError):
         )
 
 
+@dataclass(frozen=True)
+class CharacterizationGate:
+    """A passing newest characterization report for the installed CLIs."""
+
+    report_path: Path
+    characterization_id: str
+    codex_registration_turn_required: bool
+
+
+@dataclass(frozen=True)
+class _ValidatedGateReport:
+    path: Path
+    report: dict[str, Any]
+    created_at: datetime
+    characterization_id: str
+    codex_registration_turn_required: bool
+    passed: bool
+
+
+class CharacterizationGateError(RuntimeError):
+    """Stable failure from the fail-closed live-characterization gate."""
+
+    _CODES = frozenset({"missing", "invalid", "failed", "version_drift"})
+
+    def __init__(self, code: str, detail: str) -> None:
+        if code not in self._CODES:
+            raise ValueError("invalid characterization gate error code")
+        self.code = code
+        super().__init__(detail)
+
+
+def resolve_characterization_gate(
+    *,
+    report_root: Path | None = None,
+    current_versions: Mapping[str, str] | None = None,
+) -> CharacterizationGate:
+    """Require the newest report to pass exactly for the installed CLI versions."""
+
+    root = (
+        Path(
+            report_root
+            if report_root is not None
+            else get_hermes_home() / "session-bridge" / "characterization"
+        )
+        .expanduser()
+        .absolute()
+    )
+    _require_safe_report_root(root)
+    latest = max(
+        _read_validated_gate_reports(root),
+        key=lambda candidate: (candidate.created_at, candidate.characterization_id),
+    )
+    if not latest.passed:
+        raise CharacterizationGateError("failed", "characterization_report_failed")
+    observed_versions = (
+        _current_cli_versions()
+        if current_versions is None
+        else _validated_version_mapping(current_versions, source="current")
+    )
+    report_versions = _validated_version_mapping(
+        latest.report["versions"], source="report"
+    )
+    if report_versions != observed_versions:
+        raise CharacterizationGateError(
+            "version_drift", "characterization_version_mismatch"
+        )
+    return CharacterizationGate(
+        report_path=latest.path,
+        characterization_id=latest.characterization_id,
+        codex_registration_turn_required=latest.codex_registration_turn_required,
+    )
+
+
+def _require_safe_report_root(root: Path) -> None:
+    for candidate in (root, *root.parents):
+        if _path_is_redirect(candidate):
+            raise CharacterizationGateError("invalid", "characterization_report_unsafe")
+    try:
+        metadata = os.lstat(root)
+    except FileNotFoundError:
+        raise CharacterizationGateError(
+            "missing", "characterization_report_missing"
+        ) from None
+    except OSError:
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_unsafe"
+        ) from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise CharacterizationGateError("invalid", "characterization_report_unsafe")
+
+
+def _read_validated_gate_reports(root: Path) -> list[_ValidatedGateReport]:
+    try:
+        paths = sorted(
+            (path for path in root.iterdir() if path.suffix == ".json"),
+            key=lambda path: path.name,
+        )
+    except OSError:
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_unsafe"
+        ) from None
+    if not paths:
+        raise CharacterizationGateError("missing", "characterization_report_missing")
+    return [
+        _validate_gate_report(_read_report_safely(path), report_path=path)
+        for path in paths
+    ]
+
+
+def _read_report_safely(path: Path) -> dict[str, Any]:
+    try:
+        before = os.lstat(path)
+    except OSError:
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_unsafe"
+        ) from None
+    if _path_is_redirect(path) or not stat.S_ISREG(before.st_mode):
+        raise CharacterizationGateError("invalid", "characterization_report_unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+            or opened.st_size > 1_048_576
+        ):
+            raise CharacterizationGateError("invalid", "characterization_report_unsafe")
+        payload = os.read(descriptor, opened.st_size + 1)
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        current_attributes = getattr(current, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or bool(current_attributes & reparse_flag)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_dev != opened.st_dev
+            or current.st_ino != opened.st_ino
+            or current.st_size != opened.st_size
+            or current.st_mtime_ns != opened.st_mtime_ns
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or len(payload) != opened.st_size
+        ):
+            raise CharacterizationGateError("invalid", "characterization_report_unsafe")
+    except CharacterizationGateError:
+        raise
+    except OSError:
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_unsafe"
+        ) from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        report = json.loads(
+            payload.decode("utf-8"), object_pairs_hook=_unique_json_object
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKey):
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_malformed"
+        ) from None
+    if not isinstance(report, dict):
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    return report
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _DuplicateJsonKey(key)
+        value[key] = item
+    return value
+
+
+def _validate_gate_report(
+    report: dict[str, Any], *, report_path: Path
+) -> _ValidatedGateReport:
+    expected_keys = {
+        "schema_version",
+        "characterization_id",
+        "created_at",
+        "automatic_mirroring_enabled",
+        "versions",
+        "providers",
+    }
+    if set(report) != expected_keys or type(report["schema_version"]) is not int:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    if (
+        report["schema_version"] != 1
+        or report["automatic_mirroring_enabled"] is not False
+    ):
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    try:
+        characterization_id = _canonical_uuid(report["characterization_id"])
+    except ValueError:
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_malformed"
+        ) from None
+    if report_path.stem != characterization_id:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    created_at = report["created_at"]
+    try:
+        created = datetime.fromisoformat(created_at)
+    except (TypeError, ValueError):
+        raise CharacterizationGateError(
+            "invalid", "characterization_report_malformed"
+        ) from None
+    if created.tzinfo is None or created.utcoffset() is None:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    _validated_version_mapping(report["versions"], source="report")
+    providers = report["providers"]
+    if not isinstance(providers, dict) or set(providers) != {"claude", "codex"}:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    claude_registration, claude_passed = _validate_provider_status(
+        providers["claude"], provider="claude"
+    )
+    codex_registration, codex_passed = _validate_provider_status(
+        providers["codex"], provider="codex"
+    )
+    if claude_registration:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    return _ValidatedGateReport(
+        path=report_path,
+        report=report,
+        created_at=created.astimezone(timezone.utc),
+        characterization_id=characterization_id,
+        codex_registration_turn_required=codex_registration,
+        passed=claude_passed and codex_passed,
+    )
+
+
+def _validate_provider_status(value: Any, *, provider: str) -> tuple[bool, bool]:
+    allowed = _PROVIDER_ALLOWED_FIELDS[provider]
+    if (
+        not isinstance(value, dict)
+        or not _PROVIDER_REQUIRED_FIELDS.issubset(value)
+        or not set(value).issubset(allowed)
+    ):
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    if type(value["used_registration_turn"]) is not bool:
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    if (
+        not isinstance(value["cleanup"], str)
+        or not value["cleanup"]
+        or value["cleanup"] != value["cleanup"].strip()
+        or "\n" in value["cleanup"]
+        or "\r" in value["cleanup"]
+    ):
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    for stage in ("create", "discover", "read", "resume"):
+        if type(value[stage]) is not bool:
+            raise CharacterizationGateError(
+                "invalid", "characterization_report_malformed"
+            )
+    error_code = value["error_code"]
+    if error_code is not None and (
+        not isinstance(error_code, str)
+        or not error_code
+        or error_code != error_code.strip()
+        or "\n" in error_code
+        or "\r" in error_code
+    ):
+        raise CharacterizationGateError("invalid", "characterization_report_malformed")
+    native_id = value.get("native_id")
+    if native_id is not None:
+        try:
+            _canonical_uuid(native_id)
+        except ValueError:
+            raise CharacterizationGateError(
+                "invalid", "characterization_report_malformed"
+            ) from None
+    for field in _PROVIDER_NUMBER_FIELDS & value.keys():
+        field_value = value[field]
+        if field_value is not None and (
+            not isinstance(field_value, (int, float))
+            or isinstance(field_value, bool)
+            or not math.isfinite(float(field_value))
+            or float(field_value) < 0
+        ):
+            raise CharacterizationGateError(
+                "invalid", "characterization_report_malformed"
+            )
+    for field in _PROVIDER_INTEGER_FIELDS & value.keys():
+        field_value = value[field]
+        if field_value is not None and (
+            not isinstance(field_value, int)
+            or isinstance(field_value, bool)
+            or field_value < 0
+        ):
+            raise CharacterizationGateError(
+                "invalid", "characterization_report_malformed"
+            )
+    passed = (
+        all(value[stage] is True for stage in ("create", "discover", "read", "resume"))
+        and error_code is None
+    )
+    return value["used_registration_turn"], passed
+
+
+def _validated_version_mapping(value: Any, *, source: str) -> dict[str, str]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != {"claude", "codex"}
+        or not all(isinstance(value[key], str) and value[key] for key in value)
+    ):
+        code = "invalid" if source == "report" else "version_drift"
+        detail = (
+            "characterization_report_malformed"
+            if source == "report"
+            else "characterization_version_unavailable"
+        )
+        raise CharacterizationGateError(code, detail)
+    return {key: value[key] for key in ("claude", "codex")}
+
+
+def _current_cli_versions() -> dict[str, str]:
+    try:
+        claude = _cli_version([*resolve_cli_executable("claude"), "--version"])
+        codex = _cli_version([*resolve_cli_executable("codex"), "--version"])
+    except (RuntimeError, ValueError):
+        claude = codex = None
+    if claude is None or codex is None:
+        raise CharacterizationGateError(
+            "version_drift", "characterization_version_unavailable"
+        )
+    return {"claude": claude, "codex": codex}
+
+
 def write_characterization_report(
     report: Mapping[str, Any],
     *,
-    report_root: Path = _REPORT_ROOT,
+    report_root: Path | None = None,
     characterization_id: str,
 ) -> Path:
     record_id = _canonical_uuid(characterization_id)
+    resolved_report_root = (
+        Path(report_root)
+        if report_root is not None
+        else get_hermes_home() / "session-bridge" / "characterization"
+    )
     root = _safe_directory_root(
-        Path(report_root).expanduser(), error_code="unsafe_characterization_report"
+        resolved_report_root.expanduser(),
+        error_code="unsafe_characterization_report",
     )
     report_path = root / f"{record_id}.json"
     if report_path.exists() or _path_is_redirect(report_path):
@@ -195,7 +590,7 @@ def quarantine_claude_transcript(
     destination_root = (
         Path(quarantine_root).expanduser()
         if quarantine_root is not None
-        else _REPORT_ROOT / "quarantine"
+        else get_hermes_home() / "session-bridge" / "characterization" / "quarantine"
     )
     try:
         destination_root = _safe_directory_root(
@@ -233,7 +628,7 @@ def quarantine_claude_transcript(
 
 def run_live_characterization(
     *,
-    report_root: Path = _REPORT_ROOT,
+    report_root: Path | None = None,
     claude_projects_root: Path = _CLAUDE_PROJECTS_ROOT,
     claude_executable: str = "claude",
     codex_executable: str = "codex",
@@ -250,6 +645,11 @@ def run_live_characterization(
     if codex_version is None:
         raise RuntimeError("codex_cli_preflight_failed")
     characterization_id = str(uuid.uuid4())
+    resolved_report_root = (
+        Path(report_root)
+        if report_root is not None
+        else get_hermes_home() / "session-bridge" / "characterization"
+    )
     title = f"[Hermes Bridge Characterization] {characterization_id}"
     marker_secret = secrets.token_bytes(32)
     working_directory = Path(cwd or Path.cwd()).resolve()
@@ -275,7 +675,7 @@ def run_live_characterization(
             title=title,
             marker_secret=marker_secret,
             projects_root=Path(claude_projects_root),
-            report_root=Path(report_root),
+            report_root=resolved_report_root,
             executable=claude_command,
             cwd=working_directory,
         )
@@ -283,9 +683,7 @@ def run_live_characterization(
         code = _safe_error_code("claude", exc)
         report["providers"]["claude"]["error_code"] = code
         if isinstance(exc, PlaceholderCreationError):
-            _record_claude_failure_diagnostics(
-                report["providers"]["claude"], exc
-            )
+            _record_claude_failure_diagnostics(report["providers"]["claude"], exc)
         failures.append(code)
     try:
         _characterize_codex(
@@ -303,7 +701,7 @@ def run_live_characterization(
 
     report_path = write_characterization_report(
         report,
-        report_root=Path(report_root),
+        report_root=resolved_report_root,
         characterization_id=characterization_id,
     )
     if failures:
@@ -355,9 +753,7 @@ def _characterize_claude(
         )
         create_elapsed_ms = (time.monotonic() - creation_started) * 1000.0
         create_metrics = (
-            _claude_result_metrics(creation_processes[-1])
-            if creation_processes
-            else {}
+            _claude_result_metrics(creation_processes[-1]) if creation_processes else {}
         )
         status["create_cost_usd"] = create_metrics.get("cost_usd")
         status["create_latency_ms"] = create_metrics.get(
@@ -503,9 +899,7 @@ def _resume_claude_characterization(
     except subprocess.TimeoutExpired:
         process_failure = PlaceholderCreationError("claude_resume_timeout")
     except FileNotFoundError:
-        runner_failure = PlaceholderCreationError(
-            "claude_resume_executable_not_found"
-        )
+        runner_failure = PlaceholderCreationError("claude_resume_executable_not_found")
     except Exception:
         runner_failure = PlaceholderCreationError("claude_resume_process_failed")
     else:
@@ -513,9 +907,7 @@ def _resume_claude_characterization(
         if completed.returncode != 0:
             process_code = classify_claude_process_failure(completed)
             suffix = process_code.removeprefix("claude_process_")
-            process_failure = _claude_resume_error(
-                f"claude_resume_{suffix}", metrics
-            )
+            process_failure = _claude_resume_error(f"claude_resume_{suffix}", metrics)
     if runner_failure is not None:
         raise runner_failure
 
@@ -536,9 +928,7 @@ def _resume_claude_characterization(
                 raise parse_failure
             assert projection is not None
             if projection.native_id != native_id:
-                raise _claude_resume_error(
-                    "claude_resume_identity_mismatch", metrics
-                )
+                raise _claude_resume_error("claude_resume_identity_mismatch", metrics)
             if (
                 projection.origin_bridge_id != bridge_id
                 or projection.origin_kind
@@ -547,9 +937,7 @@ def _resume_claude_characterization(
                     OriginKind.BRIDGE_CONTINUATION,
                 )
             ):
-                raise _claude_resume_error(
-                    "claude_resume_marker_mismatch", metrics
-                )
+                raise _claude_resume_error("claude_resume_marker_mismatch", metrics)
 
             post_messages = _projection_message_identities(projection)
             post_fingerprint = (
@@ -653,9 +1041,7 @@ def _characterize_codex(
                 policy_generation=1,
                 cwd=cwd,
             )
-            status["create_latency_ms"] = (
-                time.monotonic() - create_started
-            ) * 1000.0
+            status["create_latency_ms"] = (time.monotonic() - create_started) * 1000.0
         except PlaceholderCreationError as exc:
             native_id = exc.native_id
             if native_id is not None:
@@ -686,9 +1072,7 @@ def _characterize_codex(
             verification_poll_interval=0.25,
         )
         status["resume"] = True
-        status["resume_latency_ms"] = (
-            time.monotonic() - resume_started
-        ) * 1000.0
+        status["resume_latency_ms"] = (time.monotonic() - resume_started) * 1000.0
     finally:
         status["total_latency_ms"] = (
             time.monotonic() - characterization_started
@@ -817,9 +1201,7 @@ def _read_codex_turns(
     if not isinstance(thread, dict) or thread.get("id") != native_id:
         raise RuntimeError("codex_resume_identity_mismatch")
     turns = thread.get("turns")
-    if not isinstance(turns, list) or not all(
-        isinstance(turn, dict) for turn in turns
-    ):
+    if not isinstance(turns, list) or not all(isinstance(turn, dict) for turn in turns):
         raise RuntimeError("codex_resume_read_malformed")
     return turns
 
@@ -831,9 +1213,7 @@ def _nonempty_mapping_text(value: Any, key: str) -> str | None:
     return observed if isinstance(observed, str) and observed else None
 
 
-def _codex_turn_user_input_has_nonce(
-    turn: dict[str, Any], *, nonce: str
-) -> bool:
+def _codex_turn_user_input_has_nonce(turn: dict[str, Any], *, nonce: str) -> bool:
     items = turn.get("items")
     if not isinstance(items, list):
         return False
@@ -878,7 +1258,11 @@ def _record_claude_failure_diagnostics(
         ):
             status[key] = float(value)
     num_turns = getattr(exc, "num_turns", None)
-    if isinstance(num_turns, int) and not isinstance(num_turns, bool) and num_turns >= 0:
+    if (
+        isinstance(num_turns, int)
+        and not isinstance(num_turns, bool)
+        and num_turns >= 0
+    ):
         status["num_turns"] = num_turns
 
 
@@ -989,9 +1373,7 @@ def _turn_identity(response: Any) -> str:
     return turn_id
 
 
-def _single_native_executable(
-    command: Sequence[str], *, label: str
-) -> str:
+def _single_native_executable(command: Sequence[str], *, label: str) -> str:
     if len(command) != 1:
         raise RuntimeError(f"{label.casefold()}_direct_runtime_required")
     executable = command[0]
@@ -1061,8 +1443,17 @@ def _cli_version(args: list[str]) -> str | None:
         return None
     if completed.returncode != 0:
         return None
-    match = re.search(r"\b\d+\.\d+\.\d+\b", completed.stdout)
-    return match.group(0) if match else None
+    stdout = completed.stdout
+    if not isinstance(stdout, str):
+        return None
+    normalized = stdout.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if (
+        not normalized
+        or "\x00" in normalized
+        or len(normalized.encode("utf-8")) > _MAX_CLI_VERSION_BYTES
+    ):
+        return None
+    return normalized
 
 
 def _safe_error_code(provider: str, exc: Exception) -> str:

@@ -97,6 +97,17 @@ class CodexSourceAdapter:
         self._inventory_cache = next_cache
         return changed
 
+    def list_full_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+        """Return every inventory row without applying the changed-thread cache."""
+
+        self._ensure_initialized()
+        summaries = self._fetch_inventory(archived=archived)
+        next_cache = dict(self._inventory_cache)
+        for summary in summaries:
+            next_cache[summary.native_id] = summary
+        self._inventory_cache = next_cache
+        return summaries
+
     def project_thread(
         self,
         summary: CodexThreadSummary,

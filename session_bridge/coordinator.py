@@ -261,6 +261,32 @@ class SessionBridgeCoordinator:
             duration_ms=sum(summary.duration_ms for summary in summaries),
         )
 
+    async def scan_all_history(
+        self, provider: Provider | None = None
+    ) -> ScanSummary:
+        """Index one complete provider inventory without mirror side effects."""
+
+        if not self._config.catalog.enabled:
+            return _zero_scan(provider)
+        if provider is not None:
+            normalized = Provider(provider)
+            if normalized not in _EXTERNAL_PROVIDERS:
+                raise ValueError("scan provider must be Claude or Codex")
+            return await self._scan_all_history_provider(normalized)
+
+        summaries = [
+            await self._scan_all_history_provider(candidate)
+            for candidate in (Provider.CLAUDE, Provider.CODEX)
+        ]
+        return ScanSummary(
+            provider=None,
+            discovered=sum(summary.discovered for summary in summaries),
+            indexed=sum(summary.indexed for summary in summaries),
+            rebuilt=sum(summary.rebuilt for summary in summaries),
+            failed=sum(summary.failed for summary in summaries),
+            duration_ms=sum(summary.duration_ms for summary in summaries),
+        )
+
     async def reconcile_once(self) -> ReconcileSummary:
         async with self._job_lock:
             jobs = await self._reconcile_jobs_locked()
@@ -449,26 +475,53 @@ class SessionBridgeCoordinator:
             failed=failed,
         )
 
-    async def process_jobs_once(self) -> JobSummary:
+    async def process_jobs_once(
+        self,
+        *,
+        job_ids: Sequence[str] | None = None,
+        limit: int | None = None,
+    ) -> JobSummary:
+        normalized_job_ids = _validated_process_job_ids(job_ids)
+        if limit is not None and (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("job processing limit must be between 1 and 1000")
         async with self._job_lock:
-            return await self._process_jobs_locked()
+            return await self._process_jobs_locked(
+                job_ids=normalized_job_ids,
+                limit=limit,
+            )
 
-    async def _process_jobs_locked(self) -> JobSummary:
+    async def _process_jobs_locked(
+        self,
+        *,
+        job_ids: tuple[str, ...] | None,
+        limit: int | None,
+    ) -> JobSummary:
         policy = self._mirror_policy()
+        requested_limit = policy.creates_per_minute if limit is None else limit
         now = float(self._clock())
         atomic_claim = getattr(self._store, "claim_due_jobs_with_limits", None)
         uses_atomic_controls = callable(atomic_claim)
         breaker = BatchProgress()
         effective_policy = policy
         if callable(atomic_claim):
+            claim_kwargs: dict[str, Any] = {
+                "now": now,
+                "limit": requested_limit,
+                "policy": policy,
+            }
+            if job_ids is not None:
+                claim_kwargs["job_ids"] = job_ids
             jobs = await asyncio.to_thread(
                 atomic_claim,
-                now=now,
-                limit=policy.creates_per_minute,
-                policy=policy,
+                **claim_kwargs,
             )
         else:
             capacity = await self._creation_capacity(policy, now=now)
+            capacity = min(capacity, requested_limit)
             if capacity == 0:
                 return JobSummary(
                     claimed=0,
@@ -477,7 +530,7 @@ class SessionBridgeCoordinator:
                     manual_failure=0,
                 )
             breaker = await self._load_breaker_progress()
-            if policy.automatic_creation and _healthy_breaker_batch_completed(
+            if _healthy_breaker_batch_completed(
                 breaker,
                 policy,
             ):
@@ -486,33 +539,44 @@ class SessionBridgeCoordinator:
             if policy.automatic_creation and should_halt_batch(breaker, policy):
                 effective_policy = replace(policy, automatic_creation=False)
             claim_limit = 1 if effective_policy.automatic_creation else capacity
+            fallback_claim_kwargs: dict[str, Any] = {
+                "now": now,
+                "limit": claim_limit,
+                "policy": effective_policy,
+            }
+            if job_ids is not None:
+                fallback_claim_kwargs["job_ids"] = job_ids
             jobs = await asyncio.to_thread(
                 _call,
                 self._store,
                 "claim_due_jobs",
-                now=now,
-                limit=claim_limit,
-                policy=effective_policy,
+                **fallback_claim_kwargs,
             )
             await self._reserve_creation_capacity(jobs, now=now)
         succeeded = 0
         retried = 0
         manual_failure = 0
-        automatic_attempts = 0
-        automatic_errors = 0
+        limited_attempts = 0
+        limited_errors = 0
         for raw_job in jobs:
             job = _validated_job(raw_job)
             outcome = await self._process_claimed_job(job, policy=effective_policy)
-            automatic_claim = job.get("claim_authority", "automatic") == "automatic"
-            automatic_attempts += int(automatic_claim)
+            fallback_authority = (
+                "automatic" if effective_policy.automatic_creation else "manual"
+            )
+            limited_claim = (
+                job.get("claim_authority", fallback_authority) == "automatic"
+                or job.get("rollout_limited", False)
+            )
+            limited_attempts += int(limited_claim)
             if outcome is MirrorJobState.SUCCEEDED:
                 succeeded += 1
             elif outcome is MirrorJobState.RETRY:
                 retried += 1
-                automatic_errors += int(automatic_claim)
+                limited_errors += int(limited_claim)
             else:
                 manual_failure += 1
-                automatic_errors += int(automatic_claim)
+                limited_errors += int(limited_claim)
         summary = JobSummary(
             claimed=len(jobs),
             succeeded=succeeded,
@@ -520,15 +584,13 @@ class SessionBridgeCoordinator:
             manual_failure=manual_failure,
         )
         if (
-            automatic_attempts
+            limited_attempts
             and not uses_atomic_controls
-            and policy.automatic_creation
-            and effective_policy.automatic_creation
         ):
             await self._save_breaker_progress(
                 BatchProgress(
-                    attempts=breaker.attempts + automatic_attempts,
-                    errors=breaker.errors + automatic_errors,
+                    attempts=breaker.attempts + limited_attempts,
+                    errors=breaker.errors + limited_errors,
                 )
             )
         return summary
@@ -1450,6 +1512,127 @@ class SessionBridgeCoordinator:
                 duration_ms=self._elapsed_ms(started),
             )
 
+    async def _scan_all_history_provider(self, provider: Provider) -> ScanSummary:
+        async with self._scan_locks[provider]:
+            started = float(self._monotonic())
+            try:
+                if provider is Provider.CLAUDE:
+                    summary = await self._scan_all_claude_history()
+                elif provider is Provider.CODEX:
+                    summary = await self._scan_all_codex_history()
+                else:
+                    raise ValueError("unsupported scan provider")
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                self._mark_scan_failure(provider)
+                return ScanSummary(
+                    provider=provider,
+                    discovered=0,
+                    indexed=0,
+                    rebuilt=0,
+                    failed=1,
+                    duration_ms=self._elapsed_ms(started),
+                )
+
+            if summary.failed:
+                self._mark_scan_failure(provider)
+            else:
+                self._mark_scan_success(provider)
+            return ScanSummary(
+                provider=provider,
+                discovered=summary.discovered,
+                indexed=summary.indexed,
+                rebuilt=summary.rebuilt,
+                failed=summary.failed,
+                duration_ms=self._elapsed_ms(started),
+            )
+
+    async def _scan_all_claude_history(self) -> ScanSummary:
+        adapter = self._adapter(Provider.CLAUDE)
+        discovered_paths = await self._provider_call(_call, adapter, "discover")
+        ordered_paths, unavailable_paths = await asyncio.to_thread(
+            _sort_claude_paths,
+            discovered_paths,
+        )
+        paths: list[Path] = []
+        seen_native_ids: set[str] = set()
+        for path in ordered_paths:
+            if path.stem in seen_native_ids:
+                continue
+            seen_native_ids.add(path.stem)
+            paths.append(path)
+
+        indexed = 0
+        rebuilt = 0
+        failed = len(unavailable_paths)
+        for path in paths:
+            try:
+                parsed = await self._provider_call(_call, adapter, "parse", path)
+                projection = _projection_from_parse(parsed)
+                result = await asyncio.to_thread(
+                    _upsert,
+                    self._store,
+                    projection,
+                    True,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed += 1
+                continue
+            indexed += 1
+            rebuilt += int(not result.first_seen)
+        return ScanSummary(
+            provider=Provider.CLAUDE,
+            discovered=len(paths) + len(unavailable_paths),
+            indexed=indexed,
+            rebuilt=rebuilt,
+            failed=failed,
+            duration_ms=0,
+        )
+
+    async def _scan_all_codex_history(self) -> ScanSummary:
+        adapter = self._adapter(Provider.CODEX)
+        discovered_summaries = await self._provider_call(
+            _codex_full_inventory,
+            adapter,
+            include_archived=True,
+        )
+        summaries = _sort_codex_summaries(discovered_summaries)
+        indexed = 0
+        rebuilt = 0
+        failed = 0
+        for thread_summary in summaries:
+            try:
+                projection = await self._provider_call(
+                    _call,
+                    adapter,
+                    "project_thread",
+                    thread_summary,
+                )
+                result = await asyncio.to_thread(
+                    _upsert,
+                    self._store,
+                    projection,
+                    True,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed += 1
+                continue
+            indexed += 1
+            rebuilt += int(not result.first_seen)
+        return ScanSummary(
+            provider=Provider.CODEX,
+            discovered=len(summaries),
+            indexed=indexed,
+            rebuilt=rebuilt,
+            failed=failed,
+            duration_ms=0,
+        )
+
     async def _scan_claude(self, discovery_mode: DiscoveryMode) -> ScanSummary:
         if _supports_scan_state(self._store):
             return await self._scan_claude_persistent(discovery_mode)
@@ -1566,19 +1749,24 @@ class SessionBridgeCoordinator:
             discovery_mode,
         )
         discovered_paths = await self._provider_call(_call, adapter, "discover")
-        ordered_paths = await asyncio.to_thread(
+        ordered_paths, unavailable_paths = await asyncio.to_thread(
             _sort_claude_paths,
             discovered_paths,
         )
         paths_by_native_id: dict[str, Path] = {}
         current_fingerprints: dict[str, dict[str, int]] = {}
         changed_ids: list[str] = []
+        unavailable_ids = {path.stem for path in unavailable_paths}
         for path in ordered_paths:
             native_id = path.stem
             if native_id in paths_by_native_id:
                 continue
+            try:
+                fingerprint = _claude_path_fingerprint(path)
+            except OSError:
+                unavailable_ids.add(native_id)
+                continue
             paths_by_native_id[native_id] = path
-            fingerprint = _claude_path_fingerprint(path)
             current_fingerprints[native_id] = fingerprint
             if (
                 committed_fingerprints.get(native_id) != fingerprint
@@ -1608,7 +1796,11 @@ class SessionBridgeCoordinator:
                 for native_id in staged_ids
             },
         )
-        selected_ids = staged_ids[: self._scan_batch_size]
+        selected_ids = [
+            native_id
+            for native_id in staged_ids
+            if native_id not in unavailable_ids
+        ][: self._scan_batch_size]
         indexed = 0
         rebuilt = 0
         failed_ids: list[str] = []
@@ -1653,7 +1845,10 @@ class SessionBridgeCoordinator:
             succeeded_ids.append(native_id)
             committed_fingerprints[native_id] = current_fingerprints[native_id]
 
-        unselected_ids = staged_ids[len(selected_ids) :]
+        selected_set = set(selected_ids)
+        unselected_ids = [
+            native_id for native_id in staged_ids if native_id not in selected_set
+        ]
         remaining_ids = _merge_native_ids(unselected_ids, failed_ids)
         await self._save_pending(provider, remaining_ids)
         await self._save_claude_fingerprints(
@@ -1682,10 +1877,10 @@ class SessionBridgeCoordinator:
         )
         return ScanSummary(
             provider=provider,
-            discovered=len(staged_ids),
+            discovered=len(set(staged_ids) | unavailable_ids),
             indexed=indexed,
             rebuilt=rebuilt,
-            failed=len(failed_ids),
+            failed=len(failed_ids) + len(unavailable_ids),
             duration_ms=0,
         )
 
@@ -2133,15 +2328,22 @@ def _load_default_awatch() -> _AWatchFactory:
     return awatch
 
 
-def _sort_claude_paths(paths: object) -> list[Path]:
+def _sort_claude_paths(paths: object) -> tuple[list[Path], list[Path]]:
     try:
         normalized = [Path(path) for path in paths]  # type: ignore[union-attr]
     except TypeError as exc:
         raise RuntimeError("Claude discovery returned no path list") from exc
-    return sorted(
-        normalized,
-        key=lambda path: (-float(path.stat().st_mtime), path.stem, str(path)),
-    )
+    sortable: list[tuple[float, str, str, Path]] = []
+    unavailable: list[Path] = []
+    for path in normalized:
+        try:
+            modified_at = float(path.stat().st_mtime)
+        except OSError:
+            unavailable.append(path)
+            continue
+        sortable.append((-modified_at, path.stem, str(path), path))
+    sortable.sort()
+    return [entry[3] for entry in sortable], unavailable
 
 
 def _claude_path_fingerprint(path: Path) -> dict[str, int]:
@@ -2260,6 +2462,25 @@ def _codex_inventory(
             batch = list(summaries)
         except TypeError as exc:
             raise RuntimeError("Codex inventory returned no summary list") from exc
+        for summary in batch:
+            native_id = _codex_native_id(summary)
+            merged.setdefault(native_id, summary)
+    return list(merged.values())
+
+
+def _codex_full_inventory(
+    adapter: object,
+    *,
+    include_archived: bool,
+) -> list[object]:
+    passes = [False, True] if include_archived else [False]
+    merged: dict[str, object] = {}
+    for archived in passes:
+        summaries = _call(adapter, "list_full_inventory", archived=archived)
+        try:
+            batch = list(summaries)
+        except TypeError as exc:
+            raise RuntimeError("Codex full inventory returned no summary list") from exc
         for summary in batch:
             native_id = _codex_native_id(summary)
             merged.setdefault(native_id, summary)
@@ -2641,6 +2862,29 @@ def _finite_number(value: object, label: str) -> float:
     return float(value)
 
 
+def _validated_process_job_ids(
+    job_ids: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if job_ids is None:
+        return None
+    if isinstance(job_ids, (str, bytes)) or not isinstance(job_ids, Sequence):
+        raise TypeError("job_ids must be a sequence")
+    if len(job_ids) > 1000:
+        raise ValueError("job_ids must contain at most 1000 IDs")
+    normalized: list[str] = []
+    for job_id in job_ids:
+        if (
+            not isinstance(job_id, str)
+            or not job_id
+            or job_id != job_id.strip()
+        ):
+            raise ValueError("job_ids must contain exact nonempty IDs")
+        normalized.append(job_id)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("job_ids must not contain duplicates")
+    return tuple(normalized)
+
+
 def _validated_job(raw_job: object) -> dict[str, Any]:
     if not isinstance(raw_job, Mapping):
         raise RuntimeError("mirror job is invalid")
@@ -2660,6 +2904,10 @@ def _validated_job(raw_job: object) -> dict[str, Any]:
     attempts = job.get("attempts")
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts <= 0:
         raise RuntimeError("mirror job attempts are invalid")
+    rollout_limited = job.get("rollout_limited", False)
+    if type(rollout_limited) is not bool:
+        raise RuntimeError("mirror job rollout authority is invalid")
+    job["rollout_limited"] = rollout_limited
     return job
 
 

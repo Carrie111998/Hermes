@@ -288,6 +288,39 @@ class TestInventory:
             "two",
         ]
 
+    def test_full_inventory_bypasses_changed_cache_on_every_call(self) -> None:
+        row = {
+            "id": "one",
+            "title": "One",
+            "cwd": "C:/one",
+            "createdAt": 100,
+            "updatedAt": 200,
+            "revision": "r1",
+        }
+        changed = {**row, "updatedAt": 201, "revision": "r2"}
+        client = FakeInitializingClient({
+            "thread/list": [
+                {"data": [row]},
+                {"data": [changed]},
+                {"data": [changed]},
+                {"data": [changed]},
+            ]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+
+        assert [row.native_id for row in adapter.list_inventory(archived=False)] == [
+            "one"
+        ]
+        assert [
+            row.native_id for row in adapter.list_full_inventory(archived=False)
+        ] == ["one"]
+        assert [row.native_id for row in adapter.list_inventory(archived=False)] == [
+            "one"
+        ]
+        assert [
+            row.native_id for row in adapter.list_full_inventory(archived=False)
+        ] == ["one"]
+
     def test_reused_explicit_revision_does_not_hide_supported_metadata_changes(
         self,
     ) -> None:

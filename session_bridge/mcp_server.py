@@ -34,6 +34,8 @@ EXPECTED_TOOLS = {
 }
 _TOKEN_ENV = "HERMES_SESSION_BRIDGE_TOKEN"
 _MIN_TOKEN_BYTES = 32
+_MIN_MARKER_KEY_BYTES = 32
+_MAX_MARKER_KEY_BYTES = 4096
 _MAX_CONTEXT_BUDGET = 100_000
 _DEFAULT_CONTEXT_BUDGET = 24_000
 _SENSITIVE_STATUS_KEYS = frozenset(
@@ -72,6 +74,85 @@ def resolve_bearer_token(
         _require_restricted_token_file(path)
         raw = path.read_text(encoding="utf-8")
     return _validated_token(raw)
+
+
+def resolve_marker_key(*, marker_key_file: Path | None = None) -> bytes:
+    """Load the origin-marker HMAC key from its independent restricted file."""
+
+    path = Path(
+        marker_key_file
+        if marker_key_file is not None
+        else get_hermes_home() / "session-bridge" / "marker-key"
+    ).expanduser()
+    try:
+        key = _read_restricted_marker_key(path)
+    except FileNotFoundError:
+        raise RuntimeError("session bridge marker key file is missing") from None
+    if len(key) < _MIN_MARKER_KEY_BYTES:
+        raise ValueError("session bridge marker key must be at least 32 bytes")
+    return key
+
+
+def _read_restricted_marker_key(path: Path) -> bytes:
+    descriptor = -1
+    try:
+        before = os.lstat(path)
+        if _secret_metadata_is_redirect(before) or not stat.S_ISREG(before.st_mode):
+            raise PermissionError(
+                "session bridge marker key file must be a non-redirect regular file"
+            )
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        if not _same_secret_file(before, opened):
+            raise PermissionError("session bridge marker key file identity changed")
+
+        _require_restricted_token_file(path)
+        verified = os.lstat(path)
+        if _secret_metadata_is_redirect(verified) or not _same_secret_file(
+            opened, verified
+        ):
+            raise PermissionError("session bridge marker key file identity changed")
+        if opened.st_size > _MAX_MARKER_KEY_BYTES:
+            raise ValueError("session bridge marker key file is too large")
+
+        chunks: list[bytes] = []
+        remaining = _MAX_MARKER_KEY_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        key = b"".join(chunks)
+        if len(key) > _MAX_MARKER_KEY_BYTES:
+            raise ValueError("session bridge marker key file is too large")
+
+        after = os.fstat(descriptor)
+        current = os.lstat(path)
+        if (
+            _secret_metadata_is_redirect(current)
+            or not _same_secret_file(opened, after)
+            or not _same_secret_file(opened, current)
+            or after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or len(key) != after.st_size
+        ):
+            raise PermissionError("session bridge marker key file changed while read")
+        return key
+    except (FileNotFoundError, PermissionError, ValueError):
+        raise
+    except OSError as exc:
+        raise PermissionError(
+            "session bridge marker key file could not be read safely"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def create_app(
@@ -369,9 +450,9 @@ def _validated_token(value: str | bytes) -> bytes:
 
 
 def _require_restricted_token_file(path: Path) -> None:
-    if path.is_symlink():
-        raise PermissionError("session bridge token file must not be a symlink")
-    info = path.stat()
+    info = os.lstat(path)
+    if _secret_metadata_is_redirect(info):
+        raise PermissionError("session bridge token file must not be a redirect")
     if not stat.S_ISREG(info.st_mode):
         raise PermissionError("session bridge token file must be a regular file")
     if os.name != "nt":
@@ -429,6 +510,23 @@ $rules = @($acl.GetAccessRules(
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise PermissionError("session bridge token file ACL could not be verified") from exc
+
+
+def _secret_metadata_is_redirect(info: os.stat_result) -> bool:
+    attributes = getattr(info, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse_flag)
+
+
+def _same_secret_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        first.st_ino != 0
+        and second.st_ino != 0
+        and first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and stat.S_IFMT(first.st_mode) == stat.S_IFMT(second.st_mode)
+        and stat.S_ISREG(second.st_mode)
+    )
 
 
 def _validate_windows_token_acl(
@@ -526,4 +624,9 @@ def _clamp_int(value: object, *, default: int, minimum: int, maximum: int) -> in
     return max(minimum, min(int(value), maximum))
 
 
-__all__ = ["EXPECTED_TOOLS", "create_app", "resolve_bearer_token"]
+__all__ = [
+    "EXPECTED_TOOLS",
+    "create_app",
+    "resolve_bearer_token",
+    "resolve_marker_key",
+]

@@ -352,6 +352,7 @@ def enqueue_mirror_job(
     context: EligibilityContext | None = None,
     retry_failed: bool = False,
     require_unmapped: bool = False,
+    rollout_limited: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(policy, MirrorPolicy):
         raise TypeError("policy must be a MirrorPolicy")
@@ -361,10 +362,14 @@ def enqueue_mirror_job(
         raise ValueError("retry_failed must be a boolean")
     if type(require_unmapped) is not bool:
         raise ValueError("require_unmapped must be a boolean")
+    if type(rollout_limited) is not bool:
+        raise ValueError("rollout_limited must be a boolean")
     if retry_failed and not manual_authorized:
         raise ValueError("retry_failed requires manual_authorized=True")
     if require_unmapped and not manual_authorized:
         raise ValueError("require_unmapped requires manual_authorized=True")
+    if rollout_limited and not require_unmapped:
+        raise ValueError("rollout_limited requires require_unmapped=True")
     source_provider = _canonical_source_provider(source_session_id)
     target = _external_provider(target_provider)
     if target is not _inverted_provider(source_provider):
@@ -393,6 +398,7 @@ def enqueue_mirror_job(
         context=context,
         retry_failed=retry_failed,
         require_unmapped=require_unmapped,
+        rollout_limited=rollout_limited,
     )
 
 
@@ -401,21 +407,30 @@ def claim_due_mirror_jobs(
     *,
     limit: int,
     policy: MirrorPolicy,
+    job_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(policy, MirrorPolicy):
         raise TypeError("policy must be a MirrorPolicy")
     _nonnegative_integer("claim limit", limit)
-    if limit == 0:
+    normalized_job_ids = _exact_job_ids(job_ids)
+    if limit == 0 or normalized_job_ids == ():
         return []
 
     def _write(connection: Any) -> list[dict[str, Any]]:
         now = _finite_float("store clock", store._clock())
         scan_limit = max(limit * 4, limit + 32)
+        scope_clause = ""
+        scope_params: list[Any] = []
+        if normalized_job_ids is not None:
+            placeholders = ",".join("?" for _ in normalized_job_ids)
+            scope_clause = f" AND job.id IN ({placeholders})"
+            scope_params.extend(normalized_job_ids)
         due = connection.execute(
-            """SELECT job.* FROM session_mirror_jobs AS job
+            f"""SELECT job.* FROM session_mirror_jobs AS job
                LEFT JOIN session_bridge_state AS authority
                  ON authority.key = ? || job.id
                WHERE job.state IN (?, ?) AND job.next_attempt_at <= ?
+                 {scope_clause}
                ORDER BY
                  CASE WHEN authority.value_json LIKE ? THEN 0 ELSE 1 END,
                  job.next_attempt_at, job.created_at, job.id
@@ -425,6 +440,7 @@ def claim_due_mirror_jobs(
                 MirrorJobState.QUEUED.value,
                 MirrorJobState.RETRY.value,
                 now,
+                *scope_params,
                 '{"authority":"manual",%',
                 scan_limit,
             ),
@@ -507,14 +523,15 @@ def claim_due_mirror_jobs(
             )
             if cursor.rowcount != 1:
                 raise ValueError("stale mirror job claim")
-            claimed.append(
-                dict(
-                    connection.execute(
-                        "SELECT * FROM session_mirror_jobs WHERE id = ?",
-                        (job["id"],),
-                    ).fetchone()
-                )
+            claimed_job = dict(
+                connection.execute(
+                    "SELECT * FROM session_mirror_jobs WHERE id = ?",
+                    (job["id"],),
+                ).fetchone()
             )
+            claimed_job["claim_authority"] = claim_authority
+            claimed_job["rollout_limited"] = authority["rollout_limited"]
+            claimed.append(claimed_job)
         return claimed
 
     return store.db._execute_write(_write)
@@ -824,6 +841,7 @@ def _enqueue_authorized_job(
     context: EligibilityContext | None,
     retry_failed: bool,
     require_unmapped: bool,
+    rollout_limited: bool,
 ) -> dict[str, Any]:
     job_id = f"job:{idempotency_key}"
 
@@ -892,6 +910,7 @@ def _enqueue_authorized_job(
             if authority == "manual" and (
                 existing_authority["authority"] == "automatic"
                 or (require_unmapped and not existing_authority["require_unmapped"])
+                or (rollout_limited and not existing_authority["rollout_limited"])
             ):
                 promoted_value = _encode_mirror_authority(
                     authority="manual",
@@ -902,6 +921,10 @@ def _enqueue_authorized_job(
                     require_unmapped=(
                         bool(existing_authority["require_unmapped"])
                         or require_unmapped
+                    ),
+                    rollout_limited=(
+                        bool(existing_authority["rollout_limited"])
+                        or rollout_limited
                     ),
                 )
                 cursor = connection.execute(
@@ -986,6 +1009,7 @@ def _enqueue_authorized_job(
             target_provider=target_provider,
             policy_generation=policy.generation,
             require_unmapped=require_unmapped,
+            rollout_limited=rollout_limited,
         )
         connection.execute(
             """INSERT INTO session_bridge_state (key, value_json, updated_at)
@@ -1067,6 +1091,7 @@ def _encode_mirror_authority(
     target_provider: Provider,
     policy_generation: int,
     require_unmapped: bool = False,
+    rollout_limited: bool = False,
 ) -> str:
     return json.dumps(
         {
@@ -1074,6 +1099,7 @@ def _encode_mirror_authority(
             "idempotency_key": idempotency_key,
             "policy_generation": policy_generation,
             "require_unmapped": require_unmapped,
+            "rollout_limited": rollout_limited,
             "source_session_id": source_session_id,
             "target_provider": target_provider.value,
         },
@@ -1101,19 +1127,29 @@ def _read_mirror_authority(connection: Any, job: Mapping[str, Any]) -> dict[str,
         "source_session_id",
         "target_provider",
     }
-    current_fields = {*legacy_fields, "require_unmapped"}
+    safe_manual_fields = {*legacy_fields, "require_unmapped"}
+    current_fields = {*safe_manual_fields, "rollout_limited"}
     if not isinstance(value, dict) or frozenset(value) not in {
         frozenset(legacy_fields),
+        frozenset(safe_manual_fields),
         frozenset(current_fields),
     }:
         raise _InvalidMirrorAuthority("invalid mirror authority metadata")
     require_unmapped = value.get("require_unmapped", False)
-    if type(require_unmapped) is not bool:
+    rollout_limited = value.get("rollout_limited", False)
+    if (
+        type(require_unmapped) is not bool
+        or type(rollout_limited) is not bool
+        or (rollout_limited and not require_unmapped)
+    ):
         raise _InvalidMirrorAuthority("invalid mirror authority metadata")
     value["require_unmapped"] = require_unmapped
+    value["rollout_limited"] = rollout_limited
     authority = value["authority"]
     generation = value["policy_generation"]
-    if authority not in ("automatic", "manual"):
+    if authority not in ("automatic", "manual") or (
+        rollout_limited and authority != "manual"
+    ):
         raise _InvalidMirrorAuthority("invalid mirror authority metadata")
     if (
         not isinstance(generation, int)
@@ -1211,6 +1247,27 @@ def _finite_float(name: str, value: object) -> float:
     if not math.isfinite(normalized):
         raise ValueError(f"{name} must be a finite number")
     return normalized
+
+
+def _exact_job_ids(job_ids: Sequence[str] | None) -> tuple[str, ...] | None:
+    if job_ids is None:
+        return None
+    if isinstance(job_ids, (str, bytes)) or not isinstance(job_ids, Sequence):
+        raise TypeError("job_ids must be a sequence")
+    if len(job_ids) > 1000:
+        raise ValueError("job_ids must contain at most 1000 IDs")
+    normalized: list[str] = []
+    for job_id in job_ids:
+        if (
+            not isinstance(job_id, str)
+            or not job_id
+            or job_id != job_id.strip()
+        ):
+            raise ValueError("job_ids must contain exact nonempty IDs")
+        normalized.append(job_id)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("job_ids must not contain duplicates")
+    return tuple(normalized)
 
 
 def _nonnegative_integer(name: str, value: object) -> None:

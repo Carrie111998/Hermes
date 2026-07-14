@@ -20,6 +20,7 @@ from session_bridge.mcp_server import (
     _validate_windows_token_acl,
     create_app,
     resolve_bearer_token,
+    resolve_marker_key,
 )
 from session_bridge.models import (
     ContextPack,
@@ -34,6 +35,7 @@ from session_bridge.store import SessionBridgeStore
 
 
 TOKEN = "bridge-test-token-with-at-least-32-bytes"
+MARKER_KEY = b"marker-key-material-with-at-least-32-bytes"
 
 
 @pytest.fixture
@@ -41,6 +43,50 @@ def db(tmp_path: Path):
     database = SessionDB(tmp_path / "state.db")
     yield database
     database.close()
+
+
+def _restrict_secret_file(path: Path) -> None:
+    path.chmod(0o600)
+    if os.name != "nt":
+        return
+    current_sid = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "icacls",
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{current_sid}:(F)",
+            "*S-1-5-18:(F)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "icacls",
+            str(path),
+            "/remove:g",
+            "*S-1-3-4",
+            "*S-1-5-32-544",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _projection(
@@ -709,47 +755,66 @@ def test_bearer_token_must_exist_and_be_at_least_32_bytes(tmp_path: Path) -> Non
 
     token_file = tmp_path / "bridge.token"
     token_file.write_text(TOKEN, encoding="utf-8")
-    token_file.chmod(0o600)
-    if os.name == "nt":
-        current_sid = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        subprocess.run(
-            [
-                "icacls",
-                str(token_file),
-                "/inheritance:r",
-                "/grant:r",
-                f"*{current_sid}:(F)",
-                "*S-1-5-18:(F)",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subprocess.run(
-            [
-                "icacls",
-                str(token_file),
-                "/remove:g",
-                "*S-1-3-4",
-                "*S-1-5-32-544",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    _restrict_secret_file(token_file)
     assert resolve_bearer_token(environ={}, token_file=token_file) == TOKEN.encode()
+
+
+def test_marker_key_is_loaded_from_its_own_restricted_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker_key_file = tmp_path / "marker-key"
+    marker_key_file.write_bytes(MARKER_KEY)
+    _restrict_secret_file(marker_key_file)
+
+    monkeypatch.setenv("HERMES_SESSION_BRIDGE_TOKEN", TOKEN)
+
+    assert resolve_marker_key(marker_key_file=marker_key_file) == MARKER_KEY
+
+
+def test_marker_key_must_exist_and_be_at_least_32_bytes(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="marker key file is missing"):
+        resolve_marker_key(marker_key_file=tmp_path / "missing")
+
+    marker_key_file = tmp_path / "marker-key"
+    marker_key_file.write_bytes(b"short")
+    _restrict_secret_file(marker_key_file)
+
+    with pytest.raises(ValueError, match="32 bytes"):
+        resolve_marker_key(marker_key_file=marker_key_file)
+
+
+def test_marker_key_uses_a_bounded_descriptor_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker_key_file = tmp_path / "marker-key"
+    marker_key_file.write_bytes(MARKER_KEY)
+    _restrict_secret_file(marker_key_file)
+
+    def forbid_path_reopen(_path: Path) -> bytes:
+        raise AssertionError("marker key must be consumed from its validated descriptor")
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_path_reopen)
+
+    assert resolve_marker_key(marker_key_file=marker_key_file) == MARKER_KEY
+
+
+def test_marker_key_rejects_oversized_file(tmp_path: Path) -> None:
+    marker_key_file = tmp_path / "marker-key"
+    marker_key_file.write_bytes(b"x" * 4097)
+    _restrict_secret_file(marker_key_file)
+
+    with pytest.raises(ValueError, match="too large"):
+        resolve_marker_key(marker_key_file=marker_key_file)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode assertion")
+def test_marker_key_rejects_group_or_world_readable_file(tmp_path: Path) -> None:
+    marker_key_file = tmp_path / "marker-key"
+    marker_key_file.write_bytes(MARKER_KEY)
+    marker_key_file.chmod(0o644)
+
+    with pytest.raises(PermissionError, match="permissions"):
+        resolve_marker_key(marker_key_file=marker_key_file)
 
 
 def test_windows_token_acl_allows_only_current_user_and_system() -> None:

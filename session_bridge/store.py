@@ -31,6 +31,12 @@ _MIRROR_AUTHORITY_STATE_PREFIX = "session-bridge:mirror-authority:"
 _MIRROR_RATE_STATE_KEY = "session-bridge:mirror-rate"
 _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
+_STRUCTURED_CONTENT_HEX_PREFIX = "006A736F6E3A"
+_PYTHON_STRIP_CHARACTERS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 _CONTINUATION_SNAPSHOT_FIELDS = frozenset({
     "version",
     "pack_id",
@@ -41,6 +47,24 @@ _CONTINUATION_SNAPSHOT_FIELDS = frozenset({
     "target_cursor",
     "target_hash",
 })
+
+
+NativeProjectionCursor = tuple[float, str]
+
+
+class NativeProjectionPage(list[SessionProjection]):
+    """A bounded newest-first page of minimal mirror-eligibility evidence."""
+
+    def __init__(
+        self,
+        projections: Sequence[SessionProjection] = (),
+        *,
+        has_more: bool = False,
+        next_cursor: NativeProjectionCursor | None = None,
+    ) -> None:
+        super().__init__(projections)
+        self.has_more = has_more
+        self.next_cursor = next_cursor
 
 
 class SessionBridgeStore:
@@ -280,6 +304,212 @@ class SessionBridgeStore:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_native_projections(
+        self,
+        after: float,
+        limit: int,
+        *,
+        cursor: NativeProjectionCursor | None = None,
+    ) -> NativeProjectionPage:
+        cutoff = _finite_number(after, "after")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("native projection limit must be between 1 and 1000")
+        normalized_cursor = _validated_native_projection_cursor(cursor)
+        cursor_clause = ""
+        query_params: dict[str, Any] = {
+            "activity_prefix": "session-bridge:external-activity:",
+            "origin_kind": OriginKind.NATIVE.value,
+            "after": cutoff,
+            "queued": MirrorJobState.QUEUED.value,
+            "running": MirrorJobState.RUNNING.value,
+            "retry": MirrorJobState.RETRY.value,
+            "structured_prefix": _STRUCTURED_CONTENT_HEX_PREFIX,
+            "trim_chars": _PYTHON_STRIP_CHARACTERS,
+            "query_limit": limit + 1,
+        }
+        if normalized_cursor is not None:
+            cursor_clause = """WHERE (
+                candidate.last_active < :cursor_activity
+                OR (
+                    candidate.last_active = :cursor_activity
+                    AND candidate.id > :cursor_session_id
+                )
+            )"""
+            query_params["cursor_activity"] = normalized_cursor[0]
+            query_params["cursor_session_id"] = normalized_cursor[1]
+
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            session_rows = conn.execute(
+                f"""WITH candidate_evidence AS (
+                       SELECT s.id, s.title, s.cwd, s.started_at, s.git_branch,
+                              e.provider, e.native_id, e.native_path,
+                              e.native_status, e.last_native_cursor,
+                              e.last_native_hash, e.parser_version,
+                              e.origin_kind, e.origin_bridge_id,
+                              activity.value_json AS activity_value_json,
+                              CAST(json_extract(
+                                  activity.value_json, '$.last_active'
+                              ) AS REAL) AS last_active,
+                              (
+                                  SELECT map.message_id
+                                  FROM external_message_map AS map
+                                  JOIN messages AS message
+                                    ON message.id = map.message_id
+                                  WHERE map.session_id = e.session_id
+                                    AND message.active = 1
+                                    AND message.role = 'user'
+                                    AND typeof(message.content) = 'text'
+                                    AND length(trim(
+                                        message.content, :trim_chars
+                                    )) > 0
+                                    AND substr(
+                                        hex(message.content), 1, 12
+                                    ) != :structured_prefix
+                                  ORDER BY message.timestamp, map.message_id
+                                  LIMIT 1
+                              ) AS evidence_message_id
+                       FROM external_sessions AS e
+                       JOIN sessions AS s ON s.id = e.session_id
+                       JOIN session_bridge_state AS activity
+                         ON activity.key = :activity_prefix || e.session_id
+                       WHERE e.origin_kind = :origin_kind
+                         AND e.origin_bridge_id IS NULL
+                         AND CAST(json_extract(
+                             activity.value_json, '$.last_active'
+                         ) AS REAL) >= :after
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_links AS link
+                             JOIN external_sessions AS target
+                               ON target.session_id = link.to_session_id
+                             WHERE link.from_session_id = e.session_id
+                               AND target.provider = CASE e.provider
+                                   WHEN 'claude' THEN 'codex'
+                                   ELSE 'claude'
+                               END
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM session_mirror_jobs AS job
+                             WHERE job.source_session_id = e.session_id
+                               AND job.state IN (
+                                   :queued, :running, :retry
+                               )
+                         )
+                   ), eligible_candidates AS (
+                       SELECT *
+                       FROM candidate_evidence
+                       WHERE evidence_message_id IS NOT NULL
+                   )
+                   SELECT candidate.*,
+                          map.native_event_id AS evidence_native_event_id,
+                          map.ordinal AS evidence_ordinal,
+                          message.role AS evidence_role,
+                          substr(trim(
+                              message.content, :trim_chars
+                          ), 1, 1) AS evidence_content,
+                          message.timestamp AS evidence_timestamp
+                   FROM eligible_candidates AS candidate
+                   JOIN external_message_map AS map
+                     ON map.session_id = candidate.id
+                    AND map.message_id = candidate.evidence_message_id
+                   JOIN messages AS message
+                     ON message.id = candidate.evidence_message_id
+                   {cursor_clause}
+                   ORDER BY candidate.last_active DESC, candidate.id
+                   LIMIT :query_limit""",
+                query_params,
+            ).fetchall()
+            if not session_rows:
+                return NativeProjectionPage()
+
+        has_more = len(session_rows) > limit
+        page_rows = session_rows[:limit]
+        projections: list[SessionProjection] = []
+        for row in page_rows:
+            last_active = _decode_external_activity(row["activity_value_json"])
+            if last_active < cutoff or last_active != float(row["last_active"]):
+                raise ValueError("native projection activity ordering is invalid")
+            evidence_content = row["evidence_content"]
+            if not isinstance(evidence_content, str) or not evidence_content.strip():
+                raise ValueError("native projection evidence is invalid")
+            projections.append(
+                SessionProjection(
+                    provider=_external_provider(row["provider"]),
+                    native_id=row["native_id"],
+                    title=row["title"],
+                    cwd=row["cwd"],
+                    started_at=float(row["started_at"]),
+                    last_active=last_active,
+                    messages=(
+                        ProjectedMessage(
+                            native_event_id=row["evidence_native_event_id"],
+                            ordinal=row["evidence_ordinal"],
+                            role=row["evidence_role"],
+                            content=evidence_content,
+                            timestamp=float(row["evidence_timestamp"]),
+                        ),
+                    ),
+                    native_path=row["native_path"],
+                    native_status=row["native_status"],
+                    native_cursor=row["last_native_cursor"],
+                    native_hash=row["last_native_hash"],
+                    parser_version=row["parser_version"],
+                    origin_kind=OriginKind(row["origin_kind"]),
+                    origin_bridge_id=row["origin_bridge_id"],
+                    git_branch=row["git_branch"],
+                )
+            )
+        next_cursor = (
+            (projections[-1].last_active, page_rows[-1]["id"])
+            if has_more and projections
+            else None
+        )
+        return NativeProjectionPage(
+            projections,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+
+    def list_existing_target_mappings(
+        self,
+        source_ids: Sequence[str],
+    ) -> frozenset[tuple[str, Provider]]:
+        normalized_source_ids = _bounded_exact_ids(
+            source_ids,
+            label="source_ids",
+            maximum=1000,
+        )
+        if not normalized_source_ids:
+            return frozenset()
+
+        mappings: set[tuple[str, Provider]] = set()
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            for start in range(0, len(normalized_source_ids), 400):
+                batch = normalized_source_ids[start : start + 400]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"""SELECT link.from_session_id, target.provider
+                         FROM session_links AS link
+                         JOIN external_sessions AS target
+                           ON target.session_id = link.to_session_id
+                         WHERE link.from_session_id IN ({placeholders})""",
+                    batch,
+                ).fetchall()
+                mappings.update(
+                    (row["from_session_id"], _external_provider(row["provider"]))
+                    for row in rows
+                )
+        return frozenset(mappings)
+
     def get_session_launch_metadata(
         self, session_id: str
     ) -> dict[str, str | None] | None:
@@ -507,6 +737,7 @@ class SessionBridgeStore:
         now: float,
         limit: int,
         policy: Any,
+        job_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         if (
             isinstance(now, bool)
@@ -516,7 +747,12 @@ class SessionBridgeStore:
             raise ValueError("now must be a finite number")
         from .mirror import claim_due_mirror_jobs
 
-        return claim_due_mirror_jobs(self, limit=limit, policy=policy)
+        return claim_due_mirror_jobs(
+            self,
+            limit=limit,
+            policy=policy,
+            job_ids=job_ids,
+        )
 
     def claim_due_jobs_with_limits(
         self,
@@ -524,29 +760,36 @@ class SessionBridgeStore:
         now: float,
         limit: int,
         policy: Any,
+        job_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         claim_time = _finite_number(now, "now")
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
             raise ValueError("claim limit must be a non-negative integer")
+        normalized_job_ids = (
+            None
+            if job_ids is None
+            else _bounded_exact_ids(job_ids, label="job_ids", maximum=1000)
+        )
         policy_values = _validated_claim_policy(policy)
-        if limit == 0:
+        if limit == 0 or normalized_job_ids == ():
             return []
 
         def _write(conn):
             automatic_creation = policy_values["automatic_creation"]
             breaker = _read_breaker_progress(conn)
-            if automatic_creation and _healthy_breaker_batch_completed(
+            if _healthy_breaker_batch_completed(
                 breaker,
                 stop_after_attempts=policy_values["stop_after_attempts"],
                 stop_error_rate=policy_values["stop_error_rate"],
             ):
                 breaker = {"attempts": 0, "errors": 0, "pending": 0}
                 _write_breaker_progress(conn, breaker, updated_at=claim_time)
-            automatic_allowed = automatic_creation and not _breaker_is_halted(
+            limited_allowed = not _breaker_is_halted(
                 breaker,
                 stop_after_attempts=policy_values["stop_after_attempts"],
                 stop_error_rate=policy_values["stop_error_rate"],
             )
+            automatic_allowed = automatic_creation and limited_allowed
 
             recent = _read_rate_attempts(conn, now=claim_time)
             capacity = min(
@@ -558,11 +801,18 @@ class SessionBridgeStore:
                 return []
 
             scan_limit = max(capacity * 4, capacity + 32)
+            scope_clause = ""
+            scope_params: list[Any] = []
+            if normalized_job_ids is not None:
+                placeholders = ",".join("?" for _ in normalized_job_ids)
+                scope_clause = f" AND job.id IN ({placeholders})"
+                scope_params.extend(normalized_job_ids)
             due = conn.execute(
-                """SELECT job.* FROM session_mirror_jobs AS job
+                f"""SELECT job.* FROM session_mirror_jobs AS job
                    LEFT JOIN session_bridge_state AS authority
                      ON authority.key = ? || job.id
                    WHERE job.state IN (?, ?) AND job.next_attempt_at <= ?
+                     {scope_clause}
                    ORDER BY
                      CASE WHEN authority.value_json LIKE ? THEN 0 ELSE 1 END,
                      job.next_attempt_at, job.created_at, job.id
@@ -572,12 +822,13 @@ class SessionBridgeStore:
                     MirrorJobState.QUEUED.value,
                     MirrorJobState.RETRY.value,
                     claim_time,
+                    *scope_params,
                     '{"authority":"manual",%',
                     scan_limit,
                 ),
             ).fetchall()
             claimed: list[dict[str, Any]] = []
-            automatic_reserved = 0
+            limited_reserved = 0
             for job in due:
                 if len(claimed) >= capacity:
                     break
@@ -602,8 +853,13 @@ class SessionBridgeStore:
                     )
                     continue
                 claim_authority = authority["authority"]
+                rollout_limited = authority["rollout_limited"]
+                is_limited = claim_authority == "automatic" or rollout_limited
                 if claim_authority == "automatic":
-                    if not automatic_allowed or automatic_reserved:
+                    if not automatic_allowed:
+                        continue
+                if is_limited:
+                    if not limited_allowed or limited_reserved:
                         continue
                 if claim_authority == "automatic" or authority["require_unmapped"]:
                     if _automatic_claim_denial(conn, job) is not None:
@@ -648,8 +904,9 @@ class SessionBridgeStore:
                     ).fetchone()
                 )
                 claimed_job["claim_authority"] = claim_authority
-                if claim_authority == "automatic":
-                    automatic_reserved = 1
+                claimed_job["rollout_limited"] = rollout_limited
+                if is_limited:
+                    limited_reserved = 1
                     _create_breaker_reservation(
                         conn,
                         claimed_job,
@@ -657,11 +914,11 @@ class SessionBridgeStore:
                     )
                 claimed.append(claimed_job)
 
-            if automatic_reserved:
+            if limited_reserved:
                 breaker = {
-                    "attempts": breaker["attempts"] + automatic_reserved,
+                    "attempts": breaker["attempts"] + limited_reserved,
                     "errors": breaker["errors"],
-                    "pending": breaker["pending"] + automatic_reserved,
+                    "pending": breaker["pending"] + limited_reserved,
                 }
                 _write_breaker_progress(conn, breaker, updated_at=claim_time)
 
@@ -1652,19 +1909,29 @@ def _read_claim_authority(conn: Any, job: Mapping[str, Any]) -> dict[str, Any]:
         "source_session_id",
         "target_provider",
     }
-    current_fields = {*legacy_fields, "require_unmapped"}
+    safe_manual_fields = {*legacy_fields, "require_unmapped"}
+    current_fields = {*safe_manual_fields, "rollout_limited"}
     if not isinstance(value, dict) or frozenset(value) not in {
         frozenset(legacy_fields),
+        frozenset(safe_manual_fields),
         frozenset(current_fields),
     }:
         raise ValueError("invalid mirror authority metadata")
     require_unmapped = value.get("require_unmapped", False)
-    if type(require_unmapped) is not bool:
+    rollout_limited = value.get("rollout_limited", False)
+    if (
+        type(require_unmapped) is not bool
+        or type(rollout_limited) is not bool
+        or (rollout_limited and not require_unmapped)
+    ):
         raise ValueError("invalid mirror authority metadata")
     value["require_unmapped"] = require_unmapped
+    value["rollout_limited"] = rollout_limited
     authority = value["authority"]
     generation = value["policy_generation"]
-    if authority not in ("automatic", "manual"):
+    if authority not in ("automatic", "manual") or (
+        rollout_limited and authority != "manual"
+    ):
         raise ValueError("invalid mirror authority metadata")
     _nonnegative_integer(generation, "mirror authority policy generation")
     provider = _external_provider(value["target_provider"])
@@ -1763,6 +2030,39 @@ def _external_provider(provider: Provider | str) -> Provider:
     if normalized not in _EXTERNAL_PROVIDERS:
         raise ValueError("bridge provider must be Claude or Codex")
     return normalized
+
+
+def _validated_native_projection_cursor(
+    cursor: NativeProjectionCursor | None,
+) -> NativeProjectionCursor | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, tuple) or len(cursor) != 2:
+        raise ValueError("native projection cursor must be an exact pair")
+    activity = _finite_number(cursor[0], "native projection cursor activity")
+    session_id = cursor[1]
+    _provider_from_canonical_session_id(session_id)
+    return activity, session_id
+
+
+def _bounded_exact_ids(
+    values: Sequence[str],
+    *,
+    label: str,
+    maximum: int,
+) -> tuple[str, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise TypeError(f"{label} must be a sequence")
+    if len(values) > maximum:
+        raise ValueError(f"{label} must contain at most {maximum} IDs")
+    normalized: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"{label} must contain exact nonempty IDs")
+        normalized.append(value)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{label} must not contain duplicates")
+    return tuple(normalized)
 
 
 def _nonempty_text(value: str, label: str) -> str:

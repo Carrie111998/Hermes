@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
@@ -222,12 +222,15 @@ class _StateStore:
         operations: list[tuple[object, ...]],
         *,
         fail_upsert_number: int | None = None,
+        existing_native_ids: set[str] | None = None,
     ) -> None:
         self.operations = operations
         self.states: dict[str, dict[str, Any]] = {}
         self.projections: list[SessionProjection] = []
         self.upsert_attempts: list[str] = []
+        self.rebuild_attempts: list[tuple[str, bool]] = []
         self.fail_upsert_number = fail_upsert_number
+        self.existing_native_ids = set(existing_native_ids or ())
 
     def get_state(self, key: str) -> dict[str, Any] | None:
         state = self.states.get(key)
@@ -245,15 +248,18 @@ class _StateStore:
         rebuild: bool = False,
     ) -> UpsertResult:
         self.upsert_attempts.append(projection.native_id)
+        self.rebuild_attempts.append((projection.native_id, rebuild))
         self.operations.append(("upsert", projection.native_id))
         if len(self.upsert_attempts) == self.fail_upsert_number:
             raise RuntimeError("synthetic upsert failure")
+        first_seen = projection.native_id not in self.existing_native_ids
+        self.existing_native_ids.add(projection.native_id)
         self.projections.append(projection)
         return UpsertResult(
             session_id=f"{projection.provider.value}:{projection.native_id}",
             inserted_messages=len(projection.messages),
             rebuilt=rebuild,
-            first_seen=True,
+            first_seen=first_seen,
         )
 
 
@@ -338,6 +344,67 @@ class _BacklogCodexAdapter:
     def project_thread(self, summary: CodexThreadSummary) -> SessionProjection:
         self.projected_native_ids.append(summary.native_id)
         self.operations.append(("project", summary.native_id))
+        return _scan_projection(Provider.CODEX, summary.native_id)
+
+
+class _FullHistoryClaudeAdapter:
+    def __init__(
+        self,
+        paths: list[Path],
+        *,
+        failing_native_ids: set[str] | None = None,
+    ) -> None:
+        self.paths = list(paths)
+        self.failing_native_ids = set(failing_native_ids or ())
+        self.discover_calls = 0
+        self.parsed_native_ids: list[str] = []
+
+    def discover(self) -> list[Path]:
+        self.discover_calls += 1
+        return list(self.paths)
+
+    def parse(self, path: Path) -> ClaudeParseResult:
+        native_id = path.stem
+        self.parsed_native_ids.append(native_id)
+        if native_id in self.failing_native_ids:
+            raise RuntimeError("synthetic Claude projection failure")
+        return ClaudeParseResult(
+            projection=_scan_projection(Provider.CLAUDE, native_id),
+            cursor=ClaudeCursor(offset=1, head_length=1, head_hash="a" * 64),
+            rebuild=False,
+            malformed_lines=0,
+            unknown_records=0,
+        )
+
+
+class _FullHistoryCodexAdapter:
+    def __init__(
+        self,
+        *,
+        active: list[CodexThreadSummary],
+        archived: list[CodexThreadSummary],
+        failing_native_ids: set[str] | None = None,
+    ) -> None:
+        self.active = list(active)
+        self.archived = list(archived)
+        self.failing_native_ids = set(failing_native_ids or ())
+        self.incremental_inventory_calls = 0
+        self.full_inventory_calls: list[bool] = []
+        self.projected_native_ids: list[str] = []
+
+    def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+        del archived
+        self.incremental_inventory_calls += 1
+        raise AssertionError("full-history scan must not use changed-only inventory")
+
+    def list_full_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+        self.full_inventory_calls.append(archived)
+        return list(self.archived if archived else self.active)
+
+    def project_thread(self, summary: CodexThreadSummary) -> SessionProjection:
+        self.projected_native_ids.append(summary.native_id)
+        if summary.native_id in self.failing_native_ids:
+            raise RuntimeError("synthetic Codex projection failure")
         return _scan_projection(Provider.CODEX, summary.native_id)
 
 
@@ -1256,6 +1323,7 @@ async def test_scan_once_is_a_zero_summary_when_catalog_is_disabled() -> None:
     )
 
     summary = await coordinator.scan_once()
+    full_summary = await coordinator.scan_all_history()
 
     assert summary.provider is None
     assert summary.discovered == 0
@@ -1263,8 +1331,187 @@ async def test_scan_once_is_a_zero_summary_when_catalog_is_disabled() -> None:
     assert summary.rebuilt == 0
     assert summary.failed == 0
     assert summary.duration_ms == 0
+    assert full_summary.provider is None
+    assert full_summary.discovered == 0
+    assert full_summary.indexed == 0
+    assert full_summary.rebuilt == 0
+    assert full_summary.failed == 0
+    assert full_summary.duration_ms == 0
     assert claude.calls == 0
     assert codex.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_all_history_is_newest_first_catalog_only_and_aggregates_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = {
+        native_id: tmp_path / f"{native_id}.jsonl"
+        for native_id in ("claude-new", "claude-middle", "claude-old")
+    }
+    for native_id, mtime in (
+        ("claude-new", 300.0),
+        ("claude-middle", 200.0),
+        ("claude-old", 100.0),
+    ):
+        paths[native_id].write_text("{}\n", encoding="utf-8")
+        os.utime(paths[native_id], (mtime, mtime))
+
+    claude = _FullHistoryClaudeAdapter(
+        [paths["claude-old"], paths["claude-new"], paths["claude-middle"]],
+        failing_native_ids={"claude-middle"},
+    )
+    codex = _FullHistoryCodexAdapter(
+        active=[
+            _codex_summary("codex-old", 100.0),
+            _codex_summary("codex-new", 300.0),
+        ],
+        archived=[_codex_summary("codex-middle", 200.0)],
+        failing_native_ids={"codex-middle"},
+    )
+    operations: list[tuple[object, ...]] = []
+    store = _StateStore(operations)
+    config = replace(
+        BridgeConfig(),
+        mirrors=replace(BridgeConfig().mirrors, automatic_creation=True),
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=config,
+        store=store,
+        adapters={Provider.CLAUDE: claude, Provider.CODEX: codex},
+        scan_batch_size=1,
+    )
+
+    async def reject_automatic_enqueue(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("full-history catalog scan must not enqueue mirrors")
+
+    monkeypatch.setattr(
+        coordinator,
+        "_maybe_enqueue_automatic",
+        reject_automatic_enqueue,
+    )
+
+    summary = await coordinator.scan_all_history()
+
+    assert summary.provider is None
+    assert summary.discovered == 6
+    assert summary.indexed == 4
+    assert summary.rebuilt == 0
+    assert summary.failed == 2
+    assert summary.duration_ms >= 0
+    assert claude.discover_calls == 1
+    assert claude.parsed_native_ids == [
+        "claude-new",
+        "claude-middle",
+        "claude-old",
+    ]
+    assert codex.incremental_inventory_calls == 0
+    assert codex.full_inventory_calls == [False, True]
+    assert codex.projected_native_ids == [
+        "codex-new",
+        "codex-middle",
+        "codex-old",
+    ]
+    assert store.upsert_attempts == [
+        "claude-new",
+        "claude-old",
+        "codex-new",
+        "codex-old",
+    ]
+    assert not [operation for operation in operations if operation[0] == "set_state"]
+    health = coordinator.health()
+    assert health["providers"]["claude"]["degraded_reason"] == "scan_failed"
+    assert health["providers"]["codex"]["degraded_reason"] == "scan_failed"
+    assert health["recent_error_codes"] == [
+        "claude_scan_failed",
+        "codex_scan_failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scan_all_codex_history_includes_archived_when_steady_state_excludes_it(
+) -> None:
+    codex = _FullHistoryCodexAdapter(
+        active=[_codex_summary("codex-active", 300.0)],
+        archived=[_codex_summary("codex-archived", 200.0)],
+    )
+    config = replace(
+        BridgeConfig(),
+        catalog=replace(BridgeConfig().catalog, include_archived_codex=False),
+    )
+    store = _StateStore([])
+    coordinator = SessionBridgeCoordinator(
+        config=config,
+        store=store,
+        adapters={Provider.CODEX: codex},
+    )
+
+    summary = await coordinator.scan_all_history(Provider.CODEX)
+
+    assert codex.full_inventory_calls == [False, True]
+    assert codex.projected_native_ids == ["codex-active", "codex-archived"]
+    assert summary.discovered == 2
+    assert summary.indexed == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_all_history_rebuilds_existing_rows_without_counting_new_rows(
+    tmp_path: Path,
+) -> None:
+    claude_path = tmp_path / "claude-existing.jsonl"
+    claude_path.write_text("{}\n", encoding="utf-8")
+    claude = _FullHistoryClaudeAdapter([claude_path])
+    codex = _FullHistoryCodexAdapter(
+        active=[_codex_summary("codex-new", 300.0)],
+        archived=[_codex_summary("codex-existing", 200.0)],
+    )
+    store = _StateStore(
+        [],
+        existing_native_ids={"claude-existing", "codex-existing"},
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CLAUDE: claude, Provider.CODEX: codex},
+    )
+
+    summary = await coordinator.scan_all_history()
+
+    assert store.rebuild_attempts == [
+        ("claude-existing", True),
+        ("codex-new", True),
+        ("codex-existing", True),
+    ]
+    assert summary.discovered == 3
+    assert summary.indexed == 3
+    assert summary.rebuilt == 2
+
+
+@pytest.mark.asyncio
+async def test_scan_all_claude_history_isolates_a_path_that_disappears_before_stat(
+    tmp_path: Path,
+) -> None:
+    available = tmp_path / "claude-available.jsonl"
+    disappeared = tmp_path / "claude-disappeared.jsonl"
+    available.write_text("{}\n", encoding="utf-8")
+    disappeared.write_text("{}\n", encoding="utf-8")
+    disappeared.unlink()
+    claude = _FullHistoryClaudeAdapter([disappeared, available])
+    store = _StateStore([])
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CLAUDE: claude},
+    )
+
+    summary = await coordinator.scan_all_history(Provider.CLAUDE)
+
+    assert summary.discovered == 2
+    assert summary.indexed == 1
+    assert summary.rebuilt == 0
+    assert summary.failed == 1
+    assert claude.parsed_native_ids == ["claude-available"]
 
 
 def test_bridge_config_load_uses_safe_defaults_when_file_is_absent(
@@ -1544,6 +1791,37 @@ async def test_claude_bounded_scan_stages_tail_and_recovers_after_restart(
     )
     for path in paths.values():
         assert str(path) not in serialized_status
+
+
+@pytest.mark.asyncio
+async def test_claude_bounded_scan_isolates_a_path_that_disappears_before_stat(
+    tmp_path: Path,
+) -> None:
+    available = tmp_path / "claude-available.jsonl"
+    disappeared = tmp_path / "claude-disappeared.jsonl"
+    available.write_text("{}\n", encoding="utf-8")
+    disappeared.write_text("{}\n", encoding="utf-8")
+    disappeared.unlink()
+    operations: list[tuple[object, ...]] = []
+    store = _StateStore(operations)
+    adapter = _BacklogClaudeAdapter(
+        discover_batches=[[disappeared, available]],
+        paths_by_native_id={"claude-available": available},
+        operations=operations,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CLAUDE: adapter},
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.discovered == 2
+    assert summary.indexed == 1
+    assert summary.rebuilt == 0
+    assert summary.failed == 1
+    assert adapter.parsed_native_ids == ["claude-available"]
 
 
 @pytest.mark.asyncio
@@ -1832,6 +2110,57 @@ async def test_stop_signals_and_closes_watcher_without_post_stop_scan(
         assert (claude.discover_calls, codex.inventory_calls) == calls_after_stop
     finally:
         await coordinator.stop()
+
+
+@pytest.mark.asyncio
+async def test_process_jobs_once_passes_exact_scope_and_limit_to_atomic_store() -> None:
+    class ScopedStore(_JobStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scoped_claims: list[dict[str, object]] = []
+
+        def claim_due_jobs_with_limits(
+            self,
+            *,
+            now: float,
+            limit: int,
+            policy: MirrorPolicy,
+            job_ids: Sequence[str] | None = None,
+        ) -> list[dict[str, Any]]:
+            self.scoped_claims.append(
+                {
+                    "now": now,
+                    "limit": limit,
+                    "policy": policy,
+                    "job_ids": job_ids,
+                }
+            )
+            return []
+
+    store = ScopedStore()
+    coordinator = SessionBridgeCoordinator(
+        config=_job_config(),
+        store=store,
+        adapters={},
+        clock=lambda: 100.0,
+    )
+
+    summary = await coordinator.process_jobs_once(
+        job_ids=["job:selected-two", "job:selected-one"],
+        limit=1,
+    )
+
+    assert summary.claimed == 0
+    assert store.scoped_claims == [
+        {
+            "now": 100.0,
+            "limit": 1,
+            "policy": MirrorPolicy(),
+            "job_ids": ("job:selected-two", "job:selected-one"),
+        }
+    ]
+    with pytest.raises(ValueError, match="limit"):
+        await coordinator.process_jobs_once(limit=0)
 
 
 @pytest.mark.asyncio

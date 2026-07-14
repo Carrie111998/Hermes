@@ -229,6 +229,232 @@ def _capture_mapping_selects(db: SessionDB, operation) -> list[str]:
     ]
 
 
+def test_list_native_projections_is_newest_first_with_minimal_exact_evidence(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    older = _projection(
+        _message(
+            "assistant-event",
+            "assistant transcript must not be materialized",
+            role="assistant",
+            timestamp=19.0,
+        ),
+        replace(
+            _message(
+                "shared-event",
+                "   ",
+                role="user",
+                timestamp=20.0,
+            ),
+            ordinal=0,
+        ),
+        replace(
+            _message(
+                "shared-event",
+                "first meaningful user turn",
+                role="user",
+                timestamp=21.0,
+            ),
+            ordinal=1,
+        ),
+        _message(
+            "later-user-event",
+            "later meaningful user turn",
+            role="user",
+            timestamp=22.0,
+        ),
+        native_id="older",
+        last_active=40.0,
+        cursor="older-cursor",
+        native_hash="older-hash",
+        git_branch="feature/older",
+    )
+    newer = _projection(
+        _message("new-event", "newer", timestamp=30.0),
+        provider=Provider.CODEX,
+        native_id="newer",
+        last_active=50.0,
+        cursor="newer-cursor",
+        native_hash="newer-hash",
+    )
+    bridged = _projection(
+        _message("bridged-event", "must be excluded", timestamp=90.0),
+        native_id="bridged",
+        last_active=90.0,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id="bridge-excluded",
+    )
+    for projection in (older, newer, bridged):
+        store.upsert_projection(projection)
+
+    projections = store.list_native_projections(after=35.0, limit=2)
+
+    assert [projection.native_id for projection in projections] == ["newer", "older"]
+    reconstructed = projections[1]
+    assert reconstructed.provider is Provider.CLAUDE
+    assert reconstructed.last_active == 40.0
+    assert reconstructed.native_cursor == "older-cursor"
+    assert reconstructed.native_hash == "older-hash"
+    assert reconstructed.git_branch == "feature/older"
+    assert tuple(reconstructed.messages) == (
+        ProjectedMessage(
+            native_event_id="shared-event",
+            ordinal=1,
+            role="user",
+            content="f",
+            timestamp=21.0,
+        ),
+    )
+
+
+def test_list_native_projections_filters_all_eligibility_predicates_before_limit(db):
+    store = SessionBridgeStore(db, clock=lambda: 200.0)
+    projections = (
+        _projection(
+            _message("bridge", "bridge"),
+            native_id="bridge",
+            last_active=100.0,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-origin",
+        ),
+        _projection(
+            _message("mapped", "mapped"),
+            native_id="mapped",
+            last_active=90.0,
+        ),
+        _projection(
+            _message("active-job", "active job"),
+            native_id="active-job",
+            last_active=80.0,
+        ),
+        _projection(
+            _message("assistant-only", "not a user", role="assistant"),
+            _message("blank-user", "\u2003\n\t", role="user"),
+            native_id="meaningless",
+            last_active=70.0,
+        ),
+        _projection(
+            _message("eligible", "eligible"),
+            native_id="eligible",
+            last_active=60.0,
+        ),
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="mapped-target",
+            last_active=50.0,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="mapped-target-origin",
+        ),
+    )
+    for projection in projections:
+        store.upsert_projection(projection)
+    store.create_link(
+        SessionLink(
+            id="mapped-link",
+            from_session_id="claude:mapped",
+            to_session_id="codex:mapped-target",
+            relation=Relation.MIRRORS,
+            bridge_id="mapped-bridge",
+            source_cursor=None,
+            source_hash=None,
+            created_at=100.0,
+        )
+    )
+    _enqueue_manual_job(store, "claude:active-job", Provider.CODEX)
+
+    page = store.list_native_projections(after=0.0, limit=1)
+
+    assert [projection.native_id for projection in page] == ["eligible"]
+    assert page.has_more is False
+    assert page.next_cursor is None
+
+
+def test_list_native_projections_keyset_page_prevents_older_candidate_starvation(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    for native_id, last_active in (
+        ("newest", 50.0),
+        ("tie-a", 40.0),
+        ("tie-b", 40.0),
+        ("oldest", 30.0),
+    ):
+        store.upsert_projection(
+            _projection(
+                _message(f"event-{native_id}", native_id),
+                native_id=native_id,
+                last_active=last_active,
+            )
+        )
+
+    first = store.list_native_projections(after=0.0, limit=2)
+    second = store.list_native_projections(
+        after=0.0,
+        limit=2,
+        cursor=first.next_cursor,
+    )
+
+    assert [projection.native_id for projection in first] == ["newest", "tie-a"]
+    assert first.has_more is True
+    assert first.next_cursor == (40.0, "claude:tie-a")
+    assert [projection.native_id for projection in second] == ["tie-b", "oldest"]
+    assert second.has_more is False
+    assert second.next_cursor is None
+
+
+def test_list_native_projections_applies_inclusive_cutoff_and_bounded_limit(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(_message("boundary", "boundary"), last_active=40.0)
+    )
+
+    assert [
+        projection.native_id
+        for projection in store.list_native_projections(after=40.0, limit=1)
+    ] == ["native-1"]
+    with pytest.raises(ValueError, match="after"):
+        store.list_native_projections(after=float("nan"), limit=1)
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_native_projections(after=0.0, limit=0)
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_native_projections(after=0.0, limit=1001)
+
+
+def test_list_existing_target_mappings_returns_exact_provider_pairs(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(_message("source", "source"), native_id="source")
+    )
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="mapping-link",
+            from_session_id="claude:source",
+            to_session_id="codex:target",
+            relation=Relation.MIRRORS,
+            bridge_id="mapping-bridge",
+            source_cursor=None,
+            source_hash=None,
+            created_at=100.0,
+        )
+    )
+
+    assert store.list_existing_target_mappings(
+        ["claude:source", "claude:unmapped"]
+    ) == frozenset({("claude:source", Provider.CODEX)})
+    assert store.list_existing_target_mappings([]) == frozenset()
+    with pytest.raises(TypeError, match="sequence"):
+        store.list_existing_target_mappings("claude:source")
+    with pytest.raises(ValueError, match="at most 1000"):
+        store.list_existing_target_mappings(
+            [f"claude:source-{index}" for index in range(1001)]
+        )
+
+
 def test_first_import_is_idempotent_and_append_only(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     first = _projection(_message("e1", "first"), _message("e2", "second"))
@@ -1030,6 +1256,115 @@ def test_atomic_store_claim_revokes_safe_manual_job_after_mapping_appears(db):
     failed = store.list_mirror_jobs([MirrorJobState.MANUAL_FAILURE])
     assert len(failed) == 1
     assert failed[0]["error_code"] == "manual_authority_revoked"
+
+
+def test_atomic_claim_accepts_an_exact_job_id_scope(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    jobs = []
+    for native_id in ("outside", "selected"):
+        store.upsert_projection(
+            _projection(_message(native_id, native_id), native_id=native_id)
+        )
+        jobs.append(_enqueue_manual_job(store, f"claude:{native_id}", Provider.CODEX))
+
+    claimed = store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(),
+        job_ids=[jobs[1]["id"]],
+    )
+
+    assert [job["id"] for job in claimed] == [jobs[1]["id"]]
+    assert store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(),
+        job_ids=[],
+    ) == []
+    queued = store.list_mirror_jobs([MirrorJobState.QUEUED])
+    assert [job["id"] for job in queued] == [jobs[0]["id"]]
+    with pytest.raises(TypeError, match="sequence"):
+        store.claim_due_jobs_with_limits(
+            now=100.0,
+            limit=1,
+            policy=MirrorPolicy(),
+            job_ids=jobs[0]["id"],
+        )
+
+
+def test_rollout_limited_manual_claims_use_global_breaker_with_auto_off(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    jobs = []
+    for native_id in ("rollout-one", "rollout-two"):
+        store.upsert_projection(
+            _projection(_message(native_id, native_id), native_id=native_id)
+        )
+        jobs.append(
+            enqueue_mirror_job(
+                store,
+                f"claude:{native_id}",
+                Provider.CODEX,
+                policy=MirrorPolicy(),
+                manual_authorized=True,
+                require_unmapped=True,
+                rollout_limited=True,
+            )
+        )
+    policy = MirrorPolicy(
+        automatic_creation=False,
+        creates_per_minute=6,
+        stop_after_attempts=1,
+        stop_error_rate=0.5,
+    )
+
+    claimed = store.claim_due_jobs_with_limits(now=100.0, limit=2, policy=policy)
+
+    assert len(claimed) == 1
+    assert claimed[0]["claim_authority"] == "manual"
+    assert claimed[0]["rollout_limited"] is True
+    assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 0}
+    assert store.claim_due_jobs_with_limits(now=100.0, limit=2, policy=policy) == []
+
+    store.retry_job(
+        claimed[0]["id"],
+        code="provider_failed",
+        detail="fixed failure",
+        next_attempt_at=120.0,
+    )
+
+    assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 1}
+    assert store.claim_due_jobs_with_limits(now=100.0, limit=2, policy=policy) == []
+    assert jobs[1]["id"] in {
+        job["id"] for job in store.list_mirror_jobs([MirrorJobState.QUEUED])
+    }
+
+
+def test_rollout_limited_claim_resets_a_healthy_completed_batch_with_auto_off(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("rollout", "rollout")))
+    job = enqueue_mirror_job(
+        store,
+        "claude:native-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+        require_unmapped=True,
+        rollout_limited=True,
+    )
+    store.accumulate_mirror_breaker_progress(attempts=1, errors=0)
+
+    claimed = store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(
+            automatic_creation=False,
+            stop_after_attempts=1,
+            stop_error_rate=0.5,
+        ),
+    )
+
+    assert [claimed_job["id"] for claimed_job in claimed] == [job["id"]]
+    assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 0}
 
 
 def test_atomic_claim_resets_completed_healthy_breaker_before_automatic_claim(db):
