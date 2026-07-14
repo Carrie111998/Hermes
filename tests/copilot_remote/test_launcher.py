@@ -431,10 +431,15 @@ class TestEnsureFolderTrusted:
 
         _ensure_folder_trusted("/brand/new/repo")
 
-        data = json.loads(settings_path.read_text())
+        written = settings_path.read_text()
+        json_only = "\n".join(
+            line for line in written.splitlines() if not line.strip().startswith("//")
+        )
+        data = json.loads(json_only)
         assert data["theme"] == "dark"
         assert "/existing/root" in data["trustedFolders"]
         assert str(Path("/brand/new/repo").resolve()) in data["trustedFolders"]
+        assert "// user comment" in written
 
     def test_noop_when_path_is_under_an_already_trusted_root(self, tmp_path, monkeypatch):
         monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
@@ -447,6 +452,18 @@ class TestEnsureFolderTrusted:
         _ensure_folder_trusted(str(Path(root) / "repos" / "some-repo"))
 
         assert settings_path.read_text() == before
+
+    def test_blank_trusted_entry_does_not_match_every_path(self, tmp_path, monkeypatch):
+        """A stray empty string in trustedFolders must not act as a universal prefix match."""
+        monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))
+        settings_path = _copilot_settings_path()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps({"trustedFolders": [""]}))
+
+        _ensure_folder_trusted("/brand/new/repo")
+
+        data = json.loads(settings_path.read_text())
+        assert str(Path("/brand/new/repo").resolve()) in data["trustedFolders"]
 
     def test_repeat_calls_do_not_duplicate_entries(self, tmp_path, monkeypatch):
         monkeypatch.setenv("COPILOT_HOME", str(tmp_path / "copilot-home"))

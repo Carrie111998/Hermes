@@ -268,18 +268,21 @@ def _ensure_folder_trusted(repo_path: str) -> None:
     except OSError:
         resolved = repo_path
 
+    comment_lines: list[str] = []
     try:
         if settings_path.exists():
             raw = settings_path.read_text(encoding="utf-8")
             # Strip // line comments Copilot tolerates in this file before
-            # parsing as JSON (json.loads does not support them).
-            data = json.loads(
-                "\n".join(
-                    line for line in raw.splitlines()
-                    if not line.strip().startswith("//")
-                )
-                or "{}"
-            )
+            # parsing as JSON (json.loads does not support them). Preserve
+            # the stripped comment lines so they can be written back verbatim
+            # rather than silently dropped.
+            json_lines = []
+            for line in raw.splitlines():
+                if line.strip().startswith("//"):
+                    comment_lines.append(line)
+                else:
+                    json_lines.append(line)
+            data = json.loads("\n".join(json_lines) or "{}")
         else:
             data = {}
     except (OSError, json.JSONDecodeError) as exc:
@@ -291,7 +294,7 @@ def _ensure_folder_trusted(repo_path: str) -> None:
         trusted = []
 
     already_trusted = any(
-        resolved == entry or resolved.startswith(entry.rstrip("/") + "/")
+        _path_covered_by_trusted_entry(resolved, entry)
         for entry in trusted
         if isinstance(entry, str)
     )
@@ -303,10 +306,31 @@ def _ensure_folder_trusted(repo_path: str) -> None:
 
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        logger.info("Pre-seeded Copilot folder trust for %s", resolved)
+        body = json.dumps(data, indent=2) + "\n"
+        if comment_lines:
+            body = "\n".join(comment_lines) + "\n" + body
+        settings_path.write_text(body, encoding="utf-8")
+        logger.info("Pre-seeded Copilot folder trust for %s", _sanitize_for_log(resolved))
     except OSError as exc:
         logger.warning("Could not write Copilot settings.json for trust pre-seed: %s", exc)
+
+
+def _path_covered_by_trusted_entry(resolved: str, entry: str) -> bool:
+    """Return True if *resolved* equals or is a subpath of trusted *entry*.
+
+    Uses :class:`~pathlib.Path` comparisons (path-separator aware) rather
+    than string prefix matching, so it behaves correctly across path
+    normalizations and separator conventions, and safely ignores blank
+    entries instead of treating them as a universal prefix match.
+    """
+    if not entry:
+        return False
+    try:
+        entry_path = Path(entry)
+        resolved_path = Path(resolved)
+    except (OSError, ValueError):
+        return False
+    return resolved_path == entry_path or entry_path in resolved_path.parents
 
 
 def _copilot_api_url() -> str:
