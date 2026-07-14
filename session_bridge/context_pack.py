@@ -42,6 +42,17 @@ class _RecentItem:
     tool_noise: bool = False
 
 
+@dataclass(frozen=True)
+class _SourceSnapshot:
+    existing_pack: Mapping[str, Any] | None
+    session: Mapping[str, Any] | None
+    messages: Sequence[Mapping[str, Any]]
+    external: Mapping[str, Any] | None
+    activity_value_json: str | None
+    target_session_id: str | None
+    target_external: Mapping[str, Any] | None
+
+
 _SECTION_ORDER = (
     "Identity / Snapshot",
     "Goal / Latest Intent",
@@ -81,10 +92,17 @@ _FILE_RE = re.compile(
     re.IGNORECASE,
 )
 _MEMORY_URI_RE = re.compile(
-    r"(?:mempalace|gbrain)://[^\s<>{}\[\]]+|https?://[^\s<>{}\[\]]*(?:mempalace|gbrain)[^\s<>{}\[\]]*",
+    r"(?:mempalace|gbrain)://[^\s<>{}\[\]]+",
     re.IGNORECASE,
 )
-_MEMPALACE_DRAWER_RE = re.compile(r"\bdrawer_[A-Za-z0-9][A-Za-z0-9_.-]*")
+_MEMPALACE_DRAWER_RE = re.compile(
+    r"\bdrawer_[A-Za-z0-9][A-Za-z0-9_.-]*_[A-Fa-f0-9]{24}\b"
+)
+_MEMPALACE_CONTEXT_RE = re.compile(
+    r"\bmempalace(?:\s+(?:drawer|record))?\s*(?::|=|at)?\s+"
+    r"(?P<reference>drawer_[A-Za-z0-9][A-Za-z0-9_.-]*)",
+    re.IGNORECASE,
+)
 _GBRAIN_CONTEXT_RE = re.compile(
     r"\bgbrain(?:\s+(?:page|wiki))?\s*(?::|=|at)?\s+"
     r"(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)",
@@ -93,6 +111,15 @@ _GBRAIN_CONTEXT_RE = re.compile(
 _GBRAIN_WIKI_RE = re.compile(
     r"\[\[(?P<reference>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)\]\]"
 )
+_GBRAIN_WIKI_NAMESPACES = frozenset({
+    "companies",
+    "concepts",
+    "decisions",
+    "events",
+    "people",
+    "projects",
+    "systems",
+})
 
 _BEARER_RE = re.compile(
     r"(?i)(\b(?:authorization\s*:\s*)?bearer\s+)[A-Za-z0-9._~+/-]{8,}"
@@ -102,10 +129,12 @@ _GITHUB_TOKEN_RE = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"
 )
 _AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
-_GENERIC_ASSIGNMENT_RE = re.compile(
-    r"(?i)(\b(?:password|token)\s*=\s*)"
-    r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[^\s;,]+)'
+_ASSIGNMENT_START_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?:\\?[\"'])?(?:password|token)(?:\\?[\"'])?\s*(?:=|:)\s*"
 )
+_GIT_STATUS_MAX_LINES = 200
+_GIT_STATUS_MAX_CHARS = 32_768
 
 
 class ContextPackBuilder:
@@ -117,33 +146,30 @@ class ContextPackBuilder:
 
     def build(self, request: ContextPackRequest) -> ContextPack:
         self._validate_request(request)
-        session = self.db.get_session(request.source_session_id)
+        snapshot = self._read_source_snapshot(request)
+        session = snapshot.session
         if session is None:
             raise KeyError(request.source_session_id)
 
         expected_pack_id = _stable_pack_id(request)
-        existing = self._get_exact_pack(request)
+        existing = snapshot.existing_pack
         if existing is not None:
             self._validate_persisted_identity(
                 existing,
                 request=request,
                 expected_pack_id=expected_pack_id,
-                expected_target_session_id=self._find_target_session(request),
+                expected_target_session_id=snapshot.target_session_id,
             )
             return _context_pack_from_row(existing)
 
-        messages = self.db.get_messages(request.source_session_id)
-        external = self.store.get_external_session(request.source_session_id)
-        target_session_id = self._find_target_session(request)
-        target_external = (
-            self.store.get_external_session(target_session_id)
-            if target_session_id is not None
-            else None
-        )
+        messages = snapshot.messages
+        external = snapshot.external
+        target_session_id = snapshot.target_session_id
+        target_external = snapshot.target_external
         snapshot_timestamp, warnings = self._snapshot_timestamp(
-            request.source_session_id,
             session,
             messages,
+            snapshot.activity_value_json,
         )
         if request.stale:
             warnings.append(
@@ -153,7 +179,7 @@ class ContextPackBuilder:
             warnings.append(
                 "- [diverged] Both linked descendants advanced; this pack does not merge them."
             )
-        if external is not None and (
+        snapshot_mismatch = external is not None and (
             (
                 external["last_native_cursor"] is not None
                 and external["last_native_cursor"] != request.source_cursor
@@ -162,7 +188,10 @@ class ContextPackBuilder:
                 external["last_native_hash"] is not None
                 and external["last_native_hash"] != request.source_hash
             )
-        ):
+        )
+        if snapshot_mismatch and not request.stale:
+            raise ValueError("source snapshot identity mismatch")
+        if snapshot_mismatch:
             warnings.append(
                 "- [snapshot identity mismatch] The requested cursor/hash differs from the latest indexed identity."
             )
@@ -223,22 +252,77 @@ class ContextPackBuilder:
         ):
             raise ValueError("context budget must be a positive integer")
 
-    def _get_exact_pack(self, request: ContextPackRequest) -> dict[str, Any] | None:
+    def _read_source_snapshot(self, request: ContextPackRequest) -> _SourceSnapshot:
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None
-            row = conn.execute(
-                """SELECT * FROM session_context_packs
-                   WHERE bridge_id = ? AND source_cursor = ? AND source_hash = ?
-                     AND budget_chars = ?""",
-                (
-                    request.bridge_id,
-                    request.source_cursor,
-                    request.source_hash,
-                    request.budget_chars,
-                ),
-            ).fetchone()
-        return dict(row) if row is not None else None
+            conn.execute("BEGIN")
+            try:
+                existing_row = conn.execute(
+                    """SELECT * FROM session_context_packs
+                       WHERE bridge_id = ? AND source_cursor = ? AND source_hash = ?
+                         AND budget_chars = ?""",
+                    (
+                        request.bridge_id,
+                        request.source_cursor,
+                        request.source_hash,
+                        request.budget_chars,
+                    ),
+                ).fetchone()
+                session_row = conn.execute(
+                    "SELECT * FROM sessions WHERE id = ?",
+                    (request.source_session_id,),
+                ).fetchone()
+                message_rows = conn.execute(
+                    """SELECT * FROM messages
+                       WHERE session_id = ? AND active = 1 ORDER BY id""",
+                    (request.source_session_id,),
+                ).fetchall()
+                external_row = conn.execute(
+                    "SELECT * FROM external_sessions WHERE session_id = ?",
+                    (request.source_session_id,),
+                ).fetchone()
+                activity_row = conn.execute(
+                    "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                    (f"session-bridge:external-activity:{request.source_session_id}",),
+                ).fetchone()
+                target_session_id = self._find_target_session_in_connection(
+                    conn, request
+                )
+                target_external_row = (
+                    conn.execute(
+                        "SELECT * FROM external_sessions WHERE session_id = ?",
+                        (target_session_id,),
+                    ).fetchone()
+                    if target_session_id is not None
+                    else None
+                )
+            finally:
+                conn.rollback()
+
+        messages: list[dict[str, Any]] = []
+        for row in message_rows:
+            message = dict(row)
+            message["content"] = self.db._decode_content(message.get("content"))
+            if message.get("tool_calls"):
+                try:
+                    message["tool_calls"] = json.loads(message["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    message["tool_calls"] = []
+            messages.append(message)
+        return _SourceSnapshot(
+            existing_pack=(dict(existing_row) if existing_row is not None else None),
+            session=dict(session_row) if session_row is not None else None,
+            messages=messages,
+            external=dict(external_row) if external_row is not None else None,
+            activity_value_json=(
+                activity_row["value_json"] if activity_row is not None else None
+            ),
+            target_session_id=target_session_id,
+            target_external=(
+                dict(target_external_row) if target_external_row is not None else None
+            ),
+        )
 
     def _validate_persisted_identity(
         self,
@@ -251,6 +335,13 @@ class ContextPackBuilder:
         if row["source_session_id"] != request.source_session_id:
             raise ValueError("context pack source identity mismatch")
         if row["id"] != expected_pack_id:
+            safety_variant_ids = {
+                _stable_pack_id_with_safety(request, stale, diverged)
+                for stale in (False, True)
+                for diverged in (False, True)
+            }
+            if row["id"] in safety_variant_ids:
+                raise ValueError("context pack safety/snapshot identity mismatch")
             raise ValueError("context pack target-provider/snapshot identity mismatch")
         if row["target_session_id"] != expected_target_session_id:
             raise ValueError("context pack target identity mismatch")
@@ -354,44 +445,63 @@ class ContextPackBuilder:
 
     def _snapshot_timestamp(
         self,
-        source_session_id: str,
         session: Mapping[str, Any],
         messages: Sequence[Mapping[str, Any]],
+        activity_value_json: str | None,
     ) -> tuple[float, list[str]]:
-        candidates = [float(session["started_at"])]
-        ended_at = session.get("ended_at")
-        if ended_at is not None:
-            ended_timestamp = float(ended_at)
-            if math.isfinite(ended_timestamp):
-                candidates.append(ended_timestamp)
-        candidates.extend(
-            timestamp
-            for row in messages
-            if math.isfinite(timestamp := float(row["timestamp"]))
-        )
-
+        candidates: list[float] = []
         warnings: list[str] = []
-        try:
-            activity = self.store.get_state(
-                f"session-bridge:external-activity:{source_session_id}"
-            )
-        except (TypeError, ValueError):
-            activity = None
+
+        invalid_source_timestamp = False
+        for value in (session.get("started_at"), session.get("ended_at")):
+            if value is None:
+                continue
+            timestamp = _finite_timestamp(value)
+            if timestamp is None:
+                invalid_source_timestamp = True
+            else:
+                candidates.append(timestamp)
+        for row in messages:
+            timestamp = _finite_timestamp(row.get("timestamp"))
+            if timestamp is None:
+                invalid_source_timestamp = True
+            else:
+                candidates.append(timestamp)
+        if invalid_source_timestamp:
             warnings.append(
-                "- [invalid activity watermark] The persisted source activity state is malformed and was ignored."
+                "- [invalid timestamp] Malformed or non-finite source timestamps were ignored; affected turns display @unknown."
             )
+
+        activity: Mapping[str, Any] | None = None
+        if activity_value_json is not None:
+            try:
+                decoded_activity = json.loads(activity_value_json)
+                if not isinstance(decoded_activity, dict):
+                    raise ValueError("activity state is not an object")
+                activity = decoded_activity
+            except (json.JSONDecodeError, TypeError, ValueError):
+                warnings.append(
+                    "- [invalid activity watermark] The persisted source activity state is malformed and was ignored."
+                )
         if activity is not None:
             last_active = activity.get("last_active")
-            if (
-                not isinstance(last_active, (int, float))
-                or isinstance(last_active, bool)
-                or not math.isfinite(float(last_active))
-            ):
+            activity_timestamp = (
+                _finite_timestamp(last_active)
+                if isinstance(last_active, (int, float))
+                and not isinstance(last_active, bool)
+                else None
+            )
+            if activity_timestamp is None:
                 warnings.append(
                     "- [invalid activity watermark] The persisted source activity timestamp is not finite numeric data and was ignored."
                 )
             else:
-                candidates.append(float(last_active))
+                candidates.append(activity_timestamp)
+        if not candidates:
+            warnings.append(
+                "- [invalid timestamp fallback] No finite source timestamp was available; the deterministic epoch fallback was used."
+            )
+            return 0.0, warnings
         return max(candidates), warnings
 
     @staticmethod
@@ -461,16 +571,31 @@ class ContextPackBuilder:
                     "- [repository unavailable] Git status could not be executed."
                 )
             else:
+                stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+                bounded_stdout = stdout[: _GIT_STATUS_MAX_CHARS + 1]
+                output_truncated = len(stdout) > _GIT_STATUS_MAX_CHARS
+                try:
+                    completed.stdout = ""
+                    completed.stderr = ""
+                except (AttributeError, TypeError):
+                    pass
                 if completed.returncode != 0:
                     warnings.append(
                         "- [repository unavailable] The recorded cwd is not an accessible git repository."
                     )
                 else:
-                    status_lines = completed.stdout.splitlines()
+                    status_lines = bounded_stdout.splitlines()
+                    if len(status_lines) > _GIT_STATUS_MAX_LINES:
+                        output_truncated = True
+                    status_lines = status_lines[:_GIT_STATUS_MAX_LINES]
                     if status_lines:
                         values.extend(f"- Git status: {line}" for line in status_lines)
                     else:
                         values.append("- Git status: clean")
+                    if output_truncated:
+                        warnings.append(
+                            "- [git output truncated] Git status exceeded the bounded line/character limit."
+                        )
 
         return (
             [
@@ -492,7 +617,7 @@ class ContextPackBuilder:
     ) -> list[_SectionItem]:
         items: list[_SectionItem] = []
         user_contents = [
-            _compact(str(row["content"]))
+            _compact(_redact(str(row["content"])))
             for row in messages
             if row.get("role") == "user"
             and isinstance(row.get("content"), str)
@@ -524,16 +649,17 @@ class ContextPackBuilder:
         for message_index, row in enumerate(messages):
             content = row.get("content")
             if isinstance(content, str):
-                for raw_line in content.splitlines():
-                    line = _compact(raw_line)
-                    if not line:
-                        continue
-                    if _DECISION_RE.search(line) or _CONSTRAINT_RE.search(line):
-                        decision_lines[line] = (message_index, line)
-                    if _OPEN_WORK_RE.search(line) or (
-                        row.get("role") == "user" and line.endswith("?")
-                    ):
-                        open_lines[line] = (message_index, line)
+                if row.get("role") in ("user", "assistant"):
+                    for raw_line in content.splitlines():
+                        line = _compact(raw_line)
+                        if not line:
+                            continue
+                        if _DECISION_RE.search(line) or _CONSTRAINT_RE.search(line):
+                            decision_lines[line] = (message_index, line)
+                        if _OPEN_WORK_RE.search(line) or (
+                            row.get("role") == "user" and line.endswith("?")
+                        ):
+                            open_lines[line] = (message_index, line)
                 searchable = content
             else:
                 searchable = ""
@@ -711,7 +837,21 @@ class ContextPackBuilder:
 
 def _format_turn(role: str, content: str, timestamp: Any) -> str:
     indented = _redact(content.strip()).replace("\n", "\n  ")
-    return f"- {role.upper()} @{float(timestamp):.6f}:\n  {indented}"
+    finite_timestamp = _finite_timestamp(timestamp)
+    timestamp_label = (
+        f"{finite_timestamp:.6f}" if finite_timestamp is not None else "unknown"
+    )
+    return f"- {role.upper()} @{timestamp_label}:\n  {indented}"
+
+
+def _finite_timestamp(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return timestamp if math.isfinite(timestamp) else None
 
 
 def _compact(value: str) -> str:
@@ -727,15 +867,27 @@ def _memory_references(value: str) -> list[str]:
 
     for pattern, group in (
         (_MEMPALACE_DRAWER_RE, 0),
+        (_MEMPALACE_CONTEXT_RE, "reference"),
         (_GBRAIN_CONTEXT_RE, "reference"),
-        (_GBRAIN_WIKI_RE, "reference"),
     ):
         for match in pattern.finditer(value):
             if any(start <= match.start() < end for start, end in uri_spans):
                 continue
             reference = match.group(group).rstrip(".,;:!?)")
             matches.append((match.start(), reference))
-    return [reference for _, reference in sorted(matches, key=lambda item: item[0])]
+    for match in _GBRAIN_WIKI_RE.finditer(value):
+        reference = match.group("reference").rstrip(".,;:!?)")
+        namespace = reference.partition("/")[0].casefold()
+        if namespace in _GBRAIN_WIKI_NAMESPACES:
+            matches.append((match.start(), reference))
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for _, reference in sorted(matches, key=lambda item: item[0]):
+        if reference not in seen:
+            ordered.append(reference)
+            seen.add(reference)
+    return ordered
 
 
 def _redact(value: str) -> str:
@@ -743,7 +895,52 @@ def _redact(value: str) -> str:
     redacted = _OPENAI_KEY_RE.sub("[REDACTED]", redacted)
     redacted = _GITHUB_TOKEN_RE.sub("[REDACTED]", redacted)
     redacted = _AWS_ACCESS_KEY_RE.sub("[REDACTED]", redacted)
-    return _GENERIC_ASSIGNMENT_RE.sub(r"\1[REDACTED]", redacted)
+    return _redact_assignments(redacted)
+
+
+def _redact_assignments(value: str) -> str:
+    output: list[str] = []
+    cursor = 0
+    while match := _ASSIGNMENT_START_RE.search(value, cursor):
+        output.append(value[cursor : match.end()])
+        output.append("[REDACTED]")
+        value_start = match.end()
+        value_end = _assignment_value_end(value, value_start)
+        cursor = max(value_end, value_start)
+    output.append(value[cursor:])
+    return "".join(output)
+
+
+def _assignment_value_end(value: str, start: int) -> int:
+    line_end = value.find("\n", start)
+    if line_end < 0:
+        line_end = len(value)
+    if start >= line_end:
+        return start
+
+    escaped_quote = value[start : start + 2]
+    if escaped_quote in (r"\"", r"\'"):
+        close = value.find(escaped_quote, start + 2, line_end)
+        return close + 2 if close >= 0 else line_end
+
+    quote = value[start]
+    if quote in ('"', "'"):
+        index = start + 1
+        while index < line_end:
+            if value[index] == "\\":
+                index += 2
+                continue
+            if value[index] == quote:
+                return index + 1
+            index += 1
+        return line_end
+
+    index = start
+    while (
+        index < line_end and not value[index].isspace() and value[index] not in ",;}]"
+    ):
+        index += 1
+    return index
 
 
 def _render_sections(bodies: Mapping[str, str]) -> str:
@@ -785,6 +982,8 @@ def _select_recent(items: Sequence[_RecentItem], budget: int) -> list[_RecentIte
         keep = remaining - len(marker)
         if keep > 0:
             selected_reversed.append(_RecentItem(item.text[:keep].rstrip() + marker))
+        elif remaining > 0:
+            selected_reversed.append(_RecentItem(item.text[:remaining]))
         break
     return list(reversed(selected_reversed))
 
@@ -816,15 +1015,23 @@ def _selected_other_bodies(items: Sequence[_SectionItem]) -> dict[str, str]:
 
 
 def _stable_pack_id(request: ContextPackRequest) -> str:
+    return _stable_pack_id_with_safety(request, request.stale, request.diverged)
+
+
+def _stable_pack_id_with_safety(
+    request: ContextPackRequest, stale: bool, diverged: bool
+) -> str:
     digest = hashlib.sha256()
     for value in (
-        "context-pack-v1",
+        "context-pack-v2",
         request.bridge_id,
         request.source_session_id,
         request.target_provider.value,
         request.source_cursor,
         request.source_hash,
         str(request.budget_chars),
+        f"stale={int(stale)}",
+        f"diverged={int(diverged)}",
     ):
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))
