@@ -46,6 +46,9 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
     "gigakun@agentmail.to": "gigakun3030",  # Upstream PR #61163
+    "agent@agents-Mac-mini.local": "momomojo",  # Upstream PR #43692
+    "jakub.wolniewicz@gmail.com": "frizikk",  # Upstream PR #59778
+    "markvlcek@gmail.com": "MarkVLK",  # Upstream commit bf3667ae (PR #63080)
     "changhyun.min@gmail.com": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
     "neo@neodeMac-mini.local": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
     "m.guttmann@journaway.com": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
