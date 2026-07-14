@@ -29,16 +29,19 @@ def _message(
     event_id: str,
     content: str,
     *,
+    role: str | None = None,
     tool_calls=None,
+    tool_call_id: str | None = None,
     timestamp: float | None = None,
 ) -> ProjectedMessage:
     return ProjectedMessage(
         native_event_id=event_id,
         ordinal=0,
-        role="assistant" if tool_calls else "user",
+        role=role or ("assistant" if tool_calls else "user"),
         content=content,
         timestamp=10.0 + len(event_id) if timestamp is None else timestamp,
         tool_calls=tool_calls,
+        tool_call_id=tool_call_id,
     )
 
 
@@ -295,7 +298,7 @@ def test_projection_normalizes_native_identity_before_persisting_and_comparing(d
     assert store.get_external_session("claude:native-1")["native_id"] == "native-1"
 
 
-def test_projection_preserves_non_native_provenance_across_native_deltas(db):
+def test_projection_preserves_placeholder_on_replay_and_non_human_native_deltas(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     placeholder = _projection(
         _message("e1", "placeholder"),
@@ -306,22 +309,159 @@ def test_projection_preserves_non_native_provenance_across_native_deltas(db):
     store.upsert_projection(placeholder)
     exact_replay = store.upsert_projection(placeholder)
 
-    native_delta = _projection(
-        _message("e1", "placeholder"),
-        _message("e2", "native delta"),
-        cursor="native-cursor",
-        native_hash="native-hash",
+    native_user_replay = store.upsert_projection(
+        _projection(
+            _message("e1", "placeholder"),
+            cursor="native-replay-cursor",
+            native_hash="native-replay-hash",
+        )
     )
-    store.upsert_projection(native_delta)
+    store.upsert_projection(
+        _projection(
+            _message("e2", "assistant delta", role="assistant"),
+            _message(
+                "e3",
+                "",
+                role="assistant",
+                tool_calls=[{"id": "call-1", "name": "Read"}],
+            ),
+            _message(
+                "e4",
+                "tool result delta",
+                role="tool",
+                tool_call_id="call-1",
+            ),
+            cursor="native-non-human-cursor",
+            native_hash="native-non-human-hash",
+        )
+    )
 
     external = store.get_external_session("claude:native-1")
+    assert external is not None
     assert exact_replay.inserted_messages == 0
+    assert native_user_replay.inserted_messages == 0
     assert external["origin_kind"] == "bridge_placeholder"
     assert external["origin_bridge_id"] == "bridge-1"
-    assert external["last_native_cursor"] == "native-cursor"
+    assert external["last_native_cursor"] == "native-non-human-cursor"
 
 
-def test_projection_allows_one_provenance_upgrade_and_rejects_conflicts_atomically(db):
+def test_new_native_user_delta_promotes_placeholder(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(
+            _message("e1", "bridge marker"),
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
+        )
+    )
+
+    result = store.upsert_projection(
+        _projection(
+            _message("e2", "  genuine later user  "),
+            cursor="human-cursor",
+            native_hash="human-hash",
+        )
+    )
+
+    external = store.get_external_session("claude:native-1")
+    assert external is not None
+    assert result.inserted_messages == 1
+    assert external["origin_kind"] == "bridge_continuation"
+    assert external["origin_bridge_id"] == "bridge-1"
+
+
+@pytest.mark.parametrize("content", ["", "   ", "\t\n"])
+def test_empty_pending_user_does_not_promote_placeholder(db, content):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(
+            _message("e1", "bridge marker"),
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
+        )
+    )
+
+    result = store.upsert_projection(
+        _projection(
+            _message("e2", content),
+            cursor="empty-user-cursor",
+            native_hash="empty-user-hash",
+        )
+    )
+
+    external = store.get_external_session("claude:native-1")
+    assert external is not None
+    assert result.inserted_messages == 1
+    assert external["origin_kind"] == "bridge_placeholder"
+    assert external["origin_bridge_id"] == "bridge-1"
+
+
+def test_explicit_placeholder_to_continuation_is_monotonic_for_same_bridge(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    placeholder = _projection(
+        _message("e1", "bridge marker"),
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id="bridge-1",
+    )
+    store.upsert_projection(placeholder)
+
+    store.upsert_projection(
+        replace(
+            placeholder,
+            native_cursor="continuation-cursor",
+            origin_kind=OriginKind.BRIDGE_CONTINUATION,
+        )
+    )
+    store.upsert_projection(
+        replace(
+            placeholder,
+            native_cursor="placeholder-replay-cursor",
+        )
+    )
+    store.upsert_projection(
+        replace(
+            placeholder,
+            native_cursor="native-replay-cursor",
+            origin_kind=OriginKind.NATIVE,
+            origin_bridge_id=None,
+        )
+    )
+
+    external = store.get_external_session("claude:native-1")
+    assert external is not None
+    assert external["origin_kind"] == "bridge_continuation"
+    assert external["origin_bridge_id"] == "bridge-1"
+    assert external["last_native_cursor"] == "native-replay-cursor"
+
+
+def test_rebuild_uses_explicit_provenance_without_inferring_from_marker_user(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(
+            _message("e1", "original bridge marker"),
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
+        )
+    )
+
+    store.upsert_projection(
+        _projection(
+            _message("rebuilt-marker", "original bridge marker"),
+            cursor="rebuilt-cursor",
+            native_hash="rebuilt-hash",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
+        ),
+        rebuild=True,
+    )
+
+    external = store.get_external_session("claude:native-1")
+    assert external is not None
+    assert external["origin_kind"] == "bridge_placeholder"
+    assert external["origin_bridge_id"] == "bridge-1"
+
+
+def test_projection_rejects_conflicting_bridge_ids_atomically(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     store.upsert_projection(_projection(_message("e1", "native")))
     store.upsert_projection(
@@ -335,7 +475,7 @@ def test_projection_allows_one_provenance_upgrade_and_rejects_conflicts_atomical
 
     conflicts = (
         (OriginKind.BRIDGE_CONTINUATION, "bridge-2"),
-        (OriginKind.BRIDGE_PLACEHOLDER, "bridge-1"),
+        (OriginKind.BRIDGE_PLACEHOLDER, "bridge-2"),
     )
     for origin_kind, origin_bridge_id in conflicts:
         with pytest.raises(ValueError, match="provenance"):

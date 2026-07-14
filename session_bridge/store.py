@@ -112,10 +112,35 @@ class SessionBridgeStore:
             ):
                 raise ValueError(f"stale projection for session {session_id!r}")
 
+            existing_keys = {
+                (row["native_event_id"], row["ordinal"])
+                for row in conn.execute(
+                    """SELECT native_event_id, ordinal
+                       FROM external_message_map WHERE session_id = ?""",
+                    (session_id,),
+                ).fetchall()
+            }
+            if rebuild:
+                pending = projected_messages
+                has_new_human_user = False
+            else:
+                pending = [
+                    (message, row)
+                    for message, row in projected_messages
+                    if (message.native_event_id, message.ordinal) not in existing_keys
+                ]
+                has_new_human_user = any(
+                    message.role == "user"
+                    and isinstance(message.content, str)
+                    and bool(message.content.strip())
+                    for message, _ in pending
+                )
+
             origin_kind, origin_bridge_id = _resolve_projection_provenance(
                 external_row,
                 projection.origin_kind,
                 projection.origin_bridge_id,
+                has_new_human_user=has_new_human_user,
             )
 
             first_seen = external_row is None
@@ -197,19 +222,6 @@ class SessionBridgeStore:
                     (session_id,),
                 )
 
-            existing_keys = {
-                (row["native_event_id"], row["ordinal"])
-                for row in conn.execute(
-                    """SELECT native_event_id, ordinal
-                       FROM external_message_map WHERE session_id = ?""",
-                    (session_id,),
-                ).fetchall()
-            }
-            pending = [
-                (message, row)
-                for message, row in projected_messages
-                if (message.native_event_id, message.ordinal) not in existing_keys
-            ]
             inserted_ids, _ = self.db._insert_message_rows_with_ids(
                 conn, session_id, [row for _, row in pending]
             )
@@ -860,6 +872,8 @@ def _resolve_projection_provenance(
     existing: Mapping[str, Any] | None,
     incoming_kind: OriginKind,
     incoming_bridge_id: str | None,
+    *,
+    has_new_human_user: bool,
 ) -> tuple[str, str | None]:
     if incoming_kind is not OriginKind.NATIVE and not incoming_bridge_id:
         raise ValueError("non-native projection provenance requires a bridge ID")
@@ -870,14 +884,21 @@ def _resolve_projection_provenance(
             None if incoming_kind is OriginKind.NATIVE else incoming_bridge_id,
         )
 
-    if incoming_kind is OriginKind.NATIVE:
-        return existing["origin_kind"], existing["origin_bridge_id"]
+    existing_kind = OriginKind(existing["origin_kind"])
+    existing_bridge_id = existing["origin_bridge_id"]
     if (
-        existing["origin_kind"] == incoming_kind.value
-        and existing["origin_bridge_id"] == incoming_bridge_id
+        incoming_kind is not OriginKind.NATIVE
+        and incoming_bridge_id != existing_bridge_id
     ):
-        return existing["origin_kind"], existing["origin_bridge_id"]
-    raise ValueError("projection provenance conflicts with persisted origin")
+        raise ValueError("projection provenance conflicts with persisted origin")
+
+    if existing_kind is OriginKind.BRIDGE_CONTINUATION:
+        return existing_kind.value, existing_bridge_id
+    if incoming_kind is OriginKind.BRIDGE_CONTINUATION or (
+        incoming_kind is OriginKind.NATIVE and has_new_human_user
+    ):
+        return OriginKind.BRIDGE_CONTINUATION.value, existing_bridge_id
+    return existing_kind.value, existing_bridge_id
 
 
 def _stable_id(*parts: str) -> str:

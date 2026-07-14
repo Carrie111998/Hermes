@@ -10,6 +10,7 @@ from typing import BinaryIO
 
 import pytest
 
+from hermes_state import SessionDB
 from session_bridge.claude_adapter import ClaudeCursor, ClaudeSourceAdapter
 from session_bridge.models import (
     BridgeMarkerPayload,
@@ -18,6 +19,7 @@ from session_bridge.models import (
     canonical_session_id,
     encode_bridge_marker,
 )
+from session_bridge.store import SessionBridgeStore
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude"
@@ -586,6 +588,50 @@ def test_appended_user_turn_promotes_cached_placeholder_to_continuation(tmp_path
 
     assert second.projection.origin_kind is OriginKind.BRIDGE_CONTINUATION
     assert second.projection.origin_bridge_id == "bridge-promoted"
+
+
+def test_cold_restart_store_promotes_placeholder_from_new_human_tail(tmp_path):
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id="bridge-cold-restart",
+            source_session_id="codex:synthetic-source",
+            target_provider=Provider.CLAUDE,
+            policy_generation=4,
+        ),
+        SECRET,
+    )
+    path = tmp_path / "cold-restart.jsonl"
+    path.write_bytes(_json_line(_message_record(marker)))
+    first = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+    database = SessionDB(tmp_path / "state.db")
+    try:
+        store = SessionBridgeStore(database, clock=lambda: 100.0)
+        store.upsert_projection(first.projection)
+        assert first.projection.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+        with path.open("ab") as stream:
+            stream.write(
+                _json_line(
+                    _message_record(
+                        "A human turn after restart",
+                        event_id="29292929-2929-4292-8292-292929292929",
+                        timestamp="2026-01-01T00:00:03Z",
+                    )
+                )
+            )
+
+        second = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(
+            path, first.cursor
+        )
+        assert second.projection.origin_kind is OriginKind.NATIVE
+        assert [message.role for message in second.projection.messages] == ["user"]
+        store.upsert_projection(second.projection)
+
+        external = store.get_external_session(f"claude:{BASIC_SESSION_ID}")
+        assert external is not None
+        assert external["origin_kind"] == "bridge_continuation"
+        assert external["origin_bridge_id"] == "bridge-cold-restart"
+    finally:
+        database.close()
 
 
 def test_tool_result_only_user_record_does_not_promote_placeholder(tmp_path):
