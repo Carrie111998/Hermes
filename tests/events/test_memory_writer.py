@@ -342,3 +342,65 @@ def test_build_content_honcho_uses_rich_phrasing(tmp_path):
     assert "Staff Eng" in content and "Acme" in content
     assert "High-score job" in content            # rich gbrain phrasing reused
     assert not content.startswith("JOB_HIGH_SCORE:")  # NOT the raw fallback dump
+
+
+# ---------------------------------------------------------------------------
+# Defensive MEMORY.md size cap (bound MEMORY.md growth) — 2026-07-14
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryMdCap:
+    def test_cap_drops_oldest_event_sections_only(self):
+        head = "# Jaum Memory\n\n## Orchestration Rules\n- keep me\n\n"
+        events = "".join(
+            f"## Event 2026-06-{d:02d}\n" + "".join(f"- filler {i}\n" for i in range(40))
+            for d in range(1, 16)
+        )
+        newest = "## Event 2026-07-14\n- newest entry\n"
+        capped = mw._cap_memory_md(head + events + newest, max_bytes=3000)
+        assert len(capped.encode("utf-8")) <= 3000
+        assert "# Jaum Memory" in capped and "- keep me" in capped   # protected head kept
+        assert "2026-06-01" not in capped                            # oldest evicted
+        assert "- newest entry" in capped                            # newest kept
+
+    def test_cap_never_trims_protected_content(self):
+        # Over cap but ZERO '## Event' sections -> returned unchanged (best-effort).
+        content = "# Jaum Memory\n" + "".join(f"- rule {i}\n" for i in range(500))
+        assert mw._cap_memory_md(content, max_bytes=100) == content
+
+    def test_write_memory_md_applies_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(mw, "MEMORY_MD_MAX_BYTES", 2000)
+        mem = tmp_path / "memories" / "MEMORY.md"
+        mem.parent.mkdir(parents=True)
+        head = "# Jaum Memory\n- keep me\n"
+        events = "".join(
+            f"## Event 2026-06-{d:02d}\n" + "".join(f"- filler {i}\n" for i in range(40))
+            for d in range(1, 12)
+        )
+        mem.write_text(head + events, encoding="utf-8")
+        w = _make_writer(tmp_path)
+        ev = Event.create(
+            EventType.CRON_FAILED_CONSECUTIVE, "cron",
+            {"job_name": "x", "consecutive_errors": 3, "error": "boom"},
+        )
+        w._write_memory_md(ev, "x failing since 2026-07-14 (3 consecutive) — boom")
+        out = mem.read_text(encoding="utf-8")
+        assert len(out.encode("utf-8")) <= 2000
+        assert "# Jaum Memory" in out and "- keep me" in out
+        assert "boom" in out                     # freshly-appended note survived
+        assert "2026-06-01" not in out           # oldest event evicted
+
+    def test_write_memory_md_under_cap_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        mem = tmp_path / "memories" / "MEMORY.md"
+        mem.parent.mkdir(parents=True)
+        mem.write_text("# Jaum Memory\n- small\n", encoding="utf-8")
+        w = _make_writer(tmp_path)
+        ev = Event.create(
+            EventType.CRON_FAILED_CONSECUTIVE, "cron",
+            {"job_name": "y", "consecutive_errors": 2, "error": "eek"},
+        )
+        w._write_memory_md(ev, "y failing since 2026-07-14 (2 consecutive) — eek")
+        out = mem.read_text(encoding="utf-8")
+        assert "# Jaum Memory" in out and "- small" in out and "eek" in out

@@ -9,6 +9,7 @@ Rate-limited: max 10 GBrain writes/hour, 5 MemPalace writes/hour.
 """
 
 import logging
+import re
 import time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
@@ -61,6 +62,45 @@ RATE_LIMITS = {
     "memory_md": {"max_per_hour": 20, "window": 3600},
     "honcho": {"max_per_hour": 30, "window": 3600},
 }
+
+# Defensive cap for the profile-scoped agent MEMORY.md. The curator's nightly
+# prune normally keeps this file far smaller; the cap only fires during an
+# extended curator-down period. It evicts ONLY MemoryWriter's own
+# '## Event <date>' appends — never the human prefix or curator-rendered blocks.
+MEMORY_MD_MAX_BYTES = 200_000
+_EVENT_HEADER_RE = re.compile(r"^## Event \d{4}-\d{2}-\d{2}")
+
+
+def _cap_memory_md(content: str, max_bytes: int) -> str:
+    """Return ``content`` trimmed to <= ``max_bytes`` by dropping the oldest
+    ``## Event <date>`` day-sections (MemoryWriter's own appends), oldest first.
+    Best-effort: if only non-event content remains above the cap, returns
+    ``content`` unchanged."""
+    if len(content.encode("utf-8")) <= max_bytes:
+        return content
+    lines = content.splitlines(keepends=True)
+    starts = [i for i, ln in enumerate(lines) if _EVENT_HEADER_RE.match(ln)]
+    if not starts:
+        return content
+
+    def section_end(start: int) -> int:
+        # A section runs to the next header (any '# '/'## ' line) or EOF, so
+        # trimming it never removes neighbouring (protected) content.
+        for j in range(start + 1, len(lines)):
+            if lines[j].startswith("## ") or lines[j].startswith("# "):
+                return j
+        return len(lines)
+
+    drop = [False] * len(lines)
+    size = len(content.encode("utf-8"))
+    for start in starts:  # file order == oldest first
+        if size <= max_bytes:
+            break
+        for k in range(start, section_end(start)):
+            if not drop[k]:
+                size -= len(lines[k].encode("utf-8"))
+                drop[k] = True
+    return "".join(ln for i, ln in enumerate(lines) if not drop[i])
 
 
 class MemoryWriter(BaseSubscriber):
@@ -322,6 +362,7 @@ class MemoryWriter(BaseSubscriber):
                 existing += date_header
             existing += f"- {content}\n"
 
+            existing = _cap_memory_md(existing, MEMORY_MD_MAX_BYTES)
             memory_path.write_text(existing, encoding="utf-8")
             logger.info("MemoryWriter: appended to MEMORY.md: %s", content[:80])
         except Exception as e:
