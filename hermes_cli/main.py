@@ -4582,7 +4582,7 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    return cron_command(args)
 
 
 def cmd_sync(args):
@@ -11155,6 +11155,11 @@ def cmd_claw(args):
     claw_command(args)
 
 
+def _normalize_exit_code(result: object) -> int:
+    """Map command handler results to process exit codes without treating bool as int."""
+    return result if type(result) is int else 0
+
+
 def main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
@@ -11199,9 +11204,9 @@ def main():
         pass
 
     if _try_termux_fast_tui_launch():
-        return
+        return 0
     if _try_termux_fast_cli_launch():
-        return
+        return 0
 
     from hermes_cli._parser import build_top_level_parser
 
@@ -12495,7 +12500,7 @@ def main():
     # Handle --version flag
     if args.version:
         cmd_version(args)
-        return
+        return 0
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
@@ -12537,8 +12542,7 @@ def main():
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
-        result = cmd_chat(args)
-        return int(result) if isinstance(result, int) else 0
+        return _normalize_exit_code(cmd_chat(args))
 
     # Default to chat if no command specified
     if args.command is None:
@@ -12554,8 +12558,7 @@ def main():
         ]:
             if not hasattr(args, attr):
                 setattr(args, attr, default)
-        result = cmd_chat(args)
-        return int(result) if isinstance(result, int) else 0
+        return _normalize_exit_code(cmd_chat(args))
 
     # Execute the command.  Propagate the handler's return code as the
     # process exit code so subcommands that signal failure (e.g.
@@ -12563,8 +12566,7 @@ def main():
     # is misconfigured) actually exit non-zero.  Handlers that return
     # None are treated as success (exit 0).
     if hasattr(args, "func"):
-        result = args.func(args)
-        return int(result) if isinstance(result, int) else 0
+        return _normalize_exit_code(args.func(args))
     else:
         parser.print_help()
         return 0
