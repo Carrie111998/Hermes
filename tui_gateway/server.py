@@ -9741,13 +9741,10 @@ def _rebind_session_transport(
     """Bind a live client and re-home only queue entries it now owns.
 
     Callers hold ``history_lock``. An explicit source-ID retry transfers that
-    one queued item to the retrying client. Resume/activate instead migrates
-    dead queue transports only when the session itself was detached, preserving
-    still-live per-item FIFO routing for other clients.
+    one queued item to the retrying client. Resume/activate migrates each dead
+    queued transport independently while preserving live per-item FIFO routing.
     """
-    previous_transport = session.get("transport")
     session["transport"] = transport
-    migrate_dead = migrate_dead_queued and _transport_is_dead(previous_transport)
 
     queued_items = [session.get("queued_prompt")]
     pending = session.get("queued_prompts")
@@ -9759,7 +9756,9 @@ def _rebind_session_transport(
         matches_source = (
             message_id is not None and item.get("message_id") == message_id
         )
-        if matches_source or (migrate_dead and _transport_is_dead(item.get("transport"))):
+        if matches_source or (
+            migrate_dead_queued and _transport_is_dead(item.get("transport"))
+        ):
             item["transport"] = transport
 
     # ``inflight_turn`` has no separate transport slot: rebinding the session
