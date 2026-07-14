@@ -137,8 +137,14 @@ _GITHUB_TOKEN_RE = re.compile(
 _AWS_ACCESS_KEY_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 _ASSIGNMENT_START_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_])"
-    r"(?:\\?[\"'])?(?:password|token)(?:\\?[\"'])?\s*(?:=|:)\s*"
+    r"(?:\\?[\"'])?(?:password|token)(?:\\?[\"'])?[ \t]*(?:=|:)[ \t]*"
 )
+_YAML_BLOCK_HEADER_RE = re.compile(r"^[|>](?:[+-]?[1-9]?|[1-9][+-]?)[ \t]*(?:#.*)?$")
+_HEREDOC_HEADER_RE = re.compile(
+    r"^<<(?P<strip_tabs>-?)[ \t]*(?P<quote>[\"']?)"
+    r"(?P<delimiter>[A-Za-z0-9_.-]+)(?P=quote)[ \t]*$"
+)
+_PEER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*[ \t]*(?:=|:)")
 _GIT_STATUS_MAX_LINES = 200
 _GIT_STATUS_MAX_CHARS = 32_768
 _STALE_WARNING = (
@@ -671,8 +677,9 @@ class ContextPackBuilder:
         for message_index, row in enumerate(messages):
             content = row.get("content")
             if isinstance(content, str):
+                redacted_content = _redact(content)
                 if row.get("role") in ("user", "assistant"):
-                    for raw_line in content.splitlines():
+                    for raw_line in redacted_content.splitlines():
                         line = _compact(raw_line)
                         if not line:
                             continue
@@ -682,7 +689,7 @@ class ContextPackBuilder:
                             row.get("role") == "user" and line.endswith("?")
                         ):
                             open_lines[line] = (message_index, line)
-                searchable = content
+                searchable = redacted_content
             else:
                 searchable = ""
             tool_calls = row.get("tool_calls")
@@ -693,6 +700,7 @@ class ContextPackBuilder:
                     separators=(",", ":"),
                     ensure_ascii=False,
                 )
+                searchable = _redact(searchable)
             for match in _FILE_RE.finditer(searchable):
                 path = match.group(0).replace("\\", "/")
                 occurrence += 1
@@ -928,15 +936,37 @@ def _redact_assignments(value: str) -> str:
         output.append(value[cursor : match.end()])
         output.append("[REDACTED]")
         value_start = match.end()
-        value_end = _assignment_value_end(value, value_start)
+        value_end = _assignment_value_end(
+            value,
+            value_start,
+            key_indent=_assignment_key_indent(value, match.start()),
+        )
         cursor = max(value_end, value_start)
     output.append(value[cursor:])
     return "".join(output)
 
 
-def _assignment_value_end(value: str, start: int) -> int:
+def _assignment_value_end(value: str, start: int, *, key_indent: int) -> int:
     if start >= len(value):
         return start
+
+    if value[start] in "\r\n":
+        _, body_start = _line_end_and_next(value, start)
+        return _indented_block_end(value, body_start, key_indent)
+
+    line_end, next_line_start = _line_end_and_next(value, start)
+    header = value[start:line_end]
+    if _YAML_BLOCK_HEADER_RE.fullmatch(header):
+        return _indented_block_end(value, next_line_start, key_indent)
+
+    heredoc = _HEREDOC_HEADER_RE.fullmatch(header)
+    if heredoc is not None:
+        return _heredoc_value_end(
+            value,
+            next_line_start,
+            delimiter=heredoc.group("delimiter"),
+            strip_tabs=bool(heredoc.group("strip_tabs")),
+        )
 
     for delimiter in ('"""', "'''", r"\"\"\"", r"\'\'\'"):
         if value.startswith(delimiter, start):
@@ -949,10 +979,93 @@ def _assignment_value_end(value: str, start: int) -> int:
     if value[start] in "{[":
         return _structured_value_end(value, start)
 
+    if header.rstrip(" \t").endswith("\\"):
+        return _continued_value_end(value, start)
+
     index = start
-    while index < len(value) and value[index] not in "\r\n,;}]":
+    while index < line_end and value[index] not in ",;}]":
         index += 1
     return index
+
+
+def _assignment_key_indent(value: str, assignment_start: int) -> int:
+    line_start = (
+        max(
+            value.rfind("\n", 0, assignment_start),
+            value.rfind("\r", 0, assignment_start),
+        )
+        + 1
+    )
+    prefix = value[line_start:assignment_start]
+    return _indent_width(prefix) if not prefix.strip(" \t") else 0
+
+
+def _line_end_and_next(value: str, start: int) -> tuple[int, int]:
+    line_feed = value.find("\n", start)
+    carriage_return = value.find("\r", start)
+    candidates = [
+        position for position in (line_feed, carriage_return) if position >= 0
+    ]
+    if not candidates:
+        return len(value), len(value)
+    end = min(candidates)
+    next_start = end + 1
+    if value[end] == "\r" and next_start < len(value) and value[next_start] == "\n":
+        next_start += 1
+    return end, next_start
+
+
+def _indent_width(value: str) -> int:
+    indentation = value[: len(value) - len(value.lstrip(" \t"))]
+    return len(indentation.expandtabs(8))
+
+
+def _indented_block_end(value: str, start: int, key_indent: int) -> int:
+    line_start = start
+    while line_start < len(value):
+        line_end, next_line_start = _line_end_and_next(value, line_start)
+        line = value[line_start:line_end]
+        if not line.strip(" \t"):
+            line_start = next_line_start
+            continue
+        indent = _indent_width(line)
+        if indent > key_indent:
+            line_start = next_line_start
+            continue
+        peer_content = line.lstrip(" \t")
+        return line_start if _PEER_KEY_RE.match(peer_content) else len(value)
+    return len(value)
+
+
+def _heredoc_value_end(
+    value: str,
+    start: int,
+    *,
+    delimiter: str,
+    strip_tabs: bool,
+) -> int:
+    line_start = start
+    while line_start < len(value):
+        line_end, next_line_start = _line_end_and_next(value, line_start)
+        line = value[line_start:line_end]
+        candidate = line.lstrip("\t") if strip_tabs else line
+        if candidate == delimiter:
+            return next_line_start
+        line_start = next_line_start
+    return len(value)
+
+
+def _continued_value_end(value: str, start: int) -> int:
+    line_start = start
+    while line_start < len(value):
+        line_end, next_line_start = _line_end_and_next(value, line_start)
+        line = value[line_start:line_end]
+        if not line.rstrip(" \t").endswith("\\"):
+            return line_end
+        if next_line_start >= len(value):
+            return len(value)
+        line_start = next_line_start
+    return len(value)
 
 
 def _quoted_value_end(value: str, start: int, delimiter: str) -> int:

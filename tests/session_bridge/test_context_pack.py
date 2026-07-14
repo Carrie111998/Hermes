@@ -1510,6 +1510,145 @@ def test_structured_and_unquoted_assignment_values_are_fully_redacted(
     assert source_id in payload
 
 
+@pytest.mark.parametrize(
+    ("header", "body_indent", "peer_indent", "line_ending"),
+    [
+        ("password: |", "  ", "", "\n"),
+        ("token: >-", "  ", "", "\n"),
+        ("  password: |2+", "    ", "  ", "\r\n"),
+    ],
+)
+def test_yaml_block_scalar_assignment_is_redacted_to_next_peer_key(
+    db: SessionDB,
+    header: str,
+    body_indent: str,
+    peer_indent: str,
+    line_ending: str,
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = line_ending.join((
+        header,
+        f"{body_indent}YAML BLOCK SECRET ONE",
+        f"{body_indent}  YAML BLOCK SECRET TWO",
+        f"{peer_indent}ordinary_uuid={uuid}",
+        f"{peer_indent}source_id={source_id}",
+    ))
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "YAML BLOCK SECRET ONE" not in payload
+    assert "YAML BLOCK SECRET TWO" not in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
+def test_indented_mapping_assignment_is_redacted_to_next_peer_key(db: SessionDB):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = (
+        "  password:\n"
+        "    value: MAPPING SECRET ONE\n"
+        "    other: MAPPING SECRET TWO\n"
+        "  next: visible\n"
+        f"  ordinary_uuid={uuid}\n"
+        f"  source_id={source_id}"
+    )
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "MAPPING SECRET ONE" not in payload
+    assert "MAPPING SECRET TWO" not in payload
+    assert "next: visible" in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
+@pytest.mark.parametrize(
+    ("opener", "body_prefix", "terminator", "line_ending"),
+    [
+        ("password=<<EOF", "", "EOF", "\n"),
+        ("token=<<-END_SECRET", "\t", "\tEND_SECRET", "\r\n"),
+    ],
+)
+def test_shell_heredoc_assignment_is_redacted_through_terminator(
+    db: SessionDB,
+    opener: str,
+    body_prefix: str,
+    terminator: str,
+    line_ending: str,
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = line_ending.join((
+        opener,
+        f"{body_prefix}HEREDOC SECRET ONE",
+        f"{body_prefix}HEREDOC SECRET TWO",
+        terminator,
+        "next=visible",
+        f"ordinary_uuid={uuid}",
+        f"source_id={source_id}",
+    ))
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "HEREDOC SECRET ONE" not in payload
+    assert "HEREDOC SECRET TWO" not in payload
+    assert "next=visible" in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_backslash_continued_assignment_redacts_complete_logical_value(
+    db: SessionDB,
+    line_ending: str,
+):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = line_ending.join((
+        "password=CONTINUED SECRET ONE \\",
+        "CONTINUED SECRET TWO \\",
+        "CONTINUED SECRET THREE",
+        "next=visible",
+        f"ordinary_uuid={uuid}",
+        f"source_id={source_id}",
+    ))
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "CONTINUED SECRET ONE" not in payload
+    assert "CONTINUED SECRET TWO" not in payload
+    assert "CONTINUED SECRET THREE" not in payload
+    assert "next=visible" in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
+def test_unclosed_heredoc_assignment_consumes_rest_of_input(db: SessionDB):
+    uuid = "123e4567-e89b-12d3-a456-426614174000"
+    source_id = "claude:source-1"
+    content = (
+        f"ordinary_uuid={uuid}\n"
+        f"source_id={source_id}\n"
+        "password=<<MISSING\n"
+        "UNCLOSED HEREDOC SECRET\n"
+        "this remainder must also be redacted"
+    )
+    store = _seed(db, [_message("u1", "user", content, timestamp=101.0)])
+
+    payload = ContextPackBuilder(db, store).build(_request()).payload
+
+    assert "UNCLOSED HEREDOC SECRET" not in payload
+    assert "this remainder must also be redacted" not in payload
+    assert uuid in payload
+    assert source_id in payload
+
+
 def test_unterminated_json_and_escaped_assignments_are_redacted_in_turns_and_git(
     db: SessionDB, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
