@@ -5625,9 +5625,18 @@ class SessionDB:
         older_than_days: Optional[float] = 90,
         source: str = None,
         sessions_dir: Optional[Path] = None,
+        max_batch: Optional[int] = None,
         **filters,
     ) -> int:
         """Delete sessions matching the filters. Returns count deleted.
+
+        When *max_batch* is set, deletion is chunked: each chunk of up to
+        ``max_batch`` sessions is deleted in its own transaction, releasing
+        the write lock between chunks. This bounds lock-hold time and WAL
+        growth for large backlogs (e.g. a retention change or post-outage
+        catch-up) so an online prune never starves the live gateway. When
+        *max_batch* is None (default), all matches are deleted in a single
+        transaction — the original behavior.
 
         Default behavior (no keyword filters) is unchanged: delete ended
         sessions older than ``older_than_days`` days, optionally restricted
@@ -5665,14 +5674,14 @@ class SessionDB:
         removed_ids: list[str] = []
 
         def _do(conn):
-            cursor = conn.execute(
-                f"SELECT s.id FROM sessions s WHERE {where}", where_params
-            )
-            session_ids = {row["id"] for row in cursor.fetchall()}
-
+            sql = f"SELECT s.id FROM sessions s WHERE {where}"
+            params = list(where_params)
+            if max_batch is not None:
+                sql += " LIMIT ?"
+                params.append(max_batch)
+            session_ids = {row["id"] for row in conn.execute(sql, params).fetchall()}
             if not session_ids:
                 return 0
-
             # Orphan any sessions whose parent is about to be deleted
             placeholders = ",".join("?" * len(session_ids))
             conn.execute(
@@ -5680,14 +5689,21 @@ class SessionDB:
                 f"WHERE parent_session_id IN ({placeholders})",
                 list(session_ids),
             )
-
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             return len(session_ids)
 
-        count = self._execute_write(_do)
+        if max_batch is None:
+            count = self._execute_write(_do)
+        else:
+            count = 0
+            while True:
+                n = self._execute_write(_do)
+                count += n
+                if n < max_batch:  # last (partial/empty) chunk drained the backlog
+                    break
         # Clean up on-disk files outside the DB transaction
         for sid in removed_ids:
             self._remove_session_files(sessions_dir, sid)

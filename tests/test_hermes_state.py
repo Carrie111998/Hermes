@@ -2043,6 +2043,49 @@ class TestPruneSessions:
         for sid in ("X", "Y", "Z"):
             assert db.get_session(sid) is None
 
+    def _make_old_ended_n(self, db, n, days_old=100):
+        for i in range(n):
+            sid = f"batch_old_{i}"
+            db.create_session(session_id=sid, source="cli")
+            db.end_session(sid, end_reason="done")
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (time.time() - days_old * 86400, sid),
+            )
+        db._conn.commit()
+
+    def test_prune_max_batch_deletes_all_in_chunks(self, db):
+        self._make_old_ended_n(db, 5)
+        pruned = db.prune_sessions(older_than_days=90, max_batch=2)
+        assert pruned == 5
+        for i in range(5):
+            assert db.get_session(f"batch_old_{i}") is None
+
+    def test_prune_max_batch_commits_between_chunks(self, db, monkeypatch):
+        """5 rows / batch of 2 -> 3 write transactions (2, 2, 1)."""
+        self._make_old_ended_n(db, 5)
+        calls = {"n": 0}
+        real = db._execute_write
+        def _counting(fn):
+            calls["n"] += 1
+            return real(fn)
+        monkeypatch.setattr(db, "_execute_write", _counting)
+        pruned = db.prune_sessions(older_than_days=90, max_batch=2)
+        assert pruned == 5
+        assert calls["n"] == 3
+
+    def test_prune_max_batch_none_is_single_transaction(self, db, monkeypatch):
+        self._make_old_ended_n(db, 4)
+        calls = {"n": 0}
+        real = db._execute_write
+        def _counting(fn):
+            calls["n"] += 1
+            return real(fn)
+        monkeypatch.setattr(db, "_execute_write", _counting)
+        pruned = db.prune_sessions(older_than_days=90)  # max_batch defaults None
+        assert pruned == 4
+        assert calls["n"] == 1
+
 
 class TestPruneSessionFilters:
     """Extended filter surface shared by prune/archive/list_prune_candidates."""
