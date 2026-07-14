@@ -64,7 +64,10 @@ _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # unique document_id fallback for older APIs.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
-_INLINE_DATA_URL_RE = re.compile(r"data:[^;,\s]+;base64,[A-Za-z0-9+/=\r\n]+")
+_INLINE_DATA_URL_RE = re.compile(
+    r"data:[^,\s]*;base64,[A-Za-z0-9+/=_-]+(?:\r?\n[A-Za-z0-9+/=_-]+)*",
+    re.IGNORECASE,
+)
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
@@ -86,7 +89,7 @@ def _memory_text_from_content(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return _redact_inline_data_urls(value).strip()
+        return _redact_inline_data_urls(value)
     if isinstance(value, list):
         parts = [_memory_text_from_content(item) for item in value]
         return "\n".join(part for part in parts if part)
@@ -101,10 +104,10 @@ def _memory_text_from_content(value: Any) -> str:
         if "text" in value:
             return _memory_text_from_content(value.get("text"))
         try:
-            return _redact_inline_data_urls(json.dumps(value, ensure_ascii=False, default=str)).strip()
+            return _redact_inline_data_urls(json.dumps(value, ensure_ascii=False, default=str))
         except (TypeError, ValueError):
-            return _redact_inline_data_urls(str(value)).strip()
-    return _redact_inline_data_urls(str(value)).strip()
+            return _redact_inline_data_urls(str(value))
+    return _redact_inline_data_urls(str(value))
 
 
 def _parse_int_setting(value: Any, default: int) -> int:
