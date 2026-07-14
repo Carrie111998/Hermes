@@ -694,7 +694,7 @@ class HermesConsoleEngine:
         self.register(
             ("cron", "run"),
             "cron run <job>",
-            "Run a job on the next scheduler tick.",
+            "Run a job now (the hosted web-console schedules it for the next tick).",
             _cron_run,
             mutating=True,
             confirmation="Trigger this cron job?",
@@ -1815,15 +1815,68 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
 def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron run <job>")
-    from cron.jobs import AmbiguousJobReference, trigger_job
+    from cron.jobs import AmbiguousJobReference
+
+    # Context-aware execution semantics (see the 2026-07-14 decision):
+    #
+    #   local (standalone REPL)  → execute NOW, matching `hermes cron run` (CLI)
+    #                              and the cronjob(action='run') tool, both of
+    #                              which route through _execute_job_now. A manual
+    #                              run then actually fires even when no gateway
+    #                              ticker is active (the #41037 case), and the
+    #                              same job behaves identically across surfaces.
+    #
+    #   hosted (dashboard web-console) → keep schedule-for-next-tick. That surface
+    #                              runs each command in a bounded 4-worker pool
+    #                              under a 60s asyncio timeout (web_server.py), so
+    #                              a synchronous agent run would be mis-reported as
+    #                              timed-out and could starve the shared pool. The
+    #                              gateway ticker there picks the job up next tick.
+    #
+    # Both paths keep caller="tui:console_engine" attribution and emit exactly one
+    # CRON_TRIGGERED (via emit_cron_triggered_safe) so the audit contract holds.
+    if _engine.context != "local":
+        from cron.jobs import trigger_job
+
+        try:
+            job = trigger_job(args[0], caller="tui:console_engine")
+        except AmbiguousJobReference as exc:
+            raise ConsoleCommandError(str(exc)) from exc
+        if not job:
+            raise ConsoleCommandError(f"Job not found: {args[0]}")
+        return _format_job(job, "Triggered")
+
+    from cron.jobs import get_job, resolve_job_ref
+    from tools.cronjob_tools import _execute_job_now
 
     try:
-        job = trigger_job(args[0], caller="tui:console_engine")
+        job = resolve_job_ref(args[0])
     except AmbiguousJobReference as exc:
         raise ConsoleCommandError(str(exc)) from exc
     if not job:
         raise ConsoleCommandError(f"Job not found: {args[0]}")
-    return _format_job(job, "Triggered")
+
+    # Execute now: _execute_job_now claims at-most-once (blocking a concurrent
+    # tick), emits CRON_TRIGGERED with the console caller, then fires via the
+    # shared run_one_job body. A lost claim means the scheduler already owns this
+    # fire — report it rather than double-running.
+    exec_result = _execute_job_now(job, caller="tui:console_engine")
+
+    refreshed = get_job(job["id"]) or job
+    name = refreshed.get("name") or job.get("name") or job["id"]
+    job_id = job["id"]
+
+    if not exec_result.get("claimed", False):
+        return (
+            f"Run skipped: {name} ({job_id}) is already being fired "
+            "by the scheduler."
+        )
+    if exec_result.get("success"):
+        return f"Ran job: {name} ({job_id}) - succeeded."
+    error = exec_result.get("error")
+    if error:
+        return f"Ran job: {name} ({job_id}) - failed: {error}"
+    return f"Ran job: {name} ({job_id}) - failed."
 
 
 def run_console_repl(
