@@ -81,11 +81,10 @@ def test_update_acp_registry_versions_is_silent_when_manifest_missing(
     module._update_acp_registry_versions("0.14.0")
 
 
-def test_update_version_files_bumps_manifest_alongside_pyproject(
+def test_update_version_files_bumps_manifest_and_desktop_alongside_pyproject(
     monkeypatch, tmp_path
 ):
-    """End-to-end: update_version_files() is the function release.py actually
-    calls, so it must drive the manifest bump too."""
+    """The release path must bump Python, ACP, and Desktop metadata together."""
     _write_manifest(tmp_path, "0.13.0")
     (tmp_path / "pyproject.toml").write_text(
         '[project]\nname = "hermes-agent"\nversion = "0.13.0"\n', encoding="utf-8"
@@ -94,6 +93,18 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     version_dir.mkdir()
     (version_dir / "__init__.py").write_text(
         '__version__ = "0.13.0"\n__release_date__ = "2026-05-14"\n',
+        encoding="utf-8",
+    )
+    desktop_dir = tmp_path / "apps" / "desktop"
+    desktop_dir.mkdir(parents=True)
+    (desktop_dir / "package.json").write_text(
+        '{\n  "name": "hermes",\n  "version": "0.13.0"\n}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text(
+        '{\n  "packages": {\n    "apps/desktop": {\n'
+        '      "name": "hermes",\n      "version": "0.13.0"\n'
+        "    }\n  }\n}\n",
         encoding="utf-8",
     )
 
@@ -111,3 +122,10 @@ def test_update_version_files_bumps_manifest_alongside_pyproject(
     )
     assert manifest["version"] == "0.14.0"
     assert manifest["distribution"]["uvx"]["package"] == "hermes-agent[acp]==0.14.0"
+
+    desktop = json.loads(
+        (desktop_dir / "package.json").read_text(encoding="utf-8")
+    )
+    lock = json.loads((tmp_path / "package-lock.json").read_text(encoding="utf-8"))
+    assert desktop["version"] == "0.14.0"
+    assert lock["packages"]["apps/desktop"]["version"] == "0.14.0"

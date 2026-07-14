@@ -2107,6 +2107,20 @@ def update_version_files(semver: str, calver_date: str):
         )
         desktop_pkg.write_text(pkg_text, encoding="utf-8")
 
+    # npm records workspace package metadata in the root lockfile. Keep that
+    # entry aligned too, otherwise a release updates package.json while leaving
+    # reproducible installs and packaged app metadata on the previous version.
+    root_lock = REPO_ROOT / "package-lock.json"
+    if root_lock.exists():
+        lock_text = root_lock.read_text(encoding="utf-8")
+        lock_text = re.sub(
+            r'("apps/desktop"\s*:\s*\{\s*"name"\s*:\s*"hermes"\s*,\s*"version"\s*:\s*)"[^"]+"',
+            rf'\g<1>"{semver}"',
+            lock_text,
+            count=1,
+        )
+        root_lock.write_text(lock_text, encoding="utf-8")
+
     # Update ACP Registry manifest + npm launcher (must stay version-locked
     # with pyproject — enforced by tests/acp/test_registry_manifest.py).
     _update_acp_registry_versions(semver)

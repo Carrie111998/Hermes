@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DESKTOP_PKG = REPO_ROOT / "apps" / "desktop" / "package.json"
 ROOT_LOCK = REPO_ROOT / "package-lock.json"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 
 # An exact semver: digits.digits.digits with an optional prerelease/build tag,
 # but NO range operators (^ ~ > < = * x || spaces || -range).
@@ -43,6 +45,18 @@ _EXACT_SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 def _desktop_pkg() -> dict:
     assert DESKTOP_PKG.is_file(), f"missing {DESKTOP_PKG}"
     return json.loads(DESKTOP_PKG.read_text(encoding="utf-8"))
+
+
+def test_desktop_package_version_matches_python_runtime():
+    """The Electron shell and shared CLI/gateway runtime are one release plane."""
+    python_version = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))["project"][
+        "version"
+    ]
+    desktop_version = _desktop_pkg()["version"]
+    assert desktop_version == python_version, (
+        f"desktop package version ({desktop_version}) must match the Python runtime "
+        f"version ({python_version}); run scripts/release.py to bump both together"
+    )
 
 
 def _electron_spec(pkg: dict) -> str:
