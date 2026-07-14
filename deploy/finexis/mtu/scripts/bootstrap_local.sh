@@ -35,6 +35,9 @@ cat > "$HERMES_HOME/.env" <<ENV
 TELEGRAM_BOT_TOKEN=$TG_TOKEN
 TELEGRAM_ALLOWED_USERS=$ALLOWED_USERS
 OPENAI_API_KEY=$OPENAI_KEY
+# Home channel silences the one-time /sethome onboarding nag and is where any
+# cron/cross-platform delivery would land. Defaults to the operator's chat.
+TELEGRAM_HOME_CHANNEL=${TELEGRAM_HOME_CHANNEL:-43919316}
 ENV
 chmod 600 "$HERMES_HOME/.env"
 
