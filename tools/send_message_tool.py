@@ -958,8 +958,11 @@ async def _send_via_adapter(
     for out-of-process callers (e.g. cron running separately from the gateway).
 
     Order of attempts:
-      1. Live in-process adapter via ``_gateway_runner_ref()`` (the path that
-         existed before this change).
+      1. **Live in-process adapter** via ``_gateway_runner_ref()``.
+         - Text is sent via ``adapter.send()``.
+         - Media are dispatched to ``send_image_file / send_voice / send_video /
+           send_document``.
+         - Failure is returned immediately — **no standalone fallback**.
       2. The plugin's ``standalone_sender_fn`` registered on its
          ``PlatformEntry`` (used when the gateway is not in this process, so
          the runner weakref is ``None``).
@@ -973,6 +976,9 @@ async def _send_via_adapter(
     except Exception:
         runner = None
 
+    media_files = media_files or []
+
+    # ── Live adapter ───────────────────────────────────────────────────
     if runner is not None:
         try:
             adapter = runner.adapters.get(platform)
@@ -994,6 +1000,9 @@ async def _send_via_adapter(
                 # gets woken when the gateway loop resolves the future.
                 # When on a different loop, dispatch onto the gateway loop via
                 # run_coroutine_threadsafe and await the wrapped future.
+                # Media descriptors route through the adapter's native media
+                # APIs (same cross-loop rules apply — the media helper awaits
+                # adapter methods bound to the gateway loop).
                 gateway_loop = getattr(runner, "_gateway_loop", None)
                 try:
                     _current_loop = asyncio.get_running_loop()
@@ -1065,6 +1074,7 @@ async def _send_via_adapter(
                 return {"success": True, "message_id": result.message_id}
             return {"error": f"Adapter send failed: {_bounded_send_error(result.error)}"}
 
+    # ── Standalone fallback ────────────────────────────────────────────
     entry = None
     try:
         from gateway.platform_registry import platform_registry
