@@ -347,8 +347,11 @@ class ContextPackBuilder:
             raise ValueError("context pack target-provider/snapshot identity mismatch")
         if row["target_session_id"] != expected_target_session_id:
             raise ValueError("context pack target identity mismatch")
-        if request.stale and "[stale source]" not in row["payload"]:
+        warnings = _rendered_section_body(row["payload"], "Warnings")
+        if request.stale and (warnings is None or "[stale source]" not in warnings):
             raise ValueError("context pack stale source warning missing")
+        if request.diverged and (warnings is None or "[diverged]" not in warnings):
+            raise ValueError("context pack diverged warning missing")
 
     def _persist_pack_once(
         self,
@@ -954,6 +957,23 @@ def _render_sections(bodies: Mapping[str, str]) -> str:
         )
         + "\n"
     )
+
+
+def _rendered_section_body(payload: str, section: str) -> str | None:
+    heading = f"## {section}\n"
+    starts: list[int] = []
+    if payload.startswith(heading):
+        starts.append(len(heading))
+    separator = f"\n\n{heading}"
+    search_from = 0
+    while (position := payload.find(separator, search_from)) >= 0:
+        starts.append(position + len(separator))
+        search_from = position + len(separator)
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    end = payload.find("\n\n## ", start)
+    return payload[start:] if end < 0 else payload[start:end]
 
 
 def _group_section_items(

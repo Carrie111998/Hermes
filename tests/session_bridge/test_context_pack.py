@@ -68,6 +68,14 @@ def _message(
     )
 
 
+def _replace_section(payload: str, heading: str, body: str) -> str:
+    section_start = payload.index(f"{heading}\n") + len(heading) + 1
+    section_end = payload.find("\n\n## ", section_start)
+    if section_end < 0:
+        section_end = len(payload.rstrip("\n"))
+    return payload[:section_start] + body + payload[section_end:]
+
+
 def _projection(
     messages: list[ProjectedMessage],
     *,
@@ -697,12 +705,61 @@ def test_existing_explicitly_stale_pack_replay_keeps_visible_warning(db: Session
     with db._lock:
         conn = db._conn
         assert conn is not None
+        corrupted_payload = _replace_section(
+            first.payload,
+            "## Recent Turns",
+            "- USER @101.000000:\n  Decoy [stale source] outside warnings",
+        )
+        corrupted_payload = _replace_section(
+            corrupted_payload,
+            "## Warnings",
+            "",
+        )
         conn.execute(
             "UPDATE session_context_packs SET payload = ? WHERE id = ?",
-            ("persisted pack without its safety marker", first.id),
+            (corrupted_payload, first.id),
         )
     with pytest.raises(ValueError, match="stale source warning missing"):
         builder.build(stale_request)
+
+
+def test_existing_diverged_pack_requires_warning_in_warnings_section(db: SessionDB):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Diverged snapshot", timestamp=101.0)],
+    )
+    builder = ContextPackBuilder(db, store)
+    diverged_request = replace(_request(), diverged=True)
+
+    first = builder.build(diverged_request)
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        corrupted_payload = _replace_section(first.payload, "## Warnings", "")
+        conn.execute(
+            "UPDATE session_context_packs SET payload = ? WHERE id = ?",
+            (corrupted_payload, first.id),
+        )
+
+    with pytest.raises(ValueError, match="diverged warning missing"):
+        builder.build(diverged_request)
+
+
+def test_existing_pack_accepts_both_safety_markers_in_warnings_section(db: SessionDB):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Dual safety snapshot", timestamp=101.0)],
+    )
+    builder = ContextPackBuilder(db, store)
+    request = replace(_request(), stale=True, diverged=True)
+
+    first = builder.build(request)
+    replay = builder.build(request)
+    warnings = _section(replay.payload, SECTION_HEADINGS[8])
+
+    assert replay == first
+    assert "[stale source]" in warnings
+    assert "[diverged]" in warnings
 
 
 def test_exact_mutable_snapshot_is_frozen_on_first_persisted_build(
