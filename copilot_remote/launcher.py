@@ -30,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -236,7 +237,10 @@ def _log_dir() -> Path:
 
 def _copilot_settings_path() -> Path:
     """Return the path to Copilot CLI's user settings.json."""
-    return Path(os.environ.get("COPILOT_HOME", str(Path.home() / ".copilot"))) / "settings.json"
+    copilot_home = os.environ.get("COPILOT_HOME")
+    if copilot_home:
+        return Path(copilot_home).expanduser() / "settings.json"
+    return Path.home() / ".copilot" / "settings.json"
 
 
 def _ensure_folder_trusted(repo_path: str) -> None:
@@ -265,7 +269,7 @@ def _ensure_folder_trusted(repo_path: str) -> None:
     settings_path = _copilot_settings_path()
     try:
         resolved = str(Path(repo_path).expanduser().resolve())
-    except OSError:
+    except (OSError, ValueError):
         resolved = repo_path
 
     comment_lines: list[str] = []
@@ -309,10 +313,32 @@ def _ensure_folder_trusted(repo_path: str) -> None:
         body = json.dumps(data, indent=2) + "\n"
         if comment_lines:
             body = "\n".join(comment_lines) + "\n" + body
-        settings_path.write_text(body, encoding="utf-8")
+        _atomic_write_text(settings_path, body)
         logger.info("Pre-seeded Copilot folder trust for %s", _sanitize_for_log(resolved))
     except OSError as exc:
         logger.warning("Could not write Copilot settings.json for trust pre-seed: %s", exc)
+
+
+def _atomic_write_text(path: Path, body: str) -> None:
+    """Write *body* to *path* atomically via a same-directory temp file + rename.
+
+    Avoids leaving ``settings.json`` partially-written/corrupt if the process
+    crashes mid-write or two launches race to update it concurrently -- the
+    file is always either the previous valid contents or the new ones.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _path_covered_by_trusted_entry(resolved: str, entry: str) -> bool:
