@@ -347,6 +347,8 @@ def enqueue_mirror_job(
     *,
     policy: MirrorPolicy,
     manual_authorized: bool = False,
+    candidate: MirrorCandidate | None = None,
+    context: EligibilityContext | None = None,
 ) -> dict[str, Any]:
     if not isinstance(policy, MirrorPolicy):
         raise TypeError("policy must be a MirrorPolicy")
@@ -360,6 +362,26 @@ def enqueue_mirror_job(
         raise PermissionError("mirror enqueue requires automatic or manual authority")
 
     expected_key = mirror_idempotency_key(source_session_id, target, policy.generation)
+    if not manual_authorized:
+        enqueue_time = _finite_float("store clock", store._clock())
+        _validate_automatic_candidate(
+            source_session_id,
+            target,
+            policy=policy,
+            candidate=candidate,
+            context=context,
+            now=enqueue_time,
+        )
+        return _enqueue_automatic_job(
+            store,
+            source_session_id,
+            source_provider,
+            target,
+            policy=policy,
+            idempotency_key=expected_key,
+            now=enqueue_time,
+        )
+
     job = store.enqueue_mirror_job(
         source_session_id,
         target,
@@ -398,7 +420,7 @@ def record_mirror_failure(
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts <= 0:
         raise ValueError("job attempts must be a positive integer")
     failure_time = _finite_float("now", now)
-    updated_at = _finite_float("store clock", store._clock())
+    authoritative_now = _finite_float("store clock", store._clock())
 
     def _write(connection: Any) -> MirrorJobState:
         durable = connection.execute(
@@ -408,6 +430,11 @@ def record_mirror_failure(
             raise KeyError(job_id)
         durable_attempts = durable["attempts"]
         durable_key = durable["idempotency_key"]
+        durable_updated_at = _finite_float(
+            "durable mirror job updated_at", durable["updated_at"]
+        )
+        if not durable_updated_at <= failure_time <= authoritative_now:
+            raise ValueError("caller time is stale or in the future")
         if (
             durable["state"] != MirrorJobState.RUNNING.value
             or durable_attempts != attempts
@@ -434,7 +461,7 @@ def record_mirror_failure(
                     next_state.value,
                     code,
                     detail,
-                    updated_at,
+                    authoritative_now,
                     job_id,
                     MirrorJobState.RUNNING.value,
                     durable_attempts,
@@ -443,7 +470,7 @@ def record_mirror_failure(
             )
         else:
             next_state = MirrorJobState.RETRY
-            next_attempt_at = failure_time + retry_delay_seconds(
+            next_attempt_at = authoritative_now + retry_delay_seconds(
                 durable_key, durable_attempts
             )
             cursor = connection.execute(
@@ -457,7 +484,7 @@ def record_mirror_failure(
                     code,
                     detail,
                     next_attempt_at,
-                    updated_at,
+                    authoritative_now,
                     job_id,
                     MirrorJobState.RUNNING.value,
                     durable_attempts,
@@ -491,13 +518,20 @@ def select_creation_batch(
     candidates: Sequence[MirrorCandidate],
     *,
     policy: MirrorPolicy,
+    context: EligibilityContext | None = None,
     now: float,
     in_flight_by_provider: Mapping[Provider | str, int],
     recent_creation_times: Sequence[float],
     progress: BatchProgress,
 ) -> tuple[MirrorCandidate, ...]:
     selection_time = _finite_float("now", now)
-    if not policy.automatic_creation or should_halt_batch(progress, policy):
+    if not policy.automatic_creation:
+        return ()
+    if not isinstance(context, EligibilityContext):
+        raise ValueError("automatic creation requires an eligibility context")
+    if context.policy != policy or context.now != selection_time:
+        raise ValueError("eligibility context must match policy and selection time")
+    if should_halt_batch(progress, policy):
         return ()
 
     normalized_creation_times: list[float] = []
@@ -542,8 +576,10 @@ def select_creation_batch(
         ),
     )
     for candidate in ordered:
-        if not _candidate_is_current_and_meaningful(
-            candidate, now=selection_time, policy=policy
+        eligibility = classify_mirror_eligibility(candidate.projection, context)
+        if (
+            not eligibility.eligible
+            or eligibility.target_provider is not candidate.target_provider
         ):
             continue
         target = _external_provider(candidate.target_provider)
@@ -592,21 +628,6 @@ def _validated_projection_timeline(
     return started_at, last_active
 
 
-def _candidate_is_current_and_meaningful(
-    candidate: MirrorCandidate,
-    *,
-    now: float,
-    policy: MirrorPolicy,
-) -> bool:
-    if _validated_projection_timeline(candidate.projection, now) is None:
-        return False
-    first_meaningful_at = _first_meaningful_user_timestamp(candidate.projection)
-    return (
-        first_meaningful_at is not None
-        and now - first_meaningful_at >= policy.debounce_seconds
-    )
-
-
 def _inverted_provider(provider: Provider) -> Provider:
     normalized = _external_provider(provider)
     if normalized is Provider.CLAUDE:
@@ -634,6 +655,119 @@ def _canonical_source_provider(source_session_id: str) -> Provider:
     if canonical != source_session_id:
         raise ValueError("source must be a canonical Claude or Codex session ID")
     return provider
+
+
+def _validate_automatic_candidate(
+    source_session_id: str,
+    target: Provider,
+    *,
+    policy: MirrorPolicy,
+    candidate: MirrorCandidate | None,
+    context: EligibilityContext | None,
+    now: float,
+) -> None:
+    if not isinstance(candidate, MirrorCandidate) or not isinstance(
+        context, EligibilityContext
+    ):
+        raise ValueError("automatic enqueue requires candidate and context")
+    if context.policy != policy or context.now > now:
+        raise ValueError("automatic enqueue context policy or time is stale")
+    if (
+        candidate.source_session_id != source_session_id
+        or candidate.target_provider is not target
+    ):
+        raise ValueError("automatic enqueue candidate identity does not match")
+    current_context = EligibilityContext(
+        now=now,
+        discovery_mode=context.discovery_mode,
+        continuous_watermark=context.continuous_watermark,
+        existing_target_mappings=context.existing_target_mappings,
+        policy=policy,
+    )
+    eligibility = classify_mirror_eligibility(candidate.projection, current_context)
+    if not eligibility.eligible or eligibility.target_provider is not target:
+        raise PermissionError(
+            f"automatic enqueue is not eligible: {eligibility.reason}"
+        )
+
+
+def _enqueue_automatic_job(
+    store: SessionBridgeStore,
+    source_session_id: str,
+    source_provider: Provider,
+    target_provider: Provider,
+    *,
+    policy: MirrorPolicy,
+    idempotency_key: str,
+    now: float,
+) -> dict[str, Any]:
+    job_id = f"job:{idempotency_key}"
+
+    def _write(connection: Any) -> dict[str, Any]:
+        source = connection.execute(
+            """SELECT s.source, e.provider, e.native_id, e.origin_kind,
+                      e.origin_bridge_id
+               FROM sessions AS s
+               JOIN external_sessions AS e ON e.session_id = s.id
+               WHERE s.id = ?""",
+            (source_session_id,),
+        ).fetchone()
+        expected_native_id = source_session_id.split(":", 1)[1]
+        if source is None or (
+            source["source"] != source_provider.value
+            or source["provider"] != source_provider.value
+            or source["native_id"] != expected_native_id
+        ):
+            raise PermissionError("automatic enqueue source identity is not durable")
+        if (
+            source["origin_kind"] != OriginKind.NATIVE.value
+            or source["origin_bridge_id"] is not None
+        ):
+            raise PermissionError(
+                "automatic enqueue durable source origin is not native"
+            )
+
+        mapped = connection.execute(
+            """SELECT 1
+               FROM session_links AS link
+               JOIN external_sessions AS target
+                 ON target.session_id = link.to_session_id
+               WHERE link.from_session_id = ? AND target.provider = ?
+               LIMIT 1""",
+            (source_session_id, target_provider.value),
+        ).fetchone()
+        if mapped is not None:
+            raise PermissionError("automatic enqueue source is already mapped")
+
+        connection.execute(
+            """INSERT OR IGNORE INTO session_mirror_jobs (
+               id, idempotency_key, source_session_id, target_provider,
+               state, attempts, next_attempt_at, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+            (
+                job_id,
+                idempotency_key,
+                source_session_id,
+                target_provider.value,
+                MirrorJobState.QUEUED.value,
+                now,
+                now,
+                now,
+            ),
+        )
+        job = connection.execute(
+            "SELECT * FROM session_mirror_jobs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if job is None or (
+            job["id"] != job_id
+            or job["source_session_id"] != source_session_id
+            or job["target_provider"] != target_provider.value
+        ):
+            raise RuntimeError("conflicting automatic mirror job replay")
+        return dict(job)
+
+    return store.db._execute_write(_write)
 
 
 def _external_provider(provider: Provider | str) -> Provider:

@@ -30,6 +30,8 @@ from session_bridge.models import (
     OriginKind,
     ProjectedMessage,
     Provider,
+    Relation,
+    SessionLink,
     SessionProjection,
     canonical_session_id,
 )
@@ -94,13 +96,14 @@ def _projection(
 
 def _context(
     *,
+    now: float = NOW,
     mode: DiscoveryMode = DiscoveryMode.INITIAL_BACKFILL,
     watermark: float | None = None,
     mappings: frozenset[tuple[str, Provider]] = frozenset(),
     policy: MirrorPolicy = MirrorPolicy(),
 ) -> EligibilityContext:
     return EligibilityContext(
-        now=NOW,
+        now=now,
         discovery_mode=mode,
         continuous_watermark=watermark,
         existing_target_mappings=mappings,
@@ -582,7 +585,8 @@ def test_enqueue_requires_exact_inverse_provider_and_canonical_external_source(d
 def test_explicit_manual_and_automatic_authority_enqueue_only_inverse_jobs(db):
     store = SessionBridgeStore(db, clock=lambda: NOW)
     store.upsert_projection(_projection(provider=Provider.CLAUDE, native_id="manual"))
-    store.upsert_projection(_projection(provider=Provider.CODEX, native_id="auto"))
+    automatic_projection = _projection(provider=Provider.CODEX, native_id="auto")
+    store.upsert_projection(automatic_projection)
 
     manual = enqueue_mirror_job(
         store,
@@ -591,11 +595,19 @@ def test_explicit_manual_and_automatic_authority_enqueue_only_inverse_jobs(db):
         policy=MirrorPolicy(generation=2),
         manual_authorized=True,
     )
+    automatic_policy = MirrorPolicy(generation=2, automatic_creation=True)
+    automatic_context = _context(policy=automatic_policy)
+    automatic_candidate = _candidate(
+        automatic_projection,
+        policy=automatic_policy,
+    )
     automatic = enqueue_mirror_job(
         store,
         "codex:auto",
         Provider.CLAUDE,
-        policy=MirrorPolicy(generation=2, automatic_creation=True),
+        policy=automatic_policy,
+        candidate=automatic_candidate,
+        context=automatic_context,
     )
 
     assert manual["target_provider"] == "codex"
@@ -620,6 +632,143 @@ def test_manual_enqueue_authority_requires_an_exact_boolean(db, manual_authorize
     assert _job_rows(db) == []
 
 
+def test_automatic_enqueue_rejects_source_that_became_bridge_origin(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection(provider=Provider.CODEX)
+    store.upsert_projection(projection)
+    context = _context(policy=policy)
+    candidate = _candidate(projection, policy=policy)
+    store.upsert_projection(
+        replace(
+            projection,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
+        )
+    )
+
+    with pytest.raises(PermissionError, match="durable source origin"):
+        enqueue_mirror_job(
+            store,
+            "codex:source-1",
+            Provider.CLAUDE,
+            policy=policy,
+            candidate=candidate,
+            context=context,
+        )
+
+    assert _job_rows(db) == []
+
+
+@pytest.mark.parametrize("relation", (Relation.MIRRORS, Relation.CONTINUES))
+def test_automatic_enqueue_rejects_mapping_added_after_eligibility(db, relation):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection()
+    target = _projection(
+        provider=Provider.CODEX,
+        native_id="target-1",
+    )
+    store.upsert_projection(projection)
+    store.upsert_projection(target)
+    context = _context(policy=policy)
+    candidate = _candidate(projection, policy=policy)
+    store.create_link(
+        SessionLink(
+            id="link-1",
+            from_session_id="claude:source-1",
+            to_session_id="codex:target-1",
+            relation=relation,
+            bridge_id="bridge-1",
+            source_cursor="cursor-1",
+            source_hash="hash-1",
+            created_at=NOW,
+        )
+    )
+
+    with pytest.raises(PermissionError, match="already mapped"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=policy,
+            candidate=candidate,
+            context=context,
+        )
+
+    assert _job_rows(db) == []
+
+
+def test_automatic_enqueue_revalidates_at_advanced_authoritative_store_time(db):
+    current_time = [NOW]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection()
+    store.upsert_projection(projection)
+    context = _context(policy=policy)
+    candidate = _candidate(projection, policy=policy)
+    current_time[0] = NOW + 1
+
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=policy,
+        candidate=candidate,
+        context=context,
+    )
+
+    assert job["state"] == "queued"
+    assert job["created_at"] == NOW + 1
+
+
+def test_manual_enqueue_explicitly_overrides_durable_origin_and_mapping(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    source = _projection(
+        provider=Provider.CODEX,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id="bridge-1",
+    )
+    store.upsert_projection(source)
+
+    job = enqueue_mirror_job(
+        store,
+        "codex:source-1",
+        Provider.CLAUDE,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+
+    assert job["state"] == "queued"
+
+
+def test_automatic_enqueue_requires_matching_candidate_context_and_policy(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    policy = MirrorPolicy(automatic_creation=True)
+    projection = _projection()
+    store.upsert_projection(projection)
+    candidate = _candidate(projection, policy=policy)
+
+    with pytest.raises(ValueError, match="candidate and context"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=policy,
+        )
+    with pytest.raises(ValueError, match="policy"):
+        enqueue_mirror_job(
+            store,
+            "claude:source-1",
+            Provider.CODEX,
+            policy=policy,
+            candidate=candidate,
+            context=_context(policy=replace(policy, generation=2)),
+        )
+
+    assert _job_rows(db) == []
+
+
 def test_retry_delay_is_deterministic_bounded_exponential_with_keyed_jitter():
     key = mirror_idempotency_key("claude:source-1", Provider.CODEX, 1)
 
@@ -638,7 +787,8 @@ def test_retry_delay_is_deterministic_bounded_exponential_with_keyed_jitter():
 
 
 def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
-    store = SessionBridgeStore(db, clock=lambda: NOW)
+    current_time = [NOW]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
     projection = _projection()
     store.upsert_projection(projection)
     policy = MirrorPolicy(max_attempts=2)
@@ -660,12 +810,13 @@ def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
         detail="temporary",
     )
     delay = retry_delay_seconds(job["idempotency_key"], 1)
-    second_claim = store.claim_due_jobs(now=NOW + delay, limit=1)[0]
+    current_time[0] = NOW + delay
+    second_claim = store.claim_due_jobs(now=current_time[0], limit=1)[0]
     final_state = record_mirror_failure(
         store,
         second_claim,
         policy=policy,
-        now=NOW + delay,
+        now=current_time[0],
         code="target_down",
         detail="temporary",
     )
@@ -674,6 +825,72 @@ def test_failure_retries_then_moves_to_manual_failure_at_max_attempts(db):
     assert second_claim["attempts"] == 2
     assert final_state is MirrorJobState.MANUAL_FAILURE
     assert _job_rows(db)[0]["state"] == "manual_failure"
+
+
+def test_failure_callback_rejects_stale_caller_time_and_uses_store_clock(db):
+    current_time = [NOW]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
+    store.upsert_projection(_projection())
+    job = enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    claim = store.claim_due_jobs(now=NOW, limit=1)[0]
+
+    with pytest.raises(ValueError, match="caller time"):
+        record_mirror_failure(
+            store,
+            claim,
+            policy=MirrorPolicy(),
+            now=0.0,
+            code="target_down",
+            detail="temporary",
+        )
+    assert _job_rows(db)[0]["state"] == "running"
+
+    current_time[0] = NOW + 10
+    state = record_mirror_failure(
+        store,
+        claim,
+        policy=MirrorPolicy(),
+        now=NOW,
+        code="target_down",
+        detail="temporary",
+    )
+    durable = _job_rows(db)[0]
+
+    assert state is MirrorJobState.RETRY
+    assert durable["next_attempt_at"] == current_time[0] + retry_delay_seconds(
+        job["idempotency_key"], 1
+    )
+
+
+def test_failure_callback_rejects_future_caller_time(db):
+    store = SessionBridgeStore(db, clock=lambda: NOW)
+    store.upsert_projection(_projection())
+    enqueue_mirror_job(
+        store,
+        "claude:source-1",
+        Provider.CODEX,
+        policy=MirrorPolicy(),
+        manual_authorized=True,
+    )
+    claim = store.claim_due_jobs(now=NOW, limit=1)[0]
+
+    with pytest.raises(ValueError, match="caller time"):
+        record_mirror_failure(
+            store,
+            claim,
+            policy=MirrorPolicy(),
+            now=NOW + 1,
+            code="target_down",
+            detail="temporary",
+        )
+
+    assert _job_rows(db)[0]["state"] == "running"
 
 
 @pytest.mark.parametrize(
@@ -740,7 +957,7 @@ def test_stale_failure_callback_after_retry_is_rejected_without_mutation(db):
             store,
             claim,
             policy=MirrorPolicy(),
-            now=NOW + 1,
+            now=NOW,
             code="second",
             detail="must not overwrite",
         )
@@ -827,6 +1044,7 @@ def test_creation_batch_is_newest_first_and_respects_provider_concurrency():
     selected = select_creation_batch(
         tuple(reversed(candidates)),
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={Provider.CLAUDE: 0, Provider.CODEX: 0},
         recent_creation_times=(),
@@ -847,6 +1065,7 @@ def test_creation_batch_deduplicates_repeated_candidate_mapping():
     selected = select_creation_batch(
         (candidate, candidate),
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(),
@@ -873,6 +1092,7 @@ def test_creation_batch_obeys_rolling_creates_per_minute_limit():
     selected = select_creation_batch(
         candidates,
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(NOW - 60.0, NOW - 59.999),
@@ -902,6 +1122,7 @@ def test_creation_batch_reserves_only_remaining_batch_attempts():
     selected = select_creation_batch(
         candidates,
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(),
@@ -910,6 +1131,7 @@ def test_creation_batch_reserves_only_remaining_batch_attempts():
     exhausted = select_creation_batch(
         candidates,
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(),
@@ -930,6 +1152,7 @@ def test_creation_batch_rejects_unknown_in_flight_provider_keys():
         select_creation_batch(
             (candidate,),
             policy=policy,
+            context=_context(policy=policy),
             now=NOW,
             in_flight_by_provider={"other": 1},
             recent_creation_times=(),
@@ -944,6 +1167,7 @@ def test_creation_batch_normalizes_known_string_in_flight_provider_keys():
     selected = select_creation_batch(
         (candidate,),
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={"codex": 1},
         recent_creation_times=(),
@@ -961,6 +1185,7 @@ def test_creation_batch_rejects_future_creation_timestamps():
         select_creation_batch(
             (candidate,),
             policy=policy,
+            context=_context(policy=policy),
             now=NOW,
             in_flight_by_provider={},
             recent_creation_times=(NOW + 0.001,),
@@ -999,6 +1224,7 @@ def test_creation_batch_revalidates_handcrafted_candidate_at_selection_time(
     selected = select_creation_batch(
         (candidate,),
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(),
@@ -1008,6 +1234,99 @@ def test_creation_batch_revalidates_handcrafted_candidate_at_selection_time(
     assert selected == ()
 
 
+def test_creation_batch_revalidates_age_watermark_and_existing_mappings():
+    policy = MirrorPolicy(automatic_creation=True)
+    old_projection = _projection(last_active=NOW - 30 * DAY - 1)
+    old_candidate = MirrorCandidate(
+        source_session_id="claude:source-1",
+        target_provider=Provider.CODEX,
+        last_active=old_projection.last_active,
+        projection=old_projection,
+    )
+    continuous_projection = _projection(
+        native_id="continuous",
+        started_at=NOW - 120,
+        last_active=NOW - 10,
+    )
+    continuous_candidate = MirrorCandidate(
+        source_session_id="claude:continuous",
+        target_provider=Provider.CODEX,
+        last_active=continuous_projection.last_active,
+        projection=continuous_projection,
+    )
+    mapped_projection = _projection(native_id="mapped")
+    mapped_candidate = MirrorCandidate(
+        source_session_id="claude:mapped",
+        target_provider=Provider.CODEX,
+        last_active=mapped_projection.last_active,
+        projection=mapped_projection,
+    )
+
+    old_selected = select_creation_batch(
+        (old_candidate,),
+        policy=policy,
+        context=_context(policy=policy),
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(),
+    )
+    continuous_selected = select_creation_batch(
+        (continuous_candidate,),
+        policy=policy,
+        context=_context(
+            mode=DiscoveryMode.CONTINUOUS,
+            watermark=NOW - 60,
+            policy=policy,
+        ),
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(),
+    )
+    mapped_selected = select_creation_batch(
+        (mapped_candidate,),
+        policy=policy,
+        context=_context(
+            mappings=frozenset({("claude:mapped", Provider.CODEX)}),
+            policy=policy,
+        ),
+        now=NOW,
+        in_flight_by_provider={},
+        recent_creation_times=(),
+        progress=BatchProgress(),
+    )
+
+    assert old_selected == ()
+    assert continuous_selected == ()
+    assert mapped_selected == ()
+
+
+def test_automatic_creation_batch_requires_current_matching_context():
+    policy = MirrorPolicy(automatic_creation=True)
+    candidate = _candidate(_projection(), policy=policy)
+
+    with pytest.raises(ValueError, match="context"):
+        select_creation_batch(
+            (candidate,),
+            policy=policy,
+            now=NOW,
+            in_flight_by_provider={},
+            recent_creation_times=(),
+            progress=BatchProgress(),
+        )
+    with pytest.raises(ValueError, match="context"):
+        select_creation_batch(
+            (candidate,),
+            policy=policy,
+            context=_context(now=NOW - 1, policy=policy),
+            now=NOW,
+            in_flight_by_provider={},
+            recent_creation_times=(),
+            progress=BatchProgress(),
+        )
+
+
 def test_safe_default_disables_automatic_creation_selection():
     policy = MirrorPolicy()
     candidate = _candidate(_projection(), policy=policy)
@@ -1015,6 +1334,7 @@ def test_safe_default_disables_automatic_creation_selection():
     selected = select_creation_batch(
         (candidate,),
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(),
@@ -1047,6 +1367,7 @@ def test_halted_batch_selects_no_jobs():
     selected = select_creation_batch(
         (candidate,),
         policy=policy,
+        context=_context(policy=policy),
         now=NOW,
         in_flight_by_provider={},
         recent_creation_times=(),
