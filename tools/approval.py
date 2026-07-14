@@ -4050,6 +4050,7 @@ def request_elicitation_consent(
     *,
     timeout_seconds: int | None = None,
     surface: str = "mcp-elicitation",
+    strict_one_shot: bool = False,
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
     the active session and return a normalized result.
@@ -4061,7 +4062,9 @@ def request_elicitation_consent(
 
     Always fails closed: missing notify_cb in a gateway session, timeouts,
     and exceptions all map to ``"decline"`` so a server treats them as
-    "user did not approve" rather than retrying or hanging.
+    "user did not approve" rather than retrying or hanging. When
+    ``strict_one_shot`` is true, only an explicit ``"once"`` choice is
+    accepted; session and permanent choices are rejected.
 
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
@@ -4103,6 +4106,8 @@ def request_elicitation_consent(
         if not decision.get("resolved"):
             return "cancel"
         choice = decision.get("choice")
+        if strict_one_shot:
+            return "accept" if choice == "once" else "decline"
         if choice in ("once", "session", "always"):
             return "accept"
         return "decline"
@@ -4110,11 +4115,14 @@ def request_elicitation_consent(
     # CLI / TUI path. allow_permanent=False because elicitation is a
     # per-call confirmation — there is no pattern to remember.
     try:
+        from tools.terminal_tool import _get_approval_callback
+
         choice = prompt_dangerous_approval(
             message,
             description,
             timeout_seconds=timeout_seconds,
             allow_permanent=False,
+            approval_callback=_get_approval_callback(),
         )
     except Exception as exc:
         logger.error(
@@ -4122,6 +4130,8 @@ def request_elicitation_consent(
         )
         return "decline"
 
+    if strict_one_shot:
+        return "accept" if choice == "once" else "decline"
     if choice in ("once", "session", "always"):
         return "accept"
     return "decline"

@@ -2523,6 +2523,59 @@ class TestTirithImportErrorFailOpenPolicy:
         assert result.get("approved") is True
 
 
+class TestStrictElicitationConsent:
+    @pytest.mark.parametrize(
+        ("choice", "expected"),
+        (("once", "accept"), ("session", "decline"), ("always", "decline")),
+    )
+    def test_cli_strict_one_shot_accepts_only_once(self, choice, expected):
+        with mock_patch.object(
+            approval_module, "_is_gateway_approval_context", return_value=False
+        ):
+            with mock_patch.object(
+                approval_module, "prompt_dangerous_approval", return_value=choice
+            ):
+                result = approval_module.request_elicitation_consent(
+                    "Approve this workflow scope",
+                    "scope summary",
+                    timeout_seconds=5,
+                    strict_one_shot=True,
+                )
+
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        ("choice", "expected"),
+        (("once", "accept"), ("session", "decline"), ("always", "decline")),
+    )
+    def test_gateway_strict_one_shot_accepts_only_once(
+        self, monkeypatch, choice, expected
+    ):
+        session_key = "gateway:research-protocol-strict-one-shot"
+        monkeypatch.setitem(
+            approval_module._gateway_notify_cbs, session_key, lambda _data: None
+        )
+        with mock_patch.object(
+            approval_module, "get_current_session_key", return_value=session_key
+        ):
+            with mock_patch.object(
+                approval_module, "_is_gateway_approval_context", return_value=True
+            ):
+                with mock_patch.object(
+                    approval_module,
+                    "_await_gateway_decision",
+                    return_value={"resolved": True, "choice": choice},
+                ):
+                    result = approval_module.request_elicitation_consent(
+                        "Approve this workflow scope",
+                        "scope summary",
+                        timeout_seconds=5,
+                        strict_one_shot=True,
+                    )
+
+        assert result == expected
+
+
 class TestApprovalPromptRedaction:
     """Secrets are masked in user-facing approval surfaces (#13139).
 
