@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
+import math
 import time
 from typing import Any
 
@@ -382,43 +383,22 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
-    def claim_due_jobs(self, *, now: float, limit: int) -> list[dict[str, Any]]:
-        if limit <= 0:
-            return []
-        claimed_at = float(now)
+    def claim_due_jobs(
+        self,
+        *,
+        now: float,
+        limit: int,
+        policy: Any,
+    ) -> list[dict[str, Any]]:
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(float(now))
+        ):
+            raise ValueError("now must be a finite number")
+        from .mirror import claim_due_mirror_jobs
 
-        def _write(conn):
-            rows = conn.execute(
-                """SELECT id FROM session_mirror_jobs
-                   WHERE state IN (?, ?) AND next_attempt_at <= ?
-                   ORDER BY next_attempt_at, created_at, id
-                   LIMIT ?""",
-                (
-                    MirrorJobState.QUEUED.value,
-                    MirrorJobState.RETRY.value,
-                    claimed_at,
-                    limit,
-                ),
-            ).fetchall()
-            claimed: list[dict[str, Any]] = []
-            for row in rows:
-                conn.execute(
-                    """UPDATE session_mirror_jobs
-                       SET state = ?, attempts = attempts + 1, updated_at = ?
-                       WHERE id = ?""",
-                    (MirrorJobState.RUNNING.value, claimed_at, row["id"]),
-                )
-                claimed.append(
-                    dict(
-                        conn.execute(
-                            "SELECT * FROM session_mirror_jobs WHERE id = ?",
-                            (row["id"],),
-                        ).fetchone()
-                    )
-                )
-            return claimed
-
-        return self.db._execute_write(_write)
+        return claim_due_mirror_jobs(self, limit=limit, policy=policy)
 
     def complete_job(
         self,

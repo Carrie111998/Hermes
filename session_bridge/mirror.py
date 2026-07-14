@@ -358,6 +358,8 @@ def enqueue_mirror_job(
         raise ValueError("manual_authorized must be a boolean")
     if type(retry_failed) is not bool:
         raise ValueError("retry_failed must be a boolean")
+    if retry_failed and not manual_authorized:
+        raise ValueError("retry_failed requires manual_authorized=True")
     source_provider = _canonical_source_provider(source_session_id)
     target = _external_provider(target_provider)
     if target is not _inverted_provider(source_provider):
@@ -392,27 +394,39 @@ def claim_due_mirror_jobs(
     store: SessionBridgeStore,
     *,
     limit: int,
+    policy: MirrorPolicy,
 ) -> list[dict[str, Any]]:
+    if not isinstance(policy, MirrorPolicy):
+        raise TypeError("policy must be a MirrorPolicy")
     _nonnegative_integer("claim limit", limit)
     if limit == 0:
         return []
 
     def _write(connection: Any) -> list[dict[str, Any]]:
         now = _finite_float("store clock", store._clock())
+        scan_limit = max(limit * 4, limit + 32)
         due = connection.execute(
-            """SELECT * FROM session_mirror_jobs
-               WHERE state IN (?, ?) AND next_attempt_at <= ?
-               ORDER BY next_attempt_at, created_at, id
+            """SELECT job.* FROM session_mirror_jobs AS job
+               LEFT JOIN session_bridge_state AS authority
+                 ON authority.key = ? || job.id
+               WHERE job.state IN (?, ?) AND job.next_attempt_at <= ?
+               ORDER BY
+                 CASE WHEN authority.value_json LIKE ? THEN 0 ELSE 1 END,
+                 job.next_attempt_at, job.created_at, job.id
                LIMIT ?""",
             (
+                _MIRROR_AUTHORITY_KEY_PREFIX,
                 MirrorJobState.QUEUED.value,
                 MirrorJobState.RETRY.value,
                 now,
-                limit,
+                '{"authority":"manual",%',
+                scan_limit,
             ),
         ).fetchall()
         claimed: list[dict[str, Any]] = []
         for job in due:
+            if len(claimed) >= limit:
+                break
             try:
                 authority = _read_mirror_authority(connection, job)
             except _MissingMirrorAuthority:
@@ -435,6 +449,8 @@ def claim_due_mirror_jobs(
                 continue
 
             if authority["authority"] == "automatic":
+                if not policy.automatic_creation:
+                    continue
                 try:
                     source_provider = _canonical_source_provider(
                         job["source_session_id"]
@@ -845,7 +861,53 @@ def _enqueue_authorized_job(
             None,
         )
         if exact_job is not None:
-            _read_mirror_authority(connection, exact_job)
+            existing_authority = _read_mirror_authority(connection, exact_job)
+            if authority == "manual" and existing_authority["authority"] == "automatic":
+                promoted_value = _encode_mirror_authority(
+                    authority="manual",
+                    idempotency_key=exact_job["idempotency_key"],
+                    source_session_id=exact_job["source_session_id"],
+                    target_provider=_external_provider(exact_job["target_provider"]),
+                    policy_generation=existing_authority["policy_generation"],
+                )
+                cursor = connection.execute(
+                    """UPDATE session_bridge_state
+                       SET value_json = ?, updated_at = ?
+                       WHERE key = ?""",
+                    (
+                        promoted_value,
+                        now,
+                        _mirror_authority_state_key(exact_job["id"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("stale mirror authority promotion")
+
+            if MirrorJobState(exact_job["state"]) is MirrorJobState.MANUAL_FAILURE:
+                if not retry_failed:
+                    raise ValueError("manual failure recovery requires retry_failed")
+                cursor = connection.execute(
+                    """UPDATE session_mirror_jobs
+                       SET state = ?, attempts = 0, next_attempt_at = ?,
+                           error_code = NULL, error_detail = NULL, updated_at = ?
+                       WHERE id = ? AND state = ? AND attempts = ?
+                         AND idempotency_key = ?""",
+                    (
+                        MirrorJobState.QUEUED.value,
+                        now,
+                        now,
+                        exact_job["id"],
+                        MirrorJobState.MANUAL_FAILURE.value,
+                        exact_job["attempts"],
+                        exact_job["idempotency_key"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("stale mirror job recovery")
+                exact_job = connection.execute(
+                    "SELECT * FROM session_mirror_jobs WHERE id = ?",
+                    (exact_job["id"],),
+                ).fetchone()
             return dict(exact_job)
         for prior in pair_jobs:
             prior_state = MirrorJobState(prior["state"])

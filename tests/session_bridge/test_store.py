@@ -6,6 +6,13 @@ from dataclasses import replace
 import pytest
 
 from hermes_state import SessionDB
+from session_bridge.mirror import (
+    DiscoveryMode,
+    EligibilityContext,
+    MirrorCandidate,
+    MirrorPolicy,
+    enqueue_mirror_job,
+)
 from session_bridge.models import (
     ContextPack,
     OriginKind,
@@ -14,6 +21,7 @@ from session_bridge.models import (
     Relation,
     SessionLink,
     SessionProjection,
+    canonical_session_id,
 )
 from session_bridge.store import SessionBridgeStore
 
@@ -78,6 +86,56 @@ def _projection(
 def _rows(db: SessionDB, sql: str, params=()):
     with db._lock:
         return [dict(row) for row in db._conn.execute(sql, params).fetchall()]
+
+
+def _enqueue_manual_job(
+    store: SessionBridgeStore,
+    source_session_id: str,
+    target_provider: Provider,
+    *,
+    generation: int = 1,
+):
+    return enqueue_mirror_job(
+        store,
+        source_session_id,
+        target_provider,
+        policy=MirrorPolicy(generation=generation),
+        manual_authorized=True,
+    )
+
+
+def _enqueue_automatic_job(
+    store: SessionBridgeStore,
+    projection: SessionProjection,
+    *,
+    now: float,
+):
+    policy = MirrorPolicy(automatic_creation=True)
+    source_session_id = canonical_session_id(
+        projection.provider, projection.native_id
+    )
+    target = Provider.CODEX if projection.provider is Provider.CLAUDE else Provider.CLAUDE
+    candidate = MirrorCandidate(
+        source_session_id=source_session_id,
+        target_provider=target,
+        last_active=projection.last_active,
+        projection=projection,
+    )
+    context = EligibilityContext(
+        now=now,
+        discovery_mode=DiscoveryMode.INITIAL_BACKFILL,
+        continuous_watermark=None,
+        existing_target_mappings=frozenset(),
+        policy=policy,
+    )
+    return enqueue_mirror_job(
+        store,
+        source_session_id,
+        target,
+        policy=policy,
+        candidate=candidate,
+        context=context,
+    )
 
 
 def _capture_mapping_selects(db: SessionDB, operation) -> list[str]:
@@ -698,7 +756,7 @@ def test_imported_messages_are_discoverable_through_existing_fts(db):
     assert [match["session_id"] for match in matches] == ["claude:native-1"]
 
 
-def test_mirror_jobs_are_idempotent_and_transition_durably(db):
+def test_low_level_mirror_job_is_idempotent_but_public_claim_fails_closed(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     store.upsert_projection(_projection(_message("e1", "source")))
 
@@ -711,35 +769,98 @@ def test_mirror_jobs_are_idempotent_and_transition_durably(db):
 
     assert replay == first
     assert len(_rows(db, "SELECT * FROM session_mirror_jobs")) == 1
-    assert store.claim_due_jobs(now=99.0, limit=10) == []
-    claimed = store.claim_due_jobs(now=100.0, limit=10)
+    with pytest.raises(TypeError, match="policy"):
+        store.claim_due_jobs(now=100.0, limit=10)
+    assert _rows(db, "SELECT * FROM session_mirror_jobs")[0]["state"] == "queued"
+
+    assert (
+        store.claim_due_jobs(now=100.0, limit=10, policy=MirrorPolicy()) == []
+    )
+    failed = _rows(db, "SELECT * FROM session_mirror_jobs")[0]
+    assert failed["state"] == "manual_failure"
+    assert failed["attempts"] == 0
+    assert failed["error_code"] == "authority_missing"
+
+
+def test_guarded_public_claim_preserves_retry_order_and_cas_transitions(db):
+    current_time = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
+    store.upsert_projection(_projection(_message("e1", "source")))
+    first = _enqueue_manual_job(
+        store, "claude:native-1", Provider.CODEX, generation=4
+    )
+
+    claimed = store.claim_due_jobs(now=100.0, limit=10, policy=MirrorPolicy())
     assert claimed[0]["state"] == "running"
     assert claimed[0]["attempts"] == 1
-    assert store.claim_due_jobs(now=100.0, limit=10) == []
+    assert store.claim_due_jobs(
+        now=100.0, limit=10, policy=MirrorPolicy()
+    ) == []
 
     store.retry_job(
         first["id"], code="timeout", detail="temporary", next_attempt_at=120.0
     )
-    store.retry_job(
-        first["id"], code="timeout", detail="temporary", next_attempt_at=120.0
+    current_time[0] = 119.0
+    assert store.claim_due_jobs(
+        now=119.0, limit=10, policy=MirrorPolicy()
+    ) == []
+    current_time[0] = 120.0
+    reclaimed = store.claim_due_jobs(
+        now=120.0, limit=10, policy=MirrorPolicy()
     )
-    assert store.claim_due_jobs(now=119.0, limit=10) == []
-    reclaimed = store.claim_due_jobs(now=120.0, limit=10)
     assert reclaimed[0]["attempts"] == 2
-    store.fail_job_manually(first["id"], code="ambiguous", detail="operator required")
-    failed = _rows(db, "SELECT * FROM session_mirror_jobs")[0]
-    assert failed["state"] == "manual_failure"
-    assert failed["error_code"] == "ambiguous"
-    assert store.claim_due_jobs(now=999.0, limit=10) == []
+
+
+def test_public_claim_delegation_pauses_automatic_and_claims_manual(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    automatic_projection = _projection(
+        _message("auto", "automatic"), native_id="automatic"
+    )
+    manual_projection = _projection(_message("manual", "manual"), native_id="manual")
+    store.upsert_projection(automatic_projection)
+    store.upsert_projection(manual_projection)
+    automatic = _enqueue_automatic_job(store, automatic_projection, now=100.0)
+    manual = _enqueue_manual_job(store, "claude:manual", Provider.CODEX)
+
+    claimed = store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
+    rows = {row["id"]: row for row in _rows(db, "SELECT * FROM session_mirror_jobs")}
+
+    assert [job["id"] for job in claimed] == [manual["id"]]
+    assert rows[automatic["id"]]["state"] == "queued"
+
+
+def test_public_claim_delegation_terminalizes_revoked_automatic_when_enabled(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    projection = _projection(_message("auto", "automatic"))
+    store.upsert_projection(projection)
+    automatic = _enqueue_automatic_job(store, projection, now=100.0)
+    store.upsert_projection(
+        replace(
+            projection,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-late",
+        )
+    )
+
+    claimed = store.claim_due_jobs(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(automatic_creation=True),
+    )
+    durable = {
+        row["id"]: row for row in _rows(db, "SELECT * FROM session_mirror_jobs")
+    }[automatic["id"]]
+
+    assert claimed == []
+    assert durable["state"] == "manual_failure"
+    assert durable["error_code"] == "automatic_authority_revoked"
 
 
 def test_retry_state_only_allows_exact_replay_or_manual_exhaustion(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     store.upsert_projection(_projection(_message("e1", "source")))
-    job = store.enqueue_mirror_job(
-        "claude:native-1", Provider.CODEX, policy_generation=1
-    )
-    store.claim_due_jobs(now=100.0, limit=1)
+    job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
     store.retry_job(
         job["id"], code="timeout", detail="temporary", next_attempt_at=120.0
     )
@@ -773,10 +894,8 @@ def test_completing_a_job_records_target_and_idempotent_mirror_link(db):
             native_id="  target-1  ",
         )
     )
-    job = store.enqueue_mirror_job(
-        "claude:native-1", Provider.CODEX, policy_generation=1
-    )
-    store.claim_due_jobs(now=100.0, limit=1)
+    job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
 
     store.complete_job(
         job["id"],
@@ -830,10 +949,8 @@ def test_completion_rejects_ordinary_target_identity_and_rolls_back(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     store.upsert_projection(_projection(_message("s1", "source")))
     db.create_session("codex:ordinary", "cli")
-    job = store.enqueue_mirror_job(
-        "claude:native-1", Provider.CODEX, policy_generation=1
-    )
-    store.claim_due_jobs(now=100.0, limit=1)
+    job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
 
     with pytest.raises(ValueError, match="cataloged target"):
         store.complete_job(
@@ -860,10 +977,8 @@ def test_conflicting_completion_replay_cannot_retarget_succeeded_job(db):
                 native_id=native_id,
             )
         )
-    job = store.enqueue_mirror_job(
-        "claude:native-1", Provider.CODEX, policy_generation=1
-    )
-    store.claim_due_jobs(now=100.0, limit=1)
+    job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
     store.complete_job(
         job["id"],
         target_native_id="target-1",
@@ -894,10 +1009,8 @@ def test_terminal_jobs_cannot_be_retried_or_overwritten(db):
             _message("t1", "target"), provider=Provider.CODEX, native_id="target-1"
         )
     )
-    succeeded = store.enqueue_mirror_job(
-        "claude:native-1", Provider.CODEX, policy_generation=1
-    )
-    store.claim_due_jobs(now=100.0, limit=1)
+    succeeded = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
     store.complete_job(
         succeeded["id"],
         target_native_id="target-1",
@@ -917,10 +1030,13 @@ def test_terminal_jobs_cannot_be_retried_or_overwritten(db):
             succeeded["id"], code="late-failure", detail="must not overwrite"
         )
 
-    terminal = store.enqueue_mirror_job(
-        "claude:native-1", Provider.CODEX, policy_generation=2
+    store.upsert_projection(
+        _projection(_message("s2", "terminal"), native_id="native-terminal")
     )
-    store.claim_due_jobs(now=100.0, limit=1)
+    terminal = _enqueue_manual_job(
+        store, "claude:native-terminal", Provider.CODEX
+    )
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
     store.fail_job_manually(terminal["id"], code="manual", detail="operator required")
     store.fail_job_manually(terminal["id"], code="manual", detail="operator required")
     with pytest.raises(ValueError, match="terminal"):
