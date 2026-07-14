@@ -8,8 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_state import SessionDB
-from session_bridge.context_pack import ContextPackBuilder, ContextPackRequest
+from session_bridge.context_pack import (
+    ContextPackBuilder,
+    ContextPackRequest,
+    _stable_pack_id,
+)
 from session_bridge.models import (
+    ContextPack,
     ProjectedMessage,
     Provider,
     Relation,
@@ -672,23 +677,149 @@ def test_existing_pack_rejects_a_corrupted_target_provider(db: SessionDB):
         builder.build(_request())
 
 
-def test_post_put_identity_is_validated_against_a_racing_row(
+@pytest.mark.parametrize(
+    "corrupted_target",
+    ["codex:target-2", None],
+    ids=["unlinked-same-provider", "unexpected-pending"],
+)
+def test_existing_pack_requires_the_exact_linked_target(
+    db: SessionDB, corrupted_target: str | None
+):
+    store = _seed(
+        db,
+        [_message("u1", "user", "Validate exact target", timestamp=101.0)],
+    )
+    for native_id in ("target-1", "target-2"):
+        store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CODEX,
+                native_id=native_id,
+                title=native_id,
+                cwd=None,
+                started_at=100.0,
+                last_active=101.0,
+                messages=[],
+                native_cursor=f"cursor-{native_id}",
+                native_hash=f"hash-{native_id}",
+            )
+        )
+    store.create_link(
+        SessionLink(
+            id="exact-target-link",
+            from_session_id="claude:source-1",
+            to_session_id="codex:target-1",
+            relation=Relation.CONTINUES,
+            bridge_id="bridge-7",
+            source_cursor="cursor-exact",
+            source_hash="sha256:exact",
+            created_at=110.0,
+        )
+    )
+    builder = ContextPackBuilder(db, store)
+    first = builder.build(_request())
+    assert first.target_session_id == "codex:target-1"
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        conn.execute(
+            "UPDATE session_context_packs SET target_session_id = ? WHERE id = ?",
+            (corrupted_target, first.id),
+        )
+
+    with pytest.raises(ValueError, match="target identity mismatch"):
+        builder.build(_request())
+
+
+def test_atomic_persist_preserves_a_real_competing_provider_winner(
     db: SessionDB, monkeypatch: pytest.MonkeyPatch
 ):
     store = _seed(
         db,
-        [_message("u1", "user", "Validate race result", timestamp=101.0)],
+        [_message("u1", "user", "Preserve the first writer", timestamp=101.0)],
     )
-    real_put = store.put_context_pack
+    store.upsert_projection(
+        _projection([], native_id="claude-winner-target", last_active=100.0)
+    )
+    store.create_link(
+        SessionLink(
+            id="claude-winner-link",
+            from_session_id="claude:source-1",
+            to_session_id="claude:claude-winner-target",
+            relation=Relation.CONTINUES,
+            bridge_id="bridge-7",
+            source_cursor="cursor-exact",
+            source_hash="sha256:exact",
+            created_at=700.0,
+        )
+    )
+    claude_request = replace(_request(), target_provider=Provider.CLAUDE)
+    winner = ContextPack(
+        id=_stable_pack_id(claude_request),
+        bridge_id="bridge-7",
+        source_session_id="claude:source-1",
+        target_session_id="claude:claude-winner-target",
+        source_cursor="cursor-exact",
+        source_hash="sha256:exact",
+        budget_chars=8000,
+        payload="WINNER-CLAUDE-PAYLOAD",
+        created_at=777.0,
+    )
+    real_execute_write = db._execute_write
+    injected = False
 
-    def racing_put(pack):
-        row = real_put(pack)
-        return {**row, "id": "pack:other-target-provider"}
+    def inject_winner_then_execute(operation):
+        nonlocal injected
+        if not injected:
+            injected = True
 
-    monkeypatch.setattr(store, "put_context_pack", racing_put)
+            def insert_winner(conn):
+                conn.execute(
+                    """INSERT INTO session_context_packs (
+                       id, bridge_id, source_session_id, target_session_id,
+                       source_cursor, source_hash, budget_chars, payload,
+                       created_at, immutable_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        winner.id,
+                        winner.bridge_id,
+                        winner.source_session_id,
+                        winner.target_session_id,
+                        winner.source_cursor,
+                        winner.source_hash,
+                        winner.budget_chars,
+                        winner.payload,
+                        winner.created_at,
+                        winner.immutable_at,
+                    ),
+                )
+
+            real_execute_write(insert_winner)
+        return real_execute_write(operation)
+
+    monkeypatch.setattr(db, "_execute_write", inject_winner_then_execute)
 
     with pytest.raises(ValueError, match="target-provider/snapshot identity mismatch"):
         ContextPackBuilder(db, store).build(_request())
+
+    assert injected is True
+    with db._lock:
+        conn = db._conn
+        assert conn is not None
+        row = dict(
+            conn.execute(
+                """SELECT id, payload, created_at, target_session_id
+                   FROM session_context_packs
+                   WHERE bridge_id = ? AND source_cursor = ?
+                     AND source_hash = ? AND budget_chars = ?""",
+                ("bridge-7", "cursor-exact", "sha256:exact", 8000),
+            ).fetchone()
+        )
+    assert row == {
+        "id": winner.id,
+        "payload": "WINNER-CLAUDE-PAYLOAD",
+        "created_at": 777.0,
+        "target_session_id": "claude:claude-winner-target",
+    }
 
 
 def test_empty_imported_session_uses_persisted_activity_watermark(db: SessionDB):

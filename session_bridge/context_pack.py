@@ -128,16 +128,13 @@ class ContextPackBuilder:
                 existing,
                 request=request,
                 expected_pack_id=expected_pack_id,
+                expected_target_session_id=self._find_target_session(request),
             )
             return _context_pack_from_row(existing)
 
         messages = self.db.get_messages(request.source_session_id)
         external = self.store.get_external_session(request.source_session_id)
-        target_session_id = (
-            existing["target_session_id"]
-            if existing is not None and existing["target_session_id"] is not None
-            else self._find_target_session(request)
-        )
+        target_session_id = self._find_target_session(request)
         target_external = (
             self.store.get_external_session(target_session_id)
             if target_session_id is not None
@@ -202,12 +199,7 @@ class ContextPackBuilder:
             created_at=snapshot_timestamp,
             immutable_at=None,
         )
-        persisted = self.store.put_context_pack(pack)
-        self._validate_persisted_identity(
-            persisted,
-            request=request,
-            expected_pack_id=expected_pack_id,
-        )
+        persisted = self._persist_pack_once(pack, request=request)
         return _context_pack_from_row(persisted)
 
     @staticmethod
@@ -254,53 +246,110 @@ class ContextPackBuilder:
         *,
         request: ContextPackRequest,
         expected_pack_id: str,
+        expected_target_session_id: str | None,
     ) -> None:
         if row["source_session_id"] != request.source_session_id:
             raise ValueError("context pack source identity mismatch")
         if row["id"] != expected_pack_id:
             raise ValueError("context pack target-provider/snapshot identity mismatch")
-        target_session_id = row["target_session_id"]
-        if target_session_id is None:
-            return
-        target = self.store.get_external_session(target_session_id)
-        if target is None or target["provider"] != request.target_provider.value:
+        if row["target_session_id"] != expected_target_session_id:
             raise ValueError("context pack target identity mismatch")
+
+    def _persist_pack_once(
+        self,
+        pack: ContextPack,
+        *,
+        request: ContextPackRequest,
+    ) -> dict[str, Any]:
+        def _write(conn):
+            conn.execute(
+                """INSERT INTO session_context_packs (
+                   id, bridge_id, source_session_id, target_session_id,
+                   source_cursor, source_hash, budget_chars, payload, created_at,
+                   immutable_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(bridge_id, source_cursor, source_hash, budget_chars)
+                   DO NOTHING""",
+                (
+                    pack.id,
+                    pack.bridge_id,
+                    pack.source_session_id,
+                    pack.target_session_id,
+                    pack.source_cursor,
+                    pack.source_hash,
+                    pack.budget_chars,
+                    pack.payload,
+                    pack.created_at,
+                    pack.immutable_at,
+                ),
+            )
+            row = conn.execute(
+                """SELECT * FROM session_context_packs
+                   WHERE bridge_id = ? AND source_cursor = ? AND source_hash = ?
+                     AND budget_chars = ?""",
+                (
+                    pack.bridge_id,
+                    pack.source_cursor,
+                    pack.source_hash,
+                    pack.budget_chars,
+                ),
+            ).fetchone()
+            if row is None:
+                raise ValueError("context pack persistence conflict")
+            persisted = dict(row)
+            self._validate_persisted_identity(
+                persisted,
+                request=request,
+                expected_pack_id=pack.id,
+                expected_target_session_id=self._find_target_session_in_connection(
+                    conn, request
+                ),
+            )
+            return persisted
+
+        return self.db._execute_write(_write)
 
     def _find_target_session(self, request: ContextPackRequest) -> str | None:
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None
-            row = conn.execute(
-                """SELECT CASE
-                              WHEN links.from_session_id = ? THEN links.to_session_id
-                              ELSE links.from_session_id
-                           END AS target_session_id
-                   FROM session_links AS links
-                   JOIN external_sessions AS target
-                     ON target.session_id = CASE
-                         WHEN links.from_session_id = ? THEN links.to_session_id
-                         ELSE links.from_session_id
-                        END
-                   WHERE links.bridge_id = ?
-                     AND (? = links.from_session_id OR ? = links.to_session_id)
-                     AND target.provider = ?
-                   ORDER BY CASE links.relation
-                                WHEN 'continues' THEN 0
-                                WHEN 'mirrors' THEN 1
-                                ELSE 2
-                            END,
-                            links.created_at DESC,
-                            links.id
-                   LIMIT 1""",
-                (
-                    request.source_session_id,
-                    request.source_session_id,
-                    request.bridge_id,
-                    request.source_session_id,
-                    request.source_session_id,
-                    request.target_provider.value,
-                ),
-            ).fetchone()
+            return self._find_target_session_in_connection(conn, request)
+
+    @staticmethod
+    def _find_target_session_in_connection(
+        conn: Any, request: ContextPackRequest
+    ) -> str | None:
+        row = conn.execute(
+            """SELECT CASE
+                          WHEN links.from_session_id = ? THEN links.to_session_id
+                          ELSE links.from_session_id
+                       END AS target_session_id
+               FROM session_links AS links
+               JOIN external_sessions AS target
+                 ON target.session_id = CASE
+                     WHEN links.from_session_id = ? THEN links.to_session_id
+                     ELSE links.from_session_id
+                    END
+               WHERE links.bridge_id = ?
+                 AND (? = links.from_session_id OR ? = links.to_session_id)
+                 AND target.provider = ?
+               ORDER BY CASE links.relation
+                            WHEN 'continues' THEN 0
+                            WHEN 'mirrors' THEN 1
+                            ELSE 2
+                        END,
+                        links.created_at DESC,
+                        links.id
+               LIMIT 1""",
+            (
+                request.source_session_id,
+                request.source_session_id,
+                request.bridge_id,
+                request.source_session_id,
+                request.source_session_id,
+                request.target_provider.value,
+            ),
+        ).fetchone()
         return row["target_session_id"] if row is not None else None
 
     def _snapshot_timestamp(
