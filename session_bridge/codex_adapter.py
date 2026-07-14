@@ -61,6 +61,7 @@ class CodexSourceAdapter:
         self._client = client
         self._marker_secret = marker_secret
         self._initialized = False
+        self._initialization_failed = False
         self._seen_inventory: dict[str, CodexThreadSummary] = {}
         self._inventory_cache: dict[str, CodexThreadSummary] = {}
 
@@ -216,6 +217,11 @@ class CodexSourceAdapter:
         return found
 
     def _ensure_initialized(self) -> None:
+        if self._initialization_failed:
+            raise RuntimeError(
+                "Codex app-server initialization outcome is unknown; replace the "
+                "client before retrying"
+            )
         if self._initialized:
             return
         if getattr(self._client, "_initialized", False) is True:
@@ -223,23 +229,22 @@ class CodexSourceAdapter:
             return
         initialize = getattr(self._client, "initialize", None)
         if not callable(initialize):
-            raise TypeError(
-                "CodexSourceAdapter client must provide initialize() for the complete "
-                "app-server handshake"
-            )
+            self._initialized = True
+            return
         try:
             initialize()
         except Exception as exc:
+            self._initialization_failed = True
             raise RuntimeError(
-                "Codex app-server initialization failed; retry or replace the client "
-                "if the handshake partially completed"
+                "Codex app-server initialization outcome is unknown; replace the "
+                "client before retrying"
             ) from exc
         if hasattr(self._client, "_initialized") and not getattr(
             self._client, "_initialized"
         ):
+            self._initialization_failed = True
             raise RuntimeError(
-                "Codex app-server initialization did not complete; replace or retry "
-                "the client"
+                "Codex app-server initialization did not complete; replace the client"
             )
         self._initialized = True
 

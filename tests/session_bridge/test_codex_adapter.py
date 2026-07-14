@@ -115,17 +115,15 @@ class TestInventory:
         assert "cursor" not in list_calls[0][1]
         assert list_calls[1][1]["cursor"] == "active-page-2"
 
-    def test_request_only_client_is_rejected_without_a_complete_handshake(self) -> None:
+    def test_request_only_client_is_caller_owned_and_never_initialized(self) -> None:
         client = FakeRequestClient({
-            "initialize": [{}],
             "thread/list": [{"data": []}],
         })
         adapter = CodexSourceAdapter(client, marker_secret=SECRET)
 
-        with pytest.raises(TypeError, match="initialize"):
-            adapter.list_inventory(archived=False)
+        assert adapter.list_inventory(archived=False) == []
 
-        assert client.calls == []
+        assert [method for method, _, _ in client.calls] == ["thread/list"]
 
     def test_already_initialized_real_client_is_reused_safely(
         self, monkeypatch: pytest.MonkeyPatch
@@ -146,14 +144,19 @@ class TestInventory:
         assert adapter.list_inventory(archived=False) == []
         assert [method for method, _, _ in calls] == ["thread/list"]
 
-    def test_initialize_failure_is_retryable_and_never_silently_succeeds(self) -> None:
+    def test_initialize_failure_latches_and_requires_client_replacement(self) -> None:
         client = FakeRetryingInitializeClient({"thread/list": [{"data": []}]})
         adapter = CodexSourceAdapter(client, marker_secret=SECRET)
 
-        with pytest.raises(RuntimeError, match="retry or replace"):
+        with pytest.raises(RuntimeError, match="replace") as first_failure:
             adapter.list_inventory(archived=False)
-        assert adapter.list_inventory(archived=False) == []
-        assert client.initialize_calls == 2
+        assert isinstance(first_failure.value.__cause__, RuntimeError)
+        with pytest.raises(RuntimeError, match="replace") as latched_failure:
+            adapter.list_inventory(archived=False)
+
+        assert latched_failure.value.__cause__ is None
+        assert client.initialize_calls == 1
+        assert client.calls == []
 
     def test_archived_pass_is_explicit_and_normalizes_inventory(self) -> None:
         pages = _fixture("thread-list-pages.json")
