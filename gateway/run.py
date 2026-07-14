@@ -579,6 +579,10 @@ def _telegramize_command_mentions(text: str, platform: Any) -> str:
 # is still classified fresh.  Override via
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness``.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+_AUTO_RESUME_EVENT_TEXT = (
+    "[Gateway auto-resume] Continue the interrupted task from the existing "
+    "conversation without asking the user to repeat it."
+)
 
 
 def _coerce_gateway_timestamp(value: Any) -> Optional[float]:
@@ -6292,8 +6296,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``_is_resume_pending`` branch in ``_handle_message_with_agent``
         injects a reason-aware recovery system note on the next turn.  This
         method closes the UX gap by synthesizing that next turn once
-        adapters are back online — the event text is empty so the existing
-        injection path owns the wording and we never double up.
+        adapters are back online. Its non-empty internal marker prevents a
+        blank user turn from being persisted or misreported to the user.
 
         Adapters that are not yet ready (adapter missing from
         ``self.adapters``) are skipped silently; their sessions stay
@@ -6334,7 +6338,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
         # this catches every other SIGTERM source (e.g. a raw `terminal(
         # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
+        if any(self._adapter_for_source(entry.origin) is not None for entry in candidates):
             try:
                 from gateway import restart_loop_guard as _rlg
 
@@ -6396,11 +6400,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
             event = MessageEvent(
-                text="",
+                text=_AUTO_RESUME_EVENT_TEXT,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
@@ -17990,11 +17991,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # return to may have its last persisted row hours back, even though
             # the interruption itself just happened.  Gating resume_pending on
             # the transcript clock alone makes the recovery note silently drop,
-            # and because the startup auto-resume turn carries empty text
-            # (_schedule_resume_pending_sessions), the model then receives a
-            # blank user message and replies with confused "the message came
-            # through blank" noise.  Treat the marker as fresh when
-            # EITHER signal is fresh so the two freshness checks agree.
+            # and because startup auto-resume depends on this branch to add
+            # recovery guidance, the model can otherwise miss the continuation
+            # context. Treat the marker as fresh when EITHER signal is fresh so
+            # the two freshness checks agree.
             _resume_mark_is_fresh = False
             if _resume_entry is not None and getattr(_resume_entry, "resume_pending", False):
                 _resume_mark_is_fresh = _is_fresh_gateway_interruption(
@@ -18021,12 +18021,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _reason == "shutdown_timeout"
                     else "a gateway interruption"
                 )
+                _is_synthetic_auto_resume = message == _AUTO_RESUME_EVENT_TEXT
                 _persist_user_message_override = message
-                # The empty-message case is the auto-resume startup turn
-                # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address, so tell the model to report
-                # recovery instead of the (nonexistent) "new message".
-                if message:
+                if _is_synthetic_auto_resume:
+                    _resume_guidance = (
+                        "Continue the unfinished task from the existing transcript. "
+                        "Re-establish ephemeral tool state if needed. Do not ask the "
+                        "user to repeat the request, choose again, or send another "
+                        "message, and do not describe this as a blank message."
+                    )
+                elif message:
                     _resume_guidance = (
                         "Address the user's NEW message below FIRST and focus "
                         "on what the user is asking now."
@@ -18041,9 +18045,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
                     f"run — do NOT re-execute or verify it. {_resume_guidance} "
-                    f"Do NOT re-execute old tool calls — skip any unfinished "
-                    f"work from the conversation history.]"
-                    + (f"\n\n{message}" if message else "")
+                    f"Do NOT re-execute completed tool calls or repeat "
+                    f"side effects.]"
+                    + (
+                        ""
+                        if _is_synthetic_auto_resume
+                        else (f"\n\n{message}" if message else "")
+                    )
                 )
             elif _has_fresh_tool_tail:
                 _persist_user_message_override = message
@@ -18066,21 +18074,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _srn:
                     message = _srn + "\n\n" + message
 
-            # Safety net: a startup auto-resume event carries empty
-            # text and relies on the resume_pending branch above to supply the
-            # recovery note.  If that branch did not fire for any reason (e.g.
-            # both freshness signals disagreed, or the marker was cleared
-            # between scheduling and dispatch) we must NOT hand the model a
-            # blank user turn — it responds with confused "the message came
-            # through blank" noise.  Restricted to resume_pending sessions so
-            # legitimately empty user turns (e.g. an image with no caption,
-            # wrapped as native content below) are untouched.
+            # Legacy safety net for blank recovery events created by an older
+            # process during a rolling restart. Restricted to resume_pending
+            # sessions so empty image captions remain valid.
             if (
                 isinstance(message, str)
                 and not message.strip()
                 and _resume_entry is not None
                 and getattr(_resume_entry, "resume_pending", False)
             ):
+                _persist_user_message_override = _AUTO_RESUME_EVENT_TEXT
                 _sn_reason = (
                     getattr(_resume_entry, "resume_reason", None) or "restart_timeout"
                 )
@@ -18095,11 +18098,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"[System note: The previous turn was interrupted by "
                     f"{_sn_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. Report to the user "
-                    f"that the session was restored successfully and ask what "
-                    f"they would like to do next. Do NOT re-execute old tool "
-                    f"calls — skip any unfinished work from the conversation "
-                    f"history.]"
+                    f"run — do NOT re-execute or verify it. Continue the "
+                    f"unfinished task from the existing transcript without "
+                    f"asking the user to repeat it or describing this as a "
+                    f"blank message. Re-establish ephemeral tool state if "
+                    f"needed, and do NOT repeat completed side effects.]"
                 )
 
             _approval_session_key = session_key or ""
