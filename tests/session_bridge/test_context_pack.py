@@ -13,6 +13,7 @@ from session_bridge.context_pack import (
     ContextPackRequest,
     _RecentItem,
     _format_turn,
+    _redact,
     _select_recent,
     _stable_pack_id,
 )
@@ -1647,6 +1648,124 @@ def test_unclosed_heredoc_assignment_consumes_rest_of_input(db: SessionDB):
     assert "this remainder must also be redacted" not in payload
     assert uuid in payload
     assert source_id in payload
+
+
+@pytest.mark.parametrize(
+    ("opener", "body_prefix", "terminator", "line_ending"),
+    [
+        ("password=$(cat <<'EOF'", "", "EOF", "\n"),
+        ("password=$(cat <<-END_SECRET", "\t", "\tEND_SECRET", "\r\n"),
+    ],
+)
+def test_embedded_shell_heredoc_redacts_body_and_preserves_wrapper(
+    opener: str,
+    body_prefix: str,
+    terminator: str,
+    line_ending: str,
+):
+    source_id = "claude:source-1"
+    content = line_ending.join((
+        opener,
+        f"{body_prefix}EMBEDDED HEREDOC SECRET",
+        terminator,
+        ")",
+        f"source_id={source_id}",
+    ))
+
+    redacted = _redact(content)
+
+    assert "EMBEDDED HEREDOC SECRET" not in redacted
+    assert f"password=[REDACTED]{line_ending}){line_ending}" in redacted
+    assert source_id in redacted
+
+
+@pytest.mark.parametrize(
+    ("quote", "line_ending"),
+    [
+        ('"', "\n"),
+        ("'", "\n"),
+        ('"', "\r\n"),
+        ("'", "\r\n"),
+    ],
+)
+def test_powershell_here_string_redacts_body_through_matching_terminator(
+    quote: str,
+    line_ending: str,
+):
+    source_id = "claude:source-1"
+    content = line_ending.join((
+        f"password=@{quote}",
+        "POWERSHELL HERE STRING SECRET",
+        f"{quote}@",
+        f"source_id={source_id}",
+    ))
+
+    redacted = _redact(content)
+
+    assert "POWERSHELL HERE STRING SECRET" not in redacted
+    assert f"password=[REDACTED]{line_ending}source_id=" in redacted
+    assert source_id in redacted
+
+
+@pytest.mark.parametrize("quote", ['"', "'"])
+def test_unclosed_powershell_here_string_consumes_rest_of_input(quote: str):
+    source_id = "claude:source-1"
+    content = (
+        f"source_id={source_id}\n"
+        f"password=@{quote}\n"
+        "UNCLOSED POWERSHELL SECRET\n"
+        "remainder must be hidden"
+    )
+
+    redacted = _redact(content)
+
+    assert "UNCLOSED POWERSHELL SECRET" not in redacted
+    assert "remainder must be hidden" not in redacted
+    assert source_id in redacted
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        '"ordinary_uuid": 123e4567-e89b-12d3-a456-426614174000',
+        "'source_id': claude:source-1",
+        "- ordinary_uuid: 123e4567-e89b-12d3-a456-426614174000",
+        "# preserve this dedented comment",
+        "---",
+        "...",
+    ],
+)
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_yaml_block_preserves_extended_peer_boundary_and_separator(
+    peer: str,
+    line_ending: str,
+):
+    content = line_ending.join((
+        "password: |",
+        "  YAML PEER BOUNDARY SECRET",
+        peer,
+        "source_id: claude:source-1",
+    ))
+
+    redacted = _redact(content)
+
+    assert "YAML PEER BOUNDARY SECRET" not in redacted
+    assert f"password: [REDACTED]{line_ending}{peer}" in redacted
+    assert "source_id: claude:source-1" in redacted
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_even_trailing_backslashes_do_not_continue_assignment(line_ending: str):
+    source_id = "claude:source-1"
+    content = (
+        f"password=C:\\\\{line_ending}source_id={source_id}{line_ending}next=visible"
+    )
+
+    redacted = _redact(content)
+
+    assert f"password=[REDACTED]{line_ending}source_id=" in redacted
+    assert source_id in redacted
+    assert "next=visible" in redacted
 
 
 def test_unterminated_json_and_escaped_assignments_are_redacted_in_turns_and_git(

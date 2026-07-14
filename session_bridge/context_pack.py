@@ -141,10 +141,16 @@ _ASSIGNMENT_START_RE = re.compile(
 )
 _YAML_BLOCK_HEADER_RE = re.compile(r"^[|>](?:[+-]?[1-9]?|[1-9][+-]?)[ \t]*(?:#.*)?$")
 _HEREDOC_HEADER_RE = re.compile(
-    r"^<<(?P<strip_tabs>-?)[ \t]*(?P<quote>[\"']?)"
-    r"(?P<delimiter>[A-Za-z0-9_.-]+)(?P=quote)[ \t]*$"
+    r"<<(?P<strip_tabs>-?)[ \t]*(?P<quote>[\"']?)"
+    r"(?P<delimiter>[A-Za-z0-9_.-]+)(?P=quote)"
 )
-_PEER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*[ \t]*(?:=|:)")
+_POWERSHELL_HERE_STRING_HEADER_RE = re.compile(r"^@(?P<quote>[\"'])[ \t]*$")
+_PEER_KEY_RE = re.compile(
+    r"^(?:-[ \t]+)?(?:"
+    r"(?P<quote>[\"'])[A-Za-z_][A-Za-z0-9_.-]*(?P=quote)"
+    r"|[A-Za-z_][A-Za-z0-9_.-]*)[ \t]*(?:=|:)"
+)
+_YAML_DOCUMENT_BOUNDARY_RE = re.compile(r"^(?:---|\.\.\.)(?:[ \t]+#.*)?$")
 _GIT_STATUS_MAX_LINES = 200
 _GIT_STATUS_MAX_CHARS = 32_768
 _STALE_WARNING = (
@@ -959,13 +965,13 @@ def _assignment_value_end(value: str, start: int, *, key_indent: int) -> int:
     if _YAML_BLOCK_HEADER_RE.fullmatch(header):
         return _indented_block_end(value, next_line_start, key_indent)
 
-    heredoc = _HEREDOC_HEADER_RE.fullmatch(header)
-    if heredoc is not None:
-        return _heredoc_value_end(
+    here_string = _POWERSHELL_HERE_STRING_HEADER_RE.fullmatch(header)
+    if here_string is not None:
+        return _terminated_line_block_end(
             value,
             next_line_start,
-            delimiter=heredoc.group("delimiter"),
-            strip_tabs=bool(heredoc.group("strip_tabs")),
+            terminator=f"{here_string.group('quote')}@",
+            strip_tabs=False,
         )
 
     for delimiter in ('"""', "'''", r"\"\"\"", r"\'\'\'"):
@@ -979,7 +985,16 @@ def _assignment_value_end(value: str, start: int, *, key_indent: int) -> int:
     if value[start] in "{[":
         return _structured_value_end(value, start)
 
-    if header.rstrip(" \t").endswith("\\"):
+    heredoc = _HEREDOC_HEADER_RE.search(header)
+    if heredoc is not None:
+        return _terminated_line_block_end(
+            value,
+            next_line_start,
+            terminator=heredoc.group("delimiter"),
+            strip_tabs=bool(heredoc.group("strip_tabs")),
+        )
+
+    if _has_odd_trailing_backslashes(header):
         return _continued_value_end(value, start)
 
     index = start
@@ -1033,15 +1048,33 @@ def _indented_block_end(value: str, start: int, key_indent: int) -> int:
             line_start = next_line_start
             continue
         peer_content = line.lstrip(" \t")
-        return line_start if _PEER_KEY_RE.match(peer_content) else len(value)
+        if _is_peer_boundary(peer_content):
+            return _line_break_start_before(value, line_start)
+        return len(value)
     return len(value)
 
 
-def _heredoc_value_end(
+def _line_break_start_before(value: str, line_start: int) -> int:
+    if line_start >= 2 and value[line_start - 2 : line_start] == "\r\n":
+        return line_start - 2
+    if line_start >= 1 and value[line_start - 1] in "\r\n":
+        return line_start - 1
+    return line_start
+
+
+def _is_peer_boundary(content: str) -> bool:
+    return bool(
+        _PEER_KEY_RE.match(content)
+        or content.startswith("#")
+        or _YAML_DOCUMENT_BOUNDARY_RE.fullmatch(content)
+    )
+
+
+def _terminated_line_block_end(
     value: str,
     start: int,
     *,
-    delimiter: str,
+    terminator: str,
     strip_tabs: bool,
 ) -> int:
     line_start = start
@@ -1049,8 +1082,8 @@ def _heredoc_value_end(
         line_end, next_line_start = _line_end_and_next(value, line_start)
         line = value[line_start:line_end]
         candidate = line.lstrip("\t") if strip_tabs else line
-        if candidate == delimiter:
-            return next_line_start
+        if candidate == terminator:
+            return line_end
         line_start = next_line_start
     return len(value)
 
@@ -1060,12 +1093,18 @@ def _continued_value_end(value: str, start: int) -> int:
     while line_start < len(value):
         line_end, next_line_start = _line_end_and_next(value, line_start)
         line = value[line_start:line_end]
-        if not line.rstrip(" \t").endswith("\\"):
+        if not _has_odd_trailing_backslashes(line):
             return line_end
         if next_line_start >= len(value):
             return len(value)
         line_start = next_line_start
     return len(value)
+
+
+def _has_odd_trailing_backslashes(value: str) -> bool:
+    stripped = value.rstrip(" \t")
+    trailing_count = len(stripped) - len(stripped.rstrip("\\"))
+    return trailing_count % 2 == 1
 
 
 def _quoted_value_end(value: str, start: int, delimiter: str) -> int:
