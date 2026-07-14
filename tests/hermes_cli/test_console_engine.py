@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.console_engine import HermesConsoleEngine, run_console_repl
+from hermes_cli.console_engine import (
+    ConsoleResult,
+    HermesConsoleEngine,
+    run_console_repl,
+)
 
 
 EXPECTED_CONSOLE_COMMANDS = {
@@ -337,6 +341,78 @@ def test_console_registry_covers_non_admin_cli_surface():
     missing = EXPECTED_CONSOLE_COMMANDS - registered
 
     assert missing == set()
+
+
+# Regression: argparse's --help/--version action calls parser.exit() ->
+# sys.exit(). The dashboard web console runs each command in a worker thread
+# whose SystemExit (a BaseException) sailed past the `except Exception` guard,
+# escaped the asyncio Task, and tore down the whole uvicorn process. The console
+# must instead return the help text at the prompt. See console_engine
+# _ArgumentParser.exit() + HermesConsoleEngine.execute().
+CONSOLE_HELP_FLAG_LINES = [
+    ("version --help", False),
+    ("version -h", False),
+    ("skills list --help", False),
+    ("mcp add --help", True),  # mutating -> reached only on the confirmed pass
+]
+
+
+@pytest.mark.parametrize("line, confirmed", CONSOLE_HELP_FLAG_LINES)
+def test_console_help_flag_returns_help_without_exiting(
+    line: str, confirmed: bool, capsys: pytest.CaptureFixture[str]
+):
+    engine = HermesConsoleEngine()
+
+    result = engine.execute(line, confirmed=confirmed)
+
+    # Reaching this line at all proves no SystemExit escaped execute().
+    assert isinstance(result, ConsoleResult)
+    assert result.status == "ok"
+    assert "usage:" in result.output
+    # The help text is surfaced in the result, not dumped to the process
+    # stdout/stderr (which the web console never shows the user).
+    captured = capsys.readouterr()
+    assert "usage:" not in captured.out
+    assert "usage:" not in captured.err
+
+
+def test_console_cron_create_help_does_not_crash_process():
+    # Exact repro from the bug report. `cron create` is mutating, so the crash
+    # happened on the confirmation pass (confirmed=True), when the handler
+    # actually parsed the args and argparse hit --help.
+    engine = HermesConsoleEngine()
+
+    pending = engine.execute("cron create --help")
+    assert pending.status == "confirm_required"
+
+    result = engine.execute("cron create --help", confirmed=True)
+
+    assert result.status == "ok"
+    assert "usage: hermes cron create" in result.output
+
+
+def _selftest_exit_handler(_engine: HermesConsoleEngine, _args: list[str]) -> str:
+    raise SystemExit(7)
+
+
+def test_console_contains_handler_process_exit():
+    # Defense-in-depth: a handler (or a parser we don't control) that calls
+    # sys.exit() must not let SystemExit escape execute(); that BaseException
+    # would slip past the dashboard worker's `except Exception` and crash the
+    # event loop. execute() must always return a ConsoleResult.
+    engine = HermesConsoleEngine()
+    engine.register(
+        ("selftest-exit",),
+        "selftest-exit",
+        "Raise SystemExit for the containment test.",
+        _selftest_exit_handler,
+    )
+
+    result = engine.execute("selftest-exit")
+
+    assert isinstance(result, ConsoleResult)
+    assert result.status == "error"
+    assert "status 7" in result.output
 
 
 EXPECTED_HOSTED_CONSOLE_COMMANDS = {

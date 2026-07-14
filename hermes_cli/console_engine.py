@@ -41,6 +41,26 @@ class ConsoleCommandError(RuntimeError):
     """User-facing console command failure."""
 
 
+class _ConsoleParserExit(ConsoleCommandError):
+    """Raised when an argparse parser would have called ``sys.exit()``.
+
+    argparse terminates the process (via ``parser.exit()`` -> ``sys.exit()``)
+    for ``--help``/``--version`` and a few internal paths. In the dashboard the
+    console runs inside a worker thread whose ``SystemExit`` escapes the asyncio
+    Task and tears down the whole uvicorn process. ``_ArgumentParser.exit()``
+    raises this instead so the line can be surfaced at the prompt.
+
+    Subclasses :class:`ConsoleCommandError` so any code path that already only
+    catches ``ConsoleCommandError`` still contains it (never reaching
+    ``sys.exit``); ``execute()`` special-cases it to render ``--help`` output as
+    a normal result rather than an error.
+    """
+
+    def __init__(self, message: str, *, code: int = 0):
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class ConsoleResult:
     status: ConsoleStatus
@@ -63,6 +83,30 @@ class ConsoleCommand:
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:  # pragma: no cover - argparse hook
         raise ConsoleCommandError(f"{self.prog}: {message}")
+
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
+        # argparse calls exit() for --help/--version and some terminal paths.
+        # The default implementation calls sys.exit(), which would raise
+        # SystemExit out of the console worker thread and — because SystemExit
+        # is a BaseException, not an Exception — sail past the dashboard's
+        # `except Exception` guard, escape the asyncio Task, and tear down the
+        # uvicorn event loop (killing the whole dashboard). Convert it to a
+        # catchable console error carrying whatever help/usage/version text
+        # argparse buffered via _print_message below. Mirrors error(), which
+        # already keeps parse failures from reaching sys.exit().
+        buffered = getattr(self, "_console_output_buffer", "")
+        text = (buffered + (message or "")).strip()
+        raise _ConsoleParserExit(text, code=int(status or 0))
+
+    def _print_message(self, message: str, file: object | None = None) -> None:
+        # argparse routes help/usage/version text through _print_message on its
+        # way to stdout/stderr. The web console never surfaces the process's own
+        # stdout, so capture the text onto the parser instead; exit() (above)
+        # then returns it to the prompt.
+        if message:
+            self._console_output_buffer = (
+                getattr(self, "_console_output_buffer", "") + message
+            )
 
 
 def _capture_output(fn: Callable[[], object]) -> str:
@@ -633,8 +677,26 @@ class HermesConsoleEngine:
             output = self._cap_output(output)
             self.history.append(raw_line)
             return ConsoleResult("ok", output=output, command=raw_line)
+        except _ConsoleParserExit as exc:
+            # argparse --help/--version (exit code 0) is a successful, informational
+            # result — show it as normal output; a non-zero code is a failure.
+            status: ConsoleStatus = "ok" if exc.code == 0 else "error"
+            return ConsoleResult(
+                status, output=self._cap_output(str(exc).strip()), command=raw_line
+            )
         except ConsoleCommandError as exc:
             return ConsoleResult("error", output=str(exc).strip(), command=raw_line)
+        except SystemExit as exc:
+            # Defense-in-depth: a handler called sys.exit() directly, or built a
+            # parser that is not our _ArgumentParser. SystemExit is a
+            # BaseException, so without this it would escape execute(), slip past
+            # the dashboard worker's `except Exception`, and crash the uvicorn
+            # loop. Contain it here so execute() ALWAYS returns a ConsoleResult.
+            code = exc.code
+            if code in (0, None):
+                return ConsoleResult("ok", command=raw_line)
+            message = code if isinstance(code, str) else f"Command exited with status {code}."
+            return ConsoleResult("error", output=str(message).strip(), command=raw_line)
 
     def help_text(self, subject: str | None = None) -> str:
         if subject:

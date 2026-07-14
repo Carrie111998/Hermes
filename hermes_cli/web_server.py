@@ -14951,7 +14951,16 @@ async def console_ws(ws: WebSocket) -> None:
                         "prompt": _CONSOLE_PROMPT,
                     },
                 )
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
+            # SystemExit is a BaseException, not an Exception: a console command
+            # (or argparse's --help/--version) that calls sys.exit() in the
+            # worker thread would otherwise slip past an `except Exception`,
+            # escape this asyncio Task, and tear down the uvicorn loop — killing
+            # the whole dashboard. The console engine already contains SystemExit
+            # (execute() is total), so this guard is defense-in-depth for any
+            # future exit path in the executor. asyncio.CancelledError still
+            # propagates (caught + re-raised above); KeyboardInterrupt is left to
+            # propagate so server shutdown is never swallowed.
             if command_id == command_generation:
                 pending_confirmation = None
                 _log.exception("console command failed")
