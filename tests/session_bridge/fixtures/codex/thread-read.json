@@ -1,0 +1,41 @@
+{
+  "thread": {
+    "id": "thread-active",
+    "rolloutPath": "C:/diagnostics/thread-active.jsonl",
+    "turns": [
+      {
+        "id": "turn-1",
+        "createdAt": "2026-07-12T10:00:10Z",
+        "items": [
+          {
+            "type": "userMessage",
+            "id": "user-1",
+            "createdAt": "2026-07-12T10:00:11Z",
+            "content": [{"type": "text", "text": "Please inspect it"}]
+          },
+          {
+            "type": "reasoning",
+            "id": "reason-1",
+            "summary": ["Need to inspect"],
+            "content": ["Use a command"]
+          },
+          {
+            "type": "commandExecution",
+            "id": "command-1",
+            "completedAtMs": 1783850412000,
+            "command": "echo ready",
+            "cwd": "C:/work/active",
+            "status": "completed",
+            "aggregatedOutput": "ready\n",
+            "exitCode": 0
+          },
+          {
+            "type": "agentMessage",
+            "id": "agent-1",
+            "text": "It is ready."
+          }
+        ]
+      }
+    ]
+  }
+}

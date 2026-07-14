@@ -71,6 +71,36 @@ class TestProjectionInvariants:
         r = p.project({"method": "totally/unknown", "params": {}})
         assert r.messages == []
 
+    def test_project_item_reuses_completed_notification_semantics(self) -> None:
+        item = COMMAND_EXEC_COMPLETED["params"]["item"]
+        direct = CodexEventProjector().project_item(item)
+        notified = CodexEventProjector().project(COMMAND_EXEC_COMPLETED)
+        assert direct == notified
+        assert len(direct.messages) == 2
+
+    def test_project_item_preserves_pending_reasoning_semantics(self) -> None:
+        projector = CodexEventProjector()
+        assert projector.project_item(
+            {
+                "type": "reasoning",
+                "id": "reason-1",
+                "summary": ["private summary"],
+                "content": ["private details"],
+            }
+        ).messages == []
+
+        direct = projector.project_item(
+            {"type": "agentMessage", "id": "answer-1", "text": "answer"}
+        )
+
+        assert direct.messages == [
+            {
+                "role": "assistant",
+                "content": "answer",
+                "reasoning": "private summary\nprivate details",
+            }
+        ]
+
 
 class TestCommandExecutionProjection:
     """Real captured notification → assistant tool_call + tool result."""

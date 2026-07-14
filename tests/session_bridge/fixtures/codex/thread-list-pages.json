@@ -1,0 +1,45 @@
+{
+  "active": [
+    {
+      "data": [
+        {
+          "id": "thread-active",
+          "title": "Active work",
+          "cwd": "C:/work/active",
+          "createdAt": "2026-07-12T10:00:00Z",
+          "updatedAt": "2026-07-12T10:05:00Z",
+          "archived": false,
+          "revision": "rev-active-1"
+        }
+      ],
+      "nextCursor": "active-page-2"
+    },
+    {
+      "threads": [
+        {
+          "threadId": "thread-fallback",
+          "name": "Fallback revision",
+          "workingDirectory": "C:/work/fallback",
+          "created_at": 1783851000,
+          "updated_at": 1783851060
+        }
+      ],
+      "next_cursor": null
+    }
+  ],
+  "archived": [
+    {
+      "threads": [
+        {
+          "sessionId": "thread-archived",
+          "title": "Archived work",
+          "cwd": "C:/work/archive",
+          "createdAt": 1783850000,
+          "updatedAt": 1783850600,
+          "archived": true,
+          "version": 7
+        }
+      ]
+    }
+  ]
+}
