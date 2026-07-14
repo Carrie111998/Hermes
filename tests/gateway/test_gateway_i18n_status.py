@@ -53,6 +53,44 @@ async def test_busy_queue_ack_uses_gateway_locale():
     assert "Queued for the next turn" not in content
 
 
+def test_busy_redirect_messages_use_gateway_locale():
+    from agent.onboarding import busy_input_hint_gateway
+
+    ack = i18n.t("gateway.busy.redirect_ack", status="")
+    hint = busy_input_hint_gateway("redirect")
+
+    assert "已按你的修正重定向当前运行" in ack
+    assert "Redirected current run" not in ack
+    assert "已使用你的消息重定向当前运行" in hint
+    assert "First-time tip" not in hint
+
+
+@pytest.mark.asyncio
+async def test_busy_first_touch_hint_uses_gateway_locale(monkeypatch):
+    import agent.onboarding as onboarding
+
+    monkeypatch.setattr(onboarding, "is_seen", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(onboarding, "mark_seen", lambda *_args, **_kwargs: True)
+
+    runner, adapter = make_restart_runner()
+    event = _message("排队这条")
+    session_key = build_session_key(event.source)
+    runner._busy_input_mode = "queue"
+    runner._busy_ack_ts = {}
+    runner._running_agents[session_key] = MagicMock()
+    runner._running_agents_ts[session_key] = time.time() - 120
+    adapter._send_with_retry = AsyncMock()
+
+    with patch("gateway.run.merge_pending_message_event"):
+        handled = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert handled is True
+    content = adapter._send_with_retry.call_args.kwargs["content"]
+    assert "首次提示" in content
+    assert "此提示不会再次显示" in content
+    assert "First-time tip" not in content
+
+
 @pytest.mark.asyncio
 async def test_busy_slash_command_reject_uses_gateway_locale():
     runner, _adapter = make_restart_runner()

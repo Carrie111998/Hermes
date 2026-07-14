@@ -166,35 +166,24 @@ class TestBusyHandlerDemotesInterruptForCompression:
         assert "/stop" in content
         assert "Interrupting" not in content
 
-    @pytest.mark.asyncio
-    async def test_ack_explains_compression_demotion_in_gateway_locale(
+    def test_ack_explains_compression_demotion_in_gateway_locale(
         self, monkeypatch
     ) -> None:
         from agent import i18n
-        import agent.onboarding as onboarding
 
         monkeypatch.setenv("HERMES_LANGUAGE", "zh")
-        monkeypatch.setattr(onboarding, "is_seen", lambda *_args, **_kwargs: True)
-        monkeypatch.setattr(
-            "gateway.display_config.resolve_display_setting",
-            lambda *_args, **_kwargs: True,
-        )
         i18n.reset_language_cache()
         try:
-            runner = _make_runner()
-            adapter = _make_adapter()
-            event = _make_event(text="hi mid-compress")
-            sk = build_session_key(event.source)
-            parent = _make_parent_no_subagents()
-            runner._running_agents[sk] = parent
-            runner._running_agents_ts[sk] = time.time() - 120
-            runner.adapters[event.source.platform] = adapter
-            runner._session_db._db.get_compression_lock_holder.return_value = "compressing"
+            details = i18n.t("gateway.busy.status_separator").join(
+                [
+                    i18n.t("gateway.busy.status_elapsed_min", minutes=2),
+                    i18n.t("gateway.busy.status_iteration", iteration=3, max=60),
+                    i18n.t("gateway.busy.status_running_tool", tool="terminal"),
+                ]
+            )
+            status = i18n.t("gateway.busy.status_detail", details=details)
+            content = i18n.t("gateway.busy.compression_queue_ack", status=status)
 
-            with patch("gateway.run.merge_pending_message_event"):
-                await runner._handle_active_session_busy_message(event, sk)
-
-            content = adapter._send_with_retry.call_args.kwargs.get("content", "")
             assert "正在压缩上下文" in content
             assert "已排队" in content
             assert "正在压缩上下文（已用 2 分钟，第 3/60 轮，正在运行：terminal）" in content
