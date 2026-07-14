@@ -847,6 +847,41 @@ class TestProjection:
 
 
 class TestBridgeMarkers:
+    def test_projection_marker_payload_requires_exact_signed_payload(self) -> None:
+        payload = BridgeMarkerPayload(
+            bridge_id="bridge-exact",
+            source_session_id="claude:source",
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        )
+        client = FakeInitializingClient({
+            "thread/read": [
+                _read_with_items({
+                    "type": "userMessage",
+                    "id": "marker",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": encode_bridge_marker(payload, SECRET),
+                        }
+                    ],
+                })
+            ]
+        })
+        adapter = CodexSourceAdapter(client, marker_secret=SECRET)
+        projection = adapter.project_thread(_summary())
+
+        assert adapter.projection_has_marker_payload(projection, payload) is True
+        assert adapter.projection_has_marker_payload(
+            projection,
+            BridgeMarkerPayload(
+                bridge_id=payload.bridge_id,
+                source_session_id="claude:different-source",
+                target_provider=payload.target_provider,
+                policy_generation=payload.policy_generation,
+            ),
+        ) is False
+
     def test_codex_marker_is_placeholder_until_later_human_user_text(self) -> None:
         marker = _marker("bridge-1")
         placeholder_client = FakeInitializingClient({

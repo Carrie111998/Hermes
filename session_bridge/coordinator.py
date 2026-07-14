@@ -1,0 +1,2727 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+import hashlib
+import math
+from pathlib import Path
+import time
+from typing import Any, cast
+import uuid
+
+from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
+from .config import BridgeConfig
+from .context_pack import ContextPackRequest
+from .mirror import (
+    DiscoveryMode,
+    BatchProgress,
+    EligibilityContext,
+    MirrorPolicy,
+    eligible_mirror_candidates,
+    enqueue_mirror_job,
+    load_continuous_watermark,
+    persist_continuous_watermark,
+    retry_delay_seconds,
+    should_halt_batch,
+)
+from .models import (
+    ContextPack,
+    BridgeMarkerPayload,
+    MirrorJobState,
+    OriginKind,
+    Provider,
+    Relation,
+    SessionLink,
+    SessionProjection,
+    UpsertResult,
+    canonical_session_id,
+)
+from .store import SessionBridgeStore
+
+
+@dataclass(frozen=True)
+class ScanSummary:
+    provider: Provider | None
+    discovered: int
+    indexed: int
+    rebuilt: int
+    failed: int
+    duration_ms: float
+
+
+@dataclass(frozen=True)
+class ReconcileSummary:
+    examined: int
+    recovered: int
+    retried: int
+    failed: int
+
+
+@dataclass(frozen=True)
+class JobSummary:
+    claimed: int
+    succeeded: int
+    retried: int
+    manual_failure: int
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    session_id: str
+    cursor: str
+    source_hash: str
+    stale: bool
+    warning: str | None
+
+
+@dataclass(frozen=True)
+class ContinueRequest:
+    session_id: str
+    bridge_id: str
+    target_provider: Provider
+    context_budget_chars: int
+
+
+@dataclass(frozen=True)
+class ContinueResult:
+    pack: ContextPack
+    link: SessionLink
+    warnings: Sequence[str]
+
+
+_AsyncSleep = Callable[[float], Awaitable[None]]
+_AWatchFactory = Callable[..., Any]
+_ProviderHealth = dict[str, float | str | None]
+_RECENT_ERROR_LIMIT = 20
+_ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
+_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
+_RATE_STATE_KEY = "session-bridge:mirror-rate"
+_CLAUDE_FINGERPRINT_KEY = "session-bridge:scan:claude:fingerprints"
+_CLAUDE_STAGED_KEY = "session-bridge:scan:claude:staged-fingerprints"
+_CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
+_CONTINUATION_RECONCILE_CURSOR_KEY = "session-bridge:reconcile:continuation-cursor"
+_EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
+_PENDING_KEYS = {
+    Provider.CLAUDE: "session-bridge:scan:claude:pending",
+    Provider.CODEX: "session-bridge:scan:codex:pending",
+}
+_PROGRESS_KEYS = {
+    Provider.CLAUDE: "session-bridge:scan:claude:progress",
+    Provider.CODEX: "session-bridge:scan:codex:progress",
+}
+_BACKFILL_KEYS = {
+    Provider.CLAUDE: "session-bridge:backfill:claude",
+    Provider.CODEX: "session-bridge:backfill:codex",
+}
+
+
+class SessionBridgeCoordinator:
+    def __init__(
+        self,
+        *,
+        config: BridgeConfig,
+        store: object,
+        adapters: Mapping[Provider, object],
+        target_adapters: Mapping[Provider, object] | None = None,
+        context_builder: object | None = None,
+        clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: _AsyncSleep = asyncio.sleep,
+        awatch_factory: _AWatchFactory | None = None,
+        scan_batch_size: int = 100,
+        claude_projects_root: Path | None = None,
+        watch_debounce_seconds: float = 0.25,
+        refresh_timeout: float = 5.0,
+    ) -> None:
+        if type(scan_batch_size) is not int or scan_batch_size <= 0:
+            raise ValueError("scan_batch_size must be a positive integer")
+        if claude_projects_root is not None and not isinstance(
+            claude_projects_root, Path
+        ):
+            raise TypeError("claude_projects_root must be a Path or None")
+        if (
+            not isinstance(watch_debounce_seconds, (int, float))
+            or isinstance(watch_debounce_seconds, bool)
+            or not math.isfinite(float(watch_debounce_seconds))
+            or watch_debounce_seconds <= 0
+        ):
+            raise ValueError("watch_debounce_seconds must be a positive number")
+        if (
+            not isinstance(refresh_timeout, (int, float))
+            or isinstance(refresh_timeout, bool)
+            or not math.isfinite(float(refresh_timeout))
+            or refresh_timeout <= 0
+        ):
+            raise ValueError("refresh_timeout must be a positive number")
+        self._config = config
+        self._store = store
+        self._adapters = dict(adapters)
+        self._target_adapters = dict(target_adapters or {})
+        self._context_builder = context_builder
+        self._clock = clock
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._awatch_factory = awatch_factory
+        self._scan_batch_size = scan_batch_size
+        self._claude_projects_root = claude_projects_root
+        self._watch_debounce_seconds = float(watch_debounce_seconds)
+        self._refresh_timeout = float(refresh_timeout)
+        self._watch_stop_event: asyncio.Event | None = None
+        self._watcher_state = "not_started"
+        self._watcher_error_code: str | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._scan_locks = {provider: asyncio.Lock() for provider in _EXTERNAL_PROVIDERS}
+        self._job_lock = asyncio.Lock()
+        self._continuation_locks: dict[str, asyncio.Lock] = {}
+        self._running = False
+        self._background_tasks: list[asyncio.Task[None]] = []
+        self._provider_tasks: set[asyncio.Task[Any]] = set()
+        self._provider_health: dict[Provider, _ProviderHealth] = {
+            provider: {
+                "last_success": None,
+                "lag_seconds": None,
+                "degraded_reason": None,
+            }
+            for provider in (Provider.CLAUDE, Provider.CODEX)
+        }
+        self._recent_error_codes: list[str] = []
+        self._backfill_progress: dict[Provider, dict[str, int | str]] = {}
+        self._continuous_watermark: float | None = None
+        self._registration_turn_fallback: bool | None = None
+
+    async def start(self) -> None:
+        async with self._lifecycle_lock:
+            if self._running:
+                return
+            while self._provider_tasks:
+                await asyncio.gather(
+                    *tuple(self._provider_tasks),
+                    return_exceptions=True,
+                )
+            await self.reconcile_once()
+            self._running = True
+            self._background_tasks = [
+                asyncio.create_task(self._scan_loop()),
+                asyncio.create_task(self._reconcile_loop()),
+            ]
+            if self._claude_projects_root is not None:
+                self._watch_stop_event = asyncio.Event()
+                self._watcher_state = "running"
+                self._watcher_error_code = None
+                self._background_tasks.append(asyncio.create_task(self._watch_loop()))
+
+    async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            if (
+                not self._running
+                and not self._background_tasks
+                and not self._provider_tasks
+            ):
+                return
+            self._running = False
+            if self._watch_stop_event is not None:
+                self._watch_stop_event.set()
+            tasks, self._background_tasks = self._background_tasks, []
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            provider_tasks = tuple(self._provider_tasks)
+            if provider_tasks:
+                _, pending = await asyncio.wait(
+                    provider_tasks,
+                    timeout=self._refresh_timeout,
+                )
+                if pending:
+                    self._record_error_code("provider_shutdown_pending")
+            if self._claude_projects_root is not None:
+                self._watcher_state = "stopped"
+
+    async def scan_once(self, provider: Provider | None = None) -> ScanSummary:
+        await self._ensure_continuous_watermark()
+        if not self._config.catalog.enabled:
+            return _zero_scan(provider)
+        if provider is not None:
+            normalized = Provider(provider)
+            if normalized not in _EXTERNAL_PROVIDERS:
+                raise ValueError("scan provider must be Claude or Codex")
+            return await self._scan_provider(normalized)
+
+        summaries = [
+            await self._scan_provider(candidate)
+            for candidate in (Provider.CLAUDE, Provider.CODEX)
+        ]
+        return ScanSummary(
+            provider=None,
+            discovered=sum(summary.discovered for summary in summaries),
+            indexed=sum(summary.indexed for summary in summaries),
+            rebuilt=sum(summary.rebuilt for summary in summaries),
+            failed=sum(summary.failed for summary in summaries),
+            duration_ms=sum(summary.duration_ms for summary in summaries),
+        )
+
+    async def reconcile_once(self) -> ReconcileSummary:
+        async with self._job_lock:
+            jobs = await self._reconcile_jobs_locked()
+        continuations = await self._reconcile_continuations()
+        return ReconcileSummary(
+            examined=jobs.examined + continuations.examined,
+            recovered=jobs.recovered + continuations.recovered,
+            retried=jobs.retried + continuations.retried,
+            failed=jobs.failed + continuations.failed,
+        )
+
+    async def _reconcile_jobs_locked(self) -> ReconcileSummary:
+        if not callable(getattr(self._store, "list_mirror_jobs", None)):
+            return ReconcileSummary(examined=0, recovered=0, retried=0, failed=0)
+        jobs = await asyncio.to_thread(
+            _call,
+            self._store,
+            "list_mirror_jobs",
+            [MirrorJobState.RUNNING],
+            limit=1000,
+        )
+        recovered = 0
+        retried = 0
+        failed = 0
+        policy = self._mirror_policy()
+        for raw_job in jobs:
+            job = _validated_job(raw_job)
+            sidecar = await asyncio.to_thread(
+                _call,
+                self._store,
+                "get_state",
+                _attempt_key(job),
+            )
+            if sidecar is None:
+                await self._retry_provider_call_not_started(job)
+                retried += 1
+                continue
+            if (
+                isinstance(sidecar, Mapping)
+                and isinstance(sidecar.get("attempts"), int)
+                and not isinstance(sidecar.get("attempts"), bool)
+                and sidecar["attempts"] < job["attempts"]
+            ):
+                await self._retry_provider_call_not_started(job)
+                retried += 1
+                continue
+            try:
+                attempt = _validated_attempt_sidecar(
+                    sidecar,
+                    job,
+                    policy_generation=policy.generation,
+                )
+            except (TypeError, ValueError, RuntimeError):
+                await self._fail_job_manually(
+                    job,
+                    code="attempt_sidecar_invalid",
+                    detail="mirror attempt sidecar is invalid",
+                )
+                failed += 1
+                continue
+            try:
+                target = await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "find_external_session_by_origin_bridge",
+                    attempt["bridge_id"],
+                    Provider(job["target_provider"]),
+                )
+                if target is None:
+                    expected_native_id = attempt.get("expected_native_id")
+                    if not isinstance(expected_native_id, str):
+                        raise RuntimeError("target identity is not cataloged")
+                    target = await self._index_exact_target(
+                        Provider(job["target_provider"]),
+                        expected_native_id,
+                        bridge_id=attempt["bridge_id"],
+                        source_session_id=job["source_session_id"],
+                        policy_generation=policy.generation,
+                        require_marker_payload=True,
+                    )
+                else:
+                    native_id = target.get("native_id")
+                    if not isinstance(native_id, str) or not native_id:
+                        raise RuntimeError("target identity is not cataloged")
+                    target = await self._index_exact_target(
+                        Provider(job["target_provider"]),
+                        native_id,
+                        bridge_id=attempt["bridge_id"],
+                        source_session_id=job["source_session_id"],
+                        policy_generation=policy.generation,
+                        require_marker_payload=True,
+                    )
+                await self._complete_cataloged_target(
+                    job,
+                    bridge_id=attempt["bridge_id"],
+                    target=target,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                await self._fail_job_manually(
+                    job,
+                    code="target_identity_unproven",
+                    detail="running mirror target identity could not be proven",
+                )
+                failed += 1
+            else:
+                recovered += 1
+        return ReconcileSummary(
+            examined=len(jobs),
+            recovered=recovered,
+            retried=retried,
+            failed=failed,
+        )
+
+    async def _reconcile_continuations(self) -> ReconcileSummary:
+        if not callable(
+            getattr(self._store, "list_continuation_snapshots", None)
+        ):
+            return ReconcileSummary(examined=0, recovered=0, retried=0, failed=0)
+        after_bridge_id = await self._load_continuation_reconcile_cursor()
+        snapshots = await asyncio.to_thread(
+            _call,
+            self._store,
+            "list_continuation_snapshots",
+            limit=1000,
+            after_bridge_id=after_bridge_id,
+        )
+        if not snapshots and after_bridge_id is not None:
+            snapshots = await asyncio.to_thread(
+                _call,
+                self._store,
+                "list_continuation_snapshots",
+                limit=1000,
+                after_bridge_id=None,
+            )
+        examined = 0
+        marked = 0
+        failed = 0
+        for raw_snapshot in snapshots:
+            examined += 1
+            try:
+                snapshot = _validated_periodic_continuation_snapshot(raw_snapshot)
+                source = await self.refresh_session(
+                    snapshot["source_session_id"],
+                    timeout=self._refresh_timeout,
+                )
+                target = await self.refresh_session(
+                    snapshot["target_session_id"],
+                    timeout=self._refresh_timeout,
+                )
+                if source.stale or target.stale:
+                    continue
+                source_advanced = (source.cursor, source.source_hash) != (
+                    snapshot["source_cursor"],
+                    snapshot["source_hash"],
+                )
+                target_advanced = (target.cursor, target.source_hash) != (
+                    snapshot["target_cursor"],
+                    snapshot["target_hash"],
+                )
+                if source_advanced and target_advanced:
+                    await asyncio.to_thread(
+                        _call,
+                        self._store,
+                        "mark_diverged",
+                        snapshot["bridge_id"],
+                        at=float(self._clock()),
+                    )
+                    marked += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed += 1
+                self._record_error_code("continuation_reconcile_failed")
+        next_cursor = (
+            snapshots[-1].get("bridge_id")
+            if len(snapshots) >= 1000 and isinstance(snapshots[-1], Mapping)
+            else None
+        )
+        await self._save_continuation_reconcile_cursor(next_cursor)
+        return ReconcileSummary(
+            examined=examined,
+            recovered=marked,
+            retried=0,
+            failed=failed,
+        )
+
+    async def process_jobs_once(self) -> JobSummary:
+        async with self._job_lock:
+            return await self._process_jobs_locked()
+
+    async def _process_jobs_locked(self) -> JobSummary:
+        policy = self._mirror_policy()
+        now = float(self._clock())
+        atomic_claim = getattr(self._store, "claim_due_jobs_with_limits", None)
+        uses_atomic_controls = callable(atomic_claim)
+        breaker = BatchProgress()
+        effective_policy = policy
+        if callable(atomic_claim):
+            jobs = await asyncio.to_thread(
+                atomic_claim,
+                now=now,
+                limit=policy.creates_per_minute,
+                policy=policy,
+            )
+        else:
+            capacity = await self._creation_capacity(policy, now=now)
+            if capacity == 0:
+                return JobSummary(
+                    claimed=0,
+                    succeeded=0,
+                    retried=0,
+                    manual_failure=0,
+                )
+            breaker = await self._load_breaker_progress()
+            if policy.automatic_creation and _healthy_breaker_batch_completed(
+                breaker,
+                policy,
+            ):
+                breaker = BatchProgress()
+                await self._save_breaker_progress(breaker)
+            if policy.automatic_creation and should_halt_batch(breaker, policy):
+                effective_policy = replace(policy, automatic_creation=False)
+            claim_limit = 1 if effective_policy.automatic_creation else capacity
+            jobs = await asyncio.to_thread(
+                _call,
+                self._store,
+                "claim_due_jobs",
+                now=now,
+                limit=claim_limit,
+                policy=effective_policy,
+            )
+            await self._reserve_creation_capacity(jobs, now=now)
+        succeeded = 0
+        retried = 0
+        manual_failure = 0
+        automatic_attempts = 0
+        automatic_errors = 0
+        for raw_job in jobs:
+            job = _validated_job(raw_job)
+            outcome = await self._process_claimed_job(job, policy=effective_policy)
+            automatic_claim = job.get("claim_authority", "automatic") == "automatic"
+            automatic_attempts += int(automatic_claim)
+            if outcome is MirrorJobState.SUCCEEDED:
+                succeeded += 1
+            elif outcome is MirrorJobState.RETRY:
+                retried += 1
+                automatic_errors += int(automatic_claim)
+            else:
+                manual_failure += 1
+                automatic_errors += int(automatic_claim)
+        summary = JobSummary(
+            claimed=len(jobs),
+            succeeded=succeeded,
+            retried=retried,
+            manual_failure=manual_failure,
+        )
+        if (
+            automatic_attempts
+            and not uses_atomic_controls
+            and policy.automatic_creation
+            and effective_policy.automatic_creation
+        ):
+            await self._save_breaker_progress(
+                BatchProgress(
+                    attempts=breaker.attempts + automatic_attempts,
+                    errors=breaker.errors + automatic_errors,
+                )
+            )
+        return summary
+
+    async def refresh_session(
+        self,
+        session_id: str,
+        *,
+        timeout: float,
+    ) -> RefreshResult:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session ID must not be empty")
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not math.isfinite(float(timeout))
+            or timeout <= 0
+        ):
+            raise ValueError("refresh timeout must be a positive finite number")
+        normalized_session_id = session_id.strip()
+        durable = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_external_session",
+            normalized_session_id,
+        )
+        if durable is None:
+            raise KeyError(normalized_session_id)
+        if not isinstance(durable, Mapping):
+            raise RuntimeError("external session record is invalid")
+        try:
+            provider = Provider(durable.get("provider"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("external session provider is invalid") from exc
+        if provider not in _EXTERNAL_PROVIDERS:
+            raise RuntimeError("external session provider is invalid")
+        native_id = durable.get("native_id")
+        if (
+            not isinstance(native_id, str)
+            or not native_id.strip()
+            or canonical_session_id(provider, native_id) != normalized_session_id
+        ):
+            raise RuntimeError("external session identity is invalid")
+
+        lock = self._scan_locks[provider]
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            await asyncio.wait_for(lock.acquire(), timeout=float(timeout))
+        except TimeoutError:
+            self._mark_refresh_failure(provider)
+            return _stale_refresh(normalized_session_id, durable)
+        remaining_timeout = float(timeout) - (loop.time() - started)
+        if remaining_timeout <= 0:
+            lock.release()
+            self._mark_refresh_failure(provider)
+            return _stale_refresh(normalized_session_id, durable)
+        release_lock = True
+        read_task = self._start_provider_call(
+            _read_exact_projection,
+            self._adapter(provider),
+            provider,
+            native_id.strip(),
+        )
+        try:
+            done, _ = await asyncio.wait({read_task}, timeout=remaining_timeout)
+            if not done:
+                release_lock = False
+                read_task.add_done_callback(lambda _task: lock.release())
+                self._mark_refresh_failure(provider)
+                return _stale_refresh(normalized_session_id, durable)
+            projection = read_task.result()
+            if (
+                projection.provider is not provider
+                or canonical_session_id(projection.provider, projection.native_id)
+                != normalized_session_id
+                or not isinstance(projection.native_cursor, str)
+                or not projection.native_cursor.strip()
+                or not isinstance(projection.native_hash, str)
+                or not projection.native_hash.strip()
+            ):
+                raise RuntimeError("refreshed session identity is invalid")
+            await asyncio.to_thread(
+                _upsert,
+                self._store,
+                projection,
+                True,
+            )
+            self._mark_provider_success(provider)
+            return RefreshResult(
+                session_id=normalized_session_id,
+                cursor=projection.native_cursor.strip(),
+                source_hash=projection.native_hash.strip(),
+                stale=False,
+                warning=None,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            if not read_task.done():
+                release_lock = False
+                read_task.add_done_callback(lambda _task: lock.release())
+            raise
+        except Exception:
+            self._mark_refresh_failure(provider)
+            return _stale_refresh(normalized_session_id, durable)
+        finally:
+            if release_lock:
+                lock.release()
+
+    async def continue_session(self, request: ContinueRequest) -> ContinueResult:
+        _validate_continue_request(request)
+        lock = self._continuation_locks.setdefault(request.bridge_id, asyncio.Lock())
+        async with lock:
+            return await self._continue_locked(request)
+
+    async def _continue_locked(self, request: ContinueRequest) -> ContinueResult:
+        snapshot = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_continuation_snapshot",
+            request.bridge_id,
+        )
+        source = await self.refresh_session(
+            request.session_id,
+            timeout=self._refresh_timeout,
+        )
+        pending_pack: ContextPack | None = None
+        if snapshot is None:
+            existing_pack_row = await asyncio.to_thread(
+                _call,
+                self._store,
+                "get_context_pack",
+                request.bridge_id,
+                budget_chars=request.context_budget_chars,
+            )
+            if existing_pack_row is not None:
+                pending_pack = _context_pack_from_row(existing_pack_row)
+                if (
+                    pending_pack.source_session_id != request.session_id
+                    or pending_pack.target_session_id is None
+                    or pending_pack.immutable_at is not None
+                ):
+                    raise RuntimeError("pending continuation pack identity is invalid")
+                target_session_id = pending_pack.target_session_id
+            else:
+                target_row = await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "find_external_session_by_origin_bridge",
+                    request.bridge_id,
+                    request.target_provider,
+                )
+                if not isinstance(target_row, Mapping):
+                    raise RuntimeError("continuation target is not cataloged")
+                target_session_id = _external_row_session_id(
+                    target_row,
+                    request.target_provider,
+                )
+        else:
+            snapshot = _validated_continuation_snapshot(snapshot)
+            if snapshot["source_session_id"] != request.session_id:
+                raise ValueError("continuation source identity mismatch")
+            target_session_id = snapshot["target_session_id"]
+
+        if _provider_from_session_id(target_session_id) is not request.target_provider:
+            raise ValueError("continuation target provider mismatch")
+
+        target = await self.refresh_session(
+            target_session_id,
+            timeout=self._refresh_timeout,
+        )
+        warnings = tuple(
+            warning
+            for warning in (source.warning, target.warning)
+            if warning is not None
+        )
+
+        if snapshot is None:
+            if pending_pack is not None:
+                pack = pending_pack
+                if not source.stale and (
+                    pack.source_cursor != source.cursor
+                    or pack.source_hash != source.source_hash
+                ):
+                    raise ValueError(
+                        "pending continuation source advanced after context build"
+                    )
+            else:
+                if self._context_builder is None:
+                    raise RuntimeError("context pack builder is not configured")
+                pack = await asyncio.to_thread(
+                    _call,
+                    self._context_builder,
+                    "build",
+                    ContextPackRequest(
+                        source_session_id=request.session_id,
+                        target_provider=request.target_provider,
+                        bridge_id=request.bridge_id,
+                        source_cursor=source.cursor,
+                        source_hash=source.source_hash,
+                        budget_chars=request.context_budget_chars,
+                        stale=source.stale,
+                        diverged=False,
+                    ),
+                )
+                if not isinstance(pack, ContextPack):
+                    raise RuntimeError("context pack builder returned no pack")
+            if pack.target_session_id != target_session_id:
+                raise RuntimeError("context pack target identity mismatch")
+            target_cursor = target.cursor
+            target_hash = target.source_hash
+        else:
+            pack_row = await asyncio.to_thread(
+                _call,
+                self._store,
+                "get_context_pack",
+                request.bridge_id,
+                budget_chars=request.context_budget_chars,
+            )
+            if pack_row is None:
+                raise ValueError("continuation context budget is already frozen")
+            pack = _context_pack_from_row(pack_row)
+            if pack.id != snapshot["pack_id"] or pack.immutable_at is None:
+                raise RuntimeError("continuation pack identity is invalid")
+            target_cursor = snapshot["target_cursor"]
+            target_hash = snapshot["target_hash"]
+
+        link_row = await asyncio.to_thread(
+            _call,
+            self._store,
+            "transition_link_to_continues",
+            request.bridge_id,
+            pack_id=pack.id,
+            target_cursor=target_cursor,
+            target_hash=target_hash,
+        )
+        persisted_pack_row = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_context_pack",
+            request.bridge_id,
+            budget_chars=request.context_budget_chars,
+        )
+        if persisted_pack_row is None:
+            raise RuntimeError("continued context pack is unavailable")
+        persisted_pack = _context_pack_from_row(persisted_pack_row)
+        link = _session_link_from_row(link_row)
+
+        if snapshot is not None and not source.stale and not target.stale:
+            source_advanced = (source.cursor, source.source_hash) != (
+                snapshot["source_cursor"],
+                snapshot["source_hash"],
+            )
+            target_advanced = (target.cursor, target.source_hash) != (
+                snapshot["target_cursor"],
+                snapshot["target_hash"],
+            )
+            if source_advanced and target_advanced:
+                await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "mark_diverged",
+                    request.bridge_id,
+                    at=float(self._clock()),
+                )
+                warnings = (*warnings, "linked_sessions_diverged")
+        return ContinueResult(pack=persisted_pack, link=link, warnings=warnings)
+
+    def health(self) -> dict[str, Any]:
+        now = float(self._clock())
+        providers: dict[str, _ProviderHealth] = {}
+        for provider, state in self._provider_health.items():
+            last_success = state["last_success"]
+            providers[provider.value] = {
+                "last_success": last_success,
+                "lag_seconds": (
+                    max(0.0, now - last_success)
+                    if isinstance(last_success, (int, float))
+                    else None
+                ),
+                "degraded_reason": state["degraded_reason"],
+            }
+        queue_counts: dict[str, int] = {}
+        counter = getattr(self._store, "mirror_job_counts", None)
+        if callable(counter):
+            try:
+                counts = counter()
+                if isinstance(counts, Mapping):
+                    queue_counts = {
+                        state.value: int(counts.get(state.value, 0))
+                        for state in MirrorJobState
+                    }
+            except Exception:
+                self._recent_error_codes.append("mirror_queue_health_failed")
+                del self._recent_error_codes[:-_RECENT_ERROR_LIMIT]
+        return {
+            "running": self._running,
+            "providers": providers,
+            "watcher_state": self._watcher_state,
+            "watcher_error_code": self._watcher_error_code,
+            "queue_counts": queue_counts,
+            "mirror_mode": (
+                "automatic"
+                if self._config.mirrors.automatic_creation
+                else "manual"
+            ),
+            "backfill_progress": {
+                provider.value: dict(progress)
+                for provider, progress in self._backfill_progress.items()
+            },
+            "registration_turn_fallback": self._registration_turn_fallback,
+            "provider_calls_inflight": len(self._provider_tasks),
+            "recent_error_codes": list(self._recent_error_codes),
+        }
+
+    def _mirror_policy(self) -> MirrorPolicy:
+        mirrors = self._config.mirrors
+        return MirrorPolicy(
+            automatic_creation=mirrors.automatic_creation,
+            backfill_days=mirrors.backfill_days,
+            creates_per_minute=mirrors.creates_per_minute,
+            max_attempts=mirrors.max_attempts,
+            stop_after_attempts=mirrors.stop_after_attempts,
+            stop_error_rate=mirrors.stop_error_rate,
+        )
+
+    async def _creation_capacity(
+        self,
+        policy: MirrorPolicy,
+        *,
+        now: float,
+    ) -> int:
+        if not _supports_scan_state(self._store):
+            return policy.creates_per_minute
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _RATE_STATE_KEY,
+        )
+        recent = _decode_creation_rate_state(state, now=now)
+        return max(0, policy.creates_per_minute - len(recent))
+
+    async def _reserve_creation_capacity(
+        self,
+        jobs: Sequence[object],
+        *,
+        now: float,
+    ) -> None:
+        if not jobs or not _supports_scan_state(self._store):
+            return
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _RATE_STATE_KEY,
+        )
+        recent = _decode_creation_rate_state(state, now=now)
+        reserved = [*recent, *([now] * len(jobs))]
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _RATE_STATE_KEY,
+            {"version": 1, "attempted_at": reserved},
+        )
+
+    async def _load_breaker_progress(self) -> BatchProgress:
+        if not _supports_scan_state(self._store):
+            return BatchProgress()
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _BREAKER_STATE_KEY,
+        )
+        return _decode_breaker_state(state)
+
+    async def _save_breaker_progress(self, progress: BatchProgress) -> None:
+        if not _supports_scan_state(self._store):
+            return
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _BREAKER_STATE_KEY,
+            {
+                "version": 1,
+                "attempts": progress.attempts,
+                "errors": progress.errors,
+            },
+        )
+
+    async def _ensure_continuous_watermark(self) -> None:
+        if self._continuous_watermark is not None:
+            return
+        if not isinstance(self._store, SessionBridgeStore):
+            return
+        watermark = await asyncio.to_thread(
+            load_continuous_watermark,
+            self._store,
+        )
+        if watermark is None:
+            watermark = float(self._clock())
+            await asyncio.to_thread(
+                persist_continuous_watermark,
+                self._store,
+                watermark,
+            )
+        self._continuous_watermark = watermark
+
+    async def _discovery_mode(self, provider: Provider) -> DiscoveryMode:
+        if (
+            not self._config.mirrors.automatic_creation
+            or not isinstance(self._store, SessionBridgeStore)
+        ):
+            return DiscoveryMode.CONTINUOUS
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _BACKFILL_KEYS[provider],
+        )
+        completed, _ = _decode_backfill_state(state)
+        return (
+            DiscoveryMode.CONTINUOUS
+            if completed
+            else DiscoveryMode.INITIAL_BACKFILL
+        )
+
+    async def _load_backfill_processed(
+        self,
+        provider: Provider,
+        discovery_mode: DiscoveryMode,
+    ) -> set[str]:
+        if discovery_mode is not DiscoveryMode.INITIAL_BACKFILL:
+            return set()
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _BACKFILL_KEYS[provider],
+        )
+        _, processed = _decode_backfill_state(state)
+        return processed
+
+    async def _record_backfill_successes(
+        self,
+        provider: Provider,
+        discovery_mode: DiscoveryMode,
+        native_ids: Sequence[str],
+    ) -> None:
+        if (
+            discovery_mode is not DiscoveryMode.INITIAL_BACKFILL
+            or not native_ids
+        ):
+            return
+        processed = await self._load_backfill_processed(provider, discovery_mode)
+        processed.update(native_ids)
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _BACKFILL_KEYS[provider],
+            {
+                "version": 1,
+                "completed": False,
+                "processed_native_ids": sorted(processed),
+            },
+        )
+
+    async def _complete_backfill_if_drained(
+        self,
+        provider: Provider,
+        discovery_mode: DiscoveryMode,
+    ) -> None:
+        if discovery_mode is not DiscoveryMode.INITIAL_BACKFILL:
+            return
+        pending = await self._load_pending(provider)
+        if pending:
+            return
+        processed = await self._load_backfill_processed(provider, discovery_mode)
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _BACKFILL_KEYS[provider],
+            {
+                "version": 1,
+                "completed": True,
+                "processed_native_ids": sorted(processed),
+            },
+        )
+
+    async def _load_codex_seen_ids(self) -> set[str]:
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _CODEX_SEEN_KEY,
+        )
+        return set(_decode_native_id_set_state(state, label="Codex seen"))
+
+    async def _save_codex_seen_ids(self, native_ids: set[str]) -> None:
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _CODEX_SEEN_KEY,
+            {"version": 1, "native_ids": sorted(native_ids)},
+        )
+
+    async def _cataloged_codex_ids(self, native_ids: Sequence[str]) -> set[str]:
+        reader = getattr(self._store, "get_external_session", None)
+        if not callable(reader):
+            return set()
+        cataloged: set[str] = set()
+        for native_id in native_ids:
+            row = await asyncio.to_thread(
+                reader,
+                canonical_session_id(Provider.CODEX, native_id),
+            )
+            if isinstance(row, Mapping):
+                cataloged.add(native_id)
+        return cataloged
+
+    async def _load_continuation_reconcile_cursor(self) -> str | None:
+        if not _supports_scan_state(self._store):
+            return None
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _CONTINUATION_RECONCILE_CURSOR_KEY,
+        )
+        return _decode_continuation_reconcile_cursor(state)
+
+    async def _save_continuation_reconcile_cursor(
+        self,
+        after_bridge_id: object,
+    ) -> None:
+        if not _supports_scan_state(self._store):
+            return
+        normalized = (
+            after_bridge_id.strip()
+            if isinstance(after_bridge_id, str) and after_bridge_id.strip()
+            else None
+        )
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _CONTINUATION_RECONCILE_CURSOR_KEY,
+            {"version": 1, "after_bridge_id": normalized},
+        )
+
+    async def _maybe_enqueue_automatic(
+        self,
+        projection: SessionProjection,
+        *,
+        discovery_mode: DiscoveryMode,
+    ) -> None:
+        if not self._config.mirrors.automatic_creation:
+            return
+        await self._ensure_continuous_watermark()
+        if self._continuous_watermark is None or not isinstance(
+            self._store, SessionBridgeStore
+        ):
+            self._record_error_code("automatic_mirror_store_unavailable")
+            return
+        policy = self._mirror_policy()
+        context = EligibilityContext(
+            now=float(self._clock()),
+            discovery_mode=discovery_mode,
+            continuous_watermark=self._continuous_watermark,
+            existing_target_mappings=frozenset(),
+            policy=policy,
+        )
+        candidates = eligible_mirror_candidates((projection,), context)
+        for candidate in candidates:
+            try:
+                await asyncio.to_thread(
+                    enqueue_mirror_job,
+                    self._store,
+                    candidate.source_session_id,
+                    candidate.target_provider,
+                    policy=policy,
+                    candidate=candidate,
+                    context=context,
+                )
+            except PermissionError:
+                continue
+            except Exception as exc:
+                self._record_error_code("automatic_mirror_enqueue_failed")
+                raise RuntimeError("automatic mirror enqueue failed") from exc
+
+    async def _process_claimed_job(
+        self,
+        job: dict[str, Any],
+        *,
+        policy: MirrorPolicy,
+    ) -> MirrorJobState:
+        target_provider = Provider(job["target_provider"])
+        bridge_id = _bridge_id(job)
+        expected_native_id = (
+            _claude_native_id(job) if target_provider is Provider.CLAUDE else None
+        )
+        sidecar: dict[str, Any] = {
+            "version": 1,
+            "phase": "provider_call_started",
+            "bridge_id": bridge_id,
+            "target_provider": target_provider.value,
+            "policy_generation": policy.generation,
+            "attempts": job["attempts"],
+        }
+        if expected_native_id is not None:
+            sidecar["expected_native_id"] = expected_native_id
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _attempt_key(job),
+            sidecar,
+        )
+
+        try:
+            target_adapter = self._target_adapter(target_provider)
+            metadata = await self._launch_metadata(job["source_session_id"])
+            kwargs: dict[str, Any] = {
+                "title": metadata["title"],
+                "source_session_id": job["source_session_id"],
+                "bridge_id": bridge_id,
+                "policy_generation": policy.generation,
+            }
+            if metadata["cwd"] is not None:
+                kwargs["cwd"] = metadata["cwd"]
+            if expected_native_id is not None:
+                kwargs["native_id"] = expected_native_id
+            result = await self._provider_call(
+                _call,
+                target_adapter,
+                "create_placeholder",
+                **kwargs,
+            )
+            native_id = _placeholder_native_id(result)
+            self._registration_turn_fallback = bool(
+                getattr(result, "used_registration_turn", False)
+            )
+            require_marker_payload = False
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except AmbiguousPlaceholderCreation as exc:
+            native_id = exc.native_id or expected_native_id
+            require_marker_payload = True
+            if native_id is None:
+                await self._fail_job_manually(
+                    job,
+                    code="target_identity_unproven",
+                    detail="target placeholder identity could not be proven",
+                )
+                return MirrorJobState.MANUAL_FAILURE
+        except PlaceholderCreationError as exc:
+            return await self._record_job_failure(job, policy=policy, code=exc.code)
+        except Exception:
+            await self._fail_job_manually(
+                job,
+                code="target_outcome_unknown",
+                detail="target placeholder outcome could not be proven",
+            )
+            return MirrorJobState.MANUAL_FAILURE
+
+        try:
+            target = await self._index_exact_target(
+                target_provider,
+                native_id,
+                bridge_id=bridge_id,
+                source_session_id=job["source_session_id"],
+                policy_generation=policy.generation,
+                require_marker_payload=require_marker_payload,
+            )
+            await self._complete_cataloged_target(
+                job,
+                bridge_id=bridge_id,
+                target=target,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            await self._fail_job_manually(
+                job,
+                code="target_identity_unproven",
+                detail="created mirror target identity could not be proven",
+            )
+            return MirrorJobState.MANUAL_FAILURE
+        return MirrorJobState.SUCCEEDED
+
+    async def _record_job_failure(
+        self,
+        job: dict[str, Any],
+        *,
+        policy: MirrorPolicy,
+        code: str,
+    ) -> MirrorJobState:
+        provider = Provider(job["target_provider"])
+        safe_code = _safe_target_error_code(provider, code)
+        self._record_error_code(f"{provider.value}_target_failed")
+        if job["attempts"] >= policy.max_attempts:
+            await self._fail_job_manually(
+                job,
+                code=safe_code,
+                detail="target placeholder creation failed",
+            )
+            return MirrorJobState.MANUAL_FAILURE
+        delay = retry_delay_seconds(job["idempotency_key"], job["attempts"])
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "retry_job",
+            job["id"],
+            code=safe_code,
+            detail="target placeholder creation failed",
+            next_attempt_at=float(self._clock()) + delay,
+        )
+        return MirrorJobState.RETRY
+
+    async def _retry_provider_call_not_started(
+        self,
+        job: Mapping[str, Any],
+    ) -> None:
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "retry_job",
+            job["id"],
+            code="provider_call_not_started",
+            detail="provider call was not started before restart",
+            next_attempt_at=float(self._clock()),
+        )
+
+    async def _fail_job_manually(
+        self,
+        job: Mapping[str, Any],
+        *,
+        code: str,
+        detail: str,
+    ) -> None:
+        target_provider = job.get("target_provider")
+        if isinstance(target_provider, str):
+            self._record_error_code(f"{target_provider}_target_failed")
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "fail_job_manually",
+            job["id"],
+            code=code,
+            detail=detail,
+        )
+
+    async def _index_exact_target(
+        self,
+        provider: Provider,
+        native_id: str,
+        *,
+        bridge_id: str,
+        source_session_id: str,
+        policy_generation: int,
+        require_marker_payload: bool,
+    ) -> dict[str, Any]:
+        adapter = self._adapter(provider)
+        if provider is Provider.CLAUDE:
+            source = await self._provider_call(
+                _call,
+                adapter,
+                "find_native_session",
+                native_id,
+            )
+            if source is None:
+                raise RuntimeError("created Claude session is not readable")
+            parsed = await self._provider_call(_call, adapter, "parse", source)
+            projection = _projection_from_parse(parsed)
+        else:
+            summary = await self._provider_call(
+                _call,
+                adapter,
+                "find_native_thread",
+                native_id,
+            )
+            if summary is None:
+                raise RuntimeError("created Codex thread is not readable")
+            projection = await self._provider_call(
+                _call,
+                adapter,
+                "project_thread",
+                summary,
+            )
+        if (
+            not isinstance(projection, SessionProjection)
+            or projection.provider is not provider
+            or projection.native_id != native_id
+            or projection.origin_kind is not OriginKind.BRIDGE_PLACEHOLDER
+            or projection.origin_bridge_id != bridge_id
+        ):
+            raise RuntimeError("created target provenance is not exact")
+        if require_marker_payload:
+            authenticated = await self._provider_call(
+                _call,
+                adapter,
+                "projection_has_marker_payload",
+                projection,
+                BridgeMarkerPayload(
+                    bridge_id=bridge_id,
+                    source_session_id=source_session_id,
+                    target_provider=provider,
+                    policy_generation=policy_generation,
+                ),
+            )
+            if authenticated is not True:
+                raise RuntimeError("created target marker payload is not exact")
+        result = await asyncio.to_thread(
+            _upsert,
+            self._store,
+            projection,
+            False,
+        )
+        return {
+            "session_id": result.session_id,
+            "provider": provider.value,
+            "native_id": native_id,
+            "origin_bridge_id": bridge_id,
+        }
+
+    async def _complete_cataloged_target(
+        self,
+        job: Mapping[str, Any],
+        *,
+        bridge_id: str,
+        target: Mapping[str, Any],
+    ) -> None:
+        provider = Provider(job["target_provider"])
+        native_id = target.get("native_id")
+        session_id = target.get("session_id")
+        if (
+            target.get("provider") != provider.value
+            or target.get("origin_bridge_id") != bridge_id
+            or not isinstance(native_id, str)
+            or not native_id
+            or session_id != canonical_session_id(provider, native_id)
+        ):
+            raise RuntimeError("cataloged target identity is not exact")
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "complete_job",
+            job["id"],
+            target_native_id=native_id,
+            target_session_id=session_id,
+            bridge_id=bridge_id,
+        )
+
+    def _target_adapter(self, provider: Provider) -> object:
+        try:
+            return self._target_adapters[provider]
+        except KeyError as exc:
+            raise RuntimeError("target adapter is not configured") from exc
+
+    async def _launch_metadata(self, source_session_id: str) -> dict[str, str | None]:
+        reader = getattr(self._store, "get_session_launch_metadata", None)
+        if not callable(reader):
+            return {"title": "Hermes bridge placeholder", "cwd": None}
+        raw = await asyncio.to_thread(reader, source_session_id)
+        if not isinstance(raw, Mapping):
+            return {"title": "Hermes bridge placeholder", "cwd": None}
+        raw_title = raw.get("title")
+        title = (
+            " ".join(raw_title.split())
+            if isinstance(raw_title, str) and raw_title.strip()
+            else "Hermes bridge placeholder"
+        )
+        raw_cwd = raw.get("cwd")
+        cwd = raw_cwd.strip() if isinstance(raw_cwd, str) and raw_cwd.strip() else None
+        if cwd is not None and ("\r" in cwd or "\n" in cwd):
+            cwd = None
+        return {"title": title[:200], "cwd": cwd}
+
+    async def _scan_provider(self, provider: Provider) -> ScanSummary:
+        async with self._scan_locks[provider]:
+            started = float(self._monotonic())
+            discovery_mode = await self._discovery_mode(provider)
+            try:
+                if provider is Provider.CLAUDE:
+                    summary = await self._scan_claude(discovery_mode)
+                elif provider is Provider.CODEX:
+                    summary = await self._scan_codex(discovery_mode)
+                else:
+                    raise ValueError("unsupported scan provider")
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                self._mark_scan_failure(provider)
+                return ScanSummary(
+                    provider=provider,
+                    discovered=0,
+                    indexed=0,
+                    rebuilt=0,
+                    failed=1,
+                    duration_ms=self._elapsed_ms(started),
+                )
+
+            if summary.failed:
+                self._mark_scan_failure(provider)
+            else:
+                await self._complete_backfill_if_drained(provider, discovery_mode)
+                self._mark_scan_success(provider)
+            return ScanSummary(
+                provider=provider,
+                discovered=summary.discovered,
+                indexed=summary.indexed,
+                rebuilt=summary.rebuilt,
+                failed=summary.failed,
+                duration_ms=self._elapsed_ms(started),
+            )
+
+    async def _scan_claude(self, discovery_mode: DiscoveryMode) -> ScanSummary:
+        if _supports_scan_state(self._store):
+            return await self._scan_claude_persistent(discovery_mode)
+        return await self._scan_claude_immediate(discovery_mode)
+
+    async def _scan_claude_immediate(
+        self,
+        discovery_mode: DiscoveryMode,
+    ) -> ScanSummary:
+        adapter = self._adapter(Provider.CLAUDE)
+        paths = await self._provider_call(_call, adapter, "discover")
+        discovered = len(paths)
+        indexed = 0
+        rebuilt = 0
+        failed = 0
+        for path in paths:
+            try:
+                parsed = await self._provider_call(_call, adapter, "parse", path)
+                projection = _projection_from_parse(parsed)
+                should_rebuild = bool(getattr(parsed, "rebuild", False))
+                result = await asyncio.to_thread(
+                    _upsert,
+                    self._store,
+                    projection,
+                    should_rebuild,
+                )
+                await self._maybe_enqueue_automatic(
+                    projection,
+                    discovery_mode=discovery_mode,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed += 1
+                continue
+            indexed += 1
+            rebuilt += int(should_rebuild or result.rebuilt)
+        return ScanSummary(
+            provider=Provider.CLAUDE,
+            discovered=discovered,
+            indexed=indexed,
+            rebuilt=rebuilt,
+            failed=failed,
+            duration_ms=0,
+        )
+
+    async def _scan_codex(self, discovery_mode: DiscoveryMode) -> ScanSummary:
+        if _supports_scan_state(self._store):
+            return await self._scan_codex_persistent(discovery_mode)
+        return await self._scan_codex_immediate(discovery_mode)
+
+    async def _scan_codex_immediate(
+        self,
+        discovery_mode: DiscoveryMode,
+    ) -> ScanSummary:
+        adapter = self._adapter(Provider.CODEX)
+        summaries = await self._provider_call(
+            _codex_inventory,
+            adapter,
+            include_archived=self._config.catalog.include_archived_codex,
+        )
+        discovered = len(summaries)
+        indexed = 0
+        failed = 0
+        for thread_summary in summaries:
+            try:
+                projection = await self._provider_call(
+                    _call,
+                    adapter,
+                    "project_thread",
+                    thread_summary,
+                )
+                await asyncio.to_thread(
+                    _upsert,
+                    self._store,
+                    projection,
+                    False,
+                )
+                await self._maybe_enqueue_automatic(
+                    projection,
+                    discovery_mode=discovery_mode,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed += 1
+                continue
+            indexed += 1
+        return ScanSummary(
+            provider=Provider.CODEX,
+            discovered=discovered,
+            indexed=indexed,
+            rebuilt=0,
+            failed=failed,
+            duration_ms=0,
+        )
+
+    async def _scan_claude_persistent(
+        self,
+        discovery_mode: DiscoveryMode,
+    ) -> ScanSummary:
+        provider = Provider.CLAUDE
+        adapter = self._adapter(provider)
+        pending_ids = await self._load_pending(provider)
+        progress = await self._load_progress(provider)
+        committed_fingerprints = await self._load_claude_fingerprints(
+            _CLAUDE_FINGERPRINT_KEY
+        )
+        staged_fingerprints = await self._load_claude_fingerprints(
+            _CLAUDE_STAGED_KEY
+        )
+        backfill_processed = await self._load_backfill_processed(
+            provider,
+            discovery_mode,
+        )
+        discovered_paths = await self._provider_call(_call, adapter, "discover")
+        ordered_paths = await asyncio.to_thread(
+            _sort_claude_paths,
+            discovered_paths,
+        )
+        paths_by_native_id: dict[str, Path] = {}
+        current_fingerprints: dict[str, dict[str, int]] = {}
+        changed_ids: list[str] = []
+        for path in ordered_paths:
+            native_id = path.stem
+            if native_id in paths_by_native_id:
+                continue
+            paths_by_native_id[native_id] = path
+            fingerprint = _claude_path_fingerprint(path)
+            current_fingerprints[native_id] = fingerprint
+            if (
+                committed_fingerprints.get(native_id) != fingerprint
+                or (
+                    discovery_mode is DiscoveryMode.INITIAL_BACKFILL
+                    and native_id not in backfill_processed
+                )
+            ):
+                changed_ids.append(native_id)
+
+        pending_set = set(pending_ids)
+        promoted_ids = [
+            native_id
+            for native_id in changed_ids
+            if native_id not in pending_set
+            or staged_fingerprints.get(native_id)
+            != current_fingerprints.get(native_id)
+        ]
+        staged_ids = _merge_native_ids(promoted_ids, pending_ids)
+        await self._save_pending(provider, staged_ids)
+        await self._save_claude_fingerprints(
+            _CLAUDE_STAGED_KEY,
+            {
+                native_id: current_fingerprints.get(
+                    native_id, staged_fingerprints.get(native_id, {})
+                )
+                for native_id in staged_ids
+            },
+        )
+        selected_ids = staged_ids[: self._scan_batch_size]
+        indexed = 0
+        rebuilt = 0
+        failed_ids: list[str] = []
+        succeeded_ids: list[str] = []
+        for native_id in selected_ids:
+            try:
+                path = paths_by_native_id.get(native_id)
+                if path is None:
+                    path = await self._provider_call(
+                        _call,
+                        adapter,
+                        "find_native_session",
+                        native_id,
+                    )
+                if path is None:
+                    raise RuntimeError("staged Claude session is unavailable")
+                fingerprint = await asyncio.to_thread(_claude_path_fingerprint, path)
+                current_fingerprints[native_id] = fingerprint
+                parsed = await self._provider_call(_call, adapter, "parse", path)
+                projection = _projection_from_parse(parsed)
+                should_rebuild = bool(
+                    getattr(parsed, "rebuild", False)
+                    or native_id in committed_fingerprints
+                )
+                result = await asyncio.to_thread(
+                    _upsert,
+                    self._store,
+                    projection,
+                    should_rebuild,
+                )
+                await self._maybe_enqueue_automatic(
+                    projection,
+                    discovery_mode=discovery_mode,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed_ids.append(native_id)
+                continue
+            indexed += 1
+            rebuilt += int(should_rebuild or result.rebuilt)
+            succeeded_ids.append(native_id)
+            committed_fingerprints[native_id] = current_fingerprints[native_id]
+
+        unselected_ids = staged_ids[len(selected_ids) :]
+        remaining_ids = _merge_native_ids(unselected_ids, failed_ids)
+        await self._save_pending(provider, remaining_ids)
+        await self._save_claude_fingerprints(
+            _CLAUDE_STAGED_KEY,
+            {
+                native_id: current_fingerprints.get(
+                    native_id, staged_fingerprints.get(native_id, {})
+                )
+                for native_id in remaining_ids
+            },
+        )
+        await self._save_claude_fingerprints(
+            _CLAUDE_FINGERPRINT_KEY,
+            committed_fingerprints,
+        )
+        await self._commit_success_progress(
+            provider,
+            succeeded_ids=succeeded_ids,
+            remaining=len(remaining_ids),
+            previous_progress=progress,
+        )
+        await self._record_backfill_successes(
+            provider,
+            discovery_mode,
+            succeeded_ids,
+        )
+        return ScanSummary(
+            provider=provider,
+            discovered=len(staged_ids),
+            indexed=indexed,
+            rebuilt=rebuilt,
+            failed=len(failed_ids),
+            duration_ms=0,
+        )
+
+    async def _load_claude_fingerprints(
+        self,
+        key: str,
+    ) -> dict[str, dict[str, int]]:
+        state = await asyncio.to_thread(_call, self._store, "get_state", key)
+        return _decode_claude_fingerprints(state)
+
+    async def _save_claude_fingerprints(
+        self,
+        key: str,
+        fingerprints: Mapping[str, Mapping[str, int]],
+    ) -> None:
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            key,
+            {
+                "version": 1,
+                "sessions": {
+                    native_id: dict(fingerprint)
+                    for native_id, fingerprint in sorted(fingerprints.items())
+                    if fingerprint
+                },
+            },
+        )
+
+    async def _commit_success_progress(
+        self,
+        provider: Provider,
+        *,
+        succeeded_ids: list[str],
+        remaining: int,
+        previous_progress: dict[str, int | str] | None,
+    ) -> None:
+        if not succeeded_ids:
+            return
+        indexed_total = (
+            int(previous_progress["indexed_total"])
+            if previous_progress is not None
+            else 0
+        ) + len(succeeded_ids)
+        progress: dict[str, int | str] = {
+            "version": 1,
+            "last_committed_native_id": succeeded_ids[-1],
+            "indexed_total": indexed_total,
+            "remaining": remaining,
+        }
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _PROGRESS_KEYS[provider],
+            progress,
+        )
+        self._backfill_progress[provider] = dict(progress)
+
+    async def _scan_codex_persistent(
+        self,
+        discovery_mode: DiscoveryMode,
+    ) -> ScanSummary:
+        provider = Provider.CODEX
+        adapter = self._adapter(provider)
+        pending_ids = await self._load_pending(provider)
+        progress = await self._load_progress(provider)
+        discovered_summaries = await self._provider_call(
+            _codex_inventory,
+            adapter,
+            include_archived=self._config.catalog.include_archived_codex,
+        )
+        ordered_summaries = _sort_codex_summaries(discovered_summaries)
+        summaries_by_native_id: dict[str, object] = {}
+        inventory_ids: list[str] = []
+        for summary in ordered_summaries:
+            native_id = _codex_native_id(summary)
+            if native_id in summaries_by_native_id:
+                continue
+            summaries_by_native_id[native_id] = summary
+            inventory_ids.append(native_id)
+
+        seen_ids = await self._load_codex_seen_ids()
+        cataloged_ids = await self._cataloged_codex_ids(inventory_ids)
+        genuinely_new_ids = [
+            native_id
+            for native_id in inventory_ids
+            if native_id not in seen_ids and native_id not in cataloged_ids
+        ]
+        backfill_processed = await self._load_backfill_processed(
+            provider,
+            discovery_mode,
+        )
+        backfill_ids = (
+            [
+                native_id
+                for native_id in inventory_ids
+                if native_id not in backfill_processed
+            ]
+            if discovery_mode is DiscoveryMode.INITIAL_BACKFILL
+            else []
+        )
+        staged_ids = _merge_native_ids(
+            backfill_ids,
+            genuinely_new_ids,
+            pending_ids,
+        )
+        await self._save_pending(provider, staged_ids)
+        selected_ids = staged_ids[: self._scan_batch_size]
+        indexed = 0
+        for native_id in selected_ids:
+            try:
+                summary = summaries_by_native_id.get(native_id)
+                if summary is None:
+                    summary = await self._provider_call(
+                        _call,
+                        adapter,
+                        "find_native_thread",
+                        native_id,
+                    )
+                if summary is None:
+                    raise RuntimeError("staged Codex thread is unavailable")
+                projection = await self._provider_call(
+                    _call,
+                    adapter,
+                    "project_thread",
+                    summary,
+                )
+                await asyncio.to_thread(
+                    _upsert,
+                    self._store,
+                    projection,
+                    False,
+                )
+                await self._maybe_enqueue_automatic(
+                    projection,
+                    discovery_mode=discovery_mode,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                return ScanSummary(
+                    provider=provider,
+                    discovered=len(staged_ids),
+                    indexed=indexed,
+                    rebuilt=0,
+                    failed=1,
+                    duration_ms=0,
+                )
+            indexed += 1
+
+        await self._commit_scan_batch(
+            provider,
+            staged_ids=staged_ids,
+            selected_ids=selected_ids,
+            previous_progress=progress,
+        )
+        await self._save_codex_seen_ids(seen_ids | set(inventory_ids))
+        await self._record_backfill_successes(
+            provider,
+            discovery_mode,
+            selected_ids,
+        )
+        return ScanSummary(
+            provider=provider,
+            discovered=len(staged_ids),
+            indexed=indexed,
+            rebuilt=0,
+            failed=0,
+            duration_ms=0,
+        )
+
+    async def _load_pending(self, provider: Provider) -> list[str]:
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _PENDING_KEYS[provider],
+        )
+        return _decode_pending_state(state)
+
+    async def _save_pending(
+        self,
+        provider: Provider,
+        native_ids: list[str],
+    ) -> None:
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _PENDING_KEYS[provider],
+            {"version": 1, "native_ids": list(native_ids)},
+        )
+
+    async def _load_progress(
+        self,
+        provider: Provider,
+    ) -> dict[str, int | str] | None:
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _PROGRESS_KEYS[provider],
+        )
+        progress = _decode_progress_state(state)
+        if progress is not None:
+            self._backfill_progress[provider] = dict(progress)
+        return progress
+
+    async def _commit_scan_batch(
+        self,
+        provider: Provider,
+        *,
+        staged_ids: list[str],
+        selected_ids: list[str],
+        previous_progress: dict[str, int | str] | None,
+    ) -> None:
+        if not selected_ids:
+            return
+        remaining_ids = staged_ids[len(selected_ids) :]
+        indexed_total = (
+            int(previous_progress["indexed_total"])
+            if previous_progress is not None
+            else 0
+        ) + len(selected_ids)
+        progress: dict[str, int | str] = {
+            "version": 1,
+            "last_committed_native_id": selected_ids[-1],
+            "indexed_total": indexed_total,
+            "remaining": len(remaining_ids),
+        }
+        await self._save_pending(provider, remaining_ids)
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _PROGRESS_KEYS[provider],
+            progress,
+        )
+        self._backfill_progress[provider] = dict(progress)
+
+    async def _scan_loop(self) -> None:
+        while self._running:
+            try:
+                await self.scan_once()
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                self._record_error_code("catalog_scan_loop_failed")
+            await self._sleep(self._config.service.catalog_scan_seconds)
+
+    async def _watch_loop(self) -> None:
+        root = self._claude_projects_root
+        stop_event = self._watch_stop_event
+        if root is None or stop_event is None:
+            return
+        pending_scan: asyncio.Task[None] | None = None
+        iterator: Any = None
+        try:
+            factory = self._awatch_factory or _load_default_awatch()
+            iterator = factory(root, stop_event=stop_event)
+            async for changes in iterator:
+                if stop_event.is_set() or not self._running:
+                    break
+                if not changes:
+                    continue
+                if pending_scan is not None:
+                    pending_scan.cancel()
+                    await asyncio.gather(pending_scan, return_exceptions=True)
+                pending_scan = asyncio.create_task(self._debounced_claude_scan())
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._mark_watcher_failure()
+        finally:
+            if pending_scan is not None:
+                pending_scan.cancel()
+                await asyncio.gather(pending_scan, return_exceptions=True)
+            closer = getattr(iterator, "aclose", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if self._running and not stop_event.is_set():
+                        self._mark_watcher_failure()
+
+    async def _debounced_claude_scan(self) -> None:
+        await self._sleep(self._watch_debounce_seconds)
+        stop_event = self._watch_stop_event
+        if self._running and (stop_event is None or not stop_event.is_set()):
+            await self.scan_once(Provider.CLAUDE)
+
+    async def _reconcile_loop(self) -> None:
+        while self._running:
+            await self._sleep(self._config.service.reconcile_seconds)
+            if self._running:
+                try:
+                    await self.reconcile_once()
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    self._record_error_code("mirror_reconcile_failed")
+                try:
+                    await self.process_jobs_once()
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    self._record_error_code("mirror_job_processing_failed")
+
+    def _adapter(self, provider: Provider) -> object:
+        try:
+            return self._adapters[provider]
+        except KeyError as exc:
+            raise RuntimeError("scan adapter is not configured") from exc
+
+    def _start_provider_call(
+        self,
+        function: Callable[..., Any],
+        *args: object,
+        **kwargs: object,
+    ) -> asyncio.Task[Any]:
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        self._provider_tasks.add(task)
+        task.add_done_callback(self._provider_call_done)
+        return task
+
+    async def _provider_call(
+        self,
+        function: Callable[..., Any],
+        *args: object,
+        **kwargs: object,
+    ) -> Any:
+        task = self._start_provider_call(function, *args, **kwargs)
+        return await asyncio.shield(task)
+
+    def _provider_call_done(self, task: asyncio.Task[Any]) -> None:
+        self._provider_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
+
+    def _mark_scan_failure(self, provider: Provider) -> None:
+        self._provider_health[provider]["degraded_reason"] = "scan_failed"
+        self._record_error_code(f"{provider.value}_scan_failed")
+
+    def _mark_scan_success(self, provider: Provider) -> None:
+        self._mark_provider_success(provider)
+
+    def _mark_refresh_failure(self, provider: Provider) -> None:
+        self._provider_health[provider]["degraded_reason"] = "refresh_failed"
+        self._record_error_code(f"{provider.value}_refresh_failed")
+
+    def _mark_provider_success(self, provider: Provider) -> None:
+        self._provider_health[provider]["last_success"] = float(self._clock())
+        self._provider_health[provider]["degraded_reason"] = None
+
+    def _mark_watcher_failure(self) -> None:
+        self._watcher_state = "degraded"
+        self._watcher_error_code = "claude_watcher_failed"
+        self._record_error_code("claude_watcher_failed")
+
+    def _record_error_code(self, code: str) -> None:
+        self._recent_error_codes.append(code)
+        del self._recent_error_codes[:-_RECENT_ERROR_LIMIT]
+
+    def _elapsed_ms(self, started: float) -> float:
+        return max(0.0, (float(self._monotonic()) - started) * 1000.0)
+
+
+def _zero_scan(provider: Provider | None) -> ScanSummary:
+    return ScanSummary(
+        provider=provider,
+        discovered=0,
+        indexed=0,
+        rebuilt=0,
+        failed=0,
+        duration_ms=0,
+    )
+
+
+def _call(instance: object, name: str, *args: object, **kwargs: object) -> Any:
+    method = getattr(instance, name, None)
+    if not callable(method):
+        raise RuntimeError("scan adapter does not implement the required operation")
+    return method(*args, **kwargs)
+
+
+def _safe_target_error_code(provider: Provider, code: object) -> str:
+    if (
+        isinstance(code, str)
+        and 0 < len(code) <= 64
+        and "a" <= code[0] <= "z"
+        and all(character.islower() or character.isdigit() or character == "_" for character in code)
+    ):
+        return code
+    return f"{provider.value}_target_failed"
+
+
+def _healthy_breaker_batch_completed(
+    progress: BatchProgress,
+    policy: MirrorPolicy,
+) -> bool:
+    return (
+        progress.attempts >= policy.stop_after_attempts
+        and (
+            progress.errors == 0
+            or progress.errors / progress.attempts < policy.stop_error_rate
+        )
+    )
+
+
+def _projection_from_parse(parsed: object) -> SessionProjection:
+    projection = getattr(parsed, "projection", None)
+    if not isinstance(projection, SessionProjection):
+        raise RuntimeError("Claude parser returned no session projection")
+    return projection
+
+
+def _upsert(
+    store: object,
+    projection: object,
+    rebuild: bool,
+) -> UpsertResult:
+    if not isinstance(projection, SessionProjection):
+        raise RuntimeError("scan adapter returned no session projection")
+    result = _call(store, "upsert_projection", projection, rebuild=rebuild)
+    if not isinstance(result, UpsertResult):
+        raise RuntimeError("session store returned no upsert result")
+    return result
+
+
+def _supports_scan_state(store: object) -> bool:
+    return callable(getattr(store, "get_state", None)) and callable(
+        getattr(store, "set_state", None)
+    )
+
+
+def _load_default_awatch() -> _AWatchFactory:
+    from watchfiles import awatch
+
+    return awatch
+
+
+def _sort_claude_paths(paths: object) -> list[Path]:
+    try:
+        normalized = [Path(path) for path in paths]  # type: ignore[union-attr]
+    except TypeError as exc:
+        raise RuntimeError("Claude discovery returned no path list") from exc
+    return sorted(
+        normalized,
+        key=lambda path: (-float(path.stat().st_mtime), path.stem, str(path)),
+    )
+
+
+def _claude_path_fingerprint(path: Path) -> dict[str, int]:
+    stat = Path(path).stat()
+    return {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+
+
+def _decode_claude_fingerprints(
+    state: object,
+) -> dict[str, dict[str, int]]:
+    if state is None:
+        return {}
+    if not isinstance(state, Mapping):
+        raise RuntimeError("invalid Claude fingerprint state")
+    typed_state = cast("Mapping[str, Any]", state)
+    if typed_state.get("version") != 1:
+        raise RuntimeError("invalid Claude fingerprint state")
+    sessions = typed_state.get("sessions")
+    if not isinstance(sessions, Mapping):
+        raise RuntimeError("invalid Claude fingerprint state")
+    decoded: dict[str, dict[str, int]] = {}
+    for native_id, raw_fingerprint in sessions.items():
+        if not isinstance(native_id, str) or not native_id.strip():
+            raise RuntimeError("invalid Claude fingerprint state")
+        if not isinstance(raw_fingerprint, Mapping):
+            raise RuntimeError("invalid Claude fingerprint state")
+        mtime_ns = raw_fingerprint.get("mtime_ns")
+        size = raw_fingerprint.get("size")
+        if (
+            set(raw_fingerprint) != {"mtime_ns", "size"}
+            or not isinstance(mtime_ns, int)
+            or isinstance(mtime_ns, bool)
+            or mtime_ns < 0
+            or not isinstance(size, int)
+            or isinstance(size, bool)
+            or size < 0
+        ):
+            raise RuntimeError("invalid Claude fingerprint state")
+        decoded[native_id.strip()] = {"mtime_ns": mtime_ns, "size": size}
+    return decoded
+
+
+def _decode_creation_rate_state(state: object, *, now: float) -> list[float]:
+    if state is None:
+        return []
+    if not isinstance(state, Mapping):
+        raise RuntimeError("invalid mirror creation rate state")
+    typed_state = cast("Mapping[str, Any]", state)
+    if set(typed_state) != {"version", "attempted_at"}:
+        raise RuntimeError("invalid mirror creation rate state")
+    if typed_state.get("version") != 1:
+        raise RuntimeError("invalid mirror creation rate state")
+    attempted_at = typed_state.get("attempted_at")
+    if not isinstance(attempted_at, list):
+        raise RuntimeError("invalid mirror creation rate state")
+    recent: list[float] = []
+    for raw_timestamp in attempted_at:
+        timestamp = _finite_number(raw_timestamp, "mirror creation timestamp")
+        if timestamp > now:
+            raise RuntimeError("invalid mirror creation rate state")
+        if timestamp > now - 60.0:
+            recent.append(timestamp)
+    return recent
+
+
+def _decode_breaker_state(state: object) -> BatchProgress:
+    if state is None:
+        return BatchProgress()
+    if not isinstance(state, Mapping):
+        raise RuntimeError("invalid mirror breaker state")
+    typed_state = cast("Mapping[str, Any]", state)
+    if set(typed_state) != {
+        "version",
+        "attempts",
+        "errors",
+    }:
+        raise RuntimeError("invalid mirror breaker state")
+    if typed_state.get("version") != 1:
+        raise RuntimeError("invalid mirror breaker state")
+    attempts = typed_state.get("attempts")
+    errors = typed_state.get("errors")
+    if (
+        not isinstance(attempts, int)
+        or isinstance(attempts, bool)
+        or not isinstance(errors, int)
+        or isinstance(errors, bool)
+    ):
+        raise RuntimeError("invalid mirror breaker state")
+    return BatchProgress(attempts=attempts, errors=errors)
+
+
+def _sort_codex_summaries(summaries: object) -> list[object]:
+    try:
+        normalized = list(summaries)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise RuntimeError("Codex inventory returned no summary list") from exc
+    return sorted(
+        normalized,
+        key=lambda summary: (
+            -_codex_last_active(summary),
+            _codex_native_id(summary),
+        ),
+    )
+
+
+def _codex_inventory(
+    adapter: object,
+    *,
+    include_archived: bool,
+) -> list[object]:
+    passes = [False, True] if include_archived else [False]
+    merged: dict[str, object] = {}
+    for archived in passes:
+        summaries = _call(adapter, "list_inventory", archived=archived)
+        try:
+            batch = list(summaries)
+        except TypeError as exc:
+            raise RuntimeError("Codex inventory returned no summary list") from exc
+        for summary in batch:
+            native_id = _codex_native_id(summary)
+            merged.setdefault(native_id, summary)
+    return list(merged.values())
+
+
+def _codex_native_id(summary: object) -> str:
+    native_id = getattr(summary, "native_id", None)
+    if not isinstance(native_id, str) or not native_id.strip():
+        raise RuntimeError("Codex inventory summary has no native identity")
+    return native_id.strip()
+
+
+def _codex_last_active(summary: object) -> float:
+    value = getattr(summary, "last_active", None)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise RuntimeError("Codex inventory summary has no activity timestamp")
+    return float(value)
+
+
+def _merge_native_ids(*groups: Sequence[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for native_id in group:
+            if native_id in seen:
+                continue
+            seen.add(native_id)
+            merged.append(native_id)
+    return merged
+
+
+def _decode_pending_state(state: object) -> list[str]:
+    if state is None:
+        return []
+    if not isinstance(state, dict):
+        raise RuntimeError("invalid pending scan state")
+    typed_state = cast("dict[str, Any]", state)
+    if typed_state.get("version") != 1:
+        raise RuntimeError("invalid pending scan state")
+    native_ids = typed_state.get("native_ids")
+    if not isinstance(native_ids, list):
+        raise RuntimeError("invalid pending scan state")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for native_id in native_ids:
+        if not isinstance(native_id, str) or not native_id.strip():
+            raise RuntimeError("invalid pending scan state")
+        candidate = native_id.strip()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
+
+
+def _decode_native_id_set_state(state: object, *, label: str) -> list[str]:
+    if state is None:
+        return []
+    if not isinstance(state, Mapping):
+        raise RuntimeError(f"invalid {label} state")
+    typed_state = cast("dict[str, Any]", dict(state))
+    if (
+        set(typed_state) != {"version", "native_ids"}
+        or typed_state.get("version") != 1
+    ):
+        raise RuntimeError(f"invalid {label} state")
+    native_ids = typed_state.get("native_ids")
+    if not isinstance(native_ids, list):
+        raise RuntimeError(f"invalid {label} state")
+    normalized: list[str] = []
+    for native_id in native_ids:
+        if (
+            not isinstance(native_id, str)
+            or not native_id.strip()
+            or native_id != native_id.strip()
+            or native_id in normalized
+        ):
+            raise RuntimeError(f"invalid {label} state")
+        normalized.append(native_id)
+    return normalized
+
+
+def _decode_backfill_state(state: object) -> tuple[bool, set[str]]:
+    if state is None:
+        return False, set()
+    if not isinstance(state, Mapping):
+        raise RuntimeError("invalid backfill state")
+    typed_state = cast("dict[str, Any]", dict(state))
+    if set(typed_state) != {"version", "completed", "processed_native_ids"}:
+        raise RuntimeError("invalid backfill state")
+    if (
+        typed_state.get("version") != 1
+        or type(typed_state.get("completed")) is not bool
+    ):
+        raise RuntimeError("invalid backfill state")
+    processed = _decode_native_id_set_state(
+        {"version": 1, "native_ids": typed_state.get("processed_native_ids")},
+        label="backfill processed IDs",
+    )
+    return bool(typed_state["completed"]), set(processed)
+
+
+def _decode_continuation_reconcile_cursor(state: object) -> str | None:
+    if state is None:
+        return None
+    if not isinstance(state, Mapping):
+        raise RuntimeError("invalid continuation reconcile cursor")
+    typed_state = cast("dict[str, Any]", dict(state))
+    if (
+        set(typed_state) != {"version", "after_bridge_id"}
+        or typed_state.get("version") != 1
+    ):
+        raise RuntimeError("invalid continuation reconcile cursor")
+    after_bridge_id = typed_state.get("after_bridge_id")
+    if after_bridge_id is None:
+        return None
+    if (
+        not isinstance(after_bridge_id, str)
+        or not after_bridge_id.strip()
+        or after_bridge_id != after_bridge_id.strip()
+    ):
+        raise RuntimeError("invalid continuation reconcile cursor")
+    return after_bridge_id
+
+
+def _decode_progress_state(state: object) -> dict[str, int | str] | None:
+    if state is None:
+        return None
+    if not isinstance(state, dict):
+        raise RuntimeError("invalid scan progress state")
+    typed_state = cast("dict[str, Any]", state)
+    if typed_state.get("version") != 1:
+        raise RuntimeError("invalid scan progress state")
+    native_id = typed_state.get("last_committed_native_id")
+    indexed_total = typed_state.get("indexed_total")
+    remaining = typed_state.get("remaining")
+    if not isinstance(native_id, str) or not native_id.strip():
+        raise RuntimeError("invalid scan progress state")
+    if (
+        not isinstance(indexed_total, int)
+        or isinstance(indexed_total, bool)
+        or indexed_total < 0
+    ):
+        raise RuntimeError("invalid scan progress state")
+    if not isinstance(remaining, int) or isinstance(remaining, bool) or remaining < 0:
+        raise RuntimeError("invalid scan progress state")
+    return {
+        "version": 1,
+        "last_committed_native_id": native_id.strip(),
+        "indexed_total": indexed_total,
+        "remaining": remaining,
+    }
+
+
+def _read_exact_projection(
+    adapter: object,
+    provider: Provider,
+    native_id: str,
+) -> SessionProjection:
+    if provider is Provider.CLAUDE:
+        path = _call(adapter, "find_native_session", native_id)
+        if path is None:
+            raise RuntimeError("Claude session is unavailable")
+        projection = _projection_from_parse(_call(adapter, "parse", path))
+    elif provider is Provider.CODEX:
+        summary = _call(adapter, "find_native_thread", native_id)
+        if summary is None:
+            raise RuntimeError("Codex thread is unavailable")
+        projection = _call(adapter, "project_thread", summary)
+        if not isinstance(projection, SessionProjection):
+            raise RuntimeError("Codex projector returned no session projection")
+    else:
+        raise RuntimeError("refresh provider is unsupported")
+    return projection
+
+
+def _stale_refresh(
+    session_id: str,
+    durable: Mapping[str, Any],
+) -> RefreshResult:
+    cursor = durable.get("last_native_cursor")
+    source_hash = durable.get("last_native_hash")
+    if (
+        not isinstance(cursor, str)
+        or not cursor.strip()
+        or not isinstance(source_hash, str)
+        or not source_hash.strip()
+    ):
+        raise RuntimeError("durable snapshot unavailable")
+    return RefreshResult(
+        session_id=session_id,
+        cursor=cursor.strip(),
+        source_hash=source_hash.strip(),
+        stale=True,
+        warning="source_refresh_failed_using_durable_snapshot",
+    )
+
+
+def _validate_continue_request(request: ContinueRequest) -> None:
+    if not isinstance(request, ContinueRequest):
+        raise TypeError("request must be a ContinueRequest")
+    for label, value in (
+        ("session ID", request.session_id),
+        ("bridge ID", request.bridge_id),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must not be empty")
+    if request.target_provider not in _EXTERNAL_PROVIDERS:
+        raise ValueError("continuation target must be Claude or Codex")
+    if (
+        not isinstance(request.context_budget_chars, int)
+        or isinstance(request.context_budget_chars, bool)
+        or not 0 < request.context_budget_chars <= 100_000
+    ):
+        raise ValueError("context budget must be between 1 and 100000 characters")
+
+
+def _external_row_session_id(
+    row: Mapping[str, Any],
+    provider: Provider,
+) -> str:
+    session_id = row.get("session_id")
+    native_id = row.get("native_id")
+    if (
+        row.get("provider") != provider.value
+        or not isinstance(session_id, str)
+        or not isinstance(native_id, str)
+        or session_id != canonical_session_id(provider, native_id)
+    ):
+        raise RuntimeError("continuation target identity is invalid")
+    return session_id
+
+
+def _provider_from_session_id(session_id: str) -> Provider:
+    prefix, separator, native_id = session_id.partition(":")
+    if not separator or not native_id:
+        raise RuntimeError("external session identity is invalid")
+    try:
+        provider = Provider(prefix)
+    except ValueError as exc:
+        raise RuntimeError("external session identity is invalid") from exc
+    if provider not in _EXTERNAL_PROVIDERS:
+        raise RuntimeError("external session identity is invalid")
+    if canonical_session_id(provider, native_id) != session_id:
+        raise RuntimeError("external session identity is invalid")
+    return provider
+
+
+def _validated_continuation_snapshot(raw_snapshot: object) -> dict[str, Any]:
+    if not isinstance(raw_snapshot, Mapping):
+        raise RuntimeError("continuation snapshot is invalid")
+    snapshot = dict(raw_snapshot)
+    if snapshot.get("version") != 1:
+        raise RuntimeError("continuation snapshot is invalid")
+    for key in (
+        "pack_id",
+        "source_session_id",
+        "source_cursor",
+        "source_hash",
+        "target_session_id",
+        "target_cursor",
+        "target_hash",
+    ):
+        value = snapshot.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("continuation snapshot is invalid")
+        snapshot[key] = value.strip()
+    return snapshot
+
+
+def _validated_periodic_continuation_snapshot(
+    raw_snapshot: object,
+) -> dict[str, Any]:
+    snapshot = _validated_continuation_snapshot(raw_snapshot)
+    assert isinstance(raw_snapshot, Mapping)
+    typed_snapshot = cast("Mapping[str, Any]", raw_snapshot)
+    bridge_id = typed_snapshot.get("bridge_id")
+    if not isinstance(bridge_id, str) or not bridge_id.strip():
+        raise RuntimeError("continuation snapshot is invalid")
+    snapshot["bridge_id"] = bridge_id.strip()
+    return snapshot
+
+
+def _context_pack_from_row(raw_row: object) -> ContextPack:
+    if not isinstance(raw_row, Mapping):
+        raise RuntimeError("context pack record is invalid")
+    row = dict(raw_row)
+    required = {
+        key: _required_mapping_text(row, key)
+        for key in (
+            "id",
+            "bridge_id",
+            "source_session_id",
+            "source_cursor",
+            "source_hash",
+            "payload",
+        )
+    }
+    target_session_id = row.get("target_session_id")
+    if target_session_id is not None and (
+        not isinstance(target_session_id, str) or not target_session_id.strip()
+    ):
+        raise RuntimeError("context pack record is invalid")
+    budget_chars = row.get("budget_chars")
+    if (
+        not isinstance(budget_chars, int)
+        or isinstance(budget_chars, bool)
+        or budget_chars <= 0
+    ):
+        raise RuntimeError("context pack record is invalid")
+    created_at = _mapping_number(row, "created_at")
+    immutable_at_raw = row.get("immutable_at")
+    immutable_at = (
+        None
+        if immutable_at_raw is None
+        else _finite_number(immutable_at_raw, "immutable_at")
+    )
+    return ContextPack(
+        id=required["id"],
+        bridge_id=required["bridge_id"],
+        source_session_id=required["source_session_id"],
+        target_session_id=(
+            target_session_id.strip() if isinstance(target_session_id, str) else None
+        ),
+        source_cursor=required["source_cursor"],
+        source_hash=required["source_hash"],
+        budget_chars=budget_chars,
+        payload=required["payload"],
+        created_at=created_at,
+        immutable_at=immutable_at,
+    )
+
+
+def _session_link_from_row(raw_row: object) -> SessionLink:
+    if not isinstance(raw_row, Mapping):
+        raise RuntimeError("session link record is invalid")
+    row = dict(raw_row)
+    try:
+        relation = Relation(row.get("relation"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("session link record is invalid") from exc
+    source_cursor = row.get("source_cursor")
+    source_hash = row.get("source_hash")
+    if source_cursor is not None and not isinstance(source_cursor, str):
+        raise RuntimeError("session link record is invalid")
+    if source_hash is not None and not isinstance(source_hash, str):
+        raise RuntimeError("session link record is invalid")
+    return SessionLink(
+        id=_required_mapping_text(row, "id"),
+        from_session_id=_required_mapping_text(row, "from_session_id"),
+        to_session_id=_required_mapping_text(row, "to_session_id"),
+        relation=relation,
+        bridge_id=_required_mapping_text(row, "bridge_id"),
+        source_cursor=source_cursor,
+        source_hash=source_hash,
+        created_at=_mapping_number(row, "created_at"),
+    )
+
+
+def _required_mapping_text(row: Mapping[str, Any], key: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError("durable bridge record is invalid")
+    return value.strip()
+
+
+def _mapping_number(row: Mapping[str, Any], key: str) -> float:
+    return _finite_number(row.get(key), key)
+
+
+def _finite_number(value: object, label: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
+        raise RuntimeError(f"{label} is invalid")
+    return float(value)
+
+
+def _validated_job(raw_job: object) -> dict[str, Any]:
+    if not isinstance(raw_job, Mapping):
+        raise RuntimeError("mirror job is invalid")
+    job = dict(raw_job)
+    for key in ("id", "idempotency_key", "source_session_id"):
+        value = job.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise RuntimeError("mirror job is invalid")
+        job[key] = value.strip()
+    try:
+        provider = Provider(job.get("target_provider"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("mirror job target provider is invalid") from exc
+    if provider not in _EXTERNAL_PROVIDERS:
+        raise RuntimeError("mirror job target provider is invalid")
+    job["target_provider"] = provider.value
+    attempts = job.get("attempts")
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts <= 0:
+        raise RuntimeError("mirror job attempts are invalid")
+    return job
+
+
+def _attempt_key(job: Mapping[str, Any]) -> str:
+    return f"{_ATTEMPT_KEY_PREFIX}{job['id']}"
+
+
+def _bridge_id(job: Mapping[str, Any]) -> str:
+    key = str(job["idempotency_key"])
+    digest = hashlib.sha256(f"session-bridge:{key}".encode()).hexdigest()
+    return f"bridge:{digest}"
+
+
+def _claude_native_id(job: Mapping[str, Any]) -> str:
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"hermes-session-bridge:{job['idempotency_key']}",
+        )
+    )
+
+
+def _placeholder_native_id(result: object) -> str:
+    native_id = getattr(result, "native_id", None)
+    if not isinstance(native_id, str) or not native_id.strip():
+        raise RuntimeError("placeholder result has no native identity")
+    return native_id.strip()
+
+
+def _validated_attempt_sidecar(
+    raw_sidecar: object,
+    job: Mapping[str, Any],
+    *,
+    policy_generation: int,
+) -> dict[str, Any]:
+    if not isinstance(raw_sidecar, Mapping):
+        raise RuntimeError("mirror attempt sidecar is invalid")
+    sidecar = dict(raw_sidecar)
+    provider = Provider(job["target_provider"])
+    expected_fields = {
+        "version",
+        "phase",
+        "bridge_id",
+        "target_provider",
+        "policy_generation",
+        "attempts",
+    }
+    if provider is Provider.CLAUDE:
+        expected_fields.add("expected_native_id")
+    bridge_id = sidecar.get("bridge_id")
+    if (
+        set(sidecar) != expected_fields
+        or sidecar.get("version") != 1
+        or sidecar.get("phase") != "provider_call_started"
+        or not isinstance(bridge_id, str)
+        or bridge_id != _bridge_id(job)
+        or sidecar.get("target_provider") != job["target_provider"]
+        or sidecar.get("policy_generation") != policy_generation
+        or sidecar.get("attempts") != job["attempts"]
+    ):
+        raise RuntimeError("mirror attempt sidecar is invalid")
+    expected_native_id = sidecar.get("expected_native_id")
+    if provider is Provider.CLAUDE and expected_native_id != _claude_native_id(job):
+        raise RuntimeError("mirror attempt sidecar is invalid")
+    return sidecar

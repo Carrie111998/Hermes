@@ -215,6 +215,14 @@ class CodexSourceAdapter:
             origin_bridge_id=origin_bridge_id,
         )
 
+    def projection_has_marker_payload(
+        self,
+        projection: SessionProjection,
+        payload: BridgeMarkerPayload,
+    ) -> bool:
+        marker = encode_bridge_marker(payload, self._marker_secret)
+        return _projection_has_exact_marker(projection, marker=marker)
+
     def find_native_thread(
         self,
         native_id: str,

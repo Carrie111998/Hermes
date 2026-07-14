@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 
 import pytest
 
@@ -15,6 +17,7 @@ from session_bridge.mirror import (
 )
 from session_bridge.models import (
     ContextPack,
+    MirrorJobState,
     OriginKind,
     ProjectedMessage,
     Provider,
@@ -86,6 +89,75 @@ def _projection(
 def _rows(db: SessionDB, sql: str, params=()):
     with db._lock:
         return [dict(row) for row in db._conn.execute(sql, params).fetchall()]
+
+
+def _seed_continuation_snapshot_rows(db: SessionDB, count: int) -> None:
+    def _write(conn):
+        for index in range(count):
+            suffix = f"{index:04d}"
+            bridge_id = f"bridge-{suffix}"
+            source_id = f"claude:source-{suffix}"
+            target_id = f"codex:target-{suffix}"
+            pack_id = f"pack-{suffix}"
+            conn.executemany(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                [(source_id, "claude", 1.0), (target_id, "codex", 1.0)],
+            )
+            conn.execute(
+                """INSERT INTO session_context_packs (
+                   id, bridge_id, source_session_id, target_session_id,
+                   source_cursor, source_hash, budget_chars, payload,
+                   created_at, immutable_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    pack_id,
+                    bridge_id,
+                    source_id,
+                    target_id,
+                    f"source-cursor-{suffix}",
+                    f"source-hash-{suffix}",
+                    4000,
+                    "handoff",
+                    2.0,
+                    3.0,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO session_links (
+                   id, from_session_id, to_session_id, relation, bridge_id,
+                   source_cursor, source_hash, created_at, hydrated_at
+                   ) VALUES (?, ?, ?, 'continues', ?, ?, ?, ?, ?)""",
+                (
+                    f"link-{suffix}",
+                    source_id,
+                    target_id,
+                    bridge_id,
+                    f"source-cursor-{suffix}",
+                    f"source-hash-{suffix}",
+                    2.0,
+                    3.0,
+                ),
+            )
+            snapshot = {
+                "version": 1,
+                "pack_id": pack_id,
+                "source_session_id": source_id,
+                "source_cursor": f"source-cursor-{suffix}",
+                "source_hash": f"source-hash-{suffix}",
+                "target_session_id": target_id,
+                "target_cursor": f"target-cursor-{suffix}",
+                "target_hash": f"target-hash-{suffix}",
+            }
+            conn.execute(
+                "INSERT INTO session_bridge_state (key, value_json, updated_at) VALUES (?, ?, ?)",
+                (
+                    f"session-bridge:continuation:{bridge_id}",
+                    json.dumps(snapshot, sort_keys=True, separators=(",", ":")),
+                    4.0,
+                ),
+            )
+
+    db._execute_write(_write)
 
 
 def _enqueue_manual_job(
@@ -784,6 +856,340 @@ def test_low_level_mirror_job_is_idempotent_but_public_claim_fails_closed(db):
     assert failed["error_code"] == "authority_missing"
 
 
+def test_mirror_jobs_can_be_listed_by_state_with_a_deterministic_bound(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    jobs = []
+    for native_id in ("source-c", "source-a", "source-b"):
+        session_id = f"claude:{native_id}"
+        store.upsert_projection(
+            _projection(_message(native_id, native_id), native_id=native_id)
+        )
+        jobs.append(
+            store.enqueue_mirror_job(session_id, Provider.CODEX, policy_generation=1)
+        )
+    retry_id = jobs[1]["id"]
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_mirror_jobs SET state = 'retry' WHERE id = ?",
+            (retry_id,),
+        )
+    )
+
+    first = store.list_mirror_jobs(
+        [MirrorJobState.RETRY, MirrorJobState.QUEUED], limit=2
+    )
+    replay = store.list_mirror_jobs(["queued", "retry"], limit=2)
+
+    expected_ids = sorted(job["id"] for job in jobs)[:2]
+    assert [job["id"] for job in first] == expected_ids
+    assert replay == first
+
+
+def test_mirror_job_listing_validates_state_filters_and_limit(db):
+    store = SessionBridgeStore(db)
+
+    assert store.list_mirror_jobs([], limit=1) == []
+    with pytest.raises(ValueError, match="mirror job state"):
+        store.list_mirror_jobs(["unknown"], limit=1)
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_mirror_jobs([MirrorJobState.QUEUED], limit=0)
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_mirror_jobs([MirrorJobState.QUEUED], limit=1001)
+
+
+def test_mirror_job_counts_have_a_stable_all_states_shape(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    for native_id in ("queued", "running", "failed"):
+        store.upsert_projection(
+            _projection(_message(native_id, native_id), native_id=native_id)
+        )
+        store.enqueue_mirror_job(
+            f"claude:{native_id}", Provider.CODEX, policy_generation=1
+        )
+    db._execute_write(
+        lambda conn: conn.executescript(
+            """UPDATE session_mirror_jobs SET state = 'running'
+               WHERE source_session_id = 'claude:running';
+               UPDATE session_mirror_jobs SET state = 'manual_failure'
+               WHERE source_session_id = 'claude:failed';"""
+        )
+    )
+
+    assert store.mirror_job_counts() == {
+        "queued": 1,
+        "running": 1,
+        "retry": 0,
+        "succeeded": 0,
+        "manual_failure": 1,
+    }
+
+
+def test_atomic_rate_limited_claim_prevents_two_store_oversubscription(tmp_path):
+    path = tmp_path / "shared-state.db"
+    first_db = SessionDB(path)
+    second_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(first_db, clock=lambda: 100.0)
+        second = SessionBridgeStore(second_db, clock=lambda: 100.0)
+        for native_id in ("source-a", "source-b"):
+            first.upsert_projection(
+                _projection(_message(native_id, native_id), native_id=native_id)
+            )
+            _enqueue_manual_job(first, f"claude:{native_id}", Provider.CODEX)
+        barrier = Barrier(2)
+
+        def _claim(store):
+            barrier.wait()
+            return store.claim_due_jobs_with_limits(
+                now=100.0,
+                limit=1,
+                policy=MirrorPolicy(creates_per_minute=1),
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(_claim, (first, second)))
+
+        claimed = [job for batch in results for job in batch]
+        assert len(claimed) == 1
+        assert claimed[0]["claim_authority"] == "manual"
+        assert first.get_state("session-bridge:mirror-rate") == {
+            "version": 1,
+            "attempted_at": [100.0],
+        }
+        assert len(first.list_mirror_jobs([MirrorJobState.QUEUED])) == 1
+    finally:
+        second_db.close()
+        first_db.close()
+
+
+def test_atomic_claim_keeps_manual_authority_when_automatic_breaker_halts(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    automatic_projection = _projection(
+        _message("auto", "automatic"), native_id="automatic"
+    )
+    manual_projection = _projection(_message("manual", "manual"), native_id="manual")
+    store.upsert_projection(automatic_projection)
+    store.upsert_projection(manual_projection)
+    automatic = _enqueue_automatic_job(store, automatic_projection, now=100.0)
+    manual = _enqueue_manual_job(store, "claude:manual", Provider.CODEX)
+    store.accumulate_mirror_breaker_progress(attempts=1, errors=1)
+
+    claimed = store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=2,
+        policy=MirrorPolicy(automatic_creation=True),
+    )
+
+    assert [job["id"] for job in claimed] == [manual["id"]]
+    assert claimed[0]["claim_authority"] == "manual"
+    rows = {job["id"]: job for job in store.list_mirror_jobs([
+        MirrorJobState.QUEUED,
+        MirrorJobState.RUNNING,
+    ])}
+    assert rows[automatic["id"]]["state"] == "queued"
+
+
+def test_atomic_claim_resets_completed_healthy_breaker_before_automatic_claim(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    projection = _projection(_message("auto", "automatic"))
+    store.upsert_projection(projection)
+    automatic = _enqueue_automatic_job(store, projection, now=100.0)
+    store.accumulate_mirror_breaker_progress(attempts=2, errors=0)
+
+    claimed = store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(
+            automatic_creation=True,
+            stop_after_attempts=2,
+            stop_error_rate=0.5,
+        ),
+    )
+
+    assert [job["id"] for job in claimed] == [automatic["id"]]
+    assert claimed[0]["claim_authority"] == "automatic"
+    assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 0}
+
+
+def test_atomic_claim_reserves_breaker_attempt_and_never_overshoots_cap(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    jobs = []
+    for native_id in ("automatic-one", "automatic-two"):
+        projection = _projection(
+            _message(native_id, native_id),
+            native_id=native_id,
+            last_active=30.0,
+        )
+        store.upsert_projection(projection)
+        jobs.append(_enqueue_automatic_job(store, projection, now=100.0))
+    store.accumulate_mirror_breaker_progress(attempts=19, errors=0)
+    policy = MirrorPolicy(
+        automatic_creation=True,
+        creates_per_minute=6,
+        stop_after_attempts=20,
+        stop_error_rate=0.01,
+    )
+
+    claimed = store.claim_due_jobs_with_limits(now=100.0, limit=6, policy=policy)
+
+    assert len(claimed) == 1
+    assert store.get_mirror_breaker_progress() == {"attempts": 20, "errors": 0}
+    assert store.claim_due_jobs_with_limits(now=100.0, limit=6, policy=policy) == []
+
+    store.retry_job(
+        claimed[0]["id"],
+        code="provider_failed",
+        detail="fixed failure",
+        next_attempt_at=120.0,
+    )
+    assert store.get_mirror_breaker_progress() == {"attempts": 20, "errors": 1}
+    assert store.claim_due_jobs_with_limits(now=100.0, limit=6, policy=policy) == []
+    assert jobs[1]["id"] in {
+        row["id"]
+        for row in store.list_mirror_jobs([MirrorJobState.QUEUED])
+    }
+
+
+def test_zero_error_threshold_resets_a_completed_error_free_batch(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    projection = _projection(_message("zero", "zero"), native_id="zero")
+    store.upsert_projection(projection)
+    automatic = _enqueue_automatic_job(store, projection, now=100.0)
+    store.accumulate_mirror_breaker_progress(attempts=2, errors=0)
+
+    claimed = store.claim_due_jobs_with_limits(
+        now=100.0,
+        limit=1,
+        policy=MirrorPolicy(
+            automatic_creation=True,
+            stop_after_attempts=2,
+            stop_error_rate=0,
+        ),
+    )
+
+    assert [job["id"] for job in claimed] == [automatic["id"]]
+    assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 0}
+
+
+def test_breaker_progress_accumulates_and_resets_across_two_stores(tmp_path):
+    path = tmp_path / "shared-breaker.db"
+    first_db = SessionDB(path)
+    second_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(first_db, clock=lambda: 100.0)
+        second = SessionBridgeStore(second_db, clock=lambda: 100.0)
+        barrier = Barrier(2)
+
+        def _add(store, attempts, errors):
+            barrier.wait()
+            return store.accumulate_mirror_breaker_progress(
+                attempts=attempts, errors=errors
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(_add, first, 1, 1),
+                executor.submit(_add, second, 2, 0),
+            ]
+            for future in futures:
+                future.result()
+
+        assert first.get_mirror_breaker_progress() == {
+            "attempts": 3,
+            "errors": 1,
+        }
+        assert second.accumulate_mirror_breaker_progress(
+            attempts=0, errors=0, reset=True
+        ) == {"attempts": 0, "errors": 0}
+        assert first.get_mirror_breaker_progress() == {
+            "attempts": 0,
+            "errors": 0,
+        }
+    finally:
+        second_db.close()
+        first_db.close()
+
+
+def test_breaker_progress_state_is_strict_and_never_overwritten_on_corruption(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    corrupt = {"version": 1, "attempts": 1, "errors": 0, "extra": True}
+    store.set_state("session-bridge:mirror-breaker", corrupt)
+
+    with pytest.raises(ValueError, match="breaker progress"):
+        store.get_mirror_breaker_progress()
+    with pytest.raises(ValueError, match="breaker progress"):
+        store.accumulate_mirror_breaker_progress(attempts=1, errors=0)
+
+    assert store.get_state("session-bridge:mirror-breaker") == corrupt
+
+
+def test_exact_origin_bridge_lookup_is_provider_scoped(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    for provider, native_id in (
+        (Provider.CLAUDE, "claude-target"),
+        (Provider.CODEX, "codex-target"),
+    ):
+        store.upsert_projection(
+            _projection(
+                _message(native_id, native_id),
+                provider=provider,
+                native_id=native_id,
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id="bridge-shared",
+            )
+        )
+
+    claude = store.find_external_session_by_origin_bridge(
+        "bridge-shared", Provider.CLAUDE
+    )
+    codex = store.find_external_session_by_origin_bridge(
+        "bridge-shared", Provider.CODEX
+    )
+
+    assert claude is not None and claude["native_id"] == "claude-target"
+    assert codex is not None and codex["native_id"] == "codex-target"
+    assert (
+        store.find_external_session_by_origin_bridge("missing", Provider.CODEX) is None
+    )
+
+
+def test_exact_origin_bridge_lookup_rejects_duplicate_provenance(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    for native_id in ("target-a", "target-b"):
+        store.upsert_projection(
+            _projection(
+                _message(native_id, native_id),
+                provider=Provider.CODEX,
+                native_id=native_id,
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id="bridge-duplicate",
+            )
+        )
+
+    with pytest.raises(ValueError, match="duplicate bridge provenance"):
+        store.find_external_session_by_origin_bridge("bridge-duplicate", Provider.CODEX)
+
+
+def test_exact_origin_bridge_lookup_ignores_unauthenticated_native_rows(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _projection(_message("native", "native"), native_id="native-with-marker")
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE external_sessions SET origin_bridge_id = ? WHERE session_id = ?",
+            ("untrusted-bridge", "claude:native-with-marker"),
+        )
+    )
+
+    assert (
+        store.find_external_session_by_origin_bridge(
+            "untrusted-bridge", Provider.CLAUDE
+        )
+        is None
+    )
+
+
 def test_guarded_public_claim_preserves_retry_order_and_cas_transitions(db):
     current_time = [100.0]
     store = SessionBridgeStore(db, clock=lambda: current_time[0])
@@ -799,9 +1205,12 @@ def test_guarded_public_claim_preserves_retry_order_and_cas_transitions(db):
         now=100.0, limit=10, policy=MirrorPolicy()
     ) == []
 
+    attempt_key = f"session-bridge:attempt:{first['id']}"
+    store.set_state(attempt_key, {"version": 1, "attempts": 1})
     store.retry_job(
         first["id"], code="timeout", detail="temporary", next_attempt_at=120.0
     )
+    assert store.get_state(attempt_key) is None
     current_time[0] = 119.0
     assert store.claim_due_jobs(
         now=119.0, limit=10, policy=MirrorPolicy()
@@ -894,6 +1303,8 @@ def test_completing_a_job_records_target_and_idempotent_mirror_link(db):
             _message("t1", "target"),
             provider=Provider.CODEX,
             native_id="  target-1  ",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
         )
     )
     job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
@@ -926,7 +1337,11 @@ def test_completion_requires_running_state_and_rolls_back(db):
     store.upsert_projection(_projection(_message("s1", "source")))
     store.upsert_projection(
         _projection(
-            _message("t1", "target"), provider=Provider.CODEX, native_id="target-1"
+            _message("t1", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
         )
     )
     job = store.enqueue_mirror_job(
@@ -968,6 +1383,44 @@ def test_completion_rejects_ordinary_target_identity_and_rolls_back(db):
     assert _rows(db, "SELECT * FROM session_links") == []
 
 
+@pytest.mark.parametrize(
+    ("origin_kind", "origin_bridge_id"),
+    [
+        (OriginKind.NATIVE, None),
+        (OriginKind.BRIDGE_PLACEHOLDER, "bridge-other"),
+    ],
+)
+def test_completion_requires_authenticated_exact_bridge_provenance(
+    db, origin_kind, origin_bridge_id
+):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("source", "source")))
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            origin_kind=origin_kind,
+            origin_bridge_id=origin_bridge_id,
+        )
+    )
+    job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
+    store.claim_due_jobs(now=100.0, limit=1, policy=MirrorPolicy())
+
+    with pytest.raises(ValueError, match="bridge provenance"):
+        store.complete_job(
+            job["id"],
+            target_native_id="target-1",
+            target_session_id="codex:target-1",
+            bridge_id="bridge-1",
+        )
+
+    persisted = _rows(db, "SELECT * FROM session_mirror_jobs")[0]
+    assert persisted["state"] == "running"
+    assert persisted["target_native_id"] is None
+    assert _rows(db, "SELECT * FROM session_links") == []
+
+
 def test_conflicting_completion_replay_cannot_retarget_succeeded_job(db):
     store = SessionBridgeStore(db, clock=lambda: 100.0)
     store.upsert_projection(_projection(_message("s1", "source")))
@@ -977,6 +1430,8 @@ def test_conflicting_completion_replay_cannot_retarget_succeeded_job(db):
                 _message(f"event-{native_id}", native_id),
                 provider=Provider.CODEX,
                 native_id=native_id,
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id=f"bridge-{native_id[-1]}",
             )
         )
     job = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
@@ -1008,7 +1463,11 @@ def test_terminal_jobs_cannot_be_retried_or_overwritten(db):
     store.upsert_projection(_projection(_message("s1", "source")))
     store.upsert_projection(
         _projection(
-            _message("t1", "target"), provider=Provider.CODEX, native_id="target-1"
+            _message("t1", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge-1",
         )
     )
     succeeded = _enqueue_manual_job(store, "claude:native-1", Provider.CODEX)
@@ -1084,6 +1543,595 @@ def test_links_are_unique_and_divergence_is_marked(db):
     assert len(links) == 1
     assert links[0]["id"] == "link-1"
     assert links[0]["diverged_at"] == 123.0
+
+
+def test_mirror_link_transitions_to_continues_from_an_immutable_pack(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("source", "source")))
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="link-mirror",
+            from_session_id="claude:native-1",
+            to_session_id="codex:target-1",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-1",
+            source_cursor=None,
+            source_hash=None,
+            created_at=50.0,
+        )
+    )
+    store.put_context_pack(
+        ContextPack(
+            id="pack-1",
+            bridge_id="bridge-1",
+            source_session_id="claude:native-1",
+            target_session_id="codex:target-1",
+            source_cursor="cursor-snapshot",
+            source_hash="hash-snapshot",
+            budget_chars=4000,
+            payload="immutable handoff",
+            created_at=60.0,
+            immutable_at=90.0,
+        )
+    )
+
+    transitioned = store.transition_link_to_continues(
+        "bridge-1",
+        pack_id="pack-1",
+        target_cursor="target-cursor",
+        target_hash="target-hash",
+    )
+    replay = store.transition_link_to_continues(
+        "bridge-1",
+        pack_id="pack-1",
+        target_cursor="target-cursor",
+        target_hash="target-hash",
+    )
+
+    assert replay == transitioned
+    assert transitioned["id"] == "link-mirror"
+    assert transitioned["relation"] == "continues"
+    assert transitioned["source_cursor"] == "cursor-snapshot"
+    assert transitioned["source_hash"] == "hash-snapshot"
+    assert transitioned["hydrated_at"] == 100.0
+    assert store.get_context_pack("bridge-1", budget_chars=4000)[
+        "immutable_at"
+    ] == 90.0
+    assert store.get_continuation_snapshot("bridge-1") == {
+        "version": 1,
+        "pack_id": "pack-1",
+        "source_session_id": "claude:native-1",
+        "source_cursor": "cursor-snapshot",
+        "source_hash": "hash-snapshot",
+        "target_session_id": "codex:target-1",
+        "target_cursor": "target-cursor",
+        "target_hash": "target-hash",
+    }
+    assert len(_rows(db, "SELECT * FROM session_links")) == 1
+
+
+def test_mirror_link_transition_atomically_freezes_and_hydrates_mutable_pack(db):
+    current_time = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
+    store.upsert_projection(_projection(_message("source", "source")))
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="link-mirror",
+            from_session_id="claude:native-1",
+            to_session_id="codex:target-1",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-1",
+            source_cursor=None,
+            source_hash=None,
+            created_at=50.0,
+        )
+    )
+    store.put_context_pack(
+        ContextPack(
+            id="pack-mutable",
+            bridge_id="bridge-1",
+            source_session_id="claude:native-1",
+            target_session_id="codex:target-1",
+            source_cursor="cursor-snapshot",
+            source_hash="hash-snapshot",
+            budget_chars=4000,
+            payload="not frozen",
+            created_at=60.0,
+        )
+    )
+
+    transitioned = store.transition_link_to_continues(
+        "bridge-1",
+        pack_id="pack-mutable",
+        target_cursor="target-cursor",
+        target_hash="target-hash",
+    )
+    current_time[0] = 200.0
+    replay = store.transition_link_to_continues(
+        "bridge-1",
+        pack_id="pack-mutable",
+        target_cursor="target-cursor",
+        target_hash="target-hash",
+    )
+
+    assert replay == transitioned
+    assert transitioned["relation"] == "continues"
+    assert transitioned["source_cursor"] == "cursor-snapshot"
+    assert transitioned["source_hash"] == "hash-snapshot"
+    assert transitioned["hydrated_at"] == 100.0
+    pack = store.get_context_pack("bridge-1", budget_chars=4000)
+    assert pack is not None and pack["immutable_at"] == 100.0
+
+
+def test_mirror_link_transition_rejects_pack_link_identity_mismatch(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("source", "source")))
+    for native_id in ("target-a", "target-b"):
+        store.upsert_projection(
+            _projection(
+                _message(native_id, native_id),
+                provider=Provider.CODEX,
+                native_id=native_id,
+                cursor="target-cursor",
+                native_hash="target-hash",
+            )
+        )
+    store.create_link(
+        SessionLink(
+            id="link-mirror",
+            from_session_id="claude:native-1",
+            to_session_id="codex:target-a",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-1",
+            source_cursor=None,
+            source_hash=None,
+            created_at=50.0,
+        )
+    )
+    store.put_context_pack(
+        ContextPack(
+            id="pack-wrong-target",
+            bridge_id="bridge-1",
+            source_session_id="claude:native-1",
+            target_session_id="codex:target-b",
+            source_cursor="cursor-snapshot",
+            source_hash="hash-snapshot",
+            budget_chars=4000,
+            payload="wrong target",
+            created_at=60.0,
+        )
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        store.transition_link_to_continues(
+            "bridge-1",
+            pack_id="pack-wrong-target",
+            target_cursor="target-cursor",
+            target_hash="target-hash",
+        )
+
+    assert _rows(
+        db,
+        "SELECT relation, source_cursor, source_hash, hydrated_at FROM session_links",
+    ) == [
+        {
+            "relation": "mirrors",
+            "source_cursor": None,
+            "source_hash": None,
+            "hydrated_at": None,
+        }
+    ]
+    pack = store.get_context_pack("bridge-1", budget_chars=4000)
+    assert pack is not None and pack["immutable_at"] is None
+
+
+def test_mirror_link_transition_rejects_conflicting_continues_row(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("source", "source")))
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    for link_id, relation, cursor, source_hash in (
+        ("link-mirror", Relation.MIRRORS, None, None),
+        ("link-continues", Relation.CONTINUES, "other-cursor", "other-hash"),
+    ):
+        store.create_link(
+            SessionLink(
+                id=link_id,
+                from_session_id="claude:native-1",
+                to_session_id="codex:target-1",
+                relation=relation,
+                bridge_id="bridge-1",
+                source_cursor=cursor,
+                source_hash=source_hash,
+                created_at=50.0,
+            )
+        )
+    store.put_context_pack(
+        ContextPack(
+            id="pack-1",
+            bridge_id="bridge-1",
+            source_session_id="claude:native-1",
+            target_session_id="codex:target-1",
+            source_cursor="cursor-snapshot",
+            source_hash="hash-snapshot",
+            budget_chars=4000,
+            payload="immutable handoff",
+            created_at=60.0,
+        )
+    )
+
+    with pytest.raises(ValueError, match="conflicting continues"):
+        store.transition_link_to_continues(
+            "bridge-1",
+            pack_id="pack-1",
+            target_cursor="target-cursor",
+            target_hash="target-hash",
+        )
+
+    assert {
+        (row["id"], row["relation"], row["source_cursor"])
+        for row in _rows(db, "SELECT * FROM session_links")
+    } == {
+        ("link-mirror", "mirrors", None),
+        ("link-continues", "continues", "other-cursor"),
+    }
+    pack = store.get_context_pack("bridge-1", budget_chars=4000)
+    assert pack is not None and pack["immutable_at"] is None
+
+
+def test_continuation_target_baseline_conflict_rolls_back_exact_state(db):
+    current_time = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: current_time[0])
+    store.upsert_projection(_projection(_message("source", "source")))
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="link-mirror",
+            from_session_id="claude:native-1",
+            to_session_id="codex:target-1",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-1",
+            source_cursor=None,
+            source_hash=None,
+            created_at=50.0,
+        )
+    )
+    store.put_context_pack(
+        ContextPack(
+            id="pack-1",
+            bridge_id="bridge-1",
+            source_session_id="claude:native-1",
+            target_session_id="codex:target-1",
+            source_cursor="source-cursor",
+            source_hash="source-hash",
+            budget_chars=4000,
+            payload="handoff",
+            created_at=60.0,
+        )
+    )
+    store.transition_link_to_continues(
+        "bridge-1",
+        pack_id="pack-1",
+        target_cursor="target-cursor",
+        target_hash="target-hash",
+    )
+    before_pack = store.get_context_pack("bridge-1", budget_chars=4000)
+    before_link = _rows(db, "SELECT * FROM session_links")[0]
+    before_snapshot = store.get_continuation_snapshot("bridge-1")
+    current_time[0] = 200.0
+
+    with pytest.raises(ValueError, match="target baseline"):
+        store.transition_link_to_continues(
+            "bridge-1",
+            pack_id="pack-1",
+            target_cursor="different-cursor",
+            target_hash="different-hash",
+        )
+
+    assert store.get_context_pack("bridge-1", budget_chars=4000) == before_pack
+    assert _rows(db, "SELECT * FROM session_links")[0] == before_link
+    assert store.get_continuation_snapshot("bridge-1") == before_snapshot
+
+
+def test_continuation_transition_rejects_noncurrent_target_baseline(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("source", "source")))
+    store.upsert_projection(
+        _projection(
+            _message("target", "target"),
+            provider=Provider.CODEX,
+            native_id="target-1",
+            cursor="current-target-cursor",
+            native_hash="current-target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="link-mirror",
+            from_session_id="claude:native-1",
+            to_session_id="codex:target-1",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge-1",
+            source_cursor=None,
+            source_hash=None,
+            created_at=50.0,
+        )
+    )
+    store.put_context_pack(
+        ContextPack(
+            id="pack-1",
+            bridge_id="bridge-1",
+            source_session_id="claude:native-1",
+            target_session_id="codex:target-1",
+            source_cursor="source-cursor",
+            source_hash="source-hash",
+            budget_chars=4000,
+            payload="handoff",
+            created_at=60.0,
+        )
+    )
+
+    with pytest.raises(ValueError, match="cataloged target snapshot"):
+        store.transition_link_to_continues(
+            "bridge-1",
+            pack_id="pack-1",
+            target_cursor="stale-target-cursor",
+            target_hash="stale-target-hash",
+        )
+
+    pack = store.get_context_pack("bridge-1", budget_chars=4000)
+    assert pack is not None and pack["immutable_at"] is None
+    link = _rows(db, "SELECT * FROM session_links")[0]
+    assert link["relation"] == "mirrors" and link["hydrated_at"] is None
+    assert store.get_continuation_snapshot("bridge-1") is None
+
+
+@pytest.mark.parametrize(
+    "invalid_snapshot",
+    [
+        {"version": 2},
+        {
+            "version": 1,
+            "pack_id": "pack-1",
+            "source_session_id": "claude:source",
+            "source_cursor": "source-cursor",
+            "source_hash": "source-hash",
+            "target_session_id": "codex:target",
+            "target_cursor": "target-cursor",
+            "target_hash": "",
+        },
+    ],
+)
+def test_continuation_snapshot_getter_rejects_invalid_schema(db, invalid_snapshot):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.set_state("session-bridge:continuation:bridge-invalid", invalid_snapshot)
+
+    with pytest.raises(ValueError, match="continuation snapshot"):
+        store.get_continuation_snapshot("bridge-invalid")
+
+
+def test_continuation_snapshot_getter_rejects_false_durable_identity(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.set_state(
+        "session-bridge:continuation:bridge-false",
+        {
+            "version": 1,
+            "pack_id": "pack-missing",
+            "source_session_id": "claude:source",
+            "source_cursor": "source-cursor",
+            "source_hash": "source-hash",
+            "target_session_id": "codex:target",
+            "target_cursor": "target-cursor",
+            "target_hash": "target-hash",
+        },
+    )
+
+    with pytest.raises(ValueError, match="durable identity"):
+        store.get_continuation_snapshot("bridge-false")
+
+
+def test_continuation_snapshot_listing_is_empty_and_strictly_bounded(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+
+    assert store.list_continuation_snapshots() == []
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_continuation_snapshots(limit=0)
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        store.list_continuation_snapshots(limit=1001)
+
+
+def test_continuation_snapshot_listing_is_deterministic_and_bounded(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    for suffix in ("b", "a"):
+        source_id = f"source-{suffix}"
+        target_id = f"target-{suffix}"
+        bridge_id = f"bridge-{suffix}"
+        store.upsert_projection(
+            _projection(
+                _message(f"source-event-{suffix}", "source"), native_id=source_id
+            )
+        )
+        store.upsert_projection(
+            _projection(
+                _message(f"target-event-{suffix}", "target"),
+                provider=Provider.CODEX,
+                native_id=target_id,
+                cursor=f"target-cursor-{suffix}",
+                native_hash=f"target-hash-{suffix}",
+            )
+        )
+        store.create_link(
+            SessionLink(
+                id=f"link-{suffix}",
+                from_session_id=f"claude:{source_id}",
+                to_session_id=f"codex:{target_id}",
+                relation=Relation.MIRRORS,
+                bridge_id=bridge_id,
+                source_cursor=None,
+                source_hash=None,
+                created_at=50.0,
+            )
+        )
+        store.put_context_pack(
+            ContextPack(
+                id=f"pack-{suffix}",
+                bridge_id=bridge_id,
+                source_session_id=f"claude:{source_id}",
+                target_session_id=f"codex:{target_id}",
+                source_cursor=f"source-cursor-{suffix}",
+                source_hash=f"source-hash-{suffix}",
+                budget_chars=4000,
+                payload="handoff",
+                created_at=60.0,
+            )
+        )
+        store.transition_link_to_continues(
+            bridge_id,
+            pack_id=f"pack-{suffix}",
+            target_cursor=f"target-cursor-{suffix}",
+            target_hash=f"target-hash-{suffix}",
+        )
+
+    snapshots = store.list_continuation_snapshots(limit=2)
+
+    assert [snapshot["bridge_id"] for snapshot in snapshots] == [
+        "bridge-a",
+        "bridge-b",
+    ]
+    assert store.list_continuation_snapshots(limit=1) == [snapshots[0]]
+    assert set(snapshots[0]) == {
+        "bridge_id",
+        "version",
+        "pack_id",
+        "source_session_id",
+        "source_cursor",
+        "source_hash",
+        "target_session_id",
+        "target_cursor",
+        "target_hash",
+    }
+
+
+def test_continuation_snapshot_listing_fails_closed_on_corruption(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.set_state("session-bridge:continuation:bridge-corrupt", {"version": 2})
+
+    with pytest.raises(ValueError, match="continuation snapshot"):
+        store.list_continuation_snapshots()
+
+
+def test_continuation_snapshot_listing_paginates_past_one_thousand(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    _seed_continuation_snapshot_rows(db, 1002)
+
+    first = store.list_continuation_snapshots(limit=1000)
+    second = store.list_continuation_snapshots(
+        limit=1000, after_bridge_id=first[-1]["bridge_id"]
+    )
+
+    assert len(first) == 1000
+    assert first[0]["bridge_id"] == "bridge-0000"
+    assert first[-1]["bridge_id"] == "bridge-0999"
+    assert [snapshot["bridge_id"] for snapshot in second] == [
+        "bridge-1000",
+        "bridge-1001",
+    ]
+
+
+def test_continuation_snapshot_listing_rejects_noncanonical_cursor_and_state_key(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    _seed_continuation_snapshot_rows(db, 1)
+    with pytest.raises(ValueError, match="after bridge ID"):
+        store.list_continuation_snapshots(after_bridge_id=" bridge-0000 ")
+
+    valid = store.get_state("session-bridge:continuation:bridge-0000")
+    assert valid is not None
+    store.set_state("session-bridge:continuation: bridge-0000 ", valid)
+
+    with pytest.raises(ValueError, match="canonical bridge ID"):
+        store.list_continuation_snapshots()
+
+
+@pytest.mark.parametrize(
+    ("target_cursor", "target_hash", "message"),
+    [("", "target-hash", "target cursor"), ("target-cursor", " ", "target hash")],
+)
+def test_continuation_transition_requires_nonempty_target_baseline(
+    db, target_cursor, target_hash, message
+):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+
+    with pytest.raises(ValueError, match=message):
+        store.transition_link_to_continues(
+            "bridge-1",
+            pack_id="pack-1",
+            target_cursor=target_cursor,
+            target_hash=target_hash,
+        )
+
+
+def test_session_launch_metadata_returns_only_title_and_cwd(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.upsert_projection(_projection(_message("event", "message")))
+
+    metadata = store.get_session_launch_metadata("claude:native-1")
+
+    assert metadata == {
+        "title": "claude session",
+        "cwd": "C:/workspace/project",
+    }
+    assert "native_path" not in metadata
+    assert store.get_session_launch_metadata("missing") is None
+
+
+def test_session_launch_metadata_validates_input_and_persisted_types(db):
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    with pytest.raises(ValueError, match="session ID"):
+        store.get_session_launch_metadata(" ")
+
+    store.upsert_projection(_projection(_message("event", "message")))
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            (b"invalid-title", "claude:native-1"),
+        )
+    )
+
+    with pytest.raises(ValueError, match="launch metadata"):
+        store.get_session_launch_metadata("claude:native-1")
 
 
 def test_hydrated_context_packs_become_immutable(db):
