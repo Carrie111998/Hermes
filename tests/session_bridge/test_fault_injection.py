@@ -1,0 +1,564 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import sqlite3
+from pathlib import Path
+from threading import Event, Thread
+from typing import Any
+
+import pytest
+
+from hermes_state import SessionDB
+from session_bridge.claude_adapter import ClaudeSourceAdapter
+from session_bridge.codex_adapter import CodexSourceAdapter, CodexTargetAdapter
+from session_bridge.config import BridgeConfig
+from session_bridge.coordinator import SessionBridgeCoordinator
+from session_bridge.mcp_server import resolve_bearer_token
+from session_bridge.mirror import (
+    MirrorPolicy,
+    enqueue_mirror_job,
+    record_mirror_failure,
+    retry_delay_seconds,
+)
+from session_bridge.models import (
+    MirrorJobState,
+    OriginKind,
+    ProjectedMessage,
+    Provider,
+    SessionProjection,
+)
+from session_bridge.store import SessionBridgeStore
+
+
+NOW = 100.0
+MARKER_SECRET = b"synthetic-marker-secret-at-least-32-bytes"
+
+
+@pytest.fixture
+def bridge_store(tmp_path: Path):
+    current_time = [NOW]
+    database = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(database, clock=lambda: current_time[0])
+    yield store, current_time
+    database.close()
+
+
+def _message(event_id: str, content: str) -> ProjectedMessage:
+    return ProjectedMessage(
+        native_event_id=event_id,
+        ordinal=0,
+        role="user",
+        content=content,
+        timestamp=10.0,
+    )
+
+
+def _projection(
+    *,
+    provider: Provider = Provider.CLAUDE,
+    native_id: str = "synthetic-source",
+    content: str = "synthetic user message",
+    origin_kind: OriginKind = OriginKind.NATIVE,
+    origin_bridge_id: str | None = None,
+) -> SessionProjection:
+    return SessionProjection(
+        provider=provider,
+        native_id=native_id,
+        title=f"{provider.value} synthetic session",
+        cwd="C:/synthetic-workspace",
+        started_at=10.0,
+        last_active=20.0,
+        messages=(_message(f"event-{native_id}", content),),
+        native_path=f"C:/synthetic/{native_id}.jsonl",
+        native_cursor=f"cursor-{native_id}",
+        native_hash=f"hash-{native_id}",
+        origin_kind=origin_kind,
+        origin_bridge_id=origin_bridge_id,
+    )
+
+
+def _claude_record(
+    *,
+    record_type: str,
+    event_id: str,
+    content: str,
+    timestamp: str,
+) -> dict[str, Any]:
+    return {
+        "type": record_type,
+        "uuid": event_id,
+        "sessionId": "synthetic-transcript",
+        "timestamp": timestamp,
+        "cwd": "C:/synthetic-workspace",
+        "message": {"role": record_type, "content": content},
+    }
+
+
+def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        b"".join(
+            json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+            for record in records
+        )
+    )
+
+
+def test_sqlite_busy_retries_without_partial_projection(
+    bridge_store: tuple[SessionBridgeStore, list[float]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _ = bridge_store
+    retry_jitters: list[float] = []
+    first_retry = Event()
+    lock_released = Event()
+
+    def fixed_jitter(_minimum: float, _maximum: float) -> float:
+        retry_jitters.append(0.01)
+        first_retry.set()
+        return 0.01
+
+    monkeypatch.setattr("hermes_state.random.uniform", fixed_jitter)
+    with store.db._lock:
+        assert store.db._conn is not None
+        store.db._conn.execute("PRAGMA busy_timeout=1")
+
+    blocker = sqlite3.connect(
+        str(store.db.db_path),
+        check_same_thread=False,
+        timeout=0,
+        isolation_level=None,
+    )
+    blocker.execute("BEGIN IMMEDIATE")
+
+    def release_lock() -> None:
+        if first_retry.wait(timeout=1.0):
+            blocker.rollback()
+            lock_released.set()
+
+    releaser = Thread(target=release_lock)
+    releaser.start()
+    try:
+        result = store.upsert_projection(_projection())
+    finally:
+        releaser.join(timeout=1.0)
+        blocker.close()
+
+    assert retry_jitters
+    assert first_retry.is_set()
+    assert lock_released.is_set()
+    assert result.inserted_messages == 1
+    assert store.get_external_session("claude:synthetic-source") is not None
+    assert len(store.db.get_messages("claude:synthetic-source")) == 1
+
+
+def test_claude_source_truncation_forces_rebuild(tmp_path: Path) -> None:
+    transcript = tmp_path / "claude-root" / "project" / "synthetic-transcript.jsonl"
+    records = [
+        _claude_record(
+            record_type="user",
+            event_id="11111111-1111-4111-8111-111111111111",
+            content="before truncation",
+            timestamp="2026-01-01T00:00:00Z",
+        ),
+        _claude_record(
+            record_type="assistant",
+            event_id="22222222-2222-4222-8222-222222222222",
+            content="removed by truncation",
+            timestamp="2026-01-01T00:00:01Z",
+        ),
+    ]
+    _write_jsonl(transcript, records)
+    adapter = ClaudeSourceAdapter(tmp_path / "claude-root", marker_secret=MARKER_SECRET)
+    initial = adapter.parse(transcript)
+
+    _write_jsonl(transcript, records[:1])
+    rebuilt = adapter.parse(transcript, initial.cursor)
+
+    assert rebuilt.rebuild is True
+    assert [message.content for message in rebuilt.projection.messages] == [
+        "before truncation"
+    ]
+    assert rebuilt.cursor.offset < initial.cursor.offset
+
+
+def test_claude_unknown_schema_record_isolated_from_known_messages(
+    tmp_path: Path,
+) -> None:
+    transcript = tmp_path / "claude-root" / "project" / "synthetic-transcript.jsonl"
+    records = [
+        _claude_record(
+            record_type="user",
+            event_id="11111111-1111-4111-8111-111111111111",
+            content="known user",
+            timestamp="2026-01-01T00:00:00Z",
+        ),
+        {
+            "type": "future-provider-schema",
+            "sessionId": "synthetic-transcript",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "payload": {"unrecognized": True},
+        },
+        _claude_record(
+            record_type="assistant",
+            event_id="22222222-2222-4222-8222-222222222222",
+            content="known assistant",
+            timestamp="2026-01-01T00:00:02Z",
+        ),
+    ]
+    _write_jsonl(transcript, records)
+
+    parsed = ClaudeSourceAdapter(
+        tmp_path / "claude-root", marker_secret=MARKER_SECRET
+    ).parse(transcript)
+
+    assert parsed.unknown_records == 1
+    assert parsed.malformed_lines == 0
+    assert [message.content for message in parsed.projection.messages] == [
+        "known user",
+        "known assistant",
+    ]
+
+
+class _BlockingCodexRefreshAdapter:
+    def __init__(self, projection: SessionProjection) -> None:
+        self.projection = projection
+        self.started = Event()
+        self.release = Event()
+
+    def find_native_thread(self, native_id: str) -> SessionProjection:
+        assert native_id == self.projection.native_id
+        self.started.set()
+        if not self.release.wait(timeout=2.0):
+            raise RuntimeError("synthetic refresh was not released")
+        return self.projection
+
+    def project_thread(self, summary: SessionProjection) -> SessionProjection:
+        return summary
+
+
+@pytest.mark.asyncio
+async def test_source_refresh_timeout_returns_durable_snapshot(
+    bridge_store: tuple[SessionBridgeStore, list[float]],
+) -> None:
+    store, _ = bridge_store
+    projection = _projection(provider=Provider.CODEX, native_id="hung-refresh")
+    store.upsert_projection(projection)
+    adapter = _BlockingCodexRefreshAdapter(projection)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: adapter},
+        clock=lambda: NOW,
+    )
+
+    started = asyncio.get_running_loop().time()
+    result = await coordinator.refresh_session(
+        "codex:hung-refresh",
+        timeout=0.01,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    assert await asyncio.to_thread(adapter.started.wait, 0.2)
+    adapter.release.set()
+    for _ in range(100):
+        if coordinator.health()["provider_calls_inflight"] == 0:
+            break
+        await asyncio.sleep(0.005)
+
+    assert elapsed < 0.2
+    assert result.stale is True
+    assert result.cursor == projection.native_cursor
+    assert result.source_hash == projection.native_hash
+    assert result.warning == "source_refresh_failed_using_durable_snapshot"
+
+
+class _TimeoutAfterCreateCodexAppServer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any], float]] = []
+        self.native_id = "created-before-timeout"
+        self.title: str | None = None
+        self.registration_text: str | None = None
+
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float,
+    ) -> dict[str, Any]:
+        self.calls.append((method, dict(params), timeout))
+        if method == "thread/start":
+            return {"thread": {"id": self.native_id}}
+        if method == "thread/name/set":
+            assert params["threadId"] == self.native_id
+            self.title = params["name"]
+            return {}
+        if method == "turn/start":
+            assert params["threadId"] == self.native_id
+            self.registration_text = params["input"][0]["text"]
+            raise TimeoutError("turn was created but the response was lost")
+        if method == "thread/list":
+            if params["archived"]:
+                return {"data": []}
+            return {
+                "data": [
+                    {
+                        "id": self.native_id,
+                        "title": self.title,
+                        "createdAt": 10.0,
+                        "updatedAt": 20.0,
+                        "revision": "revision-after-ambiguous-turn",
+                    }
+                ]
+            }
+        if method == "thread/read":
+            assert params == {"threadId": self.native_id, "includeTurns": True}
+            assert self.registration_text is not None
+            return {
+                "thread": {
+                    "id": self.native_id,
+                    "turns": [
+                        {
+                            "id": "created-registration-turn",
+                            "status": "inProgress",
+                            "items": [
+                                {
+                                    "type": "userMessage",
+                                    "id": "created-registration-item",
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": self.registration_text,
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        raise AssertionError(f"unexpected synthetic Codex request: {method}")
+
+    def take_notification(self, timeout: float = 0.0) -> dict[str, Any] | None:
+        raise AssertionError(
+            f"unexpected notification wait after ambiguous turn timeout: {timeout}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_target_timeout_after_creation_reconciles_without_duplicate(
+    bridge_store: tuple[SessionBridgeStore, list[float]],
+) -> None:
+    store, _ = bridge_store
+    store.upsert_projection(_projection())
+    policy = MirrorPolicy()
+    job = enqueue_mirror_job(
+        store,
+        "claude:synthetic-source",
+        Provider.CODEX,
+        policy=policy,
+        manual_authorized=True,
+    )
+    client = _TimeoutAfterCreateCodexAppServer()
+    source = CodexSourceAdapter(client, marker_secret=MARKER_SECRET)
+    target = CodexTargetAdapter(
+        client,
+        source_adapter=source,
+        marker_secret=MARKER_SECRET,
+        clock=lambda: NOW,
+        request_timeout=0.1,
+        require_registration_turn=True,
+        verification_timeout=0.0,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: source},
+        target_adapters={Provider.CODEX: target},
+        clock=lambda: NOW,
+    )
+
+    summary = await coordinator.process_jobs_once(job_ids=[job["id"]])
+
+    succeeded = store.list_mirror_jobs([MirrorJobState.SUCCEEDED])
+    assert summary.succeeded == 1
+    assert summary.retried == 0
+    assert summary.manual_failure == 0
+    methods = [method for method, _, _ in client.calls]
+    assert methods == [
+        "thread/start",
+        "thread/name/set",
+        "turn/start",
+        "thread/list",
+        "thread/read",
+    ]
+    assert methods.count("thread/start") == 1
+    assert client.registration_text is not None
+    assert "HERMES_SESSION_BRIDGE_V1:" in client.registration_text
+    assert [row["id"] for row in succeeded] == [job["id"]]
+    assert succeeded[0]["target_native_id"] == "created-before-timeout"
+    assert store.get_external_session("codex:created-before-timeout") is not None
+
+
+def test_malformed_bearer_token_is_rejected_before_file_access(
+    tmp_path: Path,
+) -> None:
+    token_file = tmp_path / "must-not-be-read"
+
+    with pytest.raises(ValueError, match="must not contain whitespace"):
+        resolve_bearer_token(
+            environ={
+                "HERMES_SESSION_BRIDGE_TOKEN": "x" * 32 + " malformed",
+            },
+            token_file=token_file,
+        )
+
+    assert not token_file.exists()
+
+
+class _FailedClaudeAdapter:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def discover(self) -> list[Path]:
+        self.calls += 1
+        raise RuntimeError("synthetic Claude adapter failure")
+
+
+class _HealthyCodexInventoryAdapter:
+    def __init__(self, projection: SessionProjection) -> None:
+        self.projection = projection
+        self.inventory_calls = 0
+
+    def list_inventory(self, *, archived: bool) -> list[SessionProjection]:
+        self.inventory_calls += 1
+        return [] if archived else [self.projection]
+
+    def project_thread(self, summary: SessionProjection) -> SessionProjection:
+        return summary
+
+
+@pytest.mark.asyncio
+async def test_failed_adapter_does_not_block_other_provider_scan(
+    bridge_store: tuple[SessionBridgeStore, list[float]],
+) -> None:
+    store, _ = bridge_store
+    claude = _FailedClaudeAdapter()
+    codex = _HealthyCodexInventoryAdapter(
+        _projection(provider=Provider.CODEX, native_id="healthy-codex")
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CLAUDE: claude, Provider.CODEX: codex},
+        clock=lambda: NOW,
+    )
+
+    summary = await coordinator.scan_once()
+
+    health = coordinator.health()["providers"]
+    assert summary.failed == 1
+    assert summary.indexed == 1
+    assert claude.calls == 1
+    assert codex.inventory_calls == 2
+    assert store.get_external_session("codex:healthy-codex") is not None
+    assert health["claude"]["degraded_reason"] is not None
+    assert health["codex"]["degraded_reason"] is None
+
+
+def test_repeated_manual_failure_stops_at_attempt_threshold(
+    bridge_store: tuple[SessionBridgeStore, list[float]],
+) -> None:
+    store, current_time = bridge_store
+    store.upsert_projection(_projection())
+    policy = MirrorPolicy(max_attempts=2)
+    job = enqueue_mirror_job(
+        store,
+        "claude:synthetic-source",
+        Provider.CODEX,
+        policy=policy,
+        manual_authorized=True,
+    )
+
+    first_claim = store.claim_due_jobs(now=NOW, limit=1, policy=policy)[0]
+    first_state = record_mirror_failure(
+        store,
+        first_claim,
+        policy=policy,
+        now=NOW,
+        code="synthetic_target_down",
+        detail="first injected failure",
+    )
+    current_time[0] = NOW + retry_delay_seconds(job["idempotency_key"], 1)
+    second_claim = store.claim_due_jobs(
+        now=current_time[0],
+        limit=1,
+        policy=policy,
+    )[0]
+    final_state = record_mirror_failure(
+        store,
+        second_claim,
+        policy=policy,
+        now=current_time[0],
+        code="synthetic_target_down",
+        detail="second injected failure",
+    )
+
+    durable = store.list_mirror_jobs([MirrorJobState.MANUAL_FAILURE])
+    assert first_state is MirrorJobState.RETRY
+    assert final_state is MirrorJobState.MANUAL_FAILURE
+    assert len(durable) == 1
+    assert durable[0]["attempts"] == 2
+    assert store.claim_due_jobs(now=current_time[0], limit=1, policy=policy) == []
+
+
+def test_backfill_stops_when_durable_error_rate_trips_breaker(
+    bridge_store: tuple[SessionBridgeStore, list[float]],
+) -> None:
+    store, _ = bridge_store
+    policy = MirrorPolicy(
+        automatic_creation=False,
+        creates_per_minute=6,
+        stop_after_attempts=20,
+        stop_error_rate=0.5,
+    )
+    jobs = []
+    for native_id in ("backfill-one", "backfill-two"):
+        store.upsert_projection(_projection(native_id=native_id))
+        jobs.append(
+            enqueue_mirror_job(
+                store,
+                f"claude:{native_id}",
+                Provider.CODEX,
+                policy=policy,
+                manual_authorized=True,
+                require_unmapped=True,
+                rollout_limited=True,
+            )
+        )
+
+    first_claim = store.claim_due_jobs_with_limits(
+        now=NOW,
+        limit=1,
+        policy=policy,
+    )[0]
+    store.retry_job(
+        first_claim["id"],
+        code="synthetic_backfill_failure",
+        detail="injected rollout failure",
+        next_attempt_at=NOW + 20.0,
+    )
+    blocked = store.claim_due_jobs_with_limits(
+        now=NOW,
+        limit=1,
+        policy=policy,
+    )
+
+    assert blocked == []
+    assert store.get_mirror_breaker_progress() == {"attempts": 1, "errors": 1}
+    unclaimed_job_id = next(
+        job["id"] for job in jobs if job["id"] != first_claim["id"]
+    )
+    assert unclaimed_job_id in {
+        queued["id"] for queued in store.list_mirror_jobs([MirrorJobState.QUEUED])
+    }
