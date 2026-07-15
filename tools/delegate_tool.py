@@ -1290,10 +1290,18 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
-        # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
-        effective_api_mode = "chat_completions"
+        # If explicitly forcing an ACP transport override, the provider and
+        # api_mode must be set correctly for the transport type:
+        #  - copilot-acp (legacy): provider=copilot-acp, api_mode=chat_completions
+        #    so run_agent.py initializes the CopilotACPClient.
+        #  - acp_client (generic): provider=acp_client, api_mode=acp_client
+        #    so run_agent.py initializes the ACPClientSession.  Auth is handled
+        #    by the spawned binary, not by an API key at the Hermes layer.
+        if effective_api_mode != "acp_client":
+            effective_provider = "copilot-acp"
+            effective_api_mode = "chat_completions"
+        else:
+            effective_provider = "acp_client"
 
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
@@ -3308,7 +3316,12 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         ) from exc
 
     api_key = runtime.get("api_key", "")
-    if not api_key:
+    runtime_api_mode = runtime.get("api_mode")
+    # acp_client auth is handled by the spawned binary itself (JSON-RPC over
+    # stdio) — no API key is needed at the Hermes layer.  The empty key is
+    # intentional, so we must not raise here.  Any other provider that resolves
+    # without a key is a real configuration error.
+    if not api_key and runtime_api_mode != "acp_client":
         raise ValueError(
             f"Delegation provider '{configured_provider}' resolved but has no API key. "
             f"Set the appropriate environment variable or run 'hermes auth'."

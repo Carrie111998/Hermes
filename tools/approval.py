@@ -2692,10 +2692,10 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
-    # Hardline blocks are handled by the caller BEFORE this gate, so yolo
-    # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # --yolo / approvals.mode=off bypasses all approval prompts (session- or
+    # process-scoped).  Hardline blocks are handled by the caller BEFORE this
+    # gate, so this only skips the recoverable approval layer.
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or _get_approval_mode() == "off":
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()

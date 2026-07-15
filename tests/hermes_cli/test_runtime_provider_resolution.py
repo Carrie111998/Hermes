@@ -3129,12 +3129,111 @@ def test_host_derived_key_helper_basic_cases():
         _os.environ.pop(k, None)
 
 
+# ── acp_client provider resolution tests ─────────────────────────────────────
+
+
+def test_resolve_provider_acp_client_canonical(monkeypatch):
+    """resolve_provider('acp_client') returns 'acp_client' without AuthError.
+
+    The canonical key (underscore) is used after alias normalisation. This is
+    the form that arrives from resolve_runtime_provider, which normalises via
+    _PROVIDER_ALIASES before calling resolve_provider.
+    """
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    # Must NOT raise AuthError("Unknown provider 'acp_client'")
+    result = rp.resolve_provider("acp_client")
+    assert result == "acp_client"
+
+
+def test_resolve_provider_acp_client_hyphen_alias(monkeypatch):
+    """resolve_provider('acp-client') resolves via alias to canonical 'acp_client'.
+
+    config.yaml stores provider: acp-client (hyphenated). The alias mapping
+    must normalise it so resolve_provider does not raise.
+    """
+    monkeypatch.setattr(rp.auth_mod, "_load_auth_store", lambda: {})
+    result = rp.resolve_provider("acp-client")
+    assert result == "acp_client"
+
+
+def test_resolve_runtime_provider_acp_client_returns_correct_api_mode(monkeypatch):
+    """resolve_runtime_provider('acp_client') yields api_mode='acp_client'.
+
+    This is the critical assertion: the resolved runtime dict must carry
+    api_mode='acp_client' so the gateway passes it into agent_init, which
+    routes the turn through _run_acp_client_turn instead of a chat_completions
+    HTTP path. A wrong api_mode (e.g. chat_completions) would silently
+    misroute every turn.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "acp_client")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "acp-client",
+            "acp_command": "my-acp-agent",
+            "acp_args": ["--stdio"],
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="acp_client")
+
+    assert resolved["provider"] == "acp_client"
+    assert resolved["api_mode"] == "acp_client"
+    assert resolved["api_key"] == ""
+    assert resolved["base_url"] == ""
+    assert resolved["command"] == "my-acp-agent"
+    assert resolved["args"] == ["--stdio"]
+    assert resolved["source"] == "config"
+
+
+def test_resolve_runtime_provider_acp_client_no_command_raises(monkeypatch):
+    """resolve_runtime_provider raises AuthError when acp_command is missing.
+
+    Without acp_command there is no binary to spawn; a clear error is better
+    than a silent empty-string command or fall-through to OpenRouter.
+    """
+    from hermes_cli.auth import AuthError
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "acp_client")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {"provider": "acp-client"},
+    )
+
+    with pytest.raises(AuthError, match="acp_command"):
+        rp.resolve_runtime_provider(requested="acp_client")
+
+
+def test_resolve_runtime_provider_acp_client_no_api_key_required(monkeypatch):
+    """acp_client runtime must not require an API key.
+
+    Auth is handled by the spawned binary itself. The returned api_key must be
+    empty so agent_init never tries to validate or forward a credential.
+    """
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "acp_client")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "acp-client",
+            "acp_command": "hermes-acp-agent",
+            "acp_args": [],
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="acp_client")
+    assert resolved["api_key"] == ""
+
+
+
 def _patch_bedrock(monkeypatch, config_default=""):
     """Stub the bedrock_adapter helpers resolve_runtime_provider imports.
 
     Leaves the real ``is_anthropic_bedrock_model`` in place so the dual-path
     routing decision is exercised for real. ``config_default`` is the persisted
-    ``model.default`` — kept non-Claude here to prove ``target_model`` (not the
+    ``model.default`` - kept non-Claude here to prove ``target_model`` (not the
     stale config default) drives the api_mode decision.
     """
     import agent.bedrock_adapter as ba
@@ -3195,8 +3294,8 @@ def test_auto_provider_with_local_base_url_bypasses_anthropic_key(monkeypatch):
     because resolve_provider("auto") picked up ANTHROPIC_API_KEY before the
     config.yaml base_url was checked.
     """
-    # ANTHROPIC_API_KEY is present in environment — should be ignored
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-key")
+    # ANTHROPIC_API_KEY is present in environment - should be ignored
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "«redacted:sk-…»")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -3232,7 +3331,7 @@ def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatc
     configured base_url IS a cloud API root, resolve_provider() must run
     normally and pick up ANTHROPIC_API_KEY.
     """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "«redacted:sk-…»")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -3249,7 +3348,7 @@ def test_auto_provider_with_known_cloud_base_url_still_uses_anthropic(monkeypatc
 
     resolved = rp.resolve_runtime_provider()
 
-    # Cloud base_url → bypass does NOT fire → resolve_provider picks anthropic.
+    # Cloud base_url -> bypass does NOT fire -> resolve_provider picks anthropic.
     assert resolved["provider"] == "anthropic", (
         f"Cloud base_url must not be diverted to the custom resolver: {resolved}"
     )
@@ -3263,7 +3362,7 @@ def test_auto_provider_lookalike_cloud_host_does_not_bypass_to_cloud(monkeypatch
     bypass: substring matching on "api.anthropic.com" would wrongly classify
     this attacker-controlled host as cloud and hand it the ANTHROPIC_API_KEY.
     """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "«redacted:sk-…»")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -3278,7 +3377,7 @@ def test_auto_provider_lookalike_cloud_host_does_not_bypass_to_cloud(monkeypatch
 
     resolved = rp.resolve_runtime_provider()
 
-    # Host doesn't actually match anthropic.com → bypass fires → custom route,
+    # Host doesn't actually match anthropic.com -> bypass fires -> custom route,
     # and the real Anthropic credential is NOT sent there.
     assert resolved["provider"] != "anthropic", (
         f"Look-alike host must not be classified as Anthropic cloud: {resolved}"
@@ -3325,7 +3424,7 @@ def test_named_custom_provider_with_extra_headers(monkeypatch):
 
 
 def test_named_custom_provider_without_extra_headers_omits_key(monkeypatch):
-    """No extra_headers configured → key absent from the resolved runtime."""
+    """No extra_headers configured -> key absent from the resolved runtime."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
