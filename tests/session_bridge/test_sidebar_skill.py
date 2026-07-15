@@ -205,7 +205,7 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     )
     assert (
         '`read_thread({"threadId":"<candidate threadId>",'
-        '"hostId":"<candidate hostId>","turnLimit":20,'
+        '"hostId":"<candidate hostId>","turnLimit":10,'
         '"includeOutputs":false})`'
     ) in skill
     assert "Omit `hostId` only when it was absent or null" in skill
@@ -233,9 +233,11 @@ def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() ->
 
     assert (
         '`read_thread({"threadId":"<recovered_thread_id>",'
-        '"turnLimit":20,"includeOutputs":false})`'
+        '"turnLimit":10,"includeOutputs":false})`'
         in reconcile_step
     )
+    assert '"turnLimit":20' not in reconcile_step
+    assert "Ten is the bounded reconciliation and read limit" in reconcile_step
     assert "Do not call `list_threads` before this recovered-ID read" in reconcile_step
     assert (
         "Only when `recovered_thread_id` is absent, call "
@@ -267,6 +269,24 @@ def test_sidebar_skill_matches_the_native_read_thread_response_schema() -> None:
     assert "does not return an explicit environment field" in reconcile_step
     assert "must not be treated as unavailable or ambiguous" in reconcile_step
     assert "explicitly contradicts local native execution" in reconcile_step
+
+
+def test_sidebar_skill_never_creates_after_an_unverifiable_search_candidate() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+
+    assert (
+        "Creation is permitted only when the exact-marker search returns zero "
+        "candidate summaries"
+    ) in reconcile_step
+    assert (
+        "any returned candidate that cannot be authenticated within the ten-turn "
+        "read maps to `native_task_not_indexed`"
+    ) in reconcile_step
+    assert "never continue to creation after a candidate summary was returned" in (
+        reconcile_step
+    )
+    assert "no match: continue to creation" not in reconcile_step
 
 
 def test_sidebar_skill_deterministically_settles_native_and_broker_failures() -> None:
