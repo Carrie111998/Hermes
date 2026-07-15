@@ -1140,7 +1140,6 @@ export const zh: Translations = {
       modelInactiveHint: '请先选择此后端，然后再更改其模型。',
       modelSelectedTitle: '模型已选择',
       modelSelectedMessage: model => `${model} 将应用于新会话。`,
-
       failedSelectModel: model => `选择 ${model} 失败`,
       terminalBackend: {
         sectionTitle: '执行后端',
@@ -1155,9 +1154,8 @@ export const zh: Translations = {
         failedSelect: backend => `选择 ${backend} 失败`,
         needsSetupHint: '现在即可选择此后端——但在完成设置前命令将会失败。'
       }
+    }
 
-      failedSelectModel: model => `选择 ${model} 失败`
-    },
     uninstall: {
       heading: '危险区域',
       title: '卸载 Hermes',
@@ -1187,8 +1185,6 @@ export const zh: Translations = {
           consequence: '所有内容——聊天界面、Hermes 代理、所有配置、对话、密钥和日志'
         }
       }
-    }
-
     }
   },
 
