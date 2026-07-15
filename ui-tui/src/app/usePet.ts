@@ -273,6 +273,18 @@ export function usePet(): PetRender {
     const tick = () => {
       const entry = cache.current.get(`${slugRef.current}:${stateRef.current}`)
 
+      // Self-scheduling instead of a fixed setInterval(FRAME_MS): entry.frameMs
+      // is per (pet, state) — the engine can author a slug/state with any
+      // cadence — but a plain setInterval(tick, FRAME_MS) ignored that
+      // entirely and always ticked at the constant 160ms, so any pet/state
+      // authored with a different frameMs animated at the wrong speed (too
+      // fast or too slow relative to what agent/pet/render.py actually
+      // produced). Reading entry.frameMs fresh each tick and rescheduling
+      // with it means a mid-animation state switch to a different cadence
+      // (or a live frameMs change from the engine) takes effect on the very
+      // next frame, not just at the next state transition.
+      timer = setTimeout(tick, entry?.frameMs ?? FRAME_MS)
+
       if (!entry?.frames.length) {
         return // keep the last frame painted while the new state loads
       }
@@ -303,10 +315,10 @@ export function usePet(): PetRender {
       setGrid(entry.frames[idx] ?? null)
     }
 
+    let timer: ReturnType<typeof setTimeout> | undefined
     tick()
-    const interval = setInterval(tick, FRAME_MS)
 
-    return () => clearInterval(interval)
+    return () => clearTimeout(timer)
   }, [enabled, petState, write])
 
   return { enabled, grid, kitty }
