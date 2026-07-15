@@ -171,6 +171,31 @@ def test_parse_prefers_record_session_id_and_extracts_custom_title(tmp_path):
     assert projection.last_active == _epoch("2026-01-02T00:00:01Z")
 
 
+def test_subagent_transcript_uses_agent_filename_identity(tmp_path):
+    parent_session_id = "ab77a170-ba02-4e93-844c-12a87e6e8fa1"
+    agent_id = "ac9f05c39dc3cef8f"
+    record = _message_record(
+        "Synthetic delegated request",
+        session_id=parent_session_id,
+        timestamp="2026-07-12T22:47:48.886Z",
+    )
+    record["agentId"] = agent_id
+    record["isSidechain"] = True
+    path = tmp_path / f"agent-{agent_id}.jsonl"
+    path.write_bytes(_json_line(record))
+
+    parsed = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert parsed.projection.native_id == path.stem
+    assert parsed.projection.messages == []
+    database = SessionDB(tmp_path / "state.db")
+    try:
+        result = SessionBridgeStore(database).upsert_projection(parsed.projection)
+        assert result.session_id == f"claude:{path.stem}"
+    finally:
+        database.close()
+
+
 def test_full_parse_rejects_mixed_native_session_ids(tmp_path):
     path = tmp_path / "mixed-identities.jsonl"
     path.write_bytes(

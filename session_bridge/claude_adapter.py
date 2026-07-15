@@ -49,6 +49,7 @@ _MARKER_CANDIDATE_RE = re.compile(
 _NATIVE_ID_RE = re.compile(rb'"sessionId"\s*:\s*("(?:\\.|[^"\\])*")')
 _RECORD_TYPE_RE = re.compile(rb'"type"\s*:\s*("(?:\\.|[^"\\])*")')
 _CURSOR_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_SUBAGENT_STEM_RE = re.compile(r"^agent-([A-Za-z0-9_-]{1,128})$")
 _DESCRIPTOR_UNSAFE_RE = re.compile(r"[^A-Za-z0-9._/+;-]+")
 CLAUDE_PLACEHOLDER_MAX_BUDGET_USD = "0.50"
 
@@ -184,7 +185,10 @@ class ClaudeSourceAdapter:
             base_offset=read_slice.base_offset,
         )
         records = [line.record for line in lines if line.record is not None]
-        delta_native_id = _validated_record_native_id(records)
+        delta_native_id = _validated_record_native_id(
+            records,
+            transcript_path=transcript_path,
+        )
         metadata_delta = _metadata_delta(records, native_id=delta_native_id)
         cache_key = str(transcript_path.absolute())
         cached = self._cache.get(cache_key)
@@ -206,6 +210,8 @@ class ClaudeSourceAdapter:
         else:
             if previous is not None and not read_slice.rebuild:
                 baseline_native_id = _native_id_from_bytes(read_slice.head_data)
+                if _subagent_native_id(transcript_path) is not None:
+                    baseline_native_id = transcript_path.stem
                 baseline_native_id = baseline_native_id or transcript_path.stem
                 if (
                     delta_native_id is not None
@@ -778,6 +784,9 @@ def _read_full(stream: BinaryIO, *, rebuild: bool) -> _ReadSlice:
 
 
 def _probe_native_id(path: Path) -> str | None:
+    subagent_native_id = _subagent_native_id(path)
+    if subagent_native_id is not None:
+        return subagent_native_id
     with path.open("rb") as stream:
         prefix = stream.read(_NATIVE_ID_PROBE_BYTES)
     return _native_id_from_bytes(prefix)
@@ -926,15 +935,35 @@ def _merge_metadata(baseline: _Metadata, delta: _MetadataDelta) -> _Metadata:
     )
 
 
-def _validated_record_native_id(records: list[dict[str, Any]]) -> str | None:
+def _validated_record_native_id(
+    records: list[dict[str, Any]],
+    *,
+    transcript_path: Path,
+) -> str | None:
     native_ids: set[str] = set()
+    agent_ids: set[str] = set()
     for record in records:
         if record.get("type") not in _RECOGNIZED_RECORD_TYPES:
             continue
         native_id = _nonempty_string(record.get("sessionId"))
         if native_id is not None:
             native_ids.add(native_id)
+        agent_id = _nonempty_string(record.get("agentId"))
+        if agent_id is not None:
+            agent_ids.add(agent_id)
+    subagent_native_id = _subagent_native_id(transcript_path)
+    if subagent_native_id is not None:
+        expected_agent_id = subagent_native_id.removeprefix("agent-")
+        if len(agent_ids) > 1 or (
+            agent_ids and agent_ids != {expected_agent_id}
+        ):
+            raise ValueError("Claude transcript native identity conflict")
+        return subagent_native_id
     return _single_native_id(native_ids)
+
+
+def _subagent_native_id(path: Path) -> str | None:
+    return path.stem if _SUBAGENT_STEM_RE.fullmatch(path.stem) else None
 
 
 def _single_native_id(native_ids: set[str]) -> str | None:
