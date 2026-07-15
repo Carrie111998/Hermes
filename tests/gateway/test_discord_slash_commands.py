@@ -1,8 +1,11 @@
 """Tests for native Discord slash command fast-paths (thread creation & auto-thread)."""
 
+import asyncio
+from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-import sys
 
 import pytest
 
@@ -1401,43 +1404,37 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
 
 
 class _FakeDoneThread(_FakeThreadChannel):
-    def __init__(self, messages=None, *, parent=None, **kwargs):
+    def __init__(self, *, parent=None, locked=False, archived=False, **kwargs):
         super().__init__(**kwargs)
-        if parent is not None:
-            self.parent = parent
-        else:
-            self.parent.send = AsyncMock()
-        self._messages = list(messages or [])
+        self.parent = parent or SimpleNamespace(send=AsyncMock())
+        self.locked = locked
+        self.archived = archived
         self.delete = AsyncMock()
 
-    def history(self, *args, **kwargs):
-        async def _gen():
-            # discord.py returns newest-first when oldest_first=False; helpers
-            # reverse that internally before analysis.
-            for msg in reversed(self._messages):
-                yield msg
+        async def _edit(**edit_kwargs):
+            if "locked" in edit_kwargs:
+                self.locked = edit_kwargs["locked"]
+            if "archived" in edit_kwargs:
+                self.archived = edit_kwargs["archived"]
+            return self
 
-        return _gen()
-
-
-def _done_msg(content, *, author_id=42, bot=False, name="User"):
-    return SimpleNamespace(
-        content=content,
-        clean_content=content,
-        author=SimpleNamespace(id=author_id, display_name=name, name=name, bot=bot),
-        attachments=[],
-        type=None,
-    )
+        self.edit = AsyncMock(side_effect=_edit)
 
 
-def _done_interaction(channel):
+def _done_interaction(channel, *, user_id=123, user_name="Edward"):
     return SimpleNamespace(
         channel=channel,
         channel_id=getattr(channel, "id", None),
-        user=SimpleNamespace(id=123, display_name="Edward", name="edward"),
+        user=SimpleNamespace(
+            id=user_id,
+            display_name=user_name,
+            name=user_name.lower(),
+            roles=[],
+        ),
         response=SimpleNamespace(
             defer=AsyncMock(),
             send_message=AsyncMock(),
+            edit_message=AsyncMock(),
         ),
         followup=SimpleNamespace(send=AsyncMock()),
     )
@@ -1468,332 +1465,7 @@ async def test_done_slash_rejects_non_thread_context(adapter):
 
 
 @pytest.mark.asyncio
-async def test_done_slash_deletes_thread_and_posts_parent_audit_when_clear(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(
-        [
-            _done_msg("Please update the slash command", author_id=1),
-            _done_msg("Done — implemented and verified the slash command in tests", author_id=999, bot=True, name="Hermes"),
-        ],
-        parent=parent,
-        channel_id=200,
-        name="Architect: /done",
-    )
-    interaction = _done_interaction(thread)
-
-    await adapter._handle_done_slash(interaction)
-
-    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-    parent.send.assert_awaited_once()
-    audit = parent.send.await_args.args[0]
-    assert "`/done` deleted thread" in audit
-    assert "Outstanding check: none found" in audit
-    thread.delete.assert_awaited_once()
-    interaction.followup.send.assert_awaited_once()
-    assert "deleted this thread" in interaction.followup.send.await_args.args[0]
-
-
-def test_done_analysis_flags_plain_imperative_request(adapter):
-    outstanding = adapter._analyze_done_thread_messages(
-        [_done_msg("Please update the dashboard", author_id=1)]
-    )
-    assert outstanding
-    assert "update the dashboard" in outstanding[0]
-
-
-def test_done_analysis_does_not_treat_unrelated_reply_as_answer(adapter):
-    messages = [
-        _done_msg("What color should the button be?", author_id=1),
-        _done_msg("The deployment finished", author_id=2),
-    ]
-    outstanding = adapter._analyze_done_thread_messages(messages)
-    assert outstanding
-    assert any("Unanswered question" in item for item in outstanding)
-
-
-def test_done_analysis_does_not_treat_unrelated_bot_reply_as_answer(adapter):
-    messages = [
-        _done_msg("Please update the dashboard", author_id=1),
-        _done_msg("What's the weather?", author_id=2),
-        _done_msg("It is sunny.", author_id=999, bot=True, name="Hermes"),
-    ]
-    outstanding = adapter._analyze_done_thread_messages(messages)
-    assert any("update the dashboard" in item for item in outstanding)
-
-
-@pytest.mark.parametrize("bot", [False, True])
-def test_done_analysis_requires_more_than_one_generic_overlap_word(adapter, bot):
-    messages = [
-        _done_msg("Please update the dashboard colors", author_id=1),
-        _done_msg(
-            "The dashboard weather widget is sunny",
-            author_id=999 if bot else 2,
-            bot=bot,
-            name="Hermes" if bot else "Other",
-        ),
-    ]
-    outstanding = adapter._analyze_done_thread_messages(messages)
-    assert any("update the dashboard colors" in item for item in outstanding)
-
-
-@pytest.mark.parametrize("bot", [False, True])
-def test_done_analysis_same_topic_chatter_does_not_complete_request(adapter, bot):
-    messages = [
-        _done_msg("Please update the dashboard colors", author_id=1),
-        _done_msg(
-            "The dashboard colors are unpopular",
-            author_id=999 if bot else 2,
-            bot=bot,
-            name="Hermes" if bot else "Other",
-        ),
-    ]
-    outstanding = adapter._analyze_done_thread_messages(messages)
-    assert any("update the dashboard colors" in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    "request_text",
-    [
-        "Please delete the production database",
-        "Please migrate the production database",
-        "Please configure the alerts",
-        "Please document the API",
-    ],
-)
-def test_done_analysis_flags_broad_imperative_requests(adapter, request_text):
-    outstanding = adapter._analyze_done_thread_messages([_done_msg(request_text, author_id=1)])
-    assert outstanding
-
-
-@pytest.mark.parametrize(
-    "reply",
-    [
-        "The dashboard update is not completed",
-        "The dashboard was not updated",
-        "Dashboard update has not succeeded",
-    ],
-)
-def test_done_analysis_negated_completion_does_not_clear_request(adapter, reply):
-    messages = [
-        _done_msg("Please update the production dashboard", author_id=1),
-        _done_msg(reply, author_id=999, bot=True, name="Hermes"),
-    ]
-    outstanding = adapter._analyze_done_thread_messages(messages)
-    assert any("update the production dashboard" in item for item in outstanding)
-
-
-def test_done_analysis_unrelated_completion_with_generic_overlap_does_not_clear(adapter):
-    messages = [
-        _done_msg("Please update the production dashboard", author_id=1),
-        _done_msg("The production deployment completed", author_id=999, bot=True, name="Hermes"),
-    ]
-    outstanding = adapter._analyze_done_thread_messages(messages)
-    assert any("update the production dashboard" in item for item in outstanding)
-
-
-def test_done_analysis_requires_compatible_action_and_subject_to_clear_request(adapter):
-    messages = [
-        _done_msg("Please delete the production database", author_id=1),
-        _done_msg(
-            "Updated the production database dashboard",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert any("delete the production database" in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    ("request_text", "closeout"),
-    [
-        ("Create the production database", "Updated the production database"),
-        ("Enable the payment processor", "Disabled the payment processor"),
-    ],
-)
-def test_done_analysis_does_not_clear_request_with_incompatible_action(adapter, request_text, closeout):
-    messages = [
-        _done_msg(request_text, author_id=1),
-        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert any(request_text in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    ("request_text", "closeout"),
-    [
-        (
-            "Please delete the database update job",
-            "Updated the database update job",
-        ),
-        (
-            "Please delete the production database backup schedule",
-            "Deleted the production database metrics dashboard",
-        ),
-    ],
-)
-def test_done_analysis_matches_governing_action_and_specific_subject(
-    adapter,
-    request_text,
-    closeout,
-):
-    messages = [
-        _done_msg(request_text, author_id=1),
-        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert any(request_text in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    ("request_text", "closeout"),
-    [
-        ("Please update the slash command", "Implemented the slash command update"),
-        ("Delete the obsolete cache entries", "Removed the obsolete cache entries"),
-        ("Refactor the payment processor", "Reworked the payment processor"),
-    ],
-)
-def test_done_analysis_accepts_compatible_action_paraphrases(adapter, request_text, closeout):
-    messages = [
-        _done_msg(request_text, author_id=1),
-        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-@pytest.mark.parametrize(
-    "closeout",
-    [
-        "All done except database migration",
-        "Everything is complete, but the database migration remains pending",
-        "Thread is done; the database migration is not actually complete",
-        "All set — however, we still need to migrate the database",
-        "No outstanding work except the database migration",
-        "All done, but the database migration remains",
-        "All done; database migration pending",
-        "Everything is resolved, other than the database migration",
-    ],
-)
-def test_done_analysis_qualified_global_closeout_does_not_clear_request(adapter, closeout):
-    messages = [
-        _done_msg("Please migrate the database", author_id=1),
-        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert any("migrate the database" in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    "closeout",
-    [
-        "Except for database migration; all done.",
-        "All done, but database migration remains to be completed.",
-    ],
-)
-def test_done_analysis_checks_closeout_qualifiers_across_the_whole_reply(adapter, closeout):
-    messages = [
-        _done_msg("Please migrate the database", author_id=1),
-        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert any("migrate the database" in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    "closeout",
-    [
-        "All done; nothing remains",
-        "Everything is complete, and no work remains",
-        "All set. Remaining risk: no longer blocked",
-        "All done; behavior remains stable",
-    ],
-)
-def test_done_analysis_accepts_unqualified_global_closeout(adapter, closeout):
-    messages = [
-        _done_msg("Please migrate the database", author_id=1),
-        _done_msg(closeout, author_id=999, bot=True, name="Hermes"),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-@pytest.mark.parametrize(
-    "request_text",
-    [
-        "Refactor the payment processor",
-        "Rename the settlement worker",
-        "Optimize the invoice query",
-        "Rework the webhook handler",
-    ],
-)
-def test_done_analysis_flags_broad_bare_imperative_requests(adapter, request_text):
-    outstanding = adapter._analyze_done_thread_messages([_done_msg(request_text, author_id=1)])
-
-    assert any(request_text in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    "chat_text",
-    [
-        "I refactored the payment processor yesterday",
-        "The payment processor handles refunds",
-        "Refactoring the payment processor improved throughput",
-        "Our team discussed the payment processor refactor",
-        "Update: payment processor status",
-        "Run times improved after the payment processor change",
-        "Test results are green",
-        "Change is expected in the next release",
-    ],
-)
-def test_done_analysis_does_not_flag_ordinary_chat_as_bare_imperative(adapter, chat_text):
-    outstanding = adapter._analyze_done_thread_messages([_done_msg(chat_text, author_id=1)])
-
-    assert not any("Possible unresolved item" in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    "chat_text",
-    [
-        "Open source software is useful.",
-        "Open access publishing benefits researchers.",
-        "Open issues are tracked in Linear.",
-        "Open enrollment begins next week.",
-    ],
-)
-def test_done_analysis_does_not_flag_open_noun_or_adjective_chat(adapter, chat_text):
-    outstanding = adapter._analyze_done_thread_messages([_done_msg(chat_text, author_id=1)])
-
-    assert not any("Possible unresolved item" in item for item in outstanding)
-
-
-@pytest.mark.parametrize(
-    "request_text",
-    [
-        "Open the deployment dashboard",
-        "Refactor the payment processor",
-    ],
-)
-def test_done_analysis_keeps_clear_bare_action_commands(adapter, request_text):
-    outstanding = adapter._analyze_done_thread_messages([_done_msg(request_text, author_id=1)])
-
-    assert any(request_text in item for item in outstanding)
-
-
-@pytest.mark.asyncio
-async def test_done_slash_requires_confirmation_for_attachment_only_user_message(adapter, monkeypatch):
+async def test_done_slash_always_waits_for_explicit_confirmation(adapter, monkeypatch):
     from plugins.platforms.discord import adapter as discord_adapter
 
     created_views = []
@@ -1804,109 +1476,390 @@ async def test_done_slash_requires_confirmation_for_attachment_only_user_message
             created_views.append(self)
 
     monkeypatch.setattr(discord_adapter, "DoneThreadDeleteConfirmView", FakeDoneView)
-    attachment_only = _done_msg("", author_id=1)
-    attachment_only.attachments = [SimpleNamespace(filename="request.txt")]
     parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(
-        [attachment_only],
-        parent=parent,
-        channel_id=200,
-        name="Architect: attachment request",
-    )
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="Architect: /done")
     interaction = _done_interaction(thread)
+    adapter._fetch_done_thread_messages = AsyncMock(
+        side_effect=AssertionError("/done must not inspect or classify thread history")
+    )
 
     await adapter._handle_done_slash(interaction)
 
-    getattr(thread, "delete").assert_not_awaited()
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    adapter._fetch_done_thread_messages.assert_not_awaited()
+    thread.delete.assert_not_awaited()
     parent.send.assert_not_awaited()
-    assert created_views
-    assert any("attachment" in item.lower() for item in created_views[0].kwargs["outstanding_items"])
-    assert "Delete anyway" in interaction.followup.send.await_args.args[0]
+    interaction.followup.send.assert_awaited_once()
+    prompt = interaction.followup.send.await_args.args[0]
+    assert "Delete this thread?" in prompt
+    assert "cannot be undone" in prompt
+    assert created_views[0].kwargs == {
+        "adapter": adapter,
+        "thread": thread,
+        "invoking_user": interaction.user,
+    }
 
 
-@pytest.mark.asyncio
-async def test_done_history_fails_closed_when_raw_api_window_is_full(adapter):
-    class LimitedHistoryThread(_FakeDoneThread):
-        def history(self, *, limit, oldest_first=False):
-            async def _gen():
-                newest_first = list(reversed(self._messages))[:limit]
-                for msg in newest_first:
-                    yield msg
-            return _gen()
+def test_done_confirmation_is_bound_to_invoking_user(adapter):
+    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
 
-    thread = LimitedHistoryThread(
-        [_done_msg("Please delete the production database", author_id=1)]
-        + [_done_msg(f"message {i}", author_id=1) for i in range(100)]
-        + [_done_msg("/done", author_id=1)],
-        channel_id=200,
-    )
-    with pytest.raises(RuntimeError, match="more than 100"):
-        await adapter._fetch_done_thread_messages(thread, limit=100)
-
-
-@pytest.mark.asyncio
-async def test_done_history_fails_closed_when_scan_limit_is_truncated(adapter):
-    thread = _FakeDoneThread(
-        [_done_msg(f"message {i}", author_id=1) for i in range(101)],
-        channel_id=200,
-    )
-    with pytest.raises(RuntimeError, match="more than 100"):
-        await adapter._fetch_done_thread_messages(thread, limit=100)
-
-
-def test_private_thread_audit_omits_name_id_and_outstanding_excerpts(adapter):
-    thread = SimpleNamespace(
-        name="secret acquisition",
-        id=987,
-        type=12,
-    )
-    user = SimpleNamespace(display_name="edward", name="edward", id=456)
-    text = adapter._format_done_audit(
-        thread,
-        user,
-        ["Possible unresolved item: confidential purchase terms"],
-        confirmed=True,
-    )
-    assert "secret acquisition" not in text
-    assert "987" not in text
-    assert "confidential purchase terms" not in text
-    assert "edward" not in text.lower()
-    assert "456" not in text
-
-
-@pytest.mark.asyncio
-async def test_done_delete_failure_never_posts_success_audit(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
-    thread.delete.side_effect = RuntimeError("missing permission")
-    result = await adapter._complete_done_thread_delete(
+    adapter._allowed_user_ids = {123, 456}
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    invoker = _done_interaction(thread, user_id=123).user
+    view = DoneThreadDeleteConfirmView(
+        adapter=adapter,
         thread=thread,
-        acting_user=SimpleNamespace(display_name="Edward", name="edward", id=1),
-        outstanding_items=[],
-        confirmed=False,
+        invoking_user=invoker,
     )
-    assert result["success"] is False
-    parent.send.assert_not_awaited()
+
+    assert view._check_auth(_done_interaction(thread, user_id=123)) is True
+    assert view._check_auth(_done_interaction(thread, user_id=456)) is False
+
+
+def test_done_confirmation_does_not_narrow_prior_slash_authorization(
+    adapter,
+    monkeypatch,
+):
+    from plugins.platforms.discord import adapter as discord_adapter
+    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
+
+    # `/done` has already passed the adapter's full slash authorization, which
+    # includes channel-scoped policy. The component boundary must bind identity,
+    # not rerun the narrower user/role-only helper.
+    monkeypatch.setattr(discord_adapter, "_component_check_auth", lambda *_args: False)
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    invoker = _done_interaction(thread, user_id=123).user
+    view = DoneThreadDeleteConfirmView(
+        adapter=adapter,
+        thread=thread,
+        invoking_user=invoker,
+    )
+
+    assert view._check_auth(_done_interaction(thread, user_id=123)) is True
+    assert view._check_auth(_done_interaction(thread, user_id=456)) is False
+
+
+def test_done_real_discord_button_callback_preserves_slash_authorization():
+    script = r'''
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import discord
+from plugins.platforms.discord import adapter as discord_adapter
+
+
+def interaction(user_id):
+    return SimpleNamespace(
+        user=SimpleNamespace(id=user_id),
+        response=SimpleNamespace(
+            send_message=AsyncMock(),
+            edit_message=AsyncMock(),
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+
+async def main():
+    adapter = SimpleNamespace(
+        _complete_done_thread_delete=AsyncMock(
+            return_value={"success": False, "error": "blocked"}
+        )
+    )
+    thread = SimpleNamespace(id=200)
+    invoker = SimpleNamespace(id=123)
+
+    def unexpected_reauthorization(*_args):
+        raise AssertionError("component policy was incorrectly rerun")
+
+    discord_adapter._component_check_auth = unexpected_reauthorization
+    view = discord_adapter.DoneThreadDeleteConfirmView(
+        adapter=adapter,
+        thread=thread,
+        invoking_user=invoker,
+    )
+    assert all(isinstance(child, discord.ui.Button) for child in view.children)
+    delete = next(child for child in view.children if child.label == "Delete thread")
+
+    other = interaction(456)
+    await delete.callback(other)
+    adapter._complete_done_thread_delete.assert_not_awaited()
+    other.response.send_message.assert_awaited_once()
+
+    same = interaction(123)
+    await delete.callback(same)
+    adapter._complete_done_thread_delete.assert_awaited_once_with(
+        thread=thread,
+        acting_user=invoker,
+    )
+    same.response.edit_message.assert_awaited_once()
+    same.followup.send.assert_awaited_once()
+    print("REAL_DISCORD_DONE_CALLBACK_OK")
+
+
+asyncio.run(main())
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[2],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "REAL_DISCORD_DONE_CALLBACK_OK" in completed.stdout
 
 
 @pytest.mark.asyncio
-async def test_done_private_thread_delete_reason_withholds_actor(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(parent=parent, channel_id=200, name="private")
-    thread.type = 12
-    actor = SimpleNamespace(display_name="SECRET_ACTOR", name="SECRET_ACTOR", id=456)
+async def test_done_delete_button_rejects_different_authorized_user(adapter):
+    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
+
+    adapter._allowed_user_ids = {123, 456}
+    adapter._complete_done_thread_delete = AsyncMock()
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    invoker = _done_interaction(thread, user_id=123).user
+    view = DoneThreadDeleteConfirmView(
+        adapter=adapter,
+        thread=thread,
+        invoking_user=invoker,
+    )
+    other = _done_interaction(thread, user_id=456)
+
+    await view.delete_thread(other, None)
+
+    adapter._complete_done_thread_delete.assert_not_awaited()
+    other.response.send_message.assert_awaited_once()
+    assert view.resolved is False
+
+
+@pytest.mark.asyncio
+async def test_done_delete_button_uses_original_invoking_user(adapter):
+    from plugins.platforms.discord.adapter import DoneThreadDeleteConfirmView
+
+    adapter._allowed_user_ids = {123}
+    adapter._complete_done_thread_delete = AsyncMock(
+        return_value={"success": False, "error": "test stop"}
+    )
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    invoker = _done_interaction(thread, user_id=123).user
+    view = DoneThreadDeleteConfirmView(
+        adapter=adapter,
+        thread=thread,
+        invoking_user=invoker,
+    )
+    interaction = _done_interaction(thread, user_id=123)
+
+    await view.delete_thread(interaction, None)
+
+    adapter._complete_done_thread_delete.assert_awaited_once_with(
+        thread=thread,
+        acting_user=invoker,
+    )
+
+
+@pytest.mark.asyncio
+async def test_done_confirmation_serializes_overlapping_thread_transitions(adapter):
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    state = {"deleted": False, "delete_calls": 0}
+    delete_started = asyncio.Event()
+    release_delete = asyncio.Event()
+
+    async def edit_thread(**_kwargs):
+        if state["deleted"]:
+            raise RuntimeError("thread no longer exists")
+
+    async def delete_thread(**_kwargs):
+        state["delete_calls"] += 1
+        if state["delete_calls"] == 1:
+            delete_started.set()
+            await release_delete.wait()
+            state["deleted"] = True
+            return
+        await release_delete.wait()
+        if state["deleted"]:
+            raise RuntimeError("thread no longer exists")
+
+    thread.edit = AsyncMock(side_effect=edit_thread)
+    thread.delete = AsyncMock(side_effect=delete_thread)
+    acting_user = SimpleNamespace(id=123, display_name="Edward")
+
+    first = asyncio.create_task(
+        adapter._complete_done_thread_delete(
+            thread=thread,
+            acting_user=acting_user,
+        )
+    )
+    await asyncio.wait_for(delete_started.wait(), timeout=1)
+    second = asyncio.create_task(
+        adapter._complete_done_thread_delete(
+            thread=thread,
+            acting_user=acting_user,
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    edit_calls_before_release = thread.edit.await_count
+
+    release_delete.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert edit_calls_before_release == 1
+    assert first_result["success"] is True
+    assert second_result["success"] is False
+    thread.parent.send.assert_awaited_once()
+    assert adapter._done_thread_delete_transitions == {}
+
+
+@pytest.mark.asyncio
+async def test_done_confirmation_locks_then_deletes_then_audits(adapter):
+    events = []
+
+    async def _audit_send(_text):
+        events.append("audit")
+
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock(side_effect=_audit_send))
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
+
+    async def _edit(**kwargs):
+        events.append("lock")
+        thread.locked = kwargs.get("locked", thread.locked)
+        thread.archived = kwargs.get("archived", thread.archived)
+        return thread
+
+    async def _delete(**_kwargs):
+        events.append("delete")
+
+    thread.edit.side_effect = _edit
+    thread.delete.side_effect = _delete
+    actor = _done_interaction(thread).user
 
     result = await adapter._complete_done_thread_delete(
         thread=thread,
         acting_user=actor,
-        outstanding_items=[],
-        confirmed=False,
+    )
+
+    assert result == {"success": True}
+    assert events == ["lock", "delete", "audit"]
+    thread.edit.assert_awaited_once_with(
+        locked=True,
+        archived=True,
+        reason="Explicit /done confirmation",
+    )
+    audit = parent.send.await_args.args[0]
+    assert "`/done` deleted thread" in audit
+    assert "Explicit invoking-user confirmation: yes" in audit
+
+
+@pytest.mark.asyncio
+async def test_done_delete_cancellation_restores_thread_and_reraises(adapter):
+    thread = _FakeDoneThread(channel_id=200, name="important")
+    delete_started = asyncio.Event()
+
+    async def delete_forever(**_kwargs):
+        delete_started.set()
+        await asyncio.Event().wait()
+
+    thread.delete = AsyncMock(side_effect=delete_forever)
+    task = asyncio.create_task(
+        adapter._complete_done_thread_delete(
+            thread=thread,
+            acting_user=_done_interaction(thread).user,
+        )
+    )
+    await asyncio.wait_for(delete_started.wait(), timeout=1)
+    assert thread.locked is True
+    assert thread.archived is True
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert thread.locked is False
+    assert thread.archived is False
+    assert thread.edit.await_count == 2
+    assert thread.edit.await_args_list[1].kwargs == {
+        "locked": False,
+        "archived": False,
+        "reason": "Restore thread after failed /done deletion",
+    }
+    thread.parent.send.assert_not_awaited()
+    assert adapter._done_thread_delete_transitions == {}
+
+
+@pytest.mark.asyncio
+async def test_done_delete_failure_restores_thread_and_never_audits(adapter):
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
+    thread = _FakeDoneThread(
+        parent=parent,
+        channel_id=200,
+        name="important",
+        locked=False,
+        archived=False,
+    )
+    thread.delete.side_effect = RuntimeError("missing permission")
+    actor = _done_interaction(thread).user
+
+    result = await adapter._complete_done_thread_delete(
+        thread=thread,
+        acting_user=actor,
+    )
+
+    assert result["success"] is False
+    assert "missing permission" in result["error"]
+    assert thread.edit.await_count == 2
+    assert thread.edit.await_args_list[0].kwargs == {
+        "locked": True,
+        "archived": True,
+        "reason": "Explicit /done confirmation",
+    }
+    assert thread.edit.await_args_list[1].kwargs == {
+        "locked": False,
+        "archived": False,
+        "reason": "Restore thread after failed /done deletion",
+    }
+    assert thread.locked is False
+    assert thread.archived is False
+    parent.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_done_lock_failure_never_attempts_delete_or_audit(adapter):
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
+    thread.edit.side_effect = RuntimeError("cannot lock")
+
+    result = await adapter._complete_done_thread_delete(
+        thread=thread,
+        acting_user=_done_interaction(thread).user,
+    )
+
+    assert result["success"] is False
+    assert "cannot lock" in result["error"]
+    thread.delete.assert_not_awaited()
+    parent.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_done_private_thread_delete_reason_and_audit_withhold_actor(adapter):
+    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
+    thread = _FakeDoneThread(parent=parent, channel_id=200, name="private")
+    thread.type = 12
+    actor = _done_interaction(thread, user_id=456, user_name="SECRET_ACTOR").user
+
+    result = await adapter._complete_done_thread_delete(
+        thread=thread,
+        acting_user=actor,
     )
 
     assert result["success"] is True
     reason = thread.delete.await_args.kwargs["reason"]
+    audit = parent.send.await_args.args[0]
     assert "SECRET_ACTOR" not in reason
+    assert "SECRET_ACTOR" not in audit
+    assert "456" not in audit
     assert "private" in reason.lower()
+    assert "private thread" in audit.lower()
 
 
 @pytest.mark.asyncio
@@ -1917,549 +1870,12 @@ async def test_done_reports_post_delete_audit_failure_without_suggesting_retry(a
         send=AsyncMock(side_effect=RuntimeError("audit unavailable")),
     )
     thread = _FakeDoneThread(parent=parent, channel_id=200, name="important")
-    interaction = _done_interaction(thread)
-    adapter._fetch_done_thread_messages = AsyncMock(return_value=[])
 
-    await adapter._handle_done_slash(interaction)
+    result = await adapter._complete_done_thread_delete(
+        thread=thread,
+        acting_user=_done_interaction(thread).user,
+    )
 
+    assert result["success"] is True
+    assert "audit failed" in result["warning"]
     thread.delete.assert_awaited_once()
-    text = interaction.followup.send.await_args.args[0]
-    assert "deleted" in text.lower()
-    assert "audit" in text.lower()
-    assert "retry" not in text.lower()
-
-
-@pytest.mark.asyncio
-async def test_done_slash_warns_and_waits_when_outstanding_items_found(adapter, monkeypatch):
-    from plugins.platforms.discord import adapter as discord_adapter
-
-    created_views = []
-
-    class FakeDoneView:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            created_views.append(self)
-
-    monkeypatch.setattr(discord_adapter, "DoneThreadDeleteConfirmView", FakeDoneView)
-
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(
-        [_done_msg("Can you verify this in the live UI?", author_id=1)],
-        parent=parent,
-        channel_id=200,
-        name="Architect: verify",
-    )
-    interaction = _done_interaction(thread)
-
-    await adapter._handle_done_slash(interaction)
-
-    thread.delete.assert_not_awaited()
-    parent.send.assert_not_awaited()
-    interaction.followup.send.assert_awaited_once()
-    text = interaction.followup.send.await_args.args[0]
-    assert "possible open item" in text
-    assert "Delete anyway" in text
-    assert len(text) < 240
-    assert "Unanswered question" in text or "Verification not clearly resolved" in text
-    assert created_views and created_views[0].kwargs["thread"] is thread
-    assert created_views[0].kwargs["outstanding_items"]
-
-
-def test_done_confirmation_stays_readable_on_mobile(adapter):
-    long_summary = (
-        "Short answer: mostly yes, with one deployment caveat. - Only one visible "
-        "Discord /done: yes. I verified the command exists, but there is a "
-        "deployment caveat and follow-up risk that should not fill the whole screen."
-    )
-    text = adapter._format_done_confirmation(
-        [
-            f"Possible unresolved item: {long_summary}",
-            f"Verification/risk not clearly resolved: {long_summary}",
-            "Recent failure/blocker may still be open: unrelated deployment failed in CI",
-            "Work/check still in progress: need to confirm global command sync",
-            "Unanswered question: can you verify the mobile UI?",
-        ]
-    )
-
-    assert text.startswith("⚠️ `/done` found 4 possible open items.")
-    assert "Review the thread" in text
-    assert "Delete anyway" in text
-    assert "Short answer" not in text
-    assert "Possible unresolved item:" not in text
-    assert "+1 more" in text
-    assert len(text) < 240
-
-
-def test_done_confirmation_handles_many_duplicate_signals(adapter):
-    text = adapter._format_done_confirmation(
-        [
-            "Possible unresolved item: Need to verify the live UI after deploy",
-            "Verification/risk not clearly resolved: Need to verify the live UI after deploy",
-        ]
-    )
-
-    assert text.count("Need to verify the live UI") == 1
-    assert "TODO/follow-up" in text
-    assert "+" not in text
-
-
-def test_done_confirmation_shows_specific_actionable_excerpt(adapter):
-    text = adapter._format_done_confirmation(
-        ["Unanswered question: can you verify the mobile UI after restart?"]
-    )
-
-    assert "Unanswered question" in text
-    assert "can you verify the mobile UI after restart?" in text
-    assert "Delete anyway" in text
-
-
-def test_done_audit_dedupes_multiple_labels_for_same_source(adapter):
-    thread = SimpleNamespace(name="Architect: verify", id=123)
-    user = SimpleNamespace(display_name="edward", name="edward", id=456)
-
-    text = adapter._format_done_audit(
-        thread,
-        user,
-        [
-            "Possible unresolved item: Need to verify the live UI after deploy",
-            "Verification/risk not clearly resolved: Need to verify the live UI after deploy",
-        ],
-        confirmed=True,
-    )
-
-    assert "Outstanding check: found 1 possible item(s)" in text
-    assert text.count("Need to verify the live UI after deploy") == 1
-
-
-def test_done_analysis_flags_bot_closeout_with_deferred_restart_caveat(adapter):
-    messages = [
-        _done_msg(
-            """Agreed. I changed `/done` so the confirmation is mobile-readable.
-
-What changed:
-- Removed the long warning dump.
-- Caps the warning to short reason bullets.
-
-Caveat: the gateway needs to restart before Discord shows the new prompt.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert len(outstanding) == 1
-    assert "Possible unresolved item" in outstanding[0]
-    assert "gateway needs to restart" in outstanding[0]
-
-
-def test_done_analysis_flags_deferred_restart_caveat_even_with_test_results(adapter):
-    messages = [
-        _done_msg(
-            """Agreed. I changed `/done` so the confirmation is mobile-readable.
-
-What changed:
-- Removed the long warning dump.
-- Caps the warning to short reason bullets.
-
-Verified:
-- tests/gateway/test_discord_slash_commands.py
-- Result: 57 passed in 1.33s
-
-Caveat: the code is fixed on disk, but the gateway needs to restart before Discord shows the new prompt.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert len(outstanding) == 1
-    assert "Possible unresolved item" in outstanding[0]
-    assert "gateway needs to restart" in outstanding[0]
-
-
-def test_done_analysis_still_flags_bot_closeout_with_explicit_next_steps(adapter):
-    messages = [
-        _done_msg(
-            """Implemented and tests pass.
-
-Next steps:
-- Verify the global Discord command list after restart.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Possible unresolved item" in item for item in outstanding)
-
-
-def test_done_analysis_flags_hard_bot_blocker_without_closeout(adapter):
-    messages = [
-        _done_msg(
-            "I couldn't inspect this thread before deleting it: missing message content permission.",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Recent failure/blocker" in item for item in outstanding)
-
-
-def test_done_analysis_treats_later_verified_response_as_resolved(adapter):
-    messages = [
-        _done_msg("Need to verify the live UI", author_id=1),
-        _done_msg("Verified the live UI and tests passed", author_id=999, bot=True),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_bot_completion_summary_false_positive(adapter):
-    messages = [
-        _done_msg("does /done look for open items before deleting thread?", author_id=1),
-        _done_msg(
-            "Deployed. What changed: /done now scans for TODO / follow-up language. Verified: tests passed.",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_verified_fixed_closeout_with_historical_blocker_words(adapter):
-    messages = [
-        _done_msg(
-            """Verified. Full Disk Access is fixed.
-
-Evidence:
-- `~/.hermes/bin/mfa doctor` now returns `ok: true`.
-- method: imsg
-- Hermes can read local Messages/iMessage from this launch context.
-
-Remaining risk: no longer blocked.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_uses_one_best_finding_per_source_message(adapter):
-    messages = [
-        _done_msg("Can you check the deployment and show proof?", author_id=1),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert len(outstanding) == 1
-    assert "Can you check the deployment and show proof?" in outstanding[0]
-
-
-def test_done_analysis_still_flags_bot_summary_with_explicit_remaining_work(adapter):
-    messages = [
-        _done_msg(
-            "Deployed. TODO: verify the global Discord command list after restart.",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Possible unresolved item" in item for item in outstanding)
-
-
-def test_done_analysis_does_not_treat_unrelated_done_as_resolution(adapter):
-    messages = [
-        _done_msg("Need to follow up with the landlord about the lease", author_id=1),
-        _done_msg("Done — deployed the Discord slash command", author_id=999, bot=True),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Possible unresolved item" in item for item in outstanding)
-
-
-def test_done_analysis_does_not_treat_tool_progress_as_answer(adapter):
-    messages = [
-        _done_msg("Can you check whether /done really inspects the thread first?", author_id=1),
-        _done_msg("📚 skill_view: \"hermes-agent\"", author_id=999, bot=True),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Unanswered question" in item for item in outstanding)
-
-
-def test_done_analysis_ignores_todo_tool_progress_preview(adapter):
-    messages = [
-        _done_msg('📋 todo: "updating 3 task(s)"', author_id=999, bot=True, name="Hermes"),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_tdd_failing_test_evidence_in_closeout(adapter):
-    messages = [
-        _done_msg(
-            """Implemented and tested the /done changes.
-
-Verification:
-- New failing test reproduced the bug first.
-- Targeted /done tests now pass.
-- Direct reproduction now returns [].""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_tdd_failure_evidence_user_note(adapter):
-    messages = [
-        _done_msg(
-            "<@1516837137826316339> new failing test reproduced the bug first",
-            author_id=1,
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_tdd_explanation_and_prior_warning_quotes(adapter):
-    messages = [
-        _done_msg(
-            """Yes — relevant as another `/done` false positive, not as a real open item.
-
-It flagged:
-
-> `Failure/blocker: New failing test reproduced the bug first`
-
-That sentence is TDD/process evidence — “the regression test failed before the fix” — not an unresolved failure. `/done` should not block on that.
-
-Verified:
-- New regression failed before the fix, then passed.
-- `/done` test file: `68 passed`
-- Direct reproduction now returns no outstanding item for that message.
-- Full suite still stops on the same unrelated ACP approval-isolation failure.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-        _done_msg(
-            "<@1516837137826316339> new failing test reproduced the bug first",
-            author_id=1,
-        ),
-        _done_msg(
-            """Exactly. That phrase means:
-
-- A regression test was intentionally written first.
-- It failed before the fix.
-- That proves the test actually covered the bug.
-- Then the fix made it pass.
-
-So it is evidence the issue was handled, not an open failure. `/done` should treat that as a closeout/proof sentence, not a blocker. The patch now does that while still flagging real current failures like “still failing” or “CI is blocked.”""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_added_failing_regression_test_evidence(adapter):
-    messages = [
-        _done_msg(
-            """I fixed that now:
-
-- Added a failing regression for the exact user-note shape.
-- Updated `/done` so TDD proof text scans cleanly.
-- Targeted tests passed.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_new_regression_failed_first_evidence(adapter):
-    messages = [
-        _done_msg(
-            "New regression failed first on that exact sentence",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_ignores_bulleted_prior_done_warning_from_closeout(adapter):
-    messages = [
-        _done_msg(
-            """That screenshot is a real remaining classifier miss, not a stale restart issue.
-
-What happened:
-- Your restart at **11:36** loaded the prior fix.
-- `/done` at **12:02** then hit a new variant:
-  - `Failure/blocker: New regression failed first on that exact sentence`
-- My previous fix covered “Added a failing regression…” and “New failing test…”, but not “New regression failed first…” without the word “test.”
-
-I fixed it now:
-- Added a failing regression for the exact sentence.
-- Patched `/done` to treat `new regression failed first ...` as TDD/RED-phase proof.
-- Preserved real blockers like:
-  - `The new regression is still failing after the latest patch`
-  - `CI is blocked...`
-
-Verification:
-- Exact new regression failed first, then passed.
-- `/done` tests: `72 passed`
-- Direct analyzer now returns `[]` for that sentence.
-- Full suite still fails on the unrelated ACP approval-isolation test.
-
-For the current prompt: **Delete anyway** is safe.""",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    assert adapter._analyze_done_thread_messages(messages) == []
-
-
-def test_done_analysis_still_flags_current_failing_test_blocker(adapter):
-    messages = [
-        _done_msg(
-            "CI is blocked: test_done_analysis is still failing after the latest patch.",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-        _done_msg(
-            "The new regression is still failing after the latest patch.",
-            author_id=999,
-            bot=True,
-            name="Hermes",
-        ),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Recent failure/blocker" in item for item in outstanding)
-    assert any("new regression is still failing" in item for item in outstanding)
-
-
-def test_done_analysis_flags_unanswered_question_without_duplicate_verification_risk(adapter):
-    messages = [
-        _done_msg("Can you check the deployment and show proof?", author_id=1),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert len(outstanding) == 1
-    assert "Unanswered question" in outstanding[0]
-    assert "Can you check the deployment and show proof?" in outstanding[0]
-
-
-def test_done_analysis_flags_work_still_in_progress(adapter):
-    messages = [
-        _done_msg("I'm working on this now and checking the live command list", author_id=999, bot=True),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Work/check still in progress" in item for item in outstanding)
-
-
-def test_done_analysis_does_not_skip_questions_that_contain_resolution_words(adapter):
-    messages = [
-        _done_msg("Is this done?", author_id=1),
-        _done_msg("Was the live UI verified?", author_id=1),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Is this done?" in item for item in outstanding)
-    assert any("Was the live UI verified?" in item for item in outstanding)
-    assert all("Unanswered question" in item for item in outstanding)
-
-
-def test_done_analysis_does_not_skip_failures_that_contain_resolution_words(adapter):
-    messages = [
-        _done_msg("The deployed /done command is failing and deletes without checking", author_id=1),
-    ]
-
-    outstanding = adapter._analyze_done_thread_messages(messages)
-
-    assert outstanding
-    assert any("Recent failure/blocker" in item for item in outstanding)
-
-
-@pytest.mark.asyncio
-async def test_done_slash_fails_closed_when_thread_content_cannot_be_read(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(
-        [_done_msg("", author_id=1)],
-        parent=parent,
-        channel_id=200,
-        name="Architect: contentless",
-    )
-    interaction = _done_interaction(thread)
-
-    await adapter._handle_done_slash(interaction)
-
-    getattr(thread, "delete").assert_not_awaited()
-    parent.send.assert_not_awaited()
-    interaction.followup.send.assert_awaited_once()
-    assert "couldn't inspect" in interaction.followup.send.await_args.args[0]
-
-
-@pytest.mark.asyncio
-async def test_done_slash_fails_closed_when_any_user_message_content_cannot_be_read(adapter):
-    parent = SimpleNamespace(id=100, name="system-ops", send=AsyncMock())
-    thread = _FakeDoneThread(
-        [
-            _done_msg("", author_id=1),
-            _done_msg("Done — tool output was visible", author_id=999, bot=True),
-        ],
-        parent=parent,
-        channel_id=200,
-        name="Architect: partial-contentless",
-    )
-    interaction = _done_interaction(thread)
-
-    await adapter._handle_done_slash(interaction)
-
-    getattr(thread, "delete").assert_not_awaited()
-    parent.send.assert_not_awaited()
-    interaction.followup.send.assert_awaited_once()
-    assert "couldn't inspect" in interaction.followup.send.await_args.args[0]

@@ -4240,7 +4240,7 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_architect(interaction: discord.Interaction, args: str = ""):
             await self._handle_architect_thread_slash(interaction, args)
 
-        @tree.command(name="done", description="Check the current thread for open items, then delete it")
+        @tree.command(name="done", description="Confirm and delete the current Discord thread")
         async def slash_done(interaction: discord.Interaction):
             await self._handle_done_slash(interaction)
 
@@ -4891,7 +4891,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
     async def _handle_done_slash(self, interaction: discord.Interaction) -> None:
-        """Inspect the current Discord thread for open work and delete it via /done."""
+        """Require explicit invoking-user confirmation before deleting a thread."""
         if not await self._check_slash_authorization(interaction, "/done"):
             return
 
@@ -4904,973 +4904,122 @@ class DiscordAdapter(BasePlatformAdapter):
             return
 
         await interaction.response.defer(ephemeral=True)
-
-        try:
-            messages = await self._fetch_done_thread_messages(channel)
-        except Exception as exc:
-            logger.warning("[%s] /done could not fetch thread history: %s", self.name, exc, exc_info=True)
-            await interaction.followup.send(
-                f"I couldn't inspect this thread before deleting it: {exc}",
-                ephemeral=True,
-            )
-            return
-
-        outstanding = self._analyze_done_thread_messages(messages)
-        if outstanding:
-            view = DoneThreadDeleteConfirmView(
-                adapter=self,
-                thread=channel,
-                invoking_user=interaction.user,
-                outstanding_items=outstanding[:5],
-            )
-            msg = await interaction.followup.send(
-                self._format_done_confirmation(outstanding),
-                view=view,
-                ephemeral=True,
-            )
-            try:
-                view._message = msg
-            except Exception:
-                pass
-            return
-
-        result = await self._complete_done_thread_delete(
+        view = DoneThreadDeleteConfirmView(
+            adapter=self,
             thread=channel,
-            acting_user=interaction.user,
-            outstanding_items=[],
-            confirmed=False,
+            invoking_user=interaction.user,
         )
-        if result.get("success"):
-            message = "No outstanding items found — deleted this thread."
-            if result.get("warning"):
-                message += " The audit record could not be written; operators were notified."
-            await interaction.followup.send(
-                message,
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(
-                f"I couldn't delete this thread: {result.get('error', 'unknown error')}",
-                ephemeral=True,
-            )
-
-    async def _fetch_done_thread_messages(self, thread: Any, limit: int = 100) -> list[Any]:
-        """Fetch recent messages from a thread in chronological order for /done checks."""
-        collected: list[Any] = []
-        raw_seen = 0
-        saw_contentless_user_message = False
-        # Fetch one extra raw message so a capped API window cannot silently
-        # declare a long thread safe even when system or /done messages are
-        # filtered from the readable-message list.
-        async for msg in thread.history(limit=limit + 1, oldest_first=False):
-            raw_seen += 1
-            # Ignore Discord system noise; test doubles may not expose ``type``.
-            msg_type = getattr(msg, "type", None)
-            if msg_type is not None:
-                allowed_types = {getattr(discord.MessageType, "default", None), getattr(discord.MessageType, "reply", None)}
-                if msg_type not in allowed_types:
-                    continue
-            content = self._done_message_content(msg)
-            if not content:
-                if not self._done_message_is_bot(msg):
-                    saw_contentless_user_message = True
-                continue
-            # Slash invocations themselves are not actionable thread content.
-            if content.strip().lower().startswith("/done"):
-                continue
-            collected.append(msg)
-            if len(collected) > limit:
-                raise RuntimeError(
-                    f"This thread has more than {limit} readable messages; "
-                    "the /done safety scan was truncated, so automatic deletion was blocked."
-                )
-        if raw_seen > limit:
-            raise RuntimeError(
-                f"This thread has more than {limit} raw messages; "
-                "the /done safety scan was truncated, so automatic deletion was blocked."
-            )
-        if saw_contentless_user_message:
-            # If Discord lets us see user messages but not their text, deleting
-            # would silently bypass the safety check. Fail closed even when
-            # other bot/status messages in the thread had readable content.
-            raise RuntimeError(
-                "I could see user messages in this thread, but could not read "
-                "their content for the outstanding-item check."
-            )
-        collected.reverse()
-        return collected
-
-    def _done_message_content(self, msg: Any) -> str:
-        """Return user-visible text for a Discord message-like object."""
-        content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
-        if not content and getattr(msg, "attachments", None):
-            content = "(attachment)"
-        return str(content).strip()
-
-    def _done_message_author_id(self, msg: Any) -> str:
-        author = getattr(msg, "author", None)
-        return str(getattr(author, "id", ""))
-
-    def _done_message_is_bot(self, msg: Any) -> bool:
-        author = getattr(msg, "author", None)
-        return bool(getattr(author, "bot", False))
-
-    def _format_done_confirmation(self, outstanding_items: list[str]) -> str:
-        """Build the mobile-readable /done warning shown above the buttons."""
-        compact_items = self._compact_done_outstanding_items(outstanding_items)
-        count = len(compact_items)
-        if count == 0:
-            return "⚠️ `/done` found possible open work.\nReview the thread, or press **Delete anyway**."
-
-        detail_limit = 90 if count == 1 else 48 if count == 2 else 28
-        compact_items = self._compact_done_outstanding_items(
-            outstanding_items,
-            detail_max_length=detail_limit,
+        message = await interaction.followup.send(
+            "Delete this thread? This permanently removes its messages and cannot be undone.",
+            view=view,
+            ephemeral=True,
         )
-        count = len(compact_items)
-        noun = "item" if count == 1 else "items"
-        lines = [f"⚠️ `/done` found {count} possible open {noun}."]
-        shown = compact_items[:3]
-        lines.extend(f"- {item}" for item in shown)
-        remaining = count - len(shown)
-        if remaining > 0:
-            lines.append(f"- +{remaining} more")
-        lines.append("Review the thread, or press **Delete anyway**.")
-        return "\n".join(lines)
-
-    def _compact_done_outstanding_items(
-        self,
-        outstanding_items: list[str],
-        *,
-        detail_max_length: int = 90,
-    ) -> list[str]:
-        """Deduplicate and shorten /done warning items for Discord mobile."""
-        label_map = {
-            "Possible unresolved item": "TODO/follow-up",
-            "Work/check still in progress": "In progress",
-            "Verification/risk not clearly resolved": "Needs verification",
-            "Recent failure/blocker may still be open": "Failure/blocker",
-            "Unanswered question": "Unanswered question",
-            "Unreadable/attachment-only request": "Unreadable request",
-        }
-        compact: list[str] = []
-        seen_sources: set[str] = set()
-        for item in outstanding_items:
-            normalized = re.sub(r"\s+", " ", item or "").strip()
-            if not normalized:
-                continue
-            label, _sep, detail = normalized.partition(":")
-            label = label.strip()
-            detail = detail.strip()
-            key_source = detail or normalized
-            key = re.sub(r"[^a-z0-9]+", " ", key_source.lower()).strip()
-            key = key[:160] or normalized.lower()
-            if key in seen_sources:
-                continue
-            seen_sources.add(key)
-            short_label = label_map.get(label, label or "Possible open item")
-            excerpt = self._done_compact_excerpt(detail, max_length=detail_max_length)
-            compact.append(f"{short_label}: {excerpt}" if excerpt else short_label)
-        return compact
-
-    def _done_compact_excerpt(self, detail: str, *, max_length: int = 90) -> str:
-        """Return a short, actionable source excerpt for /done warnings."""
-        normalized = re.sub(r"<@[!&]?\d+>", "", detail or "")
-        normalized = re.sub(r"\s+", " ", normalized).strip(" -")
-        if not normalized:
-            return ""
-        if len(normalized) <= max_length:
-            return normalized
-
-        keyword_match = re.search(
-            r"\b(todo|follow[- ]?up|next steps?|need(?:s)?|verify|check|proof|"
-            r"evidence|error|failed|failing|failure|blocked|blocker|pending|"
-            r"unanswered|question|risk|caveat)\b",
-            normalized,
-            re.IGNORECASE,
-        )
-        if keyword_match:
-            start = max(0, keyword_match.start() - 16)
-            end = min(len(normalized), start + max_length)
-            excerpt = normalized[start:end].strip(" -")
-            if start > 0:
-                excerpt = "…" + excerpt
-        else:
-            excerpt = normalized[:max_length].rstrip()
-        if len(excerpt) > max_length:
-            excerpt = excerpt[: max_length - 1].rstrip() + "…"
-        elif len(normalized) > len(excerpt.lstrip("…")):
-            excerpt = excerpt.rstrip(" .") + "…"
-        return excerpt
-
-    def _analyze_done_thread_messages(self, messages: list[Any]) -> list[str]:
-        """Conservative heuristic scan for unresolved work in the current thread.
-
-        This intentionally avoids consulting external systems: /done's contract is
-        "current Discord thread only."  The scan favours short, human-readable
-        warnings over exhaustive task extraction; users can still confirm and
-        delete immediately.
-        """
-        if not messages:
-            return []
-
-        resolution_re = re.compile(
-            r"(?<!/)\b(done|fixed|resolved|complete(?:d)?|verified|tested|passes?|passed|"
-            r"succeeded|success|confirmed|implemented|changed|updated|patched|"
-            r"improved|added|removed|revised|no outstanding|nothing outstanding|"
-            r"refactored|reworked|renamed|optimized|deleted|migrated|configured|"
-            r"documented|created|built|written|sent|delivered|finished|handled|"
-            r"closed|merged|deployed|shipped|all set|looks good|works now|working now)\b",
-            re.IGNORECASE,
-        )
-        in_progress_re = re.compile(
-            r"\b(working on|checking|investigating|looking into|will check|will verify|"
-            r"i['’]?ll check|i['’]?ll verify|need to check|need to verify)\b",
-            re.IGNORECASE,
-        )
-        todo_re = re.compile(
-            r"\b(todo|to do|follow[- ]?up|need(?:s)? to|still need|open issue|"
-            r"unresolved|blocked|blocker|pending|left outstanding|remaining|next steps?)\b",
-            re.IGNORECASE,
-        )
-        verify_re = re.compile(
-            r"\b(verify|verified|verification|test(?:ed|s|ing)?|check(?:ed|ing)?|"
-            r"confirm(?:ed|ing)?|make sure|proof|evidence|screenshot|live ui)\b",
-            re.IGNORECASE,
-        )
-        failure_re = re.compile(
-            r"\b(error|failed|failing|failure|traceback|exception|not working|doesn'?t work|"
-            r"can'?t|cannot|couldn['’]?t|could not|unable|refused|broken|blocked)\b",
-            re.IGNORECASE,
-        )
-        explicit_open_re = re.compile(
-            r"(?im)(?:^|\n)\s*(?:[-*]\s*)?(?:todo|to do|follow[- ]?up|"
-            r"next steps?|remaining|still need|needs? to|blocked|blocker|pending)\s*[:\-]|"
-            r"\b(?:todo|to do|follow[- ]?up|next steps?|remaining)\s*:|"
-            r"\b(?:still need|unresolved|blocked|blocker|pending|left outstanding|remaining)\b",
-        )
-        request_re = re.compile(
-            r"(?im)(?:^|\n)\s*(?:[-*]\s*)?(?:"
-            r"please\s+[a-z][a-z0-9_-]*\b|"
-            r"(?:can|could|would|will)\s+you\b|"
-            r"(?:add|archive|backfill|benchmark|build|bump|change|check|clean|clone|"
-            r"configure|convert|copy|create|debug|delete|deploy|diagnose|disable|"
-            r"document|download|draft|edit|enable|extract|fix|generate|harden|"
-            r"implement|import|install|investigate|merge|migrate|move|notify|open|"
-            r"optimize|publish|rebuild|refactor|release|remove|rename|replace|review|"
-            r"revert|rewrite|rework|rotate|run|schedule|secure|send|simplify|start|"
-            r"stop|sync|test|update|upgrade|upload|validate|verify|wire|write)\b)"
-        )
-
-        contents = [self._done_message_content(m) for m in messages]
-        lowered = [c.lower() for c in contents]
-
-        outstanding: list[str] = []
-        seen_keys: set[str] = set()
-
-        def add(label: str, text: str) -> None:
-            snippet = re.sub(r"\s+", " ", text).strip()
-            snippet = re.sub(r"<@[!&]?\d+>", "", snippet).strip()
-            if len(snippet) > 110:
-                snippet = snippet[:107].rstrip() + "..."
-            item = f"{label}: {snippet}" if snippet else label
-            key = item.lower()
-            if key not in seen_keys:
-                seen_keys.add(key)
-                outstanding.append(item)
-
-        for idx, (msg, content, _lower) in enumerate(zip(messages, contents, lowered)):
-            if self._done_message_is_unreadable_user_request(msg, content):
-                add("Unreadable/attachment-only request", content or "(unreadable message)")
-                continue
-            if not content:
-                continue
-            if self._done_message_is_bot(msg) and self._done_is_tool_progress_message(content):
-                continue
-
-            question_like = "?" in content
-            open_task_detail = self._done_open_task_signal_text(
-                content,
-                todo_re=todo_re,
-                explicit_open_re=explicit_open_re,
-                resolution_re=resolution_re,
-                failure_re=failure_re,
-            )
-            request_detail = self._done_request_signal_text(content, request_re)
-            in_progress_detail = self._done_first_matching_segment(content, in_progress_re)
-            failure_detail = self._done_open_failure_signal_text(content, failure_re=failure_re)
-            resolved_later = self._done_has_later_resolution(messages, idx, content, resolution_re)
-            answered_later = self._done_has_later_reply(
-                messages,
-                idx,
-                content,
-                require_completion=bool(request_detail),
-            )
-            verify_detail = self._done_verification_risk_signal_text(content, verify_re)
-
-            # A message that is itself clearly reporting completion/verification
-            # should count as evidence, not become a fresh verification risk.
-            # Historical words like "failed" or "blocked" are allowed when the
-            # same sentence says they are now fixed/no longer blocked.
-            if (
-                resolution_re.search(content)
-                and not question_like
-                and not open_task_detail
-                and not in_progress_detail
-                and not failure_detail
-            ):
-                continue
-
-            # Emit at most one blocking finding per source message. Pick the
-            # highest-signal reason so /done does not show the same excerpt as
-            # TODO + verification + blocker noise.
-            if question_like and not answered_later:
-                add("Unanswered question", content)
-            elif failure_detail and not resolved_later:
-                add("Recent failure/blocker may still be open", failure_detail)
-            elif in_progress_detail and not resolved_later:
-                add("Work/check still in progress", in_progress_detail)
-            elif open_task_detail and not resolved_later:
-                add("Possible unresolved item", open_task_detail)
-            elif request_detail and not (resolved_later or answered_later):
-                add("Possible unresolved item", request_detail)
-            elif verify_detail and not resolution_re.search(content) and not resolved_later:
-                add("Verification/risk not clearly resolved", verify_detail)
-
-            if len(outstanding) >= 8:
-                break
-
-        return outstanding
-
-    def _done_message_is_unreadable_user_request(self, msg: Any, content: str) -> bool:
-        """Fail closed when a user's request is represented only by an attachment marker."""
-        if self._done_message_is_bot(msg):
-            return False
-        raw_content = getattr(msg, "clean_content", None) or getattr(msg, "content", "") or ""
-        return bool(getattr(msg, "attachments", None)) and (
-            not str(raw_content).strip() or content.strip().lower() == "(attachment)"
-        )
-
-    def _done_has_open_task_signal(
-        self,
-        content: str,
-        *,
-        todo_re: re.Pattern[str],
-        explicit_open_re: re.Pattern[str],
-        resolution_re: re.Pattern[str],
-        failure_re: re.Pattern[str],
-    ) -> bool:
-        """Return True for explicit open-work language not negated by closeout text."""
-        return self._done_open_task_signal_text(
-            content,
-            todo_re=todo_re,
-            explicit_open_re=explicit_open_re,
-            resolution_re=resolution_re,
-            failure_re=failure_re,
-        ) is not None
-
-    def _done_open_task_signal_text(
-        self,
-        content: str,
-        *,
-        todo_re: re.Pattern[str],
-        explicit_open_re: re.Pattern[str],
-        resolution_re: re.Pattern[str],
-        failure_re: re.Pattern[str],
-    ) -> str | None:
-        """Return the concrete open-work segment, if one exists."""
-        if not (todo_re.search(content) or explicit_open_re.search(content)):
-            return None
-        for segment in self._done_signal_segments(content):
-            if not (todo_re.search(segment) or explicit_open_re.search(segment)):
-                continue
-            if self._done_segment_resolves_open_signal(
-                segment,
-                resolution_re=resolution_re,
-                failure_re=failure_re,
-            ):
-                continue
-            return segment
-        return None
-
-    def _done_has_open_failure_signal(self, content: str, *, failure_re: re.Pattern[str]) -> bool:
-        """Return True for failure/blocker language that is not described as fixed."""
-        return self._done_open_failure_signal_text(
-            content,
-            failure_re=failure_re,
-        ) is not None
-
-    def _done_open_failure_signal_text(self, content: str, *, failure_re: re.Pattern[str]) -> str | None:
-        """Return the concrete failure/blocker segment, if one exists."""
-        if not failure_re.search(content):
-            return None
-        for segment in self._done_signal_segments(content):
-            if not failure_re.search(segment):
-                continue
-            if self._done_segment_resolves_failure_signal(segment):
-                continue
-            return segment
-        return None
-
-    def _done_first_matching_segment(self, content: str, pattern: re.Pattern[str]) -> str | None:
-        """Return the first message segment matching a scan pattern."""
-        if not pattern.search(content):
-            return None
-        for segment in self._done_signal_segments(content):
-            if pattern.search(segment):
-                return segment
-        return content.strip() or None
-
-    def _done_request_signal_text(self, content: str, pattern: re.Pattern[str]) -> str | None:
-        """Return an imperative/request segment while rejecting common chat headings and nouns."""
-        if not pattern.search(content):
-            return None
-        ordinary_bare_action_re = re.compile(
-            r"^(?:update\s*:|change\s+(?:is|was|seems?|looks?)\b|"
-            r"(?:build|deployment)\s+status\b|release\s+notes?\b|review\s+summary\b|"
-            r"run\s+times?\b|test\s+results?\b)",
-            re.IGNORECASE,
-        )
-        for segment in self._done_signal_segments(content):
-            if not pattern.search(segment):
-                continue
-            stripped = re.sub(r"^\s*[-*]\s*", "", segment).strip()
-            if re.match(r"^(?:please\b|(?:can|could|would|will)\s+you\b)", stripped, re.IGNORECASE):
-                return segment
-            if ordinary_bare_action_re.search(stripped):
-                continue
-            # ``open`` is commonly an adjective or noun at the start of an
-            # ordinary declarative sentence ("Open source software is useful",
-            # "Open issues are tracked"). A bare command has an introduced or
-            # visibly delimited direct object; fail conservatively when that
-            # grammatical evidence is absent instead of treating every leading
-            # ``Open`` as an imperative.
-            if re.match(r"^open\b", stripped, re.IGNORECASE) and not re.match(
-                r"^open\s+(?:(?:the|a|an|this|that|these|those|my|your|our|their|"
-                r"his|her|its)\b|[`'\"/#~.])",
-                stripped,
-                re.IGNORECASE,
-            ):
-                continue
-            return segment
-        return None
-
-    def _done_verification_risk_signal_text(self, content: str, pattern: re.Pattern[str]) -> str | None:
-        """Return verification-risk text, excluding TDD/process proof."""
-        if not pattern.search(content):
-            return None
-        for segment in self._done_signal_segments(content):
-            if not pattern.search(segment):
-                continue
-            if self._done_segment_is_tdd_failure_evidence(segment.lower()):
-                continue
-            if self._done_segment_is_non_actionable_failure_reference(segment):
-                continue
-            return segment
-        return None
-
-    def _done_signal_segments(self, content: str) -> list[str]:
-        """Split a message into small heuristic units for open/closed signals."""
-        return [
-            segment.strip()
-            for segment in re.split(r"(?:\n+|[.;]\s+)", content)
-            if segment.strip()
-        ]
-
-    def _done_segment_resolves_open_signal(
-        self,
-        segment: str,
-        *,
-        resolution_re: re.Pattern[str],
-        failure_re: re.Pattern[str],
-    ) -> bool:
-        lowered = segment.lower()
-        if self._done_segment_is_non_actionable_failure_reference(segment):
-            return True
-        if re.search(
-            r"\b(?:classifier\s+miss|false positive)\b",
-            lowered,
-        ) and re.search(
-            r"\b(?:screenshot|warning|analysis|/done|stale\s+restart)\b",
-            lowered,
-        ):
-            return True
-        if re.search(r"\bwhat changed\b|\bchanged\s*:", lowered):
-            return True
-        if re.search(
-            r"\b(no longer|not anymore|no outstanding|nothing outstanding|"
-            r"nothing open|no open|none remaining|not blocked|not pending)\b",
-            lowered,
-        ):
-            return True
-        if re.search(
-            r"\b(todo|to do|follow[- ]?up|next steps?|still need|needs? to|"
-            r"need to|pending|remaining)\b",
-            lowered,
-        ):
-            return False
-        return bool(
-            resolution_re.search(segment)
-            and not self._done_has_open_failure_signal(segment, failure_re=failure_re)
-        )
-
-    def _done_segment_resolves_failure_signal(self, segment: str) -> bool:
-        lowered = segment.lower()
-        if self._done_segment_is_non_actionable_failure_reference(segment):
-            return True
-        if re.search(
-            r"\b(still|currently|continues?|keeps?|remains?|again)\b.{0,40}"
-            r"\b(error|failed|failing|failure|not working|broken|blocked)\b",
-            lowered,
-        ):
-            return False
-        if self._done_segment_is_tdd_failure_evidence(lowered):
-            return True
-        return bool(
-            re.search(
-                r"\b(no longer|not anymore|fixed|resolved|handled|recovered|"
-                r"working now|works now|passes?|passed|succeeded|success|ok)\b",
-                lowered,
-            )
-        )
-
-    def _done_segment_is_non_actionable_failure_reference(self, segment: str) -> bool:
-        """Return True for quoted/history/example failure text, not live breakage."""
-        lowered = segment.lower()
-        stripped = lowered.strip()
-        if re.match(
-            r"^(?:>\s*)?(?:[-*•]\s*|\d+[.)]\s*)?`?\s*"
-            r"(?:failure/blocker|verification/risk|possible unresolved item|"
-            r"unanswered question|work/check still in progress)\b",
-            stripped,
-        ):
-            return True
-        if re.match(
-            r"^(?:>\s*)?(?:[-*•]\s*|\d+[.)]\s*)?`[^`]+`\s*$",
-            stripped,
-        ):
-            return True
-        if re.search(r"\bfailed\s+before\s+(?:the\s+)?(?:fix|patch|change)\b", lowered):
-            return True
-        if re.search(r"\b(?:failed|failing|failure)\b", lowered) and "unrelated" in lowered:
-            return True
-        if "not an unresolved failure" in lowered or "not an open failure" in lowered:
-            return True
-        if "not a blocker" in lowered or "should not block" in lowered:
-            return True
-        if "not as a real open item" in lowered or "not a real open item" in lowered:
-            return True
-        if re.search(
-            r"\b(?:preserv(?:e|ed|ing)\s+)?real\s+current\s+(?:failures|blockers)\s+like\b",
-            lowered,
-        ):
-            return True
-        if "real current failures like" in lowered:
-            return True
-        if ("false positive" in lowered or "failure/blocker" in lowered) and re.search(
-            r"\b(flagged|flagging|warning|analysis)\b",
-            lowered,
-        ):
-            return True
-        return False
-
-    def _done_segment_is_tdd_failure_evidence(self, lowered_segment: str) -> bool:
-        """Return True for TDD RED-phase evidence, not current breakage.
-
-        Closeout summaries often say a "failing test reproduced the bug
-        first."  That is proof the regression test caught the old behavior,
-        not an unresolved failure. Keep phrases like "still failing" or
-        "blocked" as real blockers.
-        """
-        if re.search(
-            r"\b(still|currently|continues?|keeps?|remains?|again|blocked|blocker|"
-            r"unresolved|pending)\b",
-            lowered_segment,
-        ):
-            return False
-        if re.search(
-            r"\b(?:add(?:ed|ing)?|wrote|written|creat(?:ed|ing)|introduced?)\b"
-            r".{0,80}\b(?:fail(?:ed|ing)\s+)?regression\b",
-            lowered_segment,
-        ) and re.search(
-            r"\b(test|tests|tdd|red(?:-green)?|repro|reproduced?|exact|user-note|shape)\b",
-            lowered_segment,
-        ):
-            return True
-        if re.search(
-            r"\b(?:new\s+)?regression\b",
-            lowered_segment,
-        ) and re.search(
-            r"\bfail(?:ed|ing)\b",
-            lowered_segment,
-        ) and re.search(
-            r"\b(first|before\s+(?:the\s+)?(?:fix|patch|change)|reproduced?|repro|"
-            r"red(?:-green)?|tdd|exact\s+sentence)\b",
-            lowered_segment,
-        ):
-            return True
-        if re.search(
-            r"\b(?:regression\s+)?tests?\b",
-            lowered_segment,
-        ) and re.search(
-            r"\b(first|intentionally written|covered the bug|proves? the test)\b",
-            lowered_segment,
-        ):
-            return True
-        if not re.search(r"\b(?:new\s+)?fail(?:ed|ing)\s+tests?\b", lowered_segment):
-            return False
-        return bool(
-            re.search(
-                r"\b(reproduced?|repro|regression|tdd|red(?:-green)?|first|expected)\b",
-                lowered_segment,
-            )
-        )
-
-    def _done_has_later_reply(
-        self,
-        messages: list[Any],
-        idx: int,
-        content: str,
-        *,
-        require_completion: bool = False,
-    ) -> bool:
-        asker_id = self._done_message_author_id(messages[idx])
-        completion_re = re.compile(
-            r"\b(?:done|completed?|implemented|updated|fixed|resolved|handled|"
-            r"finished|deployed|sent|created|added|removed|changed|verified|"
-            r"refactored|reworked|renamed|optimized|deleted|migrated|configured|"
-            r"documented|built|written|delivered|passed|succeeded)\b",
-            re.IGNORECASE,
-        )
-        for later in messages[idx + 1:]:
-            later_content = self._done_message_content(later)
-            if not later_content or self._done_is_tool_progress_message(later_content):
-                continue
-            if self._done_message_author_id(later) == asker_id and not self._done_message_is_bot(later):
-                continue
-            # Replies only close an earlier item when they explicitly resolve
-            # the thread or plausibly answer its subject. For imperative
-            # requests, topic overlap alone is insufficient: require a concrete
-            # completion signal, compatible action, and shared subject evidence.
-            if self._done_resolution_is_negated(later_content):
-                continue
-            if self._done_is_global_resolution_message(later_content):
-                return True
-            if require_completion:
-                if not completion_re.search(later_content):
-                    continue
-                if self._done_resolution_matches_open_item(content, later_content):
-                    return True
-                continue
-            if self._done_content_overlaps(content, later_content):
-                return True
-        return False
-
-    def _done_has_later_resolution(
-        self,
-        messages: list[Any],
-        idx: int,
-        content: str,
-        resolution_re: re.Pattern[str],
-    ) -> bool:
-        """Return True only when later text plausibly resolves this item.
-
-        A generic later "done" message is not enough: it may refer to a
-        different subtask.  Either the resolution must be an unqualified global
-        closeout phrase or it must match both the requested action and subject.
-        """
-        for later in messages[idx + 1:]:
-            later_content = self._done_message_content(later)
-            if not later_content or self._done_is_tool_progress_message(later_content):
-                continue
-            if not resolution_re.search(later_content):
-                continue
-            if self._done_resolution_is_negated(later_content):
-                continue
-            if self._done_is_global_resolution_message(later_content):
-                return True
-            if self._done_resolution_matches_open_item(content, later_content):
-                return True
-        return False
-
-    def _done_is_tool_progress_message(self, content: str) -> bool:
-        """Identify Hermes tool-progress preview messages that are not answers."""
-        stripped = content.strip()
-        # Discord progress previews usually look like ``📚 skill_view: ...``.
-        # Do not rely on a complete emoji list; strip any leading icon/prefix
-        # characters and classify known tool-call prefixes instead.
-        normalized = re.sub(r"^[^A-Za-z0-9_/.-]+", "", stripped).lstrip()
-        return bool(
-            re.match(
-                r"^(?:functions\.)?(?:"
-                r"browser_[a-z_]+|cronjob|delegate_task|discord(?:_admin)?|"
-                r"execute_code|memory|patch|process|read_file|search_files|"
-                r"session_search|skill_manage|skill_view|skills_list|terminal|todo|"
-                r"vision_analyze|write_file"
-                r")\s*:",
-                normalized,
-            )
-        )
-
-    def _done_resolution_is_negated(self, content: str) -> bool:
-        """Reject completion words that are negated or followed by open-work qualifiers."""
-        return self._done_resolution_is_qualified(content) or bool(
-            re.search(
-                r"\b(?:not|never|isn['’]?t|aren['’]?t|wasn['’]?t|weren['’]?t|"
-                r"hasn['’]?t|haven['’]?t|hadn['’]?t|didn['’]?t|doesn['’]?t|"
-                r"can['’]?t|cannot)\b.{0,40}\b(?:done|complete(?:d)?|implemented|"
-                r"updated|fixed|resolved|handled|finished|deployed|sent|created|"
-                r"added|removed|changed|verified|passed|succeeded|refactored|reworked|"
-                r"renamed|optimized|deleted|migrated|configured|documented|built|"
-                r"written|delivered)\b",
-                content,
-                re.IGNORECASE | re.DOTALL,
-            )
-        )
-
-    def _done_resolution_is_qualified(self, content: str) -> bool:
-        """Return True when a closeout carves out exceptions or remaining work."""
-        completion_re = re.compile(
-            r"(?<!/)\b(?:done|complete(?:d)?|fixed|resolved|implemented|updated|"
-            r"handled|finished|verified|passed|succeeded|refactored|reworked|renamed|"
-            r"optimized|deleted|removed|migrated|configured|documented|created|built|"
-            r"written|sent|delivered|deployed|shipped|no outstanding|"
-            r"nothing outstanding|nothing open|all set|works? now)\b",
-            re.IGNORECASE,
-        )
-        exception_re = re.compile(
-            r"\b(?:except(?:\s+for)?|apart\s+from|other\s+than|save\s+for|"
-            r"with\s+the\s+exception\s+of)\b",
-            re.IGNORECASE,
-        )
-        open_work_re = re.compile(
-            r"\b(?:still\s+(?:need(?:s)?\s+to|pending|open|unfinished|incomplete|"
-            r"unresolved|outstanding)|need(?:s)?\s+to|left\s+to\s+do|todo|"
-            r"follow[- ]?up|pending|remaining|outstanding|unfinished|incomplete|"
-            r"unresolved|remains?(?:\s+(?:pending|open|unfinished|incomplete|unresolved|"
-            r"outstanding|to\s+be\s+(?:done|complete(?:d)?|finished|handled|resolved)))?"
-            r"(?=[\s.!?]*$)|not\s+(?:actually\s+)?(?:done|complete(?:d)?|"
-            r"fixed|resolved|implemented|finished|refactored|reworked|renamed|optimized|"
-            r"deleted|migrated|configured|documented|built|written|delivered|deployed)|"
-            r"not\s+yet)\b",
-            re.IGNORECASE,
-        )
-        closed_open_work_re = re.compile(
-            r"\b(?:no\s+longer|not\s+anymore)\s+(?:blocked|pending|open|remaining|"
-            r"outstanding|unfinished|incomplete|unresolved)|"
-            r"\b(?:no|nothing|none)\s+(?:is\s+)?(?:pending|remaining|outstanding|open)|"
-            r"\b(?:no\s+(?:\w+\s+){0,2}|nothing\s+)remains?\b|"
-            r"\bnot\s+(?:blocked|pending)\b",
-            re.IGNORECASE,
-        )
-
-        # Qualifiers can precede or follow the closeout clause. Establish that
-        # the whole reply contains completion evidence first, then inspect every
-        # clause rather than only clauses after the first completion word.
-        if not completion_re.search(content):
-            return False
-        for segment in self._done_signal_segments(content):
-            if exception_re.search(segment):
-                return True
-            if re.search(r"\bwhat changed\b|\bchanged\s*:", segment, re.IGNORECASE):
-                continue
-            without_closed_phrases = closed_open_work_re.sub("", segment)
-            without_closed_phrases = re.sub(
-                r"\bremaining\s+(?:risk|caveats?)\s*:?",
-                "",
-                without_closed_phrases,
-                flags=re.IGNORECASE,
-            )
-            if open_work_re.search(without_closed_phrases):
-                return True
-        return False
-
-    def _done_is_global_resolution_message(self, content: str) -> bool:
-        return not self._done_resolution_is_negated(content) and bool(
-            re.search(
-                r"\b(no outstanding|nothing outstanding|nothing open|all set|all done|"
-                r"everything (?:is )?(?:done|resolved|complete)|thread (?:is )?(?:done|resolved|complete))\b",
-                content,
-                re.IGNORECASE,
-            )
-        )
-
-    def _done_resolution_matches_open_item(self, open_content: str, resolution_content: str) -> bool:
-        """Require compatible action and concrete subject evidence for a closeout."""
-        if self._done_resolution_is_negated(resolution_content):
-            return False
-
-        open_subjects = self._done_subject_keyword_set(open_content)
-        resolution_subjects = self._done_subject_keyword_set(resolution_content)
-        common_subjects = open_subjects & resolution_subjects
-        if any(word.startswith("slash:") for word in common_subjects):
-            has_subject_evidence = True
-        else:
-            # Broad overlap such as ``production database`` must not prove that
-            # a specific ``production database backup schedule`` was handled.
-            # The resolution may add detail, but it cannot silently substitute
-            # another object named by the request.
-            has_subject_evidence = bool(open_subjects) and open_subjects <= resolution_subjects
-        if not has_subject_evidence:
-            return False
-
-        requested_actions = self._done_governing_action_families(open_content)
-        resolution_actions = self._done_governing_action_families(resolution_content)
-        if not requested_actions or not resolution_actions:
-            # Generic "done/finished/handled" closeouts carry no contradictory
-            # action, so strong subject evidence is sufficient for them.
-            return True
-        return bool(requested_actions & resolution_actions)
-
-    def _done_content_overlaps(self, open_content: str, resolution_content: str) -> bool:
-        common = self._done_keyword_set(open_content) & self._done_keyword_set(resolution_content)
-        return len(common) >= 2 or any(word.startswith("slash:") for word in common)
-
-    def _done_subject_keyword_set(self, content: str) -> set[str]:
-        """Return meaningful non-action words used to identify a request's subject."""
-        keywords = self._done_keyword_set(content)
-        for word in re.findall(r"[a-zA-Z0-9]+", content.lower()):
-            if self._done_action_families(word):
-                keywords.discard(self._done_normalize_keyword(word))
-        for word in (
-            "complete", "completed", "done", "finish", "finished", "handle", "handled",
-            "pass", "passed", "resolve", "resolved", "success", "succeeded",
-        ):
-            keywords.discard(self._done_normalize_keyword(word))
-        return keywords
-
-    def _done_governing_action_families(self, content: str) -> set[str]:
-        """Return action families for leading request or closeout verbs only."""
-        governing_action_re = re.compile(
-            r"^\s*(?:[-*]\s*)?"
-            r"(?:(?:all\s+)?(?:done|complete(?:d)?|finished|handled|resolved)\s*[-—:]\s*)?"
-            r"(?:(?:please|kindly)\s+|(?:can|could|would|will)\s+you\s+|"
-            r"(?:(?:i|we|you|they)\s+)?(?:need|needs|want|wants)\s+to\s+)*"
-            r"(?:successfully\s+)?(?P<action>[a-z]+)"
-            r"(?:\s+(?:and|then)\s+(?P<next_action>[a-z]+))?\b",
-            re.IGNORECASE,
-        )
-        for segment in self._done_signal_segments(content):
-            match = governing_action_re.match(segment)
-            if match is None:
-                continue
-            families: set[str] = set()
-            for group_name in ("action", "next_action"):
-                action = match.group(group_name)
-                if action:
-                    families.update(self._done_action_families(action))
-            if families:
-                return families
-        return set()
-
-    def _done_action_families(self, content: str) -> set[str]:
-        """Map common request/closeout action paraphrases into compatibility families."""
-        action_patterns = {
-            "construct": (
-                r"add(?:ed|ing)?|build(?:s|ing)?|built|creat(?:e|ed|ing)|implement(?:ed|ing)?"
-            ),
-            "modify": (
-                r"chang(?:e|ed|ing)|debug(?:ged|ging)?|edit(?:ed|ing)?|fix(?:ed|ing)?|"
-                r"implement(?:ed|ing)?|improv(?:e|ed|ing)|optim(?:ize|ized|izing)|"
-                r"patch(?:ed|ing)?|refactor(?:ed|ing)?|renam(?:e|ed|ing)|"
-                r"replac(?:e|ed|ing)|revis(?:e|ed|ing)|rewrit(?:e|ten|ing)|"
-                r"rework(?:ed|ing)?|updat(?:e|ed|ing)"
-            ),
-            "delete": (
-                r"delet(?:e|ed|ing|ion)|drop(?:ped|ping)?|eras(?:e|ed|ing)|"
-                r"purg(?:e|ed|ing)|remov(?:e|ed|ing|al)"
-            ),
-            "inspect": (
-                r"audit(?:ed|ing)?|benchmark(?:ed|ing)?|check(?:ed|ing)?|confirm(?:ed|ing)?|"
-                r"diagnos(?:e|ed|ing)|inspect(?:ed|ing)?|investigat(?:e|ed|ing)|"
-                r"review(?:ed|ing)?|test(?:ed|ing)?|validat(?:e|ed|ing)|verif(?:y|ied|ying)"
-            ),
-            "deploy": (
-                r"deploy(?:ed|ing)?|publish(?:ed|ing)?|releas(?:e|ed|ing)|"
-                r"ship(?:ped|ping)?|roll(?:ed|ing)?\s*out"
-            ),
-            "transfer": (
-                r"backfill(?:ed|ing)?|cop(?:y|ied|ying)|download(?:ed|ing)?|export(?:ed|ing)?|"
-                r"import(?:ed|ing)?|migrat(?:e|ed|ing|ion)|mov(?:e|ed|ing)|"
-                r"sync(?:ed|ing)?|upload(?:ed|ing)?"
-            ),
-            "configure": r"configur(?:e|ed|ing|ation)|install(?:ed|ing)?|set\s*up|wir(?:e|ed|ing)",
-            "document": r"document(?:ed|ing|ation)?|draft(?:ed|ing)?|writ(?:e|ten|ing)|wrote",
-            "communicate": r"deliver(?:ed|ing)?|notif(?:y|ied|ying)|send(?:ing)?|sent",
-            "execute": r"execut(?:e|ed|ing)|launch(?:ed|ing)?|run|running|ran|schedul(?:e|ed|ing)|start(?:ed|ing)?",
-            "enable": r"activat(?:e|ed|ing)|enable(?:d|ing)?",
-            "disable": r"deactivat(?:e|ed|ing)|disable(?:d|ing)?|stop(?:ped|ping)?",
-            "archive": r"archiv(?:e|ed|ing)",
-        }
-        return {
-            family
-            for family, pattern in action_patterns.items()
-            if re.search(rf"\b(?:{pattern})\b", content, re.IGNORECASE)
-        }
-
-    def _done_keyword_set(self, content: str) -> set[str]:
-        stopwords = {
-            "about", "after", "again", "also", "because", "before", "being",
-            "check", "could", "done", "from", "have", "into", "need", "needs",
-            "please", "should", "that", "this", "thread", "want", "what", "when",
-            "where", "whether", "with", "work", "works", "would", "you", "your",
-        }
-        keywords: set[str] = {
-            f"slash:{command.lower()}"
-            for command in re.findall(r"/([a-zA-Z0-9_-]+)", content)
-        }
-        for word in re.findall(r"[a-zA-Z0-9]+", content.lower()):
-            if len(word) < 4 or word in stopwords:
-                continue
-            keywords.add(self._done_normalize_keyword(word))
-        return keywords
-
-    def _done_normalize_keyword(self, word: str) -> str:
-        if word.startswith(("verif", "proof")):
-            return "verify"
-        if word.startswith("test"):
-            return "test"
-        if word.startswith("deploy"):
-            return "deploy"
-        if word.startswith(("resolv", "fix", "fixed")):
-            return "resolve"
-        for suffix in ("ing", "ed", "es", "s"):
-            if len(word) > len(suffix) + 3 and word.endswith(suffix):
-                return word[: -len(suffix)]
-        return word
+        try:
+            view._message = message
+        except Exception:
+            pass
 
     async def _complete_done_thread_delete(
         self,
         *,
         thread: Any,
         acting_user: Any,
-        outstanding_items: list[str],
-        confirmed: bool,
     ) -> Dict[str, Any]:
-        """Delete the thread, then write a truthful success audit outside it."""
+        """Serialize confirmed deletion transitions for one Discord thread."""
+        thread_id = getattr(thread, "id", None)
+        lock_key = str(thread_id) if thread_id is not None else f"object:{id(thread)}"
+        registry = getattr(self, "_done_thread_delete_transitions", None)
+        if registry is None:
+            registry = {}
+            self._done_thread_delete_transitions = registry
+
+        entry = registry.get(lock_key)
+        if entry is None:
+            entry = [asyncio.Lock(), 0]
+            registry[lock_key] = entry
+        entry[1] += 1
+
         try:
-            display_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
+            async with entry[0]:
+                return await self._complete_done_thread_delete_serialized(
+                    thread=thread,
+                    acting_user=acting_user,
+                )
+        finally:
+            entry[1] -= 1
+            if entry[1] == 0 and registry.get(lock_key) is entry:
+                registry.pop(lock_key, None)
+
+    async def _complete_done_thread_delete_serialized(
+        self,
+        *,
+        thread: Any,
+        acting_user: Any,
+    ) -> Dict[str, Any]:
+        """Freeze the confirmed thread, delete it, then write a truthful audit."""
+        original_locked = bool(getattr(thread, "locked", False))
+        original_archived = bool(getattr(thread, "archived", False))
+        edit = getattr(thread, "edit", None)
+        if edit is None:
+            return {"success": False, "error": "thread cannot be locked before deletion"}
+
+        try:
+            await edit(
+                locked=True,
+                archived=True,
+                reason="Explicit /done confirmation",
+            )
+        except Exception as exc:
+            logger.warning("[%s] /done thread lock failed: %s", self.name, exc, exc_info=True)
+            return {"success": False, "error": f"could not lock thread before deletion: {exc}"}
+
+        async def restore_thread_state() -> Optional[Exception]:
+            try:
+                await edit(
+                    locked=original_locked,
+                    archived=original_archived,
+                    reason="Restore thread after failed /done deletion",
+                )
+            except Exception as restore_exc:
+                logger.error(
+                    "[%s] /done could not restore thread after interrupted deletion: %s",
+                    self.name,
+                    restore_exc,
+                    exc_info=True,
+                )
+                return restore_exc
+            return None
+
+        try:
+            display_name = getattr(acting_user, "display_name", None) or getattr(
+                acting_user,
+                "name",
+                "unknown user",
+            )
             reason = (
                 "/done requested in private thread"
                 if self._done_thread_is_private(thread)
-                else f"/done requested by {display_name}"
+                else f"/done explicitly confirmed by {display_name}"
             )
             await thread.delete(reason=reason)
+        except asyncio.CancelledError:
+            await restore_thread_state()
+            raise
         except Exception as exc:
             logger.warning("[%s] /done thread delete failed: %s", self.name, exc, exc_info=True)
-            return {"success": False, "error": str(exc)}
+            restore_error = await restore_thread_state()
+            error = str(exc)
+            if restore_error is not None:
+                error += f"; thread restoration also failed: {restore_error}"
+            return {"success": False, "error": error}
 
         try:
             await self._send_done_audit(
                 thread=thread,
                 acting_user=acting_user,
-                outstanding_items=outstanding_items,
-                confirmed=confirmed,
             )
         except Exception as exc:
-            # The requested deletion succeeded. Do not report that it failed or
-            # tempt the caller to retry an irreversible action; surface the
-            # audit failure separately for operators.
+            # Deletion succeeded. Never suggest retrying an irreversible action.
             logger.warning("[%s] /done audit failed after delete: %s", self.name, exc, exc_info=True)
             return {"success": True, "warning": f"thread deleted but audit failed: {exc}"}
         return {"success": True}
@@ -5880,8 +5029,6 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         thread: Any,
         acting_user: Any,
-        outstanding_items: list[str],
-        confirmed: bool,
     ) -> None:
         """Post a compact /done deletion audit to the parent channel/context."""
         parent = getattr(thread, "parent", None)
@@ -5894,7 +5041,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if parent is None:
             raise RuntimeError("could not resolve parent channel for /done audit")
 
-        text = self._format_done_audit(thread, acting_user, outstanding_items, confirmed)
+        text = self._format_done_audit(thread, acting_user)
         if self._is_forum_parent(parent):
             audit_thread_name = (
                 "/done audit: private thread"
@@ -5932,10 +5079,12 @@ class DiscordAdapter(BasePlatformAdapter):
         self,
         thread: Any,
         acting_user: Any,
-        outstanding_items: list[str],
-        confirmed: bool,
     ) -> str:
-        user_name = getattr(acting_user, "display_name", None) or getattr(acting_user, "name", "unknown user")
+        user_name = getattr(acting_user, "display_name", None) or getattr(
+            acting_user,
+            "name",
+            "unknown user",
+        )
         user_id = str(getattr(acting_user, "id", "?"))
         ts = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime())
         if self._done_thread_is_private(thread):
@@ -5943,29 +5092,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 "`/done` deleted a private thread (details withheld)",
                 f"Deleted at: {ts}",
                 "Invoking member: withheld for private-thread confidentiality",
-                "Outstanding check: details withheld for private-thread confidentiality",
-                f"Deleted after confirmation: {'yes' if confirmed else 'not needed'}",
+                "Explicit invoking-user confirmation: yes",
             ])
 
         thread_name = getattr(thread, "name", None) or "thread"
-        thread_id = str(getattr(thread, "id", "?") )
-        compact_items = self._compact_done_outstanding_items(
-            outstanding_items,
-            detail_max_length=140,
-        )
-        status = f"found {len(compact_items)} possible item(s)" if compact_items else "none found"
-        lines = [
+        thread_id = str(getattr(thread, "id", "?"))
+        return "\n".join([
             f"`/done` deleted thread: **{thread_name}** (`{thread_id}`)",
             f"Invoked by: {user_name} (`{user_id}`)",
             f"Deleted at: {ts}",
-            f"Outstanding check: {status}",
-            f"Deleted after confirmation: {'yes' if confirmed else 'not needed'}",
-        ]
-        if compact_items:
-            lines.append("")
-            lines.append("Outstanding:")
-            lines.extend(f"- {item}" for item in compact_items[:5])
-        return "\n".join(lines)
+            "Explicit invoking-user confirmation: yes",
+        ])
 
     async def _handle_thread_create_slash(
         self,
@@ -8442,7 +7579,7 @@ def _define_discord_view_classes() -> None:
                     pass
 
     class DoneThreadDeleteConfirmView(discord.ui.View):
-        """Confirm deletion for /done when possible outstanding items were found."""
+        """Confirm /done deletion, bound to the user who invoked the command."""
 
         def __init__(
             self,
@@ -8450,20 +7587,20 @@ def _define_discord_view_classes() -> None:
             adapter: Any,
             thread: Any,
             invoking_user: Any,
-            outstanding_items: list[str],
         ):
             super().__init__(timeout=300)
             self.adapter = adapter
             self.thread = thread
             self.invoking_user = invoking_user
-            self.outstanding_items = outstanding_items
-            self.allowed_user_ids = getattr(adapter, "_allowed_user_ids", set())
-            self.allowed_role_ids = getattr(adapter, "_allowed_role_ids", set())
             self.resolved = False
+            self._message = None
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
-            return _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            interaction_user_id = str(getattr(getattr(interaction, "user", None), "id", ""))
+            invoking_user_id = str(getattr(self.invoking_user, "id", ""))
+            return bool(
+                interaction_user_id
+                and interaction_user_id == invoking_user_id
             )
 
         async def _disable_buttons(self, interaction: discord.Interaction, label: str) -> None:
@@ -8481,8 +7618,8 @@ def _define_discord_view_classes() -> None:
                 except Exception:
                     pass
 
-        @discord.ui.button(label="Delete anyway", style=discord.ButtonStyle.red, emoji="🗑️")
-        async def delete_anyway(
+        @discord.ui.button(label="Delete thread", style=discord.ButtonStyle.red, emoji="🗑️")
+        async def delete_thread(
             self, interaction: discord.Interaction, button: discord.ui.Button,
         ):
             if self.resolved:
@@ -8492,16 +7629,15 @@ def _define_discord_view_classes() -> None:
                 return
             if not self._check_auth(interaction):
                 await interaction.response.send_message(
-                    "You're not authorized to delete this thread.", ephemeral=True,
+                    "Only the member who invoked `/done` can confirm this deletion.",
+                    ephemeral=True,
                 )
                 return
 
             await self._disable_buttons(interaction, "Confirmed")
             result = await self.adapter._complete_done_thread_delete(
                 thread=self.thread,
-                acting_user=interaction.user,
-                outstanding_items=self.outstanding_items,
-                confirmed=True,
+                acting_user=self.invoking_user,
             )
             if result.get("success"):
                 message = "Deleted this thread."
