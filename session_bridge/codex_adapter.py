@@ -30,6 +30,7 @@ from .claude_adapter import (
     PlaceholderResult,
     _same_filesystem_location,
 )
+from .sidebar import VerifiedSidebarThread
 
 
 _PARSER_VERSION = 1
@@ -68,6 +69,136 @@ class CodexThreadSummary:
     last_active: float
     archived: bool
     revision: str
+
+
+class SidebarVerificationError(RuntimeError):
+    """A sanitized native-sidebar lineage verification failure."""
+
+    def __init__(self, code: str) -> None:
+        if code not in {
+            "bridge_temporarily_unavailable",
+            "marker_conflict",
+            "native_task_not_indexed",
+            "provider_mismatch",
+            "source_identity_mismatch",
+        }:
+            raise ValueError("sidebar verification error code is not fixed")
+        self.code = code
+        super().__init__(code)
+
+
+class SidebarThreadVerifier:
+    """Authenticate native Codex sidebar threads through read-only inventory."""
+
+    def __init__(
+        self,
+        source_adapter: CodexSourceAdapter,
+        *,
+        marker_secret: bytes,
+        reconciliation_interval: float,
+        poll_interval: float = 0.25,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    ) -> None:
+        if not isinstance(source_adapter, CodexSourceAdapter):
+            raise TypeError("sidebar verifier requires a Codex source adapter")
+        for label, value in (
+            ("reconciliation interval", reconciliation_interval),
+            ("poll interval", poll_interval),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                raise ValueError(f"{label} must be a non-negative finite number")
+        if not isinstance(marker_secret, bytes) or not marker_secret:
+            raise ValueError("sidebar verifier marker secret is unavailable")
+        self._source_adapter = source_adapter
+        self._marker_secret = marker_secret
+        self._reconciliation_interval = float(reconciliation_interval)
+        self._poll_interval = float(poll_interval)
+        self._monotonic = monotonic
+        self._sleep = sleep
+
+    def verify_thread(
+        self, *, thread_id: str, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread:
+        native_id = _required_sidebar_identity(thread_id, "Codex thread ID")
+        expected = _validated_sidebar_marker_payload(expected)
+        deadline = self._monotonic() + self._reconciliation_interval
+        while True:
+            try:
+                summary = self._source_adapter.find_native_thread(native_id)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                raise SidebarVerificationError(
+                    "bridge_temporarily_unavailable"
+                ) from None
+            if summary is not None:
+                try:
+                    projection = self._source_adapter.project_thread(summary)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    raise SidebarVerificationError(
+                        "bridge_temporarily_unavailable"
+                    ) from None
+                if projection.native_id != native_id:
+                    raise SidebarVerificationError("source_identity_mismatch")
+                verified = _verified_sidebar_projection(
+                    projection,
+                    expected=expected,
+                    marker_secret=self._marker_secret,
+                    strict=True,
+                )
+                assert verified is not None
+                return verified
+            now = self._monotonic()
+            if now >= deadline or self._poll_interval == 0:
+                raise SidebarVerificationError("native_task_not_indexed")
+            self._sleep(min(self._poll_interval, deadline - now))
+
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None:
+        expected = _validated_sidebar_marker_payload(expected)
+        try:
+            summaries = [
+                *self._source_adapter.list_full_inventory(archived=False),
+                *self._source_adapter.list_full_inventory(archived=True),
+            ]
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise SidebarVerificationError(
+                "bridge_temporarily_unavailable"
+            ) from None
+        matches: dict[str, VerifiedSidebarThread] = {}
+        for summary in summaries:
+            if summary.native_id in matches:
+                continue
+            try:
+                projection = self._source_adapter.project_thread(summary)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                raise SidebarVerificationError(
+                    "bridge_temporarily_unavailable"
+                ) from None
+            verified = _verified_sidebar_projection(
+                projection,
+                expected=expected,
+                marker_secret=self._marker_secret,
+                strict=False,
+            )
+            if verified is not None:
+                matches[verified.thread_id] = verified
+        if len(matches) > 1:
+            raise SidebarVerificationError("marker_conflict")
+        return next(iter(matches.values()), None)
 
 
 class CodexSourceAdapter:
@@ -923,6 +1054,77 @@ def _projection_has_authenticated_marker(
                 continue
             return True
     return False
+
+
+def _required_sidebar_identity(value: object, label: str) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise SidebarVerificationError("source_identity_mismatch")
+    if any(character in value for character in "\r\n"):
+        raise SidebarVerificationError("source_identity_mismatch")
+    return value
+
+
+def _validated_sidebar_marker_payload(
+    value: object,
+) -> BridgeMarkerPayload:
+    if not isinstance(value, BridgeMarkerPayload):
+        raise SidebarVerificationError("source_identity_mismatch")
+    if value.target_provider is not Provider.CODEX or value.policy_generation != 1:
+        raise SidebarVerificationError("provider_mismatch")
+    _required_sidebar_identity(value.source_session_id, "source session ID")
+    _required_sidebar_identity(value.bridge_id, "bridge ID")
+    return value
+
+
+def _verified_sidebar_projection(
+    projection: SessionProjection,
+    *,
+    expected: BridgeMarkerPayload,
+    marker_secret: bytes,
+    strict: bool,
+) -> VerifiedSidebarThread | None:
+    decoded: list[BridgeMarkerPayload] = []
+    invalid = False
+    invalid_expected = False
+    expected_unsigned = encode_bridge_marker(expected, marker_secret).rsplit(".", 1)[0]
+    for message in projection.messages:
+        if message.role != "user" or not message.content:
+            continue
+        for match in _MARKER_CANDIDATE_RE.finditer(message.content):
+            marker = match.group(0)
+            try:
+                decoded.append(decode_bridge_marker(marker, marker_secret))
+            except InvalidBridgeMarker:
+                invalid = True
+                invalid_expected = invalid_expected or (
+                    marker.rsplit(".", 1)[0] == expected_unsigned
+                )
+    if strict and invalid:
+        raise SidebarVerificationError("marker_conflict")
+    if invalid_expected:
+        raise SidebarVerificationError("marker_conflict")
+    exact = [payload for payload in decoded if payload == expected]
+    if len(exact) > 1:
+        raise SidebarVerificationError("marker_conflict")
+    if exact:
+        if len(decoded) != 1:
+            raise SidebarVerificationError("marker_conflict")
+        return VerifiedSidebarThread(
+            thread_id=projection.native_id,
+            source_session_id=expected.source_session_id,
+            bridge_id=expected.bridge_id,
+        )
+    if not strict:
+        return None
+    if decoded:
+        observed = decoded[0]
+        if (
+            observed.target_provider is not Provider.CODEX
+            or observed.policy_generation != 1
+        ):
+            raise SidebarVerificationError("provider_mismatch")
+        raise SidebarVerificationError("source_identity_mismatch")
+    raise SidebarVerificationError("source_identity_mismatch")
 
 
 def _started_thread_id(response: Any) -> str:

@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+from typing import Any
+
+import pytest
+
+from session_bridge.codex_adapter import SidebarVerificationError
+from session_bridge.config import BridgeConfig, SidebarConfig
+from session_bridge.coordinator import SessionBridgeCoordinator
+from session_bridge.models import BridgeMarkerPayload, Provider
+from session_bridge.sidebar import VerifiedSidebarThread
+
+
+SOURCE = "claude:source-1"
+BRIDGE = "sidebar:bridge-1"
+THREAD = "22222222-2222-4222-8222-222222222222"
+
+
+def _leased_job(*, expires_at: float = 400.0) -> dict[str, Any]:
+    return {
+        "id": "sidebar-job:1",
+        "source_session_id": SOURCE,
+        "bridge_id": BRIDGE,
+        "state": "sidebar_leased",
+        "attempts": 0,
+        "lease_expires_at": expires_at,
+        "lease_token": "opaque-lease-token",
+    }
+
+
+class FakeSidebarStore:
+    def __init__(self, *, claim_after: float = 0.0) -> None:
+        self.claim_after = claim_after
+        self.failures: list[tuple[str, str, float]] = []
+        self.commits: list[tuple[str, str, float]] = []
+
+    def claim_sidebar_jobs(
+        self, *, now: float, limit: int, lease_seconds: int
+    ) -> list[dict[str, Any]]:
+        assert lease_seconds == 300
+        if now < self.claim_after:
+            return []
+        return [_leased_job(expires_at=now + lease_seconds)][:limit]
+
+    def fail_sidebar_job(
+        self, *, lease_token: str, error_code: str, now: float
+    ) -> dict[str, Any]:
+        self.failures.append((lease_token, error_code, now))
+        return {**_leased_job(), "state": "sidebar_failed", "error_code": error_code}
+
+    def commit_sidebar_job(
+        self, *, lease_token: str, codex_thread_id: str, now: float
+    ) -> dict[str, Any]:
+        self.commits.append((lease_token, codex_thread_id, now))
+        return {
+            **_leased_job(),
+            "state": "sidebar_visible",
+            "codex_thread_id": codex_thread_id,
+        }
+
+
+class FakeVerifier:
+    def __init__(self, result: VerifiedSidebarThread | None | Exception) -> None:
+        self.result = result
+        self.find_calls: list[BridgeMarkerPayload] = []
+        self.verify_calls: list[tuple[str, BridgeMarkerPayload]] = []
+
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None:
+        self.find_calls.append(expected)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+    def verify_thread(
+        self, *, thread_id: str, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread:
+        self.verify_calls.append((thread_id, expected))
+        if isinstance(self.result, Exception):
+            raise self.result
+        if self.result is None or self.result.thread_id != thread_id:
+            raise SidebarVerificationError("source_identity_mismatch")
+        return self.result
+
+
+class ForbiddenTargetAdapter:
+    def create_placeholder(self, **_: Any) -> Any:
+        raise AssertionError("native sidebar reconciliation must never create")
+
+
+def _coordinator(
+    store: FakeSidebarStore,
+    verifier: FakeVerifier,
+    *,
+    clock=lambda: 100.0,
+) -> SessionBridgeCoordinator:
+    return SessionBridgeCoordinator(
+        config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: ForbiddenTargetAdapter()},
+        sidebar_verifier=verifier,
+        clock=clock,
+    )
+
+
+def _verified() -> VerifiedSidebarThread:
+    return VerifiedSidebarThread(THREAD, SOURCE, BRIDGE)
+
+
+def test_verified_sidebar_thread_is_frozen() -> None:
+    verified = _verified()
+    with pytest.raises(FrozenInstanceError):
+        verified.thread_id = "different"  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_lost_commit_recovers_one_authenticated_thread_without_creation() -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(_verified())
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert len(claims) == 1
+    assert claims[0].recovered_thread == _verified()
+    assert claims[0].reconcile_required is True
+    assert claims[0].rename_required is True
+    assert verifier.find_calls == [
+        BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1)
+    ]
+    assert store.failures == []
+
+
+@pytest.mark.asyncio
+async def test_zero_match_permits_retry_only_after_previous_lease_expiry() -> None:
+    store = FakeSidebarStore(claim_after=300.0)
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=299.999, limit=1) == ()
+    assert verifier.find_calls == []
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=300.0, limit=1)
+    assert len(claims) == 1
+    assert claims[0].recovered_thread is None
+    assert claims[0].reconcile_required is True
+    assert claims[0].rename_required is False
+
+
+@pytest.mark.asyncio
+async def test_multiple_authenticated_matches_are_fatal_and_never_delivered() -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(SidebarVerificationError("marker_conflict"))
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert claims == ()
+    assert store.failures == [("opaque-lease-token", "marker_conflict", 100.0)]
+    assert store.commits == []
+
+
+@pytest.mark.asyncio
+async def test_recovered_rename_failure_renames_same_thread_before_verified_commit() -> None:
+    events: list[tuple[str, str]] = []
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(_verified())
+    coordinator = _coordinator(store, verifier, clock=lambda: 101.0)
+
+    claim = (await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1))[0]
+    assert claim.recovered_thread == _verified()
+    assert claim.recovered_thread is not None
+
+    events.append(("rename", claim.recovered_thread.thread_id))
+    committed = await coordinator.commit_sidebar_job(
+        lease_token=claim.lease_token,
+        codex_thread_id=claim.recovered_thread.thread_id,
+    )
+    events.append(("commit", committed["codex_thread_id"]))
+
+    assert events == [("rename", THREAD), ("commit", THREAD)]
+    assert verifier.verify_calls == [
+        (THREAD, BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1))
+    ]
+    assert store.commits == [("opaque-lease-token", THREAD, 101.0)]

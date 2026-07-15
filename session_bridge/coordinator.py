@@ -8,10 +8,11 @@ import hashlib
 import math
 from pathlib import Path
 import time
-from typing import Any, cast
+from typing import Any, Protocol, cast
 import uuid
 
 from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
+from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig
 from .context_pack import ContextPackRequest
 from .mirror import (
@@ -40,6 +41,7 @@ from .models import (
 )
 from .sidebar import (
     SidebarCandidate,
+    VerifiedSidebarThread,
     is_sidebar_session_eligible,
     sidebar_bridge_id,
     sidebar_title,
@@ -82,6 +84,16 @@ class SidebarRegistrationSummary:
 
 
 @dataclass(frozen=True)
+class SidebarDeliveryClaim:
+    lease_token: str
+    source_session_id: str
+    bridge_id: str
+    reconcile_required: bool
+    rename_required: bool
+    recovered_thread: VerifiedSidebarThread | None
+
+
+@dataclass(frozen=True)
 class RefreshResult:
     session_id: str
     cursor: str
@@ -107,6 +119,18 @@ class ContinueResult:
 
 _AsyncSleep = Callable[[float], Awaitable[None]]
 _AWatchFactory = Callable[..., Any]
+
+
+class _SidebarVerifier(Protocol):
+    def verify_thread(
+        self, *, thread_id: str, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread: ...
+
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None: ...
+
+
 _ProviderHealth = dict[str, float | str | None]
 _RECENT_ERROR_LIMIT = 20
 _ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
@@ -155,6 +179,7 @@ class SessionBridgeCoordinator:
         claude_projects_root: Path | None = None,
         watch_debounce_seconds: float = 0.25,
         refresh_timeout: float = 5.0,
+        sidebar_verifier: _SidebarVerifier | None = None,
     ) -> None:
         if type(scan_batch_size) is not int or scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be a positive integer")
@@ -189,6 +214,8 @@ class SessionBridgeCoordinator:
         self._claude_projects_root = claude_projects_root
         self._watch_debounce_seconds = float(watch_debounce_seconds)
         self._refresh_timeout = float(refresh_timeout)
+        self._sidebar_verifier = sidebar_verifier
+        self._sidebar_claim_expectations: dict[str, BridgeMarkerPayload] = {}
         self._watch_stop_event: asyncio.Event | None = None
         self._watcher_state = "not_started"
         self._watcher_error_code: str | None = None
@@ -373,6 +400,148 @@ class SessionBridgeCoordinator:
                 registration_time=registration_time,
                 limit=limit,
             )
+
+    async def claim_sidebar_jobs_for_delivery(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 5,
+    ) -> tuple[SidebarDeliveryClaim, ...]:
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 5
+        ):
+            raise ValueError("sidebar delivery limit must be between 1 and 5")
+        claim_time = _finite_number(self._clock() if now is None else now, "now")
+        verifier = self._sidebar_verifier
+        if verifier is None:
+            return ()
+        raw_claims = await asyncio.to_thread(
+            _call,
+            self._store,
+            "claim_sidebar_jobs",
+            now=claim_time,
+            limit=limit,
+            lease_seconds=self._config.sidebar.lease_seconds,
+        )
+        if not isinstance(raw_claims, list) or len(raw_claims) > limit:
+            raise ValueError("sidebar delivery claims are malformed")
+        delivery: list[SidebarDeliveryClaim] = []
+        for raw_claim in raw_claims:
+            if not isinstance(raw_claim, Mapping):
+                raise ValueError("sidebar delivery claim is malformed")
+            lease_token = _exact_sidebar_claim_text(
+                raw_claim.get("lease_token"), "lease token"
+            )
+            source_session_id = _exact_sidebar_claim_text(
+                raw_claim.get("source_session_id"), "source session ID"
+            )
+            bridge_id = _exact_sidebar_claim_text(
+                raw_claim.get("bridge_id"), "bridge ID"
+            )
+            expected = BridgeMarkerPayload(
+                bridge_id=bridge_id,
+                source_session_id=source_session_id,
+                target_provider=Provider.CODEX,
+                policy_generation=1,
+            )
+            try:
+                recovered = await asyncio.to_thread(
+                    verifier.find_by_marker,
+                    expected,
+                )
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except SidebarVerificationError as exc:
+                code = (
+                    exc.code
+                    if exc.code
+                    in {
+                        "marker_conflict",
+                        "source_identity_mismatch",
+                        "provider_mismatch",
+                    }
+                    else "bridge_temporarily_unavailable"
+                )
+                await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "fail_sidebar_job",
+                    lease_token=lease_token,
+                    error_code=code,
+                    now=claim_time,
+                )
+                continue
+            except Exception:
+                await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "fail_sidebar_job",
+                    lease_token=lease_token,
+                    error_code="bridge_temporarily_unavailable",
+                    now=claim_time,
+                )
+                continue
+            if recovered is not None and (
+                recovered.source_session_id != source_session_id
+                or recovered.bridge_id != bridge_id
+            ):
+                await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "fail_sidebar_job",
+                    lease_token=lease_token,
+                    error_code="source_identity_mismatch",
+                    now=claim_time,
+                )
+                continue
+            self._sidebar_claim_expectations[lease_token] = expected
+            delivery.append(
+                SidebarDeliveryClaim(
+                    lease_token=lease_token,
+                    source_session_id=source_session_id,
+                    bridge_id=bridge_id,
+                    reconcile_required=True,
+                    rename_required=recovered is not None,
+                    recovered_thread=recovered,
+                )
+            )
+        return tuple(delivery)
+
+    async def commit_sidebar_job(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+    ) -> Mapping[str, Any]:
+        token = _exact_sidebar_claim_text(lease_token, "lease token")
+        thread_id = _exact_sidebar_claim_text(codex_thread_id, "Codex thread ID")
+        expected = self._sidebar_claim_expectations.get(token)
+        verifier = self._sidebar_verifier
+        if expected is None or verifier is None:
+            raise SidebarVerificationError("source_identity_mismatch")
+        verified = await asyncio.to_thread(
+            verifier.verify_thread,
+            thread_id=thread_id,
+            expected=expected,
+        )
+        if (
+            verified.thread_id != thread_id
+            or verified.source_session_id != expected.source_session_id
+            or verified.bridge_id != expected.bridge_id
+        ):
+            raise SidebarVerificationError("source_identity_mismatch")
+        result = await asyncio.to_thread(
+            _call,
+            self._store,
+            "commit_sidebar_job",
+            lease_token=token,
+            codex_thread_id=thread_id,
+            now=_finite_number(self._clock(), "now"),
+        )
+        if not isinstance(result, Mapping):
+            raise ValueError("sidebar commit result is malformed")
+        return result
 
     async def _register_sidebar_jobs_locked(
         self,
@@ -2607,6 +2776,14 @@ def _call(instance: object, name: str, *args: object, **kwargs: object) -> Any:
     if not callable(method):
         raise RuntimeError("scan adapter does not implement the required operation")
     return method(*args, **kwargs)
+
+
+def _exact_sidebar_claim_text(value: object, label: str) -> str:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"sidebar claim {label} is malformed")
+    if any(character in value for character in "\r\n"):
+        raise ValueError(f"sidebar claim {label} is malformed")
+    return value
 
 
 def _safe_target_error_code(provider: Provider, code: object) -> str:

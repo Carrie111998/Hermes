@@ -60,6 +60,13 @@ class SidebarCandidate:
     eligible_at: float
 
 
+@dataclass(frozen=True)
+class VerifiedSidebarThread:
+    thread_id: str
+    source_session_id: str
+    bridge_id: str
+
+
 def normalize_meaningful_user_text(value: object) -> str | None:
     if not isinstance(value, str):
         return None

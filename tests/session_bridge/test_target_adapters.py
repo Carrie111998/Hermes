@@ -14,6 +14,9 @@ from typing import Any
 
 import pytest
 
+if os.name == "nt" and "USERPROFILE" not in os.environ:
+    os.environ["USERPROFILE"] = os.environ["HOME"]
+
 import session_bridge.characterize as characterize_module
 from session_bridge.claude_adapter import (
     AmbiguousPlaceholderCreation,
@@ -26,6 +29,8 @@ from session_bridge.claude_adapter import (
 from session_bridge.codex_adapter import (
     CodexSourceAdapter,
     CodexTargetAdapter,
+    SidebarThreadVerifier,
+    SidebarVerificationError,
     classify_codex_empty_read_error,
 )
 from session_bridge.characterize import (
@@ -43,6 +48,7 @@ from session_bridge.models import (
     Provider,
     encode_bridge_marker,
 )
+from session_bridge.sidebar import VerifiedSidebarThread
 
 
 SECRET = b"target-adapter-test-secret"
@@ -393,6 +399,234 @@ def _codex_adapter(
         ),
         client,
     )
+
+
+def _sidebar_expected(
+    *,
+    source_session_id: str = "claude:source-1",
+    bridge_id: str = "bridge-1",
+) -> BridgeMarkerPayload:
+    return BridgeMarkerPayload(
+        bridge_id=bridge_id,
+        source_session_id=source_session_id,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+
+
+def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None:
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory()],
+        "thread/read": [_codex_signed_read()],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    verified = verifier.verify_thread(
+        thread_id=CODEX_ID,
+        expected=_sidebar_expected(),
+    )
+
+    assert verified == VerifiedSidebarThread(
+        thread_id=CODEX_ID,
+        source_session_id="claude:source-1",
+        bridge_id="bridge-1",
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/read",
+    ]
+    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+
+
+@pytest.mark.parametrize(
+    ("read", "code"),
+    [
+        (_codex_signed_read(source_session_id="claude:other"), "source_identity_mismatch"),
+        (_codex_signed_read(bridge_id="bridge-other"), "source_identity_mismatch"),
+        (_codex_signed_read(target_provider=Provider.CLAUDE), "provider_mismatch"),
+        (_codex_signed_read(policy_generation=2), "provider_mismatch"),
+    ],
+)
+def test_sidebar_thread_verifier_rejects_wrong_authenticated_lineage(
+    read: dict[str, Any], code: str
+) -> None:
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory()],
+        "thread/read": [read],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.verify_thread(thread_id=CODEX_ID, expected=_sidebar_expected())
+
+    assert raised.value.code == code
+
+
+def test_sidebar_thread_verifier_rejects_invalid_signature_and_duplicate_marker() -> None:
+    valid = encode_bridge_marker(_sidebar_expected(), SECRET)
+    invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
+    for content in (invalid, f"{valid}\n{valid}"):
+        client = FakeRequestClient({
+            "thread/list": [_codex_inventory()],
+            "thread/read": [_codex_read(turns=[{
+                "id": "registration",
+                "items": [{
+                    "type": "userMessage",
+                    "id": "item-1",
+                    "content": [{"type": "text", "text": content}],
+                }],
+            }])],
+        })
+        verifier = SidebarThreadVerifier(
+            CodexSourceAdapter(client, marker_secret=SECRET),
+            marker_secret=SECRET,
+            reconciliation_interval=0,
+        )
+
+        with pytest.raises(SidebarVerificationError) as raised:
+            verifier.verify_thread(thread_id=CODEX_ID, expected=_sidebar_expected())
+
+        assert raised.value.code == "marker_conflict"
+
+
+def test_sidebar_marker_lookup_recovers_one_exact_thread_read_only() -> None:
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_signed_read()],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
+    ]
+
+
+def test_sidebar_marker_lookup_rejects_multiple_authenticated_threads() -> None:
+    other_id = "33333333-3333-4333-8333-333333333333"
+    client = FakeRequestClient({
+        "thread/list": [
+            _codex_inventory(),
+            _codex_inventory(native_id=other_id),
+        ],
+        "thread/read": [
+            _codex_signed_read(),
+            _codex_signed_read(native_id=other_id),
+        ],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "marker_conflict"
+    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+
+
+@pytest.mark.parametrize("include_valid", [False, True])
+def test_sidebar_marker_lookup_never_turns_expected_invalid_signature_into_zero(
+    include_valid: bool,
+) -> None:
+    valid = encode_bridge_marker(_sidebar_expected(), SECRET)
+    invalid = encode_bridge_marker(_sidebar_expected(), b"different-secret")
+    content = f"{valid}\n{invalid}" if include_valid else invalid
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_read(turns=[{
+            "id": "registration",
+            "items": [{
+                "type": "userMessage",
+                "id": "item-1",
+                "content": [{"type": "text", "text": content}],
+            }],
+        }])],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "marker_conflict"
+
+
+@pytest.mark.parametrize(
+    "expected",
+    [
+        BridgeMarkerPayload("bridge-1", "claude:source-1", Provider.CLAUDE, 1),
+        BridgeMarkerPayload("bridge-1", "claude:source-1", Provider.CODEX, 2),
+    ],
+)
+def test_sidebar_verifier_requires_codex_policy_generation_one(
+    expected: BridgeMarkerPayload,
+) -> None:
+    client = FakeRequestClient({})
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(expected)
+
+    assert raised.value.code == "provider_mismatch"
+    assert client.calls == []
+
+
+def test_sidebar_thread_verifier_bounds_not_indexed_polling() -> None:
+    client = FakeRequestClient({
+        "thread/list": [
+            {"data": []},
+            {"data": []},
+            {"data": []},
+            {"data": []},
+            {"data": []},
+            {"data": []},
+        ],
+    })
+    ticks = iter((0.0, 0.0, 1.0, 2.0))
+    sleeps: list[float] = []
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=2.0,
+        poll_interval=1.0,
+        monotonic=lambda: next(ticks),
+        sleep=sleeps.append,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.verify_thread(thread_id=CODEX_ID, expected=_sidebar_expected())
+
+    assert raised.value.code == "native_task_not_indexed"
+    assert sleeps == [1.0, 1.0]
+    assert [method for method, _, _ in client.calls] == ["thread/list"] * 6
 
 
 def test_placeholder_result_is_the_frozen_common_contract() -> None:
