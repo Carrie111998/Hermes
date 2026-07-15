@@ -80,6 +80,30 @@ def _wait_for_path(path: Path, process: subprocess.Popen[str]) -> None:
     pytest.fail(f"lock holder readiness timeout: stdout={stdout!r}; stderr={stderr!r}")
 
 
+def _create_directory_redirect(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError:
+        if os.name != "nt":
+            raise
+    completed = subprocess.run(  # noqa: S603
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"directory redirects are unavailable: {completed.stderr}")
+
+
+def _remove_directory_redirect(link: Path) -> None:
+    if os.name == "nt" and link.is_dir() and not link.is_symlink():
+        os.rmdir(link)
+    else:
+        link.unlink()
+
+
 def test_sidebar_skill_baseline_records_the_verbatim_no_skill_failure() -> None:
     baseline = BASELINE.read_text(encoding="utf-8")
 
@@ -254,7 +278,7 @@ def test_install_sidebar_skill_copy_failure_preserves_existing_tree(
     monkeypatch.setattr(
         sidebar_skill,
         "_copy_packaged_skill",
-        lambda _destination: (_ for _ in ()).throw(PermissionError("denied")),
+        lambda _destination, *_guard: (_ for _ in ()).throw(PermissionError("denied")),
     )
 
     with pytest.raises(PermissionError, match="denied"):
@@ -262,6 +286,116 @@ def test_install_sidebar_skill_copy_failure_preserves_existing_tree(
 
     assert (destination / "old.txt").read_text(encoding="utf-8") == "preserve"
     assert not list((codex_home / "skills").glob(".session-sidebar-sync.install-*"))
+
+
+def test_install_sidebar_skill_rejects_staging_redirect_before_any_outside_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = skills / "session-sidebar-sync"
+    destination.mkdir(parents=True)
+    (destination / "old.txt").write_text("preserve", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_copy = sidebar_skill._copy_packaged_skill
+    swapped: dict[str, Path] = {}
+
+    def swap_staging_to_redirect(staging: Path, *guard: object) -> None:
+        preserved = staging.with_name(f"{staging.name}.preserved")
+        staging.rename(preserved)
+        try:
+            _create_directory_redirect(staging, outside)
+        except OSError:
+            preserved.rename(staging)
+            pytest.skip("directory symlinks are unavailable")
+        swapped.update(staging=staging, preserved=preserved)
+        real_copy(staging, *guard)
+
+    monkeypatch.setattr(
+        sidebar_skill, "_copy_packaged_skill", swap_staging_to_redirect
+    )
+
+    with pytest.raises(PermissionError, match="redirect|identity"):
+        sidebar_skill.install_sidebar_skill(codex_home)
+
+    assert list(outside.iterdir()) == []
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "preserve"
+    assert swapped["preserved"].is_dir()
+
+    _remove_directory_redirect(swapped["staging"])
+    swapped["preserved"].rename(swapped["staging"])
+    user_lookalike = skills / ".session-sidebar-sync.install-user-content"
+    user_lookalike.mkdir()
+    (user_lookalike / "notes.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(sidebar_skill, "_copy_packaged_skill", real_copy)
+
+    sidebar_skill.install_sidebar_skill(codex_home)
+
+    assert not swapped["staging"].exists()
+    assert (user_lookalike / "notes.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_install_sidebar_skill_revalidates_parent_identity_before_copy_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = skills / "session-sidebar-sync"
+    destination.mkdir(parents=True)
+    (destination / "old.txt").write_text("preserve", encoding="utf-8")
+    real_copy = sidebar_skill._copy_packaged_skill
+    real_lstat = os.lstat
+    identity_drifted = False
+
+    def arm_identity_drift(staging: Path, *guard: object) -> None:
+        nonlocal identity_drifted
+        identity_drifted = True
+        real_copy(staging, *guard)
+
+    def drifting_lstat(path: os.PathLike[str] | str):
+        info = real_lstat(path)
+        if identity_drifted and Path(path).absolute() == skills.absolute():
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_file_attributes=getattr(info, "st_file_attributes", 0),
+                st_dev=info.st_dev,
+                st_ino=info.st_ino + 1,
+            )
+        return info
+
+    monkeypatch.setattr(sidebar_skill, "_copy_packaged_skill", arm_identity_drift)
+    monkeypatch.setattr(os, "lstat", drifting_lstat)
+
+    with pytest.raises(PermissionError, match="identity"):
+        sidebar_skill.install_sidebar_skill(codex_home)
+
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "preserve"
+
+
+def test_install_sidebar_skill_reports_operation_and_cleanup_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import sidebar_skill
+
+    def copy_failure(_destination: Path, *guard: object) -> None:
+        raise PermissionError("copy denied")
+
+    def cleanup_failure(_destination: Path, **_kwargs: object) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(sidebar_skill, "_copy_packaged_skill", copy_failure)
+    monkeypatch.setattr(shutil, "rmtree", cleanup_failure)
+
+    with pytest.raises(ExceptionGroup) as captured:
+        sidebar_skill.install_sidebar_skill(tmp_path / "codex")
+
+    messages = {str(error) for error in captured.value.exceptions}
+    assert messages == {"copy denied", "cleanup denied"}
 
 
 def test_install_sidebar_skill_refuses_redirected_destination(

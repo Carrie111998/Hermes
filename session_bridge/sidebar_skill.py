@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 import errno
 from importlib import resources
 import os
@@ -18,6 +19,9 @@ _SKILL_NAME: Final = "session-sidebar-sync"
 _SKILL_FILES: Final = ("SKILL.md", "agents/openai.yaml")
 _INSTALL_LOCK = threading.RLock()
 _LOCK_WAIT_SECONDS: Final = 10.0
+_STAGING_PREFIX: Final = f".{_SKILL_NAME}.install-"
+_STAGING_MARKER: Final = ".session-bridge-owned-staging"
+_STAGING_MARKER_CONTENT: Final = b"session-bridge sidebar skill staging v1\n"
 
 
 def resolve_codex_home(environ: Mapping[str, str] | None = None) -> Path:
@@ -41,43 +45,78 @@ def install_sidebar_skill(codex_home: Path | str | None = None) -> Path:
     destination = skills / _SKILL_NAME
 
     with _INSTALL_LOCK, _filesystem_install_lock(skills):
+        identity = _InstallIdentity.capture(skills)
+        _remove_verified_stale_staging(skills, identity)
+        identity.revalidate()
         _assert_not_redirect(destination, "skill destination", missing_ok=True)
         if destination.exists() and _tree_matches_packaged_skill(destination):
             return destination
 
-        staging = Path(
-            tempfile.mkdtemp(prefix=f".{_SKILL_NAME}.install-", dir=skills)
+        identity.revalidate()
+        staging = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=skills))
+        identity.revalidate()
+        staging_identity = identity.extend(staging)
+        _guarded_write_bytes(
+            staging / _STAGING_MARKER,
+            _STAGING_MARKER_CONTENT,
+            staging_identity,
         )
         backup: Path | None = None
         try:
-            _copy_packaged_skill(staging)
+            _copy_packaged_skill(staging, staging_identity)
+            if not _tree_matches_packaged_skill(staging, allow_staging_marker=True):
+                raise OSError("packaged sidebar skill staging verification failed")
+            _guarded_unlink(staging / _STAGING_MARKER, staging_identity)
             if not _tree_matches_packaged_skill(staging):
                 raise OSError("packaged sidebar skill staging verification failed")
 
             if destination.exists():
                 backup = _next_backup_path(skills)
-                os.replace(destination, backup)
+                _guarded_replace(destination, backup, identity)
             try:
-                os.replace(staging, destination)
+                _guarded_replace(staging, destination, identity)
             except BaseException:
+                try:
+                    identity.revalidate()
+                except PermissionError:
+                    raise
                 if backup is not None and not destination.exists():
-                    os.replace(backup, destination)
+                    _guarded_replace(backup, destination, identity)
                 raise
             return destination
-        finally:
-            if staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
+        except BaseException as operation_error:
+            cleanup_error = _cleanup_current_staging(staging, staging_identity)
+            if cleanup_error is not None:
+                raise BaseExceptionGroup(
+                    "sidebar skill install and staging cleanup both failed",
+                    [operation_error, cleanup_error],
+                ) from None
+            raise
 
 
-def _copy_packaged_skill(destination: Path) -> None:
+def _copy_packaged_skill(
+    destination: Path, identity: _InstallIdentity | None = None
+) -> None:
     source = resources.files("session_bridge").joinpath("assets", _SKILL_NAME)
     for relative in _SKILL_FILES:
         target = destination.joinpath(*relative.split("/"))
+        if identity is not None:
+            identity.revalidate()
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(source.joinpath(*relative.split("/")).read_bytes())
+        if identity is not None:
+            identity.revalidate()
+            _guarded_write_bytes(
+                target,
+                source.joinpath(*relative.split("/")).read_bytes(),
+                identity,
+            )
+        else:
+            target.write_bytes(source.joinpath(*relative.split("/")).read_bytes())
 
 
-def _tree_matches_packaged_skill(directory: Path) -> bool:
+def _tree_matches_packaged_skill(
+    directory: Path, *, allow_staging_marker: bool = False
+) -> bool:
     if not directory.is_dir():
         return False
     _assert_tree_has_no_redirects(directory)
@@ -86,7 +125,14 @@ def _tree_matches_packaged_skill(directory: Path) -> bool:
         for path in directory.rglob("*")
         if path.is_file()
     }
-    if actual != set(_SKILL_FILES):
+    expected = set(_SKILL_FILES)
+    if allow_staging_marker:
+        expected.add(_STAGING_MARKER)
+    if actual != expected:
+        return False
+    if allow_staging_marker and (
+        directory.joinpath(_STAGING_MARKER).read_bytes() != _STAGING_MARKER_CONTENT
+    ):
         return False
     source = resources.files("session_bridge").joinpath("assets", _SKILL_NAME)
     return all(
@@ -138,6 +184,145 @@ def _next_backup_path(skills: Path) -> Path:
         suffix += 1
         candidate = skills / f"{_SKILL_NAME}.backup-{suffix}"
     return candidate
+
+
+@dataclass(frozen=True)
+class _PathIdentity:
+    path: Path
+    device: int
+    inode: int
+    file_type: int
+    attributes: int
+
+    @classmethod
+    def capture(cls, path: Path) -> _PathIdentity:
+        _assert_not_redirect(path, "installer path")
+        info = os.lstat(path)
+        return cls(
+            path=path,
+            device=info.st_dev,
+            inode=info.st_ino,
+            file_type=stat.S_IFMT(info.st_mode),
+            attributes=getattr(info, "st_file_attributes", 0),
+        )
+
+    def revalidate(self) -> None:
+        try:
+            _assert_not_redirect(self.path, "installer path")
+            info = os.lstat(self.path)
+        except (FileNotFoundError, PermissionError) as error:
+            raise PermissionError(
+                f"installer path identity changed: {self.path}"
+            ) from error
+        current = (
+            info.st_dev,
+            info.st_ino,
+            stat.S_IFMT(info.st_mode),
+            getattr(info, "st_file_attributes", 0),
+        )
+        expected = (self.device, self.inode, self.file_type, self.attributes)
+        if current != expected:
+            raise PermissionError(f"installer path identity changed: {self.path}")
+
+
+@dataclass(frozen=True)
+class _InstallIdentity:
+    entries: tuple[_PathIdentity, ...]
+
+    @classmethod
+    def capture(cls, leaf: Path) -> _InstallIdentity:
+        absolute = leaf.absolute()
+        chain = tuple(reversed((absolute, *absolute.parents)))
+        return cls(tuple(_PathIdentity.capture(path) for path in chain))
+
+    def extend(self, path: Path) -> _InstallIdentity:
+        self.revalidate()
+        return _InstallIdentity((*self.entries, _PathIdentity.capture(path.absolute())))
+
+    def revalidate(self) -> None:
+        for entry in self.entries:
+            entry.revalidate()
+
+
+def _guarded_write_bytes(
+    path: Path, content: bytes, identity: _InstallIdentity
+) -> None:
+    identity.revalidate()
+    path.write_bytes(content)
+    identity.revalidate()
+
+
+def _guarded_unlink(path: Path, identity: _InstallIdentity) -> None:
+    identity.revalidate()
+    path.unlink()
+    identity.revalidate()
+
+
+def _guarded_replace(
+    source: Path, destination: Path, identity: _InstallIdentity
+) -> None:
+    identity.revalidate()
+    _assert_not_redirect(source, "installer mutation source")
+    _assert_not_redirect(destination, "installer mutation destination", missing_ok=True)
+    os.replace(source, destination)
+    identity.revalidate()
+
+
+def _remove_verified_stale_staging(
+    skills: Path, identity: _InstallIdentity
+) -> None:
+    identity.revalidate()
+    for candidate in skills.glob(f"{_STAGING_PREFIX}*"):
+        identity.revalidate()
+        if not _is_verified_owned_staging(candidate):
+            continue
+        candidate_identity = identity.extend(candidate)
+        candidate_identity.revalidate()
+        shutil.rmtree(candidate)
+        identity.revalidate()
+
+
+def _is_verified_owned_staging(candidate: Path) -> bool:
+    try:
+        if not candidate.is_dir():
+            return False
+        _assert_tree_has_no_redirects(candidate)
+        marker = candidate / _STAGING_MARKER
+        if marker.read_bytes() != _STAGING_MARKER_CONTENT:
+            return False
+        allowed = {_STAGING_MARKER, *_SKILL_FILES}
+        actual = {
+            path.relative_to(candidate).as_posix()
+            for path in candidate.rglob("*")
+            if path.is_file()
+        }
+        if not actual <= allowed:
+            return False
+        source = resources.files("session_bridge").joinpath("assets", _SKILL_NAME)
+        return all(
+            relative == _STAGING_MARKER
+            or candidate.joinpath(*relative.split("/")).read_bytes()
+            == source.joinpath(*relative.split("/")).read_bytes()
+            for relative in actual
+        )
+    except (FileNotFoundError, OSError, PermissionError):
+        return False
+
+
+def _cleanup_current_staging(
+    staging: Path, identity: _InstallIdentity
+) -> BaseException | None:
+    try:
+        identity.revalidate()
+    except PermissionError:
+        return None
+    if not staging.exists():
+        return None
+    try:
+        shutil.rmtree(staging)
+    except BaseException as error:
+        return error
+    return None
 
 
 @contextmanager
