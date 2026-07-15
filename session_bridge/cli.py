@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, replace
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -39,9 +40,13 @@ from .mirror import (
     enqueue_mirror_job,
     should_halt_batch,
 )
-from .models import MirrorJobState, Provider
+from .models import MirrorJobState, Provider, SidebarJobState
 from .sidebar_skill import install_sidebar_skill
-from .store import SessionBridgeStore
+from .store import (
+    SIDEBAR_FATAL_ERRORS,
+    SIDEBAR_RETRYABLE_ERRORS,
+    SessionBridgeStore,
+)
 
 
 EXIT_OK = 0
@@ -99,6 +104,11 @@ class _Backend(Protocol):
         self, *, provider: str, all_history: bool, newest_first: bool
     ) -> Mapping[str, Any]: ...
     def status(self) -> Mapping[str, Any]: ...
+    def sidebar_status(self) -> Mapping[str, Any]: ...
+    def sidebar_backfill(
+        self, *, days: int, limit: int, apply: bool
+    ) -> Mapping[str, Any]: ...
+    def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]: ...
     def characterize(self, *, provider: str) -> Mapping[str, Any]: ...
     def characterization_status(self) -> str: ...
     def backfill_candidates(self, *, days: int) -> list[dict[str, Any]]: ...
@@ -281,6 +291,78 @@ class ProductionBackend:
                 "errors": progress.errors,
                 "halted": should_halt_batch(progress, policy),
             },
+        }
+
+    def sidebar_status(self) -> Mapping[str, Any]:
+        status_time = time.time()
+        raw = self._require_store().sidebar_delivery_status(now=status_time)
+        return _public_sidebar_status(
+            raw,
+            now=status_time,
+            grace_seconds=self.config.sidebar.heartbeat_grace_seconds,
+        )
+
+    def sidebar_backfill(
+        self, *, days: int, limit: int, apply: bool
+    ) -> Mapping[str, Any]:
+        coordinator = SessionBridgeCoordinator(
+            config=self.config,
+            store=self._require_store(),
+            adapters={},
+            target_adapters={},
+            clock=time.time,
+        )
+        summary = asyncio.run(
+            coordinator.backfill_sidebar_jobs_once(
+                days=days,
+                limit=limit,
+                apply=apply,
+            )
+        )
+        payload = asdict(summary)
+        result = {
+            "mode": "apply" if apply else "dry_run",
+            "days": days,
+            "limit": limit,
+            **payload,
+        }
+        if not apply:
+            result["would_queue"] = payload["queued"]
+            result["queued"] = 0
+        return result
+
+    def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]:
+        if type(enabled) is not bool:
+            raise ConfigurationFailure("invalid_sidebar_continuous_mode")
+        from hermes_cli.config import load_config, save_config
+
+        document = load_config()
+        if not isinstance(document, dict):
+            raise ConfigurationFailure("invalid_hermes_config")
+        session_bridge = document.get("session_bridge")
+        if session_bridge is None:
+            session_bridge = {}
+            document["session_bridge"] = session_bridge
+        if not isinstance(session_bridge, dict):
+            raise ConfigurationFailure("invalid_session_bridge_config")
+        sidebar = session_bridge.get("sidebar")
+        if sidebar is None:
+            sidebar = {}
+            session_bridge["sidebar"] = sidebar
+        if not isinstance(sidebar, dict):
+            raise ConfigurationFailure("invalid_sidebar_config")
+        sidebar["continuous"] = enabled
+        save_config(
+            document,
+            preserve_keys={("session_bridge", "sidebar", "continuous")},
+        )
+        self.config = replace(
+            self.config,
+            sidebar=replace(self.config.sidebar, continuous=enabled),
+        )
+        return {
+            "enabled": self.config.sidebar.enabled,
+            "continuous": enabled,
         }
 
     def characterize(self, *, provider: str) -> Mapping[str, Any]:
@@ -671,6 +753,32 @@ def build_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show sanitized local bridge status")
     status.add_argument("--json", action="store_true")
 
+    sidebar_status = commands.add_parser(
+        "sidebar-status",
+        help="show sanitized native sidebar delivery status",
+    )
+    sidebar_status.add_argument("--json", action="store_true")
+
+    sidebar_backfill = commands.add_parser(
+        "sidebar-backfill",
+        help="preview or enqueue a bounded recent native sidebar batch",
+    )
+    sidebar_backfill.add_argument("--days", type=_bounded_sidebar_days, default=30)
+    sidebar_backfill.add_argument("--limit", type=_bounded_sidebar_limit, default=10)
+    sidebar_backfill_mode = sidebar_backfill.add_mutually_exclusive_group(required=True)
+    sidebar_backfill_mode.add_argument("--dry-run", action="store_true")
+    sidebar_backfill_mode.add_argument("--apply", action="store_true")
+
+    sidebar_continuous = commands.add_parser(
+        "sidebar-continuous",
+        help="persist the native sidebar continuous registration mode",
+    )
+    sidebar_continuous_mode = sidebar_continuous.add_mutually_exclusive_group(
+        required=True
+    )
+    sidebar_continuous_mode.add_argument("--enable", action="store_true")
+    sidebar_continuous_mode.add_argument("--disable", action="store_true")
+
     characterize = commands.add_parser(
         "characterize", help="run the disposable live provider gate"
     )
@@ -741,6 +849,26 @@ def main(
             payload = dict(backend.status())
             _emit(payload)
             return EXIT_OK if payload.get("healthy", True) is True else EXIT_DEGRADED
+        if args.command == "sidebar-status":
+            payload = dict(backend.sidebar_status())
+            _emit(payload)
+            return EXIT_OK if payload.get("healthy") is True else EXIT_DEGRADED
+        if args.command == "sidebar-backfill":
+            payload = dict(
+                backend.sidebar_backfill(
+                    days=args.days,
+                    limit=args.limit,
+                    apply=bool(args.apply),
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-continuous":
+            payload = dict(
+                backend.set_sidebar_continuous(enabled=bool(args.enable))
+            )
+            _emit(payload)
+            return EXIT_OK
         if args.command == "characterize":
             _emit(dict(backend.characterize(provider=args.provider)))
             return EXIT_OK
@@ -893,6 +1021,118 @@ def _public_preview(preview: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_sidebar_status(
+    raw: Mapping[str, Any],
+    *,
+    now: float,
+    grace_seconds: int,
+) -> dict[str, Any]:
+    status_time = _finite_status_number(now)
+    if type(grace_seconds) is not int or grace_seconds < 0:
+        raise ConfigurationFailure("invalid_sidebar_heartbeat_grace")
+    raw_counts = raw.get("counts")
+    counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+    state_counts = {
+        state.value: _status_count(
+            counts.get(state.value, counts.get(state.name.casefold(), 0))
+        )
+        for state in SidebarJobState
+    }
+    raw_providers = raw.get("eligible_by_provider")
+    providers = raw_providers if isinstance(raw_providers, Mapping) else {}
+    eligible_by_provider = {
+        Provider.CLAUDE.value: _status_count(providers.get(Provider.CLAUDE.value, 0)),
+        Provider.HERMES.value: _status_count(providers.get(Provider.HERMES.value, 0)),
+    }
+    oldest_age = _optional_status_number(raw.get("oldest_pending_age_seconds"))
+    heartbeat_at = _optional_status_number(raw.get("last_heartbeat_at"))
+    heartbeat_age = (
+        max(0.0, status_time - heartbeat_at) if heartbeat_at is not None else None
+    )
+    threshold = 60 + grace_seconds
+    work_pending = sum(
+        state_counts[state.value]
+        for state in (
+            SidebarJobState.PENDING,
+            SidebarJobState.LEASED,
+            SidebarJobState.RETRY,
+        )
+    ) > 0
+    degraded_reasons: list[str] = []
+    heartbeat_stale = (
+        heartbeat_age > threshold
+        if heartbeat_age is not None
+        else oldest_age is not None and oldest_age > threshold
+    )
+    if work_pending and heartbeat_stale:
+        degraded_reasons.append("broker_heartbeat_stale")
+    if work_pending and oldest_age is not None and oldest_age > threshold:
+        degraded_reasons.append("oldest_pending_stale")
+    raw_codes = raw.get("recent_error_codes")
+    allowed_codes = SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
+    recent_codes = (
+        [
+            code
+            for code in raw_codes
+            if isinstance(code, str) and code in allowed_codes
+        ][:10]
+        if isinstance(raw_codes, list)
+        else []
+    )
+    raw_latency = raw.get("delivery_latency_seconds")
+    latency = raw_latency if isinstance(raw_latency, Mapping) else {}
+    task_id = raw.get("last_visible_task_id")
+    return {
+        "healthy": not degraded_reasons,
+        "degraded_reasons": degraded_reasons,
+        "eligible_by_provider": eligible_by_provider,
+        "counts": state_counts,
+        "oldest_pending_age_seconds": oldest_age,
+        "last_heartbeat_at": heartbeat_at,
+        "last_successful_heartbeat_at": heartbeat_at,
+        "heartbeat_age_seconds": heartbeat_age,
+        "last_visible_task_id": _redacted_task_id(task_id),
+        "recent_error_codes": recent_codes,
+        "delivery_latency_seconds": {
+            percentile: _optional_status_number(latency.get(percentile))
+            for percentile in ("p50", "p95", "p99")
+        },
+    }
+
+
+def _status_count(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    return value
+
+
+def _finite_status_number(value: object) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+    ):
+        raise ConfigurationFailure("invalid_sidebar_status")
+    return float(value)
+
+
+def _optional_status_number(value: object) -> float | None:
+    if value is None:
+        return None
+    result = _finite_status_number(value)
+    if result < 0:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    return result
+
+
+def _redacted_task_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) <= 12:
+        return "[REDACTED]"
+    return f"{value[:8]}...{value[-4:]}"
+
+
 def _sanitize(value: Any, *, key: str | None = None) -> Any:
     if key is not None and any(
         fragment in key.casefold() for fragment in _SENSITIVE_KEY_FRAGMENTS
@@ -937,6 +1177,20 @@ def _bounded_create_count(value: str) -> int:
         raise argparse.ArgumentTypeError(
             f"value must be at most {_MAX_BACKFILL_CREATE}"
         )
+    return parsed
+
+
+def _bounded_sidebar_days(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 30:
+        raise argparse.ArgumentTypeError("value must be at most 30")
+    return parsed
+
+
+def _bounded_sidebar_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 10:
+        raise argparse.ArgumentTypeError("value must be at most 10")
     return parsed
 
 

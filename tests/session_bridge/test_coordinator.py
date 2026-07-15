@@ -48,7 +48,11 @@ from session_bridge.models import (
     SidebarJobState,
     UpsertResult,
 )
-from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
+from session_bridge.sidebar import (
+    SidebarCandidate,
+    VerifiedSidebarThread,
+    sidebar_bridge_id,
+)
 from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
 from session_bridge.worktree import capture_worktree_snapshot
 
@@ -2956,6 +2960,116 @@ async def test_sidebar_registration_enqueues_only_native_meaningful_sources_once
     assert "meaningful-claude" not in serialized
     assert "lease_token" not in serialized
     assert "marker" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_sidebar_backfill_preview_is_side_effect_free_and_apply_is_bounded(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = _seed_sidebar_sources(sidebar_db, now=now)
+    config = _sidebar_config(continuous=False)
+    coordinator = SessionBridgeCoordinator(
+        config=config,
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=10,
+        apply=False,
+    )
+
+    assert preview.queued == 3
+    assert preview.by_provider == {"claude": 1, "hermes": 2}
+    assert store.sidebar_job_counts() == {
+        SidebarJobState.PENDING.value: 0,
+        SidebarJobState.LEASED.value: 0,
+        SidebarJobState.RETRY.value: 0,
+        SidebarJobState.VISIBLE.value: 0,
+        SidebarJobState.FAILED.value: 0,
+    }
+    assert store.get_state("session-bridge:sidebar:registration-cursor") is None
+    assert coordinator.health()["sidebar_registration_counts"] == {
+        "examined": 0,
+        "queued": 0,
+        "claude": 0,
+        "hermes": 0,
+        "failed": 0,
+    }
+
+    applied = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=2,
+        apply=True,
+    )
+
+    assert applied.queued == 2
+    assert store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 2
+    assert store.get_state("session-bridge:sidebar:registration-cursor") is None
+    assert config.sidebar.continuous is False
+
+
+class _HeartbeatClaimStore:
+    def __init__(self, *, fail_claim: bool = False) -> None:
+        self.fail_claim = fail_claim
+        self.heartbeats: list[float] = []
+
+    def claim_sidebar_jobs(
+        self, *, now: float, limit: int, lease_seconds: int
+    ) -> list[dict[str, Any]]:
+        if self.fail_claim:
+            raise RuntimeError("claim failed")
+        return []
+
+    def record_sidebar_broker_heartbeat(self, *, now: float) -> None:
+        self.heartbeats.append(now)
+
+
+class _EmptySidebarVerifier:
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None:
+        return None
+
+    def verify_thread(
+        self, *, thread_id: str, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread:
+        raise AssertionError("empty delivery must not verify a thread")
+
+
+@pytest.mark.asyncio
+async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_claim() -> None:
+    successful = _HeartbeatClaimStore()
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=successful,
+        adapters={},
+        target_adapters={},
+        sidebar_verifier=_EmptySidebarVerifier(),
+        clock=lambda: 100.0,
+    )
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert successful.heartbeats == [100.0]
+
+    failing = _HeartbeatClaimStore(fail_claim=True)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=failing,
+        adapters={},
+        target_adapters={},
+        sidebar_verifier=_EmptySidebarVerifier(),
+        clock=lambda: 100.0,
+    )
+    with pytest.raises(RuntimeError, match="claim failed"):
+        await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    assert failing.heartbeats == []
 
 
 @pytest.mark.asyncio

@@ -447,6 +447,41 @@ class SessionBridgeCoordinator:
                 limit=limit,
             )
 
+    async def backfill_sidebar_jobs_once(
+        self,
+        *,
+        days: int = 30,
+        limit: int = 10,
+        apply: bool = False,
+        now: float | None = None,
+    ) -> SidebarRegistrationSummary:
+        if type(days) is not int or not 1 <= days <= 30:
+            raise ValueError("sidebar backfill days must be between 1 and 30")
+        if type(limit) is not int or not 1 <= limit <= 10:
+            raise ValueError("sidebar backfill limit must be between 1 and 10")
+        if type(apply) is not bool:
+            raise ValueError("sidebar backfill apply flag must be a boolean")
+        registration_time = _finite_number(
+            self._clock() if now is None else now,
+            "now",
+        )
+        if not self._config.sidebar.enabled:
+            return SidebarRegistrationSummary(
+                examined=0,
+                queued=0,
+                by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
+                failed=0,
+            )
+        async with self._sidebar_registration_lock:
+            return await self._register_sidebar_jobs_locked(
+                registration_time=registration_time,
+                limit=limit,
+                backfill_days=days,
+                apply=apply,
+                persist_cursor=False,
+                record_summary=apply,
+            )
+
     async def claim_sidebar_jobs_for_delivery(
         self,
         *,
@@ -556,6 +591,13 @@ class SessionBridgeCoordinator:
                         recovered_thread=recovered,
                     )
                 )
+            heartbeat = getattr(
+                self._store,
+                "record_sidebar_broker_heartbeat",
+                None,
+            )
+            if callable(heartbeat):
+                await asyncio.to_thread(heartbeat, now=claim_time)
             return tuple(delivery)
         except asyncio.CancelledError as cancelled:
             try:
@@ -790,14 +832,25 @@ class SessionBridgeCoordinator:
         *,
         registration_time: float,
         limit: int,
+        backfill_days: int | None = None,
+        apply: bool = True,
+        persist_cursor: bool = True,
+        record_summary: bool = True,
     ) -> SidebarRegistrationSummary:
-        after = registration_time - self._config.sidebar.backfill_days * 86_400
+        effective_backfill_days = (
+            self._config.sidebar.backfill_days
+            if backfill_days is None
+            else backfill_days
+        )
+        after = registration_time - effective_backfill_days * 86_400
         by_provider = {Provider.CLAUDE.value: 0, Provider.HERMES.value: 0}
         queued = 0
         failed = 0
         examined = 0
         seen: set[str] = set()
-        durable_cursor = await self._load_sidebar_registration_cursor()
+        durable_cursor = (
+            await self._load_sidebar_registration_cursor() if persist_cursor else None
+        )
         cursor: tuple[float, str] | None = None
         newest_probe = True
         seen_backfill_cursors = (
@@ -859,7 +912,7 @@ class SessionBridgeCoordinator:
                     if not is_sidebar_session_eligible(
                         projection,
                         now=registration_time,
-                        backfill_days=self._config.sidebar.backfill_days,
+                        backfill_days=effective_backfill_days,
                         automation_only=source.automation_only,
                         subagent_only=source.subagent_only,
                     ):
@@ -900,13 +953,14 @@ class SessionBridgeCoordinator:
                     )
                     if existing is not None:
                         continue
-                    enqueue_method = getattr(
-                        self._store,
-                        "enqueue_sidebar_job",
-                        None,
-                    )
-                    if not callable(enqueue_method):
+                    enqueue_method = getattr(self._store, "enqueue_sidebar_job", None)
+                    if apply and not callable(enqueue_method):
                         raise RuntimeError("sidebar enqueue is unavailable")
+                    if not apply:
+                        queued += 1
+                        by_provider[projection.provider.value] += 1
+                        continue
+                    assert callable(enqueue_method)
                     parameters = inspect.signature(enqueue_method).parameters
                     if "worktree_snapshot" in parameters:
                         indexed_git_metadata = any(
@@ -954,16 +1008,18 @@ class SessionBridgeCoordinator:
                     raise
                 except Exception:
                     failed += 1
-                    self._record_error_code(
-                        "sidebar_registration_candidate_failed"
-                    )
+                    if apply:
+                        self._record_error_code(
+                            "sidebar_registration_candidate_failed"
+                        )
                 if queued >= limit:
                     break
 
             if queued >= limit:
                 break
             if not raw_page.has_more:
-                await self._save_sidebar_registration_cursor(None)
+                if persist_cursor:
+                    await self._save_sidebar_registration_cursor(None)
                 break
             assert next_cursor is not None
             if newest_probe:
@@ -971,12 +1027,14 @@ class SessionBridgeCoordinator:
                 if durable_cursor is None:
                     durable_cursor = next_cursor
                     seen_backfill_cursors.add(next_cursor)
-                    await self._save_sidebar_registration_cursor(durable_cursor)
+                    if persist_cursor:
+                        await self._save_sidebar_registration_cursor(durable_cursor)
                 cursor = durable_cursor
             else:
                 durable_cursor = next_cursor
                 seen_backfill_cursors.add(next_cursor)
-                await self._save_sidebar_registration_cursor(durable_cursor)
+                if persist_cursor:
+                    await self._save_sidebar_registration_cursor(durable_cursor)
                 cursor = durable_cursor
 
         summary = SidebarRegistrationSummary(
@@ -985,7 +1043,8 @@ class SessionBridgeCoordinator:
             by_provider=by_provider,
             failed=failed,
         )
-        self._set_sidebar_registration_counts(summary)
+        if record_summary:
+            self._set_sidebar_registration_counts(summary)
         return summary
 
     async def _load_sidebar_registration_cursor(self) -> tuple[float, str] | None:
