@@ -122,6 +122,59 @@ def test_worktree_snapshot_supports_non_git_directory_identity(tmp_path: Path) -
     assert validate_worktree_snapshot(snapshot) == (snapshot, ())
 
 
+def test_worktree_capture_rejects_git_probe_failure_when_git_metadata_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    nested = repo / "nested" / "source"
+    nested.mkdir(parents=True)
+    original_run = subprocess.run
+
+    def fail_discovery(command: list[str], **kwargs: object):
+        if command[:3] == ["git", "-C", str(nested.resolve(strict=True))]:
+            return SimpleNamespace(returncode=128, stdout=b"")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr("session_bridge.worktree.subprocess.run", fail_discovery)
+
+    with pytest.raises(WorktreeSnapshotError) as raised:
+        capture_worktree_snapshot(str(nested))
+
+    assert raised.value.code == "source_identity_mismatch"
+
+
+def test_worktree_validation_rejects_replaced_git_metadata(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    recorded = capture_worktree_snapshot(str(repo))
+    _remove_tree(repo / ".git")
+    (repo / ".git").mkdir()
+
+    with pytest.raises(WorktreeSnapshotError) as raised:
+        validate_worktree_snapshot(recorded)
+
+    assert raised.value.code == "source_identity_mismatch"
+
+
+def test_worktree_capture_rejects_probe_failure_for_worktree_git_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _repo(tmp_path / "main")
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-b", "feature/linked", str(linked))
+    assert (linked / ".git").is_file()
+    monkeypatch.setattr(
+        "session_bridge.worktree.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=128, stdout=b""),
+    )
+
+    with pytest.raises(WorktreeSnapshotError) as raised:
+        capture_worktree_snapshot(str(linked))
+
+    assert raised.value.code == "source_identity_mismatch"
+
+
 def test_worktree_snapshot_supports_unborn_repository_identity(tmp_path: Path) -> None:
     source = tmp_path / "unborn"
     source.mkdir()

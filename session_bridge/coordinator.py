@@ -909,10 +909,25 @@ class SessionBridgeCoordinator:
                         raise RuntimeError("sidebar enqueue is unavailable")
                     parameters = inspect.signature(enqueue_method).parameters
                     if "worktree_snapshot" in parameters:
+                        indexed_git_metadata = any(
+                            value is not None
+                            for value in (
+                                candidate.git_root,
+                                candidate.git_branch,
+                                candidate.git_head,
+                            )
+                        )
                         worktree_snapshot = await asyncio.to_thread(
                             capture_worktree_snapshot,
                             candidate.cwd,
                         )
+                        if (
+                            indexed_git_metadata
+                            and worktree_snapshot.git_root is None
+                        ):
+                            raise WorktreeSnapshotError(
+                                "source_identity_mismatch"
+                            )
                         candidate = replace(
                             candidate,
                             cwd=worktree_snapshot.cwd,

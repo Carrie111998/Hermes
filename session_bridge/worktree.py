@@ -65,6 +65,8 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
             deadline=deadline,
         )
         if not git_root_result:
+            if _has_git_metadata_in_ancestry(resolved):
+                raise WorktreeSnapshotError("source_identity_mismatch")
             return _filesystem_snapshot(
                 source=source,
                 source_lstat=source_lstat,
@@ -251,6 +253,21 @@ def _filesystem_snapshot(
         head=None,
         worktree_id=f"worktree:v1:{hashlib.sha256(encoded).hexdigest()}",
     )
+
+
+def _has_git_metadata_in_ancestry(cwd: Path) -> bool:
+    """Return true only when a lexical ancestor visibly owns Git metadata."""
+
+    for directory in (cwd, *cwd.parents):
+        marker = directory / ".git"
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise WorktreeSnapshotError("source_identity_mismatch") from None
+        return True
+    return False
 
 
 def _git(cwd: Path, *args: str, deadline: float) -> str:

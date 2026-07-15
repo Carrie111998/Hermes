@@ -2996,6 +2996,78 @@ async def test_sidebar_registration_isolates_malformed_claude_from_hermes(
     assert store.get_sidebar_job_for_source("claude:bad-cwd") is None
 
 
+@pytest.mark.asyncio
+async def test_sidebar_registration_rejects_filesystem_snapshot_for_indexed_git_source(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    source = tmp_path / "indexed-git-source"
+    source.mkdir()
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="indexed-git-hermes",
+        content="Continue this indexed Git source",
+        last_active=now,
+        cwd=str(source),
+    )
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(now=now, limit=1)
+
+    assert summary.queued == 0
+    assert summary.failed == 1
+    assert store.get_sidebar_job_for_source("indexed-git-hermes") is None
+    assert store.get_worktree_snapshot("indexed-git-hermes") is None
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_accepts_plain_source_without_indexed_git_metadata(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    source = tmp_path / "plain-source"
+    source.mkdir()
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="plain-hermes",
+        content="Continue this plain directory session",
+        last_active=now,
+        cwd=str(source),
+    )
+
+    def clear_git_metadata(conn: Any) -> None:
+        conn.execute(
+            "UPDATE sessions SET git_branch = NULL, git_repo_root = NULL WHERE id = ?",
+            ("plain-hermes",),
+        )
+
+    sidebar_db._execute_write(clear_git_metadata)
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(now=now, limit=1)
+
+    assert summary.queued == 1
+    snapshot = store.get_worktree_snapshot("plain-hermes")
+    assert snapshot is not None
+    assert snapshot.git_root is None
+
+
 class _SidebarScanStore(_RecordingStore):
     def __init__(self) -> None:
         super().__init__()
