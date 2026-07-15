@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import dataclass
 import hashlib
+import json
 import math
-import re
 import unicodedata
 
 from .context_pack import _redact
@@ -26,20 +28,22 @@ ACK_OR_CONTROL_ONLY = frozenset({
     "/quit",
 })
 
-_MARKER_CANDIDATE_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])"
-    r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-    r"(?![A-Za-z0-9_-])"
-)
-_MARKER_FULL_RE = re.compile(
-    r"HERMES_SESSION_BRIDGE_V1:[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"
-)
 _TITLE_PREFIXES = {
     Provider.CLAUDE: "[Claude] ",
     Provider.HERMES: "[Hermes] ",
 }
 _MAX_TITLE_CHARS = 120
 _UNICODE_LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+_MARKER_PREFIX = "HERMES_SESSION_BRIDGE_V1"
+_MARKER_FIELDS = frozenset({
+    "bridge_id",
+    "policy_generation",
+    "source_session_id",
+    "target_provider",
+})
+_BASE64URL_CHARACTERS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 
 
 @dataclass(frozen=True)
@@ -99,8 +103,6 @@ def is_sidebar_session_eligible(
     for message in projection.messages:
         if message.role != "user" or not isinstance(message.content, str):
             continue
-        if _MARKER_CANDIDATE_RE.search(message.content):
-            continue
         if is_meaningful_user_text(message.content):
             return True
     return False
@@ -138,16 +140,15 @@ def sidebar_title(provider: Provider, title: str | None, first_request: str) -> 
 
 def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:
     _validate_candidate(candidate)
-    if not isinstance(marker, str) or _MARKER_FULL_RE.fullmatch(marker) is None:
-        raise ValueError("registration marker is malformed")
+    _validate_registration_marker(candidate, marker)
 
-    source = _redacted_metadata(candidate.source_session_id)
-    provider = _redacted_metadata(candidate.provider.value)
-    cwd = _redacted_metadata(candidate.cwd)
-    git_root = _redacted_metadata(candidate.git_root)
-    git_branch = _redacted_metadata(candidate.git_branch)
-    git_head = _redacted_metadata(candidate.git_head)
-    worktree_id = _redacted_metadata(candidate.worktree_id)
+    source = _serialized_metadata(candidate.source_session_id)
+    provider = _serialized_metadata(candidate.provider.value)
+    cwd = _serialized_metadata(candidate.cwd)
+    git_root = _serialized_metadata(candidate.git_root)
+    git_branch = _serialized_metadata(candidate.git_branch)
+    git_head = _serialized_metadata(candidate.git_head)
+    worktree_id = _serialized_metadata(candidate.worktree_id)
 
     return "\n".join((
         "This is a Hermes Session Bridge placeholder registration.",
@@ -247,10 +248,9 @@ def _validate_optional_metadata(value: object, label: str) -> None:
     _validate_required_metadata(value, label)
 
 
-def _redacted_metadata(value: str | None) -> str:
-    if value is None:
-        return "(none)"
-    return _redact(value)
+def _serialized_metadata(value: str | None) -> str:
+    redacted = None if value is None else _redact(value)
+    return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
 
 
 def _compact_whitespace(value: str) -> str:
@@ -268,3 +268,55 @@ def _validate_finite_timestamp(value: object, label: str) -> None:
         or not math.isfinite(value)
     ):
         raise ValueError(f"{label} must be a finite timestamp")
+
+
+def _validate_registration_marker(candidate: SidebarCandidate, marker: object) -> None:
+    try:
+        if not isinstance(marker, str) or marker.count(":") != 1:
+            raise ValueError
+        prefix, encoded_and_signature = marker.split(":", 1)
+        if prefix != _MARKER_PREFIX or encoded_and_signature.count(".") != 1:
+            raise ValueError
+        encoded_body, encoded_signature = encoded_and_signature.split(".", 1)
+        body = _decode_canonical_base64url(encoded_body)
+        signature = _decode_canonical_base64url(encoded_signature)
+        if len(signature) != 32:
+            raise ValueError
+
+        decoded = json.loads(body.decode("utf-8"))
+        if not isinstance(decoded, dict) or set(decoded) != _MARKER_FIELDS:
+            raise ValueError
+        expected = {
+            "bridge_id": candidate.bridge_id,
+            "policy_generation": 1,
+            "source_session_id": candidate.source_session_id,
+            "target_provider": Provider.CODEX.value,
+        }
+        canonical_body = json.dumps(
+            expected,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if decoded != expected or body != canonical_body:
+            raise ValueError
+    except (binascii.Error, UnicodeError, ValueError, TypeError) as exc:
+        raise ValueError("registration marker is malformed or mismatched") from exc
+
+
+def _decode_canonical_base64url(value: object) -> bytes:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character not in _BASE64URL_CHARACTERS for character in value)
+    ):
+        raise ValueError
+    padded = value + "=" * (-len(value) % 4)
+    decoded = base64.b64decode(
+        padded.encode("ascii"),
+        altchars=b"-_",
+        validate=True,
+    )
+    canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+    if canonical != value:
+        raise ValueError
+    return decoded
