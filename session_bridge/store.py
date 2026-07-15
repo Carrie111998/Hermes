@@ -1206,6 +1206,31 @@ class SessionBridgeStore:
             raise ValueError("sidebar lease has expired")
         return result
 
+    def lookup_sidebar_job_by_lease(self, lease_token: str) -> dict[str, Any]:
+        token_digest = _sidebar_lease_digest(lease_token)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            job, matched_completion = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=True,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            state = job["state"]
+            if matched_completion:
+                if state != SidebarJobState.VISIBLE.value:
+                    raise ValueError("invalid sidebar completion state")
+            elif state != SidebarJobState.LEASED.value:
+                raise ValueError("sidebar job is not leased")
+            return {
+                "source_session_id": job["source_session_id"],
+                "bridge_id": job["bridge_id"],
+                "state": state,
+                "codex_thread_id": job["codex_thread_id"],
+            }
+
     def fail_sidebar_job(
         self,
         *,

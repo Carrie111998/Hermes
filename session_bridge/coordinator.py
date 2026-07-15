@@ -215,7 +215,6 @@ class SessionBridgeCoordinator:
         self._watch_debounce_seconds = float(watch_debounce_seconds)
         self._refresh_timeout = float(refresh_timeout)
         self._sidebar_verifier = sidebar_verifier
-        self._sidebar_claim_expectations: dict[str, BridgeMarkerPayload] = {}
         self._watch_stop_event: asyncio.Event | None = None
         self._watcher_state = "not_started"
         self._watcher_error_code: str | None = None
@@ -463,39 +462,23 @@ class SessionBridgeCoordinator:
                     }
                     else "bridge_temporarily_unavailable"
                 )
-                await asyncio.to_thread(
-                    _call,
-                    self._store,
-                    "fail_sidebar_job",
-                    lease_token=lease_token,
-                    error_code=code,
-                    now=claim_time,
-                )
+                await self._fail_sidebar_delivery_claim(lease_token, code)
                 continue
             except Exception:
-                await asyncio.to_thread(
-                    _call,
-                    self._store,
-                    "fail_sidebar_job",
-                    lease_token=lease_token,
-                    error_code="bridge_temporarily_unavailable",
-                    now=claim_time,
+                await self._fail_sidebar_delivery_claim(
+                    lease_token,
+                    "bridge_temporarily_unavailable",
                 )
                 continue
             if recovered is not None and (
                 recovered.source_session_id != source_session_id
                 or recovered.bridge_id != bridge_id
             ):
-                await asyncio.to_thread(
-                    _call,
-                    self._store,
-                    "fail_sidebar_job",
-                    lease_token=lease_token,
-                    error_code="source_identity_mismatch",
-                    now=claim_time,
+                await self._fail_sidebar_delivery_claim(
+                    lease_token,
+                    "source_identity_mismatch",
                 )
                 continue
-            self._sidebar_claim_expectations[lease_token] = expected
             delivery.append(
                 SidebarDeliveryClaim(
                     lease_token=lease_token,
@@ -508,6 +491,26 @@ class SessionBridgeCoordinator:
             )
         return tuple(delivery)
 
+    async def _fail_sidebar_delivery_claim(
+        self,
+        lease_token: str,
+        error_code: str,
+    ) -> None:
+        failure_time = _finite_number(self._clock(), "now")
+        try:
+            await asyncio.to_thread(
+                _call,
+                self._store,
+                "fail_sidebar_job",
+                lease_token=lease_token,
+                error_code=error_code,
+                now=failure_time,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._record_error_code("sidebar_delivery_failure_stale")
+
     async def commit_sidebar_job(
         self,
         *,
@@ -516,10 +519,29 @@ class SessionBridgeCoordinator:
     ) -> Mapping[str, Any]:
         token = _exact_sidebar_claim_text(lease_token, "lease token")
         thread_id = _exact_sidebar_claim_text(codex_thread_id, "Codex thread ID")
-        expected = self._sidebar_claim_expectations.get(token)
         verifier = self._sidebar_verifier
-        if expected is None or verifier is None:
+        if verifier is None:
             raise SidebarVerificationError("source_identity_mismatch")
+        raw_identity = await asyncio.to_thread(
+            _call,
+            self._store,
+            "lookup_sidebar_job_by_lease",
+            token,
+        )
+        if not isinstance(raw_identity, Mapping):
+            raise SidebarVerificationError("source_identity_mismatch")
+        source_session_id = _exact_sidebar_claim_text(
+            raw_identity.get("source_session_id"), "source session ID"
+        )
+        bridge_id = _exact_sidebar_claim_text(
+            raw_identity.get("bridge_id"), "bridge ID"
+        )
+        expected = BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id=source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        )
         verified = await asyncio.to_thread(
             verifier.verify_thread,
             thread_id=thread_id,

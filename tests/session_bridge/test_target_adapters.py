@@ -239,6 +239,25 @@ class FakeCodexRpcError(RuntimeError):
         super().__init__(message)
 
 
+class StructuralSidebarInventory:
+    def __init__(self) -> None:
+        self.list_calls = 0
+
+    def list_sidebar_inventory(
+        self, *, deadline: float | None, page_cap: int
+    ) -> list[Any]:
+        self.list_calls += 1
+        return []
+
+    def find_sidebar_thread(
+        self, thread_id: str, *, deadline: float | None, page_cap: int
+    ) -> Any | None:
+        return None
+
+    def read_sidebar_thread(self, summary: Any, *, deadline: float | None) -> Any:
+        raise AssertionError("empty structural inventory must not be read")
+
+
 def _assert_sanitized_exception_has_no_chain(
     error: BaseException, *, secret: str
 ) -> None:
@@ -440,6 +459,207 @@ def test_sidebar_thread_verifier_reads_only_exact_authenticated_thread() -> None
         "thread/read",
     ]
     assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+
+
+def test_sidebar_thread_verifier_accepts_structural_read_only_inventory() -> None:
+    inventory = StructuralSidebarInventory()
+    verifier = SidebarThreadVerifier(
+        inventory,
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) is None
+    assert inventory.list_calls == 1
+
+
+def test_sidebar_marker_lookup_page_cap_is_retryable_not_false_zero() -> None:
+    client = FakeRequestClient({
+        "thread/list": [{**_codex_inventory(), "nextCursor": "more"}],
+    })
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0)
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        inventory_page_cap=1,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert [method for method, _, _ in client.calls] == ["thread/list"]
+
+
+def test_sidebar_marker_lookup_thread_cap_stops_before_thread_reads() -> None:
+    first = _codex_inventory()["data"][0]
+    second = _codex_inventory(
+        native_id="33333333-3333-4333-8333-333333333333"
+    )["data"][0]
+    client = FakeRequestClient({
+        "thread/list": [{"data": [first, second]}, {"data": []}],
+    })
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0)
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        inventory_thread_cap=1,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert all(method != "thread/read" for method, _, _ in client.calls)
+
+
+def test_sidebar_marker_lookup_deadline_before_list_makes_no_request() -> None:
+    client = FakeRequestClient({})
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 2.0)
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=1.0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert client.calls == []
+
+
+def test_zero_interval_sidebar_lookup_still_has_finite_read_budget() -> None:
+    client = FakeRequestClient({})
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 31.0)
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert client.calls == []
+
+
+def test_sidebar_marker_lookup_deadline_after_list_is_retryable() -> None:
+    ticks = iter((0.0, 2.0))
+    client = FakeRequestClient({"thread/list": [_codex_inventory()]})
+    source = CodexSourceAdapter(
+        client,
+        marker_secret=SECRET,
+        monotonic=lambda: next(ticks),
+    )
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=1.0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert [method for method, _, _ in client.calls] == ["thread/list"]
+
+
+def test_sidebar_marker_lookup_deadline_between_list_and_read_never_false_zero() -> None:
+    ticks = iter((0.0, 0.0, 0.0, 0.0, 2.0))
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+    })
+    source = CodexSourceAdapter(
+        client,
+        marker_secret=SECRET,
+        monotonic=lambda: next(ticks),
+    )
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=1.0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert [method for method, _, _ in client.calls] == ["thread/list", "thread/list"]
+
+
+def test_sidebar_marker_lookup_deadline_after_read_is_retryable_not_a_match() -> None:
+    ticks = iter((0.0, 0.0, 0.0, 0.0, 0.0, 2.0))
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_signed_read()],
+    })
+    source = CodexSourceAdapter(
+        client,
+        marker_secret=SECRET,
+        monotonic=lambda: next(ticks),
+    )
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=1.0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
+    ]
+
+
+def test_two_sidebar_claim_markers_reuse_one_bounded_inventory_snapshot() -> None:
+    other_id = "33333333-3333-4333-8333-333333333333"
+    first = _codex_inventory()["data"][0]
+    second = _codex_inventory(native_id=other_id)["data"][0]
+    client = FakeRequestClient({
+        "thread/list": [{"data": [first, second]}, {"data": []}],
+        "thread/read": [
+            _codex_signed_read(),
+            _codex_signed_read(
+                native_id=other_id,
+                bridge_id="bridge-2",
+                source_session_id="hermes-source-2",
+            ),
+        ],
+    })
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0)
+    verifier = SidebarThreadVerifier(
+        source,
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) is not None
+    assert verifier.find_by_marker(BridgeMarkerPayload(
+        "bridge-2", "hermes-source-2", Provider.CODEX, 1
+    )) == VerifiedSidebarThread(other_id, "hermes-source-2", "bridge-2")
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
+        "thread/read",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -742,15 +962,23 @@ def test_sidebar_thread_verifier_bounds_not_indexed_polling() -> None:
             {"data": []},
         ],
     })
-    ticks = iter((0.0, 0.0, 1.0, 2.0))
+    now = [0.0]
     sleeps: list[float] = []
+    def advance(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
     verifier = SidebarThreadVerifier(
-        CodexSourceAdapter(client, marker_secret=SECRET),
+        CodexSourceAdapter(
+            client,
+            marker_secret=SECRET,
+            monotonic=lambda: now[0],
+        ),
         marker_secret=SECRET,
         reconciliation_interval=2.0,
         poll_interval=1.0,
-        monotonic=lambda: next(ticks),
-        sleep=sleeps.append,
+        monotonic=lambda: now[0],
+        sleep=advance,
     )
 
     with pytest.raises(SidebarVerificationError) as raised:
@@ -758,7 +986,7 @@ def test_sidebar_thread_verifier_bounds_not_indexed_polling() -> None:
 
     assert raised.value.code == "native_task_not_indexed"
     assert sleeps == [1.0, 1.0]
-    assert [method for method, _, _ in client.calls] == ["thread/list"] * 6
+    assert [method for method, _, _ in client.calls] == ["thread/list"] * 4
 
 
 def test_placeholder_result_is_the_frozen_common_contract() -> None:

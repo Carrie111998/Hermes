@@ -3049,6 +3049,43 @@ def test_sidebar_commit_requires_exact_unexpired_token_and_is_idempotent(db) -> 
     ).hexdigest()
 
 
+def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("lookup-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="lookup-authenticated")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    active = store.lookup_sidebar_job_by_lease(lease["lease_token"])
+    assert active == {
+        "source_session_id": candidate.source_session_id,
+        "bridge_id": candidate.bridge_id,
+        "state": SidebarJobState.LEASED.value,
+        "codex_thread_id": None,
+    }
+    assert "lease_digest" not in active
+    assert "completion_digest" not in active
+    assert "lease_token" not in active
+
+    store.commit_sidebar_job(
+        lease_token=lease["lease_token"],
+        codex_thread_id="codex-lookup-thread",
+        now=200.0,
+    )
+    assert store.lookup_sidebar_job_by_lease(lease["lease_token"]) == {
+        "source_session_id": candidate.source_session_id,
+        "bridge_id": candidate.bridge_id,
+        "state": SidebarJobState.VISIBLE.value,
+        "codex_thread_id": "codex-lookup-thread",
+    }
+
+    with pytest.raises(ValueError, match="lease token"):
+        store.lookup_sidebar_job_by_lease("wrong-token")
+
+
 def test_sidebar_digest_auth_uses_bounded_equality_candidates_for_commit_replay(
     db,
 ) -> None:

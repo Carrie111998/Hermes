@@ -5,11 +5,13 @@ from typing import Any
 
 import pytest
 
+from hermes_state import SessionDB
 from session_bridge.codex_adapter import SidebarVerificationError
 from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.coordinator import SessionBridgeCoordinator
 from session_bridge.models import BridgeMarkerPayload, Provider
-from session_bridge.sidebar import VerifiedSidebarThread
+from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
+from session_bridge.store import SessionBridgeStore
 
 
 SOURCE = "claude:source-1"
@@ -57,6 +59,15 @@ class FakeSidebarStore:
             **_leased_job(),
             "state": "sidebar_visible",
             "codex_thread_id": codex_thread_id,
+        }
+
+    def lookup_sidebar_job_by_lease(self, lease_token: str) -> dict[str, Any]:
+        assert lease_token == "opaque-lease-token"
+        return {
+            "source_session_id": SOURCE,
+            "bridge_id": BRIDGE,
+            "state": "sidebar_leased",
+            "codex_thread_id": None,
         }
 
 
@@ -183,6 +194,21 @@ async def test_related_near_match_is_persisted_fatal_and_never_exposed(
 
 
 @pytest.mark.asyncio
+async def test_inventory_budget_exhaustion_is_retryable_and_exposes_no_claim() -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(
+        SidebarVerificationError("bridge_temporarily_unavailable")
+    )
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert store.commits == []
+
+
+@pytest.mark.asyncio
 async def test_recovered_rename_failure_renames_same_thread_before_verified_commit() -> None:
     events: list[tuple[str, str]] = []
     store = FakeSidebarStore()
@@ -205,3 +231,90 @@ async def test_recovered_rename_failure_renames_same_thread_before_verified_comm
         (THREAD, BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1))
     ]
     assert store.commits == [("opaque-lease-token", THREAD, 101.0)]
+
+
+@pytest.mark.asyncio
+async def test_commit_and_exact_replay_survive_coordinator_and_store_restart(
+    tmp_path,
+) -> None:
+    path = tmp_path / "sidebar-restart.db"
+    source = "claude:restart-source"
+    bridge = sidebar_bridge_id(source)
+    token = "restart-safe-opaque-token"
+    first_db = SessionDB(path)
+    first_store = SessionBridgeStore(
+        first_db,
+        sidebar_token_factory=lambda: token,
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    first_db.ensure_session(source, source="cli")
+    first_store.enqueue_sidebar_job(SidebarCandidate(
+        source_session_id=source,
+        provider=Provider.CLAUDE,
+        bridge_id=bridge,
+        title="[Claude] Restart source",
+        cwd="C:/source",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=10.0,
+    ))
+    verified = VerifiedSidebarThread(THREAD, source, bridge)
+    first = SessionBridgeCoordinator(
+        config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
+        store=first_store,
+        adapters={},
+        sidebar_verifier=FakeVerifier(verified),
+        clock=lambda: 100.0,
+    )
+    claim = (await first.claim_sidebar_jobs_for_delivery(now=100.0, limit=1))[0]
+    assert claim.lease_token == token
+    assert not hasattr(first, "_sidebar_claim_expectations")
+    first_db.close()
+
+    second_db = SessionDB(path)
+    second = SessionBridgeCoordinator(
+        config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
+        store=SessionBridgeStore(second_db),
+        adapters={},
+        sidebar_verifier=FakeVerifier(verified),
+        clock=lambda: 200.0,
+    )
+    committed = await second.commit_sidebar_job(
+        lease_token=token,
+        codex_thread_id=THREAD,
+    )
+    assert committed["state"] == "sidebar_visible"
+    second_db.close()
+
+    replay_db = SessionDB(path)
+    replay = SessionBridgeCoordinator(
+        config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
+        store=SessionBridgeStore(replay_db),
+        adapters={},
+        sidebar_verifier=FakeVerifier(verified),
+        clock=lambda: 201.0,
+    )
+    assert await replay.commit_sidebar_job(
+        lease_token=token,
+        codex_thread_id=THREAD,
+    ) == committed
+    replay_db.close()
+
+
+class ExpiringFailureStore(FakeSidebarStore):
+    def fail_sidebar_job(
+        self, *, lease_token: str, error_code: str, now: float
+    ) -> dict[str, Any]:
+        assert now >= 400.0
+        raise ValueError("sidebar lease has expired")
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failure_uses_fresh_clock_and_hides_expired_lease() -> None:
+    store = ExpiringFailureStore()
+    verifier = FakeVerifier(SidebarVerificationError("marker_conflict"))
+    coordinator = _coordinator(store, verifier, clock=lambda: 401.0)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()

@@ -93,21 +93,50 @@ class _ConflictingCodexBridgeMarkers(ValueError):
         super().__init__("Codex thread has conflicting bridge markers")
 
 
+class _CodexReadBudgetExceeded(RuntimeError):
+    pass
+
+
+class _SidebarReadOnlyInventory(Protocol):
+    def list_sidebar_inventory(
+        self, *, deadline: float | None, page_cap: int
+    ) -> list[CodexThreadSummary]: ...
+
+    def find_sidebar_thread(
+        self, thread_id: str, *, deadline: float | None, page_cap: int
+    ) -> CodexThreadSummary | None: ...
+
+    def read_sidebar_thread(
+        self, summary: CodexThreadSummary, *, deadline: float | None
+    ) -> SessionProjection: ...
+
+
 class SidebarThreadVerifier:
     """Authenticate native Codex sidebar threads through read-only inventory."""
 
+    _ZERO_INTERVAL_READ_BUDGET_SECONDS = 30.0
+
     def __init__(
         self,
-        source_adapter: CodexSourceAdapter,
+        source_adapter: _SidebarReadOnlyInventory,
         *,
         marker_secret: bytes,
         reconciliation_interval: float,
         poll_interval: float = 0.25,
+        inventory_page_cap: int = 50,
+        inventory_thread_cap: int = 250,
         monotonic=time.monotonic,
         sleep=time.sleep,
     ) -> None:
-        if not isinstance(source_adapter, CodexSourceAdapter):
-            raise TypeError("sidebar verifier requires a Codex source adapter")
+        if not all(
+            callable(getattr(source_adapter, name, None))
+            for name in (
+                "list_sidebar_inventory",
+                "find_sidebar_thread",
+                "read_sidebar_thread",
+            )
+        ):
+            raise TypeError("sidebar verifier requires a read-only Codex inventory")
         for label, value in (
             ("reconciliation interval", reconciliation_interval),
             ("poll interval", poll_interval),
@@ -119,24 +148,49 @@ class SidebarThreadVerifier:
                 or float(value) < 0
             ):
                 raise ValueError(f"{label} must be a non-negative finite number")
+        for label, value in (
+            ("inventory page cap", inventory_page_cap),
+            ("inventory thread cap", inventory_thread_cap),
+        ):
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{label} must be a positive integer")
         if not isinstance(marker_secret, bytes) or not marker_secret:
             raise ValueError("sidebar verifier marker secret is unavailable")
         self._source_adapter = source_adapter
         self._marker_secret = marker_secret
         self._reconciliation_interval = float(reconciliation_interval)
         self._poll_interval = float(poll_interval)
+        self._inventory_page_cap = inventory_page_cap
+        self._inventory_thread_cap = inventory_thread_cap
         self._monotonic = monotonic
         self._sleep = sleep
+        self._inventory_snapshot: tuple[
+            float,
+            tuple[SessionProjection, ...],
+        ] | None = None
 
     def verify_thread(
         self, *, thread_id: str, expected: BridgeMarkerPayload
     ) -> VerifiedSidebarThread:
         native_id = _required_sidebar_identity(thread_id, "Codex thread ID")
         expected = _validated_sidebar_marker_payload(expected)
-        deadline = self._monotonic() + self._reconciliation_interval
+        started = self._monotonic()
+        polling_enabled = self._reconciliation_interval > 0
+        deadline = started + (
+            self._reconciliation_interval
+            if polling_enabled
+            else self._ZERO_INTERVAL_READ_BUDGET_SECONDS
+        )
+        completed_zero_scan = False
         while True:
+            if completed_zero_scan and self._monotonic() >= deadline:
+                raise SidebarVerificationError("native_task_not_indexed")
             try:
-                summary = self._source_adapter.find_native_thread(native_id)
+                summary = self._source_adapter.find_sidebar_thread(
+                    native_id,
+                    deadline=deadline,
+                    page_cap=self._inventory_page_cap,
+                )
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
@@ -145,7 +199,10 @@ class SidebarThreadVerifier:
                 ) from None
             if summary is not None:
                 try:
-                    projection = self._source_adapter.project_thread(summary)
+                    projection = self._source_adapter.read_sidebar_thread(
+                        summary,
+                        deadline=deadline,
+                    )
                 except _ConflictingCodexBridgeMarkers:
                     raise SidebarVerificationError("marker_conflict") from None
                 except (KeyboardInterrupt, SystemExit):
@@ -164,8 +221,9 @@ class SidebarThreadVerifier:
                 )
                 assert verified is not None
                 return verified
+            completed_zero_scan = True
             now = self._monotonic()
-            if now >= deadline or self._poll_interval == 0:
+            if not polling_enabled or now >= deadline or self._poll_interval == 0:
                 raise SidebarVerificationError("native_task_not_indexed")
             self._sleep(min(self._poll_interval, deadline - now))
 
@@ -174,10 +232,7 @@ class SidebarThreadVerifier:
     ) -> VerifiedSidebarThread | None:
         expected = _validated_sidebar_marker_payload(expected)
         try:
-            summaries = [
-                *self._source_adapter.list_full_inventory(archived=False),
-                *self._source_adapter.list_full_inventory(archived=True),
-            ]
+            projections = self._cached_inventory_projections()
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -185,26 +240,7 @@ class SidebarThreadVerifier:
                 "bridge_temporarily_unavailable"
             ) from None
         matches: dict[str, VerifiedSidebarThread] = {}
-        for summary in summaries:
-            if summary.native_id in matches:
-                continue
-            try:
-                projection = self._source_adapter.project_thread(summary)
-            except _ConflictingCodexBridgeMarkers as exc:
-                if any(
-                    payload == expected
-                    or payload.source_session_id == expected.source_session_id
-                    or payload.bridge_id == expected.bridge_id
-                    for payload in exc.payloads
-                ):
-                    raise SidebarVerificationError("marker_conflict") from None
-                continue
-            except (KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                raise SidebarVerificationError(
-                    "bridge_temporarily_unavailable"
-                ) from None
+        for projection in projections:
             verified = _verified_sidebar_projection(
                 projection,
                 expected=expected,
@@ -217,15 +253,183 @@ class SidebarThreadVerifier:
             raise SidebarVerificationError("marker_conflict")
         return next(iter(matches.values()), None)
 
+    def _cached_inventory_projections(self) -> tuple[SessionProjection, ...]:
+        now = self._monotonic()
+        cached = self._inventory_snapshot
+        if cached is not None and now <= cached[0]:
+            return cached[1]
+        deadline = now + (
+            self._reconciliation_interval
+            if self._reconciliation_interval > 0
+            else self._ZERO_INTERVAL_READ_BUDGET_SECONDS
+        )
+        summaries = self._source_adapter.list_sidebar_inventory(
+            deadline=deadline,
+            page_cap=self._inventory_page_cap,
+        )
+        if len(summaries) > self._inventory_thread_cap:
+            raise _CodexReadBudgetExceeded("Codex sidebar thread cap exceeded")
+        projections: list[SessionProjection] = []
+        for summary in summaries:
+            try:
+                projection = self._source_adapter.read_sidebar_thread(
+                    summary,
+                    deadline=deadline,
+                )
+            except _ConflictingCodexBridgeMarkers as exc:
+                projection = _conflicting_marker_projection(
+                    summary,
+                    exc.payloads,
+                    marker_secret=self._marker_secret,
+                )
+            projections.append(projection)
+        result = tuple(projections)
+        self._inventory_snapshot = (
+            now + self._reconciliation_interval,
+            result,
+        )
+        return result
+
 
 class CodexSourceAdapter:
-    def __init__(self, client: _RequestClient, *, marker_secret: bytes) -> None:
+    def __init__(
+        self,
+        client: _RequestClient,
+        *,
+        marker_secret: bytes,
+        monotonic=time.monotonic,
+    ) -> None:
         self._client = client
         self._marker_secret = marker_secret
+        self._monotonic = monotonic
         self._initialized = False
         self._initialization_failed = False
         self._seen_inventory: dict[str, CodexThreadSummary] = {}
         self._inventory_cache: dict[str, CodexThreadSummary] = {}
+
+    def list_sidebar_inventory(
+        self, *, deadline: float | None, page_cap: int
+    ) -> list[CodexThreadSummary]:
+        self._ensure_initialized()
+        active, used = self._bounded_sidebar_inventory_kind(
+            archived=False,
+            deadline=deadline,
+            page_cap=page_cap,
+        )
+        archived, _ = self._bounded_sidebar_inventory_kind(
+            archived=True,
+            deadline=deadline,
+            page_cap=page_cap - used,
+        )
+        combined = {summary.native_id: summary for summary in (*active, *archived)}
+        return [combined[native_id] for native_id in sorted(combined)]
+
+    def find_sidebar_thread(
+        self, thread_id: str, *, deadline: float | None, page_cap: int
+    ) -> CodexThreadSummary | None:
+        wanted = _nonempty_string(thread_id)
+        if wanted is None:
+            return None
+        self._ensure_initialized()
+        active, used = self._bounded_sidebar_inventory_kind(
+            archived=False,
+            deadline=deadline,
+            page_cap=page_cap,
+        )
+        found = next((summary for summary in active if summary.native_id == wanted), None)
+        if found is not None:
+            return found
+        archived, _ = self._bounded_sidebar_inventory_kind(
+            archived=True,
+            deadline=deadline,
+            page_cap=page_cap - used,
+        )
+        return next(
+            (summary for summary in archived if summary.native_id == wanted),
+            None,
+        )
+
+    def read_sidebar_thread(
+        self, summary: CodexThreadSummary, *, deadline: float | None
+    ) -> SessionProjection:
+        response = self._bounded_sidebar_request(
+            "thread/read",
+            {"threadId": summary.native_id, "includeTurns": True},
+            deadline=deadline,
+        )
+        return self.project_thread(summary, response=response)
+
+    def _bounded_sidebar_inventory_kind(
+        self,
+        *,
+        archived: bool,
+        deadline: float | None,
+        page_cap: int,
+    ) -> tuple[list[CodexThreadSummary], int]:
+        if type(page_cap) is not int or page_cap <= 0:
+            raise _CodexReadBudgetExceeded("Codex sidebar page cap exceeded")
+        cursor: Any = None
+        seen_cursors: set[str] = set()
+        normalized: dict[str, CodexThreadSummary] = {}
+        conflicts: set[str] = set()
+        pages = 0
+        while True:
+            if pages >= page_cap:
+                raise _CodexReadBudgetExceeded("Codex sidebar page cap exceeded")
+            params: dict[str, Any] = {"archived": archived}
+            if cursor is not None:
+                params["cursor"] = cursor
+            response = self._bounded_sidebar_request(
+                "thread/list",
+                params,
+                deadline=deadline,
+            )
+            pages += 1
+            if not isinstance(response, dict):
+                raise ValueError("Codex thread/list response must be an object")
+            entries = _first(response, "data", "threads")
+            if not isinstance(entries, list):
+                raise ValueError("Codex thread/list response has no entries list")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    summary = _normalize_summary(entry, archived=archived)
+                except (TypeError, ValueError):
+                    continue
+                prior = normalized.get(summary.native_id)
+                if prior is None and summary.native_id not in conflicts:
+                    normalized[summary.native_id] = summary
+                elif prior != summary:
+                    normalized.pop(summary.native_id, None)
+                    conflicts.add(summary.native_id)
+            next_cursor = _first(response, "nextCursor", "next_cursor")
+            if next_cursor in (None, ""):
+                break
+            cursor_key = _canonical_json(next_cursor)
+            if cursor_key in seen_cursors:
+                raise ValueError("Codex thread/list returned a repeated cursor")
+            seen_cursors.add(cursor_key)
+            cursor = next_cursor
+        return [normalized[key] for key in sorted(normalized)], pages
+
+    def _bounded_sidebar_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        deadline: float | None,
+    ) -> dict[str, Any]:
+        timeout = _REQUEST_TIMEOUT
+        if deadline is not None:
+            remaining = deadline - float(self._monotonic())
+            if remaining <= 0:
+                raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
+            timeout = min(timeout, remaining)
+        response = self._client.request(method, params, timeout=timeout)
+        if deadline is not None and float(self._monotonic()) > deadline:
+            raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
+        return response
 
     def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
         self._ensure_initialized()
@@ -1079,6 +1283,34 @@ def _required_sidebar_identity(value: object, label: str) -> str:
     if any(character in value for character in "\r\n"):
         raise SidebarVerificationError("source_identity_mismatch")
     return value
+
+
+def _conflicting_marker_projection(
+    summary: CodexThreadSummary,
+    payloads: tuple[BridgeMarkerPayload, ...],
+    *,
+    marker_secret: bytes,
+) -> SessionProjection:
+    content = "\n".join(
+        encode_bridge_marker(payload, marker_secret) for payload in payloads
+    )
+    return SessionProjection(
+        provider=Provider.CODEX,
+        native_id=summary.native_id,
+        title=summary.title,
+        cwd=summary.cwd,
+        started_at=summary.started_at,
+        last_active=summary.last_active,
+        messages=(
+            ProjectedMessage(
+                native_event_id="sidebar-conflicting-markers",
+                ordinal=0,
+                role="user",
+                content=content,
+                timestamp=summary.started_at,
+            ),
+        ),
+    )
 
 
 def _validated_sidebar_marker_payload(
