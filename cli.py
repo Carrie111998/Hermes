@@ -7768,21 +7768,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     
     def show_tools(self):
         """Display available tools with kawaii ASCII art."""
-        # Prefer the live agent's actual tool list once one exists: it can
-        # diverge from the static config recomputation below after in-place
-        # mutations (e.g. llama.cpp/Ollama grammar-rejection recovery strips
-        # tools from agent.tools, or a toolless max-iterations fallback) --
-        # #56461's "the agent said no memory tool was available, despite
-        # /tools listing it" contradiction is exactly this: /tools was
-        # reporting static config, not what was actually in the request.
-        # Pre-assembly (no agent yet) /tools is a discovery/inspection
-        # surface, so the static list shows the full catalog including
-        # tools deferred behind the tool_search bridge.
-        if hasattr(self, "agent") and self.agent is not None and getattr(self.agent, "tools", None) is not None:
-            tools = self.agent.tools
-        else:
-            tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True,
-                                         skip_tool_search_assembly=True)
+        # /tools is a discovery/inspection surface, so it must show the full
+        # catalog including tools deferred behind the tool_search bridge
+        # (users check this to verify an MCP installed).
+        tools = get_tool_definitions(enabled_toolsets=self.enabled_toolsets, quiet_mode=True,
+                                     skip_tool_search_assembly=True)
 
         if not tools:
             print("(;_;) No tools available")
