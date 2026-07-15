@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 from pathlib import Path
 import shutil
@@ -704,6 +705,47 @@ def test_built_wheel_contains_the_sidebar_skill_assets(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        entry_points_name = next(
+            name for name in names if name.endswith(".dist-info/entry_points.txt")
+        )
+        entry_points = archive.read(entry_points_name).decode("utf-8")
+        extracted = tmp_path / "extracted-wheel"
+        archive.extractall(extracted)
 
     assert "session_bridge/assets/session-sidebar-sync/SKILL.md" in names
     assert "session_bridge/assets/session-sidebar-sync/agents/openai.yaml" in names
+    assert "session_bridge/entrypoint.py" in names
+    assert (
+        "hermes-session-bridge = session_bridge.entrypoint:main" in entry_points
+    )
+
+    codex_home = tmp_path / "wheel-codex-home"
+    environment = {
+        "CODEX_HOME": str(codex_home),
+        "PYTHONPATH": str(extracted),
+        "SYSTEMROOT": os.environ["SYSTEMROOT"],
+    }
+    installed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            "from session_bridge.entrypoint import main; raise SystemExit(main())",
+            "install-sidebar-skill",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert installed.returncode == 0, installed.stderr
+    assert json.loads(installed.stdout) == {
+        "status": "installed",
+        "path": str(codex_home / "skills" / "session-sidebar-sync"),
+    }
+    assert _installed_files(
+        codex_home / "skills" / "session-sidebar-sync"
+    ) == _installed_files(ASSET)
