@@ -2834,6 +2834,24 @@ def _token_factory(*tokens: str):
     return lambda: next(iterator)
 
 
+def _seed_sidebar_codex_target(
+    store: SessionBridgeStore,
+    candidate: SidebarCandidate,
+    thread_id: str,
+    *,
+    bridge_id: str | None = None,
+) -> str:
+    store.upsert_projection(_projection(
+        _message(f"target-{thread_id}", "Hermes Session Bridge placeholder"),
+        provider=Provider.CODEX,
+        native_id=thread_id,
+        last_active=150.0,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=bridge_id or candidate.bridge_id,
+    ))
+    return f"codex:{thread_id}"
+
+
 def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> None:
     store = SessionBridgeStore(db, clock=lambda: 125.0)
     candidate = _sidebar_candidate(db)
@@ -3047,6 +3065,137 @@ def test_sidebar_commit_requires_exact_unexpired_token_and_is_idempotent(db) -> 
     assert committed["completion_digest"] == hashlib.sha256(
         b"commit-token"
     ).hexdigest()
+
+
+def test_sidebar_atomic_lineage_commit_and_exact_replay_are_idempotent(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("atomic-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="atomic")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    thread_id = "44444444-4444-4444-8444-444444444444"
+    target_id = _seed_sidebar_codex_target(store, candidate, thread_id)
+
+    committed = store.commit_sidebar_job_with_lineage(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=candidate.bridge_id,
+        now=200.0,
+    )
+    replay = store.commit_sidebar_job_with_lineage(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=candidate.bridge_id,
+        now=201.0,
+    )
+
+    assert replay == committed
+    assert committed["state"] == SidebarJobState.VISIBLE.value
+    links = _rows(db, "SELECT * FROM session_links WHERE bridge_id = ?", (
+        candidate.bridge_id,
+    ))
+    assert len(links) == 1
+    assert links[0]["from_session_id"] == candidate.source_session_id
+    assert links[0]["to_session_id"] == target_id
+    assert links[0]["relation"] == Relation.MIRRORS.value
+
+
+@pytest.mark.parametrize("failure", ["wrong_token", "expired", "wrong_target"])
+def test_sidebar_atomic_lineage_commit_has_no_partial_state_on_validation_failure(
+    db,
+    failure: str,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("atomic-failure-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=f"atomic-{failure}")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    thread_id = f"atomic-{failure}-thread"
+    _seed_sidebar_codex_target(
+        store,
+        candidate,
+        thread_id,
+        bridge_id=("sidebar:wrong" if failure == "wrong_target" else None),
+    )
+
+    with pytest.raises(ValueError):
+        store.commit_sidebar_job_with_lineage(
+            lease_token=(
+                "wrong-token" if failure == "wrong_token" else lease["lease_token"]
+            ),
+            codex_thread_id=thread_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            now=400.0 if failure == "expired" else 200.0,
+        )
+
+    assert _rows(db, "SELECT * FROM session_links WHERE bridge_id = ?", (
+        candidate.bridge_id,
+    )) == []
+    job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert job is not None
+    assert job["state"] == (
+        SidebarJobState.RETRY.value
+        if failure == "expired"
+        else SidebarJobState.LEASED.value
+    )
+    assert job["codex_thread_id"] is None
+
+
+def test_sidebar_atomic_lineage_write_fault_rolls_back_job_and_link(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("atomic-link-fault-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="atomic-link-fault")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    thread_id = "atomic-link-fault-thread"
+    target_id = _seed_sidebar_codex_target(store, candidate, thread_id)
+    collision_id = "sidebar-link:" + hashlib.sha256(
+        f"{candidate.bridge_id}\0{candidate.source_session_id}\0{target_id}".encode()
+    ).hexdigest()
+    db.ensure_session("collision-source", source="cli")
+    db.ensure_session("collision-target", source="cli")
+    db._execute_write(lambda conn: conn.execute(
+        """INSERT INTO session_links (
+               id, from_session_id, to_session_id, relation, bridge_id, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            collision_id,
+            "collision-source",
+            "collision-target",
+            Relation.MIRRORS.value,
+            "collision-bridge",
+            1.0,
+        ),
+    ))
+
+    with pytest.raises(ValueError, match="collision"):
+        store.commit_sidebar_job_with_lineage(
+            lease_token=lease["lease_token"],
+            codex_thread_id=thread_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            now=200.0,
+        )
+
+    assert _rows(db, "SELECT * FROM session_links WHERE bridge_id = ?", (
+        candidate.bridge_id,
+    )) == []
+    job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert job is not None
+    assert job["state"] == SidebarJobState.LEASED.value
+    assert job["codex_thread_id"] is None
 
 
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:

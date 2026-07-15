@@ -1206,6 +1206,104 @@ class SessionBridgeStore:
             raise ValueError("sidebar lease has expired")
         return result
 
+    def commit_sidebar_job_with_lineage(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+        source_session_id: str,
+        bridge_id: str,
+        now: float,
+    ) -> dict[str, Any]:
+        """Atomically bind verified lineage and commit one sidebar lease."""
+
+        token_digest = _sidebar_lease_digest(lease_token)
+        thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
+        source_id = _exact_nonempty_text(
+            source_session_id, "sidebar source session ID"
+        )
+        normalized_bridge_id = _exact_nonempty_text(bridge_id, "sidebar bridge ID")
+        commit_time = _finite_number(now, "now")
+
+        def _write(conn):
+            job, matched_completion = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=True,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if (
+                job["source_session_id"] != source_id
+                or job["bridge_id"] != normalized_bridge_id
+            ):
+                raise ValueError("source_identity_mismatch")
+            if matched_completion:
+                if (
+                    job["state"] != SidebarJobState.VISIBLE.value
+                    or job["codex_thread_id"] != thread_id
+                ):
+                    raise ValueError("conflicting sidebar completion replay")
+                _ensure_sidebar_lineage_row(
+                    conn,
+                    source_session_id=source_id,
+                    bridge_id=normalized_bridge_id,
+                    codex_thread_id=thread_id,
+                    created_at=commit_time,
+                )
+                return dict(job), False
+            if job["state"] != SidebarJobState.LEASED.value:
+                raise ValueError("sidebar job is not leased")
+            if float(job["lease_expires_at"]) <= commit_time:
+                _recover_one_expired_sidebar_lease(conn, job, now=commit_time)
+                return dict(job), True
+            conflict = conn.execute(
+                """SELECT id FROM session_sidebar_jobs
+                   WHERE codex_thread_id = ? AND id != ?""",
+                (thread_id, job["id"]),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("conflicting Codex thread identity")
+            _ensure_sidebar_lineage_row(
+                conn,
+                source_session_id=source_id,
+                bridge_id=normalized_bridge_id,
+                codex_thread_id=thread_id,
+                created_at=commit_time,
+            )
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, completion_digest = lease_digest,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       codex_thread_id = ?, error_code = NULL,
+                       visible_at = ?, updated_at = ?
+                   WHERE id = ? AND state = ?""",
+                (
+                    SidebarJobState.VISIBLE.value,
+                    thread_id,
+                    commit_time,
+                    commit_time,
+                    job["id"],
+                    SidebarJobState.LEASED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar job commit")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        return result
+
     def lookup_sidebar_job_by_lease(self, lease_token: str) -> dict[str, Any]:
         token_digest = _sidebar_lease_digest(lease_token)
         with self.db._lock:
@@ -1634,49 +1732,12 @@ class SessionBridgeStore:
         thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
 
         def _write(conn):
-            target = conn.execute(
-                """SELECT e.session_id, e.origin_kind, e.origin_bridge_id
-                     FROM external_sessions AS e
-                    WHERE e.provider = ? AND e.native_id = ?""",
-                (Provider.CODEX.value, thread_id),
-            ).fetchone()
-            if target is None:
-                raise ValueError("native_task_not_indexed")
-            if (
-                target["origin_kind"] != OriginKind.BRIDGE_PLACEHOLDER.value
-                or target["origin_bridge_id"] != normalized_bridge_id
-            ):
-                raise ValueError("source_identity_mismatch")
-            conflicting = conn.execute(
-                """SELECT 1 FROM session_links
-                    WHERE bridge_id = ? AND (
-                        from_session_id != ? OR to_session_id != ?
-                        OR relation != ?
-                    ) LIMIT 1""",
-                (
-                    normalized_bridge_id,
-                    source_id,
-                    target["session_id"],
-                    Relation.MIRRORS.value,
-                ),
-            ).fetchone()
-            if conflicting is not None:
-                raise ValueError("source_identity_mismatch")
-            link_digest = hashlib.sha256(
-                f"{normalized_bridge_id}\0{source_id}\0{target['session_id']}".encode()
-            ).hexdigest()
-            return self._create_link_row(
+            return _ensure_sidebar_lineage_row(
                 conn,
-                SessionLink(
-                    id=f"sidebar-link:{link_digest}",
-                    from_session_id=source_id,
-                    to_session_id=target["session_id"],
-                    relation=Relation.MIRRORS,
-                    bridge_id=normalized_bridge_id,
-                    source_cursor=None,
-                    source_hash=None,
-                    created_at=float(self._clock()),
-                ),
+                source_session_id=source_id,
+                bridge_id=normalized_bridge_id,
+                codex_thread_id=thread_id,
+                created_at=float(self._clock()),
             )
 
         return self.db._execute_write(_write)
@@ -2746,6 +2807,77 @@ def _exact_nonempty_text(value: object, label: str) -> str:
 def _sidebar_lease_digest(lease_token: object) -> str:
     token = _exact_nonempty_text(lease_token, "sidebar lease token")
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _ensure_sidebar_lineage_row(
+    conn: Any,
+    *,
+    source_session_id: str,
+    bridge_id: str,
+    codex_thread_id: str,
+    created_at: float,
+) -> dict[str, Any]:
+    target = conn.execute(
+        """SELECT e.session_id, e.origin_kind, e.origin_bridge_id
+             FROM external_sessions AS e
+            WHERE e.provider = ? AND e.native_id = ?""",
+        (Provider.CODEX.value, codex_thread_id),
+    ).fetchone()
+    if target is None:
+        raise ValueError("native_task_not_indexed")
+    if (
+        target["origin_kind"] != OriginKind.BRIDGE_PLACEHOLDER.value
+        or target["origin_bridge_id"] != bridge_id
+    ):
+        raise ValueError("source_identity_mismatch")
+    conflicting = conn.execute(
+        """SELECT 1 FROM session_links
+            WHERE bridge_id = ? AND (
+                from_session_id != ? OR to_session_id != ? OR relation != ?
+            ) LIMIT 1""",
+        (
+            bridge_id,
+            source_session_id,
+            target["session_id"],
+            Relation.MIRRORS.value,
+        ),
+    ).fetchone()
+    if conflicting is not None:
+        raise ValueError("source_identity_mismatch")
+    link_digest = hashlib.sha256(
+        f"{bridge_id}\0{source_session_id}\0{target['session_id']}".encode()
+    ).hexdigest()
+    link_id = f"sidebar-link:{link_digest}"
+    conn.execute(
+        """INSERT OR IGNORE INTO session_links (
+               id, from_session_id, to_session_id, relation, bridge_id,
+               source_cursor, source_hash, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            link_id,
+            source_session_id,
+            target["session_id"],
+            Relation.MIRRORS.value,
+            bridge_id,
+            None,
+            None,
+            created_at,
+        ),
+    )
+    row = conn.execute(
+        """SELECT * FROM session_links
+           WHERE bridge_id = ? AND from_session_id = ?
+             AND to_session_id = ? AND relation = ?""",
+        (
+            bridge_id,
+            source_session_id,
+            target["session_id"],
+            Relation.MIRRORS.value,
+        ),
+    ).fetchone()
+    if row is None or row["id"] != link_id:
+        raise ValueError(f"link ID collision for {link_id!r}")
+    return dict(row)
 
 
 def _find_sidebar_job_by_digest(
