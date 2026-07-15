@@ -237,6 +237,58 @@ def _seed_sidebar_source(db: SessionDB) -> tuple[SessionBridgeStore, SidebarCand
     return store, candidate
 
 
+def _seed_claimed_sidebar_pair(
+    db: SessionDB,
+) -> tuple[SessionBridgeStore, tuple[SidebarDeliveryClaim, ...]]:
+    tokens = iter(("pair-lease-one", "pair-lease-two"))
+    now = time.time()
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidates: list[SidebarCandidate] = []
+    for ordinal in (1, 2):
+        projection = _projection(
+            Provider.CLAUDE,
+            f"pair-{ordinal}",
+            title=f"Pair {ordinal}",
+            cwd=f"C:/work/pair-{ordinal}",
+            timestamp=now - 100.0 + ordinal,
+            content=f"Fix pair request {ordinal}",
+        )
+        store.upsert_projection(projection)
+        source_id = f"claude:pair-{ordinal}"
+        candidate = SidebarCandidate(
+            source_session_id=source_id,
+            provider=Provider.CLAUDE,
+            bridge_id=sidebar_bridge_id(source_id),
+            title=f"[Claude] Pair {ordinal}",
+            cwd=f"C:/work/pair-{ordinal}",
+            git_root=None,
+            git_branch="main",
+            git_head=None,
+            worktree_id=None,
+            eligible_at=now - 100.0 + ordinal,
+        )
+        store.enqueue_sidebar_job(candidate)
+        candidates.append(candidate)
+    raw_claims = store.claim_sidebar_jobs(now=now, limit=2)
+    claims = tuple(
+        SidebarDeliveryClaim(
+            lease_token=raw["lease_token"],
+            source_session_id=raw["source_session_id"],
+            bridge_id=raw["bridge_id"],
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+        )
+        for raw in raw_claims
+    )
+    return store, claims
+
+
 class _FakeCoordinator:
     def __init__(self, *, bridge_id: str, source_id: str, target_id: str) -> None:
         self.bridge_id = bridge_id
@@ -838,6 +890,139 @@ def test_session_sidebar_pending_rejects_malformed_limits_without_leasing(
     assert coordinator.sidebar_claim_limits == []
 
 
+@pytest.mark.parametrize("failed_index", [0, 1])
+def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_claim(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_index: int,
+) -> None:
+    store, claims = _seed_claimed_sidebar_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=claims[0].bridge_id,
+        source_id=claims[0].source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = claims
+    original_get = store.get_sidebar_source_for_delivery
+    failed_source = claims[failed_index].source_session_id
+
+    def selective_get(source_session_id: str):
+        if source_session_id == failed_source:
+            raise ValueError("raw traceback token=must-not-leak")
+        return original_get(source_session_id)
+
+    monkeypatch.setattr(store, "get_sidebar_source_for_delivery", selective_get)
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 5})
+
+    good_claim = claims[1 - failed_index]
+    assert [job["lease_token"] for job in response["jobs"]] == [
+        good_claim.lease_token
+    ]
+    failed = store.get_sidebar_job_for_source(failed_source)
+    assert failed is not None
+    assert failed["state"] == "sidebar_failed"
+    assert failed["error_code"] == "source_identity_mismatch"
+
+
+def test_session_sidebar_pending_preflight_failures_never_claim(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    monkeypatch.setattr(
+        "session_bridge.mcp_server.resolve_marker_key",
+        lambda: (_ for _ in ()).throw(RuntimeError("marker secret")),
+    )
+    app = create_app(
+        catalog=UnifiedCatalog(db, store),
+        coordinator=coordinator,
+        store=store,
+        config=BridgeConfig(),
+        token=TOKEN,
+        marker_key=None,
+    )
+    with _test_client(app) as client:
+        marker_failure = _rpc(
+            client,
+            "tools/call",
+            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            request_id=43,
+        )
+    assert marker_failure["result"]["isError"] is True
+    assert coordinator.sidebar_claim_limits == []
+
+    monkeypatch.setattr(
+        store,
+        "record_sidebar_broker_heartbeat",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("heartbeat secret")),
+    )
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        heartbeat_failure = _rpc(
+            client,
+            "tools/call",
+            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            request_id=44,
+        )
+    assert heartbeat_failure["result"]["isError"] is True
+    assert coordinator.sidebar_claim_limits == []
+
+
+def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, claims = _seed_claimed_sidebar_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=claims[0].bridge_id,
+        source_id=claims[0].source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = claims
+    original_get = store.get_sidebar_source_for_delivery
+    original_fail = store.fail_sidebar_job
+
+    def fail_second_source(source_session_id: str):
+        if source_session_id == claims[1].source_session_id:
+            raise RuntimeError("traceback marker=must-not-leak")
+        return original_get(source_session_id)
+
+    cleanup_calls = 0
+
+    def flaky_cleanup(**kwargs: Any):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise RuntimeError("lease token " + claims[1].lease_token)
+        return original_fail(**kwargs)
+
+    monkeypatch.setattr(store, "get_sidebar_source_for_delivery", fail_second_source)
+    monkeypatch.setattr(store, "fail_sidebar_job", flaky_cleanup)
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            request_id=45,
+        )
+
+    serialized = json.dumps(payload)
+    assert payload["result"]["isError"] is True
+    assert "sidebar_pending_failed" in serialized
+    assert "must-not-leak" not in serialized
+    assert all(claim.lease_token not in serialized for claim in claims)
+    assert all(
+        store.get_sidebar_job_for_source(claim.source_session_id)["state"]
+        != "sidebar_leased"
+        for claim in claims
+    )
+
+
 def test_session_sidebar_commit_has_two_argument_schema_and_is_idempotent(
     db: SessionDB,
 ) -> None:
@@ -998,6 +1183,90 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "p95": None,
         "p99": None,
     }
+
+
+def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Hostile:
+        def __str__(self) -> str:
+            raise AssertionError("status sanitizer must never stringify unknown objects")
+
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.health = lambda: {
+        "running": True,
+        "watcher_state": "running",
+        "recent_error_codes": ["provider_refresh_failed", Hostile()],
+        "last_error": "token=hidden-in-safe-looking-field",
+        "nested": {
+            "traceback": "Traceback: marker=hidden",
+            "exception": Hostile(),
+        },
+        "providers": {
+            "claude": {
+                "last_success": 900.0,
+                "lag_seconds": 100.0,
+                "degraded_reason": None,
+                "diagnostic": "lease=hidden",
+            }
+        },
+    }
+    catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr(
+        catalog,
+        "status",
+        lambda: {
+            "providers": {
+                "claude": {
+                    "sessions": 1,
+                    "degraded": 0,
+                    "raw_error": "token=hidden",
+                },
+                "attacker": {"sessions": 99, "degraded": 0},
+            },
+            "total_sessions": 1,
+            "traceback": Hostile(),
+        },
+    )
+    app = create_app(
+        catalog=catalog,
+        coordinator=coordinator,
+        store=store,
+        config=BridgeConfig(),
+        token=TOKEN,
+        marker_key=MARKER_KEY,
+    )
+
+    with _test_client(app) as client:
+        status = _call_tool(client, "session_status", {})
+
+    assert set(status) == {"health", "catalog", "sidebar"}
+    assert status["health"] == {
+        "running": True,
+        "providers": {
+            "claude": {
+                "last_success": 900.0,
+                "lag_seconds": 100.0,
+                "degraded_reason": None,
+            }
+        },
+        "watcher_state": "running",
+        "recent_error_codes": ["provider_refresh_failed"],
+    }
+    assert status["catalog"] == {
+        "providers": {"claude": {"sessions": 1, "degraded": 0}},
+        "total_sessions": 1,
+    }
+    serialized = json.dumps(status)
+    assert "hidden" not in serialized
+    assert "traceback" not in serialized.casefold()
+    assert "last_error" not in serialized
 
 
 class _McpSidebarVerifier:

@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import subprocess
@@ -22,7 +24,13 @@ from .catalog import UnifiedCatalog
 from .config import BridgeConfig
 from .coordinator import ContinueRequest, ContinueResult
 from .mirror import MirrorPolicy, enqueue_mirror_job
-from .models import BridgeMarkerPayload, Provider, encode_bridge_marker
+from .models import (
+    BridgeMarkerPayload,
+    MirrorJobState,
+    Provider,
+    SidebarJobState,
+    encode_bridge_marker,
+)
 from .sidebar import (
     SidebarCandidate,
     build_registration_prompt,
@@ -52,20 +60,7 @@ _MIN_MARKER_KEY_BYTES = 32
 _MAX_MARKER_KEY_BYTES = 4096
 _MAX_CONTEXT_BUDGET = 100_000
 _DEFAULT_CONTEXT_BUDGET = 24_000
-_SENSITIVE_STATUS_KEYS = frozenset(
-    {
-        "authorization",
-        "credential",
-        "error_detail",
-        "native_path",
-        "password",
-        "payload",
-        "secret",
-        "source_cursor",
-        "source_hash",
-        "token",
-    }
-)
+_FIXED_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 def resolve_bearer_token(
@@ -372,13 +367,7 @@ def create_app(
         sidebar_status["last_visible_task_id"] = _redacted_task_id(
             sidebar_status.get("last_visible_task_id")
         )
-        return _sanitize_status(
-            {
-                "health": health,
-                "catalog": catalog_status,
-                "sidebar": sidebar_status,
-            }
-        )
+        return _status_payload(health, catalog_status, sidebar_status)
 
     @mcp.tool()
     async def session_sidebar_pending(limit: Any = 5) -> dict[str, Any]:
@@ -390,74 +379,47 @@ def create_app(
         claim_method = getattr(coordinator, "claim_sidebar_jobs_for_delivery", None)
         if not callable(claim_method):
             raise RuntimeError("sidebar_pending_unavailable")
+        claimed_tokens: list[str] = []
         try:
-            claims = await claim_method(limit=bounded_limit)
-            if not isinstance(claims, tuple) or len(claims) > bounded_limit:
-                raise ValueError("malformed sidebar claims")
             secret = marker_key
             if secret is None:
                 secret = await asyncio.to_thread(resolve_marker_key)
-            jobs: list[dict[str, Any]] = []
-            for claim in claims:
-                source = await asyncio.to_thread(
-                    store.get_sidebar_source_for_delivery,
-                    claim.source_session_id,
-                )
-                first_request = _first_sidebar_request(source.projection)
-                candidate = SidebarCandidate(
-                    source_session_id=source.source_session_id,
-                    provider=source.projection.provider,
-                    bridge_id=claim.bridge_id,
-                    title=sidebar_title(
-                        source.projection.provider,
-                        source.projection.title,
-                        first_request,
-                    ),
-                    cwd=_required_sidebar_cwd(source.projection.cwd),
-                    git_root=source.git_root,
-                    git_branch=source.projection.git_branch,
-                    git_head=source.git_head,
-                    worktree_id=source.worktree_id,
-                    eligible_at=source.projection.last_active,
-                )
-                marker = encode_bridge_marker(
-                    BridgeMarkerPayload(
-                        bridge_id=claim.bridge_id,
-                        source_session_id=claim.source_session_id,
-                        target_provider=Provider.CODEX,
-                        policy_generation=1,
-                    ),
-                    secret,
-                )
-                recovered = claim.recovered_thread
-                jobs.append(
-                    {
-                        "lease_token": claim.lease_token,
-                        "registration_prompt": build_registration_prompt(
-                            candidate, marker
-                        ),
-                        "title": candidate.title,
-                        "provider": candidate.provider.value,
-                        "cwd": candidate.cwd,
-                        "git_root": candidate.git_root,
-                        "git_branch": candidate.git_branch,
-                        "git_head": candidate.git_head,
-                        "worktree_id": candidate.worktree_id,
-                        "reconcile_required": claim.reconcile_required,
-                        "rename_required": claim.rename_required,
-                        "recovered_thread_id": (
-                            recovered.thread_id if recovered is not None else None
-                        ),
-                    }
-                )
             await asyncio.to_thread(
                 store.record_sidebar_broker_heartbeat,
                 now=time.time(),
             )
+            claims = await claim_method(limit=bounded_limit)
+            if not isinstance(claims, tuple) or len(claims) > bounded_limit:
+                raise ValueError("malformed sidebar claims")
+            jobs: list[dict[str, Any]] = []
+            for claim in claims:
+                token_text = _exact_sidebar_text(
+                    getattr(claim, "lease_token", None), "lease token"
+                )
+                claimed_tokens.append(token_text)
+                try:
+                    job = await asyncio.to_thread(
+                        _build_sidebar_broker_job,
+                        store,
+                        claim,
+                        secret,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    await _settle_sidebar_claim(
+                        store,
+                        token_text,
+                        "source_identity_mismatch",
+                    )
+                    continue
+                jobs.append(job)
             return {"jobs": jobs}
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            await _rollback_sidebar_claims(store, claimed_tokens)
             raise
         except Exception:
+            await _rollback_sidebar_claims(store, claimed_tokens)
             raise ValueError("sidebar_pending_failed") from None
 
     @mcp.tool()
@@ -749,31 +711,217 @@ def _mirror_policy(config: BridgeConfig) -> MirrorPolicy:
     )
 
 
-def _sanitize_status(value: Any) -> Any:
+def _status_payload(
+    raw_health: object,
+    raw_catalog: object,
+    raw_sidebar: object,
+) -> dict[str, Any]:
+    return {
+        "health": _health_status(raw_health),
+        "catalog": _catalog_status(raw_catalog),
+        "sidebar": _sidebar_status(raw_sidebar),
+    }
+
+
+def _status_mapping(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
-        return {
-            str(key): _sanitize_status(item)
-            for key, item in value.items()
-            if not _sensitive_status_key(str(key))
+        return cast(Mapping[str, Any], value)
+    return {}
+
+
+def _health_status(value: object) -> dict[str, Any]:
+    source = _status_mapping(value)
+    result: dict[str, Any] = {}
+    if type(source.get("running")) is bool:
+        result["running"] = source["running"]
+    providers = source.get("providers")
+    if isinstance(providers, Mapping):
+        provider_map = cast(Mapping[str, Any], providers)
+        shaped_providers: dict[str, Any] = {}
+        for provider in (Provider.CLAUDE.value, Provider.CODEX.value):
+            raw_provider = provider_map.get(provider)
+            if not isinstance(raw_provider, Mapping):
+                continue
+            raw_provider = cast(Mapping[str, Any], raw_provider)
+            shaped: dict[str, Any] = {}
+            for field in ("last_success", "lag_seconds"):
+                number = _finite_status_number(raw_provider.get(field))
+                if number is not None or raw_provider.get(field) is None:
+                    shaped[field] = number
+            reason = raw_provider.get("degraded_reason")
+            if reason is None or _fixed_status_code(reason) is not None:
+                shaped["degraded_reason"] = reason
+            shaped_providers[provider] = shaped
+        if shaped_providers:
+            result["providers"] = shaped_providers
+    watcher_state = source.get("watcher_state")
+    if type(watcher_state) is str and watcher_state in {
+        "not_started",
+        "running",
+        "stopped",
+        "degraded",
+    }:
+        result["watcher_state"] = watcher_state
+    watcher_error = _fixed_status_code(source.get("watcher_error_code"))
+    if watcher_error is not None or source.get("watcher_error_code") is None:
+        if "watcher_error_code" in source:
+            result["watcher_error_code"] = watcher_error
+    queue_counts = source.get("queue_counts")
+    if isinstance(queue_counts, Mapping):
+        queue_counts = cast(Mapping[str, Any], queue_counts)
+        result["queue_counts"] = {
+            state.value: _nonnegative_status_int(queue_counts.get(state.value), 0)
+            for state in MirrorJobState
         }
-    if isinstance(value, (list, tuple)):
-        return [_sanitize_status(item) for item in value]
-    if hasattr(value, "__dataclass_fields__"):
-        return _sanitize_status(asdict(value))
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    mirror_mode = source.get("mirror_mode")
+    if type(mirror_mode) is str and mirror_mode in {"automatic", "manual"}:
+        result["mirror_mode"] = mirror_mode
+    backfill = source.get("backfill_progress")
+    if isinstance(backfill, Mapping):
+        backfill = cast(Mapping[str, Any], backfill)
+        shaped_backfill: dict[str, Any] = {}
+        for provider in (Provider.CLAUDE.value, Provider.CODEX.value):
+            progress = backfill.get(provider)
+            if not isinstance(progress, Mapping):
+                continue
+            progress = cast(Mapping[str, Any], progress)
+            shaped_progress = {
+                field: _nonnegative_status_int(progress.get(field), 0)
+                for field in ("version", "indexed_total", "remaining")
+            }
+            native_id = progress.get("last_committed_native_id")
+            if (
+                type(native_id) is str
+                and 0 < len(native_id) <= 512
+                and native_id == native_id.strip()
+                and "\n" not in native_id
+                and "\r" not in native_id
+            ):
+                shaped_progress["last_committed_native_id"] = native_id
+            shaped_backfill[provider] = shaped_progress
+        result["backfill_progress"] = shaped_backfill
+    fallback = source.get("registration_turn_fallback")
+    if fallback is None or type(fallback) is bool:
+        if "registration_turn_fallback" in source:
+            result["registration_turn_fallback"] = fallback
+    registration = source.get("sidebar_registration_counts")
+    if isinstance(registration, Mapping):
+        registration = cast(Mapping[str, Any], registration)
+        result["sidebar_registration_counts"] = {
+            field: _nonnegative_status_int(registration.get(field), 0)
+            for field in ("examined", "queued", "claude", "hermes", "failed")
+        }
+    if "provider_calls_inflight" in source:
+        result["provider_calls_inflight"] = _nonnegative_status_int(
+            source.get("provider_calls_inflight"), 0
+        )
+    errors = source.get("recent_error_codes")
+    if isinstance(errors, (list, tuple)):
+        result["recent_error_codes"] = _fixed_status_codes(errors)
+    return result
+
+
+def _catalog_status(value: object) -> dict[str, Any]:
+    source = _status_mapping(value)
+    providers = source.get("providers")
+    shaped_providers: dict[str, dict[str, int]] = {}
+    if isinstance(providers, Mapping):
+        providers = cast(Mapping[str, Any], providers)
+        for provider in (
+            Provider.CLAUDE.value,
+            Provider.CODEX.value,
+            Provider.HERMES.value,
+        ):
+            raw_provider = providers.get(provider)
+            if not isinstance(raw_provider, Mapping):
+                continue
+            raw_provider = cast(Mapping[str, Any], raw_provider)
+            shaped_providers[provider] = {
+                "sessions": _nonnegative_status_int(
+                    raw_provider.get("sessions"), 0
+                ),
+                "degraded": _nonnegative_status_int(
+                    raw_provider.get("degraded"), 0
+                ),
+            }
+    return {
+        "providers": shaped_providers,
+        "total_sessions": _nonnegative_status_int(source.get("total_sessions"), 0),
+    }
+
+
+def _sidebar_status(value: object) -> dict[str, Any]:
+    source = _status_mapping(value)
+    providers = source.get("eligible_by_provider")
+    provider_counts = _status_mapping(providers)
+    counts = source.get("counts")
+    state_counts = _status_mapping(counts)
+    latencies = source.get("delivery_latency_seconds")
+    latency_values = _status_mapping(latencies)
+    task_id = source.get("last_visible_task_id")
+    if type(task_id) is not str or (
+        task_id != "[REDACTED]"
+        and re.fullmatch(r"[0-9A-Fa-f]{8}\.\.\.[0-9A-Fa-f]{4}", task_id) is None
+    ):
+        task_id = None
+    recent = source.get("recent_error_codes")
+    return {
+        "eligible_by_provider": {
+            provider: _nonnegative_status_int(provider_counts.get(provider), 0)
+            for provider in (Provider.CLAUDE.value, Provider.HERMES.value)
+        },
+        "counts": {
+            state.value: _nonnegative_status_int(state_counts.get(state.value), 0)
+            for state in SidebarJobState
+        },
+        "oldest_pending_age_seconds": _finite_status_number(
+            source.get("oldest_pending_age_seconds")
+        ),
+        "last_heartbeat_at": _finite_status_number(source.get("last_heartbeat_at")),
+        "last_visible_task_id": task_id,
+        "recent_error_codes": (
+            _fixed_status_codes(recent)
+            if isinstance(recent, (list, tuple))
+            else []
+        ),
+        "delivery_latency_seconds": {
+            percentile: _finite_status_number(latency_values.get(percentile))
+            for percentile in ("p50", "p95", "p99")
+        },
+    }
+
+
+def _finite_status_number(value: object) -> float | None:
+    if type(value) is int:
+        number = float(cast(int, value))
+    elif type(value) is float:
+        number = cast(float, value)
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _nonnegative_status_int(value: object, default: int) -> int:
+    if type(value) is int and value >= 0:
         return value
-    return str(value)
+    return default
 
 
-def _sensitive_status_key(key: str) -> bool:
-    normalized = key.casefold()
-    return (
-        normalized in _SENSITIVE_STATUS_KEYS
-        or normalized.endswith("_token")
-        or normalized.startswith("lease_")
-        or "marker" in normalized
-        or normalized.endswith("_digest")
-    )
+def _fixed_status_code(value: object) -> str | None:
+    if type(value) is str and _FIXED_CODE.fullmatch(value):
+        return value
+    return None
+
+
+def _fixed_status_codes(values: tuple[Any, ...] | list[Any]) -> list[str]:
+    result: list[str] = []
+    for value in values[:10]:
+        code = _fixed_status_code(value)
+        if code is not None and code not in result:
+            result.append(code)
+    return result
 
 
 def _redacted_task_id(value: object) -> str | None:
@@ -781,7 +929,7 @@ def _redacted_task_id(value: object) -> str | None:
         return None
     if len(value) <= 12:
         return "[REDACTED]"
-    return f"{value[:8]}…{value[-4:]}"
+    return f"{value[:8]}...{value[-4:]}"
 
 
 def _is_mcp_path(path: str) -> bool:
@@ -840,6 +988,104 @@ def _first_sidebar_request(projection: Any) -> str:
             assert isinstance(message.content, str)
             return message.content
     raise ValueError("sidebar source has no meaningful user request")
+
+
+def _build_sidebar_broker_job(
+    store: SessionBridgeStore,
+    claim: object,
+    marker_key: bytes,
+) -> dict[str, Any]:
+    lease_token = _exact_sidebar_text(
+        getattr(claim, "lease_token", None), "lease token"
+    )
+    source_session_id = _exact_sidebar_text(
+        getattr(claim, "source_session_id", None), "source session ID"
+    )
+    bridge_id = _exact_sidebar_text(
+        getattr(claim, "bridge_id", None), "bridge ID"
+    )
+    reconcile_required = getattr(claim, "reconcile_required", None)
+    rename_required = getattr(claim, "rename_required", None)
+    if type(reconcile_required) is not bool or type(rename_required) is not bool:
+        raise ValueError("sidebar claim flags are malformed")
+    source = store.get_sidebar_source_for_delivery(source_session_id)
+    first_request = _first_sidebar_request(source.projection)
+    candidate = SidebarCandidate(
+        source_session_id=source.source_session_id,
+        provider=source.projection.provider,
+        bridge_id=bridge_id,
+        title=sidebar_title(
+            source.projection.provider,
+            source.projection.title,
+            first_request,
+        ),
+        cwd=_required_sidebar_cwd(source.projection.cwd),
+        git_root=source.git_root,
+        git_branch=source.projection.git_branch,
+        git_head=source.git_head,
+        worktree_id=source.worktree_id,
+        eligible_at=source.projection.last_active,
+    )
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id=source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_key,
+    )
+    recovered = getattr(claim, "recovered_thread", None)
+    recovered_thread_id = None
+    if recovered is not None:
+        recovered_thread_id = _exact_sidebar_text(
+            getattr(recovered, "thread_id", None), "recovered thread ID"
+        )
+        if (
+            getattr(recovered, "source_session_id", None) != source_session_id
+            or getattr(recovered, "bridge_id", None) != bridge_id
+        ):
+            raise ValueError("recovered sidebar identity is malformed")
+    return {
+        "lease_token": lease_token,
+        "registration_prompt": build_registration_prompt(candidate, marker),
+        "title": candidate.title,
+        "provider": candidate.provider.value,
+        "cwd": candidate.cwd,
+        "git_root": candidate.git_root,
+        "git_branch": candidate.git_branch,
+        "git_head": candidate.git_head,
+        "worktree_id": candidate.worktree_id,
+        "reconcile_required": reconcile_required,
+        "rename_required": rename_required,
+        "recovered_thread_id": recovered_thread_id,
+    }
+
+
+async def _settle_sidebar_claim(
+    store: SessionBridgeStore,
+    lease_token: str,
+    error_code: str,
+) -> None:
+    await asyncio.to_thread(
+        store.fail_sidebar_job,
+        lease_token=lease_token,
+        error_code=error_code,
+        now=time.time(),
+    )
+
+
+async def _rollback_sidebar_claims(
+    store: SessionBridgeStore,
+    lease_tokens: list[str],
+) -> None:
+    for lease_token in dict.fromkeys(lease_tokens):
+        try:
+            await _settle_sidebar_claim(store, lease_token, "broker_time_budget")
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            continue
 
 
 __all__ = [
