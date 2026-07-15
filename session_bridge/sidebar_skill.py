@@ -1,3 +1,13 @@
+"""Install the sidebar skill with portable cooperative filesystem hardening.
+
+The redirect and identity checks protect pre-existing redirects, accidental path
+changes, and cooperative concurrent installers. They are not a security boundary
+against a malicious process running as the same OS user: such a process can swap a
+path between filesystem syscalls and can modify the installed skill afterward.
+CODEX_HOME and every parent directory must therefore be user-owned and not writable
+by other principals.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
@@ -75,13 +85,19 @@ def install_sidebar_skill(codex_home: Path | str | None = None) -> Path:
                 _guarded_replace(destination, backup, identity)
             try:
                 _guarded_replace(staging, destination, identity)
-            except BaseException:
+            except BaseException as promotion_error:
                 try:
                     identity.revalidate()
                 except PermissionError:
                     raise
                 if backup is not None and not destination.exists():
-                    _guarded_replace(backup, destination, identity)
+                    try:
+                        _guarded_replace(backup, destination, identity)
+                    except BaseException as restore_error:
+                        raise BaseExceptionGroup(
+                            "sidebar skill promotion and backup restoration both failed",
+                            [promotion_error, restore_error],
+                        ) from None
                 raise
             return destination
         except BaseException as operation_error:
@@ -341,9 +357,11 @@ def _filesystem_install_lock(skills: Path) -> Iterator[None]:
             time.sleep(0.05)
         yield
     finally:
-        if locked:
-            _unlock_descriptor(descriptor)
-        descriptor.close()
+        try:
+            if locked:
+                _unlock_descriptor(descriptor)
+        finally:
+            descriptor.close()
 
 
 def _open_lock_descriptor(path: Path):

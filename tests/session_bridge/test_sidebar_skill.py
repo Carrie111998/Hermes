@@ -208,7 +208,7 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
         '"hostId":"<candidate hostId>","turnLimit":20,'
         '"includeOutputs":false})`'
     ) in skill
-    assert "Omit `hostId` only when the candidate has none" in skill
+    assert "Omit `hostId` only when it was absent or null" in skill
     assert "Pass no other fields" in skill
     assert '`read_thread({"threadId":"<candidate threadId>",...})`' not in skill
     assert "Before matching the signed marker" in skill
@@ -247,6 +247,60 @@ def test_sidebar_skill_deterministically_settles_native_and_broker_failures() ->
         assert rule in skill
     assert "Never retry create after any ambiguous create outcome" in skill
     assert "Never create a replacement after commit ambiguity" in skill
+
+
+def test_sidebar_skill_verification_requires_exactly_one_settlement_attempt() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    verification = skill.split("\n## Verification\n", 1)[1]
+
+    assert (
+        "every noncommitted lease had exactly one fail/release attempt with a "
+        "fixed code, whether successful, failed, or ambiguous"
+    ) in verification
+    assert "every other lease was failed/released" not in verification
+    assert "at most one" not in verification
+
+
+def test_sidebar_skill_normalizes_only_current_local_host_identity() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    project_step = skill.split("\n2. ", 1)[1].split("\n3. ", 1)[0]
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+
+    assert "(`projectId`, original returned `hostId`, normalized host)" in project_step
+    assert (
+        "missing or null `hostId` and the explicit string `local`"
+        in project_step
+    )
+    assert "current-local sentinel `local`" in project_step
+    assert "Reject every other explicit host value" in project_step
+    assert "never infer or coerce an arbitrary host string" in project_step
+    assert "Apply the same host normalization to every thread candidate" in reconcile_step
+    assert "normalized host is `local`" in reconcile_step
+    assert "equals the chosen project's normalized host" in reconcile_step
+    assert "original candidate `hostId`" in reconcile_step
+    assert "Omit `hostId` only when it was absent or null" in reconcile_step
+    assert "remote marker collision" in reconcile_step
+
+
+def test_sidebar_skill_filters_explicit_remote_candidate_before_read() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+
+    filter_rule = (
+        "Normalize and filter each `list_threads` candidate summary before any "
+        "`read_thread` call"
+    )
+    read_schema = (
+        '`read_thread({"threadId":"<candidate threadId>",'
+        '"hostId":"<candidate hostId>"'
+    )
+    assert filter_rule in reconcile_step
+    assert reconcile_step.index(filter_rule) < reconcile_step.index(read_schema)
+    assert "explicit non-`local` host maps to `codex_thread_conflict` without a read" in (
+        reconcile_step
+    )
+    assert "only when that summary supplies project identity" in reconcile_step
+    assert "do not invent a missing project field" in reconcile_step
 
 
 def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
@@ -343,7 +397,19 @@ def test_install_sidebar_skill_copy_failure_preserves_existing_tree(
     assert not list((codex_home / "skills").glob(".session-sidebar-sync.install-*"))
 
 
-def test_install_sidebar_skill_rejects_staging_redirect_before_any_outside_write(
+def test_installer_documents_portable_filesystem_threat_boundary() -> None:
+    from session_bridge import sidebar_skill
+
+    documentation = " ".join((sidebar_skill.__doc__ or "").split())
+
+    assert "not a security boundary" in documentation
+    assert "malicious process running as the same OS user" in documentation
+    assert "between filesystem syscalls" in documentation
+    assert "modify the installed skill afterward" in documentation
+    assert "user-owned and not writable by other principals" in documentation
+
+
+def test_install_sidebar_skill_rejects_observed_staging_redirect_before_copy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from session_bridge import sidebar_skill
@@ -451,6 +517,78 @@ def test_install_sidebar_skill_reports_operation_and_cleanup_failures(
 
     messages = {str(error) for error in captured.value.exceptions}
     assert messages == {"copy denied", "cleanup denied"}
+
+
+def test_install_sidebar_skill_preserves_promotion_and_restore_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import sidebar_skill
+
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = skills / "session-sidebar-sync"
+    destination.mkdir(parents=True)
+    (destination / "old.txt").write_text("preserve", encoding="utf-8")
+    real_guarded_replace = sidebar_skill._guarded_replace
+
+    def fail_promotion_and_restore(
+        source: Path, target: Path, identity: object
+    ) -> None:
+        if source == destination:
+            real_guarded_replace(source, target, identity)
+            return
+        if source.name.startswith(".session-sidebar-sync.install-"):
+            raise OSError("promotion failed")
+        if source.name.startswith("session-sidebar-sync.backup"):
+            raise PermissionError("restore failed")
+        real_guarded_replace(source, target, identity)
+
+    monkeypatch.setattr(
+        sidebar_skill, "_guarded_replace", fail_promotion_and_restore
+    )
+
+    with pytest.raises(BaseExceptionGroup) as captured:
+        sidebar_skill.install_sidebar_skill(codex_home)
+
+    assert {str(error) for error in captured.value.exceptions} == {
+        "promotion failed",
+        "restore failed",
+    }
+    assert not destination.exists()
+    backup = next(skills.glob("session-sidebar-sync.backup*"))
+    assert (backup / "old.txt").read_text(encoding="utf-8") == "preserve"
+
+
+def test_filesystem_lock_closes_descriptor_when_unlock_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from session_bridge import sidebar_skill
+
+    class TrackedStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    tracked = TrackedStream()
+    monkeypatch.setattr(
+        sidebar_skill, "_open_lock_descriptor", lambda _path: tracked
+    )
+    monkeypatch.setattr(
+        sidebar_skill, "_try_lock_descriptor", lambda _descriptor: True
+    )
+    monkeypatch.setattr(
+        sidebar_skill,
+        "_unlock_descriptor",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("unlock failed")),
+    )
+
+    with pytest.raises(OSError, match="unlock failed"):
+        with sidebar_skill._filesystem_install_lock(tmp_path):
+            pass
+
+    assert tracked.closed is True
 
 
 def test_install_sidebar_skill_refuses_redirected_destination(
