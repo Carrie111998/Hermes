@@ -5,15 +5,17 @@ import { useEffect, useState } from 'react'
 import { LanguageSwitcher } from '@/components/language-switcher'
 import { Button } from '@/components/ui/button'
 import { SegmentedControl } from '@/components/ui/segmented-control'
+import { Switch } from '@/components/ui/switch'
 import type { DesktopMarketplaceSearchItem } from '@/global'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { Check, Download, Loader2, Palette, Trash2 } from '@/lib/icons'
+import { Check, Download, FolderOpen, Loader2, Palette, Trash2 } from '@/lib/icons'
 import { selectableCardClass } from '@/lib/selectable-card'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
+import { $showHiddenFiles, setShowHiddenFiles } from '@/store/file-browser'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
 import { $toolViewMode, setToolViewMode } from '@/store/tool-view'
@@ -253,6 +255,7 @@ export function AppearanceSettings() {
   const translucency = useStore($translucency)
   const reactionsEnabled = useStore($reactionsEnabled)
   const backdrop = useStore($backdrop)
+  const showHiddenFiles = useStore($showHiddenFiles)
   const installs = useStore($marketplaceInstalls)
   const profiles = useStore($profiles)
   const activeProfileKey = normalizeProfileKey(useStore($activeGatewayProfile))
@@ -536,6 +539,25 @@ export function AppearanceSettings() {
             title={a.embedsTitle}
           />
         </div>
+      </div>
+
+      <div className="mt-6">
+        <SectionHeading icon={FolderOpen} title={a.fileBrowserTitle} />
+        <ListRow
+          action={
+            <Switch
+              aria-label={a.showHiddenFilesTitle}
+              checked={showHiddenFiles}
+              onCheckedChange={show => {
+                triggerHaptic('selection')
+                setShowHiddenFiles(show)
+              }}
+              size="xs"
+            />
+          }
+          description={a.showHiddenFilesDesc}
+          title={a.showHiddenFilesTitle}
+        />
       </div>
 
       <div className="mt-6">
