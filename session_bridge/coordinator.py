@@ -44,7 +44,7 @@ from .sidebar import (
     sidebar_bridge_id,
     sidebar_title,
 )
-from .store import SessionBridgeStore, SidebarSource
+from .store import SessionBridgeStore, SidebarSource, SidebarSourcePage
 
 
 @dataclass(frozen=True)
@@ -362,84 +362,120 @@ class SessionBridgeCoordinator:
             return summary
 
         after = registration_time - self._config.sidebar.backfill_days * 86_400
-        raw_sources = await asyncio.to_thread(
-            _call,
-            self._store,
-            "list_sidebar_candidates",
-            after,
-            limit,
-            cursor=None,
-        )
         by_provider = {Provider.CLAUDE.value: 0, Provider.HERMES.value: 0}
         queued = 0
         failed = 0
+        examined = 0
         seen: set[str] = set()
-        for raw_source in raw_sources:
-            try:
-                if not isinstance(raw_source, SidebarSource):
-                    raise ValueError("sidebar source candidate is malformed")
-                source = raw_source
-                if source.source_session_id in seen:
-                    raise ValueError("duplicate sidebar source candidate")
-                seen.add(source.source_session_id)
-                projection = source.projection
-                if not is_sidebar_session_eligible(
-                    projection,
-                    now=registration_time,
-                    backfill_days=self._config.sidebar.backfill_days,
-                    automation_only=source.automation_only,
-                    subagent_only=source.subagent_only,
-                ):
-                    continue
-                canonical_source = canonical_session_id(
-                    projection.provider,
-                    projection.native_id,
-                )
-                if canonical_source != source.source_session_id:
-                    raise ValueError("sidebar source identity is inconsistent")
-                first_request = _first_sidebar_request(projection)
-                if not isinstance(projection.cwd, str) or not projection.cwd.strip():
-                    raise ValueError("sidebar source cwd is unavailable")
-                candidate = SidebarCandidate(
-                    source_session_id=canonical_source,
-                    provider=projection.provider,
-                    bridge_id=sidebar_bridge_id(canonical_source),
-                    title=sidebar_title(
+        cursor: tuple[float, str] | None = None
+        seen_cursors: set[tuple[float, str]] = set()
+        while queued < limit:
+            page_size = max(1, min(limit, limit - queued))
+            raw_page = await asyncio.to_thread(
+                _call,
+                self._store,
+                "list_sidebar_candidates",
+                after,
+                page_size,
+                cursor=cursor,
+            )
+            if not isinstance(raw_page, SidebarSourcePage):
+                raise ValueError("sidebar candidate page is malformed")
+            if len(raw_page) > page_size:
+                raise ValueError("sidebar candidate page exceeds its limit")
+            for raw_source in raw_page:
+                examined += 1
+                try:
+                    if not isinstance(raw_source, SidebarSource):
+                        raise ValueError("sidebar source candidate is malformed")
+                    source = raw_source
+                    if source.source_session_id in seen:
+                        raise ValueError("duplicate sidebar source candidate")
+                    seen.add(source.source_session_id)
+                    projection = source.projection
+                    if not is_sidebar_session_eligible(
+                        projection,
+                        now=registration_time,
+                        backfill_days=self._config.sidebar.backfill_days,
+                        automation_only=source.automation_only,
+                        subagent_only=source.subagent_only,
+                    ):
+                        continue
+                    canonical_source = canonical_session_id(
                         projection.provider,
-                        projection.title,
-                        first_request,
-                    ),
-                    cwd=projection.cwd,
-                    git_root=source.git_root,
-                    git_branch=projection.git_branch,
-                    git_head=source.git_head,
-                    worktree_id=source.worktree_id,
-                    eligible_at=projection.last_active,
-                )
-                getter = getattr(self._store, "get_sidebar_job_for_source", None)
-                existing = (
-                    await asyncio.to_thread(getter, canonical_source)
-                    if callable(getter)
-                    else None
-                )
-                if existing is not None:
-                    continue
-                await asyncio.to_thread(
-                    _call,
-                    self._store,
-                    "enqueue_sidebar_job",
-                    candidate,
-                )
-                queued += 1
-                by_provider[projection.provider.value] += 1
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
-            except Exception:
-                failed += 1
-                self._record_error_code("sidebar_registration_candidate_failed")
+                        projection.native_id,
+                    )
+                    if canonical_source != source.source_session_id:
+                        raise ValueError("sidebar source identity is inconsistent")
+                    first_request = _first_sidebar_request(projection)
+                    if (
+                        not isinstance(projection.cwd, str)
+                        or not projection.cwd.strip()
+                    ):
+                        raise ValueError("sidebar source cwd is unavailable")
+                    candidate = SidebarCandidate(
+                        source_session_id=canonical_source,
+                        provider=projection.provider,
+                        bridge_id=sidebar_bridge_id(canonical_source),
+                        title=sidebar_title(
+                            projection.provider,
+                            projection.title,
+                            first_request,
+                        ),
+                        cwd=projection.cwd,
+                        git_root=source.git_root,
+                        git_branch=projection.git_branch,
+                        git_head=source.git_head,
+                        worktree_id=source.worktree_id,
+                        eligible_at=projection.last_active,
+                    )
+                    getter = getattr(self._store, "get_sidebar_job_for_source", None)
+                    existing = (
+                        await asyncio.to_thread(getter, canonical_source)
+                        if callable(getter)
+                        else None
+                    )
+                    if existing is not None:
+                        continue
+                    await asyncio.to_thread(
+                        _call,
+                        self._store,
+                        "enqueue_sidebar_job",
+                        candidate,
+                    )
+                    queued += 1
+                    by_provider[projection.provider.value] += 1
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception:
+                    failed += 1
+                    self._record_error_code(
+                        "sidebar_registration_candidate_failed"
+                    )
+                if queued >= limit:
+                    break
+
+            if queued >= limit:
+                break
+            if type(raw_page.has_more) is not bool:
+                raise ValueError("sidebar candidate page continuation is malformed")
+            if not raw_page.has_more:
+                if raw_page.next_cursor is not None:
+                    raise ValueError("sidebar candidate cursor is unexpected")
+                break
+            next_cursor = _validated_sidebar_page_cursor(raw_page.next_cursor)
+            if next_cursor in seen_cursors:
+                raise ValueError("sidebar candidate cursor repeated")
+            if cursor is not None and not _sidebar_cursor_advances(
+                cursor,
+                next_cursor,
+            ):
+                raise ValueError("sidebar candidate cursor did not advance")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
 
         summary = SidebarRegistrationSummary(
-            examined=len(raw_sources),
+            examined=examined,
             queued=queued,
             by_provider=by_provider,
             failed=failed,
@@ -3048,6 +3084,33 @@ def _first_sidebar_request(projection: SessionProjection) -> str:
         ):
             return message.content
     raise ValueError("eligible sidebar source has no meaningful user request")
+
+
+def _validated_sidebar_page_cursor(value: object) -> tuple[float, str]:
+    try:
+        if not isinstance(value, tuple) or len(value) != 2:
+            raise ValueError
+        activity = _finite_number(value[0], "sidebar candidate cursor activity")
+        session_id = value[1]
+        if (
+            not isinstance(session_id, str)
+            or not session_id
+            or session_id != session_id.strip()
+        ):
+            raise ValueError
+        sidebar_bridge_id(session_id)
+        return activity, session_id
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError("sidebar candidate cursor is malformed") from exc
+
+
+def _sidebar_cursor_advances(
+    previous: tuple[float, str],
+    current: tuple[float, str],
+) -> bool:
+    return current[0] < previous[0] or (
+        current[0] == previous[0] and current[1] > previous[1]
+    )
 
 
 def _required_mapping_text(row: Mapping[str, Any], key: str) -> str:

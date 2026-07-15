@@ -45,7 +45,8 @@ from session_bridge.models import (
     SidebarJobState,
     UpsertResult,
 )
-from session_bridge.store import SessionBridgeStore
+from session_bridge.sidebar import SidebarCandidate
+from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
 
 
 _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
@@ -2793,6 +2794,58 @@ def test_sidebar_candidate_query_is_batched_structural_and_stably_paginated(
     assert subagent.subagent_only is True
 
 
+def test_sidebar_candidate_query_excludes_only_incoming_hermes_bridge_lineage(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    for offset, session_id in enumerate((
+        "ordinary-hermes",
+        "outgoing-continues",
+        "incoming-continues",
+        "outgoing-mirror",
+        "incoming-mirror",
+    )):
+        _add_hermes_sidebar_source(
+            sidebar_db,
+            session_id=session_id,
+            content=f"Meaningful request for {session_id}",
+            last_active=now - offset,
+        )
+    store.create_link(
+        SessionLink(
+            id="link-continues",
+            from_session_id="outgoing-continues",
+            to_session_id="incoming-continues",
+            relation=Relation.CONTINUES,
+            bridge_id="bridge:continues",
+            source_cursor=None,
+            source_hash=None,
+            created_at=now,
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="link-mirror",
+            from_session_id="outgoing-mirror",
+            to_session_id="incoming-mirror",
+            relation=Relation.MIRRORS,
+            bridge_id="bridge:mirror",
+            source_cursor=None,
+            source_hash=None,
+            created_at=now,
+        )
+    )
+
+    sources = store.list_sidebar_candidates(now - 100, 100)
+
+    assert {source.source_session_id for source in sources} == {
+        "ordinary-hermes",
+        "outgoing-continues",
+        "outgoing-mirror",
+    }
+
+
 class _ForbiddenSidebarTarget:
     def __getattr__(self, name: str) -> object:
         raise AssertionError(f"sidebar registration called target adapter method {name}")
@@ -2896,9 +2949,162 @@ class _SidebarScanStore(_RecordingStore):
         after: float,
         limit: int,
         cursor: object = None,
-    ) -> list[object]:
+    ) -> SidebarSourcePage:
         self.sidebar_list_calls.append((after, limit, cursor))
-        return []
+        return SidebarSourcePage()
+
+
+def _paged_sidebar_source(
+    *,
+    provider: Provider,
+    native_id: str,
+    content: str,
+    last_active: float,
+) -> SidebarSource:
+    projection = _sidebar_projection(
+        provider=provider,
+        native_id=native_id,
+        content=content,
+        last_active=last_active,
+    )
+    source_session_id = (
+        f"claude:{native_id}" if provider is Provider.CLAUDE else native_id
+    )
+    return SidebarSource(
+        source_session_id=source_session_id,
+        projection=projection,
+        git_root="C:/workspace/sidebar",
+        git_head=None,
+        worktree_id=None,
+        automation_only=False,
+        subagent_only=False,
+    )
+
+
+class _PagedSidebarStore:
+    def __init__(
+        self,
+        pages: Mapping[object, SidebarSourcePage],
+        *,
+        existing: set[str] | None = None,
+    ) -> None:
+        self.pages = dict(pages)
+        self.existing = set(existing or ())
+        self.list_calls: list[tuple[float, int, object]] = []
+        self.enqueued: list[SidebarCandidate] = []
+
+    def list_sidebar_candidates(
+        self,
+        after: float,
+        limit: int,
+        *,
+        cursor: object = None,
+    ) -> SidebarSourcePage:
+        self.list_calls.append((after, limit, cursor))
+        return self.pages[cursor]
+
+    def get_sidebar_job_for_source(self, source_session_id: str) -> object | None:
+        return {} if source_session_id in self.existing else None
+
+    def enqueue_sidebar_job(self, candidate: SidebarCandidate) -> dict[str, object]:
+        self.existing.add(candidate.source_session_id)
+        self.enqueued.append(candidate)
+        return {"source_session_id": candidate.source_session_id}
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_drains_pages_past_ineligible_and_existing_rows() -> None:
+    now = 3_000_000.0
+    first_cursor = (now - 1, "ack-first-page")
+    page_one = SidebarSourcePage(
+        (
+            _paged_sidebar_source(
+                provider=Provider.HERMES,
+                native_id="ack-first-page",
+                content="yes",
+                last_active=now,
+            ),
+            _paged_sidebar_source(
+                provider=Provider.CLAUDE,
+                native_id="already-enqueued",
+                content="Keep this existing job",
+                last_active=now - 1,
+            ),
+        ),
+        has_more=True,
+        next_cursor=first_cursor,
+    )
+    page_two = SidebarSourcePage(
+        (
+            _paged_sidebar_source(
+                provider=Provider.CLAUDE,
+                native_id="eligible-second-page",
+                content="Queue the older Claude request",
+                last_active=now - 2,
+            ),
+            _paged_sidebar_source(
+                provider=Provider.HERMES,
+                native_id="eligible-hermes-second-page",
+                content="Queue the older Hermes request",
+                last_active=now - 3,
+            ),
+        ),
+    )
+    store = _PagedSidebarStore(
+        {None: page_one, first_cursor: page_two},
+        existing={"claude:already-enqueued"},
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(now=now, limit=2)
+
+    assert summary.examined == 4
+    assert summary.queued == 2
+    assert summary.failed == 0
+    assert summary.by_provider == {"claude": 1, "hermes": 1}
+    assert [candidate.source_session_id for candidate in store.enqueued] == [
+        "claude:eligible-second-page",
+        "eligible-hermes-second-page",
+    ]
+    assert store.list_calls == [
+        (now - 30 * 86_400, 2, None),
+        (now - 30 * 86_400, 2, first_cursor),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_rejects_a_repeated_pagination_cursor() -> None:
+    now = 3_000_000.0
+    repeated_cursor = (now, "ack-loop")
+    page = SidebarSourcePage(
+        (
+            _paged_sidebar_source(
+                provider=Provider.HERMES,
+                native_id="ack-loop",
+                content="yes",
+                last_active=now,
+            ),
+        ),
+        has_more=True,
+        next_cursor=repeated_cursor,
+    )
+    store = _PagedSidebarStore({None: page, repeated_cursor: page})
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    with pytest.raises(ValueError, match="sidebar candidate cursor"):
+        await coordinator.register_sidebar_jobs_once(now=now, limit=1)
 
 
 @pytest.mark.asyncio

@@ -730,6 +730,11 @@ class SessionBridgeStore:
                                 e.session_id IS NULL
                                 AND s.id NOT LIKE 'claude:%'
                                 AND s.id NOT LIKE 'codex:%'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM session_links AS incoming_link
+                                     WHERE incoming_link.to_session_id = s.id
+                                )
                             )
                         )
                    ), candidate AS (
