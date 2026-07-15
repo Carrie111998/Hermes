@@ -3056,6 +3056,14 @@ def test_sidebar_digest_auth_uses_bounded_equality_candidates_for_commit_replay(
     candidate = _sidebar_candidate(db, native_id="indexed-commit")
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    token_digest = hashlib.sha256(lease["lease_token"].encode()).hexdigest()
+    with db._lock:
+        assert db._conn is not None
+        lease_plan = db._conn.execute(
+            """EXPLAIN QUERY PLAN SELECT * FROM session_sidebar_jobs
+               WHERE lease_digest = ? LIMIT 2""",
+            (token_digest,),
+        ).fetchall()
     statements: list[str] = []
     with db._lock:
         assert db._conn is not None
@@ -3071,6 +3079,13 @@ def test_sidebar_digest_auth_uses_bounded_equality_candidates_for_commit_replay(
             codex_thread_id="codex-indexed-thread",
             now=201.0,
         )
+        with db._lock:
+            assert db._conn is not None
+            completion_plan = db._conn.execute(
+                """EXPLAIN QUERY PLAN SELECT * FROM session_sidebar_jobs
+                   WHERE completion_digest = ? LIMIT 2""",
+                (token_digest,),
+            ).fetchall()
     finally:
         with db._lock:
             assert db._conn is not None
@@ -3084,6 +3099,14 @@ def test_sidebar_digest_auth_uses_bounded_equality_candidates_for_commit_replay(
         and ("LEASE_DIGEST =" in statement or "COMPLETION_DIGEST =" in statement)
     ]
     assert replay == committed
+    assert any(
+        "USING INDEX idx_session_sidebar_jobs_lease_digest" in row[3]
+        for row in lease_plan
+    )
+    assert any(
+        "USING INDEX idx_session_sidebar_jobs_completion_digest" in row[3]
+        for row in completion_plan
+    )
     assert digest_queries
     assert all("LIMIT 2" in statement for statement in digest_queries)
     assert not any(

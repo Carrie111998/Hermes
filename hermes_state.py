@@ -968,6 +968,11 @@ CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_state_next_attempt_at
     ON session_sidebar_jobs(state, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_source_session_id
     ON session_sidebar_jobs(source_session_id);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_lease_digest
+    ON session_sidebar_jobs(lease_digest) WHERE lease_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_completion_digest
+    ON session_sidebar_jobs(completion_digest)
+    WHERE completion_digest IS NOT NULL;
 """
 
 # Indexes that reference columns added in later schema versions must be

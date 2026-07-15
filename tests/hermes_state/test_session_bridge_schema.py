@@ -31,6 +31,20 @@ EXPECTED_BRIDGE_INDEXES = {
         "next_attempt_at",
     ),
     "idx_session_sidebar_jobs_source_session_id": ("source_session_id",),
+    "idx_session_sidebar_jobs_lease_digest": ("lease_digest",),
+    "idx_session_sidebar_jobs_completion_digest": ("completion_digest",),
+}
+
+EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL = {
+    "idx_session_sidebar_jobs_lease_digest": (
+        "CREATE INDEX idx_session_sidebar_jobs_lease_digest "
+        "ON session_sidebar_jobs(lease_digest) WHERE lease_digest IS NOT NULL"
+    ),
+    "idx_session_sidebar_jobs_completion_digest": (
+        "CREATE INDEX idx_session_sidebar_jobs_completion_digest "
+        "ON session_sidebar_jobs(completion_digest) "
+        "WHERE completion_digest IS NOT NULL"
+    ),
 }
 
 EXPECTED_BRIDGE_FOREIGN_KEYS = {
@@ -238,6 +252,13 @@ def test_fresh_database_creates_bridge_tables_indexes_and_schema_v21(tmp_path):
         for index_name, expected_columns in EXPECTED_BRIDGE_INDEXES.items():
             rows = db._conn.execute(f'PRAGMA index_info("{index_name}")').fetchall()
             assert tuple(row[2] for row in rows) == expected_columns
+        for index_name, expected_sql in EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL.items():
+            row = db._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            assert row is not None
+            assert " ".join(row[0].split()) == expected_sql
     finally:
         db.close()
 
@@ -298,6 +319,76 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
         )
     finally:
         conn.close()
+
+
+def test_reopening_v21_database_repairs_missing_sidebar_digest_indexes_without_data_loss(
+    tmp_path,
+):
+    db_path = tmp_path / "v21-missing-sidebar-digest-indexes.db"
+    db = hermes_state.SessionDB(db_path)
+    try:
+        _seed_sessions(db._conn, "source")
+        _insert_sidebar_job(
+            db._conn,
+            job_id="leased-job",
+            state="sidebar_leased",
+            lease_digest="lease-digest",
+            lease_expires_at=500.0,
+        )
+        _insert_sidebar_job(
+            db._conn,
+            job_id="visible-job",
+            state="sidebar_visible",
+            completion_digest="completion-digest",
+            codex_thread_id="codex-thread",
+            visible_at=200.0,
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        for index_name in EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL:
+            conn.execute(f'DROP INDEX "{index_name}"')
+        before = conn.execute(
+            """SELECT id, state, lease_digest, completion_digest,
+                      codex_thread_id, visible_at
+               FROM session_sidebar_jobs ORDER BY id"""
+        ).fetchall()
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [
+            (21,)
+        ]
+        missing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (?, ?)",
+            tuple(EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL),
+        ).fetchall()
+        assert missing == []
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        after = reopened._conn.execute(
+            """SELECT id, state, lease_digest, completion_digest,
+                      codex_thread_id, visible_at
+               FROM session_sidebar_jobs ORDER BY id"""
+        ).fetchall()
+        assert [tuple(row) for row in after] == before
+        versions = reopened._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchall()
+        assert [tuple(row) for row in versions] == [(21,)]
+        for index_name, expected_sql in EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL.items():
+            row = reopened._conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            assert row is not None
+            assert " ".join(row[0].split()) == expected_sql
+    finally:
+        reopened.close()
 
 
 def test_bridge_foreign_keys_exist_and_foreign_key_check_is_clean(tmp_path):
