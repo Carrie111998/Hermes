@@ -545,6 +545,138 @@ def test_sidebar_marker_lookup_rejects_multiple_authenticated_threads() -> None:
     assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
 
 
+@pytest.mark.parametrize(
+    ("observed", "code"),
+    [
+        (
+            BridgeMarkerPayload("bridge-other", "claude:source-1", Provider.CODEX, 1),
+            "source_identity_mismatch",
+        ),
+        (
+            BridgeMarkerPayload("bridge-1", "claude:other", Provider.CODEX, 1),
+            "source_identity_mismatch",
+        ),
+        (
+            BridgeMarkerPayload("bridge-1", "claude:source-1", Provider.CLAUDE, 1),
+            "provider_mismatch",
+        ),
+        (
+            BridgeMarkerPayload("bridge-1", "claude:source-1", Provider.CODEX, 2),
+            "provider_mismatch",
+        ),
+    ],
+)
+def test_sidebar_marker_lookup_rejects_authenticated_related_near_match(
+    observed: BridgeMarkerPayload,
+    code: str,
+) -> None:
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_signed_read(
+            bridge_id=observed.bridge_id,
+            source_session_id=observed.source_session_id,
+            target_provider=observed.target_provider,
+            policy_generation=observed.policy_generation,
+        )],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == code
+
+
+@pytest.mark.parametrize(
+    "near",
+    [
+        BridgeMarkerPayload("bridge-other", "claude:source-1", Provider.CODEX, 1),
+        BridgeMarkerPayload("bridge-1", "claude:other", Provider.CODEX, 1),
+        BridgeMarkerPayload("bridge-1", "claude:source-1", Provider.CLAUDE, 1),
+        BridgeMarkerPayload("bridge-1", "claude:source-1", Provider.CODEX, 2),
+    ],
+)
+def test_sidebar_marker_lookup_rejects_exact_plus_related_near_match(
+    near: BridgeMarkerPayload,
+) -> None:
+    exact = encode_bridge_marker(_sidebar_expected(), SECRET)
+    related = encode_bridge_marker(near, SECRET)
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_read(turns=[{
+            "id": "registration",
+            "items": [{
+                "type": "userMessage",
+                "id": "item-1",
+                "content": [{"type": "text", "text": f"{exact}\n{related}"}],
+            }],
+        }])],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "marker_conflict"
+
+
+def test_sidebar_marker_lookup_ignores_fully_unrelated_authenticated_marker() -> None:
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_signed_read(
+            bridge_id="bridge-unrelated",
+            source_session_id="hermes-unrelated",
+        )],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) is None
+    assert all(method not in {"thread/start", "thread/name/set"} for method, _, _ in client.calls)
+
+
+def test_sidebar_marker_lookup_ignores_multiple_fully_unrelated_markers() -> None:
+    unrelated = [
+        encode_bridge_marker(
+            BridgeMarkerPayload("bridge-unrelated-a", "hermes-a", Provider.CODEX, 1),
+            SECRET,
+        ),
+        encode_bridge_marker(
+            BridgeMarkerPayload("bridge-unrelated-b", "hermes-b", Provider.CODEX, 1),
+            SECRET,
+        ),
+    ]
+    client = FakeRequestClient({
+        "thread/list": [_codex_inventory(), {"data": []}],
+        "thread/read": [_codex_read(turns=[{
+            "id": "registration",
+            "items": [{
+                "type": "userMessage",
+                "id": "item-1",
+                "content": [{"type": "text", "text": "\n".join(unrelated)}],
+            }],
+        }])],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) is None
+
+
 @pytest.mark.parametrize("include_valid", [False, True])
 def test_sidebar_marker_lookup_never_turns_expected_invalid_signature_into_zero(
     include_valid: bool,

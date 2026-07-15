@@ -163,6 +163,25 @@ async def test_multiple_authenticated_matches_are_fatal_and_never_delivered() ->
     assert store.commits == []
 
 
+@pytest.mark.parametrize(
+    "code",
+    ["source_identity_mismatch", "provider_mismatch"],
+)
+@pytest.mark.asyncio
+async def test_related_near_match_is_persisted_fatal_and_never_exposed(
+    code: str,
+) -> None:
+    store = FakeSidebarStore()
+    verifier = FakeVerifier(SidebarVerificationError(code))
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert claims == ()
+    assert store.failures == [("opaque-lease-token", code, 100.0)]
+    assert store.commits == []
+
+
 @pytest.mark.asyncio
 async def test_recovered_rename_failure_renames_same_thread_before_verified_commit() -> None:
     events: list[tuple[str, str]] = []

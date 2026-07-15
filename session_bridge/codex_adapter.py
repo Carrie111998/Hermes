@@ -87,6 +87,12 @@ class SidebarVerificationError(RuntimeError):
         super().__init__(code)
 
 
+class _ConflictingCodexBridgeMarkers(ValueError):
+    def __init__(self, payloads: tuple[BridgeMarkerPayload, ...]) -> None:
+        self.payloads = payloads
+        super().__init__("Codex thread has conflicting bridge markers")
+
+
 class SidebarThreadVerifier:
     """Authenticate native Codex sidebar threads through read-only inventory."""
 
@@ -140,6 +146,8 @@ class SidebarThreadVerifier:
             if summary is not None:
                 try:
                     projection = self._source_adapter.project_thread(summary)
+                except _ConflictingCodexBridgeMarkers:
+                    raise SidebarVerificationError("marker_conflict") from None
                 except (KeyboardInterrupt, SystemExit):
                     raise
                 except Exception:
@@ -182,6 +190,15 @@ class SidebarThreadVerifier:
                 continue
             try:
                 projection = self._source_adapter.project_thread(summary)
+            except _ConflictingCodexBridgeMarkers as exc:
+                if any(
+                    payload == expected
+                    or payload.source_session_id == expected.source_session_id
+                    or payload.bridge_id == expected.bridge_id
+                    for payload in exc.payloads
+                ):
+                    raise SidebarVerificationError("marker_conflict") from None
+                continue
             except (KeyboardInterrupt, SystemExit):
                 raise
             except Exception:
@@ -1106,23 +1123,43 @@ def _verified_sidebar_projection(
     exact = [payload for payload in decoded if payload == expected]
     if len(exact) > 1:
         raise SidebarVerificationError("marker_conflict")
+    related = [
+        payload
+        for payload in decoded
+        if payload != expected
+        and (
+            payload.source_session_id == expected.source_session_id
+            or payload.bridge_id == expected.bridge_id
+        )
+    ]
     if exact:
-        if len(decoded) != 1:
+        if related or (strict and len(decoded) != 1):
             raise SidebarVerificationError("marker_conflict")
         return VerifiedSidebarThread(
             thread_id=projection.native_id,
             source_session_id=expected.source_session_id,
             bridge_id=expected.bridge_id,
         )
+    if related:
+        codes = {
+            "provider_mismatch"
+            if (
+                payload.source_session_id == expected.source_session_id
+                and payload.bridge_id == expected.bridge_id
+                and (
+                    payload.target_provider is not Provider.CODEX
+                    or payload.policy_generation != 1
+                )
+            )
+            else "source_identity_mismatch"
+            for payload in related
+        }
+        if len(codes) != 1 or len(related) != 1:
+            raise SidebarVerificationError("marker_conflict")
+        raise SidebarVerificationError(next(iter(codes)))
     if not strict:
         return None
     if decoded:
-        observed = decoded[0]
-        if (
-            observed.target_provider is not Provider.CODEX
-            or observed.policy_generation != 1
-        ):
-            raise SidebarVerificationError("provider_mismatch")
         raise SidebarVerificationError("source_identity_mismatch")
     raise SidebarVerificationError("source_identity_mismatch")
 
@@ -1406,7 +1443,7 @@ def _detect_origin(
     messages: list[ProjectedMessage], *, marker_secret: bytes
 ) -> tuple[OriginKind, str | None]:
     marker_message_indexes: set[int] = set()
-    marker_occurrences: list[tuple[int, str]] = []
+    marker_occurrences: list[tuple[int, BridgeMarkerPayload]] = []
     for index, message in enumerate(messages):
         if message.role != "user" or not message.content:
             continue
@@ -1417,11 +1454,13 @@ def _detect_origin(
                 continue
             if payload.target_provider is Provider.CODEX:
                 marker_message_indexes.add(index)
-                marker_occurrences.append((index, payload.bridge_id))
+                marker_occurrences.append((index, payload))
 
-    marker_ids = {bridge_id for _, bridge_id in marker_occurrences}
+    marker_ids = {payload.bridge_id for _, payload in marker_occurrences}
     if len(marker_ids) > 1:
-        raise ValueError("Codex thread has conflicting bridge markers")
+        raise _ConflictingCodexBridgeMarkers(
+            tuple(payload for _, payload in marker_occurrences)
+        )
     if not marker_ids:
         return OriginKind.NATIVE, None
 
