@@ -166,6 +166,57 @@ def test_native_meaningful_request_with_marker_shaped_text_remains_eligible(
     assert is_sidebar_session_eligible(projection, now=NOW)
 
 
+def test_exact_registration_prompt_misprojected_as_native_is_ignored() -> None:
+    candidate = _candidate()
+    prompt = build_registration_prompt(candidate, _marker_for(candidate))
+    projection = _projection(Provider.CLAUDE, prompt)
+
+    assert not is_sidebar_session_eligible(projection, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "modify",
+    [
+        lambda prompt: prompt + "\nextra registration prose",
+        lambda prompt: prompt.replace(
+            'Source provider: "claude"',
+            'Source provider: "hermes"',
+        ),
+        lambda prompt: prompt.replace(
+            'session_id="claude:source-1"',
+            'session_id="claude:other"',
+        ),
+        lambda prompt: prompt.replace(
+            "Do not perform project work during registration.",
+            "Please perform project work during registration.",
+        ),
+    ],
+)
+def test_near_miss_registration_blocks_remain_meaningful(
+    modify: object,
+) -> None:
+    candidate = _candidate()
+    prompt = build_registration_prompt(candidate, _marker_for(candidate))
+    modified = modify(prompt)  # type: ignore[operator]
+
+    assert is_sidebar_session_eligible(
+        _projection(Provider.CLAUDE, modified),
+        now=NOW,
+    )
+
+
+def test_exact_registration_block_plus_separate_request_is_eligible() -> None:
+    candidate = _candidate()
+    prompt = build_registration_prompt(candidate, _marker_for(candidate))
+    projection = _projection(
+        Provider.CLAUDE,
+        prompt,
+        "now fix the failing production build",
+    )
+
+    assert is_sidebar_session_eligible(projection, now=NOW)
+
+
 def test_registration_message_does_not_hide_separate_meaningful_request() -> None:
     projection = _projection(
         Provider.HERMES,

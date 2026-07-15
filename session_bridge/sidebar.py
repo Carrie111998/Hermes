@@ -103,6 +103,8 @@ def is_sidebar_session_eligible(
     for message in projection.messages:
         if message.role != "user" or not isinstance(message.content, str):
             continue
+        if _is_exact_registration_block(message.content):
+            continue
         if is_meaningful_user_text(message.content):
             return True
     return False
@@ -324,5 +326,84 @@ def _decode_canonical_base64url(value: object) -> bytes:
     )
     canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
     if canonical != value:
+        raise ValueError
+    return decoded
+
+
+def _is_exact_registration_block(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    lines = value.split("\n")
+    if len(lines) != 12 or lines[:2] != [
+        "This is a Hermes Session Bridge placeholder registration.",
+        "Do not perform project work during registration.",
+    ]:
+        return False
+    if lines[11] != (
+        "Wait for the first substantive user message before doing anything else."
+    ):
+        return False
+
+    try:
+        marker = _prompt_line_value(lines[2], "Signed marker: ")
+        source = _decode_canonical_prompt_field(lines[3], "Source session ID: ")
+        provider_value = _decode_canonical_prompt_field(
+            lines[4], "Source provider: "
+        )
+        cwd = _decode_canonical_prompt_field(lines[5], "Source cwd: ")
+        git_root = _decode_canonical_prompt_field(lines[6], "Git root: ")
+        git_branch = _decode_canonical_prompt_field(lines[7], "Git branch: ")
+        git_head = _decode_canonical_prompt_field(lines[8], "Git HEAD: ")
+        worktree_id = _decode_canonical_prompt_field(lines[9], "Worktree ID: ")
+        if not isinstance(source, str) or not isinstance(provider_value, str):
+            return False
+        if not isinstance(cwd, str):
+            return False
+        if git_root is not None and not isinstance(git_root, str):
+            return False
+        if git_branch is not None and not isinstance(git_branch, str):
+            return False
+        if git_head is not None and not isinstance(git_head, str):
+            return False
+        if worktree_id is not None and not isinstance(worktree_id, str):
+            return False
+        provider = Provider(provider_value)
+        if provider not in (Provider.CLAUDE, Provider.HERMES):
+            return False
+        candidate = SidebarCandidate(
+            source_session_id=source,
+            provider=provider,
+            bridge_id=sidebar_bridge_id(source),
+            title="",
+            cwd=cwd,
+            git_root=git_root,
+            git_branch=git_branch,
+            git_head=git_head,
+            worktree_id=worktree_id,
+            eligible_at=0.0,
+        )
+        return build_registration_prompt(candidate, marker) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _prompt_line_value(line: str, prefix: str) -> str:
+    if not line.startswith(prefix):
+        raise ValueError
+    value = line[len(prefix) :]
+    if not value:
+        raise ValueError
+    return value
+
+
+def _decode_canonical_prompt_field(line: str, prefix: str) -> object:
+    encoded = _prompt_line_value(line, prefix)
+    decoded = json.loads(encoded)
+    canonical = json.dumps(
+        decoded,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if encoded != canonical:
         raise ValueError
     return decoded
