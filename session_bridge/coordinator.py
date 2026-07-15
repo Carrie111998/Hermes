@@ -160,6 +160,10 @@ _SIDEBAR_REGISTRATION_CURSOR_VERSION = 1
 _SIDEBAR_REGISTRATION_QUERY_BUDGET = 4
 _SIDEBAR_REGISTRATION_EXAMINED_BUDGET = 40
 _SIDEBAR_REGISTRATION_PAGE_SIZE = 10
+# Foreground cancellation recovery is intentionally short. Unfinished ownership
+# transfers to tracked background recovery, with the durable 300-second lease as
+# the final fallback if a synchronous worker never returns.
+_SIDEBAR_CANCELLATION_RECOVERY_SECONDS = 5.0
 
 
 class SessionBridgeCoordinator:
@@ -180,6 +184,9 @@ class SessionBridgeCoordinator:
         watch_debounce_seconds: float = 0.25,
         refresh_timeout: float = 5.0,
         sidebar_verifier: _SidebarVerifier | None = None,
+        sidebar_cancellation_recovery_timeout: float = (
+            _SIDEBAR_CANCELLATION_RECOVERY_SECONDS
+        ),
     ) -> None:
         if type(scan_batch_size) is not int or scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be a positive integer")
@@ -201,6 +208,15 @@ class SessionBridgeCoordinator:
             or refresh_timeout <= 0
         ):
             raise ValueError("refresh_timeout must be a positive number")
+        if (
+            not isinstance(sidebar_cancellation_recovery_timeout, (int, float))
+            or isinstance(sidebar_cancellation_recovery_timeout, bool)
+            or not math.isfinite(float(sidebar_cancellation_recovery_timeout))
+            or not 0 < sidebar_cancellation_recovery_timeout <= 5.0
+        ):
+            raise ValueError(
+                "sidebar cancellation recovery timeout must be between zero and five seconds"
+            )
         self._config = config
         self._store = store
         self._adapters = dict(adapters)
@@ -215,6 +231,9 @@ class SessionBridgeCoordinator:
         self._watch_debounce_seconds = float(watch_debounce_seconds)
         self._refresh_timeout = float(refresh_timeout)
         self._sidebar_verifier = sidebar_verifier
+        self._sidebar_cancellation_recovery_timeout = float(
+            sidebar_cancellation_recovery_timeout
+        )
         self._watch_stop_event: asyncio.Event | None = None
         self._watcher_state = "not_started"
         self._watcher_error_code: str | None = None
@@ -226,6 +245,7 @@ class SessionBridgeCoordinator:
         self._running = False
         self._background_tasks: list[asyncio.Task[None]] = []
         self._provider_tasks: set[asyncio.Task[Any]] = set()
+        self._sidebar_recovery_tasks: set[asyncio.Task[Any]] = set()
         self._provider_health: dict[Provider, _ProviderHealth] = {
             provider: {
                 "last_success": None,
@@ -298,6 +318,7 @@ class SessionBridgeCoordinator:
                 not self._running
                 and not self._background_tasks
                 and not self._provider_tasks
+                and not self._sidebar_recovery_tasks
             ):
                 return
             self._running = False
@@ -316,6 +337,8 @@ class SessionBridgeCoordinator:
                 )
                 if pending:
                     self._record_error_code("provider_shutdown_pending")
+            for task in tuple(self._sidebar_recovery_tasks):
+                task.cancel()
             if self._claude_projects_root is not None:
                 self._watcher_state = "stopped"
 
@@ -425,12 +448,16 @@ class SessionBridgeCoordinator:
                 lease_seconds=self._config.sidebar.lease_seconds,
             )
         )
+        cancelled_claim: asyncio.CancelledError | None = None
         try:
             raw_claims = await asyncio.shield(claim_task)
-        except asyncio.CancelledError as cancelled:
+        except asyncio.CancelledError as exc:
+            cancelled_claim = exc
+            raw_claims = None
+        if cancelled_claim is not None:
             await self._finish_cancelled_sidebar_claim(
                 claim_task,
-                cancelled=cancelled,
+                cancelled=cancelled_claim,
                 limit=limit,
             )
         owned_tokens, malformed_claims = _sidebar_claim_tokens(
@@ -506,6 +533,12 @@ class SessionBridgeCoordinator:
                     )
                 )
             return tuple(delivery)
+        except asyncio.CancelledError as cancelled:
+            try:
+                await self._cleanup_sidebar_delivery_claims(owned_tokens)
+            except BaseException:
+                pass
+            _raise_detached_cancelled(cancelled)
         except BaseException:
             await self._cleanup_sidebar_delivery_claims(owned_tokens)
             raise
@@ -519,28 +552,91 @@ class SessionBridgeCoordinator:
     ) -> NoReturn:
         """Recover and release leases committed by a cancelled claim worker."""
 
-        while not claim_task.done():
-            try:
-                await asyncio.shield(claim_task)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                break
+        finished, _ = await self._wait_sidebar_recovery_task(claim_task)
+        if not finished:
+            recovery_task = asyncio.create_task(
+                self._recover_sidebar_claim_in_background(claim_task, limit=limit)
+            )
+            self._track_sidebar_recovery_task(recovery_task)
+            _raise_detached_cancelled(cancelled)
+        worker_failed = False
         try:
             raw_claims = claim_task.result()
         except BaseException:
-            # The caller's cancellation owns the public outcome; do not attach a
-            # worker exception that could expose a raw lease token as context.
-            raise cancelled from None
+            worker_failed = True
+            raw_claims = None
+        if worker_failed:
+            _raise_detached_cancelled(cancelled)
+        extraction_failed = False
         try:
             owned_tokens, _ = _sidebar_claim_tokens(raw_claims, limit=limit)
         except BaseException:
-            raise cancelled from None
+            extraction_failed = True
+            owned_tokens = []
+        if extraction_failed:
+            _raise_detached_cancelled(cancelled)
         try:
             await self._cleanup_sidebar_delivery_claims(owned_tokens)
         except BaseException:
             pass
-        raise cancelled from None
+        _raise_detached_cancelled(cancelled)
+
+    async def _recover_sidebar_claim_in_background(
+        self,
+        claim_task: asyncio.Task[Any],
+        *,
+        limit: int,
+    ) -> None:
+        while not claim_task.done():
+            try:
+                await asyncio.shield(claim_task)
+            except asyncio.CancelledError:
+                # stop() must return promptly, but the wrapper retains ownership
+                # so the worker result is still consumed if it eventually arrives.
+                continue
+            except BaseException:
+                return
+        try:
+            raw_claims = claim_task.result()
+        except BaseException:
+            return
+        try:
+            owned_tokens, _ = _sidebar_claim_tokens(raw_claims, limit=limit)
+            await self._cleanup_sidebar_delivery_claims(owned_tokens)
+        except BaseException:
+            return
+
+    async def _wait_sidebar_recovery_task(
+        self,
+        task: asyncio.Task[Any],
+    ) -> tuple[bool, asyncio.CancelledError | None]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._sidebar_cancellation_recovery_timeout
+        cancelled: asyncio.CancelledError | None = None
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait((task,), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                continue
+        return task.done(), cancelled
+
+    def _track_sidebar_recovery_task(self, task: asyncio.Task[Any]) -> None:
+        self._sidebar_recovery_tasks.add(task)
+        task.add_done_callback(self._sidebar_recovery_done)
+
+    def _sidebar_recovery_done(self, task: asyncio.Task[Any]) -> None:
+        self._sidebar_recovery_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            pass
 
     async def _fail_sidebar_delivery_claim(
         self,
@@ -586,21 +682,15 @@ class SessionBridgeCoordinator:
                     continue
 
         cleanup_task = asyncio.create_task(_cleanup())
-        cancelled: asyncio.CancelledError | None = None
-        while not cleanup_task.done():
-            try:
-                await asyncio.shield(cleanup_task)
-            except asyncio.CancelledError as exc:
-                if cancelled is None:
-                    cancelled = exc
-                continue
+        finished, cancelled = await self._wait_sidebar_recovery_task(cleanup_task)
+        if not finished:
+            self._track_sidebar_recovery_task(cleanup_task)
+        elif cancelled is None:
+            cleanup_task.result()
+        elif not cleanup_task.cancelled():
+            cleanup_task.exception()
         if cancelled is not None:
-            try:
-                cleanup_task.result()
-            except BaseException:
-                pass
-            raise cancelled from None
-        cleanup_task.result()
+            _raise_detached_cancelled(cancelled)
 
     async def commit_sidebar_job(
         self,
@@ -2912,6 +3002,15 @@ def _exact_sidebar_claim_text(value: object, label: str) -> str:
     if any(character in value for character in "\r\n"):
         raise ValueError(f"sidebar claim {label} is malformed")
     return value
+
+
+def _raise_detached_cancelled(cancelled: asyncio.CancelledError) -> NoReturn:
+    """Raise the original cancellation with no reachable sensitive context."""
+
+    cancelled.__cause__ = None
+    cancelled.__context__ = None
+    cancelled.__suppress_context__ = True
+    raise cancelled from None
 
 
 def _sidebar_claim_tokens(

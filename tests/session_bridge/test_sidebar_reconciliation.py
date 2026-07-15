@@ -122,7 +122,13 @@ def _coordinator(
     verifier: FakeVerifier,
     *,
     clock=lambda: 100.0,
+    recovery_timeout: float | None = None,
 ) -> SessionBridgeCoordinator:
+    recovery_options = (
+        {}
+        if recovery_timeout is None
+        else {"sidebar_cancellation_recovery_timeout": recovery_timeout}
+    )
     return SessionBridgeCoordinator(
         config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
         store=store,
@@ -130,6 +136,7 @@ def _coordinator(
         target_adapters={Provider.CODEX: ForbiddenTargetAdapter()},
         sidebar_verifier=verifier,
         clock=clock,
+        **recovery_options,
     )
 
 
@@ -382,7 +389,7 @@ async def test_cancelled_reconciliation_releases_every_claimed_lease(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_cancellation_after_durable_claim_commit_releases_every_lease(
+async def test_cancelled_durable_claim_returns_by_deadline_then_recovers_in_background(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -421,21 +428,45 @@ async def test_cancellation_after_durable_claim_commit_releases_every_lease(
         return claimed
 
     monkeypatch.setattr(store, "claim_sidebar_jobs", claim_then_pause)
-    coordinator = _coordinator(store, FakeVerifier(None), clock=lambda: 100.0)
+    coordinator = _coordinator(
+        store,
+        FakeVerifier(None),
+        clock=lambda: 100.0,
+        recovery_timeout=0.02,
+    )
     claim_task = asyncio.create_task(
         coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
     )
     assert await asyncio.to_thread(committed.wait, 5)
 
-    claim_task.cancel()
-    release.set()
+    claim_task.cancel("claim-deadline-cancel")
     with pytest.raises(asyncio.CancelledError):
-        await claim_task
+        await asyncio.wait_for(claim_task, timeout=0.5)
+
+    leased = [store.get_sidebar_job_for_source(source) for source in sources]
+    assert all(job is not None for job in leased)
+    assert all(job["state"] == "sidebar_leased" for job in leased if job is not None)
+    assert len(coordinator._sidebar_recovery_tasks) == 1
+    await asyncio.wait_for(coordinator.stop(), timeout=0.2)
+    assert len(coordinator._sidebar_recovery_tasks) == 1
+
+    release.set()
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while any(
+        store.get_sidebar_job_for_source(source)["state"] != "sidebar_pending"
+        for source in sources
+    ):
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
 
     jobs = [store.get_sidebar_job_for_source(source) for source in sources]
     assert all(job is not None for job in jobs)
     assert all(job["state"] == "sidebar_pending" for job in jobs if job is not None)
     assert all(job["lease_digest"] is None for job in jobs if job is not None)
+    while coordinator._sidebar_recovery_tasks:
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+    assert coordinator._sidebar_recovery_tasks == set()
     db.close()
 
 
@@ -475,6 +506,48 @@ async def test_cancelled_claim_worker_failure_does_not_mask_cancellation() -> No
 
     assert verifier.find_calls == []
     assert store.failures == []
+
+
+@pytest.mark.asyncio
+async def test_non_cancelled_claim_worker_exception_propagates_unchanged() -> None:
+    store = BlockingClaimFailureStore()
+    coordinator = _coordinator(store, FakeVerifier(None), clock=lambda: 100.0)
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    )
+    assert await asyncio.to_thread(store.started.wait, 5)
+
+    store.release.set()
+    with pytest.raises(RuntimeError, match="claim worker failed with lease=must-not-leak"):
+        await claim_task
+
+    assert coordinator._sidebar_recovery_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claim_worker_exception_chain_is_fully_detached() -> None:
+    store = BlockingClaimFailureStore()
+    coordinator = _coordinator(store, FakeVerifier(None), clock=lambda: 100.0)
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    )
+    assert await asyncio.to_thread(store.started.wait, 5)
+
+    claim_task.cancel("original-claim-cancel")
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await claim_task
+
+    assert caught.value.args == ("original-claim-cancel",)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    chain: list[BaseException] = []
+    cursor: BaseException | None = caught.value
+    while cursor is not None:
+        chain.append(cursor)
+        cursor = cursor.__cause__ or cursor.__context__
+    assert chain == [caught.value]
+    assert "must-not-leak" not in " ".join(str(node) for node in chain)
 
 
 class MalformedClaimBatchStore(FakeSidebarStore):
@@ -575,6 +648,70 @@ async def test_repeated_cancellation_during_cleanup_still_releases_full_batch(
         store.get_sidebar_job_for_source(source)["state"] == "sidebar_pending"
         for source in sources
     )
+    db.close()
+
+
+@pytest.mark.asyncio
+async def test_hung_cleanup_does_not_block_cancelled_caller_or_shutdown(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "hung-cancel-cleanup.db")
+    token = "hung-cleanup-token"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: token,
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    source = "claude:hung-cleanup"
+    db.ensure_session(source, source="cli")
+    store.enqueue_sidebar_job(SidebarCandidate(
+        source_session_id=source,
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id(source),
+        title="[Claude] Hung cleanup",
+        cwd="C:/hung-cleanup",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=10.0,
+    ))
+    verifier = BlockingVerifier()
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+
+    def hung_cleanup(**_kwargs: Any) -> dict[str, Any]:
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=5)
+        raise RuntimeError("hung cleanup token=must-not-leak")
+
+    monkeypatch.setattr(store, "fail_sidebar_job", hung_cleanup)
+    coordinator = _coordinator(
+        store,
+        verifier,
+        clock=lambda: 100.0,
+        recovery_timeout=0.02,
+    )
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    )
+    assert await asyncio.to_thread(verifier.started.wait, 5)
+    claim_task.cancel("hung-cleanup-cancel")
+    verifier.release.set()
+    assert await asyncio.to_thread(cleanup_started.wait, 5)
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(claim_task, timeout=0.5)
+    assert coordinator._sidebar_recovery_tasks
+    await asyncio.wait_for(coordinator.stop(), timeout=0.2)
+
+    cleanup_release.set()
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while coordinator._sidebar_recovery_tasks:
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0.01)
+    assert coordinator._sidebar_recovery_tasks == set()
     db.close()
 
 
