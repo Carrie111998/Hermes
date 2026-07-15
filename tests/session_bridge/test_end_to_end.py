@@ -79,6 +79,7 @@ class _SidebarSkillContract:
     reconcile_limit: int
     project_precedence: tuple[str, ...]
     failure_codes: dict[str, str]
+    forbid_app_server: bool
 
     @classmethod
     def load(cls, path: Path) -> "_SidebarSkillContract":
@@ -166,13 +167,16 @@ class _SidebarSkillContract:
             ):
                 raise ValueError("fixed failure mapping")
 
+            no_app_server_rule = (
+                "Never use app-server thread creation as a fallback"
+            )
             required_rules = (
                 "choose its sidebar project in this exact order",
                 "reconcile before creating anything",
                 '"prompt":"<registration_prompt verbatim>"',
                 "title before commit",
                 "try fail/release once with `bridge_temporarily_unavailable`",
-                "Never use app-server thread creation as a fallback",
+                no_app_server_rule,
             )
             if any(text.count(rule) != 1 for rule in required_rules):
                 raise ValueError("required rule")
@@ -189,6 +193,7 @@ class _SidebarSkillContract:
                 reconcile_limit=int(list_threads.group(2)),
                 project_precedence=tuple(precedence),
                 failure_codes=failure_codes,
+                forbid_app_server=text.count(no_app_server_rule) == 1,
             )
         except (IndexError, OSError, ValueError) as exc:
             raise ValueError(f"sidebar skill contract is invalid: {path}") from exc
@@ -1447,6 +1452,8 @@ class _SidebarEndToEndHarness:
         )
         self.catalog = UnifiedCatalog(self.db, self.store)
         self.production_backend: Any | None = None
+        self.production_codex_target: CodexTargetAdapter | None = None
+        self.allow_forbidden_app_server_fallback_for_mutation = False
         self.worker_traces: list[list[dict[str, Any]]] = []
         self.inbox = tmp_path / ".hermes"
         self.inbox.mkdir()
@@ -1515,6 +1522,9 @@ class _SidebarEndToEndHarness:
             providers=(Provider.CODEX,),
         )
         coordinator._sidebar_verifier = self.native
+        target = coordinator._target_adapters[Provider.CODEX]
+        assert isinstance(target, CodexTargetAdapter)
+        self.production_codex_target = target
         self.coordinator = coordinator
         self.production_backend = backend
         self._rebuild_app()
@@ -1780,6 +1790,26 @@ class _SidebarEndToEndHarness:
                         source_cwd=job["cwd"],
                     )
                 except RuntimeError:
+                    if self.production_codex_target is not None and (
+                        self.allow_forbidden_app_server_fallback_for_mutation
+                        or not self.contract.forbid_app_server
+                    ):
+                        marker_payload = decode_bridge_marker(
+                            _registration_marker(job["registration_prompt"]),
+                            _MARKER_SECRET,
+                        )
+                        trace.append({
+                            "tool": "app-server.create_placeholder",
+                            "job": job_id,
+                            "arguments": {"source_session_id": job_id},
+                        })
+                        self.production_codex_target.create_placeholder(
+                            title=job["title"],
+                            source_session_id=marker_payload.source_session_id,
+                            bridge_id=marker_payload.bridge_id,
+                            policy_generation=marker_payload.policy_generation,
+                            cwd=job["cwd"],
+                        )
                     outcomes.append(fail_once("Desktop offline"))
                     continue
 

@@ -710,12 +710,29 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
             cwd=tmp_path / "native-only",
         )
         harness.register()
+        harness.native.available = False
 
         with harness.client() as client:
-            harness.run_worker_once(client)
+            guarded = harness.run_worker_once(client)
 
-        assert app_server_calls == []
+            harness.seed_source(
+                Provider.HERMES,
+                "fallback-mutation",
+                cwd=tmp_path / "fallback-mutation",
+            )
+            harness.register()
+            harness.allow_forbidden_app_server_fallback_for_mutation = True
+            with pytest.raises(
+                AssertionError,
+                match="sidebar delivery must not call app-server creation",
+            ):
+                harness.run_worker_once(client)
+
+        assert guarded == [
+            {"state": "sidebar_retry", "error_code": "desktop_offline"}
+        ]
+        assert len(app_server_calls) == 1
         assert harness.native.app_server_create_calls == []
-        assert len(harness.native.create_calls) == 1
+        assert harness.native.create_calls == []
     finally:
         harness.close()
