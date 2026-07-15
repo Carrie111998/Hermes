@@ -1786,6 +1786,81 @@ class SessionBridgeStore:
             raise ValueError("sidebar lease has expired")
         return result
 
+    def retry_failed_sidebar_job(
+        self,
+        *,
+        source_session_id: str,
+        expected_error_code: str,
+        now: float,
+    ) -> dict[str, Any]:
+        from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
+
+        source_id = _exact_nonempty_text(
+            source_session_id,
+            "sidebar source session ID",
+        )
+        error_code = _exact_nonempty_text(
+            expected_error_code,
+            "expected sidebar failure",
+        )
+        if error_code not in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS:
+            raise ValueError("expected sidebar failure is not in the fixed allowlist")
+        retry_time = _finite_number(now, "now")
+        idempotency_key = sidebar_idempotency_key(source_id)
+        bridge_id = sidebar_bridge_id(source_id)
+        job_id = f"sidebar-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+
+        def _write(conn):
+            jobs = conn.execute(
+                """SELECT * FROM session_sidebar_jobs
+                   WHERE source_session_id = ? ORDER BY id LIMIT 2""",
+                (source_id,),
+            ).fetchall()
+            job = jobs[0] if len(jobs) == 1 else None
+            if (
+                job is None
+                or job["id"] != job_id
+                or job["idempotency_key"] != idempotency_key
+                or job["bridge_id"] != bridge_id
+                or job["state"] != SidebarJobState.FAILED.value
+                or job["error_code"] != error_code
+                or job["codex_thread_id"] is not None
+                or job["completion_digest"] is not None
+                or job["visible_at"] is not None
+            ):
+                raise ValueError("expected sidebar failure does not match")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, attempts = 0, next_attempt_at = ?,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       error_code = NULL, updated_at = ?
+                   WHERE id = ? AND idempotency_key = ? AND bridge_id = ?
+                     AND source_session_id = ? AND state = ? AND error_code = ?
+                     AND codex_thread_id IS NULL AND completion_digest IS NULL
+                     AND visible_at IS NULL""",
+                (
+                    SidebarJobState.PENDING.value,
+                    retry_time,
+                    retry_time,
+                    job["id"],
+                    idempotency_key,
+                    bridge_id,
+                    source_id,
+                    SidebarJobState.FAILED.value,
+                    error_code,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("expected sidebar failure does not match")
+            return dict(
+                conn.execute(
+                    "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                    (job["id"],),
+                ).fetchone()
+            )
+
+        return self.db._execute_write(_write)
+
     def sidebar_job_counts(self) -> dict[str, int]:
         counts = {state.value: 0 for state in SidebarJobState}
         with self.db._lock:

@@ -3989,6 +3989,152 @@ def test_sidebar_release_returns_an_active_lease_to_pending(db) -> None:
     assert released["error_code"] is None
 
 
+def test_sidebar_operator_retry_requeues_only_the_expected_failed_job(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("fatal-token", "recovered-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="operator-retry")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="marker_conflict",
+        now=150.0,
+    )
+
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="source_identity_mismatch",
+            now=175.0,
+        )
+
+    retried = store.retry_failed_sidebar_job(
+        source_session_id=candidate.source_session_id,
+        expected_error_code="marker_conflict",
+        now=200.0,
+    )
+
+    assert retried["state"] == SidebarJobState.PENDING.value
+    assert retried["attempts"] == 0
+    assert retried["next_attempt_at"] == 200.0
+    assert retried["lease_digest"] is None
+    assert retried["lease_expires_at"] is None
+    assert retried["error_code"] is None
+    assert retried["codex_thread_id"] is None
+    assert store.claim_sidebar_jobs(now=200.0, limit=1)[0]["lease_token"] == (
+        "recovered-token"
+    )
+
+
+def test_sidebar_operator_retry_rejects_a_completed_sibling_job(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("fatal-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="operator-retry-sibling")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="marker_conflict",
+        now=150.0,
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO session_sidebar_jobs (
+               id, idempotency_key, source_session_id, bridge_id, state,
+               attempts, next_attempt_at, completion_digest, codex_thread_id,
+               eligible_at, created_at, updated_at, visible_at
+               ) VALUES (?, ?, ?, ?, 'sidebar_visible', 1, 1, ?, ?, 1, 1, 1, 1)""",
+            (
+                "sidebar-job:completed-sibling",
+                "codex-sidebar:completed-sibling:v1",
+                candidate.source_session_id,
+                "sidebar:" + "f" * 64,
+                "completed-digest",
+                "codex:completed-sibling",
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="marker_conflict",
+            now=200.0,
+        )
+
+
+def test_sidebar_operator_retry_rejects_a_malformed_job_identity(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("fatal-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="operator-retry-malformed")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="marker_conflict",
+        now=150.0,
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_sidebar_jobs
+               SET id = ?, idempotency_key = ?, bridge_id = ?
+               WHERE source_session_id = ?""",
+            (
+                "sidebar-job:malformed",
+                "codex-sidebar:malformed:v1",
+                "sidebar:" + "e" * 64,
+                candidate.source_session_id,
+            ),
+        )
+    )
+
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="marker_conflict",
+            now=200.0,
+        )
+
+
+def test_sidebar_operator_retry_rejects_a_stale_visibility_timestamp(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("fatal-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="operator-retry-visible-at")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="marker_conflict",
+        now=150.0,
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            """UPDATE session_sidebar_jobs SET visible_at = ?
+               WHERE source_session_id = ?""",
+            (125.0, candidate.source_session_id),
+        )
+    )
+
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="marker_conflict",
+            now=200.0,
+        )
+
+
 def test_malformed_sidebar_provider_row_does_not_block_valid_provider(db) -> None:
     store = SessionBridgeStore(
         db,
