@@ -3,12 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import errno
 import hashlib
+import hmac
 import json
 import math
 import os
+import random
+import secrets
 import sys
 import time
-from typing import Any, BinaryIO
+from typing import TYPE_CHECKING, Any, BinaryIO
 
 if sys.platform == "win32":
     import msvcrt
@@ -26,9 +29,13 @@ from .models import (
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarJobState,
     UpsertResult,
     canonical_session_id,
 )
+
+if TYPE_CHECKING:
+    from .sidebar import SidebarCandidate
 
 
 _EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
@@ -55,6 +62,27 @@ _CONTINUATION_SNAPSHOT_FIELDS = frozenset({
     "target_cursor",
     "target_hash",
 })
+SIDEBAR_RETRYABLE_ERRORS = frozenset({
+    "codex_tool_unavailable",
+    "desktop_offline",
+    "bridge_temporarily_unavailable",
+    "sqlite_busy",
+    "rename_failed",
+    "project_lookup_failed",
+    "native_task_not_indexed",
+    "broker_time_budget",
+})
+SIDEBAR_FATAL_ERRORS = frozenset({
+    "marker_conflict",
+    "source_identity_mismatch",
+    "codex_thread_conflict",
+    "provider_mismatch",
+    "source_cwd_missing",
+    "permission_preflight_failed",
+    "retry_budget_exhausted",
+})
+_SIDEBAR_RETRY_DELAYS_SECONDS = (60.0, 120.0, 240.0, 480.0, 900.0)
+_SIDEBAR_LEASE_SECONDS = 300
 
 
 NativeProjectionCursor = tuple[float, str]
@@ -114,9 +142,17 @@ class SessionBridgeStore:
         db: SessionDB,
         *,
         clock: Callable[[], float] = time.time,
+        sidebar_token_factory: Callable[[], str] | None = None,
+        sidebar_jitter: Callable[[float], float] | None = None,
     ) -> None:
         self.db = db
         self._clock = clock
+        self._sidebar_token_factory = sidebar_token_factory or (
+            lambda: secrets.token_urlsafe(32)
+        )
+        self._sidebar_jitter = sidebar_jitter or (
+            lambda bound: random.uniform(0.0, bound)
+        )
 
     def try_acquire_mirror_worker_lock(self) -> _MirrorWorkerFileLock | None:
         """Try to serialize mirror processing and reconciliation across processes."""
@@ -695,6 +731,424 @@ class SessionBridgeStore:
                         "bridge_links": [dict(link) for link in links],
                     }
         return summaries
+
+    def enqueue_sidebar_job(self, candidate: SidebarCandidate) -> dict[str, Any]:
+        from .sidebar import (
+            SidebarCandidate,
+            sidebar_bridge_id,
+            sidebar_idempotency_key,
+        )
+
+        if not isinstance(candidate, SidebarCandidate):
+            raise ValueError("sidebar candidate is malformed")
+        idempotency_key = sidebar_idempotency_key(candidate.source_session_id)
+        expected_provider = (
+            Provider.CLAUDE
+            if candidate.source_session_id.startswith("claude:")
+            else Provider.HERMES
+        )
+        if candidate.provider is not expected_provider:
+            raise ValueError("sidebar candidate provider does not match source")
+        expected_bridge_id = sidebar_bridge_id(candidate.source_session_id)
+        if candidate.bridge_id != expected_bridge_id:
+            raise ValueError("sidebar candidate bridge ID does not match source")
+        eligible_at = _finite_number(candidate.eligible_at, "sidebar eligible_at")
+        now = _finite_number(self._clock(), "store clock")
+        job_id = f"sidebar-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
+
+        def _write(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO session_sidebar_jobs (
+                   id, idempotency_key, source_session_id, bridge_id, state,
+                   attempts, next_attempt_at, eligible_at, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+                (
+                    job_id,
+                    idempotency_key,
+                    candidate.source_session_id,
+                    expected_bridge_id,
+                    SidebarJobState.PENDING.value,
+                    eligible_at,
+                    eligible_at,
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_sidebar_jobs WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if row is None or (
+                row["id"] != job_id
+                or row["source_session_id"] != candidate.source_session_id
+                or row["bridge_id"] != expected_bridge_id
+            ):
+                raise ValueError("conflicting sidebar job identity")
+            return dict(row)
+
+        return self.db._execute_write(_write)
+
+    def claim_sidebar_jobs(
+        self,
+        *,
+        now: float,
+        limit: int,
+        lease_seconds: int = _SIDEBAR_LEASE_SECONDS,
+    ) -> list[dict[str, Any]]:
+        claim_time = _finite_number(now, "now")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 10
+        ):
+            raise ValueError("sidebar claim limit must be between 1 and 10")
+        if (
+            not isinstance(lease_seconds, int)
+            or isinstance(lease_seconds, bool)
+            or lease_seconds != _SIDEBAR_LEASE_SECONDS
+        ):
+            raise ValueError("sidebar lease duration must be exactly 300 seconds")
+
+        def _write(conn):
+            conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+                       lease_expires_at = NULL, error_code = NULL, updated_at = ?
+                   WHERE state = ? AND lease_expires_at <= ?""",
+                (
+                    SidebarJobState.RETRY.value,
+                    claim_time,
+                    claim_time,
+                    SidebarJobState.LEASED.value,
+                    claim_time,
+                ),
+            )
+            due = conn.execute(
+                """SELECT * FROM session_sidebar_jobs
+                   WHERE state IN (?, ?) AND next_attempt_at <= ?
+                   ORDER BY eligible_at, id""",
+                (
+                    SidebarJobState.PENDING.value,
+                    SidebarJobState.RETRY.value,
+                    claim_time,
+                ),
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            for raw_row in due:
+                if len(claimed) >= limit:
+                    break
+                row = dict(raw_row)
+                try:
+                    provider = _validated_sidebar_job_provider(row)
+                except ValueError:
+                    conn.execute(
+                        """UPDATE session_sidebar_jobs
+                           SET state = ?, error_code = ?, updated_at = ?
+                           WHERE id = ? AND state = ?""",
+                        (
+                            SidebarJobState.FAILED.value,
+                            "provider_mismatch",
+                            claim_time,
+                            row["id"],
+                            row["state"],
+                        ),
+                    )
+                    continue
+                lease_token, lease_digest = self._new_sidebar_lease(conn)
+                lease_expires_at = claim_time + lease_seconds
+                cursor = conn.execute(
+                    """UPDATE session_sidebar_jobs
+                       SET state = ?, lease_digest = ?, lease_expires_at = ?,
+                           error_code = NULL, updated_at = ?
+                       WHERE id = ? AND state = ? AND attempts = ?""",
+                    (
+                        SidebarJobState.LEASED.value,
+                        lease_digest,
+                        lease_expires_at,
+                        claim_time,
+                        row["id"],
+                        row["state"],
+                        row["attempts"],
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("stale sidebar job claim")
+                claimed_row = dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (row["id"],),
+                    ).fetchone()
+                )
+                claimed_row["provider"] = provider.value
+                claimed_row["lease_token"] = lease_token
+                claimed.append(claimed_row)
+            return claimed
+
+        return self.db._execute_write(_write)
+
+    def commit_sidebar_job(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+        now: float,
+    ) -> dict[str, Any]:
+        token_digest = _sidebar_lease_digest(lease_token)
+        thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
+        commit_time = _finite_number(now, "now")
+
+        def _write(conn):
+            job, matched_completion = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=True,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if matched_completion:
+                if (
+                    job["state"] == SidebarJobState.VISIBLE.value
+                    and job["codex_thread_id"] == thread_id
+                ):
+                    return dict(job), False
+                raise ValueError("conflicting sidebar completion replay")
+            if job["state"] != SidebarJobState.LEASED.value:
+                raise ValueError("sidebar job is not leased")
+            if float(job["lease_expires_at"]) <= commit_time:
+                _recover_one_expired_sidebar_lease(conn, job, now=commit_time)
+                return dict(job), True
+            conflict = conn.execute(
+                """SELECT id FROM session_sidebar_jobs
+                   WHERE codex_thread_id = ? AND id != ?""",
+                (thread_id, job["id"]),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError("conflicting Codex thread identity")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, completion_digest = lease_digest,
+                       lease_digest = NULL, lease_expires_at = NULL,
+                       codex_thread_id = ?, error_code = NULL,
+                       visible_at = ?, updated_at = ?
+                   WHERE id = ? AND state = ?""",
+                (
+                    SidebarJobState.VISIBLE.value,
+                    thread_id,
+                    commit_time,
+                    commit_time,
+                    job["id"],
+                    SidebarJobState.LEASED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar job commit")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        return result
+
+    def fail_sidebar_job(
+        self,
+        *,
+        lease_token: str,
+        error_code: str,
+        now: float,
+    ) -> dict[str, Any]:
+        token_digest = _sidebar_lease_digest(lease_token)
+        if error_code not in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS:
+            raise ValueError("sidebar error code is not in the fixed allowlist")
+        failure_time = _finite_number(now, "now")
+
+        def _write(conn):
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if float(job["lease_expires_at"]) <= failure_time:
+                _recover_one_expired_sidebar_lease(conn, job, now=failure_time)
+                return dict(job), True
+            if error_code == "broker_time_budget":
+                cursor = conn.execute(
+                    """UPDATE session_sidebar_jobs
+                       SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+                           lease_expires_at = NULL, error_code = ?, updated_at = ?
+                       WHERE id = ? AND state = ?""",
+                    (
+                        SidebarJobState.PENDING.value,
+                        failure_time,
+                        error_code,
+                        failure_time,
+                        job["id"],
+                        SidebarJobState.LEASED.value,
+                    ),
+                )
+            elif error_code in SIDEBAR_FATAL_ERRORS:
+                cursor = conn.execute(
+                    """UPDATE session_sidebar_jobs
+                       SET state = ?, lease_digest = NULL,
+                           lease_expires_at = NULL, error_code = ?, updated_at = ?
+                       WHERE id = ? AND state = ?""",
+                    (
+                        SidebarJobState.FAILED.value,
+                        error_code,
+                        failure_time,
+                        job["id"],
+                        SidebarJobState.LEASED.value,
+                    ),
+                )
+            else:
+                attempts = int(job["attempts"]) + 1
+                base_delay = _SIDEBAR_RETRY_DELAYS_SECONDS[attempts - 1]
+                jitter_bound = min(30.0, base_delay * 0.1)
+                jitter = _finite_number(
+                    self._sidebar_jitter(jitter_bound),
+                    "sidebar retry jitter",
+                )
+                if not 0.0 <= jitter <= jitter_bound:
+                    raise ValueError("sidebar retry jitter is outside its bound")
+                next_attempt_at = failure_time + base_delay + jitter
+                state = (
+                    SidebarJobState.FAILED
+                    if attempts >= len(_SIDEBAR_RETRY_DELAYS_SECONDS)
+                    else SidebarJobState.RETRY
+                )
+                cursor = conn.execute(
+                    """UPDATE session_sidebar_jobs
+                       SET state = ?, attempts = ?, next_attempt_at = ?,
+                           lease_digest = NULL, lease_expires_at = NULL,
+                           error_code = ?, updated_at = ?
+                       WHERE id = ? AND state = ?""",
+                    (
+                        state.value,
+                        attempts,
+                        next_attempt_at,
+                        error_code,
+                        failure_time,
+                        job["id"],
+                        SidebarJobState.LEASED.value,
+                    ),
+                )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar job failure")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        return result
+
+    def release_sidebar_job(
+        self,
+        *,
+        lease_token: str,
+        now: float,
+    ) -> dict[str, Any]:
+        token_digest = _sidebar_lease_digest(lease_token)
+        release_time = _finite_number(now, "now")
+
+        def _write(conn):
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if float(job["lease_expires_at"]) <= release_time:
+                _recover_one_expired_sidebar_lease(conn, job, now=release_time)
+                return dict(job), True
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+                       lease_expires_at = NULL, error_code = NULL, updated_at = ?
+                   WHERE id = ? AND state = ?""",
+                (
+                    SidebarJobState.PENDING.value,
+                    release_time,
+                    release_time,
+                    job["id"],
+                    SidebarJobState.LEASED.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar job release")
+            return (
+                dict(
+                    conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                ),
+                False,
+            )
+
+        result, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        return result
+
+    def sidebar_job_counts(self) -> dict[str, int]:
+        counts = {state.value: 0 for state in SidebarJobState}
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            rows = conn.execute(
+                """SELECT state, COUNT(*) AS job_count
+                   FROM session_sidebar_jobs GROUP BY state"""
+            ).fetchall()
+        for row in rows:
+            counts[row["state"]] = int(row["job_count"])
+        return counts
+
+    def get_sidebar_job_for_source(
+        self,
+        source_session_id: str,
+    ) -> dict[str, Any] | None:
+        from .sidebar import sidebar_idempotency_key
+
+        sidebar_idempotency_key(source_session_id)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                """SELECT * FROM session_sidebar_jobs
+                   WHERE source_session_id = ?""",
+                (source_session_id,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def _new_sidebar_lease(self, conn: Any) -> tuple[str, str]:
+        token = self._sidebar_token_factory()
+        digest = _sidebar_lease_digest(token)
+        existing, _ = _find_sidebar_job_by_digest(
+            conn,
+            digest,
+            allow_completion=True,
+        )
+        if existing is not None:
+            raise ValueError("sidebar lease token factory returned a duplicate")
+        return token, digest
 
     def enqueue_mirror_job(
         self,
@@ -1738,6 +2192,90 @@ def _finite_number(value: object, label: str) -> float:
     ):
         raise ValueError(f"{label} must be a finite number")
     return float(value)
+
+
+def _exact_nonempty_text(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{label} must be an exact nonempty string")
+    return value
+
+
+def _sidebar_lease_digest(lease_token: object) -> str:
+    token = _exact_nonempty_text(lease_token, "sidebar lease token")
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _find_sidebar_job_by_digest(
+    conn: Any,
+    token_digest: str,
+    *,
+    allow_completion: bool,
+) -> tuple[Mapping[str, Any] | None, bool]:
+    rows = conn.execute(
+        """SELECT * FROM session_sidebar_jobs
+           WHERE lease_digest IS NOT NULL OR completion_digest IS NOT NULL"""
+    ).fetchall()
+    matches: list[tuple[Mapping[str, Any], bool]] = []
+    for row in rows:
+        lease_digest = row["lease_digest"]
+        if isinstance(lease_digest, str) and hmac.compare_digest(
+            lease_digest,
+            token_digest,
+        ):
+            matches.append((row, False))
+        completion_digest = row["completion_digest"]
+        if (
+            allow_completion
+            and isinstance(completion_digest, str)
+            and hmac.compare_digest(completion_digest, token_digest)
+        ):
+            matches.append((row, True))
+    if len(matches) > 1:
+        raise ValueError("ambiguous sidebar lease token")
+    return matches[0] if matches else (None, False)
+
+
+def _recover_one_expired_sidebar_lease(
+    conn: Any,
+    job: Mapping[str, Any],
+    *,
+    now: float,
+) -> None:
+    cursor = conn.execute(
+        """UPDATE session_sidebar_jobs
+           SET state = ?, next_attempt_at = ?, lease_digest = NULL,
+               lease_expires_at = NULL, error_code = NULL, updated_at = ?
+           WHERE id = ? AND state = ?""",
+        (
+            SidebarJobState.RETRY.value,
+            now,
+            now,
+            job["id"],
+            SidebarJobState.LEASED.value,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("stale expired sidebar lease")
+
+
+def _validated_sidebar_job_provider(job: Mapping[str, Any]) -> Provider:
+    from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
+
+    source_session_id = job.get("source_session_id")
+    if not isinstance(source_session_id, str):
+        raise ValueError("invalid sidebar source identity")
+    idempotency_key = sidebar_idempotency_key(source_session_id)
+    bridge_id = sidebar_bridge_id(source_session_id)
+    if (
+        job.get("idempotency_key") != idempotency_key
+        or job.get("bridge_id") != bridge_id
+    ):
+        raise ValueError("invalid sidebar job identity")
+    if source_session_id.startswith("claude:"):
+        return Provider.CLAUDE
+    if source_session_id.startswith("codex:"):
+        raise ValueError("Codex cannot be a sidebar source")
+    return Provider.HERMES
 
 
 def _nonnegative_integer(value: object, label: str) -> None:

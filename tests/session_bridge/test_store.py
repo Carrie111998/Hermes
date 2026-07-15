@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -24,7 +25,13 @@ from session_bridge.models import (
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarJobState,
     canonical_session_id,
+)
+from session_bridge.sidebar import (
+    SidebarCandidate,
+    sidebar_bridge_id,
+    sidebar_idempotency_key,
 )
 from session_bridge.store import SessionBridgeStore
 
@@ -2780,4 +2787,516 @@ def test_bridge_summaries_are_batched_and_include_catalog_state(db):
     assert summaries["ordinary"] == {
         "bridge_provider": "hermes",
         "bridge_mirror_state": None,
+    }
+
+
+def _sidebar_candidate(
+    db: SessionDB,
+    *,
+    provider: Provider = Provider.CLAUDE,
+    native_id: str = "sidebar-source",
+    eligible_at: float = 100.0,
+) -> SidebarCandidate:
+    if provider is Provider.CLAUDE:
+        source_session_id = canonical_session_id(provider, native_id)
+        SessionBridgeStore(db, clock=lambda: eligible_at).upsert_projection(
+            _projection(
+                _message(f"message-{native_id}", "build the sidebar feature"),
+                provider=provider,
+                native_id=native_id,
+                last_active=eligible_at,
+            )
+        )
+    elif provider is Provider.HERMES:
+        source_session_id = canonical_session_id(provider, native_id)
+        db.ensure_session(source_session_id, source="cli", started_at=eligible_at)
+    else:
+        raise ValueError("sidebar candidate helper supports Claude or Hermes")
+    return SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=provider,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title=f"[{provider.value}] source",
+        cwd="C:/workspace/project",
+        git_root="C:/workspace/project",
+        git_branch="feature/sidebar",
+        git_head="a" * 40,
+        worktree_id="worktree-1",
+        eligible_at=eligible_at,
+    )
+
+
+def _token_factory(*tokens: str):
+    iterator = iter(tokens)
+    return lambda: next(iterator)
+
+
+def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db)
+
+    first = store.enqueue_sidebar_job(candidate)
+    replay = store.enqueue_sidebar_job(candidate)
+
+    assert replay == first
+    assert first["idempotency_key"] == sidebar_idempotency_key(
+        candidate.source_session_id
+    )
+    assert first["bridge_id"] == candidate.bridge_id
+    assert first["state"] == SidebarJobState.PENDING.value
+    assert first["eligible_at"] == candidate.eligible_at
+    assert len(_rows(db, "SELECT * FROM session_sidebar_jobs")) == 1
+
+
+def test_sidebar_enqueue_rejects_a_conflicting_source_bridge_identity(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db)
+
+    conflicting = replace(candidate, bridge_id="sidebar:" + "0" * 64)
+
+    with pytest.raises(ValueError, match="bridge ID"):
+        store.enqueue_sidebar_job(conflicting)
+    assert _rows(db, "SELECT * FROM session_sidebar_jobs") == []
+
+
+def test_sidebar_claims_are_ordered_bounded_and_digest_tokens_at_rest(db) -> None:
+    tokens = ("opaque-token-a", "opaque-token-b", "opaque-token-c")
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 200.0,
+        sidebar_token_factory=_token_factory(*tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    for native_id, eligible_at in (
+        ("later", 30.0),
+        ("tie-b", 10.0),
+        ("tie-a", 10.0),
+    ):
+        store.enqueue_sidebar_job(
+            _sidebar_candidate(
+                db,
+                native_id=native_id,
+                eligible_at=eligible_at,
+            )
+        )
+    expected = _rows(
+        db,
+        "SELECT id FROM session_sidebar_jobs ORDER BY eligible_at, id LIMIT 2",
+    )
+
+    claimed = store.claim_sidebar_jobs(now=200.0, limit=2)
+
+    assert [job["id"] for job in claimed] == [row["id"] for row in expected]
+    assert [job["lease_token"] for job in claimed] == list(tokens[:2])
+    assert all(job["lease_expires_at"] == 500.0 for job in claimed)
+    persisted = {
+        row["id"]: row
+        for row in _rows(db, "SELECT * FROM session_sidebar_jobs")
+    }
+    for job, token in zip(claimed, tokens[:2], strict=True):
+        row = persisted[job["id"]]
+        assert row["lease_digest"] == hashlib.sha256(token.encode()).hexdigest()
+        assert token not in row.values()
+        assert "lease_token" not in row
+    assert store.claim_sidebar_jobs(now=200.0, limit=1)[0]["lease_token"] == tokens[2]
+    assert store.claim_sidebar_jobs(now=200.0, limit=1) == []
+
+
+@pytest.mark.parametrize("limit", [0, 11, True, 1.5])
+def test_sidebar_claim_validates_the_fixed_batch_bound(db, limit) -> None:
+    store = SessionBridgeStore(db)
+
+    with pytest.raises(ValueError, match="between 1 and 10"):
+        store.claim_sidebar_jobs(now=100.0, limit=limit)
+
+
+@pytest.mark.parametrize("now", [float("nan"), float("inf"), True, "100"])
+def test_sidebar_claim_rejects_nonfinite_times(db, now) -> None:
+    store = SessionBridgeStore(db)
+
+    with pytest.raises(ValueError, match="finite"):
+        store.claim_sidebar_jobs(now=now, limit=1)
+
+
+def test_sidebar_claim_enforces_the_fixed_five_minute_lease(db) -> None:
+    store = SessionBridgeStore(db)
+
+    with pytest.raises(ValueError, match="exactly 300"):
+        store.claim_sidebar_jobs(now=100.0, limit=1, lease_seconds=299)
+
+
+def test_sidebar_claim_is_atomic_across_independent_store_instances(tmp_path) -> None:
+    path = tmp_path / "shared-sidebar-state.db"
+    first_db = SessionDB(path)
+    second_db = SessionDB(path)
+    try:
+        first = SessionBridgeStore(
+            first_db,
+            sidebar_token_factory=_token_factory("first-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        second = SessionBridgeStore(
+            second_db,
+            sidebar_token_factory=_token_factory("second-token"),
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        for native_id in ("atomic-a", "atomic-b"):
+            first.enqueue_sidebar_job(
+                _sidebar_candidate(first_db, native_id=native_id, eligible_at=10.0)
+            )
+        barrier = Barrier(2)
+
+        def _claim(store):
+            barrier.wait()
+            return store.claim_sidebar_jobs(now=100.0, limit=1)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            batches = list(executor.map(_claim, (first, second)))
+
+        claimed = [job for batch in batches for job in batch]
+        assert len(claimed) == 2
+        assert len({job["id"] for job in claimed}) == 2
+        assert {job["lease_token"] for job in claimed} == {
+            "first-token",
+            "second-token",
+        }
+    finally:
+        second_db.close()
+        first_db.close()
+
+
+def test_expired_sidebar_lease_recovers_to_retry_then_can_be_released_again(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "expired-token", "other-token", "replacement-token"
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    expired = _sidebar_candidate(db, native_id="expired", eligible_at=20.0)
+    store.enqueue_sidebar_job(expired)
+    first = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    other = _sidebar_candidate(db, native_id="other", eligible_at=10.0)
+    store.enqueue_sidebar_job(other)
+
+    claimed_other = store.claim_sidebar_jobs(now=400.0, limit=1)[0]
+
+    assert claimed_other["source_session_id"] == other.source_session_id
+    recovered = store.get_sidebar_job_for_source(expired.source_session_id)
+    assert recovered is not None
+    assert recovered["state"] == SidebarJobState.RETRY.value
+    assert recovered["attempts"] == 0
+    assert recovered["lease_digest"] is None
+    replacement = store.claim_sidebar_jobs(now=400.0, limit=1)[0]
+    assert replacement["source_session_id"] == expired.source_session_id
+    assert replacement["lease_token"] == "replacement-token"
+    with pytest.raises(ValueError, match="lease token"):
+        store.commit_sidebar_job(
+            lease_token=first["lease_token"],
+            codex_thread_id="codex-old",
+            now=400.0,
+        )
+
+
+def test_sidebar_commit_requires_exact_unexpired_token_and_is_idempotent(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("commit-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="commit")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    committed = store.commit_sidebar_job(
+        lease_token=lease["lease_token"],
+        codex_thread_id="codex-thread-1",
+        now=399.999,
+    )
+    replay = store.commit_sidebar_job(
+        lease_token=lease["lease_token"],
+        codex_thread_id="codex-thread-1",
+        now=400.0,
+    )
+
+    assert replay == committed
+    assert committed["state"] == SidebarJobState.VISIBLE.value
+    assert committed["codex_thread_id"] == "codex-thread-1"
+    assert committed["visible_at"] == 399.999
+    assert committed["lease_digest"] is None
+    assert committed["lease_expires_at"] is None
+    assert committed["completion_digest"] == hashlib.sha256(
+        b"commit-token"
+    ).hexdigest()
+
+
+def test_sidebar_commit_rejects_expiry_and_recovers_the_job(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("expiring-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="expiring")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    with pytest.raises(ValueError, match="expired"):
+        store.commit_sidebar_job(
+            lease_token=lease["lease_token"],
+            codex_thread_id="codex-too-late",
+            now=400.0,
+        )
+
+    recovered = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert recovered is not None
+    assert recovered["state"] == SidebarJobState.RETRY.value
+    assert recovered["lease_digest"] is None
+
+
+def test_sidebar_commit_fails_closed_for_different_task_or_token(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("exact-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="conflict")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    store.commit_sidebar_job(
+        lease_token=lease["lease_token"],
+        codex_thread_id="codex-original",
+        now=200.0,
+    )
+
+    with pytest.raises(ValueError, match="conflicting"):
+        store.commit_sidebar_job(
+            lease_token=lease["lease_token"],
+            codex_thread_id="codex-different",
+            now=201.0,
+        )
+    with pytest.raises(ValueError, match="lease token"):
+        store.commit_sidebar_job(
+            lease_token="different-token",
+            codex_thread_id="codex-original",
+            now=201.0,
+        )
+    persisted = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert persisted is not None
+    assert persisted["codex_thread_id"] == "codex-original"
+
+
+def test_sidebar_fail_rejects_non_allowlisted_error_without_releasing(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("error-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="bad-error")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    with pytest.raises(ValueError, match="fixed allowlist"):
+        store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="Traceback: secret detail",
+            now=150.0,
+        )
+
+    row = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert row is not None
+    assert row["state"] == SidebarJobState.LEASED.value
+    assert row["error_code"] is None
+    assert "error_detail" not in row
+
+
+def test_sidebar_retry_backoff_counts_failures_and_fails_on_attempt_five(db) -> None:
+    jitter_bounds = []
+
+    def _max_jitter(bound: float) -> float:
+        jitter_bounds.append(bound)
+        return bound
+
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "retry-token-1",
+            "retry-token-2",
+            "retry-token-3",
+            "retry-token-4",
+            "retry-token-5",
+        ),
+        sidebar_jitter=_max_jitter,
+    )
+    candidate = _sidebar_candidate(db, native_id="retry")
+    store.enqueue_sidebar_job(candidate)
+    now = 100.0
+    expected = (
+        (60.0, 6.0),
+        (120.0, 12.0),
+        (240.0, 24.0),
+        (480.0, 30.0),
+        (900.0, 30.0),
+    )
+
+    for attempt, (base, jitter) in enumerate(expected, start=1):
+        lease = store.claim_sidebar_jobs(now=now, limit=1)[0]
+        failed = store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="desktop_offline",
+            now=now,
+        )
+        assert failed["attempts"] == attempt
+        assert failed["next_attempt_at"] == now + base + jitter
+        expected_state = (
+            SidebarJobState.FAILED.value
+            if attempt == 5
+            else SidebarJobState.RETRY.value
+        )
+        assert failed["state"] == expected_state
+        now = failed["next_attempt_at"]
+
+    assert jitter_bounds == [6.0, 12.0, 24.0, 30.0, 30.0]
+    assert store.claim_sidebar_jobs(now=now, limit=1) == []
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "marker_conflict",
+        "source_identity_mismatch",
+        "codex_thread_conflict",
+        "provider_mismatch",
+        "source_cwd_missing",
+        "permission_preflight_failed",
+        "retry_budget_exhausted",
+    ],
+)
+def test_sidebar_fatal_errors_fail_immediately_without_counting_attempt(
+    db, error_code: str
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(f"fatal-{error_code}"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=f"fatal-{error_code}")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code=error_code,
+        now=150.0,
+    )
+
+    assert failed["state"] == SidebarJobState.FAILED.value
+    assert failed["attempts"] == 0
+    assert failed["error_code"] == error_code
+    assert failed["lease_digest"] is None
+
+
+def test_sidebar_broker_budget_failure_releases_without_attempt_or_delay(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("budget-token", "budget-retry"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="budget")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    released = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="broker_time_budget",
+        now=150.0,
+    )
+
+    assert released["state"] == SidebarJobState.PENDING.value
+    assert released["attempts"] == 0
+    assert released["next_attempt_at"] == 150.0
+    assert released["error_code"] == "broker_time_budget"
+    assert store.claim_sidebar_jobs(now=150.0, limit=1)[0]["lease_token"] == (
+        "budget-retry"
+    )
+
+
+def test_sidebar_release_returns_an_active_lease_to_pending(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("release-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="release")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    released = store.release_sidebar_job(
+        lease_token=lease["lease_token"],
+        now=175.0,
+    )
+
+    assert released["state"] == SidebarJobState.PENDING.value
+    assert released["attempts"] == 0
+    assert released["next_attempt_at"] == 175.0
+    assert released["lease_digest"] is None
+    assert released["error_code"] is None
+
+
+def test_malformed_sidebar_provider_row_does_not_block_valid_provider(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("valid-provider-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    db.create_session("codex:malformed-source", source="codex")
+    db._execute_write(
+        lambda conn: conn.execute(
+            """INSERT INTO session_sidebar_jobs (
+               id, idempotency_key, source_session_id, bridge_id, state,
+               attempts, next_attempt_at, eligible_at, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, 'sidebar_pending', 0, 1, 1, 1, 1)""",
+            (
+                "sidebar-job-malformed",
+                "codex-sidebar:codex:malformed-source:v1",
+                "codex:malformed-source",
+                "sidebar:" + "f" * 64,
+            ),
+        )
+    )
+    candidate = _sidebar_candidate(db, native_id="valid-provider", eligible_at=2.0)
+    store.enqueue_sidebar_job(candidate)
+
+    claimed = store.claim_sidebar_jobs(now=100.0, limit=1)
+
+    assert [job["source_session_id"] for job in claimed] == [
+        candidate.source_session_id
+    ]
+    malformed = _rows(
+        db,
+        "SELECT * FROM session_sidebar_jobs WHERE id = 'sidebar-job-malformed'",
+    )[0]
+    assert malformed["state"] == SidebarJobState.FAILED.value
+    assert malformed["error_code"] == "provider_mismatch"
+
+
+def test_sidebar_counts_and_source_lookup_have_stable_public_shapes(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("lookup-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    pending = _sidebar_candidate(db, native_id="lookup-pending")
+    leased = _sidebar_candidate(db, native_id="lookup-leased")
+    store.enqueue_sidebar_job(pending)
+    leased_row = store.enqueue_sidebar_job(leased)
+
+    assert store.get_sidebar_job_for_source("missing") is None
+    assert store.get_sidebar_job_for_source(leased.source_session_id) == leased_row
+    store.claim_sidebar_jobs(now=200.0, limit=1)
+    assert store.sidebar_job_counts() == {
+        "sidebar_pending": 1,
+        "sidebar_leased": 1,
+        "sidebar_visible": 0,
+        "sidebar_retry": 0,
+        "sidebar_failed": 0,
     }
