@@ -174,6 +174,21 @@ def test_exact_registration_prompt_misprojected_as_native_is_ignored() -> None:
     assert not is_sidebar_session_eligible(projection, now=NOW)
 
 
+def test_disposable_bridge_characterization_session_is_ineligible() -> None:
+    projection = replace(
+        _projection(
+            Provider.CLAUDE,
+            "Hermes Bridge live characterization resume verification. Reply READY.",
+        ),
+        title=(
+            "[Hermes Bridge Characterization] "
+            "f04e561e-9d0f-4d95-95ac-3c3c6c29f078"
+        ),
+    )
+
+    assert not is_sidebar_session_eligible(projection, now=NOW)
+
+
 @pytest.mark.parametrize(
     "modify",
     [

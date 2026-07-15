@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import re
 import unicodedata
 
 from .context_pack import _redact
@@ -43,6 +44,11 @@ _MARKER_FIELDS = frozenset({
 })
 _BASE64URL_CHARACTERS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+_CHARACTERIZATION_TITLE_RE = re.compile(
+    r"^\[Hermes Bridge Characterization\] "
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 
 
@@ -105,6 +111,12 @@ def is_sidebar_session_eligible(
     ):
         return False
     if projection.last_active < now - backfill_days * 86_400:
+        return False
+    if (
+        projection.provider is Provider.CLAUDE
+        and isinstance(projection.title, str)
+        and _CHARACTERIZATION_TITLE_RE.fullmatch(projection.title) is not None
+    ):
         return False
 
     for message in projection.messages:
