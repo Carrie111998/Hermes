@@ -58,12 +58,63 @@ EXPECTED_BRIDGE_FOREIGN_KEYS = {
     "session_bridge_state": set(),
 }
 
+V20_MIRROR_JOB_COLUMNS = (
+    "id",
+    "idempotency_key",
+    "source_session_id",
+    "target_provider",
+    "state",
+    "attempts",
+    "next_attempt_at",
+    "target_native_id",
+    "error_code",
+    "error_detail",
+    "created_at",
+    "updated_at",
+)
+V20_MIRROR_JOB_ROW = (
+    "existing-mirror-job",
+    "existing-idempotency-key",
+    "existing-session",
+    "codex",
+    "retry",
+    3,
+    1010.25,
+    "existing-native-target",
+    "existing-error-code",
+    "existing error detail",
+    1002.5,
+    1009.75,
+)
+
 
 def _prepare_v20_database(db_path: Path) -> int:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(hermes_state.SCHEMA_SQL)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS session_mirror_jobs (
+                id TEXT PRIMARY KEY,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                source_session_id TEXT NOT NULL REFERENCES sessions(id),
+                target_provider TEXT NOT NULL CHECK (target_provider IN ('claude', 'codex')),
+                state TEXT NOT NULL CHECK (
+                    state IN ('queued', 'running', 'retry', 'succeeded', 'manual_failure')
+                ),
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                target_native_id TEXT,
+                error_code TEXT,
+                error_detail TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_mirror_jobs_state_next_attempt_at
+                ON session_mirror_jobs(state, next_attempt_at);
+            """
+        )
         conn.execute("INSERT INTO schema_version (version) VALUES (20)")
         conn.execute(
             "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
@@ -76,6 +127,12 @@ def _prepare_v20_database(db_path: Path) -> int:
         )
         message_id = cursor.lastrowid
         assert message_id is not None
+        placeholders = ", ".join("?" for _ in V20_MIRROR_JOB_COLUMNS)
+        conn.execute(
+            "INSERT INTO session_mirror_jobs "
+            f"({', '.join(V20_MIRROR_JOB_COLUMNS)}) VALUES ({placeholders})",
+            V20_MIRROR_JOB_ROW,
+        )
         conn.commit()
         return message_id
     finally:
@@ -104,6 +161,50 @@ def _insert_external_session(
         ") VALUES (?, ?, ?, ?, ?, ?, ?)",
         (session_id, provider, native_id, 1000.0, 1001.0, 1, origin_kind),
     )
+
+
+def _insert_sidebar_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str = "sidebar-job-1",
+    state: str = "sidebar_pending",
+    attempts: int = 0,
+    lease_digest: str | None = None,
+    lease_expires_at: float | None = None,
+    completion_digest: str | None = None,
+    codex_thread_id: str | None = None,
+    visible_at: float | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO session_sidebar_jobs ("
+        "id, idempotency_key, source_session_id, bridge_id, state, attempts, "
+        "next_attempt_at, lease_digest, lease_expires_at, completion_digest, "
+        "codex_thread_id, eligible_at, created_at, updated_at, visible_at"
+        ") VALUES (?, ?, 'source', ?, ?, ?, 2, ?, ?, ?, ?, 1, 1, 1, ?)",
+        (
+            job_id,
+            f"idempotency-{job_id}",
+            f"bridge-{job_id}",
+            state,
+            attempts,
+            lease_digest,
+            lease_expires_at,
+            completion_digest,
+            codex_thread_id,
+            visible_at,
+        ),
+    )
+
+
+def _read_v20_mirror_job(conn: sqlite3.Connection) -> tuple:
+    row = conn.execute(
+        "SELECT "
+        + ", ".join(V20_MIRROR_JOB_COLUMNS)
+        + " FROM session_mirror_jobs WHERE id = ?",
+        (V20_MIRROR_JOB_ROW[0],),
+    ).fetchone()
+    assert row is not None
+    return tuple(row)
 
 
 def _bridge_objects(db_path: Path) -> list[tuple[str, str, str]]:
@@ -141,7 +242,7 @@ def test_fresh_database_creates_bridge_tables_indexes_and_schema_v21(tmp_path):
         db.close()
 
 
-def test_v20_database_upgrades_without_losing_sessions_or_messages(tmp_path):
+def test_v20_database_upgrades_without_changing_existing_rows(tmp_path):
     db_path = tmp_path / "v20.db"
     message_id = _prepare_v20_database(db_path)
 
@@ -165,8 +266,15 @@ def test_v20_database_upgrades_without_losing_sessions_or_messages(tmp_path):
             "user",
             "preserve me",
         )
+        assert _read_v20_mirror_job(db._conn) == V20_MIRROR_JOB_ROW
     finally:
         db.close()
+
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        assert _read_v20_mirror_job(reopened._conn) == V20_MIRROR_JOB_ROW
+    finally:
+        reopened.close()
 
 
 def test_reopening_upgraded_database_is_idempotent(tmp_path):
@@ -345,6 +453,144 @@ def test_sidebar_job_source_session_foreign_key_is_enforced(tmp_path):
         db.close()
 
 
+def test_sidebar_job_rejects_negative_attempts(tmp_path):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-negative-attempts.db")
+    try:
+        _seed_sessions(db._conn, "source")
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            _insert_sidebar_job(db._conn, attempts=-1)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("lease_digest", "lease_expires_at"),
+    [
+        (None, None),
+        ("lease-digest", None),
+        (None, 5.0),
+    ],
+    ids=["both-missing", "expiry-missing", "digest-missing"],
+)
+def test_sidebar_leased_requires_both_lease_fields(
+    tmp_path, lease_digest, lease_expires_at
+):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-leased-fields.db")
+    try:
+        _seed_sessions(db._conn, "source")
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            _insert_sidebar_job(
+                db._conn,
+                state="sidebar_leased",
+                lease_digest=lease_digest,
+                lease_expires_at=lease_expires_at,
+            )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "sidebar_pending",
+        "sidebar_visible",
+        "sidebar_retry",
+        "sidebar_failed",
+    ],
+)
+@pytest.mark.parametrize(
+    ("lease_digest", "lease_expires_at"),
+    [
+        ("lease-digest", None),
+        (None, 5.0),
+        ("lease-digest", 5.0),
+    ],
+    ids=["digest-present", "expiry-present", "both-present"],
+)
+def test_non_leased_sidebar_states_reject_active_lease_fields(
+    tmp_path, state, lease_digest, lease_expires_at
+):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-non-leased-fields.db")
+    try:
+        _seed_sessions(db._conn, "source")
+        visible_fields = (
+            {
+                "completion_digest": "completion-digest",
+                "codex_thread_id": "thread-1",
+                "visible_at": 6.0,
+            }
+            if state == "sidebar_visible"
+            else {}
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            _insert_sidebar_job(
+                db._conn,
+                state=state,
+                lease_digest=lease_digest,
+                lease_expires_at=lease_expires_at,
+                **visible_fields,
+            )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["codex_thread_id", "visible_at", "completion_digest"],
+)
+def test_sidebar_visible_requires_every_completion_field(tmp_path, missing_field):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-visible-fields.db")
+    try:
+        _seed_sessions(db._conn, "source")
+        visible_fields = {
+            "completion_digest": "completion-digest",
+            "codex_thread_id": "thread-1",
+            "visible_at": 6.0,
+        }
+        visible_fields[missing_field] = None
+        with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+            _insert_sidebar_job(
+                db._conn,
+                state="sidebar_visible",
+                **visible_fields,
+            )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("state", "fields"),
+    [
+        ("sidebar_pending", {}),
+        (
+            "sidebar_leased",
+            {"lease_digest": "lease-digest", "lease_expires_at": 5.0},
+        ),
+        (
+            "sidebar_visible",
+            {
+                "completion_digest": "completion-digest",
+                "codex_thread_id": "thread-1",
+                "visible_at": 6.0,
+            },
+        ),
+        ("sidebar_retry", {}),
+        ("sidebar_failed", {}),
+    ],
+)
+def test_valid_sidebar_job_state_shapes_are_insertable(tmp_path, state, fields):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-valid-shapes.db")
+    try:
+        _seed_sessions(db._conn, "source")
+        _insert_sidebar_job(db._conn, state=state, **fields)
+
+        assert db._conn.execute(
+            "SELECT state FROM session_sidebar_jobs"
+        ).fetchone()[0] == state
+    finally:
+        db.close()
+
+
 @pytest.mark.parametrize(
     ("sql", "params"),
     [
@@ -440,9 +686,10 @@ def test_bridge_schema_failure_rolls_back_ddl_and_keeps_v20(tmp_path, monkeypatc
             (message_id,),
         ).fetchone()
 
-        assert bridge_tables == set()
+        assert bridge_tables == {"session_mirror_jobs"}
         assert version == 20
         assert session == ("existing-session",)
         assert message == ("preserve me",)
+        assert _read_v20_mirror_job(conn) == V20_MIRROR_JOB_ROW
     finally:
         conn.close()
