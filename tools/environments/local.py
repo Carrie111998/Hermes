@@ -1293,6 +1293,16 @@ class LocalEnvironment(BaseEnvironment):
     CWD persists via file-based read after each command.
     """
 
+    @property
+    def _restore_ambient_login_path(self) -> bool:
+        """Git Bash's /etc/profile is additive (nothing to repair) and its PATH
+        order must not be disturbed, so keep the #56634 repair POSIX-only.
+
+        Read per call, not bound in the class body: ``_IS_WINDOWS`` is patched
+        by the Git-Bash tests, which run on POSIX CI.
+        """
+        return not _IS_WINDOWS
+
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
         super().__init__(cwd=cwd, timeout=timeout, env=env)
