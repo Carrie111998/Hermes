@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import re
 import signal
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -211,6 +212,33 @@ class TestFileHandleClosedOnError:
         mock_fh.close.assert_called_once()
         assert adapter._bridge_log_fh is None
 
+    @pytest.mark.asyncio
+    async def test_logged_out_bridge_is_nonretryable_during_connect(self):
+        """A revoked WhatsApp session must stop the reconnect loop and request pairing."""
+        from plugins.platforms.whatsapp.adapter import WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE
+
+        adapter = _make_adapter()
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE
+        mock_proc.returncode = WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE
+
+        mock_fh = MagicMock()
+        patches = _connect_patches(mock_proc, mock_fh)
+
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patches[5], patches[6], patches[7]:
+            result = await adapter.connect()
+
+        assert result is False
+        assert adapter.fatal_error_code == "whatsapp_session_logged_out"
+        assert adapter.fatal_error_retryable is False
+        assert "hermes whatsapp" in (adapter.fatal_error_message or "")
+        fatal_handler.assert_awaited_once()
+        mock_fh.close.assert_called_once()
+
 
 class TestConnectCleanup:
     """Verify failure paths release the scoped session lock."""
@@ -234,6 +262,22 @@ class TestConnectCleanup:
         assert result is False
         mock_release.assert_called_once_with("whatsapp-session", str(adapter._session_path))
         assert adapter._platform_lock_identity is None
+
+
+def test_bridge_logged_out_exit_code_matches_adapter_contract():
+    """The Node bridge and Python adapter must agree on the terminal exit code."""
+    from plugins.platforms.whatsapp.adapter import WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE
+
+    bridge_source = (
+        Path(__file__).resolve().parents[2] / "scripts" / "whatsapp-bridge" / "bridge.js"
+    ).read_text(encoding="utf-8")
+    match = re.search(
+        r"const WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE = (\d+);",
+        bridge_source,
+    )
+    assert match is not None
+    assert int(match.group(1)) == WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE
+    assert "process.exit(WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE)" in bridge_source
 
 
 class TestBridgeRuntimeFailure:
