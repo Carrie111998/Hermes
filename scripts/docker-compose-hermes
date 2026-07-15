@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ENV_FILE=${HERMES_COMPOSE_ENV_FILE:-"$PROJECT_ROOT/.env"}
+
+fail() {
+    echo "hermes compose preflight: $*" >&2
+    exit 64
+}
+
+[ -f "$ENV_FILE" ] || fail "missing $ENV_FILE; copy docker-compose.env.example to .env"
+
+# Read only the deployment variables needed by this preflight. Do not source
+# the application .env because it may contain provider credentials.
+get_env_value() {
+    key=$1
+    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1
+}
+
+HERMES_UID=${HERMES_UID:-$(get_env_value HERMES_UID)}
+HERMES_GID=${HERMES_GID:-$(get_env_value HERMES_GID)}
+HERMES_DATA_DIR=${HERMES_DATA_DIR:-$(get_env_value HERMES_DATA_DIR)}
+
+case "$HERMES_UID" in ''|*[!0-9]*) fail "HERMES_UID must be a numeric host UID";; esac
+case "$HERMES_GID" in ''|*[!0-9]*) fail "HERMES_GID must be a numeric host GID";; esac
+case "$HERMES_DATA_DIR" in /*) ;; *) fail "HERMES_DATA_DIR must be an absolute path";; esac
+[ "$HERMES_UID" -ge 1 ] && [ "$HERMES_UID" -le 65534 ] || fail "HERMES_UID is outside 1..65534"
+[ "$HERMES_GID" -ge 1 ] && [ "$HERMES_GID" -le 65534 ] || fail "HERMES_GID is outside 1..65534"
+[ -d "$HERMES_DATA_DIR" ] || fail "HERMES_DATA_DIR does not exist: $HERMES_DATA_DIR"
+
+actual_uid=$(stat -c %u "$HERMES_DATA_DIR") || fail "cannot stat $HERMES_DATA_DIR"
+actual_gid=$(stat -c %g "$HERMES_DATA_DIR") || fail "cannot stat $HERMES_DATA_DIR"
+[ "$actual_uid" = "$HERMES_UID" ] || fail "HERMES_DATA_DIR owner UID $actual_uid != HERMES_UID $HERMES_UID"
+[ "$actual_gid" = "$HERMES_GID" ] || fail "HERMES_DATA_DIR owner GID $actual_gid != HERMES_GID $HERMES_GID"
+
+export HERMES_UID HERMES_GID HERMES_DATA_DIR
+exec docker compose --project-directory "$PROJECT_ROOT" -f "$PROJECT_ROOT/docker-compose.yml" "$@"

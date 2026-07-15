@@ -2,9 +2,13 @@
 # docker-compose.yml for Hermes Agent
 #
 # Usage:
-#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d
+#   ./scripts/docker-compose-hermes up -d
 #
-# Set HERMES_UID / HERMES_GID to the host user that owns ~/.hermes so
+# The wrapper validates the persistent path and host identity before invoking
+# Compose. Raw `docker compose` is also fail-closed because the required
+# variables below have no fallback values.
+#
+# Set HERMES_UID / HERMES_GID to the host user that owns HERMES_DATA_DIR so
 # files created inside the container stay readable/writable on the host.
 # The s6-overlay stage2 hook remaps the internal `hermes` user to these
 # values via usermod/groupmod; each supervised service then drops to that
@@ -34,46 +38,44 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      - ~/.hermes:/opt/data
+      - ${HERMES_DATA_DIR:?HERMES_DATA_DIR must be set to the existing Hermes data directory}:/opt/data
     environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
-      - HERMES_DASHBOARD=true
-      - HERMES_DASHBOARD_HOST=127.0.0.1
-      - HERMES_DASHBOARD_PORT=9119
+      HERMES_UID: ${HERMES_UID:?HERMES_UID must be set to the owner UID of HERMES_DATA_DIR}
+      HERMES_GID: ${HERMES_GID:?HERMES_GID must be set to the owner GID of HERMES_DATA_DIR}
+      HERMES_DASHBOARD: "true"
+      HERMES_DASHBOARD_HOST: 127.0.0.1
+      HERMES_DASHBOARD_PORT: "9119"
       # To expose the OpenAI-compatible API server beyond localhost,
       # uncomment BOTH lines (API_SERVER_KEY is mandatory for auth):
-      # - API_SERVER_HOST=0.0.0.0
-      # - API_SERVER_KEY=${API_SERVER_KEY}
+      # API_SERVER_HOST: 0.0.0.0
+      # API_SERVER_KEY: ${API_SERVER_KEY}
       # Microsoft Teams — uncomment and fill in to enable Teams gateway.
       # Register your bot at https://dev.botframework.com/ to get these values.
-      # - TEAMS_CLIENT_ID=${TEAMS_CLIENT_ID}
-      # - TEAMS_CLIENT_SECRET=${TEAMS_CLIENT_SECRET}
-      # - TEAMS_TENANT_ID=${TEAMS_TENANT_ID}
-      # - TEAMS_ALLOWED_USERS=${TEAMS_ALLOWED_USERS}
-      # - TEAMS_PORT=${TEAMS_PORT:-3978}
+      # TEAMS_CLIENT_ID: ${TEAMS_CLIENT_ID}
+      # TEAMS_CLIENT_SECRET: ${TEAMS_CLIENT_SECRET}
+      # TEAMS_TENANT_ID: ${TEAMS_TENANT_ID}
+      # TEAMS_ALLOWED_USERS: ${TEAMS_ALLOWED_USERS}
+      # TEAMS_PORT: ${TEAMS_PORT:-3978}
       # Google Chat — uncomment and fill in to enable the Google Chat gateway.
       # See website/docs/user-guide/messaging/google_chat.md for the full setup.
       # The SA JSON path must point to a file mounted into the container —
       # add a volume entry above (e.g. ``- ~/.hermes/google-chat-sa.json:/secrets/google-chat-sa.json:ro``)
       # then set GOOGLE_CHAT_SERVICE_ACCOUNT_JSON to that mount path.
-      # - GOOGLE_CHAT_PROJECT_ID=${GOOGLE_CHAT_PROJECT_ID}
-      # - GOOGLE_CHAT_SUBSCRIPTION_NAME=${GOOGLE_CHAT_SUBSCRIPTION_NAME}
-      # - GOOGLE_CHAT_SERVICE_ACCOUNT_JSON=${GOOGLE_CHAT_SERVICE_ACCOUNT_JSON}
-      # - GOOGLE_CHAT_ALLOWED_USERS=${GOOGLE_CHAT_ALLOWED_USERS}
+      # GOOGLE_CHAT_PROJECT_ID: ${GOOGLE_CHAT_PROJECT_ID}
+      # GOOGLE_CHAT_SUBSCRIPTION_NAME: ${GOOGLE_CHAT_SUBSCRIPTION_NAME}
+      # GOOGLE_CHAT_SERVICE_ACCOUNT_JSON: ${GOOGLE_CHAT_SERVICE_ACCOUNT_JSON}
+      # GOOGLE_CHAT_ALLOWED_USERS: ${GOOGLE_CHAT_ALLOWED_USERS}
     command: ["gateway", "run"]
-
-  dashboard:
-    image: hermes-agent
-    container_name: hermes-dashboard
-    restart: unless-stopped
-    network_mode: host
-    depends_on:
-      - gateway
-    volumes:
-      - ~/.hermes:/opt/data
-    environment:
-      - HERMES_UID=${HERMES_UID:-10000}
-      - HERMES_GID=${HERMES_GID:-10000}
-    # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
-    command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          test "$$(id -u hermes)" = "$${HERMES_UID}" &&
+          test "$$(id -g hermes)" = "$${HERMES_GID}" &&
+          s6-setuidgid hermes sh -c
+          'test -r /opt/data/config.yaml && test -r /opt/data/webui/settings.json &&
+          test -r /opt/data/skills && test -r /opt/data/plugins && test -r /opt/data/state.db'
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
