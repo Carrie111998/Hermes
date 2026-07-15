@@ -381,6 +381,203 @@ async def test_cancelled_reconciliation_releases_every_claimed_lease(tmp_path) -
     db.close()
 
 
+@pytest.mark.asyncio
+async def test_cancellation_after_durable_claim_commit_releases_every_lease(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "cancelled-during-claim.db")
+    tokens = iter(("claim-boundary-one", "claim-boundary-two"))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    sources: list[str] = []
+    for ordinal in (1, 2):
+        source = f"claude:claim-boundary-{ordinal}"
+        sources.append(source)
+        db.ensure_session(source, source="cli")
+        store.enqueue_sidebar_job(SidebarCandidate(
+            source_session_id=source,
+            provider=Provider.CLAUDE,
+            bridge_id=sidebar_bridge_id(source),
+            title=f"[Claude] Claim boundary {ordinal}",
+            cwd=f"C:/claim-boundary/{ordinal}",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=10.0 + ordinal,
+        ))
+    committed = threading.Event()
+    release = threading.Event()
+    original_claim = store.claim_sidebar_jobs
+
+    def claim_then_pause(**kwargs: Any) -> list[dict[str, Any]]:
+        claimed = original_claim(**kwargs)
+        committed.set()
+        assert release.wait(timeout=5)
+        return claimed
+
+    monkeypatch.setattr(store, "claim_sidebar_jobs", claim_then_pause)
+    coordinator = _coordinator(store, FakeVerifier(None), clock=lambda: 100.0)
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+    )
+    assert await asyncio.to_thread(committed.wait, 5)
+
+    claim_task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+
+    jobs = [store.get_sidebar_job_for_source(source) for source in sources]
+    assert all(job is not None for job in jobs)
+    assert all(job["state"] == "sidebar_pending" for job in jobs if job is not None)
+    assert all(job["lease_digest"] is None for job in jobs if job is not None)
+    db.close()
+
+
+class BlockingClaimFailureStore(FakeSidebarStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def claim_sidebar_jobs(
+        self, *, now: float, limit: int, lease_seconds: int
+    ) -> list[dict[str, Any]]:
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        raise RuntimeError("claim worker failed with lease=must-not-leak")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claim_worker_failure_does_not_mask_cancellation() -> None:
+    store = BlockingClaimFailureStore()
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    )
+    assert await asyncio.to_thread(store.started.wait, 5)
+
+    claim_task.cancel()
+    await asyncio.sleep(0)
+    assert not claim_task.done()
+    claim_task.cancel()
+    await asyncio.sleep(0)
+    assert not claim_task.done()
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+
+    assert verifier.find_calls == []
+    assert store.failures == []
+
+
+class MalformedClaimBatchStore(FakeSidebarStore):
+    def claim_sidebar_jobs(
+        self, *, now: float, limit: int, lease_seconds: int
+    ) -> list[dict[str, Any] | object]:
+        return [
+            {**_leased_job(), "lease_token": "malformed-batch-one"},
+            object(),
+            {
+                **_leased_job(),
+                "id": "sidebar-job:2",
+                "source_session_id": "claude:source-2",
+                "bridge_id": "sidebar:bridge-2",
+                "lease_token": "malformed-batch-two",
+            },
+        ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_claim_batch_releases_every_recoverable_token() -> None:
+    store = MalformedClaimBatchStore()
+    verifier = FakeVerifier(None)
+    coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
+
+    with pytest.raises(ValueError, match="claims are malformed"):
+        await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert store.failures == [
+        ("malformed-batch-one", "broker_time_budget", 100.0),
+        ("malformed-batch-two", "broker_time_budget", 100.0),
+    ]
+    assert verifier.find_calls == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_during_cleanup_still_releases_full_batch(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "repeated-cancel-cleanup.db")
+    tokens = iter(("repeated-cancel-one", "repeated-cancel-two"))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    sources: list[str] = []
+    for ordinal in (1, 2):
+        source = f"claude:repeated-cancel-{ordinal}"
+        sources.append(source)
+        db.ensure_session(source, source="cli")
+        store.enqueue_sidebar_job(SidebarCandidate(
+            source_session_id=source,
+            provider=Provider.CLAUDE,
+            bridge_id=sidebar_bridge_id(source),
+            title=f"[Claude] Repeated cancel {ordinal}",
+            cwd=f"C:/repeated-cancel/{ordinal}",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=10.0 + ordinal,
+        ))
+    verifier = BlockingVerifier()
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    original_fail = store.fail_sidebar_job
+    cleanup_calls = 0
+
+    def blocking_first_cleanup(**kwargs: Any) -> dict[str, Any]:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            cleanup_started.set()
+            assert cleanup_release.wait(timeout=5)
+        return original_fail(**kwargs)
+
+    monkeypatch.setattr(store, "fail_sidebar_job", blocking_first_cleanup)
+    coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+    )
+    assert await asyncio.to_thread(verifier.started.wait, 5)
+    claim_task.cancel()
+    verifier.release.set()
+    assert await asyncio.to_thread(cleanup_started.wait, 5)
+
+    claim_task.cancel()
+    await asyncio.sleep(0)
+    claim_task.cancel()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+
+    assert cleanup_calls == 2
+    assert all(
+        store.get_sidebar_job_for_source(source)["state"] == "sidebar_pending"
+        for source in sources
+    )
+    db.close()
+
+
 class CleanupFailureStore(FakeSidebarStore):
     def __init__(self) -> None:
         super().__init__()

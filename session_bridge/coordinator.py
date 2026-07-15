@@ -8,7 +8,7 @@ import hashlib
 import math
 from pathlib import Path
 import time
-from typing import Any, Protocol, cast
+from typing import Any, NoReturn, Protocol, cast
 import uuid
 
 from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
@@ -415,33 +415,32 @@ class SessionBridgeCoordinator:
         verifier = self._sidebar_verifier
         if verifier is None:
             return ()
-        raw_claims = await asyncio.to_thread(
-            _call,
-            self._store,
-            "claim_sidebar_jobs",
-            now=claim_time,
-            limit=limit,
-            lease_seconds=self._config.sidebar.lease_seconds,
+        claim_task = asyncio.create_task(
+            asyncio.to_thread(
+                _call,
+                self._store,
+                "claim_sidebar_jobs",
+                now=claim_time,
+                limit=limit,
+                lease_seconds=self._config.sidebar.lease_seconds,
+            )
         )
-        if not isinstance(raw_claims, list) or len(raw_claims) > limit:
-            raise ValueError("sidebar delivery claims are malformed")
-        owned_tokens: list[str] = []
-        malformed_token = False
-        for raw_claim in raw_claims:
-            if not isinstance(raw_claim, Mapping):
-                malformed_token = True
-                continue
-            try:
-                owned_tokens.append(
-                    _exact_sidebar_claim_text(
-                        raw_claim.get("lease_token"), "lease token"
-                    )
-                )
-            except ValueError:
-                malformed_token = True
-        if malformed_token or len(set(owned_tokens)) != len(owned_tokens):
+        try:
+            raw_claims = await asyncio.shield(claim_task)
+        except asyncio.CancelledError as cancelled:
+            await self._finish_cancelled_sidebar_claim(
+                claim_task,
+                cancelled=cancelled,
+                limit=limit,
+            )
+        owned_tokens, malformed_claims = _sidebar_claim_tokens(
+            raw_claims,
+            limit=limit,
+        )
+        if malformed_claims:
             await self._cleanup_sidebar_delivery_claims(owned_tokens)
-            raise ValueError("sidebar delivery claim tokens are malformed")
+            raise ValueError("sidebar delivery claims are malformed")
+        assert isinstance(raw_claims, list)
 
         try:
             delivery: list[SidebarDeliveryClaim] = []
@@ -511,6 +510,38 @@ class SessionBridgeCoordinator:
             await self._cleanup_sidebar_delivery_claims(owned_tokens)
             raise
 
+    async def _finish_cancelled_sidebar_claim(
+        self,
+        claim_task: asyncio.Task[Any],
+        *,
+        cancelled: asyncio.CancelledError,
+        limit: int,
+    ) -> NoReturn:
+        """Recover and release leases committed by a cancelled claim worker."""
+
+        while not claim_task.done():
+            try:
+                await asyncio.shield(claim_task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            raw_claims = claim_task.result()
+        except BaseException:
+            # The caller's cancellation owns the public outcome; do not attach a
+            # worker exception that could expose a raw lease token as context.
+            raise cancelled from None
+        try:
+            owned_tokens, _ = _sidebar_claim_tokens(raw_claims, limit=limit)
+        except BaseException:
+            raise cancelled from None
+        try:
+            await self._cleanup_sidebar_delivery_claims(owned_tokens)
+        except BaseException:
+            pass
+        raise cancelled from None
+
     async def _fail_sidebar_delivery_claim(
         self,
         lease_token: str,
@@ -555,10 +586,21 @@ class SessionBridgeCoordinator:
                     continue
 
         cleanup_task = asyncio.create_task(_cleanup())
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError:
-            await cleanup_task
+        cancelled: asyncio.CancelledError | None = None
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+                continue
+        if cancelled is not None:
+            try:
+                cleanup_task.result()
+            except BaseException:
+                pass
+            raise cancelled from None
+        cleanup_task.result()
 
     async def commit_sidebar_job(
         self,
@@ -2870,6 +2912,33 @@ def _exact_sidebar_claim_text(value: object, label: str) -> str:
     if any(character in value for character in "\r\n"):
         raise ValueError(f"sidebar claim {label} is malformed")
     return value
+
+
+def _sidebar_claim_tokens(
+    raw_claims: object,
+    *,
+    limit: int,
+) -> tuple[list[str], bool]:
+    """Extract every recoverable lease token before validating the batch."""
+
+    if not isinstance(raw_claims, list):
+        return [], True
+    malformed = len(raw_claims) > limit
+    owned_tokens: list[str] = []
+    for raw_claim in raw_claims:
+        if not isinstance(raw_claim, Mapping):
+            malformed = True
+            continue
+        claim = cast(Mapping[str, object], raw_claim)
+        try:
+            owned_tokens.append(
+                _exact_sidebar_claim_text(claim.get("lease_token"), "lease token")
+            )
+        except Exception:
+            malformed = True
+    if len(set(owned_tokens)) != len(owned_tokens):
+        malformed = True
+    return owned_tokens, malformed
 
 
 def _safe_target_error_code(provider: Provider, code: object) -> str:
