@@ -562,6 +562,36 @@ def test_registration_prompt_redacts_metadata_but_preserves_marker_exactly() -> 
     assert 'Git branch: "feature/[REDACTED]"' in prompt
 
 
+def test_registration_prompt_preserves_ordinary_source_identity_exactly() -> None:
+    source = "ordinary-hermes-session-id"
+    candidate = _candidate(
+        provider=Provider.HERMES,
+        source_session_id=source,
+        bridge_id=sidebar_bridge_id(source),
+    )
+
+    prompt = build_registration_prompt(candidate, _marker_for(candidate))
+    encoded_source = json.dumps(source)
+
+    assert f"Source session ID: {encoded_source}" in prompt
+    assert f"session_continue(session_id={encoded_source}, " in prompt
+
+
+def test_registration_prompt_rejects_source_identity_changed_by_redaction() -> None:
+    source = "hermes-token=source-secret-value"
+    candidate = _candidate(
+        provider=Provider.HERMES,
+        source_session_id=source,
+        bridge_id=sidebar_bridge_id(source),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^source session ID cannot be represented safely$",
+    ):
+        build_registration_prompt(candidate, _marker_for(candidate))
+
+
 def test_registration_prompt_accepts_bound_canonical_marker_without_authentication() -> None:
     candidate = _candidate()
     marker = _structural_marker(_canonical_marker_body(candidate), b"x" * 32)

@@ -142,7 +142,13 @@ def build_registration_prompt(candidate: SidebarCandidate, marker: str) -> str:
     _validate_candidate(candidate)
     _validate_registration_marker(candidate, marker)
 
-    source = _serialized_metadata(candidate.source_session_id)
+    if _redact(candidate.source_session_id) != candidate.source_session_id:
+        raise ValueError("source session ID cannot be represented safely")
+    source = json.dumps(
+        candidate.source_session_id,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     provider = _serialized_metadata(candidate.provider.value)
     cwd = _serialized_metadata(candidate.cwd)
     git_root = _serialized_metadata(candidate.git_root)
