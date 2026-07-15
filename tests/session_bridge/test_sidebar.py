@@ -254,6 +254,71 @@ def test_non_source_and_bridge_lineage_sessions_are_ineligible(
     assert not is_sidebar_session_eligible(projection, now=NOW)
 
 
+@pytest.mark.parametrize(
+    ("projection", "kwargs", "message"),
+    [
+        (
+            _projection(Provider.CODEX, "build the feature"),
+            {"now": "not-a-timestamp"},
+            "now must be a finite timestamp",
+        ),
+        (
+            _projection(
+                Provider.CLAUDE,
+                "build the feature",
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            ),
+            {"now": float("nan")},
+            "now must be a finite timestamp",
+        ),
+        (
+            _projection(Provider.CLAUDE, "build the feature"),
+            {"now": NOW, "backfill_days": -1, "automation_only": True},
+            "backfill days must be a non-negative integer",
+        ),
+        (
+            _projection(Provider.HERMES, "build the feature"),
+            {"now": NOW, "backfill_days": True, "subagent_only": True},
+            "backfill days must be a non-negative integer",
+        ),
+    ],
+)
+def test_numeric_arguments_are_validated_before_structural_exclusions(
+    projection: SessionProjection,
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        is_sidebar_session_eligible(projection, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("last_active", "provider", "origin_kind"),
+    [
+        ("not-a-timestamp", Provider.CODEX, OriginKind.NATIVE),
+        (True, Provider.CLAUDE, OriginKind.BRIDGE_PLACEHOLDER),
+        (float("nan"), Provider.HERMES, OriginKind.NATIVE),
+        (float("inf"), Provider.CLAUDE, OriginKind.NATIVE),
+        (float("-inf"), Provider.HERMES, OriginKind.BRIDGE_CONTINUATION),
+    ],
+)
+def test_projection_activity_must_be_a_finite_non_boolean_number_before_exclusion(
+    last_active: object,
+    provider: Provider,
+    origin_kind: OriginKind,
+) -> None:
+    projection = replace(
+        _projection(provider, "build the feature", origin_kind=origin_kind),
+        last_active=last_active,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^projection last_active must be a finite timestamp$",
+    ):
+        is_sidebar_session_eligible(projection, now=NOW)
+
+
 def test_sidebar_delivery_identity_is_exact_stable_and_source_sensitive() -> None:
     source = "claude:source-session-id"
     expected_key = "codex-sidebar:claude:source-session-id:v1"
@@ -268,6 +333,18 @@ def test_sidebar_delivery_identity_is_exact_stable_and_source_sensitive() -> Non
 
 
 @pytest.mark.parametrize(
+    "source_session_id",
+    ["claude:source-1", "hermes-source-1", "hermes:source-1"],
+)
+def test_sidebar_delivery_identity_accepts_only_canonical_native_sources(
+    source_session_id: str,
+) -> None:
+    assert sidebar_idempotency_key(source_session_id) == (
+        f"codex-sidebar:{source_session_id}:v1"
+    )
+
+
+@pytest.mark.parametrize(
     ("source_session_id", "message"),
     [
         (None, "source session ID must not be empty"),
@@ -275,6 +352,12 @@ def test_sidebar_delivery_identity_is_exact_stable_and_source_sensitive() -> Non
         ("   ", "source session ID must not be empty"),
         (" claude:source-1", "source session ID must be canonical"),
         ("claude:source-1 ", "source session ID must be canonical"),
+        ("claude:", "source session ID must identify native Claude or Hermes"),
+        (
+            "codex:source-1",
+            "source session ID must identify native Claude or Hermes",
+        ),
+        ("claude: source-1", "source session ID must be canonical"),
     ],
 )
 def test_sidebar_delivery_identity_rejects_noncanonical_sources(
@@ -285,6 +368,18 @@ def test_sidebar_delivery_identity_rejects_noncanonical_sources(
         sidebar_idempotency_key(source_session_id)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match=f"^{message}$"):
         sidebar_bridge_id(source_session_id)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("line_break", ["\r", "\n", "\x85", "\u2028", "\u2029"])
+def test_sidebar_source_identity_rejects_all_unicode_line_injection(
+    line_break: str,
+) -> None:
+    source = f"claude:source{line_break}injected"
+
+    with pytest.raises(ValueError, match="^source session ID must be canonical$"):
+        sidebar_idempotency_key(source)
+    with pytest.raises(ValueError, match="^source session ID must be canonical$"):
+        sidebar_bridge_id(source)
 
 
 @pytest.mark.parametrize(
@@ -403,6 +498,28 @@ def test_registration_prompt_redacts_metadata_but_preserves_marker_exactly() -> 
     assert prompt.count(MARKER) == 1
     assert secret not in prompt
     assert "Git branch: feature/[REDACTED]" in prompt
+
+
+@pytest.mark.parametrize("line_break", ["\r", "\n", "\x85", "\u2028", "\u2029"])
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("cwd", "sidebar candidate cwd must be a single line"),
+        ("git_root", "sidebar candidate git root must be a single line"),
+        ("git_branch", "sidebar candidate git branch must be a single line"),
+        ("git_head", "sidebar candidate git HEAD must be a single line"),
+        ("worktree_id", "sidebar candidate worktree ID must be a single line"),
+    ],
+)
+def test_registration_metadata_rejects_all_unicode_line_injection(
+    field: str,
+    message: str,
+    line_break: str,
+) -> None:
+    candidate = _candidate(**{field: f"value{line_break}injected"})
+
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        build_registration_prompt(candidate, MARKER)
 
 
 @pytest.mark.parametrize(

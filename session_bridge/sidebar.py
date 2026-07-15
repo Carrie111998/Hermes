@@ -39,6 +39,7 @@ _TITLE_PREFIXES = {
     Provider.HERMES: "[Hermes] ",
 }
 _MAX_TITLE_CHARS = 120
+_UNICODE_LINE_BREAKS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
 
 
 @dataclass(frozen=True)
@@ -77,26 +78,20 @@ def is_sidebar_session_eligible(
     automation_only: bool = False,
     subagent_only: bool = False,
 ) -> bool:
-    if (
-        projection.provider not in (Provider.CLAUDE, Provider.HERMES)
-        or projection.origin_kind is not OriginKind.NATIVE
-        or automation_only
-        or subagent_only
-    ):
-        return False
+    _validate_finite_timestamp(now, "now")
     if (
         not isinstance(backfill_days, int)
         or isinstance(backfill_days, bool)
         or backfill_days < 0
     ):
         raise ValueError("backfill days must be a non-negative integer")
+    _validate_finite_timestamp(projection.last_active, "projection last_active")
     if (
-        not isinstance(now, (int, float))
-        or isinstance(now, bool)
-        or not math.isfinite(now)
+        projection.provider not in (Provider.CLAUDE, Provider.HERMES)
+        or projection.origin_kind is not OriginKind.NATIVE
+        or automation_only
+        or subagent_only
     ):
-        raise ValueError("now must be a finite timestamp")
-    if not math.isfinite(projection.last_active):
         return False
     if projection.last_active < now - backfill_days * 86_400:
         return False
@@ -176,6 +171,20 @@ def _validated_source_session_id(value: object) -> str:
         raise ValueError("source session ID must not be empty")
     if value != value.strip() or _has_line_break(value):
         raise ValueError("source session ID must be canonical")
+    if value.startswith(f"{Provider.CLAUDE.value}:"):
+        provider = Provider.CLAUDE
+        native_id = value.removeprefix(f"{Provider.CLAUDE.value}:")
+    else:
+        provider = Provider.HERMES
+        native_id = value
+    try:
+        canonical = canonical_session_id(provider, native_id)
+    except ValueError as exc:
+        raise ValueError(
+            "source session ID must identify native Claude or Hermes"
+        ) from exc
+    if canonical != value:
+        raise ValueError("source session ID must be canonical")
     return value
 
 
@@ -249,4 +258,13 @@ def _compact_whitespace(value: str) -> str:
 
 
 def _has_line_break(value: str) -> bool:
-    return "\n" in value or "\r" in value
+    return any(character in _UNICODE_LINE_BREAKS for character in value)
+
+
+def _validate_finite_timestamp(value: object, label: str) -> None:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+    ):
+        raise ValueError(f"{label} must be a finite timestamp")
