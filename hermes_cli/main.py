@@ -2482,7 +2482,11 @@ def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
     from hermes_cli.config import get_env_value, save_env_value
-    from hermes_constants import find_node_executable, with_hermes_node_path
+    from hermes_constants import (
+        find_node_executable,
+        get_hermes_dir,
+        with_hermes_node_path,
+    )
 
     print()
     print("⚕ WhatsApp Setup")
@@ -2626,7 +2630,10 @@ def cmd_whatsapp(args):
         print("✓ Bridge dependencies already installed")
 
     # ── Step 5: Check for existing session ───────────────────────────────
-    session_dir = get_hermes_home() / "whatsapp" / "session"
+    session_dir = get_hermes_dir(
+        "platforms/whatsapp/session",
+        "whatsapp/session",
+    )
     session_dir.mkdir(parents=True, exist_ok=True)
 
     if (session_dir / "creds.json").exists():
