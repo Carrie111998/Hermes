@@ -1398,6 +1398,103 @@ class SessionBridgeStore:
             counts[row["state"]] = int(row["job_count"])
         return counts
 
+    def record_sidebar_broker_heartbeat(self, *, now: float) -> None:
+        heartbeat = _finite_number(now, "sidebar broker heartbeat")
+        self.set_state(
+            "session-bridge:sidebar:broker-heartbeat",
+            {"at": heartbeat},
+        )
+
+    def sidebar_delivery_status(self, *, now: float | None = None) -> dict[str, Any]:
+        status_time = _finite_number(self._clock() if now is None else now, "now")
+        counts = self.sidebar_job_counts()
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            provider_rows = conn.execute(
+                """SELECT CASE
+                              WHEN e.provider = ? THEN ?
+                              WHEN e.session_id IS NULL THEN ?
+                              ELSE 'invalid'
+                          END AS provider,
+                          COUNT(*) AS job_count
+                     FROM session_sidebar_jobs AS job
+                     JOIN sessions AS s ON s.id = job.source_session_id
+                     LEFT JOIN external_sessions AS e ON e.session_id = s.id
+                    GROUP BY provider""",
+                (
+                    Provider.CLAUDE.value,
+                    Provider.CLAUDE.value,
+                    Provider.HERMES.value,
+                ),
+            ).fetchall()
+            oldest = conn.execute(
+                """SELECT MIN(eligible_at) AS eligible_at
+                     FROM session_sidebar_jobs
+                    WHERE state IN (?, ?)""",
+                (SidebarJobState.PENDING.value, SidebarJobState.RETRY.value),
+            ).fetchone()
+            last_visible = conn.execute(
+                """SELECT codex_thread_id
+                     FROM session_sidebar_jobs
+                    WHERE state = ?
+                    ORDER BY visible_at DESC, id DESC LIMIT 1""",
+                (SidebarJobState.VISIBLE.value,),
+            ).fetchone()
+            error_rows = conn.execute(
+                """SELECT error_code
+                     FROM session_sidebar_jobs
+                    WHERE error_code IS NOT NULL
+                    ORDER BY updated_at DESC, id DESC LIMIT 10"""
+            ).fetchall()
+            latency_rows = conn.execute(
+                """SELECT visible_at - eligible_at AS latency
+                     FROM session_sidebar_jobs
+                    WHERE state = ? AND visible_at IS NOT NULL
+                    ORDER BY latency""",
+                (SidebarJobState.VISIBLE.value,),
+            ).fetchall()
+
+        eligible_by_provider = {
+            Provider.CLAUDE.value: 0,
+            Provider.HERMES.value: 0,
+        }
+        for row in provider_rows:
+            if row["provider"] in eligible_by_provider:
+                eligible_by_provider[row["provider"]] = int(row["job_count"])
+        oldest_at = oldest["eligible_at"] if oldest is not None else None
+        oldest_age = (
+            max(0.0, status_time - float(oldest_at))
+            if oldest_at is not None
+            else None
+        )
+        heartbeat = self.get_state("session-bridge:sidebar:broker-heartbeat")
+        heartbeat_at = heartbeat.get("at") if isinstance(heartbeat, Mapping) else None
+        if not isinstance(heartbeat_at, (int, float)) or isinstance(heartbeat_at, bool):
+            heartbeat_at = None
+        allowed_codes = SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
+        recent_codes: list[str] = []
+        for row in error_rows:
+            code = row["error_code"]
+            if code in allowed_codes and code not in recent_codes:
+                recent_codes.append(code)
+        latencies = [max(0.0, float(row["latency"])) for row in latency_rows]
+        return {
+            "eligible_by_provider": eligible_by_provider,
+            "counts": counts,
+            "oldest_pending_age_seconds": oldest_age,
+            "last_heartbeat_at": float(heartbeat_at) if heartbeat_at is not None else None,
+            "last_visible_task_id": (
+                last_visible["codex_thread_id"] if last_visible is not None else None
+            ),
+            "recent_error_codes": recent_codes,
+            "delivery_latency_seconds": {
+                "p50": _nearest_rank_percentile(latencies, 0.50),
+                "p95": _nearest_rank_percentile(latencies, 0.95),
+                "p99": _nearest_rank_percentile(latencies, 0.99),
+            },
+        }
+
     def get_sidebar_job_for_source(
         self,
         source_session_id: str,
@@ -1414,6 +1511,175 @@ class SessionBridgeStore:
                 (source_session_id,),
             ).fetchone()
         return None if row is None else dict(row)
+
+    def get_sidebar_source_for_delivery(
+        self,
+        source_session_id: str,
+    ) -> SidebarSource:
+        """Read the exact source metadata for an already queued sidebar job."""
+
+        source_id = _exact_nonempty_text(
+            source_session_id, "sidebar source session ID"
+        )
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                """SELECT s.id AS session_id, s.source, s.model_config,
+                          s.title, s.cwd, s.started_at, s.git_branch,
+                          s.git_repo_root, e.provider AS external_provider,
+                          e.native_id AS external_native_id, e.native_path,
+                          e.native_status, e.last_native_cursor,
+                          e.last_native_hash, e.parser_version, e.origin_kind,
+                          e.origin_bridge_id, job.eligible_at
+                     FROM session_sidebar_jobs AS job
+                     JOIN sessions AS s ON s.id = job.source_session_id
+                     LEFT JOIN external_sessions AS e ON e.session_id = s.id
+                    WHERE job.source_session_id = ?""",
+                (source_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(source_id)
+            if row["external_provider"] == Provider.CLAUDE.value:
+                provider = Provider.CLAUDE
+                native_id = row["external_native_id"]
+                if (
+                    row["origin_kind"] != OriginKind.NATIVE.value
+                    or row["origin_bridge_id"] is not None
+                ):
+                    raise ValueError("sidebar source provenance is invalid")
+            elif row["external_provider"] is None and not source_id.startswith(
+                ("claude:", "codex:")
+            ):
+                provider = Provider.HERMES
+                native_id = source_id
+            else:
+                raise ValueError("sidebar source provider is invalid")
+            message_rows = conn.execute(
+                """SELECT message.id, message.role, message.content,
+                          message.timestamp, map.native_event_id, map.ordinal
+                     FROM messages AS message
+                     LEFT JOIN external_message_map AS map
+                       ON map.message_id = message.id
+                    WHERE message.session_id = ? AND message.role = 'user'
+                      AND (message.active = 1 OR message.compacted = 1)
+                    ORDER BY message.timestamp, message.id""",
+                (source_id,),
+            ).fetchall()
+
+        messages: list[ProjectedMessage] = []
+        for message_row in message_rows:
+            message_id = int(message_row["id"])
+            decoded = self.db._decode_content(message_row["content"])
+            messages.append(
+                ProjectedMessage(
+                    native_event_id=(
+                        message_row["native_event_id"]
+                        or f"hermes-message:{message_id}"
+                    ),
+                    ordinal=(
+                        int(message_row["ordinal"])
+                        if message_row["ordinal"] is not None
+                        else message_id
+                    ),
+                    role="user",
+                    content=decoded if isinstance(decoded, str) else None,
+                    timestamp=float(message_row["timestamp"]),
+                )
+            )
+        eligible_at = _finite_number(row["eligible_at"], "sidebar eligible at")
+        projection = SessionProjection(
+            provider=provider,
+            native_id=native_id,
+            title=row["title"],
+            cwd=row["cwd"],
+            started_at=float(row["started_at"]),
+            last_active=eligible_at,
+            messages=tuple(messages),
+            native_path=row["native_path"],
+            native_status=row["native_status"] or "active",
+            native_cursor=row["last_native_cursor"],
+            native_hash=row["last_native_hash"],
+            parser_version=int(row["parser_version"] or 1),
+            origin_kind=OriginKind.NATIVE,
+            origin_bridge_id=None,
+            git_branch=row["git_branch"],
+        )
+        return SidebarSource(
+            source_session_id=source_id,
+            projection=projection,
+            git_root=row["git_repo_root"],
+            git_head=None,
+            worktree_id=None,
+            automation_only=row["source"] == "cron",
+            subagent_only=(
+                row["source"] in {"subagent", "tool"}
+                or _model_config_has_delegate(row["model_config"])
+            ),
+        )
+
+    def ensure_sidebar_lineage(
+        self,
+        *,
+        source_session_id: str,
+        bridge_id: str,
+        codex_thread_id: str,
+    ) -> dict[str, Any]:
+        """Idempotently bind one verified native Codex task to its source."""
+
+        source_id = _exact_nonempty_text(
+            source_session_id, "sidebar source session ID"
+        )
+        normalized_bridge_id = _exact_nonempty_text(bridge_id, "sidebar bridge ID")
+        thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
+
+        def _write(conn):
+            target = conn.execute(
+                """SELECT e.session_id, e.origin_kind, e.origin_bridge_id
+                     FROM external_sessions AS e
+                    WHERE e.provider = ? AND e.native_id = ?""",
+                (Provider.CODEX.value, thread_id),
+            ).fetchone()
+            if target is None:
+                raise ValueError("native_task_not_indexed")
+            if (
+                target["origin_kind"] != OriginKind.BRIDGE_PLACEHOLDER.value
+                or target["origin_bridge_id"] != normalized_bridge_id
+            ):
+                raise ValueError("source_identity_mismatch")
+            conflicting = conn.execute(
+                """SELECT 1 FROM session_links
+                    WHERE bridge_id = ? AND (
+                        from_session_id != ? OR to_session_id != ?
+                        OR relation != ?
+                    ) LIMIT 1""",
+                (
+                    normalized_bridge_id,
+                    source_id,
+                    target["session_id"],
+                    Relation.MIRRORS.value,
+                ),
+            ).fetchone()
+            if conflicting is not None:
+                raise ValueError("source_identity_mismatch")
+            link_digest = hashlib.sha256(
+                f"{normalized_bridge_id}\0{source_id}\0{target['session_id']}".encode()
+            ).hexdigest()
+            return self._create_link_row(
+                conn,
+                SessionLink(
+                    id=f"sidebar-link:{link_digest}",
+                    from_session_id=source_id,
+                    to_session_id=target["session_id"],
+                    relation=Relation.MIRRORS,
+                    bridge_id=normalized_bridge_id,
+                    source_cursor=None,
+                    source_hash=None,
+                    created_at=float(self._clock()),
+                ),
+            )
+
+        return self.db._execute_write(_write)
 
     def _new_sidebar_lease(self, conn: Any) -> tuple[str, str]:
         token = self._sidebar_token_factory()
@@ -2899,6 +3165,23 @@ def _automatic_claim_denial(conn: Any, job: Mapping[str, Any]) -> str | None:
         (source_session_id, target_provider.value),
     ).fetchone()
     return "automatic mirror source is already mapped" if mapped is not None else None
+
+
+def _model_config_has_delegate(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(decoded, Mapping) and decoded.get("_delegate_from") is not None
+
+
+def _nearest_rank_percentile(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    rank = max(1, math.ceil(percentile * len(values)))
+    return float(values[rank - 1])
 
 
 def _provider_from_canonical_session_id(session_id: object) -> Provider:

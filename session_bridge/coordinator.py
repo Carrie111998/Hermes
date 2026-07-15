@@ -516,7 +516,10 @@ class SessionBridgeCoordinator:
         *,
         lease_token: str,
         codex_thread_id: str,
+        ensure_lineage: bool = False,
     ) -> Mapping[str, Any]:
+        if type(ensure_lineage) is not bool:
+            raise ValueError("sidebar lineage flag is malformed")
         token = _exact_sidebar_claim_text(lease_token, "lease token")
         thread_id = _exact_sidebar_claim_text(codex_thread_id, "Codex thread ID")
         verifier = self._sidebar_verifier
@@ -553,6 +556,18 @@ class SessionBridgeCoordinator:
             or verified.bridge_id != expected.bridge_id
         ):
             raise SidebarVerificationError("source_identity_mismatch")
+        ensure_lineage_method = getattr(self._store, "ensure_sidebar_lineage", None)
+        if ensure_lineage:
+            if not callable(ensure_lineage_method):
+                raise ValueError("sidebar lineage store operation is unavailable")
+            lineage = await asyncio.to_thread(
+                ensure_lineage_method,
+                source_session_id=source_session_id,
+                bridge_id=bridge_id,
+                codex_thread_id=thread_id,
+            )
+            if not isinstance(lineage, Mapping):
+                raise ValueError("sidebar lineage result is malformed")
         result = await asyncio.to_thread(
             _call,
             self._store,

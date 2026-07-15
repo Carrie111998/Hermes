@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import ipaddress
 import json
 import os
@@ -13,6 +13,7 @@ from pathlib import Path
 import secrets
 import stat
 import subprocess
+import time
 from typing import Any, cast
 
 from hermes_constants import get_hermes_home
@@ -21,8 +22,18 @@ from .catalog import UnifiedCatalog
 from .config import BridgeConfig
 from .coordinator import ContinueRequest, ContinueResult
 from .mirror import MirrorPolicy, enqueue_mirror_job
-from .models import Provider
-from .store import SessionBridgeStore
+from .models import BridgeMarkerPayload, Provider, encode_bridge_marker
+from .sidebar import (
+    SidebarCandidate,
+    build_registration_prompt,
+    is_sidebar_session_eligible,
+    sidebar_title,
+)
+from .store import (
+    SIDEBAR_FATAL_ERRORS,
+    SIDEBAR_RETRYABLE_ERRORS,
+    SessionBridgeStore,
+)
 
 
 EXPECTED_TOOLS = {
@@ -31,6 +42,9 @@ EXPECTED_TOOLS = {
     "session_continue",
     "session_mirror",
     "session_status",
+    "session_sidebar_pending",
+    "session_sidebar_commit",
+    "session_sidebar_fail",
 }
 _TOKEN_ENV = "HERMES_SESSION_BRIDGE_TOKEN"
 _MIN_TOKEN_BYTES = 32
@@ -162,6 +176,7 @@ def create_app(
     store: SessionBridgeStore,
     config: BridgeConfig,
     token: str | bytes | None = None,
+    marker_key: bytes | None = None,
 ):
     """Create the parent Starlette app with an exact ``/mcp`` endpoint."""
 
@@ -180,6 +195,10 @@ def create_app(
         if token is None
         else _validated_token(token)
     )
+    if marker_key is not None and (
+        not isinstance(marker_key, bytes) or len(marker_key) < _MIN_MARKER_KEY_BYTES
+    ):
+        raise ValueError("session bridge marker key must be at least 32 bytes")
 
     try:
         from mcp.server.fastmcp import FastMCP
@@ -349,12 +368,163 @@ def create_app(
         health_method = getattr(coordinator, "health", None)
         health = health_method() if callable(health_method) else {"running": False}
         catalog_status = await asyncio.to_thread(catalog.status)
+        sidebar_status = await asyncio.to_thread(store.sidebar_delivery_status)
+        sidebar_status["last_visible_task_id"] = _redacted_task_id(
+            sidebar_status.get("last_visible_task_id")
+        )
         return _sanitize_status(
             {
                 "health": health,
                 "catalog": catalog_status,
+                "sidebar": sidebar_status,
             }
         )
+
+    @mcp.tool()
+    async def session_sidebar_pending(limit: Any = 5) -> dict[str, Any]:
+        """Lease up to five native sidebar registrations for the Codex broker."""
+
+        if type(limit) is not int:
+            raise ValueError("sidebar_pending_invalid_request")
+        bounded_limit = max(1, min(limit, 5))
+        claim_method = getattr(coordinator, "claim_sidebar_jobs_for_delivery", None)
+        if not callable(claim_method):
+            raise RuntimeError("sidebar_pending_unavailable")
+        try:
+            claims = await claim_method(limit=bounded_limit)
+            if not isinstance(claims, tuple) or len(claims) > bounded_limit:
+                raise ValueError("malformed sidebar claims")
+            secret = marker_key
+            if secret is None:
+                secret = await asyncio.to_thread(resolve_marker_key)
+            jobs: list[dict[str, Any]] = []
+            for claim in claims:
+                source = await asyncio.to_thread(
+                    store.get_sidebar_source_for_delivery,
+                    claim.source_session_id,
+                )
+                first_request = _first_sidebar_request(source.projection)
+                candidate = SidebarCandidate(
+                    source_session_id=source.source_session_id,
+                    provider=source.projection.provider,
+                    bridge_id=claim.bridge_id,
+                    title=sidebar_title(
+                        source.projection.provider,
+                        source.projection.title,
+                        first_request,
+                    ),
+                    cwd=_required_sidebar_cwd(source.projection.cwd),
+                    git_root=source.git_root,
+                    git_branch=source.projection.git_branch,
+                    git_head=source.git_head,
+                    worktree_id=source.worktree_id,
+                    eligible_at=source.projection.last_active,
+                )
+                marker = encode_bridge_marker(
+                    BridgeMarkerPayload(
+                        bridge_id=claim.bridge_id,
+                        source_session_id=claim.source_session_id,
+                        target_provider=Provider.CODEX,
+                        policy_generation=1,
+                    ),
+                    secret,
+                )
+                recovered = claim.recovered_thread
+                jobs.append(
+                    {
+                        "lease_token": claim.lease_token,
+                        "registration_prompt": build_registration_prompt(
+                            candidate, marker
+                        ),
+                        "title": candidate.title,
+                        "provider": candidate.provider.value,
+                        "cwd": candidate.cwd,
+                        "git_root": candidate.git_root,
+                        "git_branch": candidate.git_branch,
+                        "git_head": candidate.git_head,
+                        "worktree_id": candidate.worktree_id,
+                        "reconcile_required": claim.reconcile_required,
+                        "rename_required": claim.rename_required,
+                        "recovered_thread_id": (
+                            recovered.thread_id if recovered is not None else None
+                        ),
+                    }
+                )
+            await asyncio.to_thread(
+                store.record_sidebar_broker_heartbeat,
+                now=time.time(),
+            )
+            return {"jobs": jobs}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_pending_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_commit(
+        lease_token: Any,
+        codex_thread_id: Any,
+    ) -> dict[str, Any]:
+        """Verify and commit one native Codex sidebar task."""
+
+        token_text = _exact_sidebar_text(lease_token, "lease token")
+        thread_id = _exact_sidebar_text(codex_thread_id, "Codex thread ID")
+        commit_method = getattr(coordinator, "commit_sidebar_job", None)
+        if not callable(commit_method):
+            raise RuntimeError("sidebar_commit_unavailable")
+        try:
+            result = await commit_method(
+                lease_token=token_text,
+                codex_thread_id=thread_id,
+                ensure_lineage=True,
+            )
+            if (
+                not isinstance(result, Mapping)
+                or result.get("state") != "sidebar_visible"
+                or result.get("codex_thread_id") != thread_id
+            ):
+                raise ValueError("invalid sidebar commit")
+            return {
+                "state": "sidebar_visible",
+                "codex_thread_id": thread_id,
+            }
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_commit_failed") from None
+
+    @mcp.tool()
+    async def session_sidebar_fail(
+        lease_token: Any,
+        error_code: Any,
+    ) -> dict[str, Any]:
+        """Release or retry one leased sidebar registration with a fixed code."""
+
+        token_text = _exact_sidebar_text(lease_token, "lease token")
+        if (
+            type(error_code) is not str
+            or error_code not in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
+        ):
+            raise ValueError("sidebar_fail_invalid_request")
+        try:
+            result = await asyncio.to_thread(
+                store.fail_sidebar_job,
+                lease_token=token_text,
+                error_code=error_code,
+                now=time.time(),
+            )
+            state = result.get("state") if isinstance(result, Mapping) else None
+            if state not in {
+                "sidebar_pending",
+                "sidebar_retry",
+                "sidebar_failed",
+            }:
+                raise ValueError("invalid sidebar failure result")
+            return {"state": state, "error_code": error_code}
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ValueError("sidebar_fail_failed") from None
 
     actual_tools = set(mcp._tool_manager._tools)
     if actual_tools != EXPECTED_TOOLS:
@@ -584,7 +754,7 @@ def _sanitize_status(value: Any) -> Any:
         return {
             str(key): _sanitize_status(item)
             for key, item in value.items()
-            if str(key).casefold() not in _SENSITIVE_STATUS_KEYS
+            if not _sensitive_status_key(str(key))
         }
     if isinstance(value, (list, tuple)):
         return [_sanitize_status(item) for item in value]
@@ -593,6 +763,25 @@ def _sanitize_status(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
+
+
+def _sensitive_status_key(key: str) -> bool:
+    normalized = key.casefold()
+    return (
+        normalized in _SENSITIVE_STATUS_KEYS
+        or normalized.endswith("_token")
+        or normalized.startswith("lease_")
+        or "marker" in normalized
+        or normalized.endswith("_digest")
+    )
+
+
+def _redacted_task_id(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if len(value) <= 12:
+        return "[REDACTED]"
+    return f"{value[:8]}…{value[-4:]}"
 
 
 def _is_mcp_path(path: str) -> bool:
@@ -622,6 +811,35 @@ def _clamp_int(value: object, *, default: int, minimum: int, maximum: int) -> in
     if not isinstance(value, int) or isinstance(value, bool):
         value = default
     return max(minimum, min(int(value), maximum))
+
+
+def _exact_sidebar_text(value: object, label: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ValueError(f"sidebar {label} is malformed")
+    return value
+
+
+def _required_sidebar_cwd(value: object) -> str:
+    return _exact_sidebar_text(value, "source cwd")
+
+
+def _first_sidebar_request(projection: Any) -> str:
+    for message in projection.messages:
+        one_message = replace(projection, messages=(message,))
+        if is_sidebar_session_eligible(
+            one_message,
+            now=projection.last_active,
+            backfill_days=0,
+        ):
+            assert isinstance(message.content, str)
+            return message.content
+    raise ValueError("sidebar source has no meaningful user request")
 
 
 __all__ = [

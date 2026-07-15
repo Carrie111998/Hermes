@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import time
 from typing import Any
 
 import pytest
@@ -13,8 +14,12 @@ from starlette.testclient import TestClient
 
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
-from session_bridge.config import BridgeConfig
-from session_bridge.coordinator import ContinueResult
+from session_bridge.config import BridgeConfig, SidebarConfig
+from session_bridge.coordinator import (
+    ContinueResult,
+    SessionBridgeCoordinator,
+    SidebarDeliveryClaim,
+)
 from session_bridge.mcp_server import (
     EXPECTED_TOOLS,
     _validate_windows_token_acl,
@@ -23,6 +28,7 @@ from session_bridge.mcp_server import (
     resolve_marker_key,
 )
 from session_bridge.models import (
+    BridgeMarkerPayload,
     ContextPack,
     OriginKind,
     ProjectedMessage,
@@ -30,7 +36,9 @@ from session_bridge.models import (
     Relation,
     SessionLink,
     SessionProjection,
+    decode_bridge_marker,
 )
+from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
 from session_bridge.store import SessionBridgeStore
 
 
@@ -202,6 +210,33 @@ def _seed_linked_pair(db: SessionDB) -> tuple[SessionBridgeStore, str, str, str]
     return store, bridge_id, source_id, target_id
 
 
+def _seed_sidebar_source(db: SessionDB) -> tuple[SessionBridgeStore, SidebarCandidate]:
+    store = _seed_external(
+        db,
+        Provider.CLAUDE,
+        "sidebar-source",
+        title="Fix private token sk-secret-value",
+        cwd="C:/work/sidebar-tree",
+        repo="C:/repo/sidebar",
+        timestamp=900.0,
+        content="Fix the sidebar registration broker",
+    )
+    candidate = SidebarCandidate(
+        source_session_id="claude:sidebar-source",
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id("claude:sidebar-source"),
+        title="[Claude] Fix private token [REDACTED]",
+        cwd="C:/work/sidebar-tree",
+        git_root="C:/repo/sidebar",
+        git_branch="main",
+        git_head=None,
+        worktree_id=None,
+        eligible_at=900.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    return store, candidate
+
+
 class _FakeCoordinator:
     def __init__(self, *, bridge_id: str, source_id: str, target_id: str) -> None:
         self.bridge_id = bridge_id
@@ -210,6 +245,9 @@ class _FakeCoordinator:
         self.started = 0
         self.stopped = 0
         self.continue_requests: list[Any] = []
+        self.sidebar_claims: tuple[SidebarDeliveryClaim, ...] = ()
+        self.sidebar_claim_limits: list[int] = []
+        self.sidebar_commits: list[tuple[str, str]] = []
 
     async def start(self) -> None:
         self.started += 1
@@ -247,6 +285,26 @@ class _FakeCoordinator:
             warnings=("source_refresh_timeout_using_catalog_snapshot",),
         )
 
+    async def claim_sidebar_jobs_for_delivery(
+        self, *, limit: int
+    ) -> tuple[SidebarDeliveryClaim, ...]:
+        self.sidebar_claim_limits.append(limit)
+        return self.sidebar_claims[:limit]
+
+    async def commit_sidebar_job(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+        ensure_lineage: bool = False,
+    ) -> dict[str, Any]:
+        assert ensure_lineage is True
+        self.sidebar_commits.append((lease_token, codex_thread_id))
+        return {
+            "state": "sidebar_visible",
+            "codex_thread_id": codex_thread_id,
+        }
+
     def health(self) -> dict[str, Any]:
         return {
             "running": True,
@@ -268,6 +326,7 @@ def _create_test_app(
         store=store,
         config=BridgeConfig(),
         token=TOKEN,
+        marker_key=MARKER_KEY,
     )
 
 
@@ -600,7 +659,7 @@ def test_health_is_minimal_and_mcp_auth_is_constant_surface(db: SessionDB) -> No
     assert coordinator.stopped == 1
 
 
-def test_tools_list_exposes_exactly_the_five_approved_tools(db: SessionDB) -> None:
+def test_tools_list_exposes_exactly_the_eight_approved_tools(db: SessionDB) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
     coordinator = _FakeCoordinator(
         bridge_id=bridge_id, source_id=source_id, target_id=target_id
@@ -616,10 +675,13 @@ def test_tools_list_exposes_exactly_the_five_approved_tools(db: SessionDB) -> No
         "session_continue",
         "session_mirror",
         "session_status",
+        "session_sidebar_pending",
+        "session_sidebar_commit",
+        "session_sidebar_fail",
     }
 
 
-def test_all_five_tools_are_callable_and_search_filters_are_forwarded(
+def test_all_eight_tools_are_callable_and_search_filters_are_forwarded(
     db: SessionDB,
 ) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
@@ -674,6 +736,383 @@ def test_all_five_tools_are_callable_and_search_filters_are_forwarded(
     assert status["health"]["recent_error_codes"] == ["provider_refresh_failed"]
     assert "must-not-leak" not in json.dumps(status)
     assert "C:/private/session.jsonl" not in json.dumps(status)
+
+
+@pytest.mark.parametrize("supplied, expected", [(0, 1), (1, 1), (5, 5), (99, 5)])
+def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
+    db: SessionDB, supplied: int, expected: int
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token="plaintext-opaque-lease",
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(
+            client,
+            "session_sidebar_pending",
+            {"limit": supplied},
+        )
+
+    assert coordinator.sidebar_claim_limits == [expected]
+    assert set(response) == {"jobs"}
+    assert len(response["jobs"]) == 1
+    job = response["jobs"][0]
+    assert set(job) == {
+        "lease_token",
+        "registration_prompt",
+        "title",
+        "provider",
+        "cwd",
+        "git_root",
+        "git_branch",
+        "git_head",
+        "worktree_id",
+        "reconcile_required",
+        "rename_required",
+        "recovered_thread_id",
+    }
+    assert job["lease_token"] == "plaintext-opaque-lease"
+    assert job["title"].startswith("[Claude] ")
+    assert job["provider"] == "claude"
+    assert job["cwd"] == "C:/work/sidebar-tree"
+    assert job["git_root"] == "C:/repo/sidebar"
+    assert job["git_branch"] == "main"
+    assert job["git_head"] is None
+    assert job["worktree_id"] is None
+    assert job["reconcile_required"] is True
+    assert job["rename_required"] is False
+    assert job["recovered_thread_id"] is None
+    prompt = job["registration_prompt"]
+    assert "Fix the sidebar registration broker" not in prompt
+    assert "C:/claude/sidebar-source.jsonl" not in prompt
+    assert "sk-secret-value" not in prompt
+    marker = next(
+        line.removeprefix("Signed marker: ")
+        for line in prompt.splitlines()
+        if line.startswith("Signed marker: ")
+    )
+    assert decode_bridge_marker(marker, MARKER_KEY) == BridgeMarkerPayload(
+        candidate.bridge_id,
+        candidate.source_session_id,
+        Provider.CODEX,
+        1,
+    )
+
+
+@pytest.mark.parametrize("malformed", [None, True, 1.5, "5", [], {}])
+def test_session_sidebar_pending_rejects_malformed_limits_without_leasing(
+    db: SessionDB, malformed: object
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_sidebar_pending",
+                "arguments": {"limit": malformed},
+            },
+            request_id=41,
+        )
+
+    assert payload["result"]["isError"] is True
+    assert coordinator.sidebar_claim_limits == []
+
+
+def test_session_sidebar_commit_has_two_argument_schema_and_is_idempotent(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    thread_id = "22222222-2222-4222-8222-222222222222"
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        tools = _rpc(client, "tools/list")["result"]["tools"]
+        schema = next(
+            tool["inputSchema"]
+            for tool in tools
+            if tool["name"] == "session_sidebar_commit"
+        )
+        first = _call_tool(
+            client,
+            "session_sidebar_commit",
+            {
+                "lease_token": "plaintext-opaque-lease",
+                "codex_thread_id": thread_id,
+            },
+        )
+        replay = _call_tool(
+            client,
+            "session_sidebar_commit",
+            {
+                "lease_token": "plaintext-opaque-lease",
+                "codex_thread_id": thread_id,
+            },
+        )
+
+    assert set(schema["properties"]) == {"lease_token", "codex_thread_id"}
+    assert set(first) == {"state", "codex_thread_id"}
+    assert replay == first == {
+        "state": "sidebar_visible",
+        "codex_thread_id": thread_id,
+    }
+    assert coordinator.sidebar_commits == [
+        ("plaintext-opaque-lease", thread_id),
+        ("plaintext-opaque-lease", thread_id),
+    ]
+
+
+def test_session_sidebar_fail_has_fixed_schema_and_rejects_arbitrary_errors(
+    db: SessionDB,
+) -> None:
+    token = "fixed-error-lease-token"
+    now = time.time()
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: token,
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    db.ensure_session("claude:fail-source", source="cli")
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (now - 100.0, "claude:fail-source"),
+        )
+    )
+    store.enqueue_sidebar_job(
+        SidebarCandidate(
+            source_session_id="claude:fail-source",
+            provider=Provider.CLAUDE,
+            bridge_id=sidebar_bridge_id("claude:fail-source"),
+            title="[Claude] Fail source",
+            cwd="C:/work/fail",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=now - 100.0,
+        )
+    )
+    store.claim_sidebar_jobs(now=now, limit=1)
+    coordinator = _FakeCoordinator(
+        bridge_id="unused", source_id="claude:fail-source", target_id="codex:unused"
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        tools = _rpc(client, "tools/list")["result"]["tools"]
+        schema = next(
+            tool["inputSchema"]
+            for tool in tools
+            if tool["name"] == "session_sidebar_fail"
+        )
+        arbitrary = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_sidebar_fail",
+                "arguments": {
+                    "lease_token": token,
+                    "error_code": "Traceback: token=super-secret",
+                },
+            },
+            request_id=42,
+        )
+        failed = _call_tool(
+            client,
+            "session_sidebar_fail",
+            {"lease_token": token, "error_code": "desktop_offline"},
+        )
+
+    assert set(schema["properties"]) == {"lease_token", "error_code"}
+    assert arbitrary["result"]["isError"] is True
+    assert token not in json.dumps(arbitrary)
+    assert "super-secret" not in json.dumps(arbitrary)
+    assert set(failed) == {"state", "error_code"}
+    assert failed == {"state": "sidebar_retry", "error_code": "desktop_offline"}
+
+
+def test_session_status_exposes_only_sanitized_sidebar_observability(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = ()
+    coordinator.health = lambda: {
+        "running": True,
+        "marker": "signed-marker-must-not-leak",
+        "lease_token": "lease-must-not-leak",
+        "recent_error_codes": ["provider_refresh_failed"],
+    }
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        _call_tool(client, "session_sidebar_pending", {"limit": 5})
+        status = _call_tool(client, "session_status", {})
+
+    serialized = json.dumps(status)
+    assert "signed-marker-must-not-leak" not in serialized
+    assert "lease-must-not-leak" not in serialized
+    sidebar = status["sidebar"]
+    assert set(sidebar) == {
+        "eligible_by_provider",
+        "counts",
+        "oldest_pending_age_seconds",
+        "last_heartbeat_at",
+        "last_visible_task_id",
+        "recent_error_codes",
+        "delivery_latency_seconds",
+    }
+    assert sidebar["eligible_by_provider"] == {"claude": 1, "hermes": 0}
+    assert sidebar["counts"]["sidebar_pending"] == 1
+    assert sidebar["last_heartbeat_at"] is not None
+    assert sidebar["recent_error_codes"] == []
+    assert sidebar["delivery_latency_seconds"] == {
+        "p50": None,
+        "p95": None,
+        "p99": None,
+    }
+
+
+class _McpSidebarVerifier:
+    def __init__(self, verified: VerifiedSidebarThread) -> None:
+        self.verified = verified
+        self.verify_calls: list[str] = []
+
+    def verify_thread(
+        self, *, thread_id: str, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread:
+        self.verify_calls.append(thread_id)
+        assert expected.bridge_id == self.verified.bridge_id
+        assert expected.source_session_id == self.verified.source_session_id
+        return self.verified
+
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None:
+        return None
+
+
+def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
+    db: SessionDB,
+) -> None:
+    token = "lineage-opaque-lease-token"
+    now = 1_000.0
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: token,
+    )
+    source = _projection(
+        Provider.CLAUDE,
+        "lineage-source",
+        title="Lineage source",
+        cwd="C:/work/lineage",
+        timestamp=900.0,
+    )
+    store.upsert_projection(source)
+    source_id = "claude:lineage-source"
+    bridge_id = sidebar_bridge_id(source_id)
+    candidate = SidebarCandidate(
+        source_session_id=source_id,
+        provider=Provider.CLAUDE,
+        bridge_id=bridge_id,
+        title="[Claude] Lineage source",
+        cwd="C:/work/lineage",
+        git_root=None,
+        git_branch="main",
+        git_head=None,
+        worktree_id=None,
+        eligible_at=900.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    store.claim_sidebar_jobs(now=now, limit=1)
+    thread_id = "33333333-3333-4333-8333-333333333333"
+    store.upsert_projection(
+        _projection(
+            Provider.CODEX,
+            thread_id,
+            title="Native sidebar placeholder",
+            cwd="C:/work/lineage",
+            timestamp=950.0,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=bridge_id,
+        )
+    )
+    verified = VerifiedSidebarThread(thread_id, source_id, bridge_id)
+    verifier = _McpSidebarVerifier(verified)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
+        store=store,
+        adapters={},
+        sidebar_verifier=verifier,
+        clock=lambda: now,
+    )
+
+    with _test_client(
+        create_app(
+            catalog=UnifiedCatalog(db, store),
+            coordinator=coordinator,
+            store=store,
+            config=BridgeConfig(),
+            token=TOKEN,
+            marker_key=MARKER_KEY,
+        )
+    ) as client:
+        first = _call_tool(
+            client,
+            "session_sidebar_commit",
+            {"lease_token": token, "codex_thread_id": thread_id},
+        )
+        replay = _call_tool(
+            client,
+            "session_sidebar_commit",
+            {"lease_token": token, "codex_thread_id": thread_id},
+        )
+
+    assert replay == first
+    assert verifier.verify_calls == [thread_id, thread_id]
+    resolved = UnifiedCatalog(db, store).resolve_continuation(
+        session_id=source_id,
+        bridge_id=None,
+        target_provider="codex",
+    )
+    assert resolved == {
+        "source_session_id": source_id,
+        "target_session_id": f"codex:{thread_id}",
+        "target_provider": "codex",
+        "bridge_id": bridge_id,
+    }
+    links = db._conn.execute(
+        "SELECT * FROM session_links WHERE bridge_id = ?", (bridge_id,)
+    ).fetchall()
+    assert len(links) == 1
 
 
 def test_session_continue_is_idempotent_for_identical_snapshot_and_budget(
