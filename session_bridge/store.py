@@ -1656,14 +1656,17 @@ class SessionBridgeStore:
             if row is not None:
                 try:
                     existing = json.loads(row["value_json"])
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("sidebar broker heartbeat state is malformed") from exc
-                if not isinstance(existing, dict) or "at" not in existing:
-                    raise ValueError("sidebar broker heartbeat state is malformed")
-                existing_at = _finite_number(
-                    existing["at"], "persisted sidebar broker heartbeat"
-                )
-                persisted = max(existing_at, heartbeat)
+                except (TypeError, ValueError):
+                    existing = None
+                if isinstance(existing, dict) and "at" in existing:
+                    try:
+                        existing_at = _finite_number(
+                            existing["at"], "persisted sidebar broker heartbeat"
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        persisted = max(existing_at, heartbeat)
 
             value_json = json.dumps(
                 {"at": persisted},

@@ -694,6 +694,13 @@ def get_config_path() -> Path:
     return get_hermes_home() / "config.yaml"
 
 
+def _canonical_config_target(config_path: Path) -> Path:
+    """Return the real write target used to identify a config lock."""
+
+    expanded = os.path.abspath(os.path.expanduser(str(config_path)))
+    return Path(os.path.realpath(expanded))
+
+
 @contextmanager
 def _config_file_lock(config_path: Optional[Path] = None) -> Iterator[None]:
     """Serialize config writers across processes with an adjacent sidecar.
@@ -704,10 +711,13 @@ def _config_file_lock(config_path: Optional[Path] = None) -> Iterator[None]:
     race in which two processes could lock different files at the same path.
     """
 
-    target_path = config_path or get_config_path()
+    target_path = _canonical_config_target(config_path or get_config_path())
+    target_key = os.path.normcase(str(target_path))
     lock_path = target_path.with_name(f"{target_path.name}.lock")
     depth = getattr(_CONFIG_FILE_LOCK_HOLDER, "depth", 0)
     if depth:
+        if getattr(_CONFIG_FILE_LOCK_HOLDER, "target_key", None) != target_key:
+            raise RuntimeError("config_lock_reentrancy_target_mismatch")
         _CONFIG_FILE_LOCK_HOLDER.depth = depth + 1
         try:
             yield
@@ -748,10 +758,12 @@ def _config_file_lock(config_path: Optional[Path] = None) -> Iterator[None]:
                 time.sleep(_CONFIG_FILE_LOCK_POLL_SECONDS)
 
         _CONFIG_FILE_LOCK_HOLDER.depth = 1
+        _CONFIG_FILE_LOCK_HOLDER.target_key = target_key
         try:
             yield
         finally:
             _CONFIG_FILE_LOCK_HOLDER.depth = 0
+            _CONFIG_FILE_LOCK_HOLDER.target_key = None
     finally:
         if acquired:
             try:
@@ -6809,19 +6821,23 @@ def write_platform_config_field(
     user's raw config file. Dashboard routes use the default loaded-config path
     so they retain their existing profile-scoped ``load_config`` behavior.
     """
-    config = read_raw_config() if raw else load_config()
-    platforms = config.setdefault("platforms", {})
-    if not isinstance(platforms, dict):
-        platforms = {}
-        config["platforms"] = platforms
+    def update(config: Dict[str, Any]) -> None:
+        platforms = config.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            config["platforms"] = platforms
 
-    platform_config = platforms.setdefault(platform_key, {})
-    if not isinstance(platform_config, dict):
-        platform_config = {}
-        platforms[platform_key] = platform_config
+        platform_config = platforms.setdefault(platform_key, {})
+        if not isinstance(platform_config, dict):
+            platform_config = {}
+            platforms[platform_key] = platform_config
 
-    platform_config[field_key] = value
-    save_config(config)
+        platform_config[field_key] = value
+
+    if raw:
+        mutate_raw_config(update)
+    else:
+        mutate_config(update)
 
 
 TERMINAL_CONFIG_ENV_MAP = {
@@ -7095,6 +7111,34 @@ _COMMENTED_SECTIONS = """
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
 """
+
+
+def mutate_raw_config(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    sort_keys: bool = False,
+) -> Dict[str, Any]:
+    """Mutate only user-authored YAML as one cross-process transaction.
+
+    This is the canonical path for read-modify-write callers that must not
+    materialize merged defaults. Full-file replacement callers should use
+    :func:`atomic_config_write`; callers editing merged runtime config should
+    use :func:`mutate_config`.
+    """
+
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    config_path = get_config_path()
+    with _CONFIG_LOCK, _config_file_lock(config_path):
+        require_readable_config_before_write(config_path)
+        config = read_raw_config()
+        original = copy.deepcopy(config)
+        result = mutator(config)
+        if result is not None:
+            raise TypeError("config mutator must update in place and return None")
+        if config != original:
+            atomic_config_write(config_path, config, sort_keys=sort_keys)
+        return copy.deepcopy(config)
 
 
 def mutate_config(
@@ -8134,65 +8178,59 @@ def set_config_value(key: str, value: str):
         print(f"✓ Set {key} in {get_env_path()}")
         return
     
-    # Otherwise it goes to config.yaml
-    # Read the raw user config (not merged with defaults) to avoid
-    # dumping all default values back to the file
     config_path = get_config_path()
-    require_readable_config_before_write(config_path)
-    user_config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = fast_safe_load(f) or {}
-        except Exception:
-            user_config = {}
-    
     # Handle nested keys (e.g., "tts.provider") including numeric list
     # indices (e.g., "custom_providers.0.api_key").  Delegates to
     # _set_nested which preserves list-typed nodes; before #17876 the
     # inline navigation here silently overwrote lists with dicts.
 
     # Convert value to appropriate type
+    parsed_value: Any = value
     if value.lower() in {'true', 'yes', 'on'}:
-        value = True
+        parsed_value = True
     elif value.lower() in {'false', 'no', 'off'}:
-        value = False
+        parsed_value = False
     elif value.isdigit():
-        value = int(value)
+        parsed_value = int(value)
     elif value.replace('.', '', 1).isdigit():
-        value = float(value)
+        parsed_value = float(value)
 
-    _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
     # ignored. Mirrors the load-time migration in _normalize_root_model_keys.
     _alias_norm = key.strip().lower()
+    persisted_key = key
     if _alias_norm in ("model.api_base", "api_base"):
-        user_config = _normalize_root_model_keys(user_config)
-        key = "model.base_url"
+        persisted_key = "model.base_url"
         print("  (note: 'api_base' is an alias — saved as model.base_url)")
-    # Write only user config back (not the full merged defaults)
-    ensure_hermes_home()
-    from utils import atomic_yaml_write
-    atomic_yaml_write(config_path, user_config, sort_keys=False)
+    def update(user_config: Dict[str, Any]) -> None:
+        _set_nested(user_config, key, parsed_value)
+        if _alias_norm in ("model.api_base", "api_base"):
+            normalized = _normalize_root_model_keys(user_config)
+            assert isinstance(normalized, dict)
+            user_config.clear()
+            user_config.update(normalized)
+
+    mutate_raw_config(update, sort_keys=False)
+    key = persisted_key
     
     # Keep .env in sync for keys that terminal_tool reads directly from env vars.
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
     if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
+        save_env_value(env_var, _terminal_env_value(parsed_value))
 
     # Mask the echoed value when the (possibly nested) key is credential-shaped
     # — e.g. `hermes config set model.api_key cfut_...` routes to config.yaml
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
     _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(parsed_value, str) and parsed_value:
         from agent.redact import mask_secret
-        _display_value = mask_secret(value)
+        _display_value = mask_secret(parsed_value)
     else:
-        _display_value = value
+        _display_value = parsed_value
     print(f"✓ Set {key} = {_display_value} in {config_path}")
 
 

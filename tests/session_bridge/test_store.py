@@ -3470,6 +3470,27 @@ def test_sidebar_broker_heartbeat_is_monotonic_across_overlapping_stores(db) -> 
         newer_db.close()
 
 
+def test_sidebar_broker_heartbeat_recovers_malformed_ephemeral_state(db) -> None:
+    store = SessionBridgeStore(db)
+
+    def seed_malformed(conn) -> None:
+        conn.execute(
+            """INSERT INTO session_bridge_state (key, value_json, updated_at)
+               VALUES (?, ?, ?)""",
+            (
+                "session-bridge:sidebar:broker-heartbeat",
+                "not-json-sensitive-raw-value",
+                1.0,
+            ),
+        )
+
+    db._execute_write(seed_malformed)
+
+    store.record_sidebar_broker_heartbeat(now=123.0)
+
+    assert store.get_state("session-bridge:sidebar:broker-heartbeat") == {"at": 123.0}
+
+
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:
     store = SessionBridgeStore(
         db,
