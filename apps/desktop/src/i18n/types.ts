@@ -346,6 +346,11 @@ export interface Translations {
       toolViewDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      chatWidthTitle: string
+      chatWidthDesc: string
+      chatWidthNormal: string
+      chatWidthWide: string
+      chatWidthFull: string
       translucencyTitle: string
       translucencyDesc: string
       backdropTitle: string
