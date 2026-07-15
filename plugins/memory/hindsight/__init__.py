@@ -794,6 +794,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
+        # v0.8.4+ recall parameters — gated behind enable_recall_v084_params toggle.
+        # When enabled, prefer_observations and min_scores are read from config and
+        # passed to the recall API. The toggle exists so users on older Hindsight
+        # servers can safely keep this disabled — older servers ignore unknown
+        # recall-request fields, but the toggle makes the intent explicit.
+        self._enable_recall_v084_params = False
+        self._prefer_observations = False
+        self._min_scores: dict | None = None
+
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
@@ -1092,6 +1101,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "enable_recall_v084_params", "description": "Enable v0.8.4+ recall parameters (prefer_observations, min_scores). Safe to enable with Hindsight >= 0.8.4 — older servers silently ignore unknown recall-request fields, but the toggle makes the intent explicit.", "default": False},
+            {"key": "prefer_observations", "description": "When recalling observation+raw facts together, drop raw facts superseded by consolidated observations. Requires enable_recall_v084_params=true and Hindsight >= 0.8.4.", "default": False},
+            {"key": "min_scores", "description": "Per-stage score floors for recall. JSON object with optional fields: semantic (0-1, minimum vector similarity), keyword (>=0, minimum BM25 score), reranker (0-1, minimum normalized cross-encoder score), final (minimum final ranking score). Requires enable_recall_v084_params=true and Hindsight >= 0.8.4.", "default": ""},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1597,6 +1609,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        # v0.8.4+ recall parameters — gated behind explicit toggle so older
+        # Hindsight servers silently ignore unknown keys rather than erroring.
+        self._enable_recall_v084_params = self._config.get("enable_recall_v084_params", False)
+        if self._enable_recall_v084_params:
+            self._prefer_observations = self._config.get("prefer_observations", False)
+            self._min_scores = self._config.get("min_scores", None)
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(
@@ -1770,6 +1788,10 @@ class HindsightMemoryProvider(MemoryProvider):
                         recall_kwargs["tags_match"] = self._recall_tags_match
                     if self._recall_types:
                         recall_kwargs["types"] = self._recall_types
+                    if self._enable_recall_v084_params:
+                        recall_kwargs["prefer_observations"] = self._prefer_observations
+                        if self._min_scores is not None:
+                            recall_kwargs["min_scores"] = self._min_scores
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
                                  self._bank_id, len(query), self._budget)
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
@@ -2004,6 +2026,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
+                if self._enable_recall_v084_params:
+                    recall_kwargs["prefer_observations"] = self._prefer_observations
+                    if self._min_scores is not None:
+                        recall_kwargs["min_scores"] = self._min_scores
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
                 resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
