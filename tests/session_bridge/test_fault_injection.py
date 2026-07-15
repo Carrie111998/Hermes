@@ -84,7 +84,7 @@ def _claude_record(
     record_type: str,
     event_id: str,
     content: str,
-    timestamp: str,
+    timestamp: str | float,
 ) -> dict[str, Any]:
     return {
         "type": record_type,
@@ -577,30 +577,68 @@ def test_sidebar_provider_parser_failures_are_isolated_bidirectionally(
     broken_provider: Provider,
     healthy_provider: Provider,
 ) -> None:
-    harness = _SidebarEndToEndHarness(tmp_path)
+    claude_root = tmp_path / "claude-projects"
+    harness = _SidebarEndToEndHarness(
+        tmp_path,
+        claude_projects_root=claude_root,
+    )
     try:
-        broken_id = harness.seed_source(
-            broken_provider,
-            f"broken-{broken_provider.value}",
-            cwd=tmp_path / f"broken-{broken_provider.value}",
-        )
-        healthy_id = harness.seed_source(
-            healthy_provider,
-            f"healthy-{healthy_provider.value}",
-            cwd=tmp_path / f"healthy-{healthy_provider.value}",
-        )
-        harness.db._execute_write(
-            lambda conn: conn.execute(
-                "UPDATE sessions SET cwd = NULL WHERE id = ?",
-                (broken_id,),
+        transcript = claude_root / "project" / "sidebar-provider.jsonl"
+        if broken_provider is Provider.CLAUDE:
+            broken_id = "claude:broken-claude"
+            records = [
+                _claude_record(
+                    record_type="user",
+                    event_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    content="malformed Claude source",
+                    timestamp=harness.now,
+                ),
+                _claude_record(
+                    record_type="assistant",
+                    event_id="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    content="conflicting native identity",
+                    timestamp=harness.now + 1,
+                ),
+            ]
+            records[0]["sessionId"] = "broken-claude"
+            records[1]["sessionId"] = "different-native-id"
+            _write_jsonl(transcript, records)
+            healthy_id = harness.seed_source(
+                Provider.HERMES,
+                "healthy-hermes",
+                cwd=tmp_path / "healthy-hermes",
             )
-        )
+        else:
+            broken_id = "broken-hermes"
+            harness.db.create_session(broken_id, "cli", cwd=None)
+            harness.db.append_message(
+                broken_id,
+                "user",
+                "malformed Hermes source",
+                timestamp=harness.now,
+            )
+            healthy_id = "claude:healthy-claude"
+            record = _claude_record(
+                record_type="user",
+                event_id="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                content="healthy Claude source",
+                timestamp=harness.now,
+            )
+            record["sessionId"] = "healthy-claude"
+            healthy_claude_cwd = tmp_path / "healthy-claude"
+            healthy_claude_cwd.mkdir()
+            record["cwd"] = str(healthy_claude_cwd)
+            _write_jsonl(transcript, [record])
 
+        scan = harness.scan_claude_history()
         summary = harness.register()
         with harness.client() as client:
             delivered = harness.run_worker_once(client)
 
-        assert summary.failed == 1
+        assert scan.discovered == 1
+        assert scan.failed == int(broken_provider is Provider.CLAUDE)
+        assert scan.indexed == int(healthy_provider is Provider.CLAUDE)
+        assert summary.failed == int(broken_provider is Provider.HERMES)
         assert summary.queued == 1
         assert harness.store.get_sidebar_job_for_source(broken_id) is None
         assert harness.store.get_sidebar_job_for_source(healthy_id)["state"] == (

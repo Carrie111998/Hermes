@@ -14,6 +14,7 @@ import time
 from typing import Any
 import uuid
 
+import httpx
 import pytest
 from mcp.shared.version import LATEST_PROTOCOL_VERSION
 from starlette.testclient import TestClient
@@ -1133,10 +1134,51 @@ class _FakeNativeCodexTasks:
         return _verified_native_thread(thread)
 
 
+class _CommitDroppingClient:
+    """Drop one public commit request before or after MCP server processing."""
+
+    def __init__(self, delegate: TestClient, *, timing: str) -> None:
+        if timing not in {"before_processing", "after_processing"}:
+            raise ValueError("commit drop timing is invalid")
+        self.delegate = delegate
+        self.timing = timing
+        self.commit_attempts = 0
+        self.dropped = False
+        self.tool_calls: list[str] = []
+
+    @property
+    def headers(self):
+        return self.delegate.headers
+
+    def post(self, *args: Any, **kwargs: Any):
+        payload = kwargs.get("json")
+        tool_name = None
+        if isinstance(payload, dict) and payload.get("method") == "tools/call":
+            params = payload.get("params")
+            if isinstance(params, dict):
+                tool_name = params.get("name")
+                if isinstance(tool_name, str):
+                    self.tool_calls.append(tool_name)
+        if tool_name != "session_sidebar_commit" or self.dropped:
+            return self.delegate.post(*args, **kwargs)
+
+        self.commit_attempts += 1
+        self.dropped = True
+        if self.timing == "before_processing":
+            raise httpx.ReadError("synthetic commit connection drop")
+        self.delegate.post(*args, **kwargs)
+        raise httpx.ReadError("synthetic commit response drop")
+
+
 class _SidebarEndToEndHarness:
     """Drive registration and delivery through the public MCP tools."""
 
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        claude_projects_root: Path | None = None,
+    ) -> None:
         self.now = time.time()
         self.db = SessionDB(tmp_path / "sidebar-e2e-state.db")
         self.store = SessionBridgeStore(
@@ -1152,10 +1194,16 @@ class _SidebarEndToEndHarness:
             _MARKER_SECRET,
             on_create=self._index_native_thread,
         )
+        adapters = {}
+        if claude_projects_root is not None:
+            adapters[Provider.CLAUDE] = ClaudeSourceAdapter(
+                claude_projects_root,
+                marker_secret=_MARKER_SECRET,
+            )
         self.coordinator = SessionBridgeCoordinator(
             config=self.config,
             store=self.store,
-            adapters={},
+            adapters=adapters,
             target_adapters={},
             sidebar_verifier=self.native,
             clock=lambda: self.now,
@@ -1283,6 +1331,11 @@ class _SidebarEndToEndHarness:
             )
         )
 
+    def scan_claude_history(self):
+        return asyncio.run(
+            self.coordinator.scan_all_history(Provider.CLAUDE)
+        )
+
     @contextmanager
     def client(self):
         with TestClient(
@@ -1295,11 +1348,12 @@ class _SidebarEndToEndHarness:
     def advance_retry(self) -> None:
         self.now += 120.0
 
+    def advance_lease_expiry(self) -> None:
+        self.now += 301.0
+
     def run_worker_once(
         self,
-        client: TestClient,
-        *,
-        drop_commit: bool = False,
+        client: Any,
     ) -> list[dict[str, Any]]:
         jobs = _sidebar_call_tool(
             client,
@@ -1356,28 +1410,19 @@ class _SidebarEndToEndHarness:
                 )
                 continue
 
-            if drop_commit:
+            try:
                 outcomes.append(
                     _sidebar_call_tool(
                         client,
-                        "session_sidebar_fail",
+                        "session_sidebar_commit",
                         {
                             "lease_token": job["lease_token"],
-                            "error_code": "bridge_temporarily_unavailable",
+                            "codex_thread_id": thread_id,
                         },
                     )
                 )
-                continue
-            outcomes.append(
-                _sidebar_call_tool(
-                    client,
-                    "session_sidebar_commit",
-                    {
-                        "lease_token": job["lease_token"],
-                        "codex_thread_id": thread_id,
-                    },
-                )
-            )
+            except httpx.TransportError:
+                outcomes.append({"state": "commit_unknown"})
         return outcomes
 
 
@@ -1584,8 +1629,10 @@ def test_sidebar_inbox_fallback_preserves_exact_source_cwd(tmp_path: Path) -> No
         harness.close()
 
 
+@pytest.mark.parametrize("drop_timing", ["before_processing", "after_processing"])
 def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
     tmp_path: Path,
+    drop_timing: str,
 ) -> None:
     harness = _SidebarEndToEndHarness(tmp_path)
     try:
@@ -1599,21 +1646,34 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
         harness.register()
 
         with harness.client() as client:
-            first = harness.run_worker_once(client, drop_commit=True)
-            harness.advance_retry()
+            dropped_client = _CommitDroppingClient(client, timing=drop_timing)
+            first = harness.run_worker_once(dropped_client)
+            state_after_drop = harness.store.get_sidebar_job_for_source(source_id)
+            if drop_timing == "before_processing":
+                harness.advance_lease_expiry()
             second = harness.run_worker_once(client)
 
-        assert first == [
-            {
-                "state": "sidebar_retry",
-                "error_code": "bridge_temporarily_unavailable",
-            }
-        ]
-        assert second == [
-            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
-        ]
+        assert first == [{"state": "commit_unknown"}]
+        assert dropped_client.commit_attempts == 1
+        assert dropped_client.dropped is True
+        assert "session_sidebar_commit" in dropped_client.tool_calls
+        assert "session_sidebar_fail" not in dropped_client.tool_calls
+        if drop_timing == "before_processing":
+            assert state_after_drop["state"] == SidebarJobState.LEASED.value
+            assert second == [
+                {
+                    "state": "sidebar_visible",
+                    "codex_thread_id": "native-sidebar-1",
+                }
+            ]
+            assert (
+                harness.native.reconciliation_calls[-1].source_session_id
+                == source_id
+            )
+        else:
+            assert state_after_drop["state"] == SidebarJobState.VISIBLE.value
+            assert second == []
         assert len(harness.native.create_calls) == 1
-        assert harness.native.reconciliation_calls[-1].source_session_id == source_id
         assert harness.store.get_sidebar_job_for_source(source_id)["state"] == (
             SidebarJobState.VISIBLE.value
         )
