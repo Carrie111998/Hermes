@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 import errno
 import hashlib
 import hmac
@@ -88,6 +89,7 @@ _SIDEBAR_CLAIM_SCAN_LIMIT = 40
 
 
 NativeProjectionCursor = tuple[float, str]
+SidebarCandidateCursor = tuple[float, str]
 
 
 class _MirrorWorkerFileLock:
@@ -132,6 +134,32 @@ class NativeProjectionPage(list[SessionProjection]):
         next_cursor: NativeProjectionCursor | None = None,
     ) -> None:
         super().__init__(projections)
+        self.has_more = has_more
+        self.next_cursor = next_cursor
+
+
+@dataclass(frozen=True)
+class SidebarSource:
+    source_session_id: str
+    projection: SessionProjection
+    git_root: str | None
+    git_head: str | None
+    worktree_id: str | None
+    automation_only: bool
+    subagent_only: bool
+
+
+class SidebarSourcePage(list[SidebarSource]):
+    """A bounded newest-first page of sidebar-classification inputs."""
+
+    def __init__(
+        self,
+        sources: Sequence[SidebarSource] = (),
+        *,
+        has_more: bool = False,
+        next_cursor: SidebarCandidateCursor | None = None,
+    ) -> None:
+        super().__init__(sources)
         self.has_more = has_more
         self.next_cursor = next_cursor
 
@@ -613,6 +641,213 @@ class SessionBridgeStore:
                     for row in rows
                 )
         return frozenset(mappings)
+
+    def list_sidebar_candidates(
+        self,
+        after: float,
+        limit: int,
+        *,
+        cursor: SidebarCandidateCursor | None = None,
+    ) -> SidebarSourcePage:
+        cutoff = _finite_number(after, "sidebar candidate cutoff")
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("sidebar candidate limit must be between 1 and 1000")
+        normalized_cursor = _validated_sidebar_candidate_cursor(cursor)
+        cursor_clause = ""
+        params: dict[str, Any] = {
+            "after": cutoff,
+            "claude": Provider.CLAUDE.value,
+            "native": OriginKind.NATIVE.value,
+            "activity_prefix": "session-bridge:external-activity:",
+            "query_limit": limit + 1,
+        }
+        if normalized_cursor is not None:
+            cursor_clause = """AND (
+                candidate.last_active < :cursor_activity
+                OR (
+                    candidate.last_active = :cursor_activity
+                    AND candidate.session_id > :cursor_session_id
+                )
+            )"""
+            params["cursor_activity"] = normalized_cursor[0]
+            params["cursor_session_id"] = normalized_cursor[1]
+
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            rows = conn.execute(
+                f"""WITH source_metadata AS (
+                       SELECT s.id AS session_id, s.source, s.model_config,
+                              s.title, s.cwd, s.started_at, s.git_branch,
+                              s.git_repo_root,
+                              e.provider AS external_provider,
+                              e.native_id AS external_native_id,
+                              e.native_path, e.native_status,
+                              e.last_native_cursor, e.last_native_hash,
+                              e.parser_version, e.origin_kind,
+                              e.origin_bridge_id,
+                              CASE
+                                  WHEN e.provider = :claude THEN CAST(json_extract(
+                                      activity.value_json, '$.last_active'
+                                  ) AS REAL)
+                                  ELSE COALESCE(
+                                      (SELECT MAX(message.timestamp)
+                                         FROM messages AS message
+                                        WHERE message.session_id = s.id
+                                          AND (
+                                              message.active = 1
+                                              OR message.compacted = 1
+                                          )),
+                                      s.started_at
+                                  )
+                              END AS last_active,
+                              CASE WHEN s.source = 'cron' THEN 1 ELSE 0 END
+                                  AS automation_only,
+                              CASE
+                                  WHEN s.source IN ('subagent', 'tool') THEN 1
+                                  WHEN json_extract(
+                                      COALESCE(s.model_config, '{{}}'),
+                                      '$._delegate_from'
+                                  ) IS NOT NULL THEN 1
+                                  ELSE 0
+                              END AS subagent_only
+                         FROM sessions AS s
+                         LEFT JOIN external_sessions AS e
+                           ON e.session_id = s.id
+                         LEFT JOIN session_bridge_state AS activity
+                           ON activity.key = :activity_prefix || s.id
+                        WHERE (
+                            (
+                                e.provider = :claude
+                                AND e.origin_kind = :native
+                                AND e.origin_bridge_id IS NULL
+                            )
+                            OR (
+                                e.session_id IS NULL
+                                AND s.id NOT LIKE 'claude:%'
+                                AND s.id NOT LIKE 'codex:%'
+                            )
+                        )
+                   ), candidate AS (
+                       SELECT * FROM source_metadata
+                        WHERE last_active IS NOT NULL
+                          AND last_active >= :after
+                   )
+                   SELECT * FROM candidate
+                    WHERE 1 = 1
+                      {cursor_clause}
+                    ORDER BY candidate.last_active DESC, candidate.session_id
+                    LIMIT :query_limit""",
+                params,
+            ).fetchall()
+            if not rows:
+                return SidebarSourcePage()
+
+            page_rows = rows[:limit]
+            messages_by_session: dict[str, list[ProjectedMessage]] = {
+                row["session_id"]: [] for row in page_rows
+            }
+            session_ids = list(messages_by_session)
+            for start in range(0, len(session_ids), _MESSAGE_KEY_QUERY_CHUNK):
+                batch = session_ids[start : start + _MESSAGE_KEY_QUERY_CHUNK]
+                placeholders = ",".join("?" for _ in batch)
+                message_rows = conn.execute(
+                    f"""SELECT message.id, message.session_id, message.role,
+                               message.content, message.timestamp,
+                               map.native_event_id, map.ordinal
+                          FROM messages AS message
+                          LEFT JOIN external_message_map AS map
+                            ON map.message_id = message.id
+                         WHERE message.session_id IN ({placeholders})
+                           AND message.role = 'user'
+                           AND (message.active = 1 OR message.compacted = 1)
+                         ORDER BY message.session_id,
+                                  message.timestamp, message.id""",
+                    batch,
+                ).fetchall()
+                for message_row in message_rows:
+                    decoded_content = self.db._decode_content(message_row["content"])
+                    content = (
+                        decoded_content if isinstance(decoded_content, str) else None
+                    )
+                    message_id = int(message_row["id"])
+                    messages_by_session[message_row["session_id"]].append(
+                        ProjectedMessage(
+                            native_event_id=(
+                                message_row["native_event_id"]
+                                or f"hermes-message:{message_id}"
+                            ),
+                            ordinal=(
+                                int(message_row["ordinal"])
+                                if message_row["ordinal"] is not None
+                                else message_id
+                            ),
+                            role=message_row["role"],
+                            content=content,
+                            timestamp=float(message_row["timestamp"]),
+                        )
+                    )
+
+        sources: list[SidebarSource] = []
+        for row in page_rows:
+            source_session_id = row["session_id"]
+            provider = (
+                Provider.CLAUDE
+                if row["external_provider"] == Provider.CLAUDE.value
+                else Provider.HERMES
+            )
+            native_id = (
+                row["external_native_id"]
+                if provider is Provider.CLAUDE
+                else source_session_id
+            )
+            last_active = _finite_number(
+                row["last_active"], "sidebar candidate activity"
+            )
+            projection = SessionProjection(
+                provider=provider,
+                native_id=native_id,
+                title=row["title"],
+                cwd=row["cwd"],
+                started_at=float(row["started_at"]),
+                last_active=last_active,
+                messages=tuple(messages_by_session[source_session_id]),
+                native_path=row["native_path"],
+                native_status=row["native_status"] or "active",
+                native_cursor=row["last_native_cursor"],
+                native_hash=row["last_native_hash"],
+                parser_version=int(row["parser_version"] or 1),
+                origin_kind=OriginKind.NATIVE,
+                origin_bridge_id=None,
+                git_branch=row["git_branch"],
+            )
+            sources.append(
+                SidebarSource(
+                    source_session_id=source_session_id,
+                    projection=projection,
+                    git_root=row["git_repo_root"],
+                    git_head=None,
+                    worktree_id=None,
+                    automation_only=bool(row["automation_only"]),
+                    subagent_only=bool(row["subagent_only"]),
+                )
+            )
+
+        has_more = len(rows) > limit
+        next_cursor = (
+            (sources[-1].projection.last_active, sources[-1].source_session_id)
+            if has_more and sources
+            else None
+        )
+        return SidebarSourcePage(
+            sources,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
 
     def get_session_launch_metadata(
         self, session_id: str
@@ -2660,6 +2895,23 @@ def _validated_native_projection_cursor(
     activity = _finite_number(cursor[0], "native projection cursor activity")
     session_id = cursor[1]
     _provider_from_canonical_session_id(session_id)
+    return activity, session_id
+
+
+def _validated_sidebar_candidate_cursor(
+    cursor: SidebarCandidateCursor | None,
+) -> SidebarCandidateCursor | None:
+    if cursor is None:
+        return None
+    if not isinstance(cursor, tuple) or len(cursor) != 2:
+        raise ValueError("sidebar candidate cursor must be an exact pair")
+    activity = _finite_number(cursor[0], "sidebar candidate cursor activity")
+    session_id = _exact_nonempty_text(
+        cursor[1], "sidebar candidate cursor session ID"
+    )
+    from .sidebar import sidebar_idempotency_key
+
+    sidebar_idempotency_key(session_id)
     return activity, session_id
 
 

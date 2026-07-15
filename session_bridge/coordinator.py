@@ -38,7 +38,13 @@ from .models import (
     UpsertResult,
     canonical_session_id,
 )
-from .store import SessionBridgeStore
+from .sidebar import (
+    SidebarCandidate,
+    is_sidebar_session_eligible,
+    sidebar_bridge_id,
+    sidebar_title,
+)
+from .store import SessionBridgeStore, SidebarSource
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,14 @@ class JobSummary:
     succeeded: int
     retried: int
     manual_failure: int
+
+
+@dataclass(frozen=True)
+class SidebarRegistrationSummary:
+    examined: int
+    queued: int
+    by_provider: Mapping[str, int]
+    failed: int
 
 
 @dataclass(frozen=True)
@@ -191,6 +205,13 @@ class SessionBridgeCoordinator:
         self._backfill_progress: dict[Provider, dict[str, int | str]] = {}
         self._continuous_watermark: float | None = None
         self._registration_turn_fallback: bool | None = None
+        self._sidebar_registration_counts = {
+            "examined": 0,
+            "queued": 0,
+            Provider.CLAUDE.value: 0,
+            Provider.HERMES.value: 0,
+            "failed": 0,
+        }
 
     @asynccontextmanager
     async def _mirror_worker_critical_section(self) -> AsyncIterator[None]:
@@ -313,6 +334,118 @@ class SessionBridgeCoordinator:
             failed=sum(summary.failed for summary in summaries),
             duration_ms=sum(summary.duration_ms for summary in summaries),
         )
+
+    async def register_sidebar_jobs_once(
+        self,
+        *,
+        now: float | None = None,
+        limit: int = 100,
+    ) -> SidebarRegistrationSummary:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 1000
+        ):
+            raise ValueError("sidebar registration limit must be between 1 and 1000")
+        registration_time = _finite_number(
+            self._clock() if now is None else now,
+            "now",
+        )
+        if not self._config.sidebar.enabled:
+            summary = SidebarRegistrationSummary(
+                examined=0,
+                queued=0,
+                by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
+                failed=0,
+            )
+            self._set_sidebar_registration_counts(summary)
+            return summary
+
+        after = registration_time - self._config.sidebar.backfill_days * 86_400
+        raw_sources = await asyncio.to_thread(
+            _call,
+            self._store,
+            "list_sidebar_candidates",
+            after,
+            limit,
+            cursor=None,
+        )
+        by_provider = {Provider.CLAUDE.value: 0, Provider.HERMES.value: 0}
+        queued = 0
+        failed = 0
+        seen: set[str] = set()
+        for raw_source in raw_sources:
+            try:
+                if not isinstance(raw_source, SidebarSource):
+                    raise ValueError("sidebar source candidate is malformed")
+                source = raw_source
+                if source.source_session_id in seen:
+                    raise ValueError("duplicate sidebar source candidate")
+                seen.add(source.source_session_id)
+                projection = source.projection
+                if not is_sidebar_session_eligible(
+                    projection,
+                    now=registration_time,
+                    backfill_days=self._config.sidebar.backfill_days,
+                    automation_only=source.automation_only,
+                    subagent_only=source.subagent_only,
+                ):
+                    continue
+                canonical_source = canonical_session_id(
+                    projection.provider,
+                    projection.native_id,
+                )
+                if canonical_source != source.source_session_id:
+                    raise ValueError("sidebar source identity is inconsistent")
+                first_request = _first_sidebar_request(projection)
+                if not isinstance(projection.cwd, str) or not projection.cwd.strip():
+                    raise ValueError("sidebar source cwd is unavailable")
+                candidate = SidebarCandidate(
+                    source_session_id=canonical_source,
+                    provider=projection.provider,
+                    bridge_id=sidebar_bridge_id(canonical_source),
+                    title=sidebar_title(
+                        projection.provider,
+                        projection.title,
+                        first_request,
+                    ),
+                    cwd=projection.cwd,
+                    git_root=source.git_root,
+                    git_branch=projection.git_branch,
+                    git_head=source.git_head,
+                    worktree_id=source.worktree_id,
+                    eligible_at=projection.last_active,
+                )
+                getter = getattr(self._store, "get_sidebar_job_for_source", None)
+                existing = (
+                    await asyncio.to_thread(getter, canonical_source)
+                    if callable(getter)
+                    else None
+                )
+                if existing is not None:
+                    continue
+                await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "enqueue_sidebar_job",
+                    candidate,
+                )
+                queued += 1
+                by_provider[projection.provider.value] += 1
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                failed += 1
+                self._record_error_code("sidebar_registration_candidate_failed")
+
+        summary = SidebarRegistrationSummary(
+            examined=len(raw_sources),
+            queued=queued,
+            by_provider=by_provider,
+            failed=failed,
+        )
+        self._set_sidebar_registration_counts(summary)
+        return summary
 
     async def reconcile_once(self) -> ReconcileSummary:
         async with self._job_lock:
@@ -930,6 +1063,9 @@ class SessionBridgeCoordinator:
                 for provider, progress in self._backfill_progress.items()
             },
             "registration_turn_fallback": self._registration_turn_fallback,
+            "sidebar_registration_counts": dict(
+                self._sidebar_registration_counts
+            ),
             "provider_calls_inflight": len(self._provider_tasks),
             "recent_error_codes": list(self._recent_error_codes),
         }
@@ -944,6 +1080,35 @@ class SessionBridgeCoordinator:
             stop_after_attempts=mirrors.stop_after_attempts,
             stop_error_rate=mirrors.stop_error_rate,
         )
+
+    def _set_sidebar_registration_counts(
+        self,
+        summary: SidebarRegistrationSummary,
+    ) -> None:
+        self._sidebar_registration_counts = {
+            "examined": summary.examined,
+            "queued": summary.queued,
+            Provider.CLAUDE.value: int(
+                summary.by_provider.get(Provider.CLAUDE.value, 0)
+            ),
+            Provider.HERMES.value: int(
+                summary.by_provider.get(Provider.HERMES.value, 0)
+            ),
+            "failed": summary.failed,
+        }
+
+    async def _register_sidebar_after_successful_scan(self) -> None:
+        sidebar = self._config.sidebar
+        if not sidebar.enabled or not sidebar.continuous:
+            return
+        try:
+            await self.register_sidebar_jobs_once(
+                limit=sidebar.continuous_batch_limit,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            self._record_error_code("sidebar_registration_failed")
 
     async def _creation_capacity(
         self,
@@ -1532,6 +1697,7 @@ class SessionBridgeCoordinator:
             else:
                 await self._complete_backfill_if_drained(provider, discovery_mode)
                 self._mark_scan_success(provider)
+                await self._register_sidebar_after_successful_scan()
             return ScanSummary(
                 provider=provider,
                 discovered=summary.discovered,
@@ -2868,6 +3034,20 @@ def _session_link_from_row(raw_row: object) -> SessionLink:
         source_hash=source_hash,
         created_at=_mapping_number(row, "created_at"),
     )
+
+
+def _first_sidebar_request(projection: SessionProjection) -> str:
+    for message in projection.messages:
+        if message.role != "user" or not isinstance(message.content, str):
+            continue
+        single_message_projection = replace(projection, messages=(message,))
+        if is_sidebar_session_eligible(
+            single_message_projection,
+            now=projection.last_active,
+            backfill_days=0,
+        ):
+            return message.content
+    raise ValueError("eligible sidebar source has no meaningful user request")
 
 
 def _required_mapping_text(row: Mapping[str, Any], key: str) -> str:

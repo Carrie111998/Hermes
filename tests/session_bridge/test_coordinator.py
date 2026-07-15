@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
@@ -14,6 +14,7 @@ import uuid
 
 import pytest
 
+from hermes_state import SessionDB
 from session_bridge.claude_adapter import (
     AmbiguousPlaceholderCreation,
     ClaudeCursor,
@@ -22,7 +23,7 @@ from session_bridge.claude_adapter import (
     PlaceholderResult,
 )
 from session_bridge.codex_adapter import CodexThreadSummary
-from session_bridge.config import BridgeConfig
+from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.context_pack import ContextPackRequest
 from session_bridge.coordinator import (
     ContinueRequest,
@@ -36,12 +37,15 @@ from session_bridge.models import (
     ContextPack,
     MirrorJobState,
     OriginKind,
+    ProjectedMessage,
     Provider,
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarJobState,
     UpsertResult,
 )
+from session_bridge.store import SessionBridgeStore
 
 
 _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
@@ -2561,6 +2565,379 @@ def test_health_reports_durable_queue_counts_without_sensitive_job_data() -> Non
     serialized = json.dumps(health, sort_keys=True)
     assert "source-native-1" not in serialized
     assert "durable-idempotency-1" not in serialized
+
+
+@pytest.fixture
+def sidebar_db(tmp_path: Path) -> Iterator[SessionDB]:
+    database = SessionDB(tmp_path / "sidebar-state.db")
+    yield database
+    database.close()
+
+
+def _sidebar_projection(
+    *,
+    provider: Provider,
+    native_id: str,
+    content: str,
+    last_active: float,
+    origin_kind: OriginKind = OriginKind.NATIVE,
+    origin_bridge_id: str | None = None,
+    cwd: str | None = "C:/workspace/sidebar",
+) -> SessionProjection:
+    return SessionProjection(
+        provider=provider,
+        native_id=native_id,
+        title=None,
+        cwd=cwd,
+        started_at=last_active - 10,
+        last_active=last_active,
+        messages=(
+            ProjectedMessage(
+                native_event_id=f"event-{provider.value}-{native_id}",
+                ordinal=0,
+                role="user",
+                content=content,
+                timestamp=last_active,
+            ),
+        ),
+        native_path=f"C:/{provider.value}/{native_id}.jsonl",
+        native_cursor=f"cursor-{native_id}",
+        native_hash=f"hash-{native_id}",
+        origin_kind=origin_kind,
+        origin_bridge_id=origin_bridge_id,
+        git_branch="feature/sidebar",
+    )
+
+
+def _add_hermes_sidebar_source(
+    db: SessionDB,
+    *,
+    session_id: str,
+    content: str | None,
+    last_active: float,
+    source: str = "cli",
+    model_config: dict[str, str] | None = None,
+    cwd: str | None = "C:/workspace/sidebar",
+) -> None:
+    db.ensure_session(
+        session_id,
+        source=source,
+        model_config=model_config,
+        cwd=cwd,
+    )
+    if content is not None:
+        db.append_message(
+            session_id,
+            role="user",
+            content=content,
+            timestamp=last_active,
+        )
+
+    def _write(conn: Any) -> None:
+        conn.execute(
+            """UPDATE sessions
+               SET title = NULL, git_branch = ?, git_repo_root = ?, started_at = ?
+               WHERE id = ?""",
+            ("feature/sidebar", cwd, last_active - 10, session_id),
+        )
+
+    db._execute_write(_write)
+
+
+def _sidebar_config(
+    *,
+    enabled: bool = True,
+    continuous: bool = False,
+    backfill_days: int = 30,
+) -> BridgeConfig:
+    return replace(
+        BridgeConfig(),
+        sidebar=replace(
+            SidebarConfig(),
+            enabled=enabled,
+            continuous=continuous,
+            backfill_days=backfill_days,
+        ),
+    )
+
+
+def _seed_sidebar_sources(
+    db: SessionDB,
+    *,
+    now: float,
+) -> SessionBridgeStore:
+    store = SessionBridgeStore(db, clock=lambda: now)
+    cutoff = now - 30 * 86_400
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="meaningful-claude",
+            content="Build the native sidebar broker",
+            last_active=now,
+        )
+    )
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CODEX,
+            native_id="reverse-loop-codex",
+            content="Do not register Codex as a source",
+            last_active=now - 1,
+        )
+    )
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="bridge-placeholder",
+            content="This bridge row must stay excluded",
+            last_active=now - 2,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id="bridge:placeholder",
+        )
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="meaningful-hermes",
+        content="Fix the Hermes catalog",
+        last_active=now - 3,
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="ack-hermes",
+        content="yes",
+        last_active=now - 4,
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="automation-hermes",
+        content="Generate the scheduled digest",
+        last_active=now - 5,
+        source="cron",
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="subagent-hermes",
+        content="Inspect the delegated implementation",
+        last_active=now - 6,
+        source="subagent",
+        model_config={"_delegate_from": "parent-session"},
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="empty-hermes",
+        content=None,
+        last_active=now - 7,
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="boundary-hermes",
+        content="Keep the inclusive boundary",
+        last_active=cutoff,
+    )
+    _add_hermes_sidebar_source(
+        db,
+        session_id="old-hermes",
+        content="This session is too old",
+        last_active=cutoff - 0.001,
+    )
+    return store
+
+
+def test_sidebar_candidate_query_is_batched_structural_and_stably_paginated(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    cutoff = now - 30 * 86_400
+    store = _seed_sidebar_sources(sidebar_db, now=now)
+
+    first_page = store.list_sidebar_candidates(cutoff, 2)
+    second_page = store.list_sidebar_candidates(
+        cutoff,
+        10,
+        cursor=first_page.next_cursor,
+    )
+    sources = [*first_page, *second_page]
+    source_ids = [source.projection.native_id for source in sources]
+
+    assert first_page.has_more is True
+    assert first_page.next_cursor == (
+        first_page[-1].projection.last_active,
+        first_page[-1].source_session_id,
+    )
+    assert source_ids == [
+        "meaningful-claude",
+        "meaningful-hermes",
+        "ack-hermes",
+        "automation-hermes",
+        "subagent-hermes",
+        "empty-hermes",
+        "boundary-hermes",
+    ]
+    assert "reverse-loop-codex" not in source_ids
+    assert "bridge-placeholder" not in source_ids
+    assert "old-hermes" not in source_ids
+    assert next(
+        source for source in sources if source.projection.native_id == "ack-hermes"
+    ).projection.messages[0].content == "yes"
+    automation = next(
+        source
+        for source in sources
+        if source.projection.native_id == "automation-hermes"
+    )
+    subagent = next(
+        source
+        for source in sources
+        if source.projection.native_id == "subagent-hermes"
+    )
+    assert automation.automation_only is True
+    assert automation.subagent_only is False
+    assert subagent.subagent_only is True
+
+
+class _ForbiddenSidebarTarget:
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"sidebar registration called target adapter method {name}")
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_enqueues_only_native_meaningful_sources_once(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = _seed_sidebar_sources(sidebar_db, now=now)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    first = await coordinator.register_sidebar_jobs_once(now=now, limit=100)
+    replay = await coordinator.register_sidebar_jobs_once(now=now, limit=100)
+
+    assert first.examined == 7
+    assert first.queued == 3
+    assert first.by_provider == {"claude": 1, "hermes": 2}
+    assert first.failed == 0
+    assert replay.queued == 0
+    claude_job = store.get_sidebar_job_for_source("claude:meaningful-claude")
+    assert claude_job is not None
+    assert claude_job["state"] == SidebarJobState.PENDING.value
+    assert store.get_sidebar_job_for_source("meaningful-hermes") is not None
+    assert store.get_sidebar_job_for_source("boundary-hermes") is not None
+    for excluded in (
+        "ack-hermes",
+        "automation-hermes",
+        "subagent-hermes",
+        "empty-hermes",
+        "old-hermes",
+    ):
+        assert store.get_sidebar_job_for_source(excluded) is None
+
+    health = coordinator.health()
+    assert health["sidebar_registration_counts"] == {
+        "examined": 7,
+        "queued": 0,
+        "claude": 0,
+        "hermes": 0,
+        "failed": 0,
+    }
+    serialized = json.dumps(health, sort_keys=True)
+    assert "meaningful-claude" not in serialized
+    assert "lease_token" not in serialized
+    assert "marker" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_isolates_malformed_claude_from_hermes(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="bad-cwd",
+            content="Queue this source",
+            last_active=now,
+            cwd=None,
+        )
+    )
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="healthy-hermes",
+        content="Queue the healthy provider",
+        last_active=now - 1,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.register_sidebar_jobs_once(now=now, limit=100)
+
+    assert summary.queued == 1
+    assert summary.by_provider == {"claude": 0, "hermes": 1}
+    assert summary.failed == 1
+    assert store.get_sidebar_job_for_source("healthy-hermes") is not None
+    assert store.get_sidebar_job_for_source("claude:bad-cwd") is None
+
+
+class _SidebarScanStore(_RecordingStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sidebar_list_calls: list[tuple[float, int, object]] = []
+
+    def list_sidebar_candidates(
+        self,
+        after: float,
+        limit: int,
+        cursor: object = None,
+    ) -> list[object]:
+        self.sidebar_list_calls.append((after, limit, cursor))
+        return []
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_validates_clock_before_disabled_gate() -> None:
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(enabled=False),
+        store=_SidebarScanStore(),
+        adapters={},
+        target_adapters={},
+        clock=lambda: float("nan"),
+    )
+
+    with pytest.raises(RuntimeError, match="now is invalid"):
+        await coordinator.register_sidebar_jobs_once()
+
+
+@pytest.mark.parametrize("continuous", (False, True))
+@pytest.mark.asyncio
+async def test_successful_provider_scan_only_registers_sidebar_in_continuous_mode(
+    continuous: bool,
+) -> None:
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=continuous),
+        store=store,
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert len(store.sidebar_list_calls) == int(continuous)
+    if continuous:
+        assert store.sidebar_list_calls == [
+            (now - 30 * 86_400, SidebarConfig().continuous_batch_limit, None)
+        ]
 
 
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.CODEX])

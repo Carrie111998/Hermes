@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from session_bridge.config import BridgeConfig
+from hermes_cli.config import DEFAULT_CONFIG
+from session_bridge.config import BridgeConfig, SidebarConfig, _ENV_NAMES
 
 
 def _load(
@@ -109,3 +113,110 @@ def test_mcp_token_is_whitelisted_but_not_persisted_in_config(tmp_path: Path) ->
 
     assert config == BridgeConfig()
     assert not hasattr(config, "token")
+
+
+_SIDEBAR_DEFAULTS = {
+    "enabled": False,
+    "continuous": False,
+    "backfill_days": 30,
+    "continuous_batch_limit": 5,
+    "manual_batch_limit": 10,
+    "lease_seconds": 300,
+    "max_attempts": 5,
+    "heartbeat_grace_seconds": 120,
+}
+
+
+def _load_with_sidebar(
+    monkeypatch: pytest.MonkeyPatch,
+    sidebar: object,
+) -> BridgeConfig:
+    document: dict[str, Any] = {"session_bridge": {"sidebar": sidebar}}
+    snapshot = deepcopy(document)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: document,
+    )
+
+    config = BridgeConfig.load(environ={})
+
+    assert document == snapshot
+    return config
+
+
+def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert DEFAULT_CONFIG["session_bridge"] == {"sidebar": _SIDEBAR_DEFAULTS}
+    assert asdict(SidebarConfig()) == _SIDEBAR_DEFAULTS
+    assert not any("SIDEBAR" in name for name in _ENV_NAMES)
+
+    config = _load_with_sidebar(monkeypatch, {})
+
+    assert config.sidebar == SidebarConfig()
+    assert config.sidebar.enabled is False
+    assert config.sidebar.continuous is False
+
+
+def test_sidebar_config_loads_only_from_config_yaml(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = {
+        "enabled": True,
+        "continuous": True,
+        "backfill_days": 14,
+        "continuous_batch_limit": 3,
+        "manual_batch_limit": 7,
+        "lease_seconds": 300,
+        "max_attempts": 5,
+        "heartbeat_grace_seconds": 45,
+    }
+
+    config = _load_with_sidebar(monkeypatch, configured)
+
+    assert asdict(config.sidebar) == configured
+
+
+def test_unknown_sidebar_config_key_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="unknown session_bridge.sidebar configuration key: typo",
+    ):
+        _load_with_sidebar(monkeypatch, {**_SIDEBAR_DEFAULTS, "typo": True})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("enabled", 1, "enabled must be a boolean"),
+        ("continuous", "false", "continuous must be a boolean"),
+        ("backfill_days", True, "backfill_days must be an integer"),
+        ("backfill_days", -1, "backfill_days must be at least 0"),
+        ("continuous_batch_limit", 0, "continuous_batch_limit must be at least 1"),
+        ("continuous_batch_limit", 11, "continuous_batch_limit must be at most 10"),
+        ("manual_batch_limit", True, "manual_batch_limit must be an integer"),
+        ("manual_batch_limit", 11, "manual_batch_limit must be at most 10"),
+        ("lease_seconds", 299, "lease_seconds must be exactly 300"),
+        ("lease_seconds", True, "lease_seconds must be an integer"),
+        ("max_attempts", 4, "max_attempts must be exactly 5"),
+        ("max_attempts", True, "max_attempts must be an integer"),
+        (
+            "heartbeat_grace_seconds",
+            -1,
+            "heartbeat_grace_seconds must be at least 0",
+        ),
+    ),
+)
+def test_sidebar_config_rejects_unsafe_values(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        _load_with_sidebar(
+            monkeypatch,
+            {**_SIDEBAR_DEFAULTS, field: value},
+        )

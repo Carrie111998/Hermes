@@ -63,10 +63,23 @@ class MirrorsConfig:
 
 
 @dataclass(frozen=True)
+class SidebarConfig:
+    enabled: bool = False
+    continuous: bool = False
+    backfill_days: int = 30
+    continuous_batch_limit: int = 5
+    manual_batch_limit: int = 10
+    lease_seconds: int = 300
+    max_attempts: int = 5
+    heartbeat_grace_seconds: int = 120
+
+
+@dataclass(frozen=True)
 class BridgeConfig:
     service: ServiceConfig = ServiceConfig()
     catalog: CatalogConfig = CatalogConfig()
     mirrors: MirrorsConfig = MirrorsConfig()
+    sidebar: SidebarConfig = SidebarConfig()
 
     @classmethod
     def load(
@@ -89,6 +102,27 @@ class BridgeConfig:
                 f"{unknown_environment[0]}"
             )
         document = _load_document(config_path)
+        from hermes_cli.config import load_config
+
+        yaml_document = load_config()
+        if not isinstance(yaml_document, Mapping):
+            raise ValueError("config.yaml root must be a mapping")
+        session_bridge = _mapping_section(yaml_document, "session_bridge")
+        sidebar = _mapping_section(session_bridge, "sidebar")
+        _reject_unknown_keys(
+            sidebar,
+            allowed=frozenset({
+                "enabled",
+                "continuous",
+                "backfill_days",
+                "continuous_batch_limit",
+                "manual_batch_limit",
+                "lease_seconds",
+                "max_attempts",
+                "heartbeat_grace_seconds",
+            }),
+            scope="session_bridge.sidebar",
+        )
 
         _reject_unknown_keys(
             document,
@@ -271,10 +305,67 @@ class BridgeConfig:
                 ),
             ),
         )
+        sidebar_defaults = cls().sidebar
+        lease_seconds = _toml_int(
+            sidebar.get("lease_seconds", sidebar_defaults.lease_seconds),
+            "session_bridge.sidebar.lease_seconds",
+        )
+        if lease_seconds != 300:
+            raise ValueError("session_bridge.sidebar.lease_seconds must be exactly 300")
+        max_attempts = _toml_int(
+            sidebar.get("max_attempts", sidebar_defaults.max_attempts),
+            "session_bridge.sidebar.max_attempts",
+        )
+        if max_attempts != 5:
+            raise ValueError("session_bridge.sidebar.max_attempts must be exactly 5")
+        sidebar_config = SidebarConfig(
+            enabled=_toml_bool(
+                sidebar.get("enabled", sidebar_defaults.enabled),
+                "session_bridge.sidebar.enabled",
+            ),
+            continuous=_toml_bool(
+                sidebar.get("continuous", sidebar_defaults.continuous),
+                "session_bridge.sidebar.continuous",
+            ),
+            backfill_days=_toml_int(
+                sidebar.get("backfill_days", sidebar_defaults.backfill_days),
+                "session_bridge.sidebar.backfill_days",
+                minimum=0,
+            ),
+            continuous_batch_limit=_toml_int(
+                sidebar.get(
+                    "continuous_batch_limit",
+                    sidebar_defaults.continuous_batch_limit,
+                ),
+                "session_bridge.sidebar.continuous_batch_limit",
+                minimum=1,
+                maximum=10,
+            ),
+            manual_batch_limit=_toml_int(
+                sidebar.get(
+                    "manual_batch_limit",
+                    sidebar_defaults.manual_batch_limit,
+                ),
+                "session_bridge.sidebar.manual_batch_limit",
+                minimum=1,
+                maximum=10,
+            ),
+            lease_seconds=lease_seconds,
+            max_attempts=max_attempts,
+            heartbeat_grace_seconds=_toml_int(
+                sidebar.get(
+                    "heartbeat_grace_seconds",
+                    sidebar_defaults.heartbeat_grace_seconds,
+                ),
+                "session_bridge.sidebar.heartbeat_grace_seconds",
+                minimum=0,
+            ),
+        )
         return cls(
             service=service_config,
             catalog=catalog_config,
             mirrors=mirrors_config,
+            sidebar=sidebar_config,
         )
 
 
@@ -289,6 +380,13 @@ def _section(document: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     value = document.get(name, {})
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a TOML table")
+    return value
+
+
+def _mapping_section(document: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    value = document.get(name, {})
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
     return value
 
 

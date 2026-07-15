@@ -2963,6 +2963,19 @@ DEFAULT_CONFIG = {
         "write_json_snapshots": False,
     },
 
+    "session_bridge": {
+        "sidebar": {
+            "enabled": False,
+            "continuous": False,
+            "backfill_days": 30,
+            "continuous_batch_limit": 5,
+            "manual_batch_limit": 10,
+            "lease_seconds": 300,
+            "max_attempts": 5,
+            "heartbeat_grace_seconds": 120,
+        },
+    },
+
     # Contextual first-touch onboarding hints (see agent/onboarding.py).
     # Each hint is shown once per install and then latched here so it
     # never fires again.  Users can wipe the section to re-see all hints.
@@ -5132,7 +5145,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "session_bridge", "streaming", "updates", "mcp_servers",
 }
 
 # Valid fields inside a custom_providers list entry
