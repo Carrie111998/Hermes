@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from typing import Any
 import uuid
 
@@ -735,10 +735,28 @@ class _JobTargetAdapter:
         )
 
 
+class _TestWorkerLockHandle:
+    def __init__(self, lock: Lock) -> None:
+        self._lock: Lock | None = lock
+
+    def release(self) -> None:
+        if self._lock is None:
+            return
+        lock = self._lock
+        self._lock = None
+        lock.release()
+
+
 class _ActiveJobStore(_JobStore):
     def __init__(self, job: dict[str, Any]) -> None:
         super().__init__(claimed=[job], running=[job])
         self.active = True
+        self.worker_lock = Lock()
+
+    def try_acquire_mirror_worker_lock(self):
+        if not self.worker_lock.acquire(blocking=False):
+            return None
+        return _TestWorkerLockHandle(self.worker_lock)
 
     def list_mirror_jobs(
         self,
@@ -2943,6 +2961,52 @@ async def test_reconcile_waits_for_active_job_processing_critical_section() -> N
     process_task = asyncio.create_task(coordinator.process_jobs_once())
     assert await asyncio.to_thread(started.wait, 1.0)
     reconcile_task = asyncio.create_task(coordinator.reconcile_once())
+    await asyncio.sleep(0.03)
+    reconcile_completed_during_creation = reconcile_task.done()
+    release.set()
+    process_summary, reconcile_summary = await asyncio.gather(
+        process_task,
+        reconcile_task,
+    )
+
+    assert reconcile_completed_during_creation is False
+    assert process_summary.succeeded == 1
+    assert reconcile_summary.examined == 0
+    assert target.calls == 1
+    assert store.retry_calls == []
+    assert store.manual_failure_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconcile_waits_for_other_coordinator_processing_same_store() -> None:
+    job = _running_job()
+    store = _ActiveJobStore(job)
+    source = _JobCodexSourceAdapter(store.operations)
+    started = Event()
+    release = Event()
+    target = _BlockingJobTargetAdapter(
+        source=source,
+        started=started,
+        release=release,
+    )
+    processor = SessionBridgeCoordinator(
+        config=_job_config(),
+        store=store,
+        adapters={Provider.CODEX: source},
+        target_adapters={Provider.CODEX: target},
+        clock=lambda: 100.0,
+    )
+    reconciler = SessionBridgeCoordinator(
+        config=_job_config(),
+        store=store,
+        adapters={Provider.CODEX: source},
+        target_adapters={},
+        clock=lambda: 100.0,
+    )
+
+    process_task = asyncio.create_task(processor.process_jobs_once())
+    assert await asyncio.to_thread(started.wait, 1.0)
+    reconcile_task = asyncio.create_task(reconciler.reconcile_once())
     await asyncio.sleep(0.03)
     reconcile_completed_during_creation = reconcile_task.done()
     release.set()

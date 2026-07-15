@@ -36,6 +36,29 @@ def db(tmp_path):
     database.close()
 
 
+def test_mirror_worker_lock_serializes_independent_store_instances(db) -> None:
+    first = SessionBridgeStore(db)
+    second_db = SessionDB(db.db_path)
+    second = SessionBridgeStore(second_db)
+    first_lock = None
+    second_lock = None
+    try:
+        first_lock = first.try_acquire_mirror_worker_lock()
+        assert first_lock is not None
+        assert second.try_acquire_mirror_worker_lock() is None
+
+        first_lock.release()
+        first_lock = None
+        second_lock = second.try_acquire_mirror_worker_lock()
+        assert second_lock is not None
+    finally:
+        if first_lock is not None:
+            first_lock.release()
+        if second_lock is not None:
+            second_lock.release()
+        second_db.close()
+
+
 def _message(
     event_id: str,
     content: str,

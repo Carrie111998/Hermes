@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import hashlib
 import math
@@ -114,6 +115,7 @@ _BACKFILL_KEYS = {
     Provider.CLAUDE: "session-bridge:backfill:claude",
     Provider.CODEX: "session-bridge:backfill:codex",
 }
+_MIRROR_WORKER_LOCK_POLL_SECONDS = 0.05
 
 
 class SessionBridgeCoordinator:
@@ -189,6 +191,31 @@ class SessionBridgeCoordinator:
         self._backfill_progress: dict[Provider, dict[str, int | str]] = {}
         self._continuous_watermark: float | None = None
         self._registration_turn_fallback: bool | None = None
+
+    @asynccontextmanager
+    async def _mirror_worker_critical_section(self) -> AsyncIterator[None]:
+        acquire = getattr(self._store, "try_acquire_mirror_worker_lock", None)
+        if not callable(acquire):
+            yield
+            return
+
+        handle = None
+        while handle is None:
+            handle = await asyncio.to_thread(acquire)
+            if handle is None:
+                await self._sleep(_MIRROR_WORKER_LOCK_POLL_SECONDS)
+        release = getattr(handle, "release", None)
+        if not callable(release):
+            raise RuntimeError("mirror worker lock handle must provide release()")
+        try:
+            yield
+        finally:
+            release_task = asyncio.create_task(asyncio.to_thread(release))
+            try:
+                await asyncio.shield(release_task)
+            except asyncio.CancelledError:
+                await release_task
+                raise
 
     async def start(self) -> None:
         async with self._lifecycle_lock:
@@ -289,7 +316,8 @@ class SessionBridgeCoordinator:
 
     async def reconcile_once(self) -> ReconcileSummary:
         async with self._job_lock:
-            jobs = await self._reconcile_jobs_locked()
+            async with self._mirror_worker_critical_section():
+                jobs = await self._reconcile_jobs_locked()
         continuations = await self._reconcile_continuations()
         return ReconcileSummary(
             examined=jobs.examined + continuations.examined,
@@ -489,10 +517,11 @@ class SessionBridgeCoordinator:
         ):
             raise ValueError("job processing limit must be between 1 and 1000")
         async with self._job_lock:
-            return await self._process_jobs_locked(
-                job_ids=normalized_job_ids,
-                limit=limit,
-            )
+            async with self._mirror_worker_critical_section():
+                return await self._process_jobs_locked(
+                    job_ids=normalized_job_ids,
+                    limit=limit,
+                )
 
     async def _process_jobs_locked(
         self,

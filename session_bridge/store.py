@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import errno
 import hashlib
 import json
 import math
+import os
+import sys
 import time
-from typing import Any
+from typing import Any, BinaryIO
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 from hermes_state import SessionDB
 
@@ -52,6 +60,37 @@ _CONTINUATION_SNAPSHOT_FIELDS = frozenset({
 NativeProjectionCursor = tuple[float, str]
 
 
+class _MirrorWorkerFileLock:
+    """Crash-releasing lock handle for mirror worker critical sections."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream: BinaryIO | None = stream
+
+    def release(self) -> None:
+        stream = self._stream
+        if stream is None:
+            return
+        self._stream = None
+        try:
+            stream.seek(0)
+            if sys.platform == "win32":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            stream.close()
+
+
+def _mirror_worker_lock_contended(exc: OSError) -> bool:
+    if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+        return True
+    return sys.platform == "win32" and getattr(exc, "winerror", None) in {
+        32,
+        33,
+        36,
+    }
+
+
 class NativeProjectionPage(list[SessionProjection]):
     """A bounded newest-first page of minimal mirror-eligibility evidence."""
 
@@ -78,6 +117,33 @@ class SessionBridgeStore:
     ) -> None:
         self.db = db
         self._clock = clock
+
+    def try_acquire_mirror_worker_lock(self) -> _MirrorWorkerFileLock | None:
+        """Try to serialize mirror processing and reconciliation across processes."""
+
+        lock_path = self.db.db_path.with_name(
+            f"{self.db.db_path.name}.session-bridge-worker.lock"
+        )
+        stream = lock_path.open("a+b")
+        try:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell() == 0:
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            if sys.platform == "win32":
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(
+                    stream.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+        except OSError as exc:
+            stream.close()
+            if _mirror_worker_lock_contended(exc):
+                return None
+            raise
+        return _MirrorWorkerFileLock(stream)
 
     def upsert_projection(
         self,
