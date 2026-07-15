@@ -5218,6 +5218,36 @@ class AIAgent:
         """
         if client is None:
             return
+        from agent.copilot_acp_client import CopilotACPClient
+
+        if isinstance(client, CopilotACPClient):
+            # Copilot ACP's "client" wraps a subprocess + JSON-RPC loop, not
+            # an httpx transport — _force_close_tcp_sockets() finds no pool
+            # to reach into and is a silent no-op for it, leaving the
+            # subprocess and its two reader threads running (burning the
+            # user's Copilot quota) until the request's own timeout fires,
+            # up to _DEFAULT_TIMEOUT_SECONDS (900s) later. Its close()
+            # (agent/copilot_acp_client.py) is safe to call from a stranger
+            # thread: unlike the httpx SSL BIO FD-aliasing hazard above, it
+            # only takes a lock, sends SIGTERM/SIGKILL via subprocess.Popen,
+            # and is idempotent, so call it directly to kill the subprocess
+            # immediately instead of waiting for the request's own deadline.
+            # Not part of the httpx-pool cache below, so no poisoning needed.
+            try:
+                client.close()
+                logger.info(
+                    "Copilot ACP client aborted (%s, shared=False) %s",
+                    reason,
+                    self._client_log_context(),
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Copilot ACP client abort failed (%s) %s error=%s",
+                    reason,
+                    self._client_log_context(),
+                    exc,
+                )
+            return
         # A pool whose sockets were shut down from a stranger thread must
         # never be reused: poison the cache slot so the owner-thread close
         # discards it and the next create builds a fresh client.
