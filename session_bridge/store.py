@@ -1029,11 +1029,18 @@ class SessionBridgeStore:
                                     self._clock(), "store clock"
                                 )
                             stale = float(lease_expires_at) <= sidebar_now
+                            if error_code is not None:
+                                public_state = "failed"
+                                error_code = "catalog_metadata_invalid"
                     elif row["state"] == SidebarJobState.VISIBLE.value:
-                        thread_id = _public_codex_thread_id(row["codex_thread_id"])
-                        if thread_id is None:
+                        visible_thread_id = _public_codex_thread_id(
+                            row["codex_thread_id"]
+                        )
+                        if visible_thread_id is None or error_code is not None:
                             public_state = "failed"
                             error_code = "catalog_metadata_invalid"
+                        else:
+                            thread_id = visible_thread_id
                     sidebar_by_session[session_id] = {
                         "bridge_sidebar_state": public_state,
                         "bridge_sidebar_codex_thread_id": thread_id,

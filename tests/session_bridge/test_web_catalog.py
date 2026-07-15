@@ -192,7 +192,7 @@ def _set_sidebar_catalog_field(
     *,
     ignore_checks: bool = False,
 ) -> None:
-    assert field in {"codex_thread_id", "lease_expires_at"}
+    assert field in {"codex_thread_id", "error_code", "lease_expires_at"}
     db = SessionDB(db_path=db_path)
     try:
         def update(conn) -> None:
@@ -480,6 +480,69 @@ async def test_sessions_api_fails_closed_for_invalid_leased_expiry(
         response,
         sort_keys=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_id", "persisted_error", "expected_stale"),
+    [
+        ("sidebar-visible", "C:/private/visible bearer-secret", False),
+        ("sidebar-visible", "", False),
+        ("sidebar-visible", sqlite3.Binary(b"visible-binary-secret"), False),
+        ("sidebar-leased", "C:/private/leased bearer-secret", True),
+        ("sidebar-leased", "", True),
+        ("sidebar-leased", sqlite3.Binary(b"leased-binary-secret"), True),
+    ],
+    ids=(
+        "visible-text",
+        "visible-empty",
+        "visible-blob",
+        "leased-text",
+        "leased-empty",
+        "leased-blob",
+    ),
+)
+async def test_sessions_api_fails_closed_for_errors_on_active_sidebar_states(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    persisted_error: object,
+    expected_stale: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_sidebar_catalog_jobs(db_path)
+    _set_sidebar_catalog_field(
+        db_path,
+        session_id,
+        "error_code",
+        persisted_error,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile: SessionDB(db_path=db_path),
+    )
+
+    response = await web_server.get_sessions(limit=20)
+
+    row = next(
+        session for session in response["sessions"]
+        if session["id"] == session_id
+    )
+    assert (
+        row["bridge_sidebar_state"],
+        row["bridge_sidebar_codex_thread_id"],
+        row["bridge_sidebar_error"],
+        row["bridge_sidebar_stale"],
+    ) == ("failed", None, "delivery_degraded", expected_stale)
+    serialized = json.dumps(response, sort_keys=True)
+    for forbidden in (
+        "C:/private/visible bearer-secret",
+        "visible-binary-secret",
+        "C:/private/leased bearer-secret",
+        "leased-binary-secret",
+    ):
+        assert forbidden not in serialized
 
 
 def test_profiles_sessions_api_preserves_rows_and_batches_once_per_profile(
