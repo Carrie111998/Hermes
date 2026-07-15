@@ -37,6 +37,7 @@ from session_bridge.store import (
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
 )
+from session_bridge.worktree import capture_worktree_snapshot
 
 
 @pytest.fixture
@@ -2871,6 +2872,28 @@ def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> No
     assert first["state"] == SidebarJobState.PENDING.value
     assert first["eligible_at"] == candidate.eligible_at
     assert len(_rows(db, "SELECT * FROM session_sidebar_jobs")) == 1
+
+
+def test_sidebar_worktree_snapshot_roundtrips_without_git_metadata(
+    db: SessionDB,
+    tmp_path,
+) -> None:
+    source = tmp_path / "ordinary-source"
+    source.mkdir()
+    snapshot = capture_worktree_snapshot(str(source))
+    candidate = replace(
+        _sidebar_candidate(db, native_id="ordinary-source"),
+        cwd=snapshot.cwd,
+        git_root=snapshot.git_root,
+        git_branch=snapshot.branch,
+        git_head=snapshot.head,
+        worktree_id=snapshot.worktree_id,
+    )
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+
+    store.enqueue_sidebar_job(candidate, worktree_snapshot=snapshot)
+
+    assert store.get_worktree_snapshot(candidate.source_session_id) == snapshot
 
 
 def test_sidebar_enqueue_persists_versioned_delivery_candidate_across_restart(

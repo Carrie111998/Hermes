@@ -1602,6 +1602,16 @@ class SessionBridgeCoordinator:
                     at=float(self._clock()),
                 )
                 warnings = (*warnings, "linked_sessions_diverged")
+        if exact_worktree is not None:
+            exact_worktree, final_worktree_warnings = (
+                await self._continuation_worktree(request)
+            )
+            non_worktree_warnings = tuple(
+                warning for warning in warnings if warning not in worktree_warnings
+            )
+            warnings = tuple(
+                dict.fromkeys((*final_worktree_warnings, *non_worktree_warnings))
+            )
         return ContinueResult(
             pack=persisted_pack,
             link=link,
@@ -1642,7 +1652,7 @@ class SessionBridgeCoordinator:
                 "source_identity_mismatch: exact source worktree snapshot is invalid",
             )
         try:
-            current, warnings = await asyncio.to_thread(
+            current, _initial_warnings = await asyncio.to_thread(
                 validate_worktree_snapshot,
                 recorded,
             )
@@ -1671,7 +1681,17 @@ class SessionBridgeCoordinator:
                 "permission_preflight_failed",
                 "permission_preflight_failed: exact source cwd is not authorized",
             )
-        return current, warnings
+        try:
+            final_current, final_warnings = await asyncio.to_thread(
+                validate_worktree_snapshot,
+                recorded,
+            )
+        except WorktreeSnapshotError as exc:
+            raise ContinuationBlockedError(
+                exc.code,
+                f"{exc.code}: exact source worktree identity validation failed",
+            ) from exc
+        return final_current, final_warnings
 
     def health(self) -> dict[str, Any]:
         now = float(self._clock())

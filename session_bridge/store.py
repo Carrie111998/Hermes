@@ -3009,12 +3009,9 @@ def _encode_worktree_snapshot(
         or candidate.worktree_id != snapshot.worktree_id
     ):
         raise ValueError("sidebar candidate worktree snapshot mismatch")
-    values = (
+    required_values = (
         source_session_id,
         snapshot.cwd,
-        snapshot.git_root,
-        snapshot.branch,
-        snapshot.head,
         snapshot.worktree_id,
     )
     if any(
@@ -3022,7 +3019,24 @@ def _encode_worktree_snapshot(
         or not value
         or any(character in value for character in "\x00\r\n")
         or _redact(value) != value
-        for value in values
+        for value in required_values
+    ):
+        raise ValueError("invalid worktree snapshot")
+    if snapshot.git_root is None:
+        if snapshot.branch is not None or snapshot.head is not None:
+            raise ValueError("invalid worktree snapshot")
+    elif snapshot.branch is None:
+        raise ValueError("invalid worktree snapshot")
+    optional_values = (snapshot.git_root, snapshot.branch, snapshot.head)
+    if any(
+        value is not None
+        and (
+            not isinstance(value, str)
+            or not value
+            or any(character in value for character in "\x00\r\n")
+            or _redact(value) != value
+        )
+        for value in optional_values
     ):
         raise ValueError("invalid worktree snapshot")
     payload = {
@@ -3064,12 +3078,9 @@ def _decode_worktree_snapshot(
         or payload.get("source_session_id") != expected_source_session_id
     ):
         raise ValueError("invalid worktree snapshot")
-    values = tuple(payload.get(field) for field in (
+    required_values = tuple(payload.get(field) for field in (
         "source_session_id",
         "cwd",
-        "git_root",
-        "branch",
-        "head",
         "worktree_id",
     ))
     if any(
@@ -3077,8 +3088,30 @@ def _decode_worktree_snapshot(
         or not value
         or any(character in value for character in "\x00\r\n")
         or _redact(value) != value
-        for value in values
+        for value in required_values
     ):
+        raise ValueError("invalid worktree snapshot")
+    optional_values = tuple(payload.get(field) for field in (
+        "git_root",
+        "branch",
+        "head",
+    ))
+    if any(
+        value is not None
+        and (
+            not isinstance(value, str)
+            or not value
+            or any(character in value for character in "\x00\r\n")
+            or _redact(value) != value
+        )
+        for value in optional_values
+    ):
+        raise ValueError("invalid worktree snapshot")
+    git_root, branch, head = optional_values
+    if git_root is None:
+        if branch is not None or head is not None:
+            raise ValueError("invalid worktree snapshot")
+    elif branch is None:
         raise ValueError("invalid worktree snapshot")
     return WorktreeSnapshot(
         cwd=payload["cwd"],

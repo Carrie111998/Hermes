@@ -260,6 +260,45 @@ def test_claude_only_runtime_never_spawns_codex(
         backend.close()
 
 
+def test_production_runtime_wires_exact_cwd_permission_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    captured: dict[str, object] = {}
+    sentinel = lambda cwd: cwd == str(tmp_path)
+
+    def coordinator_factory(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.SessionBridgeCoordinator",
+        coordinator_factory,
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli._production_codex_permission_preflight",
+        sentinel,
+        raising=False,
+    )
+    try:
+        backend._provider_runtime(
+            targets=False,
+            catalog_only=True,
+            providers=(Provider.CLAUDE,),
+        )
+    finally:
+        backend.close()
+
+    assert captured["permission_preflight"] is sentinel
+
+
 def test_production_all_provider_scan_isolates_provider_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

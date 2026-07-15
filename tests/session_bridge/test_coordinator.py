@@ -1205,6 +1205,26 @@ def _exact_cwd_repo(path: Path) -> Path:
     return path
 
 
+def _directory_alias(alias: Path, target: Path) -> str:
+    try:
+        alias.symlink_to(target, target_is_directory=True)
+        return "symlink"
+    except OSError as symlink_error:
+        if os.name != "nt":
+            pytest.skip(f"directory symlink unavailable: {symlink_error}")
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            pytest.skip(
+                "directory retarget race test requires a symlink or junction"
+            )
+        return "junction"
+
+
 @pytest.mark.asyncio
 async def test_start_reconciles_before_background_scans_and_stop_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
@@ -3703,6 +3723,8 @@ def test_worktree_snapshot_is_transactional_immutable_and_restart_safe(
 
 def _exact_cwd_continuation(
     tmp_path: Path,
+    *,
+    source_cwd: Path | None = None,
 ) -> tuple[
     SessionBridgeCoordinator,
     _ContinuationStore,
@@ -3711,7 +3733,7 @@ def _exact_cwd_continuation(
     Path,
 ]:
     operations: list[tuple[object, ...]] = []
-    repo = _exact_cwd_repo(tmp_path / "source")
+    repo = source_cwd or _exact_cwd_repo(tmp_path / "source")
     source_projection = replace(_refresh_projection(Provider.CLAUDE), cwd=str(repo))
     source_id = f"claude:{source_projection.native_id}"
     bridge_id = sidebar_bridge_id(source_id)
@@ -3824,6 +3846,74 @@ async def test_worktree_registered_native_target_is_reused_without_second_placeh
     assert result.exact_cwd == os.path.abspath(str(repo))
     assert builder.requests[0].exact_cwd == result.exact_cwd
     assert ("find_origin", request.bridge_id, "codex") in store.operations
+
+
+@pytest.mark.asyncio
+async def test_exact_cwd_is_revalidated_after_awaits_before_continuation_handoff(
+    tmp_path: Path,
+) -> None:
+    first = _exact_cwd_repo(tmp_path / "first")
+    second = _exact_cwd_repo(tmp_path / "second")
+    alias = tmp_path / "source-alias"
+    alias_kind = _directory_alias(alias, first)
+    coordinator, store, builder, request, _repo = _exact_cwd_continuation(
+        tmp_path,
+        source_cwd=alias,
+    )
+    original_build = builder.build
+
+    def retarget_during_build(request_value: ContextPackRequest) -> ContextPack:
+        if alias_kind == "junction":
+            os.rmdir(alias)
+        else:
+            alias.unlink()
+        _directory_alias(alias, second)
+        return original_build(request_value)
+
+    builder.build = retarget_during_build
+
+    with pytest.raises(ContinuationBlockedError) as raised:
+        await coordinator.continue_session(request)
+
+    assert raised.value.code == "source_identity_mismatch"
+    assert raised.value.warnings == (
+        "source_identity_mismatch: exact source worktree identity validation failed",
+    )
+    assert store.transition_calls
+
+
+@pytest.mark.asyncio
+async def test_exact_cwd_revalidation_follows_final_permission_await(
+    tmp_path: Path,
+) -> None:
+    first = _exact_cwd_repo(tmp_path / "first-permission")
+    second = _exact_cwd_repo(tmp_path / "second-permission")
+    alias = tmp_path / "permission-alias"
+    alias_kind = _directory_alias(alias, first)
+    coordinator, _store, _builder, request, _repo = _exact_cwd_continuation(
+        tmp_path,
+        source_cwd=alias,
+    )
+    calls = 0
+
+    def permission_preflight(_cwd: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            if alias_kind == "junction":
+                os.rmdir(alias)
+            else:
+                alias.unlink()
+            _directory_alias(alias, second)
+        return True
+
+    coordinator._permission_preflight = permission_preflight
+
+    with pytest.raises(ContinuationBlockedError) as raised:
+        await coordinator.continue_session(request)
+
+    assert calls == 2
+    assert raised.value.code == "source_identity_mismatch"
 
 
 @pytest.mark.asyncio

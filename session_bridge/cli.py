@@ -68,6 +68,30 @@ _SENSITIVE_KEY_FRAGMENTS = (
 )
 
 
+def _production_codex_permission_preflight(cwd: str) -> bool:
+    """Verify the production broker process can traverse the exact Codex cwd.
+
+    Native task sandbox authorization is additionally proven by the rollout
+    canary; this check is the fail-closed host-side gate available before
+    handing a continuation back to Codex.
+    """
+
+    if type(cwd) is not str or not cwd or any(character in cwd for character in "\x00\r\n"):
+        return False
+    try:
+        path = Path(cwd)
+        if not path.is_absolute():
+            return False
+        resolved = path.resolve(strict=True)
+        if not resolved.is_dir() or not os.access(resolved, os.R_OK | os.X_OK):
+            return False
+        with os.scandir(resolved) as entries:
+            next(entries, None)
+    except OSError:
+        return False
+    return True
+
+
 class _Backend(Protocol):
     def close(self) -> None: ...
     def serve(self) -> None: ...
@@ -579,6 +603,7 @@ class ProductionBackend:
                 claude_projects_root=(
                     _CLAUDE_PROJECTS_ROOT if Provider.CLAUDE in selected else None
                 ),
+                permission_preflight=_production_codex_permission_preflight,
             )
             return self._coordinator
         except Exception:

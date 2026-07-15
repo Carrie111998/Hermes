@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 
-_GIT_TIMEOUT_SECONDS = 5.0
+_GIT_CAPTURE_TIMEOUT_SECONDS = 5.0
 _GIT_OUTPUT_LIMIT = 4096
 _HEAD_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 
@@ -19,9 +20,9 @@ class WorktreeSnapshot:
     """Exact source spelling plus the Git worktree identity it resolved to."""
 
     cwd: str
-    git_root: str
-    branch: str
-    head: str
+    git_root: str | None
+    branch: str | None
+    head: str | None
     worktree_id: str
 
 
@@ -42,6 +43,7 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
     source_lstat: os.stat_result | None = None
     resolved: Path | None = None
     resolved_stat: os.stat_result | None = None
+    git_failed = False
     try:
         source_lstat = source.lstat()
         resolved = source.resolve(strict=True)
@@ -53,23 +55,51 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
     if not resolved.is_dir():
         raise WorktreeSnapshotError("source_cwd_missing")
 
-    git_root: Path | None = None
-    git_dir: Path | None = None
-    common_dir: Path | None = None
-    head: str | None = None
-    branch_result: str | None = None
+    deadline = time.monotonic() + _GIT_CAPTURE_TIMEOUT_SECONDS
     try:
-        git_root = Path(_git(resolved, "rev-parse", "--show-toplevel")).resolve(
-            strict=True
+        git_root_result = _git_result(
+            resolved,
+            "rev-parse",
+            "--show-toplevel",
+            allowed_returncodes=(0, 128),
+            deadline=deadline,
         )
-        git_dir = Path(_git(resolved, "rev-parse", "--absolute-git-dir")).resolve(
-            strict=True
+        if not git_root_result:
+            return _filesystem_snapshot(
+                source=source,
+                source_lstat=source_lstat,
+                resolved=resolved,
+                resolved_stat=resolved_stat,
+            )
+        git_root = Path(git_root_result).resolve(strict=True)
+        git_dir = Path(
+            _git(
+                resolved,
+                "rev-parse",
+                "--absolute-git-dir",
+                deadline=deadline,
+            )
+        ).resolve(strict=True)
+        common_dir = Path(
+            _git(
+                resolved,
+                "rev-parse",
+                "--git-common-dir",
+                deadline=deadline,
+            )
         )
-        common_dir = Path(_git(resolved, "rev-parse", "--git-common-dir"))
         if not common_dir.is_absolute():
             common_dir = resolved / common_dir
         common_dir = common_dir.resolve(strict=True)
-        head = _git(resolved, "rev-parse", "--verify", "HEAD")
+        head_result = _git_result(
+            resolved,
+            "rev-parse",
+            "--verify",
+            "HEAD",
+            allowed_returncodes=(0, 128),
+            deadline=deadline,
+        )
+        head = head_result or None
         branch_result = _git_result(
             resolved,
             "symbolic-ref",
@@ -77,21 +107,14 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
             "--short",
             "HEAD",
             allowed_returncodes=(0, 1),
+            deadline=deadline,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
-        pass
-    if any(
-        value is None
-        for value in (git_root, git_dir, common_dir, head, branch_result)
-    ):
+        git_failed = True
+    if git_failed:
         raise WorktreeSnapshotError("source_identity_mismatch")
-    assert git_root is not None
-    assert git_dir is not None
-    assert common_dir is not None
-    assert head is not None
-    assert branch_result is not None
 
-    if not _HEAD_RE.fullmatch(head):
+    if head is not None and not _HEAD_RE.fullmatch(head):
         raise WorktreeSnapshotError("source_identity_mismatch")
     branch = branch_result if branch_result else "(detached)"
     if any(character in branch for character in "\x00\r\n"):
@@ -99,6 +122,7 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
 
     identity = {
         "version": 1,
+        "kind": "git",
         "source_path": _normalized_path(source),
         "source_entry": _stat_identity(source_lstat),
         "resolved_cwd": _normalized_path(resolved),
@@ -120,7 +144,7 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
         cwd=str(source),
         git_root=str(git_root),
         branch=branch,
-        head=head.lower(),
+        head=(head.lower() if head is not None else None),
         worktree_id=f"worktree:v1:{hashlib.sha256(encoded).hexdigest()}",
     )
 
@@ -134,8 +158,8 @@ def validate_worktree_snapshot(
     current = capture_worktree_snapshot(snapshot.cwd)
     if (
         _normalized_path(Path(current.cwd)) != _normalized_path(Path(snapshot.cwd))
-        or _normalized_path(Path(current.git_root))
-        != _normalized_path(Path(snapshot.git_root))
+        or _normalized_optional_path(current.git_root)
+        != _normalized_optional_path(snapshot.git_root)
         or current.worktree_id != snapshot.worktree_id
     ):
         raise WorktreeSnapshotError("source_identity_mismatch")
@@ -167,35 +191,91 @@ def _source_path(cwd: str) -> Path:
 def _validate_recorded_snapshot(snapshot: WorktreeSnapshot) -> None:
     if not isinstance(snapshot, WorktreeSnapshot):
         raise WorktreeSnapshotError("source_identity_mismatch")
-    for value in (
-        snapshot.cwd,
-        snapshot.git_root,
-        snapshot.branch,
-        snapshot.head,
-        snapshot.worktree_id,
-    ):
+    for value in (snapshot.cwd, snapshot.worktree_id):
         if not isinstance(value, str) or not value or any(
             character in value for character in "\x00\r\n"
         ):
             raise WorktreeSnapshotError("source_identity_mismatch")
-    if not os.path.isabs(snapshot.cwd) or not os.path.isabs(snapshot.git_root):
+    if not os.path.isabs(snapshot.cwd):
         raise WorktreeSnapshotError("source_identity_mismatch")
-    if not _HEAD_RE.fullmatch(snapshot.head) or not re.fullmatch(
-        r"worktree:v1:[0-9a-f]{64}", snapshot.worktree_id
-    ):
+    if snapshot.git_root is None:
+        if snapshot.branch is not None or snapshot.head is not None:
+            raise WorktreeSnapshotError("source_identity_mismatch")
+    else:
+        if not isinstance(snapshot.git_root, str) or not os.path.isabs(
+            snapshot.git_root
+        ):
+            raise WorktreeSnapshotError("source_identity_mismatch")
+        if (
+            not isinstance(snapshot.branch, str)
+            or not snapshot.branch
+            or any(character in snapshot.branch for character in "\x00\r\n")
+            or (
+                snapshot.head is not None
+                and (
+                    not isinstance(snapshot.head, str)
+                    or _HEAD_RE.fullmatch(snapshot.head) is None
+                )
+            )
+        ):
+            raise WorktreeSnapshotError("source_identity_mismatch")
+    if not re.fullmatch(r"worktree:v1:[0-9a-f]{64}", snapshot.worktree_id):
         raise WorktreeSnapshotError("source_identity_mismatch")
 
 
-def _git(cwd: Path, *args: str) -> str:
-    return _git_result(cwd, *args, allowed_returncodes=(0,))
+def _filesystem_snapshot(
+    *,
+    source: Path,
+    source_lstat: os.stat_result,
+    resolved: Path,
+    resolved_stat: os.stat_result,
+) -> WorktreeSnapshot:
+    identity = {
+        "version": 1,
+        "kind": "filesystem",
+        "source_path": _normalized_path(source),
+        "source_entry": _stat_identity(source_lstat),
+        "resolved_cwd": _normalized_path(resolved),
+        "resolved_cwd_entry": _stat_identity(resolved_stat),
+    }
+    encoded = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return WorktreeSnapshot(
+        cwd=str(source),
+        git_root=None,
+        branch=None,
+        head=None,
+        worktree_id=f"worktree:v1:{hashlib.sha256(encoded).hexdigest()}",
+    )
+
+
+def _git(cwd: Path, *args: str, deadline: float) -> str:
+    return _git_result(
+        cwd,
+        *args,
+        allowed_returncodes=(0,),
+        deadline=deadline,
+    )
 
 
 def _git_result(
     cwd: Path,
     *args: str,
     allowed_returncodes: tuple[int, ...],
+    deadline: float,
 ) -> str:
-    env = os.environ.copy()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired(["git"], 0)
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
     env.update({
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -209,7 +289,7 @@ def _git_result(
         stderr=subprocess.DEVNULL,
         env=env,
         shell=False,
-        timeout=_GIT_TIMEOUT_SECONDS,
+        timeout=remaining,
         check=False,
     )
     if completed.returncode not in allowed_returncodes:
@@ -228,6 +308,10 @@ def _git_result(
 
 def _normalized_path(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _normalized_optional_path(value: str | None) -> str | None:
+    return None if value is None else _normalized_path(Path(value))
 
 
 def _stat_identity(value: os.stat_result) -> tuple[int, int]:

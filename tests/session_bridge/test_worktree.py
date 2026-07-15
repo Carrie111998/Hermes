@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +93,85 @@ def test_worktree_snapshot_captures_exact_spelling_and_linked_identity(
     assert validate_worktree_snapshot(snapshot) == (snapshot, ())
 
 
+def test_worktree_capture_ignores_inherited_git_repository_redirection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _repo(tmp_path / "source")
+    redirected = _repo(tmp_path / "redirected", content="private")
+    expected_head = _git(source, "rev-parse", "HEAD")
+    monkeypatch.setenv("GIT_DIR", str(redirected / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(redirected))
+
+    snapshot = capture_worktree_snapshot(str(source))
+
+    assert snapshot.cwd == os.path.abspath(str(source))
+    assert snapshot.git_root == str(source.resolve(strict=True))
+    assert snapshot.head == expected_head
+
+
+def test_worktree_snapshot_supports_non_git_directory_identity(tmp_path: Path) -> None:
+    source = tmp_path / "ordinary"
+    source.mkdir()
+
+    snapshot = capture_worktree_snapshot(str(source))
+
+    assert snapshot.git_root is None
+    assert snapshot.branch is None
+    assert snapshot.head is None
+    assert validate_worktree_snapshot(snapshot) == (snapshot, ())
+
+
+def test_worktree_snapshot_supports_unborn_repository_identity(tmp_path: Path) -> None:
+    source = tmp_path / "unborn"
+    source.mkdir()
+    _git(source, "init", "-b", "main")
+
+    snapshot = capture_worktree_snapshot(str(source))
+
+    assert snapshot.git_root == str(source.resolve(strict=True))
+    assert snapshot.branch == "main"
+    assert snapshot.head is None
+    assert validate_worktree_snapshot(snapshot) == (snapshot, ())
+
+
+def test_worktree_git_probes_share_one_total_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _repo(tmp_path / "source")
+    git_dir = source / ".git"
+    clock = [100.0]
+    timeouts: list[float] = []
+
+    def monotonic() -> float:
+        return clock[0]
+
+    def run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        timeout = float(kwargs["timeout"])
+        timeouts.append(timeout)
+        clock[0] += 2.0
+        args = command[3:]
+        if args == ["rev-parse", "--show-toplevel"]:
+            output = str(source)
+        elif args == ["rev-parse", "--absolute-git-dir"]:
+            output = str(git_dir)
+        elif args == ["rev-parse", "--git-common-dir"]:
+            output = str(git_dir)
+        else:
+            output = "0" * 40
+        return SimpleNamespace(returncode=0, stdout=f"{output}\n".encode())
+
+    monkeypatch.setattr("session_bridge.worktree.time.monotonic", monotonic)
+    monkeypatch.setattr("session_bridge.worktree.subprocess.run", run)
+
+    with pytest.raises(WorktreeSnapshotError) as raised:
+        capture_worktree_snapshot(str(source))
+
+    assert raised.value.code == "source_identity_mismatch"
+    assert timeouts == [5.0, 3.0, 1.0]
+
+
 def test_worktree_validation_allows_branch_and_head_drift_with_truthful_warnings(
     tmp_path: Path,
 ) -> None:
@@ -129,12 +209,18 @@ def test_worktree_validation_fails_closed_when_cwd_disappears(tmp_path: Path) ->
 
 def test_worktree_capture_does_not_expose_raw_git_error_context(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ordinary_directory = tmp_path / "not-a-repository-private-name"
-    ordinary_directory.mkdir()
+    source = _repo(tmp_path / "private-repository-name")
+    monkeypatch.setattr(
+        "session_bridge.worktree.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("private-git-command", 5)
+        ),
+    )
 
     with pytest.raises(WorktreeSnapshotError) as raised:
-        capture_worktree_snapshot(str(ordinary_directory))
+        capture_worktree_snapshot(str(source))
 
     assert raised.value.code == "source_identity_mismatch"
     assert str(raised.value) == "source_identity_mismatch"
