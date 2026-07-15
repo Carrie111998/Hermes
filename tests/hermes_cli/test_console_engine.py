@@ -9,6 +9,14 @@ import pytest
 from hermes_cli.console_engine import HermesConsoleEngine, run_console_repl
 
 
+@pytest.fixture()
+def tmp_cron_store(tmp_path):
+    from cron import jobs
+
+    with jobs.use_cron_store(tmp_path):
+        yield
+
+
 EXPECTED_CONSOLE_COMMANDS = {
     ("status",),
     ("doctor",),
@@ -430,7 +438,7 @@ def test_sessions_export_zero_limit_disables_guard(
 
 
 def test_cron_pause_resume_and_run_require_confirmation(
-    _isolate_hermes_home, monkeypatch
+    _isolate_hermes_home, tmp_cron_store, monkeypatch
 ):
     from cron.jobs import create_job, get_job
 
