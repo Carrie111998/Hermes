@@ -44,17 +44,17 @@ class FakeRequestClient:
 class FakeInitializingClient(FakeRequestClient):
     def __init__(self, responses: dict[str, list[dict[str, Any] | Exception]]) -> None:
         super().__init__(responses)
-        self.initialize_calls = 0
+        self.initialize_calls: list[dict[str, Any]] = []
 
-    def initialize(self) -> dict[str, Any]:
-        self.initialize_calls += 1
+    def initialize(self, **kwargs: Any) -> dict[str, Any]:
+        self.initialize_calls.append(deepcopy(kwargs))
         return {"userAgent": "synthetic"}
 
 
 class FakeRetryingInitializeClient(FakeInitializingClient):
-    def initialize(self) -> dict[str, Any]:
-        self.initialize_calls += 1
-        if self.initialize_calls == 1:
+    def initialize(self, **kwargs: Any) -> dict[str, Any]:
+        self.initialize_calls.append(deepcopy(kwargs))
+        if len(self.initialize_calls) == 1:
             raise RuntimeError("synthetic initialization failure")
         return {"userAgent": "synthetic"}
 
@@ -103,7 +103,7 @@ class TestInventory:
         pages = _fixture("thread-list-pages.json")
         client = FakeInitializingClient({"thread/list": pages["active"]})
         adapter = CodexSourceAdapter(client, marker_secret=SECRET)
-        assert client.initialize_calls == 0
+        assert client.initialize_calls == []
 
         summaries = adapter.list_inventory(archived=False)
 
@@ -111,7 +111,9 @@ class TestInventory:
             "thread-active",
             "thread-fallback",
         ]
-        assert client.initialize_calls == 1
+        assert client.initialize_calls == [
+            {"capabilities": {"experimentalApi": True}}
+        ]
         list_calls = [call for call in client.calls if call[0] == "thread/list"]
         assert list_calls[0][1]["archived"] is False
         assert "cursor" not in list_calls[0][1]
@@ -157,7 +159,9 @@ class TestInventory:
             adapter.list_inventory(archived=False)
 
         assert latched_failure.value.__cause__ is None
-        assert client.initialize_calls == 1
+        assert client.initialize_calls == [
+            {"capabilities": {"experimentalApi": True}}
+        ]
         assert client.calls == []
 
     def test_archived_pass_is_explicit_and_normalizes_inventory(self) -> None:

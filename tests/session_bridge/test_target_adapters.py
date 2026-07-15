@@ -213,6 +213,18 @@ class FakeRequestClient:
         }
 
 
+class ExperimentalSearchClient(FakeRequestClient):
+    def __init__(self, responses: dict[str, list[dict[str, Any] | Exception]]) -> None:
+        super().__init__(responses)
+        self._initialized = False
+        self.initialize_calls: list[dict[str, Any]] = []
+
+    def initialize(self, **kwargs: Any) -> dict[str, Any]:
+        self.initialize_calls.append(deepcopy(kwargs))
+        self._initialized = True
+        return {"userAgent": "synthetic"}
+
+
 class CompletionAwareFakeRequestClient(FakeRequestClient):
     def __init__(
         self,
@@ -809,6 +821,76 @@ def test_sidebar_marker_lookup_recovers_one_exact_thread_read_only() -> None:
         "thread/list",
         "thread/read",
     ]
+
+
+def test_sidebar_marker_lookup_searches_exact_marker_before_thread_reads() -> None:
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    row = _codex_inventory()["data"][0]
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {"data": [{"thread": row, "snippet": f"Signed marker: {marker}"}]},
+            {"data": []},
+        ],
+        "thread/read": [_codex_signed_read()],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+    )
+
+    assert verifier.find_by_marker(expected) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/search",
+        "thread/search",
+        "thread/read",
+    ]
+    search_calls = [params for method, params, _ in client.calls if method == "thread/search"]
+    assert [params["archived"] for params in search_calls] == [False, True]
+    unsigned_marker = marker.rsplit(".", 1)[0]
+    assert all(params["searchTerm"] == unsigned_marker for params in search_calls)
+    assert all(method != "thread/list" for method, _, _ in client.calls)
+    assert client.initialize_calls == [
+        {"capabilities": {"experimentalApi": True}}
+    ]
+
+
+def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> None:
+    expected = _sidebar_expected()
+    valid = encode_bridge_marker(expected, SECRET)
+    invalid = encode_bridge_marker(expected, b"different-secret")
+    row = _codex_inventory()["data"][0]
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {"data": [{"thread": row, "snippet": f"Signed marker: {invalid}"}]},
+            {"data": []},
+        ],
+        "thread/read": [_codex_read(turns=[{
+            "id": "registration",
+            "items": [{
+                "type": "userMessage",
+                "id": "item-1",
+                "content": [{"type": "text", "text": invalid}],
+            }],
+        }])],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(expected)
+
+    assert raised.value.code == "marker_conflict"
+    search_calls = [params for method, params, _ in client.calls if method == "thread/search"]
+    assert all(params["searchTerm"] == valid.rsplit(".", 1)[0] for params in search_calls)
 
 
 def test_sidebar_marker_lookup_rejects_multiple_authenticated_threads() -> None:
