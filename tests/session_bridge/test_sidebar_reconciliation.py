@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import asyncio
+import threading
 from typing import Any
 
 import pytest
@@ -95,6 +97,20 @@ class FakeVerifier:
             raise SidebarVerificationError("source_identity_mismatch")
         return self.result
 
+
+class BlockingVerifier(FakeVerifier):
+    def __init__(self) -> None:
+        super().__init__(None)
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None:
+        self.find_calls.append(expected)
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return None
 
 class ForbiddenTargetAdapter:
     def create_placeholder(self, **_: Any) -> Any:
@@ -318,3 +334,97 @@ async def test_reconciliation_failure_uses_fresh_clock_and_hides_expired_lease()
     coordinator = _coordinator(store, verifier, clock=lambda: 401.0)
 
     assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reconciliation_releases_every_claimed_lease(tmp_path) -> None:
+    db = SessionDB(tmp_path / "cancelled-sidebar.db")
+    tokens = iter(("cancelled-lease-one", "cancelled-lease-two"))
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: next(tokens),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    sources: list[str] = []
+    for ordinal in (1, 2):
+        source = f"claude:cancelled-{ordinal}"
+        sources.append(source)
+        db.ensure_session(source, source="cli")
+        store.enqueue_sidebar_job(SidebarCandidate(
+            source_session_id=source,
+            provider=Provider.CLAUDE,
+            bridge_id=sidebar_bridge_id(source),
+            title=f"[Claude] Cancelled {ordinal}",
+            cwd=f"C:/cancelled/{ordinal}",
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=10.0 + ordinal,
+        ))
+    verifier = BlockingVerifier()
+    coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
+
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+    )
+    assert await asyncio.to_thread(verifier.started.wait, 5)
+    claim_task.cancel()
+    verifier.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+
+    assert all(
+        store.get_sidebar_job_for_source(source)["state"] == "sidebar_pending"
+        for source in sources
+    )
+    db.close()
+
+
+class CleanupFailureStore(FakeSidebarStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.claims = [
+            {**_leased_job(), "lease_token": "cleanup-one"},
+            {
+                **_leased_job(),
+                "id": "sidebar-job:2",
+                "source_session_id": "claude:source-2",
+                "bridge_id": "sidebar:bridge-2",
+                "lease_token": "cleanup-two",
+            },
+        ]
+
+    def claim_sidebar_jobs(
+        self, *, now: float, limit: int, lease_seconds: int
+    ) -> list[dict[str, Any]]:
+        return self.claims[:limit]
+
+    def fail_sidebar_job(
+        self, *, lease_token: str, error_code: str, now: float
+    ) -> dict[str, Any]:
+        self.failures.append((lease_token, error_code, now))
+        if lease_token == "cleanup-one":
+            raise RuntimeError("first cleanup failed")
+        return {**self.claims[1], "state": "sidebar_pending"}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reconciliation_cleanup_continues_after_one_failure() -> None:
+    store = CleanupFailureStore()
+    verifier = BlockingVerifier()
+    coordinator = _coordinator(store, verifier, clock=lambda: 100.0)
+
+    claim_task = asyncio.create_task(
+        coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=2)
+    )
+    assert await asyncio.to_thread(verifier.started.wait, 5)
+    claim_task.cancel()
+    verifier.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await claim_task
+
+    assert store.failures == [
+        ("cleanup-one", "broker_time_budget", 100.0),
+        ("cleanup-two", "broker_time_budget", 100.0),
+    ]

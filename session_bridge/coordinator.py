@@ -425,77 +425,97 @@ class SessionBridgeCoordinator:
         )
         if not isinstance(raw_claims, list) or len(raw_claims) > limit:
             raise ValueError("sidebar delivery claims are malformed")
-        delivery: list[SidebarDeliveryClaim] = []
+        owned_tokens: list[str] = []
+        malformed_token = False
         for raw_claim in raw_claims:
             if not isinstance(raw_claim, Mapping):
-                raise ValueError("sidebar delivery claim is malformed")
-            lease_token = _exact_sidebar_claim_text(
-                raw_claim.get("lease_token"), "lease token"
-            )
-            source_session_id = _exact_sidebar_claim_text(
-                raw_claim.get("source_session_id"), "source session ID"
-            )
-            bridge_id = _exact_sidebar_claim_text(
-                raw_claim.get("bridge_id"), "bridge ID"
-            )
-            expected = BridgeMarkerPayload(
-                bridge_id=bridge_id,
-                source_session_id=source_session_id,
-                target_provider=Provider.CODEX,
-                policy_generation=1,
-            )
+                malformed_token = True
+                continue
             try:
-                recovered = await asyncio.to_thread(
-                    verifier.find_by_marker,
-                    expected,
+                owned_tokens.append(
+                    _exact_sidebar_claim_text(
+                        raw_claim.get("lease_token"), "lease token"
+                    )
                 )
-            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
-            except SidebarVerificationError as exc:
-                code = (
-                    exc.code
-                    if exc.code
-                    in {
-                        "marker_conflict",
-                        "source_identity_mismatch",
-                        "provider_mismatch",
-                    }
-                    else "bridge_temporarily_unavailable"
-                )
-                await self._fail_sidebar_delivery_claim(lease_token, code)
-                continue
-            except Exception:
-                await self._fail_sidebar_delivery_claim(
-                    lease_token,
-                    "bridge_temporarily_unavailable",
-                )
-                continue
-            if recovered is not None and (
-                recovered.source_session_id != source_session_id
-                or recovered.bridge_id != bridge_id
+            except ValueError:
+                malformed_token = True
+        if malformed_token or len(set(owned_tokens)) != len(owned_tokens):
+            await self._cleanup_sidebar_delivery_claims(owned_tokens)
+            raise ValueError("sidebar delivery claim tokens are malformed")
+
+        try:
+            delivery: list[SidebarDeliveryClaim] = []
+            for raw_claim, lease_token in zip(
+                raw_claims, owned_tokens, strict=True
             ):
-                await self._fail_sidebar_delivery_claim(
-                    lease_token,
-                    "source_identity_mismatch",
+                assert isinstance(raw_claim, Mapping)
+                source_session_id = _exact_sidebar_claim_text(
+                    raw_claim.get("source_session_id"), "source session ID"
                 )
-                continue
-            delivery.append(
-                SidebarDeliveryClaim(
-                    lease_token=lease_token,
-                    source_session_id=source_session_id,
+                bridge_id = _exact_sidebar_claim_text(
+                    raw_claim.get("bridge_id"), "bridge ID"
+                )
+                expected = BridgeMarkerPayload(
                     bridge_id=bridge_id,
-                    reconcile_required=True,
-                    rename_required=recovered is not None,
-                    recovered_thread=recovered,
+                    source_session_id=source_session_id,
+                    target_provider=Provider.CODEX,
+                    policy_generation=1,
                 )
-            )
-        return tuple(delivery)
+                try:
+                    recovered = await asyncio.to_thread(
+                        verifier.find_by_marker,
+                        expected,
+                    )
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except SidebarVerificationError as exc:
+                    code = (
+                        exc.code
+                        if exc.code
+                        in {
+                            "marker_conflict",
+                            "source_identity_mismatch",
+                            "provider_mismatch",
+                        }
+                        else "bridge_temporarily_unavailable"
+                    )
+                    await self._fail_sidebar_delivery_claim(lease_token, code)
+                    continue
+                except Exception:
+                    await self._fail_sidebar_delivery_claim(
+                        lease_token,
+                        "bridge_temporarily_unavailable",
+                    )
+                    continue
+                if recovered is not None and (
+                    recovered.source_session_id != source_session_id
+                    or recovered.bridge_id != bridge_id
+                ):
+                    await self._fail_sidebar_delivery_claim(
+                        lease_token,
+                        "source_identity_mismatch",
+                    )
+                    continue
+                delivery.append(
+                    SidebarDeliveryClaim(
+                        lease_token=lease_token,
+                        source_session_id=source_session_id,
+                        bridge_id=bridge_id,
+                        reconcile_required=True,
+                        rename_required=recovered is not None,
+                        recovered_thread=recovered,
+                    )
+                )
+            return tuple(delivery)
+        except BaseException:
+            await self._cleanup_sidebar_delivery_claims(owned_tokens)
+            raise
 
     async def _fail_sidebar_delivery_claim(
         self,
         lease_token: str,
         error_code: str,
-    ) -> None:
+    ) -> bool:
         failure_time = _finite_number(self._clock(), "now")
         try:
             await asyncio.to_thread(
@@ -510,6 +530,35 @@ class SessionBridgeCoordinator:
             raise
         except Exception:
             self._record_error_code("sidebar_delivery_failure_stale")
+            return False
+        return True
+
+    async def _cleanup_sidebar_delivery_claims(
+        self,
+        lease_tokens: Sequence[str],
+    ) -> None:
+        async def _cleanup() -> None:
+            for lease_token in dict.fromkeys(lease_tokens):
+                try:
+                    await asyncio.to_thread(
+                        _call,
+                        self._store,
+                        "fail_sidebar_job",
+                        lease_token=lease_token,
+                        error_code="broker_time_budget",
+                        now=_finite_number(self._clock(), "now"),
+                    )
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException:
+                    self._record_error_code("sidebar_delivery_failure_stale")
+                    continue
+
+        cleanup_task = asyncio.create_task(_cleanup())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            await cleanup_task
 
     async def commit_sidebar_job(
         self,
