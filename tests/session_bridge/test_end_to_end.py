@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
@@ -8,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import time
@@ -54,6 +56,217 @@ from session_bridge.store import SessionBridgeStore
 
 _MARKER_SECRET = b"synthetic-end-to-end-marker-secret"
 _SIDEBAR_TOKEN = "synthetic-sidebar-mcp-token-at-least-32-bytes"
+_SIDEBAR_SKILL_PATH = (
+    Path(__file__).parents[2]
+    / "session_bridge"
+    / "assets"
+    / "session-sidebar-sync"
+    / "SKILL.md"
+)
+
+
+@dataclass(frozen=True)
+class _SidebarSkillContract:
+    pending_tool: str
+    pending_limit: int
+    projects_tool: str
+    list_threads_tool: str
+    read_thread_tool: str
+    create_tool: str
+    rename_tool: str
+    commit_tool: str
+    fail_tool: str
+    reconcile_limit: int
+    project_precedence: tuple[str, ...]
+    failure_codes: dict[str, str]
+
+    @classmethod
+    def load(cls, path: Path) -> "_SidebarSkillContract":
+        try:
+            text = path.read_text(encoding="utf-8")
+            procedure = text.split("\n## Procedure\n", 1)[1].split(
+                "\n## Fixed Failure Mapping\n", 1
+            )[0]
+            steps = {
+                int(number): body.strip()
+                for number, body in re.findall(
+                    r"(?ms)^(\d+)\. (.*?)(?=^\d+\. |\Z)",
+                    procedure,
+                )
+            }
+            if set(steps) != set(range(1, 10)):
+                raise ValueError("procedure steps")
+
+            pending = re.search(
+                r"Call `(session_sidebar_[a-z_]+)\(limit=(\d+)\)` exactly once",
+                steps[1],
+            )
+            projects = re.search(
+                r"native tool `(list_[a-z_]+)\(\{\}\)` exactly once",
+                steps[2],
+            )
+            list_threads = re.search(
+                r"call `(list_threads)\(\{.*?\"limit\":(\d+)\}\)`",
+                steps[5],
+            )
+            read_thread = re.search(r"call `(read_thread)\(", steps[5])
+            create = re.search(r"with `(create_thread)\(", steps[6])
+            rename = re.search(r"Use `(set_thread_title)\(", steps[7])
+            commit = re.search(r"Call `(session_sidebar_commit)\(", steps[8])
+            fail = re.search(r"call `(session_sidebar_fail)\(", steps[9])
+            matches = (
+                pending,
+                projects,
+                list_threads,
+                read_thread,
+                create,
+                rename,
+                commit,
+                fail,
+            )
+            if any(match is None for match in matches):
+                raise ValueError("required call schemas")
+            assert pending and projects and list_threads
+            assert read_thread and create and rename and commit and fail
+
+            precedence: list[str] = []
+            for item in re.findall(r"(?m)^   \d+\. (.+)$", steps[3]):
+                if "exact cwd" in item:
+                    precedence.append("cwd")
+                elif "exact git root" in item:
+                    precedence.append("git_root")
+                elif "Session Inbox" in item:
+                    precedence.append("inbox")
+                else:
+                    raise ValueError("project precedence")
+            if tuple(precedence) != ("cwd", "git_root", "inbox"):
+                raise ValueError("project precedence")
+
+            mapping_block = text.split(
+                "\n## Fixed Failure Mapping\n", 1
+            )[1].split("\n## Deterministic Call-Failure Rules\n", 1)[0]
+            failure_codes = {
+                label.strip(): code
+                for label, code in re.findall(
+                    r"(?m)^\| ([^|]+?) \| `([^`]+)` \|$",
+                    mapping_block,
+                )
+            }
+            required_failures = {
+                "Desktop offline": "desktop_offline",
+                "Bridge temporarily unavailable": "bridge_temporarily_unavailable",
+                "Project listing or canonical lookup failed": "project_lookup_failed",
+                "Rename failed": "rename_failed",
+                "Create response lost or task not yet indexed": "native_task_not_indexed",
+                "Authenticated marker conflict": "marker_conflict",
+            }
+            if any(
+                failure_codes.get(label) != code
+                for label, code in required_failures.items()
+            ):
+                raise ValueError("fixed failure mapping")
+
+            required_rules = (
+                "choose its sidebar project in this exact order",
+                "reconcile before creating anything",
+                '"prompt":"<registration_prompt verbatim>"',
+                "title before commit",
+                "try fail/release once with `bridge_temporarily_unavailable`",
+                "Never use app-server thread creation as a fallback",
+            )
+            if any(text.count(rule) != 1 for rule in required_rules):
+                raise ValueError("required rule")
+            return cls(
+                pending_tool=pending.group(1),
+                pending_limit=int(pending.group(2)),
+                projects_tool=projects.group(1),
+                list_threads_tool=list_threads.group(1),
+                read_thread_tool=read_thread.group(1),
+                create_tool=create.group(1),
+                rename_tool=rename.group(1),
+                commit_tool=commit.group(1),
+                fail_tool=fail.group(1),
+                reconcile_limit=int(list_threads.group(2)),
+                project_precedence=tuple(precedence),
+                failure_codes=failure_codes,
+            )
+        except (IndexError, OSError, ValueError) as exc:
+            raise ValueError(f"sidebar skill contract is invalid: {path}") from exc
+
+    def failure_code(self, label: str) -> str:
+        try:
+            return self.failure_codes[label]
+        except KeyError as exc:
+            raise ValueError("sidebar skill contract has no fixed failure") from exc
+
+    def choose_project(
+        self,
+        projects: dict[str, str],
+        *,
+        cwd: str,
+        git_root: str | None,
+        inbox: str,
+    ) -> str:
+        candidates = {"cwd": cwd, "git_root": git_root, "inbox": inbox}
+        for source in self.project_precedence:
+            candidate = candidates[source]
+            if candidate is not None and candidate in projects:
+                return projects[candidate]
+        raise ValueError(self.failure_code("Project listing or canonical lookup failed"))
+
+    def validate_trace(self, trace: list[dict[str, Any]]) -> None:
+        if not trace or trace[0]["tool"] != self.pending_tool:
+            raise AssertionError("sidebar worker must start with pending")
+        if sum(event["tool"] == self.pending_tool for event in trace) != 1:
+            raise AssertionError("pending must be called exactly once")
+        if len(trace) == 1:
+            return
+        if trace[1]["tool"] != self.projects_tool:
+            raise AssertionError("projects must be listed after pending")
+        if sum(event["tool"] == self.projects_tool for event in trace) != 1:
+            raise AssertionError("projects must be listed exactly once")
+        if any("app-server" in event["tool"] for event in trace):
+            raise AssertionError("app-server creation is forbidden")
+
+        job_ids = {event.get("job") for event in trace if event.get("job")}
+        for job_id in job_ids:
+            events = [event for event in trace if event.get("job") == job_id]
+            tools = [event["tool"] for event in events]
+            ranks = {
+                "project_choice": 0,
+                self.list_threads_tool: 1,
+                self.read_thread_tool: 2,
+                self.create_tool: 3,
+                self.rename_tool: 4,
+                self.commit_tool: 5,
+                self.fail_tool: 6,
+            }
+            try:
+                ordered = [ranks[tool] for tool in tools]
+            except KeyError as exc:
+                raise AssertionError("worker trace contains an unknown call") from exc
+            if ordered != sorted(ordered):
+                raise AssertionError("worker calls violate shipped procedure order")
+            if self.create_tool in tools:
+                create = events[tools.index(self.create_tool)]
+                if create["arguments"]["prompt"] != create["registration_prompt"]:
+                    raise AssertionError("registration prompt must be verbatim")
+            if self.list_threads_tool in tools and self.create_tool in tools:
+                if tools.index(self.list_threads_tool) > tools.index(self.create_tool):
+                    raise AssertionError("reconciliation must precede creation")
+            if self.commit_tool in tools:
+                if self.rename_tool not in tools or tools.index(
+                    self.rename_tool
+                ) > tools.index(self.commit_tool):
+                    raise AssertionError("rename must precede commit")
+            fail_events = [
+                event for event in events if event["tool"] == self.fail_tool
+            ]
+            if len(fail_events) > 1:
+                raise AssertionError("lease may be failed only once")
+            for event in fail_events:
+                if event["arguments"]["error_code"] not in self.failure_codes.values():
+                    raise AssertionError("failure code must come from shipped mapping")
 
 
 class _SyntheticCodexClient:
@@ -1062,7 +1275,7 @@ class _FakeNativeCodexTasks:
     def __init__(self, marker_secret: bytes, *, on_create=None) -> None:
         self.marker_secret = marker_secret
         self.on_create = on_create
-        self.projects: list[dict[str, str]] = []
+        self.projects: list[dict[str, Any]] = []
         self.threads: dict[str, dict[str, Any]] = {}
         self.create_calls: list[dict[str, Any]] = []
         self.rename_calls: list[tuple[str, str]] = []
@@ -1073,8 +1286,30 @@ class _FakeNativeCodexTasks:
 
     def add_project(self, project_id: str, path: Path) -> None:
         self.projects.append(
-            {"projectId": project_id, "path": _canonical_sidebar_path(path)}
+            {
+                "projectId": project_id,
+                "path": _canonical_sidebar_path(path),
+                "hostId": None,
+            }
         )
+
+    def list_projects(self) -> list[dict[str, Any]]:
+        return [dict(project) for project in self.projects]
+
+    def list_threads(self, *, query: str, limit: int) -> list[dict[str, Any]]:
+        assert limit == 20
+        return [
+            {
+                "threadId": thread["thread_id"],
+                "projectId": thread["project_id"],
+                "hostId": None,
+            }
+            for thread in self.threads.values()
+            if thread["marker"] == query
+        ][:limit]
+
+    def read_thread(self, *, thread_id: str) -> dict[str, Any]:
+        return dict(self.threads[thread_id])
 
     def create_thread(
         self,
@@ -1178,7 +1413,9 @@ class _SidebarEndToEndHarness:
         tmp_path: Path,
         *,
         claude_projects_root: Path | None = None,
+        skill_path: Path = _SIDEBAR_SKILL_PATH,
     ) -> None:
+        self.contract = _SidebarSkillContract.load(skill_path)
         self.now = time.time()
         self.db = SessionDB(tmp_path / "sidebar-e2e-state.db")
         self.store = SessionBridgeStore(
@@ -1209,9 +1446,14 @@ class _SidebarEndToEndHarness:
             clock=lambda: self.now,
         )
         self.catalog = UnifiedCatalog(self.db, self.store)
+        self.production_backend: Any | None = None
+        self.worker_traces: list[list[dict[str, Any]]] = []
         self.inbox = tmp_path / ".hermes"
         self.inbox.mkdir()
         self.native.add_project("session-inbox", self.inbox)
+        self._rebuild_app()
+
+    def _rebuild_app(self) -> None:
         self.app = create_app(
             catalog=self.catalog,
             coordinator=_SidebarMcpCoordinator(self.coordinator),
@@ -1222,7 +1464,61 @@ class _SidebarEndToEndHarness:
         )
 
     def close(self) -> None:
+        if self.production_backend is not None:
+            self.production_backend._db = None
+            self.production_backend._store = None
+            self.production_backend._catalog = None
+            self.production_backend.close()
         self.db.close()
+
+    def install_production_runtime(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> SessionBridgeCoordinator:
+        monkeypatch.setattr(Path, "home", lambda: self.inbox.parent)
+        from session_bridge.cli import ProductionBackend
+
+        class CompositionCodexClient:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def request(self, *_args: Any, **_kwargs: Any):
+                raise AssertionError("app-server request is outside sidebar delivery")
+
+            def take_notification(self, timeout: float = 0.0) -> None:
+                del timeout
+                return None
+
+            def close(self) -> None:
+                self.closed = True
+
+        client = CompositionCodexClient()
+        backend = ProductionBackend(self.config)
+        backend._db = self.db
+        backend._store = self.store
+        backend._catalog = self.catalog
+        monkeypatch.setattr(
+            "session_bridge.cli.resolve_marker_key",
+            lambda: _MARKER_SECRET,
+        )
+        monkeypatch.setattr(
+            "session_bridge.cli.resolve_cli_executable",
+            lambda name: (name,),
+        )
+        monkeypatch.setattr(
+            "session_bridge.cli.CodexAppServerClient",
+            lambda **_kwargs: client,
+        )
+        coordinator = backend._provider_runtime(
+            targets=True,
+            catalog_only=False,
+            providers=(Provider.CODEX,),
+        )
+        coordinator._sidebar_verifier = self.native
+        self.coordinator = coordinator
+        self.production_backend = backend
+        self._rebuild_app()
+        return coordinator
 
     def add_project(self, project_id: str, path: Path) -> None:
         self.native.add_project(project_id, path)
@@ -1355,74 +1651,174 @@ class _SidebarEndToEndHarness:
         self,
         client: Any,
     ) -> list[dict[str, Any]]:
+        trace: list[dict[str, Any]] = [{
+            "tool": self.contract.pending_tool,
+            "arguments": {"limit": self.contract.pending_limit},
+        }]
         jobs = _sidebar_call_tool(
             client,
-            "session_sidebar_pending",
-            {"limit": 5},
+            self.contract.pending_tool,
+            {"limit": self.contract.pending_limit},
         )["jobs"]
         outcomes: list[dict[str, Any]] = []
+        if not jobs:
+            self.contract.validate_trace(trace)
+            self.worker_traces.append(trace)
+            return outcomes
+
+        trace.append({"tool": self.contract.projects_tool, "arguments": {}})
+        listed_projects = getattr(
+            self.native,
+            self.contract.projects_tool,
+        )()
         projects = {
             project["path"]: project["projectId"]
-            for project in self.native.projects
+            for project in listed_projects
         }
-        for job in jobs:
-            project_id = projects.get(_canonical_sidebar_path(job["cwd"]))
-            if project_id is None and job["git_root"] is not None:
-                project_id = projects.get(
-                    _canonical_sidebar_path(job["git_root"])
-                )
-            if project_id is None:
-                project_id = projects[_canonical_sidebar_path(self.inbox)]
+        for ordinal, job in enumerate(jobs):
+            job_id = job.get("source_session_id", f"job-{ordinal}")
+            cwd = _canonical_sidebar_path(job["cwd"])
+            git_root = (
+                None
+                if job["git_root"] is None
+                else _canonical_sidebar_path(job["git_root"])
+            )
+            project_id = self.contract.choose_project(
+                projects,
+                cwd=cwd,
+                git_root=git_root,
+                inbox=_canonical_sidebar_path(self.inbox),
+            )
+            trace.append({
+                "tool": "project_choice",
+                "job": job_id,
+                "arguments": {
+                    "cwd": cwd,
+                    "git_root": git_root,
+                    "project_id": project_id,
+                },
+            })
 
-            thread_id = job["recovered_thread_id"]
+            def fail_once(label: str) -> dict[str, Any]:
+                code = self.contract.failure_code(label)
+                arguments = {
+                    "lease_token": job["lease_token"],
+                    "error_code": code,
+                }
+                trace.append({
+                    "tool": self.contract.fail_tool,
+                    "job": job_id,
+                    "arguments": arguments,
+                })
+                settled = _sidebar_try_fail(
+                    client,
+                    self.contract.fail_tool,
+                    arguments,
+                )
+                return (
+                    settled
+                    if settled is not None
+                    else {"state": "commit_unknown", "fail_attempted": True}
+                )
+
+            thread_id = None
+            recovered_thread_id = job["recovered_thread_id"]
+            if job.get("reconcile_required") or recovered_thread_id is not None:
+                marker = _registration_marker(job["registration_prompt"])
+                list_arguments = {
+                    "query": marker,
+                    "limit": self.contract.reconcile_limit,
+                }
+                trace.append({
+                    "tool": self.contract.list_threads_tool,
+                    "job": job_id,
+                    "arguments": list_arguments,
+                })
+                summaries = getattr(
+                    self.native,
+                    self.contract.list_threads_tool,
+                )(**list_arguments)
+                for summary in summaries:
+                    candidate_id = summary["threadId"]
+                    trace.append({
+                        "tool": self.contract.read_thread_tool,
+                        "job": job_id,
+                        "arguments": {"threadId": candidate_id},
+                    })
+                    getattr(self.native, self.contract.read_thread_tool)(
+                        thread_id=candidate_id
+                    )
+                    if recovered_thread_id in (None, candidate_id):
+                        thread_id = candidate_id
+                        break
+                if recovered_thread_id is not None and thread_id is None:
+                    outcomes.append(fail_once("Authenticated marker conflict"))
+                    continue
+
             if thread_id is None:
+                create_arguments = {
+                    "prompt": job["registration_prompt"],
+                    "target": {
+                        "type": "project",
+                        "projectId": project_id,
+                        "environment": {"type": "local"},
+                    },
+                }
+                trace.append({
+                    "tool": self.contract.create_tool,
+                    "job": job_id,
+                    "arguments": create_arguments,
+                    "registration_prompt": job["registration_prompt"],
+                })
                 try:
-                    thread_id = self.native.create_thread(
+                    thread_id = getattr(
+                        self.native,
+                        self.contract.create_tool,
+                    )(
                         prompt=job["registration_prompt"],
                         project_id=project_id,
                         source_cwd=job["cwd"],
                     )
                 except RuntimeError:
-                    outcomes.append(
-                        _sidebar_call_tool(
-                            client,
-                            "session_sidebar_fail",
-                            {
-                                "lease_token": job["lease_token"],
-                                "error_code": "desktop_offline",
-                            },
-                        )
-                    )
+                    outcomes.append(fail_once("Desktop offline"))
                     continue
 
+            rename_arguments = {"threadId": thread_id, "title": job["title"]}
+            trace.append({
+                "tool": self.contract.rename_tool,
+                "job": job_id,
+                "arguments": rename_arguments,
+            })
             try:
-                self.native.set_thread_title(thread_id, job["title"])
-            except RuntimeError:
-                outcomes.append(
-                    _sidebar_call_tool(
-                        client,
-                        "session_sidebar_fail",
-                        {
-                            "lease_token": job["lease_token"],
-                            "error_code": "rename_failed",
-                        },
-                    )
+                getattr(self.native, self.contract.rename_tool)(
+                    thread_id,
+                    job["title"],
                 )
+            except RuntimeError:
+                outcomes.append(fail_once("Rename failed"))
                 continue
 
+            commit_arguments = {
+                "lease_token": job["lease_token"],
+                "codex_thread_id": thread_id,
+            }
+            trace.append({
+                "tool": self.contract.commit_tool,
+                "job": job_id,
+                "arguments": commit_arguments,
+            })
             try:
                 outcomes.append(
                     _sidebar_call_tool(
                         client,
-                        "session_sidebar_commit",
-                        {
-                            "lease_token": job["lease_token"],
-                            "codex_thread_id": thread_id,
-                        },
+                        self.contract.commit_tool,
+                        commit_arguments,
                     )
                 )
             except httpx.TransportError:
-                outcomes.append({"state": "commit_unknown"})
+                outcomes.append(fail_once("Bridge temporarily unavailable"))
+        self.contract.validate_trace(trace)
+        self.worker_traces.append(trace)
         return outcomes
 
 
@@ -1532,6 +1928,29 @@ def _sidebar_call_tool(
     )
 
 
+def _sidebar_try_fail(
+    client: Any,
+    name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any] | None:
+    payload = _sidebar_rpc(
+        client,
+        "tools/call",
+        {"name": name, "arguments": arguments},
+        request_id=10,
+    )
+    assert "error" not in payload, payload
+    result = payload["result"]
+    if result.get("isError"):
+        return None
+    structured = result.get("structuredContent")
+    return (
+        structured
+        if structured is not None
+        else json.loads(result["content"][0]["text"])
+    )
+
+
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.HERMES])
 def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
     tmp_path: Path,
@@ -1561,6 +1980,15 @@ def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
         assert harness.native.threads["native-sidebar-1"]["title"].startswith(
             "[Claude] " if provider is Provider.CLAUDE else "[Hermes] "
         )
+        assert [event["tool"] for event in harness.worker_traces[-1]] == [
+            harness.contract.pending_tool,
+            harness.contract.projects_tool,
+            "project_choice",
+            harness.contract.list_threads_tool,
+            harness.contract.create_tool,
+            harness.contract.rename_tool,
+            harness.contract.commit_tool,
+        ]
     finally:
         harness.close()
 
@@ -1650,16 +2078,21 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
             first = harness.run_worker_once(dropped_client)
             state_after_drop = harness.store.get_sidebar_job_for_source(source_id)
             if drop_timing == "before_processing":
-                harness.advance_lease_expiry()
+                harness.advance_retry()
             second = harness.run_worker_once(client)
 
-        assert first == [{"state": "commit_unknown"}]
         assert dropped_client.commit_attempts == 1
         assert dropped_client.dropped is True
-        assert "session_sidebar_commit" in dropped_client.tool_calls
-        assert "session_sidebar_fail" not in dropped_client.tool_calls
+        assert dropped_client.tool_calls.count("session_sidebar_commit") == 1
+        assert dropped_client.tool_calls.count("session_sidebar_fail") == 1
         if drop_timing == "before_processing":
-            assert state_after_drop["state"] == SidebarJobState.LEASED.value
+            assert first == [
+                {
+                    "state": "sidebar_retry",
+                    "error_code": "bridge_temporarily_unavailable",
+                }
+            ]
+            assert state_after_drop["state"] == SidebarJobState.RETRY.value
             assert second == [
                 {
                     "state": "sidebar_visible",
@@ -1671,6 +2104,9 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
                 == source_id
             )
         else:
+            assert first == [
+                {"state": "commit_unknown", "fail_attempted": True}
+            ]
             assert state_after_drop["state"] == SidebarJobState.VISIBLE.value
             assert second == []
         assert len(harness.native.create_calls) == 1
@@ -1679,3 +2115,37 @@ def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
         )
     finally:
         harness.close()
+
+
+@pytest.mark.parametrize(
+    ("needle", "replacement"),
+    [
+        (
+            "the saved project whose canonical path equals the job's exact cwd;",
+            "an arbitrary saved project;",
+        ),
+        (
+            "try fail/release once with `bridge_temporarily_unavailable`",
+            "leave the lease unsettled",
+        ),
+        (
+            "Never use app-server thread creation as a fallback",
+            "Use app-server thread creation as a fallback",
+        ),
+    ],
+)
+def test_sidebar_harness_rejects_mutated_shipped_skill_contract(
+    tmp_path: Path,
+    needle: str,
+    replacement: str,
+) -> None:
+    shipped = _SIDEBAR_SKILL_PATH.read_text(encoding="utf-8")
+    assert shipped.count(needle) == 1
+    mutated = tmp_path / "mutated-sidebar-SKILL.md"
+    mutated.write_text(shipped.replace(needle, replacement), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sidebar skill contract"):
+        _SidebarEndToEndHarness(
+            tmp_path / "harness",
+            skill_path=mutated,
+        )

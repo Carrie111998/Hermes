@@ -694,13 +694,16 @@ def test_sidebar_native_broker_never_calls_app_server_creation(
         app_server_calls.append(kwargs)
         raise AssertionError("sidebar delivery must not call app-server creation")
 
-    monkeypatch.setattr(
-        CodexTargetAdapter,
-        "create_placeholder",
-        forbidden_app_server_create,
-    )
     harness = _SidebarEndToEndHarness(tmp_path)
     try:
+        coordinator = harness.install_production_runtime(monkeypatch)
+        codex_target = coordinator._target_adapters[Provider.CODEX]
+        assert isinstance(codex_target, CodexTargetAdapter)
+        monkeypatch.setattr(
+            codex_target,
+            "create_placeholder",
+            forbidden_app_server_create,
+        )
         harness.seed_source(
             Provider.CLAUDE,
             "native-only",
