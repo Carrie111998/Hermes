@@ -2454,11 +2454,16 @@ async def get_status(profile: Optional[str] = None):
         # Try local PID check first (same-host).  If that fails and a remote
         # GATEWAY_HEALTH_URL is configured, probe the gateway over HTTP so the
         # dashboard works when the gateway runs in a separate container.
-        gateway_pid = (
-            get_running_pid(_gateway_pid_path)
-            if _gateway_pid_path is not None
-            else get_running_pid()
-        )
+        # On Windows get_running_pid() may invoke tasklist, which can take
+        # seconds under process pressure. Keep that subprocess off the asyncio
+        # loop so status polling cannot starve websocket flushes or unrelated
+        # dashboard requests.
+        if _gateway_pid_path is not None:
+            gateway_pid = await asyncio.to_thread(get_running_pid, _gateway_pid_path)
+        else:
+            # to_thread propagates the selected profile's contextvars into the
+            # worker; run_in_executor would silently probe the root profile.
+            gateway_pid = await asyncio.to_thread(get_running_pid)
         gateway_running = gateway_pid is not None
         remote_health_body: dict | None = None
 

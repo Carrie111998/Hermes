@@ -145,6 +145,70 @@ def test_get_status_does_not_block_event_loop():
     )
 
 
+def test_get_status_local_pid_probe_does_not_block_event_loop():
+    """A slow same-host PID probe must not starve unrelated API requests."""
+    import httpx
+
+    release_probe = threading.Event()
+    fallback_released_probe = threading.Event()
+    first_probe = True
+    timings: dict[str, float] = {}
+
+    def _blocking_pid_probe(*_args, **_kwargs):
+        nonlocal first_probe
+        if first_probe:
+            first_probe = False
+            release_probe.wait(timeout=4)
+        return None
+
+    async def _run():
+        transport = httpx.ASGITransport(app=web_server_mod.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            async def _status():
+                return await client.get("/api/status", timeout=5)
+
+            async def _version():
+                started = time.perf_counter()
+                await asyncio.sleep(0.05)
+                response = await client.get("/api/version", timeout=5)
+                timings["version_ms"] = (time.perf_counter() - started) * 1000
+                release_probe.set()
+                return response
+
+            status_response, version_response = await asyncio.gather(
+                asyncio.create_task(_status()),
+                asyncio.create_task(_version()),
+            )
+            assert status_response.status_code == 200
+            # The auth middleware may gate /api/version when this test runs in
+            # isolation; either response proves the unrelated request ran.
+            assert version_response.status_code in {200, 401}
+
+    def _fallback_release():
+        if not release_probe.is_set():
+            fallback_released_probe.set()
+            release_probe.set()
+
+    release_timer = threading.Timer(2.0, _fallback_release)
+    release_timer.start()
+    try:
+        with (
+            patch.object(web_server_mod, "get_running_pid", _blocking_pid_probe),
+            patch.object(web_server_mod, "_resolve_restart_drain_timeout", lambda: 180.0),
+        ):
+            asyncio.run(_run())
+    finally:
+        release_probe.set()
+        release_timer.cancel()
+
+    assert not fallback_released_probe.is_set(), (
+        "A blocking local gateway PID probe starved the asyncio event loop: "
+        f"/api/version took {timings['version_ms']:.0f} ms"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 3 — no orphan accumulation: concurrent probes all receive 200
 # ---------------------------------------------------------------------------
