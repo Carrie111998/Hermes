@@ -161,7 +161,7 @@ class ProviderConfig:
     """Describes a known inference provider."""
     id: str
     name: str
-    auth_type: str  # "oauth_device_code", "oauth_external", "oauth_minimax", "api_key", "external_process", "aws_sdk", or "gcp_adc"
+    auth_type: str  # "oauth_device_code", "oauth_external", "oauth_minimax", "api_key", "external_process", "aws_sdk", or "vertex"
     portal_base_url: str = ""
     inference_base_url: str = ""
     client_id: str = ""
@@ -1742,7 +1742,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 continue
             if has_usable_secret(os.getenv(env_var, "")):
                 return True
-    if pconfig and pconfig.auth_type == "gcp_adc":
+    if pconfig and pconfig.auth_type == "vertex":
         for env_var in pconfig.api_key_env_vars:
             if str(os.getenv(env_var, "")).strip():
                 return True
