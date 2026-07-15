@@ -697,6 +697,66 @@ class TestSaveConfigAtomicity:
 
 
 class TestConfigInterprocessLocking:
+    def test_mutate_config_rejects_unpersisted_managed_document_and_releases_lock(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.config as config_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        save_config({"existing": True}, strip_defaults=False)
+        original = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+
+        def rejected(document):
+            document["unpersisted"] = "sensitive-value"
+
+        with pytest.raises(
+            config_module.ConfigPersistenceRejected,
+            match="^config_persistence_rejected$",
+        ):
+            config_module.mutate_config(rejected, strip_defaults=False)
+        assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == original
+
+        monkeypatch.delenv("HERMES_MANAGED")
+        config_module.mutate_config(
+            lambda document: document.update({"recovered": True}),
+            strip_defaults=False,
+        )
+        assert read_raw_config()["recovered"] is True
+
+    def test_mutate_config_returns_effective_value_after_managed_leaf_stripping(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import managed_scope
+        import hermes_cli.config as config_module
+
+        home = tmp_path / "home"
+        managed = tmp_path / "managed"
+        home.mkdir()
+        managed.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+        (managed / "config.yaml").write_text(
+            "session_bridge:\n  sidebar:\n    continuous: false\n",
+            encoding="utf-8",
+        )
+        managed_scope.invalidate_managed_cache()
+
+        def request_true(document):
+            document.setdefault("session_bridge", {}).setdefault("sidebar", {})[
+                "continuous"
+            ] = True
+
+        persisted = config_module.mutate_config(
+            request_true,
+            preserve_keys={("session_bridge", "sidebar", "continuous")},
+        )
+
+        assert persisted["session_bridge"]["sidebar"]["continuous"] is False
+        assert read_raw_config().get("session_bridge", {}).get("sidebar", {}).get(
+            "continuous"
+        ) is not True
+
     def test_mutate_config_preserves_unrelated_keys_across_processes(self, tmp_path):
         context = multiprocessing.get_context("spawn")
         first_entered = context.Event()

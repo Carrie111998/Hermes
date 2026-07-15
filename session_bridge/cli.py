@@ -335,7 +335,7 @@ class ProductionBackend:
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]:
         if type(enabled) is not bool:
             raise ConfigurationFailure("invalid_sidebar_continuous_mode")
-        from hermes_cli.config import mutate_config
+        from hermes_cli.config import ConfigPersistenceRejected, mutate_config
 
         def _mutate(document: dict[str, Any]) -> None:
             session_bridge = document.get("session_bridge")
@@ -352,17 +352,39 @@ class ProductionBackend:
                 raise ConfigurationFailure("invalid_sidebar_config")
             sidebar["continuous"] = enabled
 
-        mutate_config(
-            _mutate,
-            preserve_keys={("session_bridge", "sidebar", "continuous")},
+        try:
+            persisted = mutate_config(
+                _mutate,
+                preserve_keys={("session_bridge", "sidebar", "continuous")},
+            )
+        except ConfigPersistenceRejected as exc:
+            raise ConfigurationFailure("config_persistence_rejected") from exc
+
+        persisted_bridge = persisted.get("session_bridge")
+        persisted_sidebar = (
+            persisted_bridge.get("sidebar")
+            if isinstance(persisted_bridge, dict)
+            else None
         )
+        persisted_continuous = (
+            persisted_sidebar.get("continuous")
+            if isinstance(persisted_sidebar, dict)
+            else None
+        )
+        if type(persisted_continuous) is not bool:
+            raise ConfigurationFailure("invalid_persisted_sidebar_config")
+        if persisted_continuous is not enabled:
+            raise ConfigurationFailure("sidebar_continuous_not_persisted")
         self.config = replace(
             self.config,
-            sidebar=replace(self.config.sidebar, continuous=enabled),
+            sidebar=replace(
+                self.config.sidebar,
+                continuous=persisted_continuous,
+            ),
         )
         return {
             "enabled": self.config.sidebar.enabled,
-            "continuous": enabled,
+            "continuous": persisted_continuous,
         }
 
     def characterize(self, *, provider: str) -> Mapping[str, Any]:

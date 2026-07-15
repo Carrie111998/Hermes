@@ -256,6 +256,10 @@ _CONFIG_LOCK = threading.RLock()
 _CONFIG_FILE_LOCK_TIMEOUT_SECONDS = 10.0
 _CONFIG_FILE_LOCK_POLL_SECONDS = 0.05
 _CONFIG_FILE_LOCK_HOLDER = threading.local()
+
+
+class ConfigPersistenceRejected(RuntimeError):
+    """A config transaction was rejected before its requested state persisted."""
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -7167,7 +7171,7 @@ def mutate_raw_config_with_save_policy(
             strip_defaults=strip_defaults,
             preserve_keys=preserve_keys,
         )
-        return copy.deepcopy(config)
+        return read_raw_config()
 
 
 def mutate_config(
@@ -7185,12 +7189,14 @@ def mutate_config(
         result = mutator(config)
         if result is not None:
             raise TypeError("config mutator must update in place and return None")
-        save_config(
+        persisted = save_config(
             config,
             strip_defaults=strip_defaults,
             preserve_keys=preserve_keys,
         )
-        return copy.deepcopy(config)
+        if not persisted:
+            raise ConfigPersistenceRejected("config_persistence_rejected")
+        return load_config()
 
 
 def save_config(
@@ -7198,7 +7204,7 @@ def save_config(
     *,
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
-):
+) -> bool:
     """Save configuration to ~/.hermes/config.yaml.\n
 
     Default values from ``DEFAULT_CONFIG`` are not written to disk unless
@@ -7210,7 +7216,7 @@ def save_config(
     with _CONFIG_LOCK, _config_file_lock():
         if is_managed():
             managed_error("save configuration")
-            return
+            return False
         # Managed scope: strip any leaf the managed layer pins, so a bulk write
         # (wizard / programmatic save) never persists a user value that would
         # silently lose to managed on the next load. Single-key `config set`
@@ -7293,6 +7299,7 @@ def save_config(
         )
         _secure_file(config_path)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
+        return True
 
 
 def _parse_env_value(raw_value: str) -> str:

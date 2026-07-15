@@ -21,6 +21,7 @@ from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
 from session_bridge.characterize import CharacterizationGateError
 from session_bridge.cli import (
+    ConfigurationFailure,
     ProductionBackend,
     ProviderDegraded,
     RolloutGateBlocked,
@@ -499,6 +500,7 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
         value = json.loads(json.dumps(loaded))
         mutator(value)
         saved.append((value, kwargs.get("preserve_keys")))
+        return value
 
     monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
     backend = ProductionBackend(BridgeConfig())
@@ -516,6 +518,78 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
         },
         {("session_bridge", "sidebar", "continuous")},
     )]
+
+
+def test_sidebar_continuous_full_managed_rejects_without_runtime_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_cli.config import save_config
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    save_config(
+        {"session_bridge": {"sidebar": {"continuous": False}}},
+        strip_defaults=False,
+    )
+    original = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+    backend = ProductionBackend(BridgeConfig())
+
+    exit_code = main(
+        ["sidebar-continuous", "--enable"],
+        config_loader=lambda: backend.config,
+        backend_factory=lambda _config: backend,
+    )
+
+    rendered = capsys.readouterr().out
+    assert exit_code == 2
+    assert json.loads(rendered) == {"error": "configuration_error"}
+    assert "sensitive" not in rendered
+    assert backend.config.sidebar.continuous is False
+    assert (tmp_path / "config.yaml").read_text(encoding="utf-8") == original
+
+
+def test_sidebar_continuous_managed_leaf_reports_effective_value_without_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import managed_scope
+
+    home = tmp_path / "home"
+    managed = tmp_path / "managed"
+    home.mkdir()
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    (managed / "config.yaml").write_text(
+        "session_bridge:\n  sidebar:\n    continuous: false\n",
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    backend = ProductionBackend(BridgeConfig())
+
+    with pytest.raises(ConfigurationFailure, match="sidebar_continuous_not_persisted"):
+        backend.set_sidebar_continuous(enabled=True)
+
+    assert backend.config.sidebar.continuous is False
+
+
+def test_sidebar_continuous_mutation_exception_does_not_change_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ProductionBackend(BridgeConfig())
+    monkeypatch.setattr(
+        "hermes_cli.config.mutate_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("sensitive persistence failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="sensitive persistence failure"):
+        backend.set_sidebar_continuous(enabled=True)
+
+    assert backend.config.sidebar.continuous is False
 
 
 def test_mutate_config_serializes_competing_updates_without_lost_keys(
@@ -536,6 +610,7 @@ def test_mutate_config_serializes_competing_updates_without_lost_keys(
     def save_config(value, **_kwargs):
         durable.clear()
         durable.update(json.loads(json.dumps(value)))
+        return True
 
     monkeypatch.setattr(config_module, "save_config", save_config)
 
