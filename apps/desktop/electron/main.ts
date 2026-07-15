@@ -164,6 +164,7 @@ import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRoutePr
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { resolveRemoteConnectionWithRetry } from './remote-connection-retry'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
