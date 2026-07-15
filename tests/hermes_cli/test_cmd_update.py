@@ -266,7 +266,7 @@ class TestCmdUpdateBranchFallback:
         captured = capsys.readouterr()
         assert "Restart required to finish the managed Python runtime repair" in captured.out
         assert "long-lived processes still use the previous runtime" in captured.out
-        assert str(backup) in captured.out
+        assert "Restart each of them to pick up the repaired runtime" in captured.out
         assert "Update complete!" not in captured.out
 
 
