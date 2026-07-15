@@ -225,6 +225,7 @@ class ClaudeSourceAdapter:
         malformed_lines = 0
         unknown_records = 0
         messages: list[ProjectedMessage] = []
+        projected_by_identity: dict[tuple[str, int], ProjectedMessage] = {}
         for line in lines:
             if line.record is None:
                 malformed_lines += 1
@@ -236,7 +237,13 @@ class ClaudeSourceAdapter:
             if record_type in {"user", "assistant"} and _is_eligible_record(
                 line.record
             ):
-                messages.extend(_project_record(line))
+                for message in _project_record(line):
+                    identity = (message.native_event_id, message.ordinal)
+                    previous = projected_by_identity.get(identity)
+                    if previous == message:
+                        continue
+                    projected_by_identity[identity] = message
+                    messages.append(message)
 
         origin_kind, origin_bridge_id = _detect_origin(
             records,

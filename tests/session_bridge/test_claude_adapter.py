@@ -395,6 +395,43 @@ def test_normalizes_user_assistant_text_and_tool_call_result(tmp_path):
     assert messages[2].tool_call_id == "tool-1"
 
 
+def test_exact_duplicate_tool_result_record_is_projected_once(tmp_path):
+    event_id = "5bc142fe-c731-42b1-b34d-4fd7d0b57a75"
+    record = {
+        "type": "user",
+        "sessionId": BASIC_SESSION_ID,
+        "uuid": event_id,
+        "timestamp": "2026-06-09T15:58:57.172Z",
+        "isSidechain": False,
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tool-synthetic",
+                    "content": "Synthetic tool output",
+                    "is_error": False,
+                }
+            ],
+        },
+    }
+    replayed = {**record, "slug": "synthetic-compaction-replay"}
+    path = tmp_path / f"{BASIC_SESSION_ID}.jsonl"
+    path.write_bytes(_json_line(record) + _json_line(replayed))
+
+    parsed = ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path)
+
+    assert [
+        (message.native_event_id, message.ordinal, message.content)
+        for message in parsed.projection.messages
+    ] == [(event_id, 0, "Synthetic tool output")]
+    database = SessionDB(tmp_path / "state.db")
+    try:
+        SessionBridgeStore(database).upsert_projection(parsed.projection)
+    finally:
+        database.close()
+
+
 def test_mixed_media_tool_result_redacts_binary_payloads_through_store(tmp_path):
     secret_payload = "SYNTHETIC_BASE64_SECRET_" + "A" * 200
     record = {
