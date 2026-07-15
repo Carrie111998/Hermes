@@ -45,6 +45,10 @@ import {
   pollUpdateForAggregation,
 } from './bridge_helpers.js';
 
+// Terminal contract with the Python adapter: unlike generic startup failures,
+// a logged-out session cannot recover by retrying and requires QR pairing.
+const WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE = 64;
+
 // Parse CLI args
 const args = process.argv.slice(2);
 function getArg(name, defaultVal) {
@@ -431,7 +435,7 @@ async function startSocket() {
         if (!PAIR_JSON) {
           console.log('❌ Logged out. Delete session and restart to re-authenticate.');
         }
-        process.exit(1);
+        process.exit(WHATSAPP_SESSION_LOGGED_OUT_EXIT_CODE);
       } else {
         // 515 = restart requested (common after pairing). Always reconnect.
         emitPairEvent({ event: 'disconnected', reason });
