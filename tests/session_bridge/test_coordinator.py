@@ -3911,6 +3911,65 @@ async def test_continue_hydrates_native_hermes_source_without_external_adapter(
     assert ("get_external", source_id) not in operations
 
 
+@pytest.mark.asyncio
+async def test_periodic_reconcile_refreshes_native_hermes_source_without_adapter(
+) -> None:
+    operations: list[tuple[object, ...]] = []
+    source_id = "hermes-native-reconcile"
+    bridge_id = "bridge-native-reconcile"
+    target_id = "codex:target-existing"
+    store = _ContinuationStore(operations)
+    store.add_native_snapshot(
+        source_id,
+        cursor="hermes:1:10:abcdef",
+        source_hash="h" * 64,
+    )
+    store.add_external(
+        target_id,
+        provider=Provider.CODEX,
+        native_id="target-existing",
+        cursor="codex-target-cursor-fresh",
+        source_hash="codex-target-hash-fresh",
+        origin_bridge_id=bridge_id,
+    )
+    store.list_continuation_snapshots = lambda **_kwargs: [
+        {
+            "bridge_id": bridge_id,
+            "version": 1,
+            "pack_id": "pack-native-reconcile",
+            "source_session_id": source_id,
+            "source_cursor": "hermes:1:10:abcdef",
+            "source_hash": "h" * 64,
+            "target_session_id": target_id,
+            "target_cursor": "codex-target-cursor-fresh",
+            "target_hash": "codex-target-hash-fresh",
+        }
+    ]
+    target_projection = replace(
+        _refresh_projection(Provider.CODEX),
+        native_id="target-existing",
+        native_cursor="codex-target-cursor-fresh",
+        native_hash="codex-target-hash-fresh",
+        origin_bridge_id=bridge_id,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={
+            Provider.CODEX: _RefreshAdapter(target_projection, operations),
+        },
+        context_builder=_RecordingContextBuilder(store, operations),
+        clock=lambda: 100.0,
+    )
+
+    result = await coordinator._reconcile_continuations()
+
+    assert result.examined == 1
+    assert result.failed == 0
+    assert ("get_native", source_id) in operations
+    assert ("get_external", source_id) not in operations
+
+
 def test_worktree_snapshot_is_transactional_immutable_and_restart_safe(
     sidebar_db: SessionDB,
     tmp_path: Path,

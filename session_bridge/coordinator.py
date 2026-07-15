@@ -1240,9 +1240,8 @@ class SessionBridgeCoordinator:
             examined += 1
             try:
                 snapshot = _validated_periodic_continuation_snapshot(raw_snapshot)
-                source = await self.refresh_session(
-                    snapshot["source_session_id"],
-                    timeout=self._refresh_timeout,
+                source = await self._refresh_continuation_source(
+                    snapshot["source_session_id"]
                 )
                 target = await self.refresh_session(
                     snapshot["target_session_id"],
