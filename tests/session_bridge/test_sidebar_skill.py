@@ -99,6 +99,22 @@ def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     assert 'prompt="Review launch"' not in skill
 
 
+def test_sidebar_skill_unconditionally_renames_every_task_before_commit() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    rename_step = skill.split("\n7. ", 1)[1].split("\n8. ", 1)[0]
+
+    assert rename_step.startswith(
+        "Rename every reconciled task and every newly created task to the returned "
+        "`[Claude]` or `[Hermes]` title before commit."
+    )
+    assert "whenever" not in rename_step
+    assert "flag" not in rename_step.casefold()
+    assert (
+        "On rename failure, call `session_sidebar_fail` with `rename_failed`; "
+        "do not commit and do not create a replacement task."
+    ) in rename_step
+
+
 def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
     import re
 

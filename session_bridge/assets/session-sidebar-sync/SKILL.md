@@ -34,7 +34,7 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
    - no match: continue to creation only when no recovered thread was returned;
    - conflicting or multiple matches: call `session_sidebar_fail` with `marker_conflict`.
 6. If no task was reconciled, create exactly one native local task in the chosen project using the job's `registration_prompt` verbatim. Do not replace it with the title, transcript text, or a summary.
-7. Rename the reconciled or newly created task to the returned `[Claude]` or `[Hermes]` title whenever the returned flags require it. A rename failure maps to `rename_failed`; do not create a replacement task.
+7. Rename every reconciled task and every newly created task to the returned `[Claude]` or `[Hermes]` title before commit. On rename failure, call `session_sidebar_fail` with `rename_failed`; do not commit and do not create a replacement task.
 8. Call `session_sidebar_commit(lease_token=<exact token>, codex_thread_id=<native thread ID>)`. A job is complete only after commit succeeds.
 9. Before exit, call `session_sidebar_fail(lease_token=<exact token>, error_code=<fixed code>)` once for every unfinished lease that can still be settled. The argument is named `error_code`, never `code`, `error`, or exception text.
 
