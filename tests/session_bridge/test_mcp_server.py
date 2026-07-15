@@ -16,6 +16,7 @@ from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
 from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.coordinator import (
+    ContinuationBlockedError,
     ContinueResult,
     SessionBridgeCoordinator,
     SidebarDeliveryClaim,
@@ -291,10 +292,18 @@ def _seed_claimed_sidebar_pair(
 
 
 class _FakeCoordinator:
-    def __init__(self, *, bridge_id: str, source_id: str, target_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        bridge_id: str,
+        source_id: str,
+        target_id: str,
+        exact_cwd: str | None = None,
+    ) -> None:
         self.bridge_id = bridge_id
         self.source_id = source_id
         self.target_id = target_id
+        self.exact_cwd = exact_cwd
         self.started = 0
         self.stopped = 0
         self.continue_requests: list[Any] = []
@@ -336,6 +345,7 @@ class _FakeCoordinator:
             pack=pack,
             link=link,
             warnings=("source_refresh_timeout_using_catalog_snapshot",),
+            exact_cwd=self.exact_cwd,
         )
 
     async def claim_sidebar_jobs_for_delivery(
@@ -1528,10 +1538,15 @@ def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
 
 def test_session_continue_is_idempotent_for_identical_snapshot_and_budget(
     db: SessionDB,
+    tmp_path: Path,
 ) -> None:
     store, bridge_id, source_id, target_id = _seed_linked_pair(db)
+    exact_cwd = os.path.abspath(str(tmp_path / "exact-source"))
     coordinator = _FakeCoordinator(
-        bridge_id=bridge_id, source_id=source_id, target_id=target_id
+        bridge_id=bridge_id,
+        source_id=source_id,
+        target_id=target_id,
+        exact_cwd=exact_cwd,
     )
 
     with _test_client(_create_test_app(db, store, coordinator)) as client:
@@ -1549,7 +1564,95 @@ def test_session_continue_is_idempotent_for_identical_snapshot_and_budget(
     assert first == second
     assert first["pack_id"] == "pack-stable"
     assert first["payload"] == "immutable context payload"
+    assert first["exact_cwd"] == exact_cwd
+    assert set(first) == {
+        "session_id",
+        "target_session_id",
+        "target_provider",
+        "bridge_id",
+        "pack_id",
+        "payload",
+        "budget_chars",
+        "immutable_at",
+        "relation",
+        "warnings",
+        "exact_cwd",
+    }
     assert all(request.bridge_id == bridge_id for request in coordinator.continue_requests)
+
+
+@pytest.mark.parametrize("exact_cwd", [object(), "relative/source", "C:/source/../other"])
+def test_session_continue_rejects_noncanonical_fake_exact_cwd(
+    db: SessionDB,
+    exact_cwd: object,
+) -> None:
+    store, bridge_id, source_id, target_id = _seed_linked_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=bridge_id,
+        source_id=source_id,
+        target_id=target_id,
+    )
+    coordinator.exact_cwd = exact_cwd  # type: ignore[assignment]
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_continue",
+                "arguments": {"bridge_id": bridge_id},
+            },
+            request_id=19,
+        )
+
+    assert payload["result"]["isError"] is True
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "relative/source" not in serialized
+    assert "C:/source/../other" not in serialized
+
+
+class _BlockedContinuationCoordinator(_FakeCoordinator):
+    async def continue_session(self, request: Any) -> ContinueResult:
+        self.continue_requests.append(request)
+        try:
+            raise RuntimeError(self.raw_cwd)
+        except RuntimeError as raw_error:
+            raise ContinuationBlockedError(
+                "source_identity_mismatch",
+                "source_identity_mismatch: exact source worktree snapshot is unavailable",
+            ) from raw_error
+
+
+def test_session_continue_legacy_block_does_not_leak_alternate_cwd(
+    db: SessionDB,
+) -> None:
+    store, bridge_id, source_id, target_id = _seed_linked_pair(db)
+    alternate_cwd = "C:/private/alternate-worktree"
+    raw_cwd = "C:/private/raw-source-worktree"
+    coordinator = _BlockedContinuationCoordinator(
+        bridge_id=bridge_id,
+        source_id=source_id,
+        target_id=target_id,
+        exact_cwd=alternate_cwd,
+    )
+    coordinator.raw_cwd = raw_cwd
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_continue",
+                "arguments": {"bridge_id": bridge_id},
+            },
+            request_id=20,
+        )
+
+    assert payload["result"]["isError"] is True
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "source_identity_mismatch" in serialized
+    assert alternate_cwd not in serialized
+    assert raw_cwd not in serialized
 
 
 def test_session_mirror_dry_run_is_side_effect_free_and_manual_enqueue_is_durable(

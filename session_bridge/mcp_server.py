@@ -294,6 +294,14 @@ def create_app(
         )
         if not isinstance(result, ContinueResult):
             raise RuntimeError("session continuation returned an invalid result")
+        exact_cwd = result.exact_cwd
+        if exact_cwd is not None and (
+            type(exact_cwd) is not str
+            or not exact_cwd
+            or exact_cwd != os.path.abspath(os.path.normpath(exact_cwd))
+            or any(character in exact_cwd for character in "\x00\r\n")
+        ):
+            raise RuntimeError("session continuation returned an invalid exact cwd")
         return {
             "session_id": result.pack.source_session_id,
             "target_session_id": result.pack.target_session_id,
@@ -305,6 +313,7 @@ def create_app(
             "immutable_at": result.pack.immutable_at,
             "relation": result.link.relation.value,
             "warnings": list(result.warnings),
+            "exact_cwd": exact_cwd,
         }
 
     @mcp.tool()
