@@ -160,6 +160,46 @@ class TestHandleResumeCommand:
         db.close()
 
     @pytest.mark.asyncio
+    async def test_matrix_resume_index_excludes_current_session(self, tmp_path):
+        """Matrix numbering must use the same current-session filter."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(
+            text="/resume",
+            platform=Platform.MATRIX,
+            user_id="@alice:hs",
+            chat_id="!room:hs",
+        )
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "matrix_old", "matrix", session_key=lane_key,
+            user_id="@alice:hs", chat_id="!room:hs",
+        )
+        db.set_session_title("matrix_old", "Earlier")
+        db.create_session(
+            "matrix_current",
+            "matrix",
+            session_key=lane_key,
+            user_id="@alice:hs",
+            chat_id="!room:hs",
+        )
+        db.set_session_title("matrix_current", "Current")
+
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="matrix_current",
+            event=event,
+        )
+        runner._gateway_session_origin_for_id = lambda _session_id: event.source
+
+        listing = await runner._handle_resume_command(event)
+
+        assert "Current" not in listing
+        assert "Earlier" in listing
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_resume_clears_session_model_overrides(self, tmp_path):
         """Resume must not carry a previous session's /model override into the
         restored conversation, while leaving other chats' overrides intact (#10702)."""
