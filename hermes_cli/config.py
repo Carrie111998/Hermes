@@ -6835,7 +6835,7 @@ def write_platform_config_field(
         platform_config[field_key] = value
 
     if raw:
-        mutate_raw_config(update)
+        mutate_raw_config_with_save_policy(update)
     else:
         mutate_config(update)
 
@@ -7138,6 +7138,35 @@ def mutate_raw_config(
             raise TypeError("config mutator must update in place and return None")
         if config != original:
             atomic_config_write(config_path, config, sort_keys=sort_keys)
+        return copy.deepcopy(config)
+
+
+def mutate_raw_config_with_save_policy(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+) -> Dict[str, Any]:
+    """Mutate raw user YAML while retaining ``save_config`` authorization.
+
+    Some callers intentionally read only user-authored values, but historically
+    persisted through :func:`save_config`. This keeps that raw read shape while
+    preserving the full managed-install write lock and managed-leaf stripping.
+    """
+
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    config_path = get_config_path()
+    with _CONFIG_LOCK, _config_file_lock(config_path):
+        config = read_raw_config()
+        result = mutator(config)
+        if result is not None:
+            raise TypeError("config mutator must update in place and return None")
+        save_config(
+            config,
+            strip_defaults=strip_defaults,
+            preserve_keys=preserve_keys,
+        )
         return copy.deepcopy(config)
 
 

@@ -99,6 +99,22 @@ def _hold_config_file_lock_process(config_path, entered, release):
             raise RuntimeError("test release timed out")
 
 
+def _managed_policy_writer_process(home, action, ready, done):
+    os.environ["HERMES_HOME"] = str(home)
+    ready.set()
+    if action == "model":
+        from hermes_cli.auth import _save_model_choice
+
+        _save_model_choice("new-model")
+    elif action == "platform":
+        from hermes_cli.config import write_platform_config_field
+
+        write_platform_config_field("email", "mode", "pair", raw=True)
+    else:  # pragma: no cover - test helper contract
+        raise ValueError(action)
+    done.set()
+
+
 class TestGetHermesHome:
     def test_default_path(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -939,6 +955,52 @@ class TestConfigInterprocessLocking:
             ):
                 with _config_file_lock(tmp_path / "second.yaml"):
                     pass
+
+    @pytest.mark.parametrize("action", ("model", "platform"))
+    def test_managed_policy_writers_keep_cross_process_serialization(
+        self, tmp_path, action
+    ):
+        context = multiprocessing.get_context("spawn")
+        holder_entered = context.Event()
+        release_holder = context.Event()
+        writer_ready = context.Event()
+        writer_done = context.Event()
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config(
+                {"model": {"default": "old-model"}, "race_test": {"initial": True}},
+                strip_defaults=False,
+            )
+            holder = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "mutate", holder_entered, release_holder),
+            )
+            writer = context.Process(
+                target=_managed_policy_writer_process,
+                args=(tmp_path, action, writer_ready, writer_done),
+            )
+            holder.start()
+            assert holder_entered.wait(timeout=10)
+            writer.start()
+            try:
+                assert writer_ready.wait(timeout=10)
+                assert not writer_done.wait(timeout=0.5)
+            finally:
+                release_holder.set()
+                holder.join(timeout=15)
+                writer.join(timeout=15)
+                if holder.is_alive():
+                    holder.terminate()
+                if writer.is_alive():
+                    writer.terminate()
+
+            assert holder.exitcode == 0
+            assert writer.exitcode == 0
+            raw = read_raw_config()
+            assert raw["race_test"] == {"initial": True, "mutate": True}
+            if action == "model":
+                assert raw["model"]["default"] == "new-model"
+            else:
+                assert raw["platforms"]["email"]["mode"] == "pair"
 
 
 class TestSanitizeEnvLines:

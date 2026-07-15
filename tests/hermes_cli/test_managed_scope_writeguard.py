@@ -108,3 +108,78 @@ def test_save_config_strips_managed_leaves(homes, capsys):
     assert raw.get("model", {}).get("default") != "user/override"  # stripped
     assert raw.get("model", {}).get("fallback") == "user/fb"  # kept
     assert "managed" in capsys.readouterr().err.lower()
+
+
+def test_save_model_choice_respects_full_managed_write_lock(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    original = "model:\n  default: original-model\n"
+    config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+
+    from hermes_cli.auth import _save_model_choice
+
+    _save_model_choice("forbidden-model")
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert "managed" in capsys.readouterr().err.lower()
+
+
+def test_platform_raw_write_respects_full_managed_write_lock(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    original = "platforms:\n  email:\n    mode: original\n"
+    config_path.write_text(original, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+
+    from hermes_cli.config import write_platform_config_field
+
+    write_platform_config_field("email", "mode", "forbidden", raw=True)
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert "managed" in capsys.readouterr().err.lower()
+
+
+def test_save_model_choice_strips_managed_model_leaf(homes, capsys):
+    home, _managed = homes
+    (home / "config.yaml").write_text(
+        "model:\n  default: old-user-model\n  fallback: user/fallback\n",
+        encoding="utf-8",
+    )
+    from hermes_cli.auth import _save_model_choice
+    from hermes_cli.config import read_raw_config
+
+    _save_model_choice("forbidden-model")
+
+    raw = read_raw_config()
+    assert raw.get("model", {}).get("default") != "forbidden-model"
+    assert raw["model"]["fallback"] == "user/fallback"
+    assert "managed" in capsys.readouterr().err.lower()
+
+
+def test_platform_raw_write_strips_managed_platform_leaf(homes, capsys):
+    home, managed = homes
+    (managed / "config.yaml").write_text(
+        "platforms:\n  email:\n    mode: admin-only\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "platforms:\n  email:\n    mode: old-user\n    sibling: keep\n",
+        encoding="utf-8",
+    )
+    from hermes_cli import managed_scope
+    from hermes_cli.config import read_raw_config, write_platform_config_field
+
+    managed_scope.invalidate_managed_cache()
+    write_platform_config_field("email", "mode", "forbidden", raw=True)
+
+    raw = read_raw_config()
+    assert raw.get("platforms", {}).get("email", {}).get("mode") != "forbidden"
+    assert raw["platforms"]["email"]["sibling"] == "keep"
+    assert "managed" in capsys.readouterr().err.lower()

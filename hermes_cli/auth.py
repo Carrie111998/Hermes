@@ -47,6 +47,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
     mutate_raw_config,
+    mutate_raw_config_with_save_policy,
     read_raw_config,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
@@ -6892,7 +6893,7 @@ def _save_model_choice(model_id: str) -> None:
         else:
             config["model"] = {"default": model_id}
 
-    mutate_raw_config(update)
+    mutate_raw_config_with_save_policy(update)
 
 
 def login_command(args) -> None:
