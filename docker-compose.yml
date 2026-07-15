@@ -72,7 +72,7 @@ services:
         - >-
           test "$$(id -u hermes)" = "$${HERMES_UID}" &&
           test "$$(id -g hermes)" = "$${HERMES_GID}" &&
-          s6-setuidgid hermes sh -c
+          /package/admin/s6-2.15.0.0/command/s6-setuidgid hermes sh -c
           'test -r /opt/data/config.yaml && test -r /opt/data/webui/settings.json &&
           test -r /opt/data/skills && test -r /opt/data/plugins && test -r /opt/data/state.db'
       interval: 30s
