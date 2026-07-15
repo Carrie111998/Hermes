@@ -2030,10 +2030,14 @@ DEFAULT_CONFIG = {
     },
 
     # Skills — external skill directories for sharing skills across tools/agents.
-    # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
-    # always goes to ~/.hermes/skills/.
+    # Each path is expanded (~, ${VAR}) and resolved. Skill creation always goes
+    # to the active profile's HERMES_HOME/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Opt-in skill_manage ownership boundary. When enabled, skills from
+        # external_dirs remain discoverable and readable but mutations are
+        # restricted to resolved targets under the active profile's skills root.
+        "external_read_only": False,
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``
         # are sourced as the highest-precedence skill tier — but ONLY when the
