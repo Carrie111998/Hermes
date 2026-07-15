@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
+import time
 from typing import Any
 import uuid
 
 import pytest
+from mcp.shared.version import LATEST_PROTOCOL_VERSION
+from starlette.testclient import TestClient
 
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
@@ -22,12 +28,13 @@ from session_bridge.claude_adapter import (
     PlaceholderResult,
 )
 from session_bridge.codex_adapter import CodexSourceAdapter, CodexTargetAdapter
-from session_bridge.config import BridgeConfig
+from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.context_pack import ContextPackBuilder
 from session_bridge.coordinator import (
     ContinueRequest,
     SessionBridgeCoordinator,
 )
+from session_bridge.mcp_server import create_app
 from session_bridge.mirror import MirrorPolicy, enqueue_mirror_job
 from session_bridge.models import (
     BridgeMarkerPayload,
@@ -36,12 +43,16 @@ from session_bridge.models import (
     Provider,
     Relation,
     SessionProjection,
+    SidebarJobState,
     canonical_session_id,
+    decode_bridge_marker,
 )
+from session_bridge.sidebar import VerifiedSidebarThread
 from session_bridge.store import SessionBridgeStore
 
 
 _MARKER_SECRET = b"synthetic-end-to-end-marker-secret"
+_SIDEBAR_TOKEN = "synthetic-sidebar-mcp-token-at-least-32-bytes"
 
 
 class _SyntheticCodexClient:
@@ -1010,3 +1021,601 @@ async def test_restart_mid_job_recovers_exact_claude_target_once(
         assert links[0]["relation"] == Relation.MIRRORS.value
     finally:
         restarted_db.close()
+
+
+class _SidebarMcpCoordinator:
+    """Expose the real coordinator's public sidebar methods without background loops."""
+
+    def __init__(self, delegate: SessionBridgeCoordinator) -> None:
+        self.delegate = delegate
+
+    async def start(self) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+    async def claim_sidebar_jobs_for_delivery(self, *, limit: int):
+        return await self.delegate.claim_sidebar_jobs_for_delivery(limit=limit)
+
+    async def commit_sidebar_job(
+        self,
+        *,
+        lease_token: str,
+        codex_thread_id: str,
+        ensure_lineage: bool = False,
+    ):
+        return await self.delegate.commit_sidebar_job(
+            lease_token=lease_token,
+            codex_thread_id=codex_thread_id,
+            ensure_lineage=ensure_lineage,
+        )
+
+    def health(self) -> dict[str, Any]:
+        return self.delegate.health()
+
+
+class _FakeNativeCodexTasks:
+    """Native Codex project/task surface used by the Task 11 broker tests."""
+
+    def __init__(self, marker_secret: bytes, *, on_create=None) -> None:
+        self.marker_secret = marker_secret
+        self.on_create = on_create
+        self.projects: list[dict[str, str]] = []
+        self.threads: dict[str, dict[str, Any]] = {}
+        self.create_calls: list[dict[str, Any]] = []
+        self.rename_calls: list[tuple[str, str]] = []
+        self.reconciliation_calls: list[BridgeMarkerPayload] = []
+        self.app_server_create_calls: list[dict[str, Any]] = []
+        self.available = True
+        self.rename_failures_remaining = 0
+
+    def add_project(self, project_id: str, path: Path) -> None:
+        self.projects.append(
+            {"projectId": project_id, "path": _canonical_sidebar_path(path)}
+        )
+
+    def create_thread(
+        self,
+        *,
+        prompt: str,
+        project_id: str,
+        source_cwd: str,
+    ) -> str:
+        if not self.available:
+            raise RuntimeError("synthetic Desktop offline")
+        thread_id = f"native-sidebar-{len(self.threads) + 1}"
+        marker = _registration_marker(prompt)
+        payload = decode_bridge_marker(marker, self.marker_secret)
+        call = {
+            "thread_id": thread_id,
+            "prompt": prompt,
+            "project_id": project_id,
+            "source_cwd": source_cwd,
+        }
+        self.create_calls.append(call)
+        self.threads[thread_id] = {
+            **call,
+            "title": None,
+            "marker": marker,
+            "payload": payload,
+        }
+        if self.on_create is not None:
+            self.on_create(self.threads[thread_id])
+        return thread_id
+
+    def set_thread_title(self, thread_id: str, title: str) -> None:
+        self.rename_calls.append((thread_id, title))
+        if self.rename_failures_remaining:
+            self.rename_failures_remaining -= 1
+            raise RuntimeError("synthetic rename failure")
+        self.threads[thread_id]["title"] = title
+
+    def find_by_marker(
+        self, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread | None:
+        self.reconciliation_calls.append(expected)
+        matches = [
+            thread
+            for thread in self.threads.values()
+            if thread["payload"] == expected
+        ]
+        if not matches:
+            return None
+        assert len(matches) == 1, "fake native inventory must never hide duplicates"
+        return _verified_native_thread(matches[0])
+
+    def verify_thread(
+        self, *, thread_id: str, expected: BridgeMarkerPayload
+    ) -> VerifiedSidebarThread:
+        thread = self.threads[thread_id]
+        assert thread["payload"] == expected
+        return _verified_native_thread(thread)
+
+
+class _SidebarEndToEndHarness:
+    """Drive registration and delivery through the public MCP tools."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.now = time.time()
+        self.db = SessionDB(tmp_path / "sidebar-e2e-state.db")
+        self.store = SessionBridgeStore(
+            self.db,
+            clock=lambda: self.now,
+            sidebar_jitter=lambda _bound: 0.0,
+        )
+        self.config = replace(
+            BridgeConfig(),
+            sidebar=replace(SidebarConfig(), enabled=True, continuous=False),
+        )
+        self.native = _FakeNativeCodexTasks(
+            _MARKER_SECRET,
+            on_create=self._index_native_thread,
+        )
+        self.coordinator = SessionBridgeCoordinator(
+            config=self.config,
+            store=self.store,
+            adapters={},
+            target_adapters={},
+            sidebar_verifier=self.native,
+            clock=lambda: self.now,
+        )
+        self.catalog = UnifiedCatalog(self.db, self.store)
+        self.inbox = tmp_path / ".hermes"
+        self.inbox.mkdir()
+        self.native.add_project("session-inbox", self.inbox)
+        self.app = create_app(
+            catalog=self.catalog,
+            coordinator=_SidebarMcpCoordinator(self.coordinator),
+            store=self.store,
+            config=self.config,
+            token=_SIDEBAR_TOKEN,
+            marker_key=_MARKER_SECRET,
+        )
+
+    def close(self) -> None:
+        self.db.close()
+
+    def add_project(self, project_id: str, path: Path) -> None:
+        self.native.add_project(project_id, path)
+
+    def seed_source(
+        self,
+        provider: Provider,
+        native_id: str,
+        *,
+        cwd: Path,
+        content: str | None = "Build the native sidebar broker",
+        git_root: Path | None = None,
+    ) -> str:
+        cwd.mkdir(parents=True, exist_ok=True)
+        if provider is Provider.CLAUDE:
+            messages = (
+                ()
+                if content is None
+                else (
+                    ProjectedMessage(
+                        native_event_id=f"event-{native_id}",
+                        ordinal=0,
+                        role="user",
+                        content=content,
+                        timestamp=self.now,
+                    ),
+                )
+            )
+            projection = SessionProjection(
+                provider=Provider.CLAUDE,
+                native_id=native_id,
+                title=f"Claude {native_id}",
+                cwd=str(cwd),
+                started_at=self.now - 10,
+                last_active=self.now,
+                messages=messages,
+                native_path=str(cwd / f"{native_id}.jsonl"),
+                native_cursor=f"cursor-{native_id}",
+                native_hash=f"hash-{native_id}",
+                origin_kind=OriginKind.NATIVE,
+            )
+            source_id = self.store.upsert_projection(projection).session_id
+        elif provider is Provider.HERMES:
+            source_id = native_id
+            self.db.create_session(
+                source_id,
+                "cli",
+                cwd=str(cwd),
+            )
+            self.db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET title = ?, started_at = ? WHERE id = ?",
+                    (f"Hermes {native_id}", self.now - 10, source_id),
+                )
+            )
+            if content is not None:
+                self.db.append_message(
+                    source_id,
+                    "user",
+                    content,
+                    timestamp=self.now,
+                )
+        else:  # pragma: no cover - misuse guard for the shared harness
+            raise ValueError("sidebar source must be Claude or Hermes")
+        if git_root is not None:
+            self.db._execute_write(
+                lambda conn: conn.execute(
+                    "UPDATE sessions SET git_repo_root = ? WHERE id = ?",
+                    (str(git_root), source_id),
+                )
+            )
+        return source_id
+
+    def _index_native_thread(self, thread: dict[str, Any]) -> None:
+        payload = thread["payload"]
+        self.store.upsert_projection(
+            SessionProjection(
+                provider=Provider.CODEX,
+                native_id=thread["thread_id"],
+                title="Native sidebar placeholder",
+                cwd=thread["source_cwd"],
+                started_at=self.now,
+                last_active=self.now,
+                messages=(
+                    ProjectedMessage(
+                        native_event_id=f"registration-{thread['thread_id']}",
+                        ordinal=0,
+                        role="user",
+                        content=thread["prompt"],
+                        timestamp=self.now,
+                    ),
+                ),
+                native_path=f"native://{thread['thread_id']}",
+                native_cursor=f"cursor-{thread['thread_id']}",
+                native_hash=f"hash-{thread['thread_id']}",
+                origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+                origin_bridge_id=payload.bridge_id,
+            )
+        )
+
+    def register(self, *, limit: int = 100):
+        return asyncio.run(
+            self.coordinator.register_sidebar_jobs_once(
+                now=self.now,
+                limit=limit,
+            )
+        )
+
+    @contextmanager
+    def client(self):
+        with TestClient(
+            self.app,
+            base_url="http://127.0.0.1:7484",
+            follow_redirects=False,
+        ) as client:
+            yield client
+
+    def advance_retry(self) -> None:
+        self.now += 120.0
+
+    def run_worker_once(
+        self,
+        client: TestClient,
+        *,
+        drop_commit: bool = False,
+    ) -> list[dict[str, Any]]:
+        jobs = _sidebar_call_tool(
+            client,
+            "session_sidebar_pending",
+            {"limit": 5},
+        )["jobs"]
+        outcomes: list[dict[str, Any]] = []
+        projects = {
+            project["path"]: project["projectId"]
+            for project in self.native.projects
+        }
+        for job in jobs:
+            project_id = projects.get(_canonical_sidebar_path(job["cwd"]))
+            if project_id is None and job["git_root"] is not None:
+                project_id = projects.get(
+                    _canonical_sidebar_path(job["git_root"])
+                )
+            if project_id is None:
+                project_id = projects[_canonical_sidebar_path(self.inbox)]
+
+            thread_id = job["recovered_thread_id"]
+            if thread_id is None:
+                try:
+                    thread_id = self.native.create_thread(
+                        prompt=job["registration_prompt"],
+                        project_id=project_id,
+                        source_cwd=job["cwd"],
+                    )
+                except RuntimeError:
+                    outcomes.append(
+                        _sidebar_call_tool(
+                            client,
+                            "session_sidebar_fail",
+                            {
+                                "lease_token": job["lease_token"],
+                                "error_code": "desktop_offline",
+                            },
+                        )
+                    )
+                    continue
+
+            try:
+                self.native.set_thread_title(thread_id, job["title"])
+            except RuntimeError:
+                outcomes.append(
+                    _sidebar_call_tool(
+                        client,
+                        "session_sidebar_fail",
+                        {
+                            "lease_token": job["lease_token"],
+                            "error_code": "rename_failed",
+                        },
+                    )
+                )
+                continue
+
+            if drop_commit:
+                outcomes.append(
+                    _sidebar_call_tool(
+                        client,
+                        "session_sidebar_fail",
+                        {
+                            "lease_token": job["lease_token"],
+                            "error_code": "bridge_temporarily_unavailable",
+                        },
+                    )
+                )
+                continue
+            outcomes.append(
+                _sidebar_call_tool(
+                    client,
+                    "session_sidebar_commit",
+                    {
+                        "lease_token": job["lease_token"],
+                        "codex_thread_id": thread_id,
+                    },
+                )
+            )
+        return outcomes
+
+
+def _canonical_sidebar_path(value: str | Path) -> str:
+    return os.path.normcase(os.path.realpath(os.fspath(value)))
+
+
+def _registration_marker(prompt: str) -> str:
+    return next(
+        line.removeprefix("Signed marker: ")
+        for line in prompt.splitlines()
+        if line.startswith("Signed marker: ")
+    )
+
+
+def _verified_native_thread(thread: dict[str, Any]) -> VerifiedSidebarThread:
+    payload = thread["payload"]
+    return VerifiedSidebarThread(
+        thread_id=thread["thread_id"],
+        source_session_id=payload.source_session_id,
+        bridge_id=payload.bridge_id,
+    )
+
+
+def _sidebar_rpc(
+    client: TestClient,
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    request_id: int = 1,
+):
+    if method != "initialize" and "Mcp-Session-Id" not in client.headers:
+        _sidebar_rpc(
+            client,
+            "initialize",
+            {
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "sidebar-e2e", "version": "1"},
+            },
+            request_id=0,
+        )
+        initialized = client.post(
+            "/mcp",
+            headers={
+                "Authorization": f"Bearer {_SIDEBAR_TOKEN}",
+                "Accept": "application/json, text/event-stream",
+                "Content-Type": "application/json",
+                "Mcp-Session-Id": client.headers["Mcp-Session-Id"],
+            },
+            json={
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            },
+        )
+        assert initialized.status_code == 202, initialized.text
+    response = client.post(
+        "/mcp",
+        headers={
+            "Authorization": f"Bearer {_SIDEBAR_TOKEN}",
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+        },
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params or {},
+        },
+    )
+    assert response.status_code == 200, response.text
+    session_id = response.headers.get("Mcp-Session-Id")
+    if session_id:
+        client.headers["Mcp-Session-Id"] = session_id
+    if "text/event-stream" in response.headers.get("content-type", ""):
+        lines = [
+            line.removeprefix("data: ")
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert lines, response.text
+        return json.loads(lines[-1])
+    return response.json()
+
+
+def _sidebar_call_tool(
+    client: TestClient,
+    name: str,
+    arguments: dict[str, Any],
+):
+    payload = _sidebar_rpc(
+        client,
+        "tools/call",
+        {"name": name, "arguments": arguments},
+        request_id=9,
+    )
+    assert "error" not in payload, payload
+    result = payload["result"]
+    if result.get("isError"):
+        pytest.fail(result["content"][0]["text"])
+    structured = result.get("structuredContent")
+    return (
+        structured
+        if structured is not None
+        else json.loads(result["content"][0]["text"])
+    )
+
+
+@pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.HERMES])
+def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
+    tmp_path: Path,
+    provider: Provider,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / f"{provider.value}-source"
+        harness.add_project(f"{provider.value}-project", source_cwd)
+        source_id = harness.seed_source(
+            provider,
+            f"meaningful-{provider.value}",
+            cwd=source_cwd,
+        )
+        summary = harness.register()
+
+        with harness.client() as client:
+            outcomes = harness.run_worker_once(client)
+
+        assert summary.by_provider[provider.value] == 1
+        assert outcomes == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        catalog_row = harness.store.get_bridge_summaries([source_id])[source_id]
+        assert catalog_row["bridge_sidebar_state"] == "visible"
+        assert catalog_row["bridge_sidebar_codex_thread_id"] == "native-sidebar-1"
+        assert harness.native.threads["native-sidebar-1"]["title"].startswith(
+            "[Claude] " if provider is Provider.CLAUDE else "[Hermes] "
+        )
+    finally:
+        harness.close()
+
+
+def test_sidebar_exact_cwd_saved_project_selection(tmp_path: Path) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "exact-cwd"
+        harness.add_project("exact-cwd-project", source_cwd)
+        harness.seed_source(Provider.CLAUDE, "exact-cwd", cwd=source_cwd)
+        harness.register()
+
+        with harness.client() as client:
+            harness.run_worker_once(client)
+
+        assert harness.native.create_calls[0]["project_id"] == "exact-cwd-project"
+    finally:
+        harness.close()
+
+
+def test_sidebar_exact_git_root_saved_project_selection(tmp_path: Path) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        repo = tmp_path / "saved-git-root"
+        source_cwd = repo / "nested" / "worktree"
+        source_cwd.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "-q", str(repo)],
+            check=True,
+            capture_output=True,
+        )
+        harness.add_project("git-root-project", repo)
+        harness.seed_source(
+            Provider.HERMES,
+            "git-root-source",
+            cwd=source_cwd,
+            git_root=repo,
+        )
+        harness.register()
+
+        with harness.client() as client:
+            harness.run_worker_once(client)
+
+        assert harness.native.create_calls[0]["project_id"] == "git-root-project"
+    finally:
+        harness.close()
+
+
+def test_sidebar_inbox_fallback_preserves_exact_source_cwd(tmp_path: Path) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "unsaved" / "source-worktree"
+        harness.seed_source(Provider.CLAUDE, "inbox-source", cwd=source_cwd)
+        harness.register()
+
+        with harness.client() as client:
+            harness.run_worker_once(client)
+
+        created = harness.native.create_calls[0]
+        assert created["project_id"] == "session-inbox"
+        assert _canonical_sidebar_path(created["source_cwd"]) == (
+            _canonical_sidebar_path(source_cwd)
+        )
+        assert f"Source cwd: {json.dumps(created['source_cwd'])}" in created["prompt"]
+    finally:
+        harness.close()
+
+
+def test_sidebar_commit_drop_reconciles_exact_marker_without_duplicate(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "commit-drop"
+        harness.add_project("commit-drop-project", source_cwd)
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "commit-drop",
+            cwd=source_cwd,
+        )
+        harness.register()
+
+        with harness.client() as client:
+            first = harness.run_worker_once(client, drop_commit=True)
+            harness.advance_retry()
+            second = harness.run_worker_once(client)
+
+        assert first == [
+            {
+                "state": "sidebar_retry",
+                "error_code": "bridge_temporarily_unavailable",
+            }
+        ]
+        assert second == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        assert len(harness.native.create_calls) == 1
+        assert harness.native.reconciliation_calls[-1].source_session_id == source_id
+        assert harness.store.get_sidebar_job_for_source(source_id)["state"] == (
+            SidebarJobState.VISIBLE.value
+        )
+    finally:
+        harness.close()

@@ -34,6 +34,12 @@ from session_bridge.models import (
     SessionProjection,
     UpsertResult,
 )
+from tests.session_bridge.test_end_to_end import (
+    _SidebarEndToEndHarness,
+    _canonical_sidebar_path,
+    _sidebar_call_tool,
+    _sidebar_rpc,
+)
 
 
 def _job(provider: Provider, *, state: MirrorJobState = MirrorJobState.RUNNING):
@@ -737,3 +743,91 @@ async def test_target_failure_uses_fixed_sanitized_health_code() -> None:
     assert provider_secret not in repr(health)
     assert target_secret not in repr(health)
     assert target_secret not in repr(store.retries)
+
+
+def test_sidebar_expired_lease_stale_worker_cannot_commit(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "expired-before-create"
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "expired-before-create",
+            cwd=source_cwd,
+        )
+        harness.register()
+
+        with harness.client() as client:
+            job = _sidebar_call_tool(
+                client,
+                "session_sidebar_pending",
+                {"limit": 1},
+            )["jobs"][0]
+            harness.now += 301.0
+            thread_id = harness.native.create_thread(
+                prompt=job["registration_prompt"],
+                project_id="session-inbox",
+                source_cwd=_canonical_sidebar_path(source_cwd),
+            )
+            response = _sidebar_rpc(
+                client,
+                "tools/call",
+                {
+                    "name": "session_sidebar_commit",
+                    "arguments": {
+                        "lease_token": job["lease_token"],
+                        "codex_thread_id": thread_id,
+                    },
+                },
+                request_id=77,
+            )
+
+        durable = harness.store.get_sidebar_job_for_source(source_id)
+        assert response["result"]["isError"] is True
+        assert durable is not None
+        assert durable["state"] == "sidebar_retry"
+        assert durable["codex_thread_id"] is None
+        assert harness.store.sidebar_job_counts()["sidebar_visible"] == 0
+    finally:
+        harness.close()
+
+
+def test_sidebar_empty_control_and_ack_sessions_create_no_jobs(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        harness.seed_source(
+            Provider.CLAUDE,
+            "empty-source",
+            cwd=tmp_path / "empty-source",
+            content=None,
+        )
+        harness.seed_source(
+            Provider.HERMES,
+            "control-source",
+            cwd=tmp_path / "control-source",
+            content="/help",
+        )
+        harness.seed_source(
+            Provider.CLAUDE,
+            "ack-source",
+            cwd=tmp_path / "ack-source",
+            content="ok",
+        )
+
+        summary = harness.register()
+        with harness.client() as client:
+            pending = _sidebar_call_tool(
+                client,
+                "session_sidebar_pending",
+                {"limit": 5},
+            )
+
+        assert summary.queued == 0
+        assert summary.failed == 0
+        assert pending == {"jobs": []}
+        assert sum(harness.store.sidebar_job_counts().values()) == 0
+    finally:
+        harness.close()

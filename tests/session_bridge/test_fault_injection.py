@@ -29,6 +29,7 @@ from session_bridge.models import (
     SessionProjection,
 )
 from session_bridge.store import SessionBridgeStore
+from tests.session_bridge.test_end_to_end import _SidebarEndToEndHarness
 
 
 NOW = 100.0
@@ -562,3 +563,118 @@ def test_backfill_stops_when_durable_error_rate_trips_breaker(
     assert unclaimed_job_id in {
         queued["id"] for queued in store.list_mirror_jobs([MirrorJobState.QUEUED])
     }
+
+
+@pytest.mark.parametrize(
+    ("broken_provider", "healthy_provider"),
+    [
+        (Provider.CLAUDE, Provider.HERMES),
+        (Provider.HERMES, Provider.CLAUDE),
+    ],
+)
+def test_sidebar_provider_parser_failures_are_isolated_bidirectionally(
+    tmp_path: Path,
+    broken_provider: Provider,
+    healthy_provider: Provider,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        broken_id = harness.seed_source(
+            broken_provider,
+            f"broken-{broken_provider.value}",
+            cwd=tmp_path / f"broken-{broken_provider.value}",
+        )
+        healthy_id = harness.seed_source(
+            healthy_provider,
+            f"healthy-{healthy_provider.value}",
+            cwd=tmp_path / f"healthy-{healthy_provider.value}",
+        )
+        harness.db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET cwd = NULL WHERE id = ?",
+                (broken_id,),
+            )
+        )
+
+        summary = harness.register()
+        with harness.client() as client:
+            delivered = harness.run_worker_once(client)
+
+        assert summary.failed == 1
+        assert summary.queued == 1
+        assert harness.store.get_sidebar_job_for_source(broken_id) is None
+        assert harness.store.get_sidebar_job_for_source(healthy_id)["state"] == (
+            "sidebar_visible"
+        )
+        assert delivered == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+    finally:
+        harness.close()
+
+
+def test_sidebar_codex_desktop_offline_keeps_durable_retry_and_recovers(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_id = harness.seed_source(
+            Provider.HERMES,
+            "desktop-offline",
+            cwd=tmp_path / "desktop-offline",
+        )
+        harness.register()
+        harness.native.available = False
+
+        with harness.client() as client:
+            offline = harness.run_worker_once(client)
+            durable = harness.store.get_sidebar_job_for_source(source_id)
+            harness.native.available = True
+            harness.advance_retry()
+            recovered = harness.run_worker_once(client)
+
+        assert offline == [
+            {"state": "sidebar_retry", "error_code": "desktop_offline"}
+        ]
+        assert durable is not None
+        assert durable["state"] == "sidebar_retry"
+        assert recovered == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        assert len(harness.native.create_calls) == 1
+    finally:
+        harness.close()
+
+
+def test_sidebar_native_broker_never_calls_app_server_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app_server_calls: list[dict[str, Any]] = []
+
+    def forbidden_app_server_create(*_args: Any, **kwargs: Any):
+        app_server_calls.append(kwargs)
+        raise AssertionError("sidebar delivery must not call app-server creation")
+
+    monkeypatch.setattr(
+        CodexTargetAdapter,
+        "create_placeholder",
+        forbidden_app_server_create,
+    )
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        harness.seed_source(
+            Provider.CLAUDE,
+            "native-only",
+            cwd=tmp_path / "native-only",
+        )
+        harness.register()
+
+        with harness.client() as client:
+            harness.run_worker_once(client)
+
+        assert app_server_calls == []
+        assert harness.native.app_server_create_calls == []
+        assert len(harness.native.create_calls) == 1
+    finally:
+        harness.close()

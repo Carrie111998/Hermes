@@ -30,6 +30,7 @@ from session_bridge.models import (
     canonical_session_id,
 )
 from session_bridge.store import SessionBridgeStore
+from tests.session_bridge.test_end_to_end import _SidebarEndToEndHarness
 
 
 def _projection(
@@ -668,3 +669,39 @@ async def test_background_scan_failure_is_reported_and_next_cycle_runs(
         ]
     finally:
         await coordinator.stop()
+
+
+def test_sidebar_rename_failure_reconciles_without_duplicate_create(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "rename-reconcile",
+            cwd=tmp_path / "rename-reconcile",
+        )
+        harness.register()
+        harness.native.rename_failures_remaining = 1
+
+        with harness.client() as client:
+            failed = harness.run_worker_once(client)
+            retry_job = harness.store.get_sidebar_job_for_source(source_id)
+            harness.advance_retry()
+            recovered = harness.run_worker_once(client)
+
+        assert failed == [
+            {"state": "sidebar_retry", "error_code": "rename_failed"}
+        ]
+        assert retry_job is not None
+        assert retry_job["state"] == "sidebar_retry"
+        assert recovered == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        assert len(harness.native.create_calls) == 1
+        assert [thread_id for thread_id, _title in harness.native.rename_calls] == [
+            "native-sidebar-1",
+            "native-sidebar-1",
+        ]
+    finally:
+        harness.close()
