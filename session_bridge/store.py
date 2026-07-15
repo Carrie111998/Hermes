@@ -47,6 +47,20 @@ _MIRROR_AUTHORITY_STATE_PREFIX = "session-bridge:mirror-authority:"
 _MIRROR_RATE_STATE_KEY = "session-bridge:mirror-rate"
 _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
+_SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
+_SIDEBAR_DELIVERY_STATE_FIELDS = frozenset({
+    "version",
+    "source_session_id",
+    "provider",
+    "bridge_id",
+    "title",
+    "cwd",
+    "git_root",
+    "git_branch",
+    "git_head",
+    "worktree_id",
+    "eligible_at",
+})
 _STRUCTURED_CONTENT_HEX_PREFIX = "006A736F6E3A"
 _PYTHON_STRIP_CHARACTERS = (
     "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
@@ -991,6 +1005,8 @@ class SessionBridgeStore:
 
         if not isinstance(candidate, SidebarCandidate):
             raise ValueError("sidebar candidate is malformed")
+        state_key = _sidebar_delivery_state_key(candidate.source_session_id)
+        state_value_json = _encode_sidebar_delivery_candidate(candidate)
         idempotency_key = sidebar_idempotency_key(candidate.source_session_id)
         expected_provider = (
             Provider.CLAUDE
@@ -1034,6 +1050,18 @@ class SessionBridgeStore:
                 or row["bridge_id"] != expected_bridge_id
             ):
                 raise ValueError("conflicting sidebar job identity")
+            state_row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (state_key,),
+            ).fetchone()
+            if state_row is None:
+                conn.execute(
+                    """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                       VALUES (?, ?, ?)""",
+                    (state_key, state_value_json, now),
+                )
+            elif state_row["value_json"] != state_value_json:
+                raise ValueError("conflicting sidebar delivery candidate")
             return {**dict(row), "created": insert.rowcount == 1}
 
         return self.db._execute_write(_write)
@@ -1616,111 +1644,41 @@ class SessionBridgeStore:
             ).fetchone()
         return None if row is None else dict(row)
 
-    def get_sidebar_source_for_delivery(
+    def get_sidebar_candidate_for_delivery(
         self,
         source_session_id: str,
-    ) -> SidebarSource:
-        """Read the exact source metadata for an already queued sidebar job."""
+    ) -> SidebarCandidate:
+        """Read immutable, bounded delivery metadata for an already queued job."""
 
         source_id = _exact_nonempty_text(
             source_session_id, "sidebar source session ID"
         )
+        state_key = _sidebar_delivery_state_key(source_id)
         with self.db._lock:
             conn = self.db._conn
             assert conn is not None
             row = conn.execute(
-                """SELECT s.id AS session_id, s.source, s.model_config,
-                          s.title, s.cwd, s.started_at, s.git_branch,
-                          s.git_repo_root, e.provider AS external_provider,
-                          e.native_id AS external_native_id, e.native_path,
-                          e.native_status, e.last_native_cursor,
-                          e.last_native_hash, e.parser_version, e.origin_kind,
-                          e.origin_bridge_id, job.eligible_at
+                """SELECT job.source_session_id, job.idempotency_key,
+                          job.bridge_id, job.eligible_at, state.value_json
                      FROM session_sidebar_jobs AS job
-                     JOIN sessions AS s ON s.id = job.source_session_id
-                     LEFT JOIN external_sessions AS e ON e.session_id = s.id
+                     LEFT JOIN session_bridge_state AS state ON state.key = ?
                     WHERE job.source_session_id = ?""",
-                (source_id,),
+                (state_key, source_id),
             ).fetchone()
-            if row is None:
-                raise KeyError(source_id)
-            if row["external_provider"] == Provider.CLAUDE.value:
-                provider = Provider.CLAUDE
-                native_id = row["external_native_id"]
-                if (
-                    row["origin_kind"] != OriginKind.NATIVE.value
-                    or row["origin_bridge_id"] is not None
-                ):
-                    raise ValueError("sidebar source provenance is invalid")
-            elif row["external_provider"] is None and not source_id.startswith(
-                ("claude:", "codex:")
-            ):
-                provider = Provider.HERMES
-                native_id = source_id
-            else:
-                raise ValueError("sidebar source provider is invalid")
-            message_rows = conn.execute(
-                """SELECT message.id, message.role, message.content,
-                          message.timestamp, map.native_event_id, map.ordinal
-                     FROM messages AS message
-                     LEFT JOIN external_message_map AS map
-                       ON map.message_id = message.id
-                    WHERE message.session_id = ? AND message.role = 'user'
-                      AND (message.active = 1 OR message.compacted = 1)
-                    ORDER BY message.timestamp, message.id""",
-                (source_id,),
-            ).fetchall()
-
-        messages: list[ProjectedMessage] = []
-        for message_row in message_rows:
-            message_id = int(message_row["id"])
-            decoded = self.db._decode_content(message_row["content"])
-            messages.append(
-                ProjectedMessage(
-                    native_event_id=(
-                        message_row["native_event_id"]
-                        or f"hermes-message:{message_id}"
-                    ),
-                    ordinal=(
-                        int(message_row["ordinal"])
-                        if message_row["ordinal"] is not None
-                        else message_id
-                    ),
-                    role="user",
-                    content=decoded if isinstance(decoded, str) else None,
-                    timestamp=float(message_row["timestamp"]),
-                )
-            )
-        eligible_at = _finite_number(row["eligible_at"], "sidebar eligible at")
-        projection = SessionProjection(
-            provider=provider,
-            native_id=native_id,
-            title=row["title"],
-            cwd=row["cwd"],
-            started_at=float(row["started_at"]),
-            last_active=eligible_at,
-            messages=tuple(messages),
-            native_path=row["native_path"],
-            native_status=row["native_status"] or "active",
-            native_cursor=row["last_native_cursor"],
-            native_hash=row["last_native_hash"],
-            parser_version=int(row["parser_version"] or 1),
-            origin_kind=OriginKind.NATIVE,
-            origin_bridge_id=None,
-            git_branch=row["git_branch"],
-        )
-        return SidebarSource(
-            source_session_id=source_id,
-            projection=projection,
-            git_root=row["git_repo_root"],
-            git_head=None,
-            worktree_id=None,
-            automation_only=row["source"] == "cron",
-            subagent_only=(
-                row["source"] in {"subagent", "tool"}
-                or _model_config_has_delegate(row["model_config"])
-            ),
-        )
+        if row is None:
+            raise KeyError(source_id)
+        if row["value_json"] is None:
+            raise ValueError("missing sidebar delivery candidate")
+        candidate = _decode_sidebar_delivery_candidate(row["value_json"])
+        expected_provider = _validated_sidebar_job_provider(dict(row))
+        if (
+            candidate.source_session_id != row["source_session_id"]
+            or candidate.bridge_id != row["bridge_id"]
+            or candidate.provider is not expected_provider
+            or candidate.eligible_at != float(row["eligible_at"])
+        ):
+            raise ValueError("invalid sidebar delivery candidate identity")
+        return candidate
 
     def ensure_sidebar_lineage(
         self,
@@ -2964,6 +2922,139 @@ def _validated_sidebar_job_provider(job: Mapping[str, Any]) -> Provider:
     if source_session_id.startswith("codex:"):
         raise ValueError("Codex cannot be a sidebar source")
     return Provider.HERMES
+
+
+def _sidebar_delivery_state_key(source_session_id: str) -> str:
+    from .sidebar import sidebar_idempotency_key
+
+    sidebar_idempotency_key(source_session_id)
+    digest = hashlib.sha256(source_session_id.encode()).hexdigest()
+    return f"{_SIDEBAR_DELIVERY_STATE_PREFIX}{digest}"
+
+
+def _encode_sidebar_delivery_candidate(candidate: SidebarCandidate) -> str:
+    from .context_pack import _redact
+    from .sidebar import _validate_candidate
+
+    _validate_candidate(candidate)
+    title = _exact_nonempty_text(candidate.title, "sidebar candidate title")
+    _exact_nonempty_text(candidate.cwd, "sidebar candidate cwd")
+    for value, label in (
+        (candidate.git_root, "sidebar candidate git root"),
+        (candidate.git_branch, "sidebar candidate git branch"),
+        (candidate.git_head, "sidebar candidate git HEAD"),
+        (candidate.worktree_id, "sidebar candidate worktree ID"),
+    ):
+        if value is not None:
+            _exact_nonempty_text(value, label)
+    if any(character in title for character in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"):
+        raise ValueError("sidebar candidate title must be a single line")
+    if _redact(candidate.source_session_id) != candidate.source_session_id:
+        raise ValueError("sidebar source identity cannot be persisted safely")
+    if _redact(candidate.bridge_id) != candidate.bridge_id:
+        raise ValueError("sidebar bridge identity cannot be persisted safely")
+
+    def _safe(value: str | None) -> str | None:
+        return None if value is None else _redact(value)
+
+    payload = {
+        "version": 1,
+        "source_session_id": candidate.source_session_id,
+        "provider": candidate.provider.value,
+        "bridge_id": candidate.bridge_id,
+        "title": _safe(title),
+        "cwd": _safe(candidate.cwd),
+        "git_root": _safe(candidate.git_root),
+        "git_branch": _safe(candidate.git_branch),
+        "git_head": _safe(candidate.git_head),
+        "worktree_id": _safe(candidate.worktree_id),
+        "eligible_at": _finite_number(candidate.eligible_at, "sidebar eligible_at"),
+    }
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _decode_sidebar_delivery_candidate(value_json: object) -> SidebarCandidate:
+    from .context_pack import _redact
+    from .sidebar import SidebarCandidate, _validate_candidate
+
+    if not isinstance(value_json, (str, bytes, bytearray)):
+        raise ValueError("invalid sidebar delivery candidate")
+    try:
+        payload = json.loads(value_json)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("invalid sidebar delivery candidate") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _SIDEBAR_DELIVERY_STATE_FIELDS
+        or payload.get("version") != 1
+        or isinstance(payload.get("version"), bool)
+    ):
+        raise ValueError("invalid sidebar delivery candidate")
+    provider_value = payload.get("provider")
+    try:
+        provider = Provider(provider_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid sidebar delivery candidate") from exc
+    required = (
+        payload.get("source_session_id"),
+        payload.get("bridge_id"),
+        payload.get("title"),
+        payload.get("cwd"),
+    )
+    optional = (
+        payload.get("git_root"),
+        payload.get("git_branch"),
+        payload.get("git_head"),
+        payload.get("worktree_id"),
+    )
+    if any(
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or _redact(value) != value
+        for value in required
+    ) or any(
+        value is not None
+        and (
+            not isinstance(value, str)
+            or not value.strip()
+            or _redact(value) != value
+        )
+        for value in optional
+    ):
+        raise ValueError("invalid sidebar delivery candidate")
+    title = payload["title"]
+    if any(
+        character in title
+        for character in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+    ):
+        raise ValueError("invalid sidebar delivery candidate")
+    try:
+        candidate = SidebarCandidate(
+            source_session_id=payload["source_session_id"],
+            provider=provider,
+            bridge_id=payload["bridge_id"],
+            title=payload["title"],
+            cwd=payload["cwd"],
+            git_root=payload["git_root"],
+            git_branch=payload["git_branch"],
+            git_head=payload["git_head"],
+            worktree_id=payload["worktree_id"],
+            eligible_at=_finite_number(
+                payload.get("eligible_at"), "sidebar eligible_at"
+            ),
+        )
+        _validate_candidate(candidate)
+        _exact_nonempty_text(candidate.title, "sidebar candidate title")
+    except ValueError as exc:
+        raise ValueError("invalid sidebar delivery candidate") from exc
+    return candidate
 
 
 def _nonnegative_integer(value: object, label: str) -> None:

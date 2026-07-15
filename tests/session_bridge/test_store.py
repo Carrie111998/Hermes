@@ -2873,6 +2873,119 @@ def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> No
     assert len(_rows(db, "SELECT * FROM session_sidebar_jobs")) == 1
 
 
+def test_sidebar_enqueue_persists_versioned_delivery_candidate_across_restart(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db)
+    state_key = "session-bridge:sidebar-delivery:" + hashlib.sha256(
+        candidate.source_session_id.encode()
+    ).hexdigest()
+
+    store.enqueue_sidebar_job(candidate)
+    row = _rows(
+        db,
+        "SELECT key, value_json FROM session_bridge_state WHERE key = ?",
+        (state_key,),
+    )[0]
+    reopened_db = SessionDB(db.db_path)
+    try:
+        recovered = SessionBridgeStore(reopened_db).get_sidebar_candidate_for_delivery(
+            candidate.source_session_id
+        )
+    finally:
+        reopened_db.close()
+
+    assert row["key"] == state_key
+    assert json.loads(row["value_json"]) == {
+        "version": 1,
+        "source_session_id": candidate.source_session_id,
+        "provider": candidate.provider.value,
+        "bridge_id": candidate.bridge_id,
+        "title": candidate.title,
+        "cwd": candidate.cwd,
+        "git_root": candidate.git_root,
+        "git_branch": candidate.git_branch,
+        "git_head": candidate.git_head,
+        "worktree_id": candidate.worktree_id,
+        "eligible_at": candidate.eligible_at,
+    }
+    assert recovered == candidate
+
+
+def test_sidebar_duplicate_enqueue_never_overwrites_delivery_candidate(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db)
+    store.enqueue_sidebar_job(candidate)
+    before = _rows(
+        db,
+        "SELECT key, value_json, updated_at FROM session_bridge_state "
+        "WHERE key LIKE 'session-bridge:sidebar-delivery:%'",
+    )
+
+    replay = store.enqueue_sidebar_job(candidate)
+    with pytest.raises(ValueError, match="conflicting sidebar delivery candidate"):
+        store.enqueue_sidebar_job(replace(candidate, title="[Claude] different"))
+
+    after = _rows(
+        db,
+        "SELECT key, value_json, updated_at FROM session_bridge_state "
+        "WHERE key LIKE 'session-bridge:sidebar-delivery:%'",
+    )
+    assert replay["created"] is False
+    assert after == before
+
+
+def test_sidebar_delivery_candidate_is_redacted_at_enqueue(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = replace(
+        _sidebar_candidate(db),
+        title="[Claude] rotate sk-1234567890abcdefghijkl",
+        cwd="C:/workspace?token=must-not-persist",
+    )
+
+    store.enqueue_sidebar_job(candidate)
+    row = _rows(
+        db,
+        "SELECT value_json FROM session_bridge_state "
+        "WHERE key LIKE 'session-bridge:sidebar-delivery:%'",
+    )[0]
+    recovered = store.get_sidebar_candidate_for_delivery(candidate.source_session_id)
+
+    assert "sk-1234567890abcdefghijkl" not in row["value_json"]
+    assert "must-not-persist" not in row["value_json"]
+    assert "[REDACTED]" in row["value_json"]
+    assert recovered.title == "[Claude] rotate [REDACTED]"
+    assert recovered.cwd == "C:/workspace?token=[REDACTED]"
+
+
+def test_sidebar_delivery_candidate_missing_or_malformed_state_fails_closed(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 125.0)
+    candidate = _sidebar_candidate(db)
+    store.enqueue_sidebar_job(candidate)
+    state_key = "session-bridge:sidebar-delivery:" + hashlib.sha256(
+        candidate.source_session_id.encode()
+    ).hexdigest()
+
+    db._execute_write(
+        lambda conn: conn.execute(
+            "DELETE FROM session_bridge_state WHERE key = ?", (state_key,)
+        )
+    )
+    with pytest.raises(ValueError, match="missing sidebar delivery candidate"):
+        store.get_sidebar_candidate_for_delivery(candidate.source_session_id)
+
+    db._execute_write(
+        lambda conn: conn.execute(
+            "INSERT INTO session_bridge_state (key, value_json, updated_at) "
+            "VALUES (?, ?, ?)",
+            (state_key, '{"version":2}', 126.0),
+        )
+    )
+    with pytest.raises(ValueError, match="invalid sidebar delivery candidate"):
+        store.get_sidebar_candidate_for_delivery(candidate.source_session_id)
+
+
 def test_sidebar_enqueue_rejects_a_conflicting_source_bridge_identity(db) -> None:
     store = SessionBridgeStore(db, clock=lambda: 125.0)
     candidate = _sidebar_candidate(db)

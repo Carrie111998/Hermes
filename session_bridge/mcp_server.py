@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import replace
 import ipaddress
 import json
 import math
@@ -32,10 +31,7 @@ from .models import (
     encode_bridge_marker,
 )
 from .sidebar import (
-    SidebarCandidate,
     build_registration_prompt,
-    is_sidebar_session_eligible,
-    sidebar_title,
 )
 from .store import (
     SIDEBAR_FATAL_ERRORS,
@@ -981,23 +977,6 @@ def _exact_sidebar_text(value: object, label: str) -> str:
     return value
 
 
-def _required_sidebar_cwd(value: object) -> str:
-    return _exact_sidebar_text(value, "source cwd")
-
-
-def _first_sidebar_request(projection: Any) -> str:
-    for message in projection.messages:
-        one_message = replace(projection, messages=(message,))
-        if is_sidebar_session_eligible(
-            one_message,
-            now=projection.last_active,
-            backfill_days=0,
-        ):
-            assert isinstance(message.content, str)
-            return message.content
-    raise ValueError("sidebar source has no meaningful user request")
-
-
 def _build_sidebar_broker_job(
     store: SessionBridgeStore,
     claim: object,
@@ -1016,24 +995,9 @@ def _build_sidebar_broker_job(
     rename_required = getattr(claim, "rename_required", None)
     if type(reconcile_required) is not bool or type(rename_required) is not bool:
         raise ValueError("sidebar claim flags are malformed")
-    source = store.get_sidebar_source_for_delivery(source_session_id)
-    first_request = _first_sidebar_request(source.projection)
-    candidate = SidebarCandidate(
-        source_session_id=source.source_session_id,
-        provider=source.projection.provider,
-        bridge_id=bridge_id,
-        title=sidebar_title(
-            source.projection.provider,
-            source.projection.title,
-            first_request,
-        ),
-        cwd=_required_sidebar_cwd(source.projection.cwd),
-        git_root=source.git_root,
-        git_branch=source.projection.git_branch,
-        git_head=source.git_head,
-        worktree_id=source.worktree_id,
-        eligible_at=source.projection.last_active,
-    )
+    candidate = store.get_sidebar_candidate_for_delivery(source_session_id)
+    if candidate.bridge_id != bridge_id:
+        raise ValueError("sidebar claim bridge identity is malformed")
     marker = encode_bridge_marker(
         BridgeMarkerPayload(
             bridge_id=bridge_id,

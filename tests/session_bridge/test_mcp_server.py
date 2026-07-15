@@ -36,6 +36,7 @@ from session_bridge.models import (
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarJobState,
     decode_bridge_marker,
 )
 from session_bridge.sidebar import SidebarCandidate, VerifiedSidebarThread, sidebar_bridge_id
@@ -864,6 +865,97 @@ def test_session_sidebar_pending_clamps_limit_and_returns_only_broker_fields(
     )
 
 
+def test_session_sidebar_pending_never_reads_transcript_after_enqueue(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    db._execute_write(
+        lambda conn: conn.executemany(
+            "INSERT INTO messages (session_id, role, content, timestamp, active) "
+            "VALUES (?, 'user', ?, ?, 1)",
+            [
+                (candidate.source_session_id, f"private transcript {index}", 901.0 + index)
+                for index in range(600)
+            ],
+        )
+    )
+    monkeypatch.setattr(
+        db,
+        "_decode_content",
+        lambda _value: (_ for _ in ()).throw(
+            AssertionError("sidebar pending decoded transcript content")
+        ),
+    )
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token="bounded-candidate-lease",
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
+
+    assert [job["lease_token"] for job in response["jobs"]] == [
+        "bounded-candidate-lease"
+    ]
+
+
+def test_session_sidebar_pending_settles_legacy_job_missing_delivery_candidate(
+    db: SessionDB,
+) -> None:
+    token = "legacy-missing-candidate-lease"
+    now = time.time()
+    store, candidate = _seed_sidebar_source(db)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "DELETE FROM session_bridge_state "
+            "WHERE key LIKE 'session-bridge:sidebar-delivery:%'"
+        )
+    )
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: token,
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    claims = store.claim_sidebar_jobs(now=now, limit=1)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token=claims[0]["lease_token"],
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
+
+    assert response == {"jobs": []}
+    job = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert job is not None
+    assert job["state"] == SidebarJobState.FAILED.value
+    assert job["error_code"] == "source_identity_mismatch"
+
+
 @pytest.mark.parametrize("malformed", [None, True, 1.5, "5", [], {}])
 def test_session_sidebar_pending_rejects_malformed_limits_without_leasing(
     db: SessionDB, malformed: object
@@ -903,7 +995,7 @@ def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_cla
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = claims
-    original_get = store.get_sidebar_source_for_delivery
+    original_get = store.get_sidebar_candidate_for_delivery
     failed_source = claims[failed_index].source_session_id
 
     def selective_get(source_session_id: str):
@@ -911,7 +1003,7 @@ def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_cla
             raise ValueError("raw traceback token=must-not-leak")
         return original_get(source_session_id)
 
-    monkeypatch.setattr(store, "get_sidebar_source_for_delivery", selective_get)
+    monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", selective_get)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         response = _call_tool(client, "session_sidebar_pending", {"limit": 5})
 
@@ -984,7 +1076,7 @@ def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = claims
-    original_get = store.get_sidebar_source_for_delivery
+    original_get = store.get_sidebar_candidate_for_delivery
     original_fail = store.fail_sidebar_job
 
     def fail_second_source(source_session_id: str):
@@ -1001,7 +1093,7 @@ def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
             raise RuntimeError("lease token " + claims[1].lease_token)
         return original_fail(**kwargs)
 
-    monkeypatch.setattr(store, "get_sidebar_source_for_delivery", fail_second_source)
+    monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", fail_second_source)
     monkeypatch.setattr(store, "fail_sidebar_job", flaky_cleanup)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         payload = _rpc(
@@ -1034,7 +1126,7 @@ def test_session_sidebar_pending_first_cleanup_failure_rolls_back_later_claims(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = claims
-    original_get = store.get_sidebar_source_for_delivery
+    original_get = store.get_sidebar_candidate_for_delivery
     original_fail = store.fail_sidebar_job
 
     def fail_first_source(source_session_id: str):
@@ -1051,7 +1143,7 @@ def test_session_sidebar_pending_first_cleanup_failure_rolls_back_later_claims(
             raise RuntimeError("first cleanup lease=" + claims[0].lease_token)
         return original_fail(**kwargs)
 
-    monkeypatch.setattr(store, "get_sidebar_source_for_delivery", fail_first_source)
+    monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", fail_first_source)
     monkeypatch.setattr(store, "fail_sidebar_job", fail_first_cleanup)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         payload = _rpc(
