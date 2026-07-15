@@ -26,7 +26,7 @@ from .characterize import (
     run_live_characterization,
 )
 from .claude_adapter import ClaudeSourceAdapter, ClaudeTargetAdapter
-from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter
+from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter, SidebarThreadVerifier
 from .config import BridgeConfig
 from .context_pack import ContextPackBuilder
 from .coordinator import SessionBridgeCoordinator
@@ -46,6 +46,7 @@ from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
+    redact_codex_thread_id,
 )
 
 
@@ -334,26 +335,25 @@ class ProductionBackend:
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]:
         if type(enabled) is not bool:
             raise ConfigurationFailure("invalid_sidebar_continuous_mode")
-        from hermes_cli.config import load_config, save_config
+        from hermes_cli.config import mutate_config
 
-        document = load_config()
-        if not isinstance(document, dict):
-            raise ConfigurationFailure("invalid_hermes_config")
-        session_bridge = document.get("session_bridge")
-        if session_bridge is None:
-            session_bridge = {}
-            document["session_bridge"] = session_bridge
-        if not isinstance(session_bridge, dict):
-            raise ConfigurationFailure("invalid_session_bridge_config")
-        sidebar = session_bridge.get("sidebar")
-        if sidebar is None:
-            sidebar = {}
-            session_bridge["sidebar"] = sidebar
-        if not isinstance(sidebar, dict):
-            raise ConfigurationFailure("invalid_sidebar_config")
-        sidebar["continuous"] = enabled
-        save_config(
-            document,
+        def _mutate(document: dict[str, Any]) -> None:
+            session_bridge = document.get("session_bridge")
+            if session_bridge is None:
+                session_bridge = {}
+                document["session_bridge"] = session_bridge
+            if not isinstance(session_bridge, dict):
+                raise ConfigurationFailure("invalid_session_bridge_config")
+            sidebar = session_bridge.get("sidebar")
+            if sidebar is None:
+                sidebar = {}
+                session_bridge["sidebar"] = sidebar
+            if not isinstance(sidebar, dict):
+                raise ConfigurationFailure("invalid_sidebar_config")
+            sidebar["continuous"] = enabled
+
+        mutate_config(
+            _mutate,
             preserve_keys={("session_bridge", "sidebar", "continuous")},
         )
         self.config = replace(
@@ -674,6 +674,15 @@ class ProductionBackend:
                     ),
                 )
             catalog = self._require_catalog()
+            sidebar_verifier = (
+                SidebarThreadVerifier(
+                    codex_source,
+                    marker_secret=marker_key,
+                    reconciliation_interval=effective_config.service.reconcile_seconds,
+                )
+                if codex_source is not None
+                else None
+            )
             self._coordinator = SessionBridgeCoordinator(
                 config=effective_config,
                 store=self._require_store(),
@@ -686,6 +695,7 @@ class ProductionBackend:
                     _CLAUDE_PROJECTS_ROOT if Provider.CLAUDE in selected else None
                 ),
                 permission_preflight=_production_codex_permission_preflight,
+                sidebar_verifier=sidebar_verifier,
             )
             return self._coordinator
         except Exception:
@@ -862,7 +872,7 @@ def main(
                 )
             )
             _emit(payload)
-            return EXIT_OK
+            return EXIT_DEGRADED if int(payload.get("failed", 0)) else EXIT_OK
         if args.command == "sidebar-continuous":
             payload = dict(
                 backend.set_sidebar_continuous(enabled=bool(args.enable))
@@ -1094,7 +1104,7 @@ def _public_sidebar_status(
         "last_heartbeat_at": heartbeat_at,
         "last_successful_heartbeat_at": heartbeat_at,
         "heartbeat_age_seconds": heartbeat_age,
-        "last_visible_task_id": _redacted_task_id(task_id),
+        "last_visible_task_id": redact_codex_thread_id(task_id),
         "recent_error_codes": recent_codes,
         "delivery_latency_seconds": {
             percentile: _optional_status_number(latency.get(percentile))
@@ -1126,14 +1136,6 @@ def _optional_status_number(value: object) -> float | None:
     if result < 0:
         raise ConfigurationFailure("invalid_sidebar_status")
     return result
-
-
-def _redacted_task_id(value: object) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    if len(value) <= 12:
-        return "[REDACTED]"
-    return f"{value[:8]}...{value[-4:]}"
 
 
 def _sanitize(value: Any, *, key: str | None = None) -> Any:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -1354,6 +1355,50 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "p95": None,
         "p99": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("task_id", "expected"),
+    (
+        (
+            "safe.native-task_1",
+            "task:" + hashlib.sha256(b"safe.native-task_1").hexdigest()[:16],
+        ),
+        ("a", "task:" + hashlib.sha256(b"a").hexdigest()[:16]),
+        (
+            "sk-proj-secret-value",
+            "task:" + hashlib.sha256(b"sk-proj-secret-value").hexdigest()[:16],
+        ),
+        ("C:/private/native-task", None),
+        ("secret\nsecond-line", None),
+        ("a" * 513, None),
+    ),
+)
+def test_session_status_task_id_is_validated_then_opaque(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+    task_id: str,
+    expected: str | None,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    original_status = store.sidebar_delivery_status
+
+    def sidebar_status():
+        return {**original_status(), "last_visible_task_id": task_id}
+
+    monkeypatch.setattr(store, "sidebar_delivery_status", sidebar_status)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        status = _call_tool(client, "session_status", {})
+
+    assert status["sidebar"]["last_visible_task_id"] == expected
+    if len(task_id) > 8:
+        assert task_id not in json.dumps(status)
 
 
 def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(

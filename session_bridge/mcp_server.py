@@ -37,6 +37,7 @@ from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
+    redact_codex_thread_id,
 )
 
 
@@ -369,7 +370,7 @@ def create_app(
         health = health_method() if callable(health_method) else {"running": False}
         catalog_status = await asyncio.to_thread(catalog.status)
         sidebar_status = await asyncio.to_thread(store.sidebar_delivery_status)
-        sidebar_status["last_visible_task_id"] = _redacted_task_id(
+        sidebar_status["last_visible_task_id"] = redact_codex_thread_id(
             sidebar_status.get("last_visible_task_id")
         )
         return _status_payload(health, catalog_status, sidebar_status)
@@ -868,10 +869,9 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     latencies = source.get("delivery_latency_seconds")
     latency_values = _status_mapping(latencies)
     task_id = source.get("last_visible_task_id")
-    if type(task_id) is not str or (
-        task_id != "[REDACTED]"
-        and re.fullmatch(r"[0-9A-Fa-f]{8}\.\.\.[0-9A-Fa-f]{4}", task_id) is None
-    ):
+    if type(task_id) is not str or re.fullmatch(
+        r"task:[0-9a-f]{16}", task_id
+    ) is None:
         task_id = None
     recent = source.get("recent_error_codes")
     return {
@@ -931,14 +931,6 @@ def _fixed_status_codes(values: tuple[Any, ...] | list[Any]) -> list[str]:
         if code is not None and code not in result:
             result.append(code)
     return result
-
-
-def _redacted_task_id(value: object) -> str | None:
-    if not isinstance(value, str) or not value:
-        return None
-    if len(value) <= 12:
-        return "[REDACTED]"
-    return f"{value[:8]}...{value[-4:]}"
 
 
 def _is_mcp_path(path: str) -> bool:

@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from threading import Event, Thread
+import time
 from typing import Any
 
 import pytest
@@ -22,10 +26,24 @@ from session_bridge.cli import (
     RolloutGateBlocked,
     main,
 )
-from session_bridge.config import BridgeConfig, CatalogConfig, MirrorsConfig, SidebarConfig
+from session_bridge.codex_adapter import SidebarThreadVerifier
+from session_bridge.config import (
+    BridgeConfig,
+    CatalogConfig,
+    MirrorsConfig,
+    ServiceConfig,
+    SidebarConfig,
+)
 from session_bridge.coordinator import ScanSummary
 from session_bridge.mirror import MirrorPolicy, enqueue_mirror_job
-from session_bridge.models import ProjectedMessage, Provider, SessionProjection
+from session_bridge.models import (
+    BridgeMarkerPayload,
+    ProjectedMessage,
+    Provider,
+    SessionProjection,
+    encode_bridge_marker,
+)
+from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
 from session_bridge.store import SessionBridgeStore
 
 
@@ -249,6 +267,31 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
     assert not any(call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls)
 
 
+@pytest.mark.parametrize("apply", (False, True))
+def test_sidebar_backfill_candidate_failures_exit_degraded(
+    capsys: pytest.CaptureFixture[str],
+    apply: bool,
+) -> None:
+    backend = FakeBackend(
+        sidebar_backfill_payload={
+            "mode": "apply" if apply else "dry_run",
+            "days": 30,
+            "limit": 10,
+            "examined": 1,
+            "queued": 0,
+            "by_provider": {"claude": 0, "hermes": 0},
+            "failed": 1,
+        }
+    )
+    mode = "--apply" if apply else "--dry-run"
+
+    assert _run(
+        ["sidebar-backfill", "--days", "30", "--limit", "10", mode],
+        backend,
+    ) == 3
+    assert _json_output(capsys)["failed"] == 1
+
+
 def test_sidebar_backfill_rejects_a_limit_above_ten() -> None:
     with pytest.raises(SystemExit):
         main(["sidebar-backfill", "--days", "30", "--limit", "11", "--dry-run"])
@@ -335,10 +378,43 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
         "broker_heartbeat_stale",
         "oldest_pending_stale",
     ]
-    assert status["last_visible_task_id"] == "019f-sec...fier"
+    expected_tag = hashlib.sha256(
+        b"019f-secret-thread-identifier"
+    ).hexdigest()[:16]
+    assert status["last_visible_task_id"] == f"task:{expected_tag}"
     assert "019f-secret-thread-identifier" not in rendered
     assert "lease_token" not in rendered
     assert "marker" not in rendered
+
+
+@pytest.mark.parametrize(
+    "hostile_id",
+    (
+        "C:/private/task",
+        "../private-task",
+        "secret\nsecond-line",
+        "\x00control",
+        "_leading-symbol",
+        "a" * 513,
+        "",
+    ),
+)
+def test_sidebar_status_never_redacts_hostile_task_ids_by_fragment(
+    monkeypatch: pytest.MonkeyPatch,
+    hostile_id: str,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 0, "hermes": 0},
+        "counts": {},
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": hostile_id,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    assert backend.sidebar_status()["last_visible_task_id"] is None
 
 
 @pytest.mark.parametrize(
@@ -385,6 +461,29 @@ def test_sidebar_status_alerts_only_for_work_older_than_threshold(
     assert status["degraded_reasons"] == reasons
 
 
+@pytest.mark.parametrize(
+    ("age", "healthy"),
+    ((0.0, True), (181.0, False)),
+)
+def test_sidebar_status_includes_leased_only_actionable_work(
+    monkeypatch: pytest.MonkeyPatch,
+    age: float,
+    healthy: bool,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"leased": 1},
+        "oldest_pending_age_seconds": age,
+        "last_heartbeat_at": 1.0,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    assert backend.sidebar_status()["healthy"] is healthy
+
+
 def test_sidebar_continuous_preserves_unrelated_hermes_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -396,14 +495,12 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
         },
     }
     saved: list[tuple[dict[str, Any], set[tuple[str, ...]] | None]] = []
-    monkeypatch.setattr(
-        "hermes_cli.config.load_config",
-        lambda: json.loads(json.dumps(loaded)),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.config.save_config",
-        lambda value, **kwargs: saved.append((value, kwargs.get("preserve_keys"))),
-    )
+    def mutate_config(mutator, **kwargs):
+        value = json.loads(json.dumps(loaded))
+        mutator(value)
+        saved.append((value, kwargs.get("preserve_keys")))
+
+    monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
     backend = ProductionBackend(BridgeConfig())
 
     result = backend.set_sidebar_continuous(enabled=True)
@@ -419,6 +516,54 @@ def test_sidebar_continuous_preserves_unrelated_hermes_config(
         },
         {("session_bridge", "sidebar", "continuous")},
     )]
+
+
+def test_mutate_config_serializes_competing_updates_without_lost_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hermes_cli.config as config_module
+
+    durable: dict[str, Any] = {"existing": {"keep": True}}
+    first_inside = Event()
+    release_first = Event()
+    second_inside = Event()
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: json.loads(json.dumps(durable)),
+    )
+
+    def save_config(value, **_kwargs):
+        durable.clear()
+        durable.update(json.loads(json.dumps(value)))
+
+    monkeypatch.setattr(config_module, "save_config", save_config)
+
+    def first_mutation(value: dict[str, Any]) -> None:
+        value["sidebar_writer"] = True
+        first_inside.set()
+        assert release_first.wait(timeout=5)
+
+    def second_mutation(value: dict[str, Any]) -> None:
+        second_inside.set()
+        value["concurrent_writer"] = True
+
+    first = Thread(target=lambda: config_module.mutate_config(first_mutation))
+    second = Thread(target=lambda: config_module.mutate_config(second_mutation))
+    first.start()
+    assert first_inside.wait(timeout=5)
+    second.start()
+    assert not second_inside.wait(timeout=0.1)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert durable == {
+        "existing": {"keep": True},
+        "sidebar_writer": True,
+        "concurrent_writer": True,
+    }
 
 
 def test_production_serve_blocks_automatic_mode_without_passing_gate(
@@ -534,6 +679,154 @@ def test_production_runtime_wires_exact_cwd_permission_preflight(
         backend.close()
 
     assert captured["permission_preflight"] is sentinel
+
+
+def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_key = b"m" * 32
+    now = time.time()
+    thread_id = "task.native-123"
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: now,
+        sidebar_token_factory=lambda: "production-composition-lease",
+    )
+    source = SessionProjection(
+        provider=Provider.CLAUDE,
+        native_id="production-composition",
+        title="Production composition",
+        cwd=str(tmp_path),
+        started_at=now - 20,
+        last_active=now - 10,
+        messages=(
+            ProjectedMessage(
+                native_event_id="production-composition-request",
+                ordinal=0,
+                role="user",
+                content="Prove the production sidebar verifier path",
+                timestamp=now - 10,
+            ),
+        ),
+        native_cursor="cursor-production-composition",
+        native_hash="hash-production-composition",
+    )
+    store.upsert_projection(source)
+    source_id = "claude:production-composition"
+    bridge_id = sidebar_bridge_id(source_id)
+    store.enqueue_sidebar_job(
+        SidebarCandidate(
+            source_session_id=source_id,
+            provider=Provider.CLAUDE,
+            bridge_id=bridge_id,
+            title="[Claude] Production composition",
+            cwd=str(tmp_path),
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=now - 10,
+        )
+    )
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id=source_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_key,
+    )
+
+    class ProtocolCodexClient:
+        def __init__(self) -> None:
+            self.published = False
+            self.calls: list[str] = []
+            self.closed = False
+
+        def request(
+            self, method: str, params: dict[str, Any], timeout: float
+        ) -> dict[str, Any]:
+            self.calls.append(method)
+            if method == "thread/list":
+                if self.published and params.get("archived") is False:
+                    return {"data": [{
+                        "id": thread_id,
+                        "title": "Native task",
+                        "cwd": str(tmp_path),
+                        "createdAt": now,
+                        "updatedAt": now,
+                        "revision": "revision-1",
+                    }]}
+                return {"data": []}
+            if method == "thread/read":
+                return {"thread": {
+                    "id": thread_id,
+                    "turns": [{
+                        "id": "registration-turn",
+                        "status": "completed",
+                        "items": [{
+                            "type": "userMessage",
+                            "id": "registration-item",
+                            "content": [{"type": "text", "text": marker}],
+                        }],
+                    }],
+                }}
+            raise AssertionError(f"unexpected production request: {method}")
+
+        def take_notification(self, timeout: float = 0.0) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    client = ProtocolCodexClient()
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            service=replace(ServiceConfig(), reconcile_seconds=0.0),
+            sidebar=replace(SidebarConfig(), enabled=True),
+        )
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: client,
+    )
+    try:
+        coordinator = backend._provider_runtime(
+            targets=True,
+            catalog_only=False,
+            providers=(Provider.CODEX,),
+        )
+        assert isinstance(coordinator._sidebar_verifier, SidebarThreadVerifier)
+
+        claim = asyncio.run(
+            coordinator.claim_sidebar_jobs_for_delivery(now=now, limit=1)
+        )[0]
+        assert store.sidebar_delivery_status(now=now)["last_heartbeat_at"] == now
+        client.published = True
+        committed = asyncio.run(
+            coordinator.commit_sidebar_job(
+                lease_token=claim.lease_token,
+                codex_thread_id=thread_id,
+            )
+        )
+    finally:
+        backend.close()
+
+    assert committed["state"] == "sidebar_visible"
+    assert "thread/read" in client.calls
+    assert client.closed is True
 
 
 def test_production_all_provider_scan_isolates_provider_startup_failure(

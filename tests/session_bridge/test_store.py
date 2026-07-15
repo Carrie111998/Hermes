@@ -3409,6 +3409,26 @@ def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:
     }
 
 
+def test_sidebar_actionable_age_uses_fresh_lease_time_then_ages_while_leased(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: 0.0,
+        sidebar_token_factory=_token_factory("leased-age-token"),
+    )
+    candidate = _sidebar_candidate(db, native_id="leased-age", eligible_at=0.0)
+    store.enqueue_sidebar_job(candidate)
+
+    store.claim_sidebar_jobs(now=100.0, limit=1)
+
+    fresh = store.sidebar_delivery_status(now=100.0)
+    stale = store.sidebar_delivery_status(now=281.0)
+    assert fresh["counts"][SidebarJobState.LEASED.value] == 1
+    assert fresh["oldest_pending_age_seconds"] == 0.0
+    assert stale["oldest_pending_age_seconds"] == 181.0
+
+
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:
     store = SessionBridgeStore(
         db,

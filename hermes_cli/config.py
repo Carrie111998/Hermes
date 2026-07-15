@@ -27,7 +27,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Callable, Optional, List, Tuple, Set
 
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -7004,6 +7004,29 @@ _COMMENTED_SECTIONS = """
 #   provider: openrouter
 #   model: anthropic/claude-sonnet-4
 """
+
+
+def mutate_config(
+    mutator: Callable[[Dict[str, Any]], None],
+    *,
+    strip_defaults: bool = True,
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
+) -> Dict[str, Any]:
+    """Atomically load, mutate, and save config under the shared process lock."""
+
+    if not callable(mutator):
+        raise TypeError("config mutator must be callable")
+    with _CONFIG_LOCK:
+        config = load_config()
+        result = mutator(config)
+        if result is not None:
+            raise TypeError("config mutator must update in place and return None")
+        save_config(
+            config,
+            strip_defaults=strip_defaults,
+            preserve_keys=preserve_keys,
+        )
+        return copy.deepcopy(config)
 
 
 def save_config(

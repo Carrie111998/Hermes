@@ -1673,10 +1673,17 @@ class SessionBridgeStore:
                 ),
             ).fetchall()
             oldest = conn.execute(
-                """SELECT MIN(eligible_at) AS eligible_at
+                """SELECT MIN(
+                              CASE WHEN state = ? THEN updated_at ELSE eligible_at END
+                          ) AS actionable_at
                      FROM session_sidebar_jobs
-                    WHERE state IN (?, ?)""",
-                (SidebarJobState.PENDING.value, SidebarJobState.RETRY.value),
+                    WHERE state IN (?, ?, ?)""",
+                (
+                    SidebarJobState.LEASED.value,
+                    SidebarJobState.PENDING.value,
+                    SidebarJobState.RETRY.value,
+                    SidebarJobState.LEASED.value,
+                ),
             ).fetchone()
             last_visible = conn.execute(
                 """SELECT codex_thread_id
@@ -1707,7 +1714,7 @@ class SessionBridgeStore:
         for row in provider_rows:
             if row["provider"] in eligible_by_provider:
                 eligible_by_provider[row["provider"]] = int(row["job_count"])
-        oldest_at = oldest["eligible_at"] if oldest is not None else None
+        oldest_at = oldest["actionable_at"] if oldest is not None else None
         oldest_age = (
             max(0.0, status_time - float(oldest_at))
             if oldest_at is not None
@@ -3740,6 +3747,16 @@ def _public_codex_thread_id(value: object) -> str | None:
     if type(value) is not str or _PUBLIC_CODEX_THREAD_ID.fullmatch(value) is None:
         return None
     return value
+
+
+def redact_codex_thread_id(value: object) -> str | None:
+    """Return a fixed opaque tag only for a structurally safe native task ID."""
+
+    thread_id = _public_codex_thread_id(value)
+    if thread_id is None:
+        return None
+    digest = hashlib.sha256(thread_id.encode("utf-8")).hexdigest()[:16]
+    return f"task:{digest}"
 
 
 def _nonempty_text(value: str, label: str) -> str:
