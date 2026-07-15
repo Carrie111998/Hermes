@@ -16,7 +16,9 @@ from session_bridge.models import (
     ProjectedMessage,
     Provider,
     SessionProjection,
+    SidebarJobState,
 )
+from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
 from session_bridge.store import SessionBridgeStore
 
 
@@ -92,6 +94,94 @@ def _set_sync_error(db_path: Path, session_id: str, detail: str) -> None:
         db.close()
 
 
+def _seed_sidebar_catalog_jobs(db_path: Path) -> dict[str, str]:
+    now = time.time()
+    states = {
+        "sidebar-pending": SidebarJobState.PENDING,
+        "sidebar-leased": SidebarJobState.LEASED,
+        "sidebar-retry": SidebarJobState.RETRY,
+        "sidebar-visible": SidebarJobState.VISIBLE,
+        "sidebar-failed": SidebarJobState.FAILED,
+    }
+    thread_id = "33333333-3333-4333-8333-333333333333"
+    secret_error = "C:/private/native/sidebar.jsonl bearer-secret"
+    secret_lease_digest = "lease-digest-must-not-leak"
+    db = SessionDB(db_path=db_path)
+    try:
+        store = SessionBridgeStore(db, clock=lambda: now)
+        for session_id, state in states.items():
+            db.create_session(
+                session_id,
+                "cli",
+                model="preserved-hermes-model",
+                cwd=f"C:/workspace/{session_id}",
+            )
+            candidate = SidebarCandidate(
+                source_session_id=session_id,
+                provider=Provider.HERMES,
+                bridge_id=sidebar_bridge_id(session_id),
+                title=f"[Hermes] {session_id}",
+                cwd=f"C:/workspace/{session_id}",
+                git_root=None,
+                git_branch=None,
+                git_head=None,
+                worktree_id=None,
+                eligible_at=now - 120.0,
+            )
+            store.enqueue_sidebar_job(candidate)
+
+            def set_state(conn, *, source_id: str = session_id, job_state=state) -> None:
+                values = {
+                    "state": job_state.value,
+                    "lease_digest": (
+                        secret_lease_digest
+                        if job_state is SidebarJobState.LEASED
+                        else None
+                    ),
+                    "lease_expires_at": (
+                        now - 1.0 if job_state is SidebarJobState.LEASED else None
+                    ),
+                    "completion_digest": (
+                        "completion-digest"
+                        if job_state is SidebarJobState.VISIBLE
+                        else None
+                    ),
+                    "codex_thread_id": (
+                        thread_id if job_state is SidebarJobState.VISIBLE else None
+                    ),
+                    "error_code": (
+                        secret_error
+                        if job_state
+                        in (SidebarJobState.RETRY, SidebarJobState.FAILED)
+                        else None
+                    ),
+                    "visible_at": (
+                        now if job_state is SidebarJobState.VISIBLE else None
+                    ),
+                }
+                conn.execute(
+                    """UPDATE session_sidebar_jobs
+                       SET state = :state,
+                           lease_digest = :lease_digest,
+                           lease_expires_at = :lease_expires_at,
+                           completion_digest = :completion_digest,
+                           codex_thread_id = :codex_thread_id,
+                           error_code = :error_code,
+                           visible_at = :visible_at
+                       WHERE source_session_id = :source_id""",
+                    {**values, "source_id": source_id},
+                )
+
+            db._execute_write(set_state)
+    finally:
+        db.close()
+    return {
+        "secret_error": secret_error,
+        "secret_lease_digest": secret_lease_digest,
+        "thread_id": thread_id,
+    }
+
+
 @pytest.mark.asyncio
 async def test_sessions_api_preserves_rows_and_batches_bridge_metadata(
     tmp_path: Path,
@@ -150,6 +240,84 @@ async def test_sessions_api_preserves_rows_and_batches_bridge_metadata(
     assert rows[expected_ids[2]]["bridge_native_id"] == "codex-default"
     assert rows[expected_ids[2]]["bridge_origin_kind"] == "native"
     assert rows[expected_ids[2]]["bridge_mirror_state"] == "catalog_only"
+
+
+@pytest.mark.asyncio
+async def test_sessions_api_exposes_only_sanitized_batched_sidebar_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_profile(db_path, "default")
+    secrets = _seed_sidebar_catalog_jobs(db_path)
+    sidebar_queries: list[str] = []
+    original = SessionBridgeStore.get_bridge_summaries
+
+    def recording_summaries(
+        store: SessionBridgeStore, session_ids: Sequence[str]
+    ) -> dict[str, dict[str, object]]:
+        assert store.db._conn is not None
+
+        def record(statement: str) -> None:
+            if "from session_sidebar_jobs" in statement.casefold():
+                sidebar_queries.append(statement)
+
+        store.db._conn.set_trace_callback(record)
+        try:
+            return original(store, session_ids)
+        finally:
+            store.db._conn.set_trace_callback(None)
+
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile: SessionDB(db_path=db_path),
+    )
+    monkeypatch.setattr(
+        SessionBridgeStore,
+        "get_bridge_summaries",
+        recording_summaries,
+    )
+
+    response = await web_server.get_sessions(limit=20)
+
+    assert len(sidebar_queries) == 1
+    rows = {row["id"]: row for row in response["sessions"]}
+    expected = {
+        "sidebar-pending": ("pending", None, None, False),
+        "sidebar-leased": ("pending", None, None, True),
+        "sidebar-retry": ("retrying", None, "delivery_degraded", False),
+        "sidebar-visible": ("visible", secrets["thread_id"], None, False),
+        "sidebar-failed": ("failed", None, "delivery_degraded", False),
+    }
+    for session_id, values in expected.items():
+        row = rows[session_id]
+        assert (
+            row["bridge_sidebar_state"],
+            row["bridge_sidebar_codex_thread_id"],
+            row["bridge_sidebar_error"],
+            row["bridge_sidebar_stale"],
+        ) == values
+        assert {
+            key for key in row if key.startswith("bridge_sidebar_")
+        } == {
+            "bridge_sidebar_state",
+            "bridge_sidebar_codex_thread_id",
+            "bridge_sidebar_error",
+            "bridge_sidebar_stale",
+        }
+
+    serialized = json.dumps(response, sort_keys=True)
+    for forbidden in (
+        "lease_digest",
+        "lease_token",
+        "signed_marker",
+        "registration_prompt",
+        secrets["secret_error"],
+        secrets["secret_lease_digest"],
+        "C:/claude/claude-default.jsonl",
+    ):
+        assert forbidden not in serialized
 
 
 def test_profiles_sessions_api_preserves_rows_and_batches_once_per_profile(

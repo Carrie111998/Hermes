@@ -8,6 +8,8 @@ import { zh } from '@/i18n/zh'
 import type { SessionInfo } from '@/types/hermes'
 
 import {
+  bridgeSidebarStateLabel,
+  bridgeSidebarStateSearchTerms,
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
   sessionSourceLabel,
@@ -48,6 +50,24 @@ describe('Claude session source metadata', () => {
     expect(sessionSourceSearchTerms('claude')).toEqual(
       expect.arrayContaining(['claude', 'Claude', 'claude code', 'anthropic'])
     )
+  })
+})
+
+describe('Codex sidebar delivery metadata', () => {
+  it('uses the exact public sidebar labels', () => {
+    expect(bridgeSidebarStateLabel('pending')).toBe('Pending')
+    expect(bridgeSidebarStateLabel('visible')).toBe('Visible in Codex')
+    expect(bridgeSidebarStateLabel('retrying')).toBe('Retrying')
+    expect(bridgeSidebarStateLabel('failed')).toBe('Failed')
+    expect(bridgeSidebarStateLabel('unknown')).toBeNull()
+  })
+
+  it('adds the generic Codex sidebar term to every public state', () => {
+    for (const state of ['pending', 'visible', 'retrying', 'failed']) {
+      expect(bridgeSidebarStateSearchTerms(state)).toEqual(
+        expect.arrayContaining(['codex sidebar', state])
+      )
+    }
   })
 })
 

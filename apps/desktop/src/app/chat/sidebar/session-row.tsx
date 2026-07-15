@@ -10,7 +10,12 @@ import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { bridgeProviderLabel, handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
+import {
+  bridgeProviderLabel,
+  bridgeSidebarStateLabel,
+  handoffOriginSource,
+  sessionSourceLabel
+} from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { $attentionSessionIds } from '@/store/session'
@@ -89,6 +94,8 @@ export function SidebarSessionRow({
 
   const bridgeProviderDescription = bridgeProvider ? r.bridgeProvider(bridgeProvider) : null
   const bridgeMirrorStateDescription = bridgeMirrorState ? r.bridgeMirrorState(bridgeMirrorState) : null
+  const bridgeSidebarState = bridgeSidebarStateLabel(session.bridge_sidebar_state)
+  const bridgeSidebarStateDescription = bridgeSidebarState ? `Codex sidebar: ${bridgeSidebarState}` : null
   // Subscribe per-row (the leaf) instead of drilling a set through the list —
   // the atom is tiny and rarely non-empty. True when a clarify prompt in this
   // session is waiting on the user.
@@ -245,6 +252,22 @@ export function SidebarSessionRow({
               title={bridgeMirrorStateDescription ?? undefined}
             >
               {bridgeMirrorState}
+            </span>
+          ) : null}
+          {bridgeSidebarState ? (
+            <span
+              aria-label={bridgeSidebarStateDescription ?? undefined}
+              className={cn(
+                'shrink-0 rounded-[3px] px-1 py-px text-[0.5625rem] font-medium leading-none',
+                session.bridge_sidebar_state === 'failed'
+                  ? 'bg-destructive/10 text-destructive'
+                  : session.bridge_sidebar_state === 'pending' || session.bridge_sidebar_state === 'retrying'
+                    ? 'bg-(--ui-accent)/10 text-(--ui-accent)'
+                    : 'bg-(--ui-control-background) text-(--ui-text-tertiary)'
+              )}
+              title={bridgeSidebarStateDescription ?? undefined}
+            >
+              {bridgeSidebarState}
             </span>
           ) : null}
           <SidebarRowLabel className="flex-1 font-normal group-hover:text-foreground group-data-[working=true]:text-foreground/90">

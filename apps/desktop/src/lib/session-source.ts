@@ -165,3 +165,23 @@ export function bridgeMirrorStateSearchTerms(state: null | string | undefined): 
 
   return id && label ? [id, label, ...(BRIDGE_MIRROR_STATE_ALIASES[id] ?? [])] : []
 }
+
+const BRIDGE_SIDEBAR_STATE_LABELS: Record<string, string> = {
+  failed: 'Failed',
+  pending: 'Pending',
+  retrying: 'Retrying',
+  visible: 'Visible in Codex'
+}
+
+export function bridgeSidebarStateLabel(state: null | string | undefined): string | null {
+  const id = normalizeSessionSource(state)
+
+  return id ? (BRIDGE_SIDEBAR_STATE_LABELS[id] ?? null) : null
+}
+
+export function bridgeSidebarStateSearchTerms(state: null | string | undefined): string[] {
+  const id = normalizeSessionSource(state)
+  const label = bridgeSidebarStateLabel(id)
+
+  return id && label ? ['codex sidebar', id, label] : []
+}

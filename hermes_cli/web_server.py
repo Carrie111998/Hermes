@@ -3826,6 +3826,10 @@ def _add_bridge_metadata_to_sessions(
         "bridge_sync_error",
         "bridge_stale",
         "bridge_id",
+        "bridge_sidebar_state",
+        "bridge_sidebar_codex_thread_id",
+        "bridge_sidebar_error",
+        "bridge_sidebar_stale",
     }
     session_ids = [
         session_id
@@ -3858,6 +3862,8 @@ def _add_bridge_metadata_to_sessions(
             }
             if public_summary.get("bridge_sync_error") is not None:
                 public_summary["bridge_sync_error"] = "sync_degraded"
+            if public_summary.get("bridge_sidebar_error") is not None:
+                public_summary["bridge_sidebar_error"] = "delivery_degraded"
             session.update(public_summary)
 
 

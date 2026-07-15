@@ -77,6 +77,18 @@ describe('sessionMatchesSearch', () => {
     expect(sessionMatchesSearch(makeSession({ bridge_mirror_state: 'catalog_only' }), '僅目錄')).toBe(true)
   })
 
+  it.each([
+    ['pending', 'pending'],
+    ['visible', 'visible'],
+    ['retrying', 'retrying'],
+    ['failed', 'failed']
+  ] as const)('matches %s Codex sidebar delivery status', (state, query) => {
+    const session = makeSession({ bridge_sidebar_state: state })
+
+    expect(sessionMatchesSearch(session, query)).toBe(true)
+    expect(sessionMatchesSearch(session, 'Codex sidebar')).toBe(true)
+  })
+
   it('does not match unrelated queries', () => {
     expect(sessionMatchesSearch(makeSession(), 'totally-unrelated')).toBe(false)
   })

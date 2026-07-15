@@ -107,6 +107,13 @@ SIDEBAR_FATAL_ERRORS = frozenset({
     "permission_preflight_failed",
     "retry_budget_exhausted",
 })
+PUBLIC_SIDEBAR_STATE = {
+    SidebarJobState.PENDING.value: "pending",
+    SidebarJobState.LEASED.value: "pending",
+    SidebarJobState.RETRY.value: "retrying",
+    SidebarJobState.VISIBLE.value: "visible",
+    SidebarJobState.FAILED.value: "failed",
+}
 _SIDEBAR_RETRY_DELAYS_SECONDS = (60.0, 120.0, 240.0, 480.0, 900.0)
 _SIDEBAR_LEASE_SECONDS = 300
 # Four maximum-size broker batches bound malformed-row cleanup per write lock.
@@ -971,6 +978,13 @@ class SessionBridgeStore:
                            OR to_session_id IN ({placeholders})""",
                     [*batch, *batch],
                 ).fetchall()
+                sidebar_rows = conn.execute(
+                    f"""SELECT source_session_id, state, lease_expires_at,
+                               codex_thread_id, error_code
+                        FROM session_sidebar_jobs
+                        WHERE source_session_id IN ({placeholders})""",
+                    batch,
+                ).fetchall()
 
                 jobs_by_session: dict[str, list[str]] = {}
                 for row in job_rows:
@@ -985,6 +999,28 @@ class SessionBridgeStore:
                         links_by_session.setdefault(row["to_session_id"], []).append(
                             link
                         )
+                sidebar_by_session: dict[str, dict[str, Any]] = {}
+                for row in sidebar_rows:
+                    session_id = row["source_session_id"]
+                    if session_id in sidebar_by_session:
+                        raise ValueError("duplicate sidebar summary source identity")
+                    public_state = PUBLIC_SIDEBAR_STATE.get(row["state"])
+                    if public_state is None:
+                        raise ValueError("invalid sidebar summary state")
+                    lease_expires_at = row["lease_expires_at"]
+                    stale = (
+                        row["state"] == SidebarJobState.LEASED.value
+                        and isinstance(lease_expires_at, (int, float))
+                        and not isinstance(lease_expires_at, bool)
+                        and float(lease_expires_at)
+                        <= _finite_number(self._clock(), "store clock")
+                    )
+                    sidebar_by_session[session_id] = {
+                        "bridge_sidebar_state": public_state,
+                        "bridge_sidebar_codex_thread_id": row["codex_thread_id"],
+                        "bridge_sidebar_error": row["error_code"],
+                        "bridge_sidebar_stale": stale,
+                    }
 
                 for row in session_rows:
                     session_id = row["id"]
@@ -992,6 +1028,7 @@ class SessionBridgeStore:
                         summaries[session_id] = {
                             "bridge_provider": Provider.HERMES.value,
                             "bridge_mirror_state": None,
+                            **sidebar_by_session.get(session_id, {}),
                         }
                         continue
                     links = links_by_session.get(session_id, [])
@@ -1004,6 +1041,7 @@ class SessionBridgeStore:
                         ),
                         "bridge_sync_error": row["sync_error"],
                         "bridge_links": [dict(link) for link in links],
+                        **sidebar_by_session.get(session_id, {}),
                     }
         return summaries
 
