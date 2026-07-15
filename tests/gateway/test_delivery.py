@@ -329,3 +329,59 @@ async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypa
     assert saved_files[0].read_text() == long_content
 
 
+
+
+# ---------------------------------------------------------------------------
+# Local delivery routes through the central cron output-dir resolver
+# ---------------------------------------------------------------------------
+
+class TestDeliverLocalOutputDirNaming:
+    """_deliver_local must write into the canonical {name-slug}-{job_id}
+    directory via cron.jobs.resolve_job_output_dir — never recreate the plain
+    legacy {job_id} directory and split output across two dirs."""
+
+    def _router(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        return DeliveryRouter(GatewayConfig(), adapters={})
+
+    def test_job_output_lands_in_slug_dir_not_legacy_dir(self, tmp_path, monkeypatch):
+        router = self._router(tmp_path, monkeypatch)
+
+        result = router._deliver_local("hello", "abc123", "Daily Report", None)
+
+        output_root = tmp_path / "cron" / "output"
+        slug_dir = output_root / "daily-report-abc123"
+        assert slug_dir.is_dir()
+        files = list(slug_dir.glob("*.md"))
+        assert len(files) == 1
+        assert "hello" in files[0].read_text(encoding="utf-8")
+        assert result["path"] == str(files[0])
+        # No plain legacy {job_id} dir gets (re)created.
+        assert not (output_root / "abc123").exists()
+
+    def test_job_output_migrates_existing_legacy_dir(self, tmp_path, monkeypatch):
+        router = self._router(tmp_path, monkeypatch)
+        legacy_dir = tmp_path / "cron" / "output" / "abc123"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "old.md").write_text("old run", encoding="utf-8")
+
+        router._deliver_local("new run", "abc123", "Daily Report", None)
+
+        output_root = tmp_path / "cron" / "output"
+        slug_dir = output_root / "daily-report-abc123"
+        assert not (output_root / "abc123").exists()  # migrated, not split
+        assert (slug_dir / "old.md").read_text(encoding="utf-8") == "old run"
+        assert len(list(slug_dir.glob("*.md"))) == 2
+
+    def test_unsafe_job_id_falls_back_to_misc_without_raising(self, tmp_path, monkeypatch):
+        router = self._router(tmp_path, monkeypatch)
+
+        result = router._deliver_local("payload", "../escape", "Evil", None)
+
+        misc_files = list((tmp_path / "cron" / "output" / "misc").glob("*.md"))
+        assert len(misc_files) == 1
+        assert result["path"] == str(misc_files[0])
+        # Nothing escaped the output root.
+        assert not (tmp_path / "cron" / "escape").exists()
+        assert not (tmp_path / "escape").exists()

@@ -399,12 +399,30 @@ class DeliveryRouter:
     ) -> Dict[str, Any]:
         """Save content to local files."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
+        output_path = None
         if job_id:
-            output_path = self.output_dir / job_id / f"{timestamp}.md"
-        else:
+            # Route through the central resolver so local delivery writes into
+            # the canonical {name-slug}-{job_id} directory (migrating a legacy
+            # {job_id} dir) instead of recreating the plain {job_id} form and
+            # splitting output across two directories. The resolver is also
+            # profile-aware (context-local cron store), unlike the
+            # get_hermes_home() snapshot taken at router construction.
+            # Lazy import keeps cron.jobs off the gateway cold-start path.
+            from cron.jobs import resolve_job_output_dir
+            try:
+                job_dir = resolve_job_output_dir(job_id, job_name, create=True)
+                output_path = job_dir / f"{timestamp}.md"
+            except ValueError as e:
+                # Unsafe/legacy job id — fail closed on the per-job dir but
+                # never crash delivery; fall back to the misc/ bucket.
+                logger.warning(
+                    "Local delivery: invalid job id %r (%s); saving to misc/",
+                    job_id, e,
+                )
+        if output_path is None:
             output_path = self.output_dir / "misc" / f"{timestamp}.md"
-        
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Build the output document
