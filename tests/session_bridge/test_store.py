@@ -3045,6 +3045,53 @@ def test_sidebar_commit_requires_exact_unexpired_token_and_is_idempotent(db) -> 
     ).hexdigest()
 
 
+def test_sidebar_digest_auth_uses_bounded_equality_candidates_for_commit_replay(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("indexed-commit-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="indexed-commit")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    statements: list[str] = []
+    with db._lock:
+        assert db._conn is not None
+        db._conn.set_trace_callback(statements.append)
+    try:
+        committed = store.commit_sidebar_job(
+            lease_token=lease["lease_token"],
+            codex_thread_id="codex-indexed-thread",
+            now=200.0,
+        )
+        replay = store.commit_sidebar_job(
+            lease_token=lease["lease_token"],
+            codex_thread_id="codex-indexed-thread",
+            now=201.0,
+        )
+    finally:
+        with db._lock:
+            assert db._conn is not None
+            db._conn.set_trace_callback(None)
+
+    normalized = [" ".join(statement.upper().split()) for statement in statements]
+    digest_queries = [
+        statement
+        for statement in normalized
+        if "SELECT * FROM SESSION_SIDEBAR_JOBS" in statement
+        and ("LEASE_DIGEST =" in statement or "COMPLETION_DIGEST =" in statement)
+    ]
+    assert replay == committed
+    assert digest_queries
+    assert all("LIMIT 2" in statement for statement in digest_queries)
+    assert not any(
+        "LEASE_DIGEST IS NOT NULL OR COMPLETION_DIGEST IS NOT NULL" in statement
+        for statement in normalized
+    )
+
+
 def test_sidebar_commit_rejects_expiry_and_recovers_the_job(db) -> None:
     store = SessionBridgeStore(
         db,
@@ -3122,6 +3169,43 @@ def test_sidebar_fail_rejects_non_allowlisted_error_without_releasing(db) -> Non
     assert row["state"] == SidebarJobState.LEASED.value
     assert row["error_code"] is None
     assert "error_detail" not in row
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [None, True, False, [], {}, 1, 1.0, b"desktop_offline"],
+)
+def test_sidebar_fail_rejects_nonstring_error_codes_without_mutating_lease(
+    db, error_code
+) -> None:
+    token = f"nonstring-error-{type(error_code).__name__}-{error_code!r}"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(token),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(
+        db,
+        native_id=f"nonstring-error-{type(error_code).__name__}",
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert before is not None
+
+    with pytest.raises(ValueError, match="fixed allowlist"):
+        store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code=error_code,
+            now=150.0,
+        )
+
+    after = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert after == before
+    assert after is not None
+    assert after["state"] == SidebarJobState.LEASED.value
+    assert after["lease_digest"] == hashlib.sha256(token.encode()).hexdigest()
+    assert after["attempts"] == 0
 
 
 def test_sidebar_retryable_error_allowlist_is_the_exact_fixed_contract() -> None:
@@ -3369,6 +3453,69 @@ def test_malformed_sidebar_provider_row_does_not_block_valid_provider(db) -> Non
     )[0]
     assert malformed["state"] == SidebarJobState.FAILED.value
     assert malformed["error_code"] == "provider_mismatch"
+
+
+def test_sidebar_claim_scans_bounded_pages_and_eventually_passes_malformed_rows(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("bounded-scan-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+
+    def _seed_malformed_page(conn) -> None:
+        for index in range(45):
+            source_session_id = f"codex:malformed-page-{index:02d}"
+            conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, 'codex', 1)",
+                (source_session_id,),
+            )
+            conn.execute(
+                """INSERT INTO session_sidebar_jobs (
+                   id, idempotency_key, source_session_id, bridge_id, state,
+                   attempts, next_attempt_at, eligible_at, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, 'sidebar_pending', 0, 1, ?, 1, 1)""",
+                (
+                    f"sidebar-malformed-page-{index:02d}",
+                    f"codex-sidebar:{source_session_id}:v1",
+                    source_session_id,
+                    "sidebar:" + f"{index:064x}",
+                    float(index),
+                ),
+            )
+
+    db._execute_write(_seed_malformed_page)
+    valid = _sidebar_candidate(db, native_id="after-malformed-page", eligible_at=100.0)
+    store.enqueue_sidebar_job(valid)
+    statements: list[str] = []
+    with db._lock:
+        assert db._conn is not None
+        db._conn.set_trace_callback(statements.append)
+    try:
+        first = store.claim_sidebar_jobs(now=200.0, limit=1)
+        after_first = store.sidebar_job_counts()
+        second = store.claim_sidebar_jobs(now=200.0, limit=1)
+    finally:
+        with db._lock:
+            assert db._conn is not None
+            db._conn.set_trace_callback(None)
+
+    due_queries = [
+        " ".join(statement.upper().split())
+        for statement in statements
+        if "SELECT * FROM SESSION_SIDEBAR_JOBS" in statement.upper()
+        and "ORDER BY ELIGIBLE_AT, ID" in " ".join(statement.upper().split())
+    ]
+    assert first == []
+    assert after_first[SidebarJobState.FAILED.value] == 40
+    assert after_first[SidebarJobState.PENDING.value] == 6
+    assert [job["source_session_id"] for job in second] == [
+        valid.source_session_id
+    ]
+    assert len({job["id"] for job in second}) == 1
+    assert len(due_queries) == 2
+    assert all("LIMIT 40" in statement for statement in due_queries)
 
 
 def test_sidebar_counts_and_source_lookup_have_stable_public_shapes(db) -> None:

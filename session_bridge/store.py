@@ -83,6 +83,8 @@ SIDEBAR_FATAL_ERRORS = frozenset({
 })
 _SIDEBAR_RETRY_DELAYS_SECONDS = (60.0, 120.0, 240.0, 480.0, 900.0)
 _SIDEBAR_LEASE_SECONDS = 300
+# Four maximum-size broker batches bound malformed-row cleanup per write lock.
+_SIDEBAR_CLAIM_SCAN_LIMIT = 40
 
 
 NativeProjectionCursor = tuple[float, str]
@@ -826,11 +828,13 @@ class SessionBridgeStore:
             due = conn.execute(
                 """SELECT * FROM session_sidebar_jobs
                    WHERE state IN (?, ?) AND next_attempt_at <= ?
-                   ORDER BY eligible_at, id""",
+                   ORDER BY eligible_at, id
+                   LIMIT ?""",
                 (
                     SidebarJobState.PENDING.value,
                     SidebarJobState.RETRY.value,
                     claim_time,
+                    _SIDEBAR_CLAIM_SCAN_LIMIT,
                 ),
             ).fetchall()
             claimed: list[dict[str, Any]] = []
@@ -964,9 +968,12 @@ class SessionBridgeStore:
         error_code: str,
         now: float,
     ) -> dict[str, Any]:
-        token_digest = _sidebar_lease_digest(lease_token)
-        if error_code not in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS:
+        if (
+            type(error_code) is not str
+            or error_code not in SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS
+        ):
             raise ValueError("sidebar error code is not in the fixed allowlist")
+        token_digest = _sidebar_lease_digest(lease_token)
         failure_time = _finite_number(now, "now")
 
         def _write(conn):
@@ -2211,25 +2218,32 @@ def _find_sidebar_job_by_digest(
     *,
     allow_completion: bool,
 ) -> tuple[Mapping[str, Any] | None, bool]:
-    rows = conn.execute(
-        """SELECT * FROM session_sidebar_jobs
-           WHERE lease_digest IS NOT NULL OR completion_digest IS NOT NULL"""
-    ).fetchall()
     matches: list[tuple[Mapping[str, Any], bool]] = []
-    for row in rows:
+    lease_rows = conn.execute(
+        """SELECT * FROM session_sidebar_jobs
+           WHERE lease_digest = ? LIMIT 2""",
+        (token_digest,),
+    ).fetchall()
+    for row in lease_rows:
         lease_digest = row["lease_digest"]
         if isinstance(lease_digest, str) and hmac.compare_digest(
             lease_digest,
             token_digest,
         ):
             matches.append((row, False))
-        completion_digest = row["completion_digest"]
-        if (
-            allow_completion
-            and isinstance(completion_digest, str)
-            and hmac.compare_digest(completion_digest, token_digest)
-        ):
-            matches.append((row, True))
+    if allow_completion:
+        completion_rows = conn.execute(
+            """SELECT * FROM session_sidebar_jobs
+               WHERE completion_digest = ? LIMIT 2""",
+            (token_digest,),
+        ).fetchall()
+        for row in completion_rows:
+            completion_digest = row["completion_digest"]
+            if isinstance(completion_digest, str) and hmac.compare_digest(
+                completion_digest,
+                token_digest,
+            ):
+                matches.append((row, True))
     if len(matches) > 1:
         raise ValueError("ambiguous sidebar lease token")
     return matches[0] if matches else (None, False)
