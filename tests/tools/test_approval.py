@@ -542,6 +542,30 @@ class TestSensitiveInPlaceEditPattern:
         assert key is None
         assert desc is None
 
+    def test_awk_in_place_hermes_env(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "awk -i inplace '{gsub(/SECRET=old/, \"SECRET=new\")}' ~/.hermes/.env"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "hermes config/env" in desc.lower() or "awk" in desc.lower()
+
+    def test_awk_in_place_hermes_config(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "awk -i inplace '{gsub(/manual/, \"off\")}' ~/.hermes/config.yaml"
+        )
+        assert dangerous is True
+        assert key is not None
+        assert "hermes config/env" in desc.lower() or "awk" in desc.lower()
+
+    def test_awk_without_inplace_hermes_config_safe(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "awk '{print}' ~/.hermes/config.yaml"
+        )
+        assert dangerous is False
+        assert key is None
+        assert desc is None
+
     def test_sed_in_place_regular_file_safe(self):
         dangerous, key, desc = detect_dangerous_command("sed -i 's/a/b/' notes.txt")
         assert dangerous is False
