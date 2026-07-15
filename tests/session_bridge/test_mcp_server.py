@@ -1027,7 +1027,7 @@ def test_session_sidebar_pending_cleans_one_bad_claim_and_returns_other_good_cla
     assert failed["error_code"] == "source_identity_mismatch"
 
 
-def test_session_sidebar_pending_preflight_failures_never_claim(
+def test_session_sidebar_pending_marker_preflight_failure_never_claims(
     db: SessionDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1059,20 +1059,38 @@ def test_session_sidebar_pending_preflight_failures_never_claim(
     assert marker_failure["result"]["isError"] is True
     assert coordinator.sidebar_claim_limits == []
 
-    monkeypatch.setattr(
-        store,
-        "record_sidebar_broker_heartbeat",
-        lambda **_: (_ for _ in ()).throw(RuntimeError("heartbeat secret")),
+
+def test_session_sidebar_pending_claim_failure_does_not_advance_heartbeat(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+
+    class FailingClaimCoordinator(_FakeCoordinator):
+        async def claim_sidebar_jobs_for_delivery(
+            self, *, limit: int
+        ) -> tuple[SidebarDeliveryClaim, ...]:
+            self.sidebar_claim_limits.append(limit)
+            raise RuntimeError("claim unavailable")
+
+    coordinator = FailingClaimCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
     )
+    store.record_sidebar_broker_heartbeat(now=123.0)
+    before = store.get_state("session-bridge:sidebar:broker-heartbeat")
+
     with _test_client(_create_test_app(db, store, coordinator)) as client:
-        heartbeat_failure = _rpc(
+        response = _rpc(
             client,
             "tools/call",
             {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
-            request_id=44,
+            request_id=45,
         )
-    assert heartbeat_failure["result"]["isError"] is True
-    assert coordinator.sidebar_claim_limits == []
+
+    assert response["result"]["isError"] is True
+    assert coordinator.sidebar_claim_limits == [5]
+    assert store.get_state("session-bridge:sidebar:broker-heartbeat") == before
 
 
 def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
@@ -1302,6 +1320,7 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = ()
+    store.record_sidebar_broker_heartbeat(now=100.0)
     coordinator.health = lambda: {
         "running": True,
         "marker": "signed-marker-must-not-leak",

@@ -389,10 +389,6 @@ def create_app(
             secret = marker_key
             if secret is None:
                 secret = await asyncio.to_thread(resolve_marker_key)
-            await asyncio.to_thread(
-                store.record_sidebar_broker_heartbeat,
-                now=time.time(),
-            )
             claims = await claim_method(limit=bounded_limit)
             if not isinstance(claims, tuple) or len(claims) > bounded_limit:
                 raise ValueError("malformed sidebar claims")

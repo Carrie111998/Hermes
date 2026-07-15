@@ -1064,9 +1064,12 @@ def _public_sidebar_status(
         if heartbeat_age is not None
         else oldest_age is not None and oldest_age > threshold
     )
-    if work_pending and heartbeat_stale:
+    overdue_work = (
+        work_pending and oldest_age is not None and oldest_age > threshold
+    )
+    if overdue_work and heartbeat_stale:
         degraded_reasons.append("broker_heartbeat_stale")
-    if work_pending and oldest_age is not None and oldest_age > threshold:
+    if overdue_work:
         degraded_reasons.append("oldest_pending_stale")
     raw_codes = raw.get("recent_error_codes")
     allowed_codes = SIDEBAR_RETRYABLE_ERRORS | SIDEBAR_FATAL_ERRORS

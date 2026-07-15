@@ -341,6 +341,50 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
     assert "marker" not in rendered
 
 
+@pytest.mark.parametrize(
+    ("oldest_age", "heartbeat_at", "healthy", "reasons"),
+    (
+        (179.0, 1.0, True, []),
+        (180.0, None, True, []),
+        (
+            181.0,
+            None,
+            False,
+            ["broker_heartbeat_stale", "oldest_pending_stale"],
+        ),
+        (
+            181.0,
+            819.0,
+            False,
+            ["broker_heartbeat_stale", "oldest_pending_stale"],
+        ),
+        (181.0, 999.0, False, ["oldest_pending_stale"]),
+    ),
+)
+def test_sidebar_status_alerts_only_for_work_older_than_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    oldest_age: float,
+    heartbeat_at: float | None,
+    healthy: bool,
+    reasons: list[str],
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"pending": 1},
+        "oldest_pending_age_seconds": oldest_age,
+        "last_heartbeat_at": heartbeat_at,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is healthy
+    assert status["degraded_reasons"] == reasons
+
+
 def test_sidebar_continuous_preserves_unrelated_hermes_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
