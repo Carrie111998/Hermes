@@ -186,7 +186,7 @@ class UnifiedCatalog:
 
         where: list[str] = [
             "link.relation IN (?, ?)",
-            "source.provider IS NOT NULL",
+            "source_session.id IS NOT NULL",
             "target.provider IS NOT NULL",
         ]
         params: list[Any] = [Relation.MIRRORS.value, Relation.CONTINUES.value]
@@ -207,7 +207,9 @@ class UnifiedCatalog:
                 f"""SELECT link.bridge_id, link.from_session_id, link.to_session_id,
                            target.provider AS target_provider
                       FROM session_links AS link
-                      JOIN external_sessions AS source
+                      JOIN sessions AS source_session
+                        ON source_session.id = link.from_session_id
+                      LEFT JOIN external_sessions AS source
                         ON source.session_id = link.from_session_id
                       JOIN external_sessions AS target
                         ON target.session_id = link.to_session_id

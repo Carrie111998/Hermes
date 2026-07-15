@@ -2794,6 +2794,71 @@ def test_bridge_summaries_are_batched_and_include_catalog_state(db):
     }
 
 
+def test_native_hermes_snapshot_identity_is_stable_and_tracks_messages(db):
+    store = SessionBridgeStore(db)
+    db.create_session("hermes-native", "tui", cwd="C:/workspace/project")
+    db.append_message(
+        "hermes-native",
+        "user",
+        "continue this native Hermes session",
+        timestamp=100.0,
+    )
+
+    first = store.get_native_session_snapshot("hermes-native")
+    replay = store.get_native_session_snapshot("hermes-native")
+
+    assert first == replay
+    assert first is not None
+    assert first["session_id"] == "hermes-native"
+    assert first["provider"] == Provider.HERMES.value
+    assert first["cursor"].startswith("hermes:")
+    assert len(first["source_hash"]) == 64
+
+    db.append_message(
+        "hermes-native",
+        "assistant",
+        "native continuation ready",
+        timestamp=101.0,
+    )
+    advanced = store.get_native_session_snapshot("hermes-native")
+
+    assert advanced is not None
+    assert advanced["cursor"] != first["cursor"]
+    assert advanced["source_hash"] != first["source_hash"]
+
+
+def test_native_hermes_snapshot_canonicalizes_binary_and_nonfinite_content(db):
+    store = SessionBridgeStore(db)
+    db.create_session("hermes-structured", "tui")
+    db.append_message(
+        "hermes-structured",
+        "user",
+        b"binary content",
+        timestamp=100.0,
+    )
+    db.append_message(
+        "hermes-structured",
+        "assistant",
+        [float("nan"), float("inf"), float("-inf")],
+        timestamp=101.0,
+    )
+
+    first = store.get_native_session_snapshot("hermes-structured")
+    replay = store.get_native_session_snapshot("hermes-structured")
+
+    assert first == replay
+    assert first is not None
+    assert first["cursor"].startswith("hermes:2:")
+    assert len(first["source_hash"]) == 64
+
+
+def test_native_hermes_snapshot_rejects_external_sessions(db):
+    store = SessionBridgeStore(db)
+    store.upsert_projection(_projection(_message("external", "source")))
+
+    assert store.get_native_session_snapshot("claude:native-1") is None
+
+
 def _sidebar_candidate(
     db: SessionDB,
     *,

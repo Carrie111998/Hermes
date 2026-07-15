@@ -1516,6 +1516,37 @@ class SessionBridgeCoordinator:
         async with lock:
             return await self._continue_locked(request)
 
+    async def _refresh_continuation_source(
+        self, session_id: str
+    ) -> RefreshResult:
+        native_snapshot_method = getattr(
+            self._store, "get_native_session_snapshot", None
+        )
+        if callable(native_snapshot_method):
+            native = await asyncio.to_thread(native_snapshot_method, session_id)
+            if native is not None:
+                if not isinstance(native, Mapping):
+                    raise RuntimeError("native Hermes snapshot is invalid")
+                cursor = native.get("cursor")
+                source_hash = native.get("source_hash")
+                if (
+                    native.get("session_id") != session_id
+                    or native.get("provider") != Provider.HERMES.value
+                    or not isinstance(cursor, str)
+                    or not cursor.strip()
+                    or not isinstance(source_hash, str)
+                    or not source_hash.strip()
+                ):
+                    raise RuntimeError("native Hermes snapshot is invalid")
+                return RefreshResult(
+                    session_id=session_id,
+                    cursor=cursor.strip(),
+                    source_hash=source_hash.strip(),
+                    stale=False,
+                    warning=None,
+                )
+        return await self.refresh_session(session_id, timeout=self._refresh_timeout)
+
     async def _continue_locked(self, request: ContinueRequest) -> ContinueResult:
         exact_worktree, worktree_warnings = await self._continuation_worktree(
             request
@@ -1526,10 +1557,7 @@ class SessionBridgeCoordinator:
             "get_continuation_snapshot",
             request.bridge_id,
         )
-        source = await self.refresh_session(
-            request.session_id,
-            timeout=self._refresh_timeout,
-        )
+        source = await self._refresh_continuation_source(request.session_id)
         pending_pack: ContextPack | None = None
         if snapshot is None:
             existing_pack_row = await asyncio.to_thread(

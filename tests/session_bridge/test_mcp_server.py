@@ -1600,6 +1600,53 @@ def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
     assert len(links) == 1
 
 
+def test_native_hermes_sidebar_lineage_resolves_for_codex_continuation(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 1_000.0)
+    source_id = "hermes-native-source"
+    db.create_session(source_id, "tui", cwd="C:/work/hermes")
+    bridge_id = sidebar_bridge_id(source_id)
+    thread_id = "44444444-4444-4444-8444-444444444444"
+    target_id = f"codex:{thread_id}"
+    store.upsert_projection(
+        _projection(
+            Provider.CODEX,
+            thread_id,
+            title="Native Hermes sidebar placeholder",
+            cwd="C:/work/hermes",
+            timestamp=950.0,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=bridge_id,
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="native-hermes-sidebar-link",
+            from_session_id=source_id,
+            to_session_id=target_id,
+            relation=Relation.MIRRORS,
+            bridge_id=bridge_id,
+            source_cursor=None,
+            source_hash=None,
+            created_at=1_000.0,
+        )
+    )
+
+    resolved = UnifiedCatalog(db, store).resolve_continuation(
+        session_id=source_id,
+        bridge_id=None,
+        target_provider="codex",
+    )
+
+    assert resolved == {
+        "source_session_id": source_id,
+        "target_session_id": target_id,
+        "target_provider": "codex",
+        "bridge_id": bridge_id,
+    }
+
+
 def test_session_continue_is_idempotent_for_identical_snapshot_and_budget(
     db: SessionDB,
     tmp_path: Path,

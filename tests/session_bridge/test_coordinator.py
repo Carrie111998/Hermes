@@ -993,12 +993,34 @@ class _ContinuationStore:
     def __init__(self, operations: list[tuple[object, ...]]) -> None:
         self.operations = operations
         self.external: dict[str, dict[str, Any]] = {}
+        self.native: dict[str, dict[str, Any]] = {}
         self.origin_rows: dict[tuple[str, Provider], dict[str, Any]] = {}
         self.pack: ContextPack | None = None
         self.link_row: dict[str, Any] | None = None
         self.continuation_snapshot: dict[str, Any] | None = None
         self.transition_calls: list[tuple[str, str, str, str]] = []
         self.divergence_calls: list[tuple[str, float]] = []
+
+    def add_native_snapshot(
+        self,
+        session_id: str,
+        *,
+        cursor: str,
+        source_hash: str,
+    ) -> None:
+        self.native[session_id] = {
+            "session_id": session_id,
+            "provider": Provider.HERMES.value,
+            "cursor": cursor,
+            "source_hash": source_hash,
+        }
+
+    def get_native_session_snapshot(
+        self, session_id: str
+    ) -> dict[str, Any] | None:
+        self.operations.append(("get_native", session_id))
+        row = self.native.get(session_id)
+        return deepcopy(row) if row is not None else None
 
     def add_external(
         self,
@@ -3831,6 +3853,62 @@ async def test_continue_refreshes_before_build_and_atomically_transitions_exact_
         created_at=90.0,
     )
     assert result.warnings == ()
+
+
+@pytest.mark.asyncio
+async def test_continue_hydrates_native_hermes_source_without_external_adapter(
+) -> None:
+    operations: list[tuple[object, ...]] = []
+    source_id = "hermes-native-source"
+    bridge_id = "sidebar:hermes-native-source"
+    target_projection = replace(
+        _refresh_projection(Provider.CODEX),
+        native_id="target-existing",
+        native_cursor="codex-target-cursor-fresh",
+        native_hash="codex-target-hash-fresh",
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=bridge_id,
+    )
+    store = _ContinuationStore(operations)
+    store.add_native_snapshot(
+        source_id,
+        cursor="hermes:4:293335",
+        source_hash="h" * 64,
+    )
+    store.add_external(
+        "codex:target-existing",
+        provider=Provider.CODEX,
+        native_id="target-existing",
+        cursor="codex-target-cursor-old",
+        source_hash="codex-target-hash-old",
+        origin_bridge_id=bridge_id,
+    )
+    builder = _RecordingContextBuilder(store, operations)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={
+            Provider.CODEX: _RefreshAdapter(target_projection, operations),
+        },
+        context_builder=builder,
+        clock=lambda: 100.0,
+    )
+
+    result = await coordinator.continue_session(
+        ContinueRequest(
+            session_id=source_id,
+            bridge_id=bridge_id,
+            target_provider=Provider.CODEX,
+            context_budget_chars=4_000,
+        )
+    )
+
+    assert builder.requests[0].source_session_id == source_id
+    assert builder.requests[0].source_cursor == "hermes:4:293335"
+    assert builder.requests[0].source_hash == "h" * 64
+    assert result.pack.source_session_id == source_id
+    assert ("get_native", source_id) in operations
+    assert ("get_external", source_id) not in operations
 
 
 def test_worktree_snapshot_is_transactional_immutable_and_restart_safe(

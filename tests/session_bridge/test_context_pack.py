@@ -772,6 +772,65 @@ def test_existing_pack_replay_rechecks_current_snapshot_identity(db: SessionDB):
     assert persisted["payload"] == first.payload
 
 
+def test_native_pack_rejects_messages_appended_after_snapshot_refresh(
+    db: SessionDB,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 900.0)
+    db.create_session("hermes-native", "tui", cwd="C:/workspace/native")
+    db.append_message(
+        "hermes-native",
+        "user",
+        "snapshot before continuation",
+        timestamp=101.0,
+    )
+    source = store.get_native_session_snapshot("hermes-native")
+    assert source is not None
+    store.upsert_projection(
+        SessionProjection(
+            provider=Provider.CODEX,
+            native_id="native-target",
+            title="Native target",
+            cwd="C:/workspace/native",
+            started_at=100.0,
+            last_active=101.0,
+            messages=[],
+            native_cursor="target-cursor",
+            native_hash="target-hash",
+        )
+    )
+    store.create_link(
+        SessionLink(
+            id="native-race-link",
+            from_session_id="hermes-native",
+            to_session_id="codex:native-target",
+            relation=Relation.MIRRORS,
+            bridge_id="native-race-bridge",
+            source_cursor=source["cursor"],
+            source_hash=source["source_hash"],
+            created_at=110.0,
+        )
+    )
+    request = ContextPackRequest(
+        source_session_id="hermes-native",
+        target_provider=Provider.CODEX,
+        bridge_id="native-race-bridge",
+        source_cursor=source["cursor"],
+        source_hash=source["source_hash"],
+        budget_chars=8000,
+    )
+
+    db.append_message(
+        "hermes-native",
+        "assistant",
+        "message appended between refresh and context build",
+        timestamp=102.0,
+    )
+
+    with pytest.raises(ValueError, match="snapshot identity mismatch"):
+        ContextPackBuilder(db, store).build(request)
+    assert store.get_context_pack("native-race-bridge", budget_chars=8000) is None
+
+
 def test_existing_explicitly_stale_pack_replay_keeps_visible_warning(db: SessionDB):
     old_message = _message("u1", "user", "C1 snapshot", timestamp=101.0)
     store = _seed(

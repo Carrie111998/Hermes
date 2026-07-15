@@ -13,7 +13,7 @@ from typing import Any
 from hermes_state import SessionDB
 
 from .models import ContextPack, Provider
-from .store import SessionBridgeStore
+from .store import SessionBridgeStore, _native_session_snapshot_identity
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ class _SourceSnapshot:
     session: Mapping[str, Any] | None
     messages: Sequence[Mapping[str, Any]]
     external: Mapping[str, Any] | None
+    native_identity: Mapping[str, str] | None
     activity_value_json: str | None
     target_session_id: str | None
     target_external: Mapping[str, Any] | None
@@ -179,16 +180,21 @@ class ContextPackBuilder:
             raise KeyError(request.source_session_id)
 
         external = snapshot.external
-        snapshot_mismatch = external is not None and (
-            (
+        if external is not None:
+            snapshot_mismatch = (
                 external["last_native_cursor"] is not None
                 and external["last_native_cursor"] != request.source_cursor
-            )
-            or (
+            ) or (
                 external["last_native_hash"] is not None
                 and external["last_native_hash"] != request.source_hash
             )
-        )
+        elif snapshot.native_identity is not None:
+            snapshot_mismatch = (
+                snapshot.native_identity["cursor"] != request.source_cursor
+                or snapshot.native_identity["source_hash"] != request.source_hash
+            )
+        else:
+            snapshot_mismatch = False
         if snapshot_mismatch and not request.stale:
             raise ValueError("source snapshot identity mismatch")
 
@@ -322,7 +328,7 @@ class ContextPackBuilder:
                 ).fetchone()
                 message_rows = conn.execute(
                     """SELECT * FROM messages
-                       WHERE session_id = ? AND active = 1 ORDER BY id""",
+                       WHERE session_id = ? ORDER BY id""",
                     (request.source_session_id,),
                 ).fetchall()
                 external_row = conn.execute(
@@ -347,21 +353,33 @@ class ContextPackBuilder:
             finally:
                 conn.rollback()
 
+        session = dict(session_row) if session_row is not None else None
+        message_records = [dict(row) for row in message_rows]
+        native_identity = (
+            _native_session_snapshot_identity(
+                session,
+                message_records,
+                decode_content=self.db._decode_content,
+            )
+            if session is not None and external_row is None
+            else None
+        )
         messages: list[dict[str, Any]] = []
-        for row in message_rows:
-            message = dict(row)
+        for message in message_records:
             message["content"] = self.db._decode_content(message.get("content"))
             if message.get("tool_calls"):
                 try:
                     message["tool_calls"] = json.loads(message["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
                     message["tool_calls"] = []
-            messages.append(message)
+            if message.get("active") == 1:
+                messages.append(message)
         return _SourceSnapshot(
             existing_pack=(dict(existing_row) if existing_row is not None else None),
-            session=dict(session_row) if session_row is not None else None,
+            session=session,
             messages=messages,
             external=dict(external_row) if external_row is not None else None,
+            native_identity=native_identity,
             activity_value_json=(
                 activity_row["value_json"] if activity_row is not None else None
             ),

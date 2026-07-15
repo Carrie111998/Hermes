@@ -61,6 +61,39 @@ _WORKTREE_SNAPSHOT_FIELDS = frozenset({
     "head",
     "worktree_id",
 })
+_NATIVE_SESSION_SNAPSHOT_FIELDS = (
+    "id",
+    "source",
+    "model",
+    "title",
+    "started_at",
+    "ended_at",
+    "end_reason",
+    "message_count",
+    "tool_call_count",
+    "cwd",
+    "git_branch",
+    "git_repo_root",
+    "rewind_count",
+    "archived",
+)
+_NATIVE_MESSAGE_SNAPSHOT_FIELDS = (
+    "id",
+    "role",
+    "content",
+    "tool_call_id",
+    "tool_calls",
+    "tool_name",
+    "timestamp",
+    "finish_reason",
+    "reasoning",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "reasoning_content",
+    "codex_message_items",
+    "active",
+    "compacted",
+)
 _SIDEBAR_DELIVERY_STATE_FIELDS = frozenset({
     "version",
     "source_session_id",
@@ -128,6 +161,76 @@ _SIDEBAR_LATENCY_SAMPLE_LIMIT = 512
 
 NativeProjectionCursor = tuple[float, str]
 SidebarCandidateCursor = tuple[float, str]
+
+
+def _canonical_snapshot_value(value: object) -> list[Any]:
+    """Encode persisted SQLite/JSON values without lossy type coercion."""
+
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", str(value)]
+    if isinstance(value, float):
+        if math.isnan(value):
+            encoded_float = "nan"
+        elif math.isinf(value):
+            encoded_float = "infinity" if value > 0 else "-infinity"
+        else:
+            encoded_float = value.hex()
+        return ["float", encoded_float]
+    if isinstance(value, str):
+        return ["str", value]
+    if isinstance(value, bytes):
+        return ["bytes", value.hex()]
+    if isinstance(value, Mapping):
+        items = [
+            (_canonical_snapshot_value(key), _canonical_snapshot_value(item))
+            for key, item in value.items()
+        ]
+        items.sort(
+            key=lambda pair: json.dumps(
+                pair[0], separators=(",", ":"), ensure_ascii=False
+            )
+        )
+        return ["mapping", items]
+    if isinstance(value, Sequence):
+        return ["sequence", [_canonical_snapshot_value(item) for item in value]]
+    raise TypeError(f"unsupported native snapshot value: {type(value).__name__}")
+
+
+def _native_session_snapshot_identity(
+    session_row: Mapping[str, Any],
+    message_rows: Sequence[Mapping[str, Any]],
+    *,
+    decode_content: Callable[[Any], Any],
+) -> dict[str, str]:
+    session_payload = {
+        key: session_row[key] for key in _NATIVE_SESSION_SNAPSHOT_FIELDS
+    }
+    messages_payload: list[dict[str, Any]] = []
+    for row in message_rows:
+        message = {key: row[key] for key in _NATIVE_MESSAGE_SNAPSHOT_FIELDS}
+        message["content"] = decode_content(message.get("content"))
+        messages_payload.append(message)
+    canonical = _canonical_snapshot_value(
+        {"session": session_payload, "messages": messages_payload}
+    )
+    encoded = json.dumps(
+        canonical,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    source_hash = hashlib.sha256(encoded).hexdigest()
+    last_message_id = messages_payload[-1]["id"] if messages_payload else 0
+    return {
+        "cursor": (
+            f"hermes:{len(messages_payload)}:{last_message_id}:{source_hash[:16]}"
+        ),
+        "source_hash": source_hash,
+    }
 
 
 class _MirrorWorkerFileLock:
@@ -917,6 +1020,59 @@ class SessionBridgeStore:
         ):
             raise ValueError("invalid session launch metadata")
         return metadata
+
+    def get_native_session_snapshot(
+        self, session_id: str
+    ) -> dict[str, str] | None:
+        """Return a stable snapshot identity for a native Hermes session.
+
+        External harness sessions already carry provider cursors and hashes in
+        ``external_sessions``. Native Hermes rows do not, so continuation uses
+        this transactionally read digest instead of pretending they are an
+        external provider session.
+        """
+
+        normalized_session_id = _nonempty_text(session_id, "session ID")
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            session_row = conn.execute(
+                """SELECT s.id, s.source, s.model, s.title, s.started_at,
+                          s.ended_at, s.end_reason, s.message_count,
+                          s.tool_call_count, s.cwd, s.git_branch,
+                          s.git_repo_root, s.rewind_count, s.archived,
+                          e.session_id AS external_session_id
+                     FROM sessions AS s
+                     LEFT JOIN external_sessions AS e ON e.session_id = s.id
+                    WHERE s.id = ?""",
+                (normalized_session_id,),
+            ).fetchone()
+            if session_row is None:
+                raise KeyError(normalized_session_id)
+            if session_row["external_session_id"] is not None:
+                return None
+            message_rows = conn.execute(
+                """SELECT id, role, content, tool_call_id, tool_calls,
+                          tool_name, timestamp, finish_reason, reasoning,
+                          reasoning_details, codex_reasoning_items,
+                          reasoning_content, codex_message_items, active,
+                          compacted
+                     FROM messages
+                    WHERE session_id = ?
+                    ORDER BY id""",
+                (normalized_session_id,),
+            ).fetchall()
+
+        identity = _native_session_snapshot_identity(
+            dict(session_row),
+            [dict(row) for row in message_rows],
+            decode_content=self.db._decode_content,
+        )
+        return {
+            "session_id": normalized_session_id,
+            "provider": Provider.HERMES.value,
+            **identity,
+        }
 
     def find_external_session_by_origin_bridge(
         self,
