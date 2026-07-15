@@ -249,6 +249,26 @@ def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() ->
     assert "never permits creation" in recovered_branch
 
 
+def test_sidebar_skill_matches_the_native_read_thread_response_schema() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+
+    assert "response's nested `thread` object" in reconcile_step
+    assert "absence of a top-level thread ID is expected" in reconcile_step
+    assert "`thread.id`, `thread.hostId`, and `thread.cwd`" in reconcile_step
+    assert (
+        "missing or null `thread.hostId` and explicit `local` normalize only to "
+        "`local`"
+    ) in reconcile_step
+    assert "every other explicit `thread.hostId` maps to `codex_thread_conflict`" in (
+        reconcile_step
+    )
+    assert "must equal the chosen project's normalized host" in reconcile_step
+    assert "does not return an explicit environment field" in reconcile_step
+    assert "must not be treated as unavailable or ambiguous" in reconcile_step
+    assert "explicitly contradicts local native execution" in reconcile_step
+
+
 def test_sidebar_skill_deterministically_settles_native_and_broker_failures() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
