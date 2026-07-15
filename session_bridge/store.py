@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import secrets
 import sys
 import time
@@ -114,6 +115,7 @@ PUBLIC_SIDEBAR_STATE = {
     SidebarJobState.VISIBLE.value: "visible",
     SidebarJobState.FAILED.value: "failed",
 }
+_PUBLIC_CODEX_THREAD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}")
 _SIDEBAR_RETRY_DELAYS_SECONDS = (60.0, 120.0, 240.0, 480.0, 900.0)
 _SIDEBAR_LEASE_SECONDS = 300
 # Four maximum-size broker batches bound malformed-row cleanup per write lock.
@@ -1000,6 +1002,7 @@ class SessionBridgeStore:
                             link
                         )
                 sidebar_by_session: dict[str, dict[str, Any]] = {}
+                sidebar_now: float | None = None
                 for row in sidebar_rows:
                     session_id = row["source_session_id"]
                     if session_id in sidebar_by_session:
@@ -1007,18 +1010,34 @@ class SessionBridgeStore:
                     public_state = PUBLIC_SIDEBAR_STATE.get(row["state"])
                     if public_state is None:
                         raise ValueError("invalid sidebar summary state")
-                    lease_expires_at = row["lease_expires_at"]
-                    stale = (
-                        row["state"] == SidebarJobState.LEASED.value
-                        and isinstance(lease_expires_at, (int, float))
-                        and not isinstance(lease_expires_at, bool)
-                        and float(lease_expires_at)
-                        <= _finite_number(self._clock(), "store clock")
-                    )
+                    error_code = row["error_code"]
+                    thread_id = None
+                    stale = False
+                    if row["state"] == SidebarJobState.LEASED.value:
+                        lease_expires_at = row["lease_expires_at"]
+                        if (
+                            not isinstance(lease_expires_at, (int, float))
+                            or isinstance(lease_expires_at, bool)
+                            or not math.isfinite(float(lease_expires_at))
+                        ):
+                            public_state = "failed"
+                            error_code = "catalog_metadata_invalid"
+                            stale = True
+                        else:
+                            if sidebar_now is None:
+                                sidebar_now = _finite_number(
+                                    self._clock(), "store clock"
+                                )
+                            stale = float(lease_expires_at) <= sidebar_now
+                    elif row["state"] == SidebarJobState.VISIBLE.value:
+                        thread_id = _public_codex_thread_id(row["codex_thread_id"])
+                        if thread_id is None:
+                            public_state = "failed"
+                            error_code = "catalog_metadata_invalid"
                     sidebar_by_session[session_id] = {
                         "bridge_sidebar_state": public_state,
-                        "bridge_sidebar_codex_thread_id": row["codex_thread_id"],
-                        "bridge_sidebar_error": row["error_code"],
+                        "bridge_sidebar_codex_thread_id": thread_id,
+                        "bridge_sidebar_error": error_code,
                         "bridge_sidebar_stale": stale,
                     }
 
@@ -3708,6 +3727,12 @@ def _bounded_exact_ids(
     if len(set(normalized)) != len(normalized):
         raise ValueError(f"{label} must not contain duplicates")
     return tuple(normalized)
+
+
+def _public_codex_thread_id(value: object) -> str | None:
+    if type(value) is not str or _PUBLIC_CODEX_THREAD_ID.fullmatch(value) is None:
+        return None
+    return value
 
 
 def _nonempty_text(value: str, label: str) -> str:

@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 import json
 import logging
+import math
 from pathlib import Path
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -182,6 +184,30 @@ def _seed_sidebar_catalog_jobs(db_path: Path) -> dict[str, str]:
     }
 
 
+def _set_sidebar_catalog_field(
+    db_path: Path,
+    session_id: str,
+    field: str,
+    value: object,
+    *,
+    ignore_checks: bool = False,
+) -> None:
+    assert field in {"codex_thread_id", "lease_expires_at"}
+    db = SessionDB(db_path=db_path)
+    try:
+        def update(conn) -> None:
+            if ignore_checks:
+                conn.execute("PRAGMA ignore_check_constraints = ON")
+            conn.execute(
+                f"UPDATE session_sidebar_jobs SET {field} = ? WHERE source_session_id = ?",
+                (value, session_id),
+            )
+
+        db._execute_write(update)
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_sessions_api_preserves_rows_and_batches_bridge_metadata(
     tmp_path: Path,
@@ -318,6 +344,142 @@ async def test_sessions_api_exposes_only_sanitized_batched_sidebar_status(
         "C:/claude/claude-default.jsonl",
     ):
         assert forbidden not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread_id", "expected_thread_id"),
+    [
+        ("44444444-4444-4444-8444-444444444444", "44444444-4444-4444-8444-444444444444"),
+        ("thread_01JABCDEF0123456789ABCDE", "thread_01JABCDEF0123456789ABCDE"),
+        ("C:/private/native/sidebar.jsonl bearer-secret", None),
+        (sqlite3.Binary(b"binary-thread-secret"), None),
+        ("thread with spaces", None),
+        ("x" * 513, None),
+    ],
+    ids=("uuid", "opaque", "path-secret", "blob", "spaces", "overlong"),
+)
+async def test_sessions_api_validates_visible_codex_thread_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    thread_id: object,
+    expected_thread_id: str | None,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_sidebar_catalog_jobs(db_path)
+    _set_sidebar_catalog_field(
+        db_path,
+        "sidebar-visible",
+        "codex_thread_id",
+        thread_id,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile: SessionDB(db_path=db_path),
+    )
+
+    response = await web_server.get_sessions(limit=20)
+
+    row = next(
+        session for session in response["sessions"]
+        if session["id"] == "sidebar-visible"
+    )
+    expected_state = "visible" if expected_thread_id is not None else "failed"
+    expected_error = None if expected_thread_id is not None else "delivery_degraded"
+    assert (
+        row["bridge_sidebar_state"],
+        row["bridge_sidebar_codex_thread_id"],
+        row["bridge_sidebar_error"],
+        row["bridge_sidebar_stale"],
+    ) == (expected_state, expected_thread_id, expected_error, False)
+    serialized = json.dumps(response, sort_keys=True)
+    assert "C:/private/native/sidebar.jsonl bearer-secret" not in serialized
+    assert "binary-thread-secret" not in serialized
+    assert "thread with spaces" not in serialized
+    assert "x" * 513 not in serialized
+
+
+@pytest.mark.asyncio
+async def test_sessions_api_exposes_thread_identity_only_for_visible_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_sidebar_catalog_jobs(db_path)
+    secret = "thread_01JSHOULDNOTBEPUBLIC"
+    _set_sidebar_catalog_field(
+        db_path,
+        "sidebar-pending",
+        "codex_thread_id",
+        secret,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile: SessionDB(db_path=db_path),
+    )
+
+    response = await web_server.get_sessions(limit=20)
+
+    row = next(
+        session for session in response["sessions"]
+        if session["id"] == "sidebar-pending"
+    )
+    assert row["bridge_sidebar_state"] == "pending"
+    assert row["bridge_sidebar_codex_thread_id"] is None
+    assert secret not in json.dumps(response, sort_keys=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lease_expires_at", "ignore_checks"),
+    [
+        ("C:/private/lease bearer-secret", False),
+        (None, True),
+        (math.nan, True),
+        (math.inf, False),
+        (-math.inf, False),
+    ],
+    ids=("text-secret", "null", "nan", "positive-inf", "negative-inf"),
+)
+async def test_sessions_api_fails_closed_for_invalid_leased_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lease_expires_at: object,
+    ignore_checks: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_sidebar_catalog_jobs(db_path)
+    _set_sidebar_catalog_field(
+        db_path,
+        "sidebar-leased",
+        "lease_expires_at",
+        lease_expires_at,
+        ignore_checks=ignore_checks,
+    )
+    monkeypatch.setattr(
+        web_server,
+        "_open_session_db_for_profile",
+        lambda _profile: SessionDB(db_path=db_path),
+    )
+
+    response = await web_server.get_sessions(limit=20)
+
+    row = next(
+        session for session in response["sessions"]
+        if session["id"] == "sidebar-leased"
+    )
+    assert (
+        row["bridge_sidebar_state"],
+        row["bridge_sidebar_codex_thread_id"],
+        row["bridge_sidebar_error"],
+        row["bridge_sidebar_stale"],
+    ) == ("failed", None, "delivery_degraded", True)
+    assert "C:/private/lease bearer-secret" not in json.dumps(
+        response,
+        sort_keys=True,
+    )
 
 
 def test_profiles_sessions_api_preserves_rows_and_batches_once_per_profile(
