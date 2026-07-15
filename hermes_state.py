@@ -973,6 +973,9 @@ CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_lease_digest
 CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_completion_digest
     ON session_sidebar_jobs(completion_digest)
     WHERE completion_digest IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_visible_at
+    ON session_sidebar_jobs(state, visible_at DESC, id DESC)
+    WHERE visible_at IS NOT NULL;
 """
 
 # Indexes that reference columns added in later schema versions must be

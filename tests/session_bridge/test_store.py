@@ -3198,6 +3198,81 @@ def test_sidebar_atomic_lineage_write_fault_rolls_back_job_and_link(db) -> None:
     assert job["codex_thread_id"] is None
 
 
+def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:
+    sample_limit = 512
+    row_count = sample_limit + 75
+
+    def _seed(conn):
+        conn.executemany(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            [
+                (f"claude:latency-{index}", "claude", float(index))
+                for index in range(row_count)
+            ],
+        )
+        conn.executemany(
+            """INSERT INTO session_sidebar_jobs (
+                   id, idempotency_key, source_session_id, bridge_id, state,
+                   attempts, next_attempt_at, completion_digest,
+                   codex_thread_id, eligible_at, created_at, updated_at,
+                   visible_at
+               ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    f"latency-job-{index:04d}",
+                    f"latency-key-{index:04d}",
+                    f"claude:latency-{index}",
+                    f"latency-bridge-{index:04d}",
+                    SidebarJobState.VISIBLE.value,
+                    float(index),
+                    f"latency-digest-{index:04d}",
+                    f"latency-thread-{index:04d}",
+                    float(index - 990 if index < 75 else index),
+                    float(index),
+                    float(index + 10),
+                    float(index + 10),
+                )
+                for index in range(row_count)
+            ],
+        )
+
+    db._execute_write(_seed)
+    statements: list[str] = []
+    with db._lock:
+        db._conn.set_trace_callback(statements.append)
+    try:
+        status = SessionBridgeStore(db).sidebar_delivery_status(now=10_000.0)
+    finally:
+        with db._lock:
+            db._conn.set_trace_callback(None)
+    with db._lock:
+        plan = db._conn.execute(
+            """EXPLAIN QUERY PLAN
+               SELECT visible_at - eligible_at AS latency
+                 FROM session_sidebar_jobs
+                WHERE state = ? AND visible_at IS NOT NULL
+                ORDER BY visible_at DESC, id DESC LIMIT ?""",
+            (SidebarJobState.VISIBLE.value, sample_limit),
+        ).fetchall()
+
+    latency_queries = [
+        " ".join(statement.upper().split())
+        for statement in statements
+        if "VISIBLE_AT - ELIGIBLE_AT AS LATENCY" in statement.upper()
+    ]
+    assert latency_queries
+    assert all("LIMIT 512" in statement for statement in latency_queries)
+    assert any(
+        "USING INDEX IDX_SESSION_SIDEBAR_JOBS_VISIBLE_AT" in row[3].upper()
+        for row in plan
+    )
+    assert status["delivery_latency_seconds"] == {
+        "p50": 10.0,
+        "p95": 10.0,
+        "p99": 10.0,
+    }
+
+
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:
     store = SessionBridgeStore(
         db,

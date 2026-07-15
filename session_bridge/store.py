@@ -86,6 +86,9 @@ _SIDEBAR_RETRY_DELAYS_SECONDS = (60.0, 120.0, 240.0, 480.0, 900.0)
 _SIDEBAR_LEASE_SECONDS = 300
 # Four maximum-size broker batches bound malformed-row cleanup per write lock.
 _SIDEBAR_CLAIM_SCAN_LIMIT = 40
+# Delivery latency summarizes only the newest durable visible jobs, keeping status
+# reads bounded while preserving a useful recent operational window.
+_SIDEBAR_LATENCY_SAMPLE_LIMIT = 512
 
 
 NativeProjectionCursor = tuple[float, str]
@@ -1549,8 +1552,9 @@ class SessionBridgeStore:
                 """SELECT visible_at - eligible_at AS latency
                      FROM session_sidebar_jobs
                     WHERE state = ? AND visible_at IS NOT NULL
-                    ORDER BY latency""",
-                (SidebarJobState.VISIBLE.value,),
+                    ORDER BY visible_at DESC, id DESC
+                    LIMIT ?""",
+                (SidebarJobState.VISIBLE.value, _SIDEBAR_LATENCY_SAMPLE_LIMIT),
             ).fetchall()
 
         eligible_by_provider = {
@@ -1576,7 +1580,9 @@ class SessionBridgeStore:
             code = row["error_code"]
             if code in allowed_codes and code not in recent_codes:
                 recent_codes.append(code)
-        latencies = [max(0.0, float(row["latency"])) for row in latency_rows]
+        latencies = sorted(
+            max(0.0, float(row["latency"])) for row in latency_rows
+        )
         return {
             "eligible_by_provider": eligible_by_provider,
             "counts": counts,

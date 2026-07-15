@@ -33,6 +33,7 @@ EXPECTED_BRIDGE_INDEXES = {
     "idx_session_sidebar_jobs_source_session_id": ("source_session_id",),
     "idx_session_sidebar_jobs_lease_digest": ("lease_digest",),
     "idx_session_sidebar_jobs_completion_digest": ("completion_digest",),
+    "idx_session_sidebar_jobs_visible_at": ("state", "visible_at", "id"),
 }
 
 EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL = {
@@ -44,6 +45,11 @@ EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL = {
         "CREATE INDEX idx_session_sidebar_jobs_completion_digest "
         "ON session_sidebar_jobs(completion_digest) "
         "WHERE completion_digest IS NOT NULL"
+    ),
+    "idx_session_sidebar_jobs_visible_at": (
+        "CREATE INDEX idx_session_sidebar_jobs_visible_at "
+        "ON session_sidebar_jobs(state, visible_at DESC, id DESC) "
+        "WHERE visible_at IS NOT NULL"
     ),
 }
 
@@ -321,7 +327,7 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
         conn.close()
 
 
-def test_reopening_v21_database_repairs_missing_sidebar_digest_indexes_without_data_loss(
+def test_reopening_v21_database_repairs_missing_sidebar_indexes_without_data_loss(
     tmp_path,
 ):
     db_path = tmp_path / "v21-missing-sidebar-digest-indexes.db"
@@ -359,8 +365,10 @@ def test_reopening_v21_database_repairs_missing_sidebar_digest_indexes_without_d
         assert conn.execute("SELECT version FROM schema_version").fetchall() == [
             (21,)
         ]
+        placeholders = ",".join("?" for _ in EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL)
         missing = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN (?, ?)",
+            f"SELECT name FROM sqlite_master "
+            f"WHERE type = 'index' AND name IN ({placeholders})",
             tuple(EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL),
         ).fetchall()
         assert missing == []
