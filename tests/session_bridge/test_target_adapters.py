@@ -1165,6 +1165,7 @@ def test_codex_uses_supported_method_order_instructions_and_exact_verification(
         "thread/read",
     ]
     start = client.calls[0][1]
+    assert start["threadSource"] == "user"
     assert start["cwd"] == str(tmp_path.resolve())
     assert "HERMES_SESSION_BRIDGE_V1:" in start["baseInstructions"]
     assert "HERMES_SESSION_BRIDGE_V1:" in start["developerInstructions"]

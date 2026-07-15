@@ -466,6 +466,7 @@ class CodexTargetAdapter:
         start_params: dict[str, Any] = {
             "baseInstructions": hydration,
             "developerInstructions": hydration,
+            "threadSource": "user",
         }
         existing_cwd = _codex_existing_directory(cwd)
         if existing_cwd is not None:
