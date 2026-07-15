@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+# The canonical runner uses ``env -i``. Windows' stdlib ignores HOME and needs
+# USERPROFILE for ``Path.home()`` during imported-module initialization.
+if os.name == "nt" and "USERPROFILE" not in os.environ:
+    os.environ["USERPROFILE"] = os.environ["HOME"]
 
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
@@ -135,6 +141,47 @@ def test_serve_dispatches_and_closes_runtime(capsys):
 
     assert backend.calls == [("serve",), ("close",)]
     assert _json_output(capsys)["status"] == "stopped"
+
+
+def test_sidebar_skill_cli_installs_without_loading_bridge_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installed = tmp_path / "codex" / "skills" / "session-sidebar-sync"
+    calls: list[None] = []
+    monkeypatch.setattr(
+        "session_bridge.cli.install_sidebar_skill",
+        lambda: calls.append(None) or installed,
+    )
+
+    result = main(
+        ["install-sidebar-skill"],
+        config_loader=lambda: pytest.fail("installer must not load bridge config"),
+        backend_factory=lambda _config: pytest.fail("installer must not start backend"),
+    )
+
+    assert result == 0
+    assert calls == [None]
+    assert _json_output(capsys) == {
+        "status": "installed",
+        "path": str(installed),
+    }
+
+
+def test_sidebar_skill_cli_sanitizes_install_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "session_bridge.cli.install_sidebar_skill",
+        lambda: (_ for _ in ()).throw(PermissionError("private destination")),
+    )
+
+    assert main(["install-sidebar-skill"]) == 2
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {"error": "configuration_error"}
+    assert "private destination" not in rendered
 
 
 def test_production_serve_blocks_automatic_mode_without_passing_gate(

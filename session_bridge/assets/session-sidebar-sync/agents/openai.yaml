@@ -1,0 +1,4 @@
+interface:
+  display_name: "Session Sidebar Sync"
+  short_description: "Deliver leased Claude and Hermes sessions to the Codex sidebar"
+  default_prompt: "Run $session-sidebar-sync once and end quietly when no work is pending."

@@ -1,0 +1,18 @@
+Chronological dispatch trace:
+
+- **14:00:00** — `fail(lease_token="tc", fixed_code="broker_time_budget")`
+  - Required marker reconciliation cannot finish before 14:00:12.
+  - Did not classify the ambiguous prior response as `native_create_failed`.
+  - Did not use app-server or create a possible duplicate.
+
+- **14:00:00** — `native_create_local_task(project="C:\work\billing", cwd="C:\work\billing", prompt="Audit billing")`
+- **14:00:20** — `native_rename_task(thread_id=BILLING_THREAD_ID, title="Audit billing")`
+- **14:00:20** — `commit(lease_token="th", thread_id=BILLING_THREAD_ID)`
+
+- **14:00:20** — `native_create_local_task(project="Session Inbox", cwd="C:\Users\demo\.hermes", prompt="Review launch")`
+- **14:00:40** — `native_rename_task(thread_id=LAUNCH_THREAD_ID, title="Review launch")`
+- **14:00:40** — `commit(lease_token="tx", thread_id=LAUNCH_THREAD_ID)`
+
+No project-list call was made because the supplied project state was sufficient. No three-line transcript was substituted for the leased prompts.
+
+Unfinished: `c-17` remains unreconciled and failed at the broker; an authenticated native task with marker `m-c17` may already exist. Neither Hermes task can become visible by 14:00:15 because native creation alone takes 20 seconds. The incident tools were not exposed in this subagent context, so these are the exact calls selected, not executed calls.

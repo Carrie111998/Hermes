@@ -40,6 +40,7 @@ from .mirror import (
     should_halt_batch,
 )
 from .models import MirrorJobState, Provider
+from .sidebar_skill import install_sidebar_skill
 from .store import SessionBridgeStore
 
 
@@ -627,6 +628,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
+    commands.add_parser(
+        "install-sidebar-skill",
+        help="install the personal Codex sidebar delivery skill",
+    )
     commands.add_parser("serve", help="serve the authenticated loopback MCP")
 
     scan = commands.add_parser("scan", help="import provider history into the catalog")
@@ -675,6 +680,14 @@ def main(
     backend_factory: Callable[[BridgeConfig], _Backend] = ProductionBackend,
 ) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "install-sidebar-skill":
+        try:
+            installed = install_sidebar_skill()
+        except Exception:
+            _emit({"error": "configuration_error"})
+            return EXIT_CONFIG
+        _emit({"status": "installed", "path": str(installed)})
+        return EXIT_OK
     try:
         config = config_loader()
         if not isinstance(config, BridgeConfig):
