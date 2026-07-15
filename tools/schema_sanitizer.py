@@ -542,17 +542,25 @@ def _sanitize_node(node: Any, path: str) -> Any:
                 _sanitize_node(item, f"{path}.{key}[{i}]")
                 for i, item in enumerate(value)
             ]
-        elif key in {"required", "enum", "examples", "dependentRequired"}:
+        elif (
+            key in {"required", "enum", "examples", "dependentRequired", "default", "const"}
+            or key.startswith("x-")
+        ):
             # Schema "sibling" keywords whose values are NOT schemas:
             #  - ``required``: list of property-name strings
             #  - ``enum``: list of literal values (any JSON type)
             #  - ``examples``: list of example values (any JSON type)
             #  - ``dependentRequired``: mapping of property names to lists of
             #    required property-name strings (JSON Schema 2020-12)
+            #  - ``default`` / ``const``: a single literal value (any JSON
+            #    type — including objects whose keys may collide with schema
+            #    keywords like ``type`` or ``enum``)
+            #  - ``x-*``: OpenAPI-style extension keywords (annotations)
             # Recursing into these with _sanitize_node() would mis-interpret
-            # literal strings like "path" as bare-string schemas and replace
-            # them with {"type": "object"} dicts. Pass through unchanged
-            # (remapping ``required`` entries through the property renames).
+            # literal strings like "path" as bare-string schemas, and the
+            # null-keyword drop would delete data keys like ``"type": null``
+            # inside literal objects. Pass through unchanged (remapping
+            # ``required`` entries through the property renames).
             if key == "required" and prop_renames and isinstance(value, list):
                 out[key] = [prop_renames.get(r, r) if isinstance(r, str) else r
                             for r in value]
