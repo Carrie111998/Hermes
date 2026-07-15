@@ -227,6 +227,28 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     )
 
 
+def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+
+    assert (
+        '`read_thread({"threadId":"<recovered_thread_id>",'
+        '"turnLimit":20,"includeOutputs":false})`'
+        in reconcile_step
+    )
+    assert "Do not call `list_threads` before this recovered-ID read" in reconcile_step
+    assert (
+        "Only when `recovered_thread_id` is absent, call "
+        '`list_threads({"query":"<exact signed marker>","limit":20})`'
+        in reconcile_step
+    )
+    recovered_branch = reconcile_step.split(
+        "When `recovered_thread_id` is present", 1
+    )[1].split("Only when `recovered_thread_id` is absent", 1)[0]
+    assert "missing or mismatched task maps to `marker_conflict`" in recovered_branch
+    assert "never permits creation" in recovered_branch
+
+
 def test_sidebar_skill_deterministically_settles_native_and_broker_failures() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
