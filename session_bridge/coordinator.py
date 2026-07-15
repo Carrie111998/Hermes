@@ -5,7 +5,9 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 import hashlib
+import inspect
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any, NoReturn, Protocol, cast
@@ -47,6 +49,12 @@ from .sidebar import (
     sidebar_title,
 )
 from .store import SessionBridgeStore, SidebarSource, SidebarSourcePage
+from .worktree import (
+    WorktreeSnapshot,
+    WorktreeSnapshotError,
+    capture_worktree_snapshot,
+    validate_worktree_snapshot,
+)
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,18 @@ class ContinueResult:
     pack: ContextPack
     link: SessionLink
     warnings: Sequence[str]
+    exact_cwd: str | None = None
+
+
+class ContinuationBlockedError(RuntimeError):
+    """Visible fixed-code refusal before a continuation can create or hydrate."""
+
+    def __init__(self, code: str, warning: str) -> None:
+        if code not in {"source_cwd_missing", "source_identity_mismatch", "permission_preflight_failed"}:
+            raise ValueError("invalid continuation blocking code")
+        self.code = code
+        self.warnings = (warning,)
+        super().__init__(code)
 
 
 _AsyncSleep = Callable[[float], Awaitable[None]]
@@ -187,6 +207,7 @@ class SessionBridgeCoordinator:
         sidebar_cancellation_recovery_timeout: float = (
             _SIDEBAR_CANCELLATION_RECOVERY_SECONDS
         ),
+        permission_preflight: Callable[[str], bool] | None = None,
     ) -> None:
         if type(scan_batch_size) is not int or scan_batch_size <= 0:
             raise ValueError("scan_batch_size must be a positive integer")
@@ -234,6 +255,9 @@ class SessionBridgeCoordinator:
         self._sidebar_cancellation_recovery_timeout = float(
             sidebar_cancellation_recovery_timeout
         )
+        if permission_preflight is not None and not callable(permission_preflight):
+            raise TypeError("permission_preflight must be callable or None")
+        self._permission_preflight = permission_preflight
         self._watch_stop_event: asyncio.Event | None = None
         self._watcher_state = "not_started"
         self._watcher_error_code: str | None = None
@@ -876,12 +900,34 @@ class SessionBridgeCoordinator:
                     )
                     if existing is not None:
                         continue
-                    result = await asyncio.to_thread(
-                        _call,
+                    enqueue_method = getattr(
                         self._store,
                         "enqueue_sidebar_job",
-                        candidate,
+                        None,
                     )
+                    if not callable(enqueue_method):
+                        raise RuntimeError("sidebar enqueue is unavailable")
+                    parameters = inspect.signature(enqueue_method).parameters
+                    if "worktree_snapshot" in parameters:
+                        worktree_snapshot = await asyncio.to_thread(
+                            capture_worktree_snapshot,
+                            candidate.cwd,
+                        )
+                        candidate = replace(
+                            candidate,
+                            cwd=worktree_snapshot.cwd,
+                            git_root=worktree_snapshot.git_root,
+                            git_branch=worktree_snapshot.branch,
+                            git_head=worktree_snapshot.head,
+                            worktree_id=worktree_snapshot.worktree_id,
+                        )
+                        result = await asyncio.to_thread(
+                            enqueue_method,
+                            candidate,
+                            worktree_snapshot=worktree_snapshot,
+                        )
+                    else:
+                        result = await asyncio.to_thread(enqueue_method, candidate)
                     if not isinstance(result, Mapping) or type(
                         result.get("created")
                     ) is not bool:
@@ -1397,6 +1443,9 @@ class SessionBridgeCoordinator:
             return await self._continue_locked(request)
 
     async def _continue_locked(self, request: ContinueRequest) -> ContinueResult:
+        exact_worktree, worktree_warnings = await self._continuation_worktree(
+            request
+        )
         snapshot = await asyncio.to_thread(
             _call,
             self._store,
@@ -1454,7 +1503,7 @@ class SessionBridgeCoordinator:
         )
         warnings = tuple(
             warning
-            for warning in (source.warning, target.warning)
+            for warning in (*worktree_warnings, source.warning, target.warning)
             if warning is not None
         )
 
@@ -1484,6 +1533,12 @@ class SessionBridgeCoordinator:
                         budget_chars=request.context_budget_chars,
                         stale=source.stale,
                         diverged=False,
+                        exact_cwd=(
+                            exact_worktree.cwd
+                            if exact_worktree is not None
+                            else None
+                        ),
+                        worktree_warnings=worktree_warnings,
                     ),
                 )
                 if not isinstance(pack, ContextPack):
@@ -1547,7 +1602,76 @@ class SessionBridgeCoordinator:
                     at=float(self._clock()),
                 )
                 warnings = (*warnings, "linked_sessions_diverged")
-        return ContinueResult(pack=persisted_pack, link=link, warnings=warnings)
+        return ContinueResult(
+            pack=persisted_pack,
+            link=link,
+            warnings=warnings,
+            exact_cwd=(exact_worktree.cwd if exact_worktree is not None else None),
+        )
+
+    async def _continuation_worktree(
+        self,
+        request: ContinueRequest,
+    ) -> tuple[WorktreeSnapshot | None, tuple[str, ...]]:
+        if request.session_id.startswith("codex:"):
+            return None, ()
+        if request.bridge_id != sidebar_bridge_id(request.session_id):
+            return None, ()
+        try:
+            recorded = await asyncio.to_thread(
+                _call,
+                self._store,
+                "get_worktree_snapshot",
+                request.session_id,
+            )
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            raise ContinuationBlockedError(
+                "source_identity_mismatch",
+                "source_identity_mismatch: exact source worktree snapshot is invalid",
+            ) from exc
+        if recorded is None:
+            raise ContinuationBlockedError(
+                "source_identity_mismatch",
+                "source_identity_mismatch: exact source worktree snapshot is unavailable",
+            )
+        if not isinstance(recorded, WorktreeSnapshot):
+            raise ContinuationBlockedError(
+                "source_identity_mismatch",
+                "source_identity_mismatch: exact source worktree snapshot is invalid",
+            )
+        try:
+            current, warnings = await asyncio.to_thread(
+                validate_worktree_snapshot,
+                recorded,
+            )
+        except WorktreeSnapshotError as exc:
+            raise ContinuationBlockedError(
+                exc.code,
+                f"{exc.code}: exact source worktree identity validation failed",
+            ) from exc
+        permitted = await asyncio.to_thread(
+            _filesystem_permission_preflight,
+            current.cwd,
+        )
+        if permitted and self._permission_preflight is not None:
+            try:
+                permission_result = await asyncio.to_thread(
+                    self._permission_preflight,
+                    current.cwd,
+                )
+                permitted = permission_result is True
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                permitted = False
+        if not permitted:
+            raise ContinuationBlockedError(
+                "permission_preflight_failed",
+                "permission_preflight_failed: exact source cwd is not authorized",
+            )
+        return current, warnings
 
     def health(self) -> dict[str, Any]:
         now = float(self._clock())
@@ -2994,6 +3118,24 @@ def _call(instance: object, name: str, *args: object, **kwargs: object) -> Any:
     if not callable(method):
         raise RuntimeError("scan adapter does not implement the required operation")
     return method(*args, **kwargs)
+
+
+def _filesystem_permission_preflight(cwd: str) -> bool:
+    """Read-only filesystem sanity check; external authorization stays injected."""
+
+    try:
+        path = Path(cwd)
+        resolved = path.resolve(strict=True)
+        if not resolved.is_dir():
+            return False
+        for parent in (resolved, *resolved.parents):
+            if not os.access(parent, os.R_OK | os.X_OK):
+                return False
+        with os.scandir(resolved) as entries:
+            next(entries, None)
+    except OSError:
+        return False
+    return True
 
 
 def _exact_sidebar_claim_text(value: object, label: str) -> str:

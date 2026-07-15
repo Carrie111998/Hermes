@@ -26,6 +26,8 @@ class ContextPackRequest:
     budget_chars: int
     stale: bool = False
     diverged: bool = False
+    exact_cwd: str | None = None
+    worktree_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -217,6 +219,9 @@ class ContextPackBuilder:
             warnings.append(
                 "- [snapshot identity mismatch] The requested cursor/hash differs from the latest indexed identity."
             )
+        if request.exact_cwd is not None:
+            warnings.append(_exact_cwd_instruction(request.exact_cwd))
+        warnings.extend(f"- [{warning}]" for warning in request.worktree_warnings)
 
         repository_items, repository_warnings = self._repository_state(session)
         warnings.extend(repository_warnings)
@@ -273,6 +278,26 @@ class ContextPackBuilder:
             or request.budget_chars <= 0
         ):
             raise ValueError("context budget must be a positive integer")
+        if request.exact_cwd is not None and (
+            not isinstance(request.exact_cwd, str)
+            or not request.exact_cwd
+            or not Path(request.exact_cwd).is_absolute()
+            or any(character in request.exact_cwd for character in "\x00\r\n")
+            or _redact(request.exact_cwd) != request.exact_cwd
+        ):
+            raise ValueError("exact cwd must be a safe absolute path")
+        if not isinstance(request.worktree_warnings, tuple) or any(
+            not isinstance(warning, str)
+            or not warning
+            or len(warning) > 1024
+            or any(character in warning for character in "\x00\r\n")
+            or not warning.startswith((
+                "worktree_branch_drift: recorded=",
+                "worktree_head_drift: recorded=",
+            ))
+            for warning in request.worktree_warnings
+        ):
+            raise ValueError("worktree warnings are malformed")
 
     def _read_source_snapshot(self, request: ContextPackRequest) -> _SourceSnapshot:
         with self.db._lock:
@@ -373,6 +398,15 @@ class ContextPackBuilder:
             raise ValueError("context pack stale source warning missing")
         if request.diverged and _DIVERGED_WARNING not in warning_lines:
             raise ValueError("context pack diverged warning missing")
+        if request.exact_cwd is not None and _exact_cwd_instruction(
+            request.exact_cwd
+        ) not in warning_lines:
+            raise ValueError("context pack exact cwd instruction missing")
+        if any(
+            f"- [{warning}]" not in warning_lines
+            for warning in request.worktree_warnings
+        ):
+            raise ValueError("context pack worktree warning missing")
 
     def _persist_pack_once(
         self,
@@ -881,6 +915,18 @@ def _format_turn(role: str, content: str, timestamp: Any) -> str:
     return f"- {role.upper()} @{timestamp_label}:\n  {indented}"
 
 
+def _exact_cwd_instruction(exact_cwd: str) -> str:
+    serialized_cwd = json.dumps(
+        exact_cwd,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return (
+        "- [exact cwd] Every command and file operation MUST pass "
+        f"cwd={serialized_cwd}; sidebar project grouping is not cwd."
+    )
+
+
 def _finite_timestamp(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -1265,6 +1311,8 @@ def _stable_pack_id_with_safety(
         str(request.budget_chars),
         f"stale={int(stale)}",
         f"diverged={int(diverged)}",
+        request.exact_cwd or "",
+        *request.worktree_warnings,
     ):
         encoded = value.encode("utf-8")
         digest.update(len(encoded).to_bytes(8, "big"))

@@ -37,6 +37,7 @@ from .models import (
 
 if TYPE_CHECKING:
     from .sidebar import SidebarCandidate
+    from .worktree import WorktreeSnapshot
 
 
 _EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
@@ -48,6 +49,16 @@ _MIRROR_RATE_STATE_KEY = "session-bridge:mirror-rate"
 _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
+_WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
+_WORKTREE_SNAPSHOT_FIELDS = frozenset({
+    "version",
+    "source_session_id",
+    "cwd",
+    "git_root",
+    "branch",
+    "head",
+    "worktree_id",
+})
 _SIDEBAR_DELIVERY_STATE_FIELDS = frozenset({
     "version",
     "source_session_id",
@@ -996,7 +1007,12 @@ class SessionBridgeStore:
                     }
         return summaries
 
-    def enqueue_sidebar_job(self, candidate: SidebarCandidate) -> dict[str, Any]:
+    def enqueue_sidebar_job(
+        self,
+        candidate: SidebarCandidate,
+        *,
+        worktree_snapshot: WorktreeSnapshot | None = None,
+    ) -> dict[str, Any]:
         from .sidebar import (
             SidebarCandidate,
             sidebar_bridge_id,
@@ -1007,6 +1023,15 @@ class SessionBridgeStore:
             raise ValueError("sidebar candidate is malformed")
         state_key = _sidebar_delivery_state_key(candidate.source_session_id)
         state_value_json = _encode_sidebar_delivery_candidate(candidate)
+        worktree_key: str | None = None
+        worktree_value_json: str | None = None
+        if worktree_snapshot is not None:
+            worktree_key = _worktree_snapshot_state_key(candidate.source_session_id)
+            worktree_value_json = _encode_worktree_snapshot(
+                candidate.source_session_id,
+                candidate,
+                worktree_snapshot,
+            )
         idempotency_key = sidebar_idempotency_key(candidate.source_session_id)
         expected_provider = (
             Provider.CLAUDE
@@ -1050,6 +1075,19 @@ class SessionBridgeStore:
                 or row["bridge_id"] != expected_bridge_id
             ):
                 raise ValueError("conflicting sidebar job identity")
+            if worktree_key is not None and worktree_value_json is not None:
+                worktree_row = conn.execute(
+                    "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                    (worktree_key,),
+                ).fetchone()
+                if worktree_row is None:
+                    conn.execute(
+                        """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                           VALUES (?, ?, ?)""",
+                        (worktree_key, worktree_value_json, now),
+                    )
+                elif worktree_row["value_json"] != worktree_value_json:
+                    raise ValueError("conflicting worktree snapshot identity")
             state_row = conn.execute(
                 "SELECT value_json FROM session_bridge_state WHERE key = ?",
                 (state_key,),
@@ -1065,6 +1103,19 @@ class SessionBridgeStore:
             return {**dict(row), "created": insert.rowcount == 1}
 
         return self.db._execute_write(_write)
+
+    def get_worktree_snapshot(self, source_session_id: str) -> WorktreeSnapshot | None:
+        state_key = _worktree_snapshot_state_key(source_session_id)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (state_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _decode_worktree_snapshot(row["value_json"], source_session_id)
 
     def claim_sidebar_jobs(
         self,
@@ -2930,6 +2981,112 @@ def _sidebar_delivery_state_key(source_session_id: str) -> str:
     sidebar_idempotency_key(source_session_id)
     digest = hashlib.sha256(source_session_id.encode()).hexdigest()
     return f"{_SIDEBAR_DELIVERY_STATE_PREFIX}{digest}"
+
+
+def _worktree_snapshot_state_key(source_session_id: str) -> str:
+    from .sidebar import sidebar_idempotency_key
+
+    sidebar_idempotency_key(source_session_id)
+    digest = hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()
+    return f"{_WORKTREE_SNAPSHOT_STATE_PREFIX}{digest}"
+
+
+def _encode_worktree_snapshot(
+    source_session_id: str,
+    candidate: SidebarCandidate,
+    snapshot: WorktreeSnapshot,
+) -> str:
+    from .context_pack import _redact
+    from .worktree import WorktreeSnapshot
+
+    if not isinstance(snapshot, WorktreeSnapshot):
+        raise ValueError("invalid worktree snapshot")
+    if (
+        candidate.cwd != snapshot.cwd
+        or candidate.git_root != snapshot.git_root
+        or candidate.git_branch != snapshot.branch
+        or candidate.git_head != snapshot.head
+        or candidate.worktree_id != snapshot.worktree_id
+    ):
+        raise ValueError("sidebar candidate worktree snapshot mismatch")
+    values = (
+        source_session_id,
+        snapshot.cwd,
+        snapshot.git_root,
+        snapshot.branch,
+        snapshot.head,
+        snapshot.worktree_id,
+    )
+    if any(
+        not isinstance(value, str)
+        or not value
+        or any(character in value for character in "\x00\r\n")
+        or _redact(value) != value
+        for value in values
+    ):
+        raise ValueError("invalid worktree snapshot")
+    payload = {
+        "version": 1,
+        "source_session_id": source_session_id,
+        "cwd": snapshot.cwd,
+        "git_root": snapshot.git_root,
+        "branch": snapshot.branch,
+        "head": snapshot.head,
+        "worktree_id": snapshot.worktree_id,
+    }
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _decode_worktree_snapshot(
+    value_json: object,
+    expected_source_session_id: str,
+) -> WorktreeSnapshot:
+    from .context_pack import _redact
+    from .worktree import WorktreeSnapshot
+
+    if not isinstance(value_json, (str, bytes, bytearray)):
+        raise ValueError("invalid worktree snapshot")
+    try:
+        payload = json.loads(value_json)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("invalid worktree snapshot") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _WORKTREE_SNAPSHOT_FIELDS
+        or payload.get("version") != 1
+        or isinstance(payload.get("version"), bool)
+        or payload.get("source_session_id") != expected_source_session_id
+    ):
+        raise ValueError("invalid worktree snapshot")
+    values = tuple(payload.get(field) for field in (
+        "source_session_id",
+        "cwd",
+        "git_root",
+        "branch",
+        "head",
+        "worktree_id",
+    ))
+    if any(
+        not isinstance(value, str)
+        or not value
+        or any(character in value for character in "\x00\r\n")
+        or _redact(value) != value
+        for value in values
+    ):
+        raise ValueError("invalid worktree snapshot")
+    return WorktreeSnapshot(
+        cwd=payload["cwd"],
+        git_root=payload["git_root"],
+        branch=payload["branch"],
+        head=payload["head"],
+        worktree_id=payload["worktree_id"],
+    )
 
 
 def _encode_sidebar_delivery_candidate(candidate: SidebarCandidate) -> str:

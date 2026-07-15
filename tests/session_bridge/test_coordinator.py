@@ -8,7 +8,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from threading import Barrier, Event, Lock
+import subprocess
+from threading import Barrier, Event, Lock, get_ident
 import time
 from typing import Any
 import uuid
@@ -27,6 +28,7 @@ from session_bridge.codex_adapter import CodexThreadSummary
 from session_bridge.config import BridgeConfig, SidebarConfig
 from session_bridge.context_pack import ContextPackRequest
 from session_bridge.coordinator import (
+    ContinuationBlockedError,
     ContinueRequest,
     JobSummary,
     ReconcileSummary,
@@ -46,8 +48,9 @@ from session_bridge.models import (
     SidebarJobState,
     UpsertResult,
 )
-from session_bridge.sidebar import SidebarCandidate
+from session_bridge.sidebar import SidebarCandidate, sidebar_bridge_id
 from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
+from session_bridge.worktree import capture_worktree_snapshot
 
 
 _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
@@ -1180,6 +1183,26 @@ def _load(
     environ: dict[str, str] | None = None,
 ) -> BridgeConfig:
     return BridgeConfig.load(path=path, environ={} if environ is None else environ)
+
+
+def _exact_cwd_repo(path: Path) -> Path:
+    path.mkdir()
+    git = [
+        "git",
+        "-c",
+        "user.name=Session Bridge Tests",
+        "-c",
+        "user.email=session-bridge@example.invalid",
+        "-C",
+        str(path),
+    ]
+    subprocess.run([*git, "init", "-b", "main"], check=True, capture_output=True)
+    (path / "tracked.txt").write_text("initial", encoding="utf-8")
+    subprocess.run([*git, "add", "tracked.txt"], check=True, capture_output=True)
+    subprocess.run(
+        [*git, "commit", "-m", "initial"], check=True, capture_output=True
+    )
+    return path
 
 
 @pytest.mark.asyncio
@@ -2611,6 +2634,13 @@ def _sidebar_projection(
     )
 
 
+def _sidebar_source_repo(db: SessionDB) -> Path:
+    path = db.db_path.parent / "sidebar-source-repo"
+    if not path.exists():
+        _exact_cwd_repo(path)
+    return path
+
+
 def _add_hermes_sidebar_source(
     db: SessionDB,
     *,
@@ -2621,6 +2651,8 @@ def _add_hermes_sidebar_source(
     model_config: dict[str, str] | None = None,
     cwd: str | None = "C:/workspace/sidebar",
 ) -> None:
+    if cwd == "C:/workspace/sidebar":
+        cwd = str(_sidebar_source_repo(db))
     db.ensure_session(
         session_id,
         source=source,
@@ -2669,6 +2701,7 @@ def _seed_sidebar_sources(
     now: float,
 ) -> SessionBridgeStore:
     store = SessionBridgeStore(db, clock=lambda: now)
+    source_cwd = str(_sidebar_source_repo(db))
     cutoff = now - 30 * 86_400
     store.upsert_projection(
         _sidebar_projection(
@@ -2676,6 +2709,7 @@ def _seed_sidebar_sources(
             native_id="meaningful-claude",
             content="Build the native sidebar broker",
             last_active=now,
+            cwd=source_cwd,
         )
     )
     store.upsert_projection(
@@ -2684,6 +2718,7 @@ def _seed_sidebar_sources(
             native_id="reverse-loop-codex",
             content="Do not register Codex as a source",
             last_active=now - 1,
+            cwd=source_cwd,
         )
     )
     store.upsert_projection(
@@ -2694,6 +2729,7 @@ def _seed_sidebar_sources(
             last_active=now - 2,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
             origin_bridge_id="bridge:placeholder",
+            cwd=source_cwd,
         )
     )
     _add_hermes_sidebar_source(
@@ -3589,6 +3625,277 @@ async def test_continue_refreshes_before_build_and_atomically_transitions_exact_
         created_at=90.0,
     )
     assert result.warnings == ()
+
+
+def test_worktree_snapshot_is_transactional_immutable_and_restart_safe(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    repo = _exact_cwd_repo(tmp_path / "exact-source")
+    snapshot = capture_worktree_snapshot(str(repo))
+    store = SessionBridgeStore(sidebar_db, clock=lambda: 100.0)
+    store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="exact-source",
+            content="Continue in the exact source worktree",
+            last_active=90.0,
+            cwd=snapshot.cwd,
+        )
+    )
+    candidate = SidebarCandidate(
+        source_session_id="claude:exact-source",
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id("claude:exact-source"),
+        title="[Claude] exact source",
+        cwd=snapshot.cwd,
+        git_root=snapshot.git_root,
+        git_branch=snapshot.branch,
+        git_head=snapshot.head,
+        worktree_id=snapshot.worktree_id,
+        eligible_at=90.0,
+    )
+
+    first = store.enqueue_sidebar_job(candidate, worktree_snapshot=snapshot)
+    replay = store.enqueue_sidebar_job(candidate, worktree_snapshot=snapshot)
+
+    assert first["created"] is True
+    assert replay["created"] is False
+    assert store.get_worktree_snapshot(candidate.source_session_id) == snapshot
+    restarted = SessionBridgeStore(sidebar_db, clock=lambda: 101.0)
+    assert restarted.get_worktree_snapshot(candidate.source_session_id) == snapshot
+    with sidebar_db._lock:
+        assert sidebar_db._conn is not None
+        before_state = [
+            tuple(row)
+            for row in sidebar_db._conn.execute(
+                """SELECT key, value_json, updated_at FROM session_bridge_state
+                   WHERE key LIKE 'session-bridge:worktree:%'"""
+            ).fetchall()
+        ]
+        before_jobs = sidebar_db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_jobs"
+        ).fetchone()[0]
+    tampered_id = f"{snapshot.worktree_id}-tampered"
+    with pytest.raises(ValueError, match="conflicting worktree snapshot identity"):
+        store.enqueue_sidebar_job(
+            replace(candidate, worktree_id=tampered_id),
+            worktree_snapshot=replace(
+                snapshot,
+                worktree_id=tampered_id,
+            ),
+        )
+    with sidebar_db._lock:
+        assert sidebar_db._conn is not None
+        after_state = [
+            tuple(row)
+            for row in sidebar_db._conn.execute(
+                """SELECT key, value_json, updated_at FROM session_bridge_state
+                   WHERE key LIKE 'session-bridge:worktree:%'"""
+            ).fetchall()
+        ]
+        after_jobs = sidebar_db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_jobs"
+        ).fetchone()[0]
+    assert after_state == before_state
+    assert after_jobs == before_jobs
+
+
+def _exact_cwd_continuation(
+    tmp_path: Path,
+) -> tuple[
+    SessionBridgeCoordinator,
+    _ContinuationStore,
+    _RecordingContextBuilder,
+    ContinueRequest,
+    Path,
+]:
+    operations: list[tuple[object, ...]] = []
+    repo = _exact_cwd_repo(tmp_path / "source")
+    source_projection = replace(_refresh_projection(Provider.CLAUDE), cwd=str(repo))
+    source_id = f"claude:{source_projection.native_id}"
+    bridge_id = sidebar_bridge_id(source_id)
+    target_projection = replace(
+        _refresh_projection(Provider.CODEX),
+        native_id="target-existing",
+        native_cursor="codex-target-cursor-fresh",
+        native_hash="codex-target-hash-fresh",
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=bridge_id,
+    )
+    store = _ContinuationStore(operations)
+    store.add_external(
+        source_id,
+        provider=Provider.CLAUDE,
+        native_id=source_projection.native_id,
+        cursor="claude-old",
+        source_hash="claude-old-hash",
+    )
+    store.add_external(
+        "codex:target-existing",
+        provider=Provider.CODEX,
+        native_id="target-existing",
+        cursor="codex-old",
+        source_hash="codex-old-hash",
+        origin_bridge_id=bridge_id,
+    )
+    snapshot = capture_worktree_snapshot(str(repo))
+    store.get_worktree_snapshot = lambda session_id: (
+        snapshot if session_id == source_id else None
+    )
+    builder = _RecordingContextBuilder(store, operations)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={
+            Provider.CLAUDE: _RefreshAdapter(source_projection, operations),
+            Provider.CODEX: _RefreshAdapter(target_projection, operations),
+        },
+        context_builder=builder,
+        permission_preflight=lambda cwd: cwd == snapshot.cwd,
+        clock=lambda: 100.0,
+    )
+    return (
+        coordinator,
+        store,
+        builder,
+        ContinueRequest(
+            session_id=source_id,
+            bridge_id=bridge_id,
+            target_provider=Provider.CODEX,
+            context_budget_chars=4000,
+        ),
+        repo,
+    )
+
+
+class _CountingPlaceholderTarget:
+    def __init__(self) -> None:
+        self.create_calls = 0
+
+    def create_placeholder(self, **_kwargs: object) -> None:
+        self.create_calls += 1
+        raise AssertionError("continuation attempted a second placeholder")
+
+
+@pytest.mark.asyncio
+async def test_exact_cwd_is_authoritative_for_every_continuation_operation(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, builder, request, repo = _exact_cwd_continuation(tmp_path)
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-b", "feature/drift"],
+        check=True,
+        capture_output=True,
+    )
+
+    result = await coordinator.continue_session(request)
+
+    assert result.exact_cwd == os.path.abspath(str(repo))
+    assert builder.requests[0].exact_cwd == result.exact_cwd
+    assert any(
+        warning
+        == "worktree_branch_drift: recorded=main current=feature/drift"
+        for warning in result.warnings
+    )
+    assert store.transition_calls == [
+        (
+            request.bridge_id,
+            "pack-continue-1",
+            "codex-target-cursor-fresh",
+            "codex-target-hash-fresh",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worktree_registered_native_target_is_reused_without_second_placeholder(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, builder, request, repo = _exact_cwd_continuation(tmp_path)
+    target = _CountingPlaceholderTarget()
+    coordinator._target_adapters[Provider.CODEX] = target
+
+    result = await coordinator.continue_session(request)
+
+    assert target.create_calls == 0
+    assert result.link.to_session_id == "codex:target-existing"
+    assert result.pack.target_session_id == "codex:target-existing"
+    assert result.exact_cwd == os.path.abspath(str(repo))
+    assert builder.requests[0].exact_cwd == result.exact_cwd
+    assert ("find_origin", request.bridge_id, "codex") in store.operations
+
+
+@pytest.mark.asyncio
+async def test_worktree_permission_preflight_failure_blocks_before_target_lookup(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, builder, request, _repo = _exact_cwd_continuation(tmp_path)
+    coordinator._permission_preflight = lambda _cwd: False
+
+    with pytest.raises(ContinuationBlockedError) as raised:
+        await coordinator.continue_session(request)
+
+    assert raised.value.code == "permission_preflight_failed"
+    assert raised.value.warnings == (
+        "permission_preflight_failed: exact source cwd is not authorized",
+    )
+    assert builder.requests == []
+    assert not any(operation[0] == "find_origin" for operation in store.operations)
+    assert store.transition_calls == []
+
+
+@pytest.mark.parametrize("outcome", ["false", "truthy_object", "exception"])
+@pytest.mark.asyncio
+async def test_worktree_permission_preflight_is_off_loop_strict_and_fixed(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    coordinator, store, builder, request, _repo = _exact_cwd_continuation(tmp_path)
+    loop_thread = get_ident()
+    callback_threads: list[int] = []
+    secret = "private-preflight-detail"
+
+    def preflight(_cwd: str) -> object:
+        callback_threads.append(get_ident())
+        if outcome == "exception":
+            raise RuntimeError(secret)
+        if outcome == "truthy_object":
+            return object()
+        return False
+
+    coordinator._permission_preflight = preflight
+
+    with pytest.raises(ContinuationBlockedError) as raised:
+        await coordinator.continue_session(request)
+
+    assert callback_threads and callback_threads[0] != loop_thread
+    assert raised.value.code == "permission_preflight_failed"
+    assert str(raised.value) == "permission_preflight_failed"
+    assert secret not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert builder.requests == []
+    assert not any(operation[0] == "find_origin" for operation in store.operations)
+    assert store.transition_calls == []
+
+
+@pytest.mark.asyncio
+async def test_worktree_missing_legacy_snapshot_blocks_sidebar_continuation(
+    tmp_path: Path,
+) -> None:
+    coordinator, store, builder, request, _repo = _exact_cwd_continuation(tmp_path)
+    store.get_worktree_snapshot = lambda _session_id: None
+
+    with pytest.raises(ContinuationBlockedError) as raised:
+        await coordinator.continue_session(request)
+
+    assert raised.value.code == "source_identity_mismatch"
+    assert raised.value.warnings == (
+        "source_identity_mismatch: exact source worktree snapshot is unavailable",
+    )
+    assert builder.requests == []
+    assert store.transition_calls == []
 
 
 @pytest.mark.asyncio

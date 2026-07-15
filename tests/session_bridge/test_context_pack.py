@@ -174,6 +174,65 @@ def test_pack_has_exact_section_order_and_snapshot_identity(db: SessionDB):
     assert persisted["payload"] == pack.payload
 
 
+def test_exact_cwd_instruction_is_bounded_and_machine_testable(db: SessionDB) -> None:
+    exact_cwd = "C:/source/worktree"
+    store = _seed(
+        db,
+        [_message("u-exact", "user", "Continue here.", timestamp=101.0)],
+        cwd=exact_cwd,
+    )
+
+    pack = ContextPackBuilder(db, store).build(
+        replace(
+            _request(budget=1200),
+            exact_cwd=exact_cwd,
+            worktree_warnings=(
+                "worktree_branch_drift: recorded=main current=feature/exact",
+            ),
+        )
+    )
+
+    warnings = _section(pack.payload, "## Warnings")
+    assert (
+        '- [exact cwd] Every command and file operation MUST pass cwd="C:/source/worktree"; '
+        "sidebar project grouping is not cwd." in warnings
+    )
+    assert (
+        "worktree_branch_drift: recorded=main current=feature/exact" in warnings
+    )
+    assert len(pack.payload) <= 1200
+
+
+def test_exact_cwd_replay_rejects_removed_mandatory_instruction(
+    db: SessionDB,
+) -> None:
+    exact_cwd = "C:/source/worktree"
+    store = _seed(
+        db,
+        [_message("u-exact", "user", "Continue here.", timestamp=101.0)],
+        cwd=exact_cwd,
+    )
+    request = replace(_request(budget=1200), exact_cwd=exact_cwd)
+    first = ContextPackBuilder(db, store).build(request)
+    tampered = first.payload.replace(
+        '- [exact cwd] Every command and file operation MUST pass cwd="C:/source/worktree"; '
+        "sidebar project grouping is not cwd.\n",
+        "",
+    )
+    assert tampered != first.payload
+
+    def _write(conn) -> None:
+        conn.execute(
+            "UPDATE session_context_packs SET payload = ? WHERE id = ?",
+            (tampered, first.id),
+        )
+
+    db._execute_write(_write)
+
+    with pytest.raises(ValueError, match="exact cwd instruction missing"):
+        ContextPackBuilder(db, store).build(request)
+
+
 def test_goal_decision_constraint_and_unresolved_work_are_extracted(db: SessionDB):
     store = _seed(
         db,
