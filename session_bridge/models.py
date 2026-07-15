@@ -37,6 +37,14 @@ class MirrorJobState(StrEnum):
     MANUAL_FAILURE = "manual_failure"
 
 
+class SidebarJobState(StrEnum):
+    PENDING = "sidebar_pending"
+    LEASED = "sidebar_leased"
+    VISIBLE = "sidebar_visible"
+    RETRY = "sidebar_retry"
+    FAILED = "sidebar_failed"
+
+
 @dataclass(frozen=True)
 class ProjectedMessage:
     native_event_id: str

@@ -11,6 +11,7 @@ EXPECTED_BRIDGE_TABLES = {
     "external_message_map",
     "session_links",
     "session_mirror_jobs",
+    "session_sidebar_jobs",
     "session_context_packs",
     "session_bridge_state",
 }
@@ -25,6 +26,11 @@ EXPECTED_BRIDGE_INDEXES = {
         "state",
         "next_attempt_at",
     ),
+    "idx_session_sidebar_jobs_state_next_attempt_at": (
+        "state",
+        "next_attempt_at",
+    ),
+    "idx_session_sidebar_jobs_source_session_id": ("source_session_id",),
 }
 
 EXPECTED_BRIDGE_FOREIGN_KEYS = {
@@ -42,6 +48,9 @@ EXPECTED_BRIDGE_FOREIGN_KEYS = {
     "session_mirror_jobs": {
         ("source_session_id", "sessions", "id", "NO ACTION"),
     },
+    "session_sidebar_jobs": {
+        ("source_session_id", "sessions", "id", "NO ACTION"),
+    },
     "session_context_packs": {
         ("source_session_id", "sessions", "id", "NO ACTION"),
         ("target_session_id", "sessions", "id", "NO ACTION"),
@@ -50,12 +59,12 @@ EXPECTED_BRIDGE_FOREIGN_KEYS = {
 }
 
 
-def _prepare_v19_database(db_path: Path) -> int:
+def _prepare_v20_database(db_path: Path) -> int:
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(hermes_state.SCHEMA_SQL)
-        conn.execute("INSERT INTO schema_version (version) VALUES (19)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (20)")
         conn.execute(
             "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
             ("existing-session", "cli", 1000.0),
@@ -111,7 +120,7 @@ def _bridge_objects(db_path: Path) -> list[tuple[str, str, str]]:
         conn.close()
 
 
-def test_fresh_database_creates_bridge_tables_indexes_and_schema_v20(tmp_path):
+def test_fresh_database_creates_bridge_tables_indexes_and_schema_v21(tmp_path):
     db = hermes_state.SessionDB(tmp_path / "fresh.db")
     try:
         tables = {
@@ -123,7 +132,7 @@ def test_fresh_database_creates_bridge_tables_indexes_and_schema_v20(tmp_path):
         version = db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
 
         assert EXPECTED_BRIDGE_TABLES <= tables
-        assert version == 20
+        assert version == 21
 
         for index_name, expected_columns in EXPECTED_BRIDGE_INDEXES.items():
             rows = db._conn.execute(f'PRAGMA index_info("{index_name}")').fetchall()
@@ -132,9 +141,9 @@ def test_fresh_database_creates_bridge_tables_indexes_and_schema_v20(tmp_path):
         db.close()
 
 
-def test_v19_database_upgrades_without_losing_sessions_or_messages(tmp_path):
-    db_path = tmp_path / "v19.db"
-    message_id = _prepare_v19_database(db_path)
+def test_v20_database_upgrades_without_losing_sessions_or_messages(tmp_path):
+    db_path = tmp_path / "v20.db"
+    message_id = _prepare_v20_database(db_path)
 
     db = hermes_state.SessionDB(db_path)
     try:
@@ -148,7 +157,7 @@ def test_v19_database_upgrades_without_losing_sessions_or_messages(tmp_path):
             (message_id,),
         ).fetchone()
 
-        assert version == 20
+        assert version == 21
         assert tuple(session) == ("existing-session", "cli", 1000.0)
         assert tuple(message) == (
             message_id,
@@ -162,7 +171,7 @@ def test_v19_database_upgrades_without_losing_sessions_or_messages(tmp_path):
 
 def test_reopening_upgraded_database_is_idempotent(tmp_path):
     db_path = tmp_path / "reopen.db"
-    _prepare_v19_database(db_path)
+    _prepare_v20_database(db_path)
 
     first_open = hermes_state.SessionDB(db_path)
     first_open.close()
@@ -174,7 +183,7 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         versions = conn.execute("SELECT version FROM schema_version").fetchall()
-        assert versions == [(20,)]
+        assert versions == [(21,)]
         assert _bridge_objects(db_path) == first_objects
         assert len(first_objects) == len(EXPECTED_BRIDGE_TABLES) + len(
             EXPECTED_BRIDGE_INDEXES
@@ -276,6 +285,67 @@ def test_duplicate_mirror_job_idempotency_key_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("column", "duplicate_value"),
+    [
+        ("idempotency_key", "same-key"),
+        ("bridge_id", "same-bridge"),
+        ("codex_thread_id", "same-thread"),
+    ],
+)
+def test_sidebar_job_unique_fields_are_rejected(
+    tmp_path, column, duplicate_value
+):
+    db = hermes_state.SessionDB(tmp_path / f"sidebar-{column}-unique.db")
+    try:
+        conn = db._conn
+        _seed_sessions(conn, "source")
+        conn.execute(
+            "INSERT INTO session_sidebar_jobs "
+            "(id, idempotency_key, source_session_id, bridge_id, state, "
+            "next_attempt_at, codex_thread_id, eligible_at, created_at, updated_at) "
+            "VALUES ('job-1', 'same-key', 'source', 'same-bridge', "
+            "'sidebar_pending', 1, 'same-thread', 1, 1, 1)"
+        )
+
+        values = {
+            "idempotency_key": "different-key",
+            "bridge_id": "different-bridge",
+            "codex_thread_id": "different-thread",
+        }
+        values[column] = duplicate_value
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO session_sidebar_jobs "
+                "(id, idempotency_key, source_session_id, bridge_id, state, "
+                "next_attempt_at, codex_thread_id, eligible_at, created_at, updated_at) "
+                "VALUES (?, ?, 'source', ?, 'sidebar_pending', 2, ?, 2, 2, 2)",
+                (
+                    "job-2",
+                    values["idempotency_key"],
+                    values["bridge_id"],
+                    values["codex_thread_id"],
+                ),
+            )
+    finally:
+        db.close()
+
+
+def test_sidebar_job_source_session_foreign_key_is_enforced(tmp_path):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-source-foreign-key.db")
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
+            db._conn.execute(
+                "INSERT INTO session_sidebar_jobs "
+                "(id, idempotency_key, source_session_id, bridge_id, state, "
+                "next_attempt_at, eligible_at, created_at, updated_at) "
+                "VALUES ('job-1', 'idem-1', 'missing', 'bridge-1', "
+                "'sidebar_pending', 1, 1, 1, 1)"
+            )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
     ("sql", "params"),
     [
         (
@@ -308,6 +378,13 @@ def test_duplicate_mirror_job_idempotency_key_is_rejected(tmp_path):
             "next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, 1, 1)",
             ("job-1", "idem-1", "source", "codex", "invalid-state"),
         ),
+        (
+            "INSERT INTO session_sidebar_jobs "
+            "(id, idempotency_key, source_session_id, bridge_id, state, "
+            "next_attempt_at, eligible_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, 1, 1, 1)",
+            ("job-1", "idem-1", "source", "bridge-1", "invalid-state"),
+        ),
     ],
     ids=[
         "external-provider",
@@ -315,6 +392,7 @@ def test_duplicate_mirror_job_idempotency_key_is_rejected(tmp_path):
         "relation",
         "target-provider",
         "job-state",
+        "sidebar-job-state",
     ],
 )
 def test_bridge_check_constraints_reject_invalid_values(tmp_path, sql, params):
@@ -327,9 +405,9 @@ def test_bridge_check_constraints_reject_invalid_values(tmp_path, sql, params):
         db.close()
 
 
-def test_bridge_schema_failure_rolls_back_ddl_and_keeps_v19(tmp_path, monkeypatch):
+def test_bridge_schema_failure_rolls_back_ddl_and_keeps_v20(tmp_path, monkeypatch):
     db_path = tmp_path / "rollback.db"
-    message_id = _prepare_v19_database(db_path)
+    message_id = _prepare_v20_database(db_path)
     injected_schema = """
     CREATE TABLE external_sessions (session_id TEXT PRIMARY KEY);
     CREATE TABLE session_bridge_state (key TEXT PRIMARY KEY);
@@ -363,7 +441,7 @@ def test_bridge_schema_failure_rolls_back_ddl_and_keeps_v19(tmp_path, monkeypatc
         ).fetchone()
 
         assert bridge_tables == set()
-        assert version == 19
+        assert version == 20
         assert session == ("existing-session",)
         assert message == ("preserve me",)
     finally:

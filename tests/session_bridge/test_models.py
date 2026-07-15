@@ -26,6 +26,7 @@ from session_bridge import (
     encode_bridge_marker,
     stable_message_key,
 )
+from session_bridge.models import SidebarJobState
 
 
 SECRET = b"local-test-key"
@@ -93,6 +94,19 @@ def test_public_enum_values_are_exact_and_validate_unknown_values():
     for enum_type in (Provider, OriginKind, Relation, MirrorJobState):
         with pytest.raises(ValueError):
             enum_type("unknown")
+
+
+def test_sidebar_job_states_are_the_public_contract() -> None:
+    assert [state.value for state in SidebarJobState] == [
+        "sidebar_pending",
+        "sidebar_leased",
+        "sidebar_visible",
+        "sidebar_retry",
+        "sidebar_failed",
+    ]
+
+    with pytest.raises(ValueError):
+        SidebarJobState("unknown")
 
 
 @pytest.mark.parametrize(

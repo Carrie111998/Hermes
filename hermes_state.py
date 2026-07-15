@@ -139,7 +139,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -896,6 +896,42 @@ CREATE TABLE IF NOT EXISTS session_mirror_jobs (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
+    id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL REFERENCES sessions(id),
+    bridge_id TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'sidebar_pending', 'sidebar_leased', 'sidebar_visible',
+            'sidebar_retry', 'sidebar_failed'
+        )
+    ),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at REAL NOT NULL,
+    lease_digest TEXT,
+    lease_expires_at REAL,
+    completion_digest TEXT,
+    codex_thread_id TEXT UNIQUE,
+    error_code TEXT,
+    eligible_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    visible_at REAL,
+    CHECK (
+        (state = 'sidebar_leased' AND lease_digest IS NOT NULL AND lease_expires_at IS NOT NULL)
+        OR (state != 'sidebar_leased' AND lease_digest IS NULL AND lease_expires_at IS NULL)
+    ),
+    CHECK (
+        state != 'sidebar_visible'
+        OR (
+            codex_thread_id IS NOT NULL
+            AND visible_at IS NOT NULL
+            AND completion_digest IS NOT NULL
+        )
+    )
+);
+
 CREATE TABLE IF NOT EXISTS session_context_packs (
     id TEXT PRIMARY KEY,
     bridge_id TEXT NOT NULL,
@@ -928,6 +964,10 @@ CREATE INDEX IF NOT EXISTS idx_session_links_to_session_id
     ON session_links(to_session_id);
 CREATE INDEX IF NOT EXISTS idx_session_mirror_jobs_state_next_attempt_at
     ON session_mirror_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_state_next_attempt_at
+    ON session_sidebar_jobs(state, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_source_session_id
+    ON session_sidebar_jobs(source_session_id);
 """
 
 # Indexes that reference columns added in later schema versions must be
