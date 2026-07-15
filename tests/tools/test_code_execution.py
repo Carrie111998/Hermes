@@ -35,6 +35,7 @@ def _force_local_terminal(monkeypatch):
 import sys
 import threading
 import unittest
+from typing import cast
 from unittest.mock import patch, MagicMock
 
 from tools.code_execution_tool import (
@@ -346,6 +347,8 @@ class TestExecuteCodeHelpers(unittest.TestCase):
 
 
 class TestRpcServerLoop(unittest.TestCase):
+    RPC_TOKEN = "test-rpc-token"
+
     def _run_rpc(
         self, payloads, *, allowed_tools=frozenset({"terminal"}), max_tool_calls=5
     ):
@@ -366,13 +369,14 @@ class TestRpcServerLoop(unittest.TestCase):
             child.sendall(b"".join(payloads))
             child.shutdown(socket.SHUT_WR)
             _rpc_server_loop(
-                FakeServerSock(),
+                cast(socket.socket, FakeServerSock()),
                 "task-123",
                 tool_call_log,
                 tool_call_counter,
                 max_tool_calls,
                 allowed_tools,
                 stop_event,
+                self.RPC_TOKEN,
             )
             chunks = []
             while True:
@@ -393,7 +397,11 @@ class TestRpcServerLoop(unittest.TestCase):
     def test_rpc_server_rejects_invalid_json_and_disallowed_tool(self):
         responses, tool_call_log, count = self._run_rpc([
             b"not-json\n",
-            json.dumps({"tool": "read_file", "args": {"path": "x"}}).encode()
+            json.dumps({
+                "tool": "read_file",
+                "args": {"path": "x"},
+                "token": self.RPC_TOKEN,
+            }).encode()
             + b"\n",
         ])
 
@@ -408,6 +416,7 @@ class TestRpcServerLoop(unittest.TestCase):
                 json.dumps({
                     "tool": "terminal",
                     "args": {"command": "echo hi"},
+                    "token": self.RPC_TOKEN,
                 }).encode()
                 + b"\n",
             ],
@@ -436,6 +445,7 @@ class TestRpcServerLoop(unittest.TestCase):
                         "notify_on_complete": True,
                         "watch_patterns": ["done"],
                     },
+                    "token": self.RPC_TOKEN,
                 }).encode()
                 + b"\n",
             ])
