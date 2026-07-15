@@ -194,6 +194,60 @@ def test_sidebar_skill_unconditionally_renames_every_task_before_commit() -> Non
     ) in rename_step
 
 
+def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "`list_projects({})` exactly once" in skill
+    assert "canonical path to its returned `projectId`" in skill
+    assert (
+        '`list_threads({"query":"<exact signed marker>","limit":20})`' in skill
+    )
+    assert (
+        '`read_thread({"threadId":"<candidate threadId>",'
+        '"hostId":"<candidate hostId>","turnLimit":20,'
+        '"includeOutputs":false})`'
+    ) in skill
+    assert "Omit `hostId` only when the candidate has none" in skill
+    assert "Pass no other fields" in skill
+    assert '`read_thread({"threadId":"<candidate threadId>",...})`' not in skill
+    assert "Before matching the signed marker" in skill
+    assert "remote-host candidate" in skill
+    assert "`codex_thread_conflict`" in skill
+    assert (
+        '`create_thread({"prompt":"<registration_prompt verbatim>",'
+        '"target":{"type":"project","projectId":"<chosen projectId>",'
+        '"environment":{"type":"local"}}})`'
+    ) in skill
+    assert "Only the returned `threadId` is a successful create result" in skill
+    assert "`worktreeId`" in skill and "`clientThreadId`" in skill
+    assert (
+        '`set_thread_title({"threadId":"<threadId>","title":"<exact title>"})`'
+        in skill
+    )
+
+
+def test_sidebar_skill_deterministically_settles_native_and_broker_failures() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    required_rules = (
+        "Unavailable native tool -> `codex_tool_unavailable`",
+        "Desktop explicitly offline -> `desktop_offline`",
+        "Definite or ambiguous create failure -> `native_task_not_indexed`",
+        "Failed or ambiguous reconciliation -> `native_task_not_indexed`",
+        "Failed rename -> `rename_failed`",
+        "Definite or ambiguous commit failure -> `bridge_temporarily_unavailable`",
+        "If the fail/release call itself fails",
+        "exhausts settlement for that lease in this batch",
+        "never call `session_sidebar_fail` for that lease again",
+        "continue with the next leased job",
+        "never expose raw exception text",
+    )
+    for rule in required_rules:
+        assert rule in skill
+    assert "Never retry create after any ambiguous create outcome" in skill
+    assert "Never create a replacement after commit ambiguity" in skill
+
+
 def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
     import re
 

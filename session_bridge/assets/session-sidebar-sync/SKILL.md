@@ -23,20 +23,20 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
 ## Procedure
 
 1. Call `session_sidebar_pending(limit=5)` exactly once. Never create a task without a lease from this batch. If `jobs` is empty, end immediately with no user-facing message.
-2. List native Codex projects exactly once and index every saved project by its canonical local path. If listing fails, call `session_sidebar_fail` with `project_lookup_failed` for every unfinished lease, then end.
+2. Call the native tool `list_projects({})` exactly once. Read every returned saved project's canonical local path, and index that canonical path to its returned `projectId`. Do not call it again for another job. If the call or canonical lookup definitively fails, fail/release every unfinished lease with `project_lookup_failed`, then end.
 3. For each leased job, choose its sidebar project in this exact order:
    1. the saved project whose canonical path equals the job's exact cwd;
    2. the saved project whose canonical path equals the job's exact git root;
    3. the saved `Session Inbox` project whose canonical path is the local `.hermes` directory.
 4. Treat project choice as sidebar grouping only. Sidebar grouping never changes command cwd, and registration never runs project commands. The job's exact source cwd remains authoritative for later command and file operations after continuation.
-5. When `reconcile_required` is true or `recovered_thread_id` is returned, inspect native Codex tasks in the chosen project before creating anything. If `recovered_thread_id` is present, locate that exact native task and verify its authenticated marker; a missing or mismatched task maps to `marker_conflict` and never permits creation. Otherwise match the exact authenticated signed marker carried inside `registration_prompt`:
+5. When `reconcile_required` is true or `recovered_thread_id` is returned, reconcile before creating anything. Extract the exact authenticated signed marker from `registration_prompt`, call `list_threads({"query":"<exact signed marker>","limit":20})`, and inspect each candidate with `read_thread({"threadId":"<candidate threadId>","hostId":"<candidate hostId>","turnLimit":20,"includeOutputs":false})`. Omit `hostId` only when the candidate has none. Pass no other fields. Twenty is the bounded reconciliation and read limit; never paginate or broaden the query during this batch. Before matching the signed marker, require the read result to belong to the chosen local project and host identity and to be a native local task. A remote-host candidate, wrong-project candidate, non-native task, or non-local environment maps to `codex_thread_conflict`, is never reused, and never permits replacement creation. Then verify the exact signed marker. If `recovered_thread_id` is present, only that exact ID may be accepted; a missing or mismatched task maps to `marker_conflict` and never permits creation. Otherwise:
    - exactly one matching native task: reuse its thread ID;
    - no match: continue to creation only when no recovered thread was returned;
    - conflicting or multiple matches: call `session_sidebar_fail` with `marker_conflict`.
-6. If no task was reconciled, create exactly one native local task in the chosen project using the job's `registration_prompt` verbatim. Do not replace it with the title, transcript text, or a summary.
-7. Rename every reconciled task and every newly created task to the returned `[Claude]` or `[Hermes]` title before commit. On rename failure, call `session_sidebar_fail` with `rename_failed`; do not commit and do not create a replacement task.
-8. Call `session_sidebar_commit(lease_token=<exact token>, codex_thread_id=<native thread ID>)`. A job is complete only after commit succeeds.
-9. Before exit, call `session_sidebar_fail(lease_token=<exact token>, error_code=<fixed code>)` once for every unfinished lease that can still be settled. The argument is named `error_code`, never `code`, `error`, or exception text.
+6. If no task was reconciled, create exactly one native local task with `create_thread({"prompt":"<registration_prompt verbatim>","target":{"type":"project","projectId":"<chosen projectId>","environment":{"type":"local"}}})`. Do not replace the prompt with the title, transcript text, or a summary. Only the returned `threadId` is a successful create result. `worktreeId`, `clientThreadId`, any other ID, a missing response, or an uncertain call outcome is an ambiguous create: never accept it and never create again for that lease.
+7. Rename every reconciled task and every newly created task to the returned `[Claude]` or `[Hermes]` title before commit. Use `set_thread_title({"threadId":"<threadId>","title":"<exact title>"})`. On rename failure, call `session_sidebar_fail` with `rename_failed`; do not commit and do not create a replacement task.
+8. Call `session_sidebar_commit(lease_token=<exact token>, codex_thread_id=<threadId>)`. A job is complete only after commit succeeds. On a definite or ambiguous commit failure, never create a replacement or repeat create; try fail/release once with `bridge_temporarily_unavailable`, then continue to the next lease.
+9. Before exit, call `session_sidebar_fail(lease_token=<exact token>, error_code=<fixed code>)` once for every unfinished lease with no prior fail/release attempt in this batch. The argument is named `error_code`, never `code`, `error`, or exception text.
 
 ## Fixed Failure Mapping
 
@@ -58,6 +58,20 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
 | Permission preflight failed | `permission_preflight_failed` |
 
 Calling `session_sidebar_fail` is the fail/release operation for an unfinished lease. Continue settling the other leases even when one job fails.
+
+## Deterministic Call-Failure Rules
+
+Classify failures without copying exception text. Apply the first matching rule:
+
+- Unavailable native tool -> `codex_tool_unavailable`.
+- Desktop explicitly offline -> `desktop_offline`.
+- Bridge call temporarily unavailable -> `bridge_temporarily_unavailable`; an explicit SQLite busy result -> `sqlite_busy`.
+- Project list or path-to-project mapping failure -> `project_lookup_failed`.
+- Definite or ambiguous create failure -> `native_task_not_indexed`. Never retry create after any ambiguous create outcome; try fail/release once and continue with the next leased job.
+- Failed or ambiguous reconciliation -> `native_task_not_indexed`. Multiple authenticated matches or a recovered-ID mismatch remain `marker_conflict`.
+- Failed rename -> `rename_failed`; never commit or create a replacement.
+- Definite or ambiguous commit failure -> `bridge_temporarily_unavailable`. Never create a replacement after commit ambiguity; try fail/release once and continue with the next leased job.
+- If the fail/release call itself fails, do not substitute a new error code, do not retry create or commit, and continue with the next leased job. A fail/release attempt, whether successful, failed, or ambiguous, exhausts settlement for that lease in this batch: record it as attempted and never call `session_sidebar_fail` for that lease again. Let the broker lease expire or recover later, and never expose raw exception text.
 
 ## Hard Stops
 
