@@ -13,6 +13,7 @@ This module provides:
 """
 
 import copy
+import importlib
 import json
 import logging
 import os
@@ -25,11 +26,22 @@ import sys
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Callable, Optional, List, Tuple, Set
+from typing import Dict, Any, Callable, Iterator, Optional, List, Tuple, Set
 
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+try:
+    _fcntl: Any = importlib.import_module("fcntl")
+except ImportError:  # pragma: no cover - Windows
+    _fcntl = None
+
+try:
+    _msvcrt: Any = importlib.import_module("msvcrt")
+except ImportError:  # pragma: no cover - POSIX
+    _msvcrt = None
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +253,9 @@ _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
 # calls read_raw_config. Also covers mutation of the module-level cache
 # dicts above.
 _CONFIG_LOCK = threading.RLock()
+_CONFIG_FILE_LOCK_TIMEOUT_SECONDS = 10.0
+_CONFIG_FILE_LOCK_POLL_SECONDS = 0.05
+_CONFIG_FILE_LOCK_HOLDER = threading.local()
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS
 # (managed by setup/provider flows directly).
 _EXTRA_ENV_KEYS = frozenset({
@@ -677,6 +692,81 @@ from utils import atomic_replace, fast_safe_load
 def get_config_path() -> Path:
     """Get the main config file path."""
     return get_hermes_home() / "config.yaml"
+
+
+@contextmanager
+def _config_file_lock(config_path: Optional[Path] = None) -> Iterator[None]:
+    """Serialize config writers across processes with an adjacent sidecar.
+
+    The sidecar is intentionally persistent: kernel advisory-lock ownership is
+    released when the file handle or process exits, so a surviving ``.lock``
+    file is not stale ownership. Deleting it would create an inode-replacement
+    race in which two processes could lock different files at the same path.
+    """
+
+    target_path = config_path or get_config_path()
+    lock_path = target_path.with_name(f"{target_path.name}.lock")
+    depth = getattr(_CONFIG_FILE_LOCK_HOLDER, "depth", 0)
+    if depth:
+        _CONFIG_FILE_LOCK_HOLDER.depth = depth + 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_HOLDER.depth -= 1
+        return
+
+    if _fcntl is None and _msvcrt is None:  # pragma: no cover - supported OSes have one
+        raise RuntimeError("config_lock_unavailable")
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    acquired = False
+    try:
+        if _msvcrt is not None:
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+
+        deadline = time.monotonic() + max(0.0, _CONFIG_FILE_LOCK_TIMEOUT_SECONDS)
+        while True:
+            try:
+                if _fcntl is not None:
+                    getattr(_fcntl, "flock")(
+                        lock_file.fileno(),
+                        getattr(_fcntl, "LOCK_EX") | getattr(_fcntl, "LOCK_NB"),
+                    )
+                else:
+                    assert _msvcrt is not None
+                    lock_file.seek(0)
+                    _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except (BlockingIOError, OSError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("config_lock_timeout")
+                time.sleep(_CONFIG_FILE_LOCK_POLL_SECONDS)
+
+        _CONFIG_FILE_LOCK_HOLDER.depth = 1
+        try:
+            yield
+        finally:
+            _CONFIG_FILE_LOCK_HOLDER.depth = 0
+    finally:
+        if acquired:
+            try:
+                if _fcntl is not None:
+                    getattr(_fcntl, "flock")(
+                        lock_file.fileno(), getattr(_fcntl, "LOCK_UN")
+                    )
+                else:
+                    assert _msvcrt is not None
+                    lock_file.seek(0)
+                    _msvcrt.locking(lock_file.fileno(), _msvcrt.LK_UNLCK, 1)
+            except (OSError, PermissionError):
+                pass
+        lock_file.close()
+
 
 def get_env_path() -> Path:
     """Get the .env file path (for API keys)."""
@@ -6661,8 +6751,9 @@ def atomic_config_write(config_path: Path, data: Any, **kwargs: Any) -> None:
     """
     from utils import atomic_yaml_write
 
-    require_readable_config_before_write(config_path)
-    atomic_yaml_write(config_path, data, **kwargs)
+    with _CONFIG_LOCK, _config_file_lock(config_path):
+        require_readable_config_before_write(config_path)
+        atomic_yaml_write(config_path, data, **kwargs)
 
 
 def load_config() -> Dict[str, Any]:
@@ -7012,11 +7103,11 @@ def mutate_config(
     strip_defaults: bool = True,
     preserve_keys: Optional[Set[Tuple[str, ...]]] = None,
 ) -> Dict[str, Any]:
-    """Atomically load, mutate, and save config under the shared process lock."""
+    """Load, mutate, and atomically save config as one cross-process transaction."""
 
     if not callable(mutator):
         raise TypeError("config mutator must be callable")
-    with _CONFIG_LOCK:
+    with _CONFIG_LOCK, _config_file_lock():
         config = load_config()
         result = mutator(config)
         if result is not None:
@@ -7043,7 +7134,7 @@ def save_config(
     contaminated with schema defaults on every save, which makes future
     default changes invisible to users.
     """
-    with _CONFIG_LOCK:
+    with _CONFIG_LOCK, _config_file_lock():
         if is_managed():
             managed_error("save configuration")
             return

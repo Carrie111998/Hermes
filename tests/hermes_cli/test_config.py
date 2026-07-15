@@ -1,5 +1,6 @@
 """Tests for hermes_cli configuration management."""
 
+import multiprocessing
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,41 @@ from hermes_cli.config import (
     write_platform_config_field,
     _sanitize_env_lines,
 )
+
+
+def _mutate_config_process(home, key, entered, release=None, ready=None):
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.config import mutate_config
+
+    if ready is not None:
+        ready.set()
+
+    def update(config):
+        config.setdefault("race_test", {})[key] = True
+        entered.set()
+        if release is not None and not release.wait(timeout=10):
+            raise RuntimeError("test release timed out")
+
+    mutate_config(update, strip_defaults=False)
+
+
+def _mutate_config_after_exception_process(home):
+    os.environ["HERMES_HOME"] = str(home)
+    from hermes_cli.config import mutate_config
+
+    def fail(_config):
+        raise RuntimeError("expected mutation failure")
+
+    try:
+        mutate_config(fail, strip_defaults=False)
+    except RuntimeError as exc:
+        if str(exc) != "expected mutation failure":
+            raise
+
+    def recover(config):
+        config.setdefault("race_test", {})["recovered"] = True
+
+    mutate_config(recover, strip_defaults=False)
 
 
 class TestGetHermesHome:
@@ -609,6 +645,97 @@ class TestSaveConfigAtomicity:
                 raw = yaml.safe_load(f)
             assert raw["model"] == "test/atomic-model"
             assert raw["agent"]["max_turns"] == 77
+
+
+class TestConfigInterprocessLocking:
+    def test_mutate_config_preserves_unrelated_keys_across_processes(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        first_entered = context.Event()
+        release_first = context.Event()
+        second_ready = context.Event()
+        second_entered = context.Event()
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            save_config({"existing": {"keep": True}}, strip_defaults=False)
+            first = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "first", first_entered, release_first),
+            )
+            second = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "second", second_entered, None, second_ready),
+            )
+            first.start()
+            assert first_entered.wait(timeout=10)
+            second.start()
+            try:
+                assert second_ready.wait(timeout=10)
+                assert not second_entered.wait(timeout=0.5)
+            finally:
+                release_first.set()
+                first.join(timeout=15)
+                second.join(timeout=15)
+                if first.is_alive():
+                    first.terminate()
+                if second.is_alive():
+                    second.terminate()
+
+            assert first.exitcode == 0
+            assert second.exitcode == 0
+            assert read_raw_config()["race_test"] == {
+                "first": True,
+                "second": True,
+            }
+            assert read_raw_config()["existing"] == {"keep": True}
+
+    def test_mutator_exception_releases_lock(self, tmp_path):
+        context = multiprocessing.get_context("spawn")
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            process = context.Process(
+                target=_mutate_config_after_exception_process,
+                args=(tmp_path,),
+            )
+            process.start()
+            process.join(timeout=15)
+            if process.is_alive():
+                process.terminate()
+                pytest.fail("config lock remained held after a mutator exception")
+
+            assert process.exitcode == 0
+            assert read_raw_config()["race_test"]["recovered"] is True
+
+    def test_direct_save_uses_bounded_lock_with_fixed_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_cli.config as config_module
+
+        context = multiprocessing.get_context("spawn")
+        holder_entered = context.Event()
+        release_holder = context.Event()
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            holder = context.Process(
+                target=_mutate_config_process,
+                args=(tmp_path, "holder", holder_entered, release_holder),
+            )
+            holder.start()
+            assert holder_entered.wait(timeout=10)
+            monkeypatch.setattr(
+                config_module,
+                "_CONFIG_FILE_LOCK_TIMEOUT_SECONDS",
+                0.1,
+                raising=False,
+            )
+            try:
+                with pytest.raises(TimeoutError) as raised:
+                    save_config({"direct": True}, strip_defaults=False)
+                assert str(raised.value) == "config_lock_timeout"
+            finally:
+                release_holder.set()
+                holder.join(timeout=15)
+                if holder.is_alive():
+                    holder.terminate()
+
+            assert holder.exitcode == 0
 
 
 class TestSanitizeEnvLines:

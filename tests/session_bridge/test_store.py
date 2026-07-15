@@ -4,7 +4,7 @@ import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
@@ -3427,6 +3427,47 @@ def test_sidebar_actionable_age_uses_fresh_lease_time_then_ages_while_leased(
     assert fresh["counts"][SidebarJobState.LEASED.value] == 1
     assert fresh["oldest_pending_age_seconds"] == 0.0
     assert stale["oldest_pending_age_seconds"] == 181.0
+
+
+def test_sidebar_broker_heartbeat_rejects_invalid_timestamps(db) -> None:
+    store = SessionBridgeStore(db)
+
+    for invalid in (True, float("nan"), float("inf"), "100", None):
+        with pytest.raises((TypeError, ValueError)):
+            store.record_sidebar_broker_heartbeat(now=invalid)  # type: ignore[arg-type]
+
+
+def test_sidebar_broker_heartbeat_is_monotonic_across_overlapping_stores(db) -> None:
+    """An older request finishing late must not overwrite a newer heartbeat."""
+
+    older_store = SessionBridgeStore(db)
+    newer_db = SessionDB(db.db_path)
+    newer_store = SessionBridgeStore(newer_db)
+    older_started = Event()
+    newer_finished = Event()
+
+    def finish_older_request_late() -> None:
+        older_started.set()
+        assert newer_finished.wait(timeout=5)
+        older_store.record_sidebar_broker_heartbeat(now=100.0)
+
+    def finish_newer_request_first() -> None:
+        assert older_started.wait(timeout=5)
+        newer_store.record_sidebar_broker_heartbeat(now=200.0)
+        newer_finished.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            older = executor.submit(finish_older_request_late)
+            newer = executor.submit(finish_newer_request_first)
+            older.result(timeout=5)
+            newer.result(timeout=5)
+
+        assert older_store.get_state(
+            "session-bridge:sidebar:broker-heartbeat"
+        ) == {"at": 200.0}
+    finally:
+        newer_db.close()
 
 
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(db) -> None:

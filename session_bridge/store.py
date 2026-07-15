@@ -50,6 +50,7 @@ _MIRROR_RATE_STATE_KEY = "session-bridge:mirror-rate"
 _MIRROR_BREAKER_STATE_KEY = "session-bridge:mirror-breaker"
 _MIRROR_BREAKER_RESERVATION_PREFIX = "session-bridge:breaker-reservation:"
 _SIDEBAR_DELIVERY_STATE_PREFIX = "session-bridge:sidebar-delivery:"
+_SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _WORKTREE_SNAPSHOT_STATE_PREFIX = "session-bridge:worktree:"
 _WORKTREE_SNAPSHOT_FIELDS = frozenset({
     "version",
@@ -1644,10 +1645,43 @@ class SessionBridgeStore:
 
     def record_sidebar_broker_heartbeat(self, *, now: float) -> None:
         heartbeat = _finite_number(now, "sidebar broker heartbeat")
-        self.set_state(
-            "session-bridge:sidebar:broker-heartbeat",
-            {"at": heartbeat},
-        )
+        updated_at = _finite_number(self._clock(), "current time")
+
+        def _write(conn) -> None:
+            row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_SIDEBAR_BROKER_HEARTBEAT_STATE_KEY,),
+            ).fetchone()
+            persisted = heartbeat
+            if row is not None:
+                try:
+                    existing = json.loads(row["value_json"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("sidebar broker heartbeat state is malformed") from exc
+                if not isinstance(existing, dict) or "at" not in existing:
+                    raise ValueError("sidebar broker heartbeat state is malformed")
+                existing_at = _finite_number(
+                    existing["at"], "persisted sidebar broker heartbeat"
+                )
+                persisted = max(existing_at, heartbeat)
+
+            value_json = json.dumps(
+                {"at": persisted},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            conn.execute(
+                """INSERT INTO session_bridge_state (key, value_json, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET
+                       value_json = excluded.value_json,
+                       updated_at = excluded.updated_at""",
+                (_SIDEBAR_BROKER_HEARTBEAT_STATE_KEY, value_json, updated_at),
+            )
+
+        self.db._execute_write(_write)
 
     def sidebar_delivery_status(self, *, now: float | None = None) -> dict[str, Any]:
         status_time = _finite_number(self._clock() if now is None else now, "now")
