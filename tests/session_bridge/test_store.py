@@ -33,7 +33,10 @@ from session_bridge.sidebar import (
     sidebar_bridge_id,
     sidebar_idempotency_key,
 )
-from session_bridge.store import SessionBridgeStore
+from session_bridge.store import (
+    SIDEBAR_RETRYABLE_ERRORS,
+    SessionBridgeStore,
+)
 
 
 @pytest.fixture
@@ -2918,11 +2921,23 @@ def test_sidebar_claim_rejects_nonfinite_times(db, now) -> None:
         store.claim_sidebar_jobs(now=now, limit=1)
 
 
-def test_sidebar_claim_enforces_the_fixed_five_minute_lease(db) -> None:
+@pytest.mark.parametrize(
+    "lease_seconds",
+    [299, 301, 300.0, True, False, "300", None],
+)
+def test_sidebar_claim_rejects_every_nonexact_lease_duration(
+    db, lease_seconds
+) -> None:
     store = SessionBridgeStore(db)
 
     with pytest.raises(ValueError, match="exactly 300"):
-        store.claim_sidebar_jobs(now=100.0, limit=1, lease_seconds=299)
+        store.claim_sidebar_jobs(now=100.0, limit=1, lease_seconds=lease_seconds)
+
+
+def test_sidebar_claim_accepts_only_exact_integer_five_minute_lease(db) -> None:
+    store = SessionBridgeStore(db)
+
+    assert store.claim_sidebar_jobs(now=100.0, limit=1, lease_seconds=300) == []
 
 
 def test_sidebar_claim_is_atomic_across_independent_store_instances(tmp_path) -> None:
@@ -3107,6 +3122,83 @@ def test_sidebar_fail_rejects_non_allowlisted_error_without_releasing(db) -> Non
     assert row["state"] == SidebarJobState.LEASED.value
     assert row["error_code"] is None
     assert "error_detail" not in row
+
+
+def test_sidebar_retryable_error_allowlist_is_the_exact_fixed_contract() -> None:
+    assert SIDEBAR_RETRYABLE_ERRORS == frozenset({
+        "codex_tool_unavailable",
+        "desktop_offline",
+        "bridge_temporarily_unavailable",
+        "sqlite_busy",
+        "rename_failed",
+        "project_lookup_failed",
+        "native_task_not_indexed",
+        "broker_time_budget",
+    })
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    sorted(SIDEBAR_RETRYABLE_ERRORS - {"broker_time_budget"}),
+)
+def test_each_regular_retryable_sidebar_error_schedules_a_retry(
+    db, error_code: str
+) -> None:
+    token = f"retryable-{error_code}"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(token),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=f"retryable-{error_code}")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code=error_code,
+        now=150.0,
+    )
+
+    assert failed["state"] == SidebarJobState.RETRY.value
+    assert failed["attempts"] == 1
+    assert failed["next_attempt_at"] == 210.0
+    assert failed["error_code"] == error_code
+
+
+@pytest.mark.parametrize("jitter_kind", ["negative", "above-bound"])
+def test_sidebar_retry_rejects_out_of_range_jitter_and_rolls_back_lease(
+    db, jitter_kind: str
+) -> None:
+    def _invalid_jitter(bound: float) -> float:
+        return -0.01 if jitter_kind == "negative" else bound + 0.01
+
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(f"jitter-{jitter_kind}"),
+        sidebar_jitter=_invalid_jitter,
+    )
+    candidate = _sidebar_candidate(db, native_id=f"jitter-{jitter_kind}")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert before is not None
+
+    with pytest.raises(ValueError, match="outside its bound"):
+        store.fail_sidebar_job(
+            lease_token=lease["lease_token"],
+            error_code="desktop_offline",
+            now=150.0,
+        )
+
+    after = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert after == before
+    assert after is not None
+    assert after["state"] == SidebarJobState.LEASED.value
+    assert after["lease_digest"] == hashlib.sha256(
+        lease["lease_token"].encode()
+    ).hexdigest()
+    assert after["attempts"] == 0
 
 
 def test_sidebar_retry_backoff_counts_failures_and_fails_on_attempt_five(db) -> None:
