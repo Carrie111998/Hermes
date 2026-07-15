@@ -737,6 +737,11 @@ class SessionBridgeStore:
                                 )
                             )
                         )
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM session_sidebar_jobs AS sidebar_job
+                               WHERE sidebar_job.source_session_id = s.id
+                          )
                    ), candidate AS (
                        SELECT * FROM source_metadata
                         WHERE last_active IS NOT NULL
@@ -999,7 +1004,7 @@ class SessionBridgeStore:
         job_id = f"sidebar-job:{hashlib.sha256(idempotency_key.encode()).hexdigest()}"
 
         def _write(conn):
-            conn.execute(
+            insert = conn.execute(
                 """INSERT OR IGNORE INTO session_sidebar_jobs (
                    id, idempotency_key, source_session_id, bridge_id, state,
                    attempts, next_attempt_at, eligible_at, created_at, updated_at
@@ -1026,7 +1031,7 @@ class SessionBridgeStore:
                 or row["bridge_id"] != expected_bridge_id
             ):
                 raise ValueError("conflicting sidebar job identity")
-            return dict(row)
+            return {**dict(row), "created": insert.rowcount == 1}
 
         return self.db._execute_write(_write)
 

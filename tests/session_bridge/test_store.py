@@ -2841,7 +2841,11 @@ def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> No
     first = store.enqueue_sidebar_job(candidate)
     replay = store.enqueue_sidebar_job(candidate)
 
-    assert replay == first
+    assert first["created"] is True
+    assert replay["created"] is False
+    assert {key: value for key, value in replay.items() if key != "created"} == {
+        key: value for key, value in first.items() if key != "created"
+    }
     assert first["idempotency_key"] == sidebar_idempotency_key(
         candidate.source_session_id
     )
@@ -3553,7 +3557,9 @@ def test_sidebar_counts_and_source_lookup_have_stable_public_shapes(db) -> None:
     leased_row = store.enqueue_sidebar_job(leased)
 
     assert store.get_sidebar_job_for_source("missing") is None
-    assert store.get_sidebar_job_for_source(leased.source_session_id) == leased_row
+    assert store.get_sidebar_job_for_source(leased.source_session_id) == {
+        key: value for key, value in leased_row.items() if key != "created"
+    }
     store.claim_sidebar_jobs(now=200.0, limit=1)
     assert store.sidebar_job_counts() == {
         "sidebar_pending": 1,

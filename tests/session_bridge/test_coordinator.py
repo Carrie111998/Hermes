@@ -8,7 +8,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from threading import Event, Lock
+from threading import Barrier, Event, Lock
+import time
 from typing import Any
 import uuid
 
@@ -2889,7 +2890,7 @@ async def test_sidebar_registration_enqueues_only_native_meaningful_sources_once
 
     health = coordinator.health()
     assert health["sidebar_registration_counts"] == {
-        "examined": 7,
+        "examined": 4,
         "queued": 0,
         "claude": 0,
         "hermes": 0,
@@ -2942,7 +2943,14 @@ async def test_sidebar_registration_isolates_malformed_claude_from_hermes(
 class _SidebarScanStore(_RecordingStore):
     def __init__(self) -> None:
         super().__init__()
+        self.state: dict[str, dict[str, object]] = {}
         self.sidebar_list_calls: list[tuple[float, int, object]] = []
+
+    def get_state(self, key: str) -> dict[str, object] | None:
+        return self.state.get(key)
+
+    def set_state(self, key: str, value: Mapping[str, object]) -> None:
+        self.state[key] = dict(value)
 
     def list_sidebar_candidates(
         self,
@@ -2990,15 +2998,22 @@ class _PagedSidebarStore:
     ) -> None:
         self.pages = dict(pages)
         self.existing = set(existing or ())
+        self.state: dict[str, dict[str, object]] = {}
         self.list_calls: list[tuple[float, int, object]] = []
         self.enqueued: list[SidebarCandidate] = []
+
+    def get_state(self, key: str) -> dict[str, object] | None:
+        return self.state.get(key)
+
+    def set_state(self, key: str, value: Mapping[str, object]) -> None:
+        self.state[key] = dict(value)
 
     def list_sidebar_candidates(
         self,
         after: float,
         limit: int,
         *,
-        cursor: object = None,
+        cursor: tuple[float, str] | None = None,
     ) -> SidebarSourcePage:
         self.list_calls.append((after, limit, cursor))
         return self.pages[cursor]
@@ -3009,7 +3024,7 @@ class _PagedSidebarStore:
     def enqueue_sidebar_job(self, candidate: SidebarCandidate) -> dict[str, object]:
         self.existing.add(candidate.source_session_id)
         self.enqueued.append(candidate)
-        return {"source_session_id": candidate.source_session_id}
+        return {"source_session_id": candidate.source_session_id, "created": True}
 
 
 @pytest.mark.asyncio
@@ -3105,6 +3120,230 @@ async def test_sidebar_registration_rejects_a_repeated_pagination_cursor() -> No
 
     with pytest.raises(ValueError, match="sidebar candidate cursor"):
         await coordinator.register_sidebar_jobs_once(now=now, limit=1)
+
+
+class _BudgetRecordingSidebarStore(SessionBridgeStore):
+    def __init__(self, db: SessionDB, *, clock: Callable[[], float]) -> None:
+        super().__init__(db, clock=clock)
+        self.list_calls: list[tuple[float, int, object]] = []
+
+    def list_sidebar_candidates(
+        self,
+        after: float,
+        limit: int,
+        *,
+        cursor: tuple[float, str] | None = None,
+    ) -> SidebarSourcePage:
+        self.list_calls.append((after, limit, cursor))
+        return super().list_sidebar_candidates(after, limit, cursor=cursor)
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_is_bounded_durable_and_probes_newest_first(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = _BudgetRecordingSidebarStore(sidebar_db, clock=lambda: now)
+    for offset in range(12):
+        _add_hermes_sidebar_source(
+            sidebar_db,
+            session_id=f"ack-{offset:02d}",
+            content="yes",
+            last_active=now - offset,
+        )
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="older-eligible",
+        content="Queue this older eligible request",
+        last_active=now - 20,
+    )
+    first = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    first_summary = await first.register_sidebar_jobs_once(now=now, limit=1)
+    first_call_count = len(store.list_calls)
+    durable_after_first = store.get_state(
+        "session-bridge:sidebar:registration-cursor"
+    )
+
+    assert first_summary.queued == 0
+    assert first_summary.examined <= 40
+    assert 1 <= first_call_count <= 4
+    assert durable_after_first is not None
+    assert store.get_sidebar_job_for_source("older-eligible") is None
+
+    _add_hermes_sidebar_source(
+        sidebar_db,
+        session_id="newest-eligible",
+        content="Queue this newly arrived request",
+        last_active=now + 1,
+    )
+    restarted = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now + 1,
+    )
+    before_newest_probe = len(store.list_calls)
+
+    newest_summary = await restarted.register_sidebar_jobs_once(now=now + 1, limit=1)
+
+    assert newest_summary.queued == 1
+    assert len(store.list_calls) - before_newest_probe == 1
+    assert store.get_sidebar_job_for_source("newest-eligible") is not None
+    assert store.get_state(
+        "session-bridge:sidebar:registration-cursor"
+    ) == durable_after_first
+
+    older_summary = None
+    for _ in range(4):
+        continued = SessionBridgeCoordinator(
+            config=_sidebar_config(),
+            store=store,
+            adapters={},
+            target_adapters={},
+            clock=lambda: now + 1,
+        )
+        before = len(store.list_calls)
+        older_summary = await continued.register_sidebar_jobs_once(
+            now=now + 1,
+            limit=1,
+        )
+        assert 1 <= len(store.list_calls) - before <= 4
+        assert older_summary.examined <= 40
+        if store.get_sidebar_job_for_source("older-eligible") is not None:
+            break
+
+    assert older_summary is not None
+    assert store.get_sidebar_job_for_source("older-eligible") is not None
+
+
+class _SlowEmptySidebarStore:
+    def __init__(self) -> None:
+        self.state: dict[str, dict[str, object]] = {}
+        self.guard = Lock()
+        self.active = 0
+        self.max_active = 0
+
+    def get_state(self, key: str) -> dict[str, object] | None:
+        return self.state.get(key)
+
+    def set_state(self, key: str, value: Mapping[str, object]) -> None:
+        self.state[key] = dict(value)
+
+    def list_sidebar_candidates(
+        self,
+        after: float,
+        limit: int,
+        *,
+        cursor: object = None,
+    ) -> SidebarSourcePage:
+        del after, limit, cursor
+        with self.guard:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        time.sleep(0.05)
+        with self.guard:
+            self.active -= 1
+        return SidebarSourcePage()
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_serializes_calls_within_one_coordinator() -> None:
+    store = _SlowEmptySidebarStore()
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: 3_000_000.0,
+    )
+
+    await asyncio.gather(
+        coordinator.register_sidebar_jobs_once(limit=1),
+        coordinator.register_sidebar_jobs_once(limit=1),
+    )
+
+    assert store.max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_sidebar_registration_caps_candidate_page_size() -> None:
+    store = _SidebarScanStore()
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: 3_000_000.0,
+    )
+
+    await coordinator.register_sidebar_jobs_once(limit=100)
+
+    assert store.sidebar_list_calls == [
+        (3_000_000.0 - 30 * 86_400, 10, None)
+    ]
+
+
+class _BarrierEnqueueSidebarStore(SessionBridgeStore):
+    def __init__(
+        self,
+        db: SessionDB,
+        barrier: Barrier,
+        *,
+        clock: Callable[[], float],
+    ) -> None:
+        super().__init__(db, clock=clock)
+        self.barrier = barrier
+
+    def enqueue_sidebar_job(self, candidate: SidebarCandidate) -> dict[str, Any]:
+        self.barrier.wait(timeout=5)
+        return super().enqueue_sidebar_job(candidate)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sidebar_registration_counts_one_transactional_enqueue(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    seed_store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    seed_store.upsert_projection(
+        _sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id="concurrent-source",
+            content="Queue this source exactly once",
+            last_active=now,
+        )
+    )
+    barrier = Barrier(2)
+    coordinators = [
+        SessionBridgeCoordinator(
+            config=_sidebar_config(),
+            store=_BarrierEnqueueSidebarStore(
+                sidebar_db,
+                barrier,
+                clock=lambda: now,
+            ),
+            adapters={},
+            target_adapters={},
+            clock=lambda: now,
+        )
+        for _ in range(2)
+    ]
+
+    summaries = await asyncio.gather(*(
+        coordinator.register_sidebar_jobs_once(now=now, limit=1)
+        for coordinator in coordinators
+    ))
+
+    assert sum(summary.queued for summary in summaries) == 1
+    assert seed_store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 1
 
 
 @pytest.mark.asyncio

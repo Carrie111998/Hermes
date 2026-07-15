@@ -130,6 +130,12 @@ _BACKFILL_KEYS = {
     Provider.CODEX: "session-bridge:backfill:codex",
 }
 _MIRROR_WORKER_LOCK_POLL_SECONDS = 0.05
+_SIDEBAR_REGISTRATION_CURSOR_KEY = "session-bridge:sidebar:registration-cursor"
+_SIDEBAR_REGISTRATION_CURSOR_VERSION = 1
+# Bound database work independently from the number of jobs requested by a caller.
+_SIDEBAR_REGISTRATION_QUERY_BUDGET = 4
+_SIDEBAR_REGISTRATION_EXAMINED_BUDGET = 40
+_SIDEBAR_REGISTRATION_PAGE_SIZE = 10
 
 
 class SessionBridgeCoordinator:
@@ -189,6 +195,7 @@ class SessionBridgeCoordinator:
         self._lifecycle_lock = asyncio.Lock()
         self._scan_locks = {provider: asyncio.Lock() for provider in _EXTERNAL_PROVIDERS}
         self._job_lock = asyncio.Lock()
+        self._sidebar_registration_lock = asyncio.Lock()
         self._continuation_locks: dict[str, asyncio.Lock] = {}
         self._running = False
         self._background_tasks: list[asyncio.Task[None]] = []
@@ -361,16 +368,45 @@ class SessionBridgeCoordinator:
             self._set_sidebar_registration_counts(summary)
             return summary
 
+        async with self._sidebar_registration_lock:
+            return await self._register_sidebar_jobs_locked(
+                registration_time=registration_time,
+                limit=limit,
+            )
+
+    async def _register_sidebar_jobs_locked(
+        self,
+        *,
+        registration_time: float,
+        limit: int,
+    ) -> SidebarRegistrationSummary:
         after = registration_time - self._config.sidebar.backfill_days * 86_400
         by_provider = {Provider.CLAUDE.value: 0, Provider.HERMES.value: 0}
         queued = 0
         failed = 0
         examined = 0
         seen: set[str] = set()
+        durable_cursor = await self._load_sidebar_registration_cursor()
         cursor: tuple[float, str] | None = None
-        seen_cursors: set[tuple[float, str]] = set()
-        while queued < limit:
-            page_size = max(1, min(limit, limit - queued))
+        newest_probe = True
+        seen_backfill_cursors = (
+            {durable_cursor} if durable_cursor is not None else set()
+        )
+        query_count = 0
+        while (
+            queued < limit
+            and query_count < _SIDEBAR_REGISTRATION_QUERY_BUDGET
+            and examined < _SIDEBAR_REGISTRATION_EXAMINED_BUDGET
+        ):
+            page_size = max(
+                1,
+                min(
+                    limit,
+                    limit - queued,
+                    _SIDEBAR_REGISTRATION_PAGE_SIZE,
+                    _SIDEBAR_REGISTRATION_EXAMINED_BUDGET - examined,
+                ),
+            )
             raw_page = await asyncio.to_thread(
                 _call,
                 self._store,
@@ -379,10 +415,26 @@ class SessionBridgeCoordinator:
                 page_size,
                 cursor=cursor,
             )
+            query_count += 1
             if not isinstance(raw_page, SidebarSourcePage):
                 raise ValueError("sidebar candidate page is malformed")
             if len(raw_page) > page_size:
                 raise ValueError("sidebar candidate page exceeds its limit")
+            if type(raw_page.has_more) is not bool:
+                raise ValueError("sidebar candidate page continuation is malformed")
+            next_cursor: tuple[float, str] | None = None
+            if raw_page.has_more:
+                next_cursor = _validated_sidebar_page_cursor(raw_page.next_cursor)
+                if cursor is not None and not _sidebar_cursor_advances(
+                    cursor,
+                    next_cursor,
+                ):
+                    raise ValueError("sidebar candidate cursor did not advance")
+                if not newest_probe and next_cursor in seen_backfill_cursors:
+                    raise ValueError("sidebar candidate cursor repeated")
+            elif raw_page.next_cursor is not None:
+                raise ValueError("sidebar candidate cursor is unexpected")
+
             for raw_source in raw_page:
                 examined += 1
                 try:
@@ -437,14 +489,19 @@ class SessionBridgeCoordinator:
                     )
                     if existing is not None:
                         continue
-                    await asyncio.to_thread(
+                    result = await asyncio.to_thread(
                         _call,
                         self._store,
                         "enqueue_sidebar_job",
                         candidate,
                     )
-                    queued += 1
-                    by_provider[projection.provider.value] += 1
+                    if not isinstance(result, Mapping) or type(
+                        result.get("created")
+                    ) is not bool:
+                        raise ValueError("sidebar enqueue result is malformed")
+                    if result["created"]:
+                        queued += 1
+                        by_provider[projection.provider.value] += 1
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     raise
                 except Exception:
@@ -457,22 +514,22 @@ class SessionBridgeCoordinator:
 
             if queued >= limit:
                 break
-            if type(raw_page.has_more) is not bool:
-                raise ValueError("sidebar candidate page continuation is malformed")
             if not raw_page.has_more:
-                if raw_page.next_cursor is not None:
-                    raise ValueError("sidebar candidate cursor is unexpected")
+                await self._save_sidebar_registration_cursor(None)
                 break
-            next_cursor = _validated_sidebar_page_cursor(raw_page.next_cursor)
-            if next_cursor in seen_cursors:
-                raise ValueError("sidebar candidate cursor repeated")
-            if cursor is not None and not _sidebar_cursor_advances(
-                cursor,
-                next_cursor,
-            ):
-                raise ValueError("sidebar candidate cursor did not advance")
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
+            assert next_cursor is not None
+            if newest_probe:
+                newest_probe = False
+                if durable_cursor is None:
+                    durable_cursor = next_cursor
+                    seen_backfill_cursors.add(next_cursor)
+                    await self._save_sidebar_registration_cursor(durable_cursor)
+                cursor = durable_cursor
+            else:
+                durable_cursor = next_cursor
+                seen_backfill_cursors.add(next_cursor)
+                await self._save_sidebar_registration_cursor(durable_cursor)
+                cursor = durable_cursor
 
         summary = SidebarRegistrationSummary(
             examined=examined,
@@ -482,6 +539,55 @@ class SessionBridgeCoordinator:
         )
         self._set_sidebar_registration_counts(summary)
         return summary
+
+    async def _load_sidebar_registration_cursor(self) -> tuple[float, str] | None:
+        raw_state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _SIDEBAR_REGISTRATION_CURSOR_KEY,
+        )
+        if raw_state is None:
+            return None
+        if not isinstance(raw_state, Mapping) or set(raw_state) != {
+            "version",
+            "activity",
+            "session_id",
+        }:
+            raise ValueError("sidebar registration cursor state is malformed")
+        if (
+            type(raw_state["version"]) is not int
+            or raw_state["version"] != _SIDEBAR_REGISTRATION_CURSOR_VERSION
+        ):
+            raise ValueError("sidebar registration cursor version is unsupported")
+        activity = raw_state["activity"]
+        session_id = raw_state["session_id"]
+        if activity is None and session_id is None:
+            return None
+        if activity is None or session_id is None:
+            raise ValueError("sidebar registration cursor state is malformed")
+        return _validated_sidebar_page_cursor((activity, session_id))
+
+    async def _save_sidebar_registration_cursor(
+        self,
+        cursor: tuple[float, str] | None,
+    ) -> None:
+        state: dict[str, object] = {
+            "version": _SIDEBAR_REGISTRATION_CURSOR_VERSION,
+            "activity": None,
+            "session_id": None,
+        }
+        if cursor is not None:
+            activity, session_id = _validated_sidebar_page_cursor(cursor)
+            state["activity"] = activity
+            state["session_id"] = session_id
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _SIDEBAR_REGISTRATION_CURSOR_KEY,
+            state,
+        )
 
     async def reconcile_once(self) -> ReconcileSummary:
         async with self._job_lock:
