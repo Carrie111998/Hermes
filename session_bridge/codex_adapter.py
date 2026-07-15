@@ -115,6 +115,8 @@ class SidebarThreadVerifier:
     """Authenticate native Codex sidebar threads through read-only inventory."""
 
     _ZERO_INTERVAL_READ_BUDGET_SECONDS = 30.0
+    _MAX_SNAPSHOT_TTL_SECONDS = 30.0
+    _ZERO_INTERVAL_SNAPSHOT_TTL_SECONDS = 1.0
 
     def __init__(
         self,
@@ -284,8 +286,16 @@ class SidebarThreadVerifier:
                 )
             projections.append(projection)
         result = tuple(projections)
+        snapshot_ttl = (
+            min(
+                self._reconciliation_interval,
+                self._MAX_SNAPSHOT_TTL_SECONDS,
+            )
+            if self._reconciliation_interval > 0
+            else self._ZERO_INTERVAL_SNAPSHOT_TTL_SECONDS
+        )
         self._inventory_snapshot = (
-            now + self._reconciliation_interval,
+            now + snapshot_ttl,
             result,
         )
         return result

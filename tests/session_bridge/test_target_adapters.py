@@ -45,7 +45,9 @@ from session_bridge.characterize import (
 from session_bridge.models import (
     BridgeMarkerPayload,
     OriginKind,
+    ProjectedMessage,
     Provider,
+    SessionProjection,
     encode_bridge_marker,
 )
 from session_bridge.sidebar import VerifiedSidebarThread
@@ -256,6 +258,45 @@ class StructuralSidebarInventory:
 
     def read_sidebar_thread(self, summary: Any, *, deadline: float | None) -> Any:
         raise AssertionError("empty structural inventory must not be read")
+
+
+class MutableSidebarInventory:
+    def __init__(self) -> None:
+        self.visible = False
+        self.list_deadlines: list[float | None] = []
+        self.read_deadlines: list[float | None] = []
+        self.summary = SimpleNamespace(native_id=CODEX_ID)
+
+    def list_sidebar_inventory(
+        self, *, deadline: float | None, page_cap: int
+    ) -> list[Any]:
+        self.list_deadlines.append(deadline)
+        return [self.summary] if self.visible else []
+
+    def find_sidebar_thread(
+        self, thread_id: str, *, deadline: float | None, page_cap: int
+    ) -> Any | None:
+        return self.summary if self.visible and thread_id == CODEX_ID else None
+
+    def read_sidebar_thread(
+        self, summary: Any, *, deadline: float | None
+    ) -> SessionProjection:
+        self.read_deadlines.append(deadline)
+        return SessionProjection(
+            provider=Provider.CODEX,
+            native_id=summary.native_id,
+            title="Shared task",
+            cwd=None,
+            started_at=0.0,
+            last_active=0.0,
+            messages=(ProjectedMessage(
+                native_event_id="marker",
+                ordinal=0,
+                role="user",
+                content=encode_bridge_marker(_sidebar_expected(), SECRET),
+                timestamp=0.0,
+            ),),
+        )
 
 
 def _assert_sanitized_exception_has_no_chain(
@@ -642,15 +683,17 @@ def test_two_sidebar_claim_markers_reuse_one_bounded_inventory_snapshot() -> Non
             ),
         ],
     })
-    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0)
+    now = [0.0]
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: now[0])
     verifier = SidebarThreadVerifier(
         source,
         marker_secret=SECRET,
-        reconciliation_interval=30.0,
-        monotonic=lambda: 0.0,
+        reconciliation_interval=0,
+        monotonic=lambda: now[0],
     )
 
     assert verifier.find_by_marker(_sidebar_expected()) is not None
+    now[0] = 0.5
     assert verifier.find_by_marker(BridgeMarkerPayload(
         "bridge-2", "hermes-source-2", Provider.CODEX, 1
     )) == VerifiedSidebarThread(other_id, "hermes-source-2", "bridge-2")
@@ -660,6 +703,34 @@ def test_two_sidebar_claim_markers_reuse_one_bounded_inventory_snapshot() -> Non
         "thread/read",
         "thread/read",
     ]
+
+
+def test_sidebar_snapshot_ttl_is_capped_below_lease_retry_window() -> None:
+    now = [0.0]
+    inventory = MutableSidebarInventory()
+    verifier = SidebarThreadVerifier(
+        inventory,
+        marker_secret=SECRET,
+        reconciliation_interval=600.0,
+        monotonic=lambda: now[0],
+    )
+
+    assert verifier.find_by_marker(_sidebar_expected()) is None
+    assert inventory.list_deadlines == [600.0]
+
+    inventory.visible = True
+    now[0] = 29.0
+    assert verifier.find_by_marker(_sidebar_expected()) is None
+    assert inventory.list_deadlines == [600.0]
+
+    now[0] = 31.0
+    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert inventory.list_deadlines == [600.0, 631.0]
+    assert inventory.read_deadlines == [631.0]
 
 
 @pytest.mark.parametrize(
