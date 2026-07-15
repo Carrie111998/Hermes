@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 import zipfile
 
@@ -15,6 +16,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 ASSET = ROOT / "session_bridge" / "assets" / "session-sidebar-sync"
 BASELINE = Path(__file__).parent / "fixtures" / "sidebar_skill_baseline.txt"
+LOCK_NAME = ".session-sidebar-sync.install.lock"
 
 
 def _installed_files(path: Path) -> dict[str, bytes]:
@@ -23,6 +25,59 @@ def _installed_files(path: Path) -> dict[str, bytes]:
         for file in path.rglob("*")
         if file.is_file()
     }
+
+
+def _subprocess_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    prior = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(ROOT) if not prior else str(ROOT) + os.pathsep + prior
+    )
+    return environment
+
+
+def _start_python(code: str, *arguments: Path | str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-c", code, *(str(argument) for argument in arguments)],
+        cwd=ROOT,
+        env=_subprocess_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _run_python(
+    code: str,
+    *arguments: Path | str,
+    timeout: float = 15.0,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-c", code, *(str(argument) for argument in arguments)],
+        cwd=ROOT,
+        env=_subprocess_environment(),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _wait_for_path(path: Path, process: subprocess.Popen[str]) -> None:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            pytest.fail(
+                f"lock holder exited before readiness: {process.returncode}; "
+                f"stdout={stdout!r}; stderr={stderr!r}"
+            )
+        time.sleep(0.02)
+    process.kill()
+    stdout, stderr = process.communicate()
+    pytest.fail(f"lock holder readiness timeout: stdout={stdout!r}; stderr={stderr!r}")
 
 
 def test_sidebar_skill_baseline_records_the_verbatim_no_skill_failure() -> None:
@@ -265,6 +320,179 @@ def test_install_sidebar_skill_serializes_concurrent_repeated_installs(
     assert len(set(results)) == 1
     assert _installed_files(results[0]) == _installed_files(ASSET)
     assert not list((codex_home / "skills").glob(".session-sidebar-sync.install-*"))
+
+
+@pytest.mark.live_system_guard_bypass
+def test_process_lock_serializes_install_and_preserves_one_backup(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = skills / "session-sidebar-sync"
+    destination.mkdir(parents=True)
+    (destination / "old.txt").write_text("preserve", encoding="utf-8")
+    ready = tmp_path / "holder-ready"
+    holder = _start_python(
+        "from pathlib import Path\n"
+        "import sys, time\n"
+        "from session_bridge.sidebar_skill import _filesystem_install_lock\n"
+        "skills, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "with _filesystem_install_lock(skills):\n"
+        "    ready.write_text('ready', encoding='utf-8')\n"
+        "    time.sleep(0.6)\n",
+        skills,
+        ready,
+    )
+    _wait_for_path(ready, holder)
+    installer = _start_python(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from session_bridge.sidebar_skill import install_sidebar_skill\n"
+        "print(install_sidebar_skill(Path(sys.argv[1])))\n",
+        codex_home,
+    )
+    time.sleep(0.15)
+
+    assert installer.poll() is None, "installer must wait for the held OS lock"
+    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+    installer_stdout, installer_stderr = installer.communicate(timeout=10)
+    assert holder.returncode == 0, (holder_stdout, holder_stderr)
+    assert installer.returncode == 0, (installer_stdout, installer_stderr)
+    backups = list(skills.glob("session-sidebar-sync.backup*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old.txt").read_text(encoding="utf-8") == "preserve"
+    assert _installed_files(destination) == _installed_files(ASSET)
+    assert (skills / LOCK_NAME).is_file(), "descriptor lock file is persistent"
+
+
+@pytest.mark.live_system_guard_bypass
+def test_process_lock_crash_releases_descriptor_without_unlinking(
+    tmp_path: Path,
+) -> None:
+    skills = tmp_path / "codex" / "skills"
+    skills.mkdir(parents=True)
+    ready = tmp_path / "crash-ready"
+    holder = _start_python(
+        "from pathlib import Path\n"
+        "import os, sys\n"
+        "from session_bridge.sidebar_skill import _filesystem_install_lock\n"
+        "skills, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "with _filesystem_install_lock(skills):\n"
+        "    ready.write_text('ready', encoding='utf-8')\n"
+        "    os._exit(23)\n",
+        skills,
+        ready,
+    )
+    _wait_for_path(ready, holder)
+    lock_path = skills / LOCK_NAME
+    identity_before = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+    holder.wait(timeout=5)
+    result = _run_python(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from session_bridge.sidebar_skill import install_sidebar_skill\n"
+        "install_sidebar_skill(Path(sys.argv[1]))\n",
+        tmp_path / "codex",
+    )
+
+    assert holder.returncode == 23
+    assert result.returncode == 0, result.stderr
+    assert lock_path.is_file()
+    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == identity_before
+
+
+@pytest.mark.live_system_guard_bypass
+def test_process_lock_ignores_malformed_persistent_contents(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    skills.mkdir(parents=True)
+    lock_path = skills / LOCK_NAME
+    lock_path.write_bytes(b"not-json-and-not-a-pid")
+    identity_before = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+
+    result = _run_python(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import session_bridge.sidebar_skill as skill\n"
+        "skill._LOCK_WAIT_SECONDS = 0.1\n"
+        "skill.install_sidebar_skill(Path(sys.argv[1]))\n",
+        codex_home,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert lock_path.read_bytes() == b"not-json-and-not-a-pid"
+    assert (lock_path.stat().st_dev, lock_path.stat().st_ino) == identity_before
+
+
+@pytest.mark.live_system_guard_bypass
+def test_process_lock_times_out_without_stealing_held_descriptor(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    skills.mkdir(parents=True)
+    ready = tmp_path / "timeout-ready"
+    holder = _start_python(
+        "from pathlib import Path\n"
+        "import sys, time\n"
+        "from session_bridge.sidebar_skill import _filesystem_install_lock\n"
+        "skills, ready = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "with _filesystem_install_lock(skills):\n"
+        "    ready.write_text('ready', encoding='utf-8')\n"
+        "    time.sleep(0.8)\n",
+        skills,
+        ready,
+    )
+    _wait_for_path(ready, holder)
+    result = _run_python(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "import session_bridge.sidebar_skill as skill\n"
+        "skill._LOCK_WAIT_SECONDS = 0.1\n"
+        "try:\n"
+        "    skill.install_sidebar_skill(Path(sys.argv[1]))\n"
+        "except TimeoutError:\n"
+        "    print('timeout')\n"
+        "else:\n"
+        "    raise SystemExit('lock was stolen')\n",
+        codex_home,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "timeout"
+    holder_stdout, holder_stderr = holder.communicate(timeout=5)
+    assert holder.returncode == 0, (holder_stdout, holder_stderr)
+    assert (skills / LOCK_NAME).is_file()
+    assert not (skills / "session-sidebar-sync").exists()
+
+
+@pytest.mark.live_system_guard_bypass
+def test_process_lock_concurrent_installers_do_not_lose_backup_or_install(
+    tmp_path: Path,
+) -> None:
+    codex_home = tmp_path / "codex"
+    skills = codex_home / "skills"
+    destination = skills / "session-sidebar-sync"
+    destination.mkdir(parents=True)
+    (destination / "old.txt").write_text("original", encoding="utf-8")
+    code = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from session_bridge.sidebar_skill import install_sidebar_skill\n"
+        "install_sidebar_skill(Path(sys.argv[1]))\n"
+    )
+    installers = [_start_python(code, codex_home) for _index in range(4)]
+
+    outputs = [process.communicate(timeout=15) for process in installers]
+
+    assert [process.returncode for process in installers] == [0, 0, 0, 0], outputs
+    backups = list(skills.glob("session-sidebar-sync.backup*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old.txt").read_text(encoding="utf-8") == "original"
+    assert _installed_files(destination) == _installed_files(ASSET)
+    assert (skills / LOCK_NAME).is_file()
 
 
 @pytest.mark.skipif(

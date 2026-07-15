@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+import errno
 from importlib import resources
-import json
 import os
 from pathlib import Path
 import shutil
@@ -12,9 +12,6 @@ import tempfile
 import threading
 import time
 from typing import Final
-import uuid
-
-import psutil
 
 
 _SKILL_NAME: Final = "session-sidebar-sync"
@@ -146,46 +143,80 @@ def _next_backup_path(skills: Path) -> Path:
 @contextmanager
 def _filesystem_install_lock(skills: Path) -> Iterator[None]:
     lock_path = skills / f".{_SKILL_NAME}.install.lock"
-    token = uuid.uuid4().hex
+    descriptor = _open_lock_descriptor(lock_path)
     deadline = time.monotonic() + _LOCK_WAIT_SECONDS
-    while True:
-        _assert_not_redirect(lock_path, "installer lock", missing_ok=True)
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            if _stale_lock(lock_path, deadline_reached=time.monotonic() >= deadline):
-                try:
-                    lock_path.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
+    locked = False
+    try:
+        while not locked:
+            locked = _try_lock_descriptor(descriptor)
+            if locked:
+                break
             if time.monotonic() >= deadline:
                 raise TimeoutError("sidebar skill installer lock is busy") from None
             time.sleep(0.05)
-            continue
-        try:
-            payload = json.dumps({"pid": os.getpid(), "token": token}).encode("ascii")
-            os.write(descriptor, payload)
-        finally:
-            os.close(descriptor)
-        break
-    try:
         yield
     finally:
-        try:
-            payload = json.loads(lock_path.read_text(encoding="ascii"))
-            if payload.get("token") == token:
-                lock_path.unlink()
-        except (FileNotFoundError, OSError, UnicodeError, ValueError, AttributeError):
-            pass
+        if locked:
+            _unlock_descriptor(descriptor)
+        descriptor.close()
 
 
-def _stale_lock(path: Path, *, deadline_reached: bool) -> bool:
+def _open_lock_descriptor(path: Path):
+    _assert_not_redirect(path, "installer lock", missing_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    raw_descriptor = os.open(path, flags, 0o600)
     try:
-        payload = json.loads(path.read_text(encoding="ascii"))
-        pid = payload.get("pid")
-        if type(pid) is int and pid > 0:
-            return not psutil.pid_exists(pid)
-    except (OSError, UnicodeError, ValueError, AttributeError):
-        pass
-    return deadline_reached
+        descriptor = os.fdopen(raw_descriptor, "r+b", buffering=0)
+    except BaseException:
+        os.close(raw_descriptor)
+        raise
+    try:
+        _assert_not_redirect(path, "installer lock")
+        opened = os.fstat(descriptor.fileno())
+        current = os.lstat(path)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise PermissionError("installer lock identity changed while opening")
+        if opened.st_size == 0:
+            descriptor.write(b"\0")
+        descriptor.seek(0)
+        return descriptor
+    except BaseException:
+        descriptor.close()
+        raise
+
+
+def _try_lock_descriptor(descriptor) -> bool:
+    descriptor.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, 13, 36}:
+                return False
+            raise
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN}:
+            return False
+        raise
+    return True
+
+
+def _unlock_descriptor(descriptor) -> None:
+    descriptor.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(descriptor.fileno(), fcntl.LOCK_UN)
