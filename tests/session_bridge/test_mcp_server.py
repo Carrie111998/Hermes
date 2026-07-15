@@ -1023,6 +1023,56 @@ def test_session_sidebar_pending_cleanup_failure_rolls_back_batch_safely(
     )
 
 
+def test_session_sidebar_pending_first_cleanup_failure_rolls_back_later_claims(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, claims = _seed_claimed_sidebar_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=claims[0].bridge_id,
+        source_id=claims[0].source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = claims
+    original_get = store.get_sidebar_source_for_delivery
+    original_fail = store.fail_sidebar_job
+
+    def fail_first_source(source_session_id: str):
+        if source_session_id == claims[0].source_session_id:
+            raise RuntimeError("first source traceback token=must-not-leak")
+        return original_get(source_session_id)
+
+    cleanup_calls = 0
+
+    def fail_first_cleanup(**kwargs: Any):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise RuntimeError("first cleanup lease=" + claims[0].lease_token)
+        return original_fail(**kwargs)
+
+    monkeypatch.setattr(store, "get_sidebar_source_for_delivery", fail_first_source)
+    monkeypatch.setattr(store, "fail_sidebar_job", fail_first_cleanup)
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {"name": "session_sidebar_pending", "arguments": {"limit": 5}},
+            request_id=46,
+        )
+
+    serialized = json.dumps(payload)
+    assert payload["result"]["isError"] is True
+    assert "sidebar_pending_failed" in serialized
+    assert "must-not-leak" not in serialized
+    assert all(claim.lease_token not in serialized for claim in claims)
+    assert all(
+        store.get_sidebar_job_for_source(claim.source_session_id)["state"]
+        != "sidebar_leased"
+        for claim in claims
+    )
+
+
 def test_session_sidebar_commit_has_two_argument_schema_and_is_idempotent(
     db: SessionDB,
 ) -> None:

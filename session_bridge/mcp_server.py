@@ -391,12 +391,20 @@ def create_app(
             claims = await claim_method(limit=bounded_limit)
             if not isinstance(claims, tuple) or len(claims) > bounded_limit:
                 raise ValueError("malformed sidebar claims")
-            jobs: list[dict[str, Any]] = []
+            malformed_token = False
             for claim in claims:
-                token_text = _exact_sidebar_text(
-                    getattr(claim, "lease_token", None), "lease token"
-                )
-                claimed_tokens.append(token_text)
+                try:
+                    claimed_tokens.append(
+                        _exact_sidebar_text(
+                            getattr(claim, "lease_token", None), "lease token"
+                        )
+                    )
+                except ValueError:
+                    malformed_token = True
+            if malformed_token or len(set(claimed_tokens)) != len(claimed_tokens):
+                raise ValueError("malformed sidebar lease batch")
+            jobs: list[dict[str, Any]] = []
+            for claim, token_text in zip(claims, claimed_tokens, strict=True):
                 try:
                     job = await asyncio.to_thread(
                         _build_sidebar_broker_job,
