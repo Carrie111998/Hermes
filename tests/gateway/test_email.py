@@ -1104,6 +1104,76 @@ class TestSenderAuthentication(unittest.TestCase):
         )
         self.assertFalse(ok, reason)
 
+    def test_spf_does_not_fall_back_to_visible_header_from(self):
+        """A matching visible From must not override a misaligned envelope sender."""
+        ok, reason = self._verify(
+            "user@example.com",
+            [
+                "mx.example.net; spf=pass smtp.mailfrom=bounce@evil.com; "
+                "header.from=example.com"
+            ],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_dkim_pass_misaligned_rejected(self):
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["mx.google.com; dkim=pass header.d=evil.com"],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_dkim_does_not_fall_back_to_dmarc_header_from(self):
+        """DMARC's visible From property is not a DKIM signing identity."""
+        ok, reason = self._verify(
+            "user@example.com",
+            [
+                "mx.example.net; dkim=pass header.d=evil.com; "
+                "dmarc=fail header.from=example.com"
+            ],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_dkim_does_not_borrow_header_d_from_another_method(self):
+        cases = [
+            "mx.example.net; dkim=pass header.d=evil.com; "
+            "arc=pass header.d=example.com",
+            "mx.example.net; dkim=pass header.d=evil.com; "
+            "spf=fail header.d=example.com",
+        ]
+        for auth_results in cases:
+            with self.subTest(auth_results=auth_results):
+                ok, reason = self._verify("user@example.com", [auth_results])
+                self.assertFalse(ok, reason)
+
+    def test_spf_does_not_borrow_mailfrom_from_another_method(self):
+        ok, reason = self._verify(
+            "user@example.com",
+            [
+                "mx.example.net; spf=pass smtp.mailfrom=bounce@evil.com; "
+                "dkim=fail smtp.mailfrom=user@example.com"
+            ],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_all_fail_rejected(self):
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["mx.google.com; dmarc=fail; spf=fail; dkim=fail"],
+        )
+        self.assertFalse(ok, reason)
+
+    def test_no_authentication_results_rejected(self):
+        ok, reason = self._verify("admin@example.com", [])
+        self.assertFalse(ok)
+        self.assertIn("no Authentication-Results", reason)
+
+    def test_relaxed_alignment_subdomain(self):
+        # mail.example.com (DKIM signer) aligns with example.com (From).
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["mx.google.com; dkim=pass header.d=mail.example.com"],
+        )
+        self.assertTrue(ok, reason)
 
     def test_netease_auth_results_aliases_authenticate(self):
         """NetEase/163 stamps SPF/DKIM properties as smtp.mail/header.i.
