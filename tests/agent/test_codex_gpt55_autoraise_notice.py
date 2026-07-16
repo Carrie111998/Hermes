@@ -54,8 +54,10 @@ def _config(*, show_notice: bool) -> dict:
     }
 
 
-def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
-    """Construct a real Codex gpt-5.5 agent under an isolated config."""
+def _make_codex_agent(
+    monkeypatch, tmp_path: Path, *, show_notice: bool, model: str = "gpt-5.5"
+):
+    """Construct a real Codex gpt-5.x agent under an isolated config."""
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(show_notice=show_notice))
@@ -69,7 +71,7 @@ def _make_codex_agent(monkeypatch, tmp_path: Path, *, show_notice: bool):
             base_url="https://chatgpt.com/backend-api/codex",
             api_key="test-key",
             provider="openai-codex",
-            model="gpt-5.5",
+            model=model,
             enabled_toolsets=[],
             disabled_toolsets=[],
             quiet_mode=False,
@@ -102,6 +104,35 @@ def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(monkeypatch, tm
     assert getattr(agent1, "_compression_warning") is not None
 
     agent2, stdout2 = _make_codex_agent(monkeypatch, tmp_path, show_notice=True)
+    assert _threshold_ratio(agent2) == 0.85  # autoraise still applies
+    assert "auto-compaction was raised" not in stdout2
+    assert getattr(agent2, "_compression_warning") is None
+
+
+def test_codex_gpt56_autoraise_notice_enabled_by_default(monkeypatch, tmp_path):
+    agent, stdout = _make_codex_agent(
+        monkeypatch, tmp_path, show_notice=True, model="gpt-5.6-sol"
+    )
+
+    assert _threshold_ratio(agent) == 0.85
+    warning = getattr(agent, "_compression_warning")
+    assert warning is not None
+    assert "auto-compaction was raised" in warning
+    assert "gpt-5.6-sol" in warning
+    assert "auto-compaction was raised" in stdout
+
+
+def test_codex_gpt56_autoraise_notice_deduped_across_agent_inits(monkeypatch, tmp_path):
+    # Each gpt-5.6 slug has its own marker state, but still only shows once.
+    agent1, stdout1 = _make_codex_agent(
+        monkeypatch, tmp_path, show_notice=True, model="gpt-5.6-sol"
+    )
+    assert "auto-compaction was raised" in stdout1
+    assert getattr(agent1, "_compression_warning") is not None
+
+    agent2, stdout2 = _make_codex_agent(
+        monkeypatch, tmp_path, show_notice=True, model="gpt-5.6-sol"
+    )
     assert _threshold_ratio(agent2) == 0.85  # autoraise still applies
     assert "auto-compaction was raised" not in stdout2
     assert getattr(agent2, "_compression_warning") is None
