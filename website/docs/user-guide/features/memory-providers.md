@@ -546,51 +546,72 @@ Each provider's data is isolated per [profile](/user-guide/profiles):
 
 ## Seeding & Dreams
 
-You don't have to start every provider cold. The **memstore seeding** workflow
-bootstraps the active provider with knowledge *before* the first conversation,
-and an offline **dream** pass consolidates what the agent already knows. Both
-write through the provider-agnostic `on_memory_write` contract, so the same
-seed runs against Honcho, Supermemory, Holographic — whichever provider is
-active.
+You don't have to start an agent cold. The **memstore seeding** workflow
+bootstraps memory with knowledge *before* the first conversation, and an
+offline **dream** pass consolidates what the agent already knows.
+
+The store of record is a **canonical markdown file tree** — plain files any
+agent framework can read, which is what makes the design provider-agnostic.
+Whatever external provider is active is mirrored as a bonus.
+
+### The canonical file tree
+
+Written under `HERMES_HOME` (profile-scoped):
+
+```
+SOUL.md                agent identity prose (read at boot)
+memories/
+  IDENTITY.md          structured agent persona
+  USER.md              the user profile
+  AGENTS.md            operating instructions (memstore-scoped)
+  TOOLS.md             tools & environment
+  MEMORY.md            rolled-up notes + synthesised insights
+  daily/2026-07-16.md  one digest per day — the base layer of the tree
+```
+
+Facts live inside `<!-- hermes:seed:begin … -->` managed blocks, so re-seeding
+merges (de-duplicating bullets) and never clobbers hand-written content.
 
 ### Seed from persona docs and transcripts
 
 ```bash
-# Preview (no writes):
+# Preview the extraction (no writes):
 hermes memory seed --persona about-me.md --transcript last-session.json --dry-run
 
-# Seed the active provider (consolidates with a dream pass first):
-hermes memory seed --persona about-me.md
+# Seed the file tree (+ per-day digests, + provider mirror):
+hermes memory seed --persona about-me.md --transcript last-session.json
 
-# Seed the raw extraction, skipping consolidation:
-hermes memory seed --persona about-me.md --no-dream
+# File tree only, no external provider:
+hermes memory seed --persona about-me.md --no-mirror
 ```
 
-- **Persona docs** — a markdown "about the user/project" file. Headings set
-  the category (`user_pref`, `project`, `tool`, …), bullets and sentences
-  become individual facts.
-- **Transcripts** — prior conversation JSON/JSONL. The seeder mines user turns
-  for preferences (`I always …`), identity (`my name is …`), decisions
-  (`we decided …`), and explicit `remember that …` cues.
+- **Persona docs** — a markdown "about the user / project / agent" file.
+  Headings route to files: *About the User* → USER.md, *About the Agent* →
+  IDENTITY.md + SOUL.md, *Project* → AGENTS.md, *Tools* → TOOLS.md.
+- **Transcripts** — prior conversation JSON/JSONL, split into
+  `memories/daily/*.md` by message timestamp and mined for preferences
+  (`I always …`), identity (`my name is …`), decisions (`we decided …`), and
+  explicit `remember that …` cues.
 
-### Dreams: offline consolidation
+### Dreams: two-layer consolidation
 
-A dream reviews a fact corpus the way sleep consolidates memory — it
+The base layer is the per-day digests; the higher layer is the roll-up. A dream
 de-duplicates near-identical facts, flags contradictions about the same entity
-(demoting the weaker fact), optionally decays and prunes low-trust facts, and
-synthesises higher-level `insight` facts from clusters of related observations.
+(demoting the weaker fact), optionally decays/prunes low-trust facts, and
+synthesises higher-level `insight` facts — then folds the result into MEMORY.md
+and USER.md.
 
 ```bash
-# Consolidate an exported corpus and write the refined facts to the provider:
-hermes memory dream --corpus corpus.jsonl --min-trust 0.3 --decay 0.95
+hermes memory dream                 # roll up all daily digests
+hermes memory dream --days 7        # only the last 7 days
 
-# Or run the whole pipeline standalone (handy for CI / cron):
-python scripts/seed_memstore.py --persona about-me.md --export corpus.jsonl
+# Or consolidate a standalone JSONL corpus:
+hermes memory dream --corpus corpus.jsonl --min-trust 0.3 --export refined.jsonl
 ```
 
-See [`examples/memstore-seed/`](https://github.com/hermes-ai/hermes-agent/tree/main/examples/memstore-seed)
-for runnable sample inputs and the programmatic API
-(`agent.memstore_seeding`).
+See [`docs/memstore-seed/`](https://github.com/hermes-ai/hermes-agent/tree/main/docs/memstore-seed)
+for runnable sample inputs, and `agent.memstore_files` /
+`agent.memstore_seeding` for the programmatic API.
 
 ## Building a Memory Provider
 

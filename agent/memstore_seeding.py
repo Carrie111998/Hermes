@@ -42,13 +42,15 @@ from typing import Any, Iterable, Iterator, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Categories carry semantic intent. ``user_pref`` and identity facts default
-# to the USER memory target; everything else lands in the agent's MEMORY.
+# Categories carry semantic intent. ``user_pref`` and user-identity facts
+# default to the USER memory target; agent ``identity`` and everything else
+# land in the agent's own memory.
 CATEGORY_USER = "user_pref"
 CATEGORY_PROJECT = "project"
 CATEGORY_TOOL = "tool"
 CATEGORY_GENERAL = "general"
 CATEGORY_INSIGHT = "insight"
+CATEGORY_IDENTITY = "identity"  # agent persona/identity (SOUL.md / IDENTITY.md)
 
 _USER_TARGET_CATEGORIES = {CATEGORY_USER}
 
@@ -275,17 +277,26 @@ def extract_entities(text: str, limit: int = 6) -> tuple[str, ...]:
 # Source parser: persona / "about" documents
 # ---------------------------------------------------------------------------
 
-# Headings that imply user-scoped (USER.md) facts rather than agent notes.
-_USER_HEADING_HINTS = (
-    "user", "about me", "about you", "profile", "preference", "persona",
-    "who i am", "identity", "communication", "style", "bio",
+# Heading hints routing persona-doc sections to a category. Agent-identity
+# hints are checked first so "About the agent" doesn't get mistaken for the
+# user's own profile.
+_IDENTITY_HEADING_HINTS = (
+    "about you", "about the agent", "about the assistant", "agent identity",
+    "your identity", "who you are", "persona", "soul", "personality", "voice",
+    "assistant style",
 )
-_PROJECT_HEADING_HINTS = ("project", "codebase", "repo", "stack", "architecture", "build")
+_USER_HEADING_HINTS = (
+    "user", "about me", "about the user", "profile", "preference",
+    "who i am", "bio", "communication", "my style",
+)
+_PROJECT_HEADING_HINTS = ("project", "codebase", "repo", "stack", "architecture", "build", "operating")
 _TOOL_HEADING_HINTS = ("tool", "environment", "setup", "workflow", "command")
 
 
 def _category_for_heading(heading: str) -> str:
     low = heading.lower()
+    if any(h in low for h in _IDENTITY_HEADING_HINTS):
+        return CATEGORY_IDENTITY
     if any(h in low for h in _USER_HEADING_HINTS):
         return CATEGORY_USER
     if any(h in low for h in _PROJECT_HEADING_HINTS):

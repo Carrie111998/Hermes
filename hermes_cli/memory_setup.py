@@ -476,11 +476,18 @@ def _build_active_memory_sink():
 
 
 def cmd_seed(args) -> None:
-    """Seed the active memstore from persona docs and conversation transcripts."""
+    """Seed the canonical markdown memstore from persona docs and transcripts.
+
+    Writes the canonical file tree (USER.md, AGENTS.md, IDENTITY.md, …) as the
+    provider-agnostic store of record, splits transcripts into per-day digests
+    (the base layer of the memory tree), and — unless ``--no-mirror`` — mirrors
+    the same facts into whatever external provider is active.
+    """
+    from agent.memstore_files import CanonicalMemstore
     from agent.memstore_seeding import (
         DreamConsolidator,
+        MemstoreSeeder,
         build_corpus_from_sources,
-        seed_and_dream,
     )
 
     persona = list(getattr(args, "persona", None) or [])
@@ -498,64 +505,108 @@ def cmd_seed(args) -> None:
 
     dry_run = bool(getattr(args, "dry_run", False))
     do_dream = not bool(getattr(args, "no_dream", False))
-    manager, provider_name = _build_active_memory_sink()
+    do_daily = not bool(getattr(args, "no_daily", False))
+    do_mirror = not bool(getattr(args, "no_mirror", False))
+    store = CanonicalMemstore(root=getattr(args, "home", None) or None)
 
     print(f"\n  Extracted {len(corpus)} candidate fact(s) from "
           f"{len(persona)} persona doc(s) + {len(transcripts)} transcript(s).")
-    print(f"  Target provider: {provider_name or '(built-in only)'}")
+    print(f"  Memstore: {store.memories}")
     if dry_run:
         print("  Mode: dry-run (no writes)\n")
 
-    seed_report, dream_report = seed_and_dream(
-        manager, corpus, dream=do_dream, dry_run=dry_run,
-        consolidator=DreamConsolidator() if do_dream else None,
-    )
-
-    if dream_report is not None:
+    if do_dream:
+        refined, dream_report = DreamConsolidator().consolidate(corpus)
         print(f"  Dreams: {dream_report.summary()}")
-    print(f"  {seed_report.summary()}")
-    if seed_report.errors:
-        print(f"  ⚠ {len(seed_report.errors)} write error(s); first: {seed_report.errors[0]}")
-    try:
-        manager.shutdown_all()
-    except Exception:
-        pass
+        corpus = refined
+
+    if dry_run:
+        by_target: dict[str, int] = {}
+        for f in corpus:
+            by_target[f.category] = by_target.get(f.category, 0) + 1
+        cats = ", ".join(f"{k}={v}" for k, v in sorted(by_target.items()))
+        print(f"  Would write {len(corpus)} fact(s) by category: {cats}\n")
+        return
+
+    # 1. Canonical file tree — the store of record.
+    file_report = store.seed_facts(corpus)
+    print(f"  Files: {file_report.summary()}")
+
+    # 2. Per-day digests (base layer) from the raw transcripts.
+    if do_daily and transcripts:
+        from agent.memstore_seeding import load_transcript
+        all_msgs = []
+        for path in transcripts:
+            try:
+                all_msgs.extend(load_transcript(path))
+            except OSError:
+                pass
+        if all_msgs:
+            written = store.write_daily_digests(all_msgs, default_date=getattr(args, "date", None))
+            days = ", ".join(f"{d}({n})" for d, n in sorted(written.items()))
+            print(f"  Daily: {len(written)} digest(s) → {days}")
+
+    # 3. Mirror into the active external provider (optional).
+    if do_mirror:
+        manager, provider_name = _build_active_memory_sink()
+        if provider_name:
+            mirror = MemstoreSeeder(manager).seed(corpus)
+            print(f"  Provider '{provider_name}': {mirror.summary()}")
+            try:
+                manager.shutdown_all()
+            except Exception:
+                pass
+        else:
+            print("  Provider: none active (file tree only)")
     print()
 
 
 def cmd_dream(args) -> None:
-    """Run an offline consolidation ('dream') over a fact corpus file.
+    """Roll up the daily memory tree, or consolidate a JSONL corpus.
 
-    Reads a JSONL corpus (as produced by ``--export``), consolidates it, and
-    either writes the refined facts to the active provider or re-exports them.
+    Default: read recent ``memories/daily/*.md`` digests, dream-consolidate
+    them, and fold the result (merged facts + synthesised insights) into
+    MEMORY.md / USER.md — "build on top of the daily breakdown".
+
+    With ``--corpus FILE`` it instead consolidates a standalone JSONL corpus
+    and writes it to the canonical files (or re-exports with ``--export``).
     """
     from pathlib import Path
 
-    from agent.memstore_seeding import (
-        DreamConsolidator,
-        FactCorpus,
-        MemstoreSeeder,
-    )
-
-    corpus_path = getattr(args, "corpus", None)
-    if not corpus_path:
-        print("\n  Provide a corpus file: hermes memory dream --corpus facts.jsonl\n")
-        return
-    try:
-        text = Path(corpus_path).read_text(encoding="utf-8")
-    except OSError as exc:
-        print(f"\n  Could not read corpus: {exc}\n")
-        return
-
-    corpus = FactCorpus.from_jsonl(text)
-    if not corpus:
-        print("\n  Corpus is empty or unparseable.\n")
-        return
+    from agent.memstore_files import CanonicalMemstore
+    from agent.memstore_seeding import DreamConsolidator, FactCorpus
 
     consolidator = DreamConsolidator(
         min_trust=float(getattr(args, "min_trust", 0.25)),
         decay_factor=float(getattr(args, "decay", 1.0)),
     )
+    store = CanonicalMemstore(root=getattr(args, "home", None) or None)
+    corpus_path = getattr(args, "corpus", None)
+
+    if not corpus_path:
+        # Roll-up mode over the daily tree.
+        days = getattr(args, "days", None)
+        report = store.roll_up(days=days, consolidator=consolidator)
+        if report.days_read == 0:
+            print(f"\n  No daily digests found under {store.daily}\n")
+            return
+        print(f"\n  Roll-up: {report.summary()}")
+        if report.dream_summary:
+            print(f"  Dreams: {report.dream_summary}")
+        print()
+        return
+
+    # Standalone corpus mode.
+    try:
+        text = Path(corpus_path).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"\n  Could not read corpus: {exc}\n")
+        return
+    corpus = FactCorpus.from_jsonl(text)
+    if not corpus:
+        print("\n  Corpus is empty or unparseable.\n")
+        return
+
     refined, report = consolidator.consolidate(corpus)
     print(f"\n  Dreamed over {len(corpus)} fact(s): {report.summary()}")
 
@@ -564,20 +615,11 @@ def cmd_dream(args) -> None:
         Path(export).write_text(refined.to_jsonl(), encoding="utf-8")
         print(f"  Refined corpus written to {export}\n")
         return
-
     if getattr(args, "dry_run", False):
-        print("  Dry-run: refined corpus not written to provider.\n")
+        print("  Dry-run: refined corpus not written.\n")
         return
-
-    manager, provider_name = _build_active_memory_sink()
-    seed_report = MemstoreSeeder(manager).seed(refined)
-    print(f"  Target provider: {provider_name or '(built-in only)'}")
-    print(f"  {seed_report.summary()}")
-    try:
-        manager.shutdown_all()
-    except Exception:
-        pass
-    print()
+    file_report = store.seed_facts(refined)
+    print(f"  Files: {file_report.summary()}\n")
 
 
 # ---------------------------------------------------------------------------

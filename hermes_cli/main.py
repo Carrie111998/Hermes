@@ -12788,49 +12788,78 @@ Examples:
 
     _seed_parser = memory_sub.add_parser(
         "seed",
-        help="Seed the active memstore from persona docs and transcripts",
+        help="Seed the canonical markdown memstore from persona docs and transcripts",
         description=(
-            "Bootstrap the active memory provider with knowledge before the\n"
-            "first conversation. Sources are parsed into facts and written\n"
-            "through the provider-agnostic memory-write contract.\n\n"
-            "By default the facts are first consolidated by a 'dream' pass\n"
-            "(dedupe, contradiction check, insight synthesis); use --no-dream\n"
-            "to seed the raw extraction."
+            "Bootstrap the canonical markdown memory tree (USER.md, AGENTS.md,\n"
+            "IDENTITY.md, …) — the provider-agnostic store of record — with\n"
+            "knowledge before the first conversation. Transcripts are also\n"
+            "split into per-day digests under memories/daily/.\n\n"
+            "By default facts are consolidated by a 'dream' pass (dedupe,\n"
+            "contradiction check, insight synthesis) and mirrored into the\n"
+            "active external provider. Use --no-dream / --no-mirror / --no-daily\n"
+            "to turn those off."
         ),
     )
     _seed_parser.add_argument(
         "--persona", action="append", metavar="FILE",
-        help="Markdown 'about the user/project' doc (repeatable)",
+        help="Markdown 'about the user/project/agent' doc (repeatable)",
     )
     _seed_parser.add_argument(
         "--transcript", action="append", metavar="FILE",
         help="Conversation transcript JSON/JSONL to mine for facts (repeatable)",
     )
     _seed_parser.add_argument(
+        "--home", metavar="DIR",
+        help="Memstore root (default: HERMES_HOME)",
+    )
+    _seed_parser.add_argument(
+        "--date", metavar="YYYY-MM-DD",
+        help="Fallback date for undated transcript messages (default: today)",
+    )
+    _seed_parser.add_argument(
         "--no-dream", action="store_true",
         help="Skip the consolidation pass; seed the raw extracted facts",
     )
     _seed_parser.add_argument(
+        "--no-daily", action="store_true",
+        help="Skip writing per-day digest files",
+    )
+    _seed_parser.add_argument(
+        "--no-mirror", action="store_true",
+        help="Write only the file tree; don't mirror to the external provider",
+    )
+    _seed_parser.add_argument(
         "--dry-run", action="store_true",
-        help="Show what would be written without writing to any provider",
+        help="Show what would be written without writing anything",
     )
 
     _dream_parser = memory_sub.add_parser(
         "dream",
-        help="Consolidate a fact corpus (dedupe, de-conflict, synthesise)",
+        help="Roll up the daily memory tree (dedupe, de-conflict, synthesise)",
         description=(
-            "Run an offline 'dream' over an exported JSONL fact corpus:\n"
-            "merge near-duplicates, flag contradictions, decay/prune stale\n"
-            "facts, and synthesise higher-level insights. Writes the refined\n"
-            "facts to the active provider, or re-exports them with --export."
+            "Run an offline 'dream' consolidation. By default it reads recent\n"
+            "memories/daily/*.md digests, merges near-duplicates, flags\n"
+            "contradictions, decays/prunes stale facts, synthesises higher-level\n"
+            "insights, and folds the result into MEMORY.md / USER.md.\n\n"
+            "With --corpus FILE it consolidates a standalone JSONL corpus\n"
+            "instead, writing to the canonical files or re-exporting (--export)."
         ),
     )
     _dream_parser.add_argument(
-        "--corpus", metavar="FILE", help="JSONL fact corpus to consolidate",
+        "--days", type=int, default=None,
+        help="Only roll up the most recent N daily digests (default: all)",
+    )
+    _dream_parser.add_argument(
+        "--home", metavar="DIR",
+        help="Memstore root (default: HERMES_HOME)",
+    )
+    _dream_parser.add_argument(
+        "--corpus", metavar="FILE",
+        help="Consolidate a standalone JSONL corpus instead of the daily tree",
     )
     _dream_parser.add_argument(
         "--export", metavar="FILE",
-        help="Write the refined corpus to FILE instead of the provider",
+        help="With --corpus: write the refined corpus to FILE instead of the files",
     )
     _dream_parser.add_argument(
         "--min-trust", type=float, default=0.25, dest="min_trust",
@@ -12842,7 +12871,7 @@ Examples:
     )
     _dream_parser.add_argument(
         "--dry-run", action="store_true",
-        help="Consolidate and report without writing to any provider",
+        help="With --corpus: consolidate and report without writing",
     )
     _reset_parser = memory_sub.add_parser(
         "reset",
