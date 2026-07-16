@@ -260,6 +260,36 @@ def test_worktree_validation_fails_closed_when_cwd_disappears(tmp_path: Path) ->
     assert raised.value.__context__ is None
 
 
+def test_worktree_capture_missing_path_is_excludable(tmp_path: Path) -> None:
+    missing = tmp_path / "deleted-worktree"
+
+    with pytest.raises(WorktreeSnapshotError) as raised:
+        capture_worktree_snapshot(str(missing))
+
+    assert raised.value.code == "source_cwd_missing"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+@pytest.mark.parametrize("error", [PermissionError(), OSError("io")])
+def test_worktree_capture_inaccessible_path_is_not_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: OSError,
+) -> None:
+    def _raise_error(_path: Path) -> os.stat_result:
+        raise error
+
+    monkeypatch.setattr(Path, "lstat", _raise_error)
+
+    with pytest.raises(WorktreeSnapshotError) as raised:
+        capture_worktree_snapshot(str(tmp_path))
+
+    assert raised.value.code == "permission_preflight_failed"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_worktree_capture_does_not_expose_raw_git_error_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

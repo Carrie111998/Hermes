@@ -30,7 +30,11 @@ class WorktreeSnapshotError(ValueError):
     """A fixed, non-sensitive failure from worktree capture or validation."""
 
     def __init__(self, code: str) -> None:
-        if code not in {"source_cwd_missing", "source_identity_mismatch"}:
+        if code not in {
+            "source_cwd_missing",
+            "source_identity_mismatch",
+            "permission_preflight_failed",
+        }:
             raise ValueError("invalid worktree snapshot error code")
         self.code = code
         super().__init__(code)
@@ -44,12 +48,17 @@ def capture_worktree_snapshot(cwd: str) -> WorktreeSnapshot:
     resolved: Path | None = None
     resolved_stat: os.stat_result | None = None
     git_failed = False
+    capture_error: str | None = None
     try:
         source_lstat = source.lstat()
         resolved = source.resolve(strict=True)
         resolved_stat = resolved.stat()
-    except (FileNotFoundError, NotADirectoryError, OSError):
-        pass
+    except (FileNotFoundError, NotADirectoryError):
+        capture_error = "source_cwd_missing"
+    except OSError:
+        capture_error = "permission_preflight_failed"
+    if capture_error is not None:
+        raise WorktreeSnapshotError(capture_error)
     if source_lstat is None or resolved is None or resolved_stat is None:
         raise WorktreeSnapshotError("source_cwd_missing")
     if not resolved.is_dir():
