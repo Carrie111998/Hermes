@@ -6059,6 +6059,11 @@ class DispatchResult:
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
+    retriaged: list[str] = field(default_factory=list)
+    """Task ids sent back to ``triage`` for decomposition instead of
+    being auto-blocked, because they kept timing out and
+    ``kanban.retriage_on_timeout`` is enabled. The auto-decomposer picks
+    them up on its next tick and splits them into smaller children."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
@@ -6421,6 +6426,7 @@ def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    retriage_on_timeout: bool = False,
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -6430,12 +6436,21 @@ def enforce_max_runtime(
     breaker has already given up, in which case the task stays blocked
     where ``_record_spawn_failure`` parked it.
 
+    ``retriage_on_timeout`` is forwarded to ``_record_task_failure``:
+    when enabled, a task whose breaker trips on a timeout goes back to
+    ``triage`` for decomposition instead of ``blocked`` (see the
+    ``_record_task_failure`` docstring). Task ids retriaged this call
+    are stashed on ``enforce_max_runtime._last_retriaged`` (same
+    side-channel pattern as ``detect_crashed_workers``) so
+    ``dispatch_once`` can surface them in ``DispatchResult.retriaged``.
+
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
     test hook; defaults to ``os.kill`` on POSIX.
     """
     import signal
     timed_out: list[str] = []
+    retriaged: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
@@ -6527,7 +6542,19 @@ def enforce_max_runtime(
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
+                retriage_on_timeout=retriage_on_timeout,
             )
+            if retriage_on_timeout:
+                status_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,),
+                ).fetchone()
+                if status_row is not None and status_row["status"] == "triage":
+                    retriaged.append(tid)
+    # Side-channel for dispatch_once — mirrors the
+    # ``detect_crashed_workers._last_auto_blocked`` pattern so the
+    # public list-of-timed-out return type stays stable for direct
+    # callers and existing tests.
+    enforce_max_runtime._last_retriaged = retriaged  # type: ignore[attr-defined]
     return timed_out
 
 
@@ -7019,6 +7046,93 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _was_retriaged(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task already went through retriage-on-timeout once.
+
+    The ``retriaged`` event is the durable marker — no schema change
+    needed, and the audit trail doubles as the loop guard. Must be
+    called inside the caller's ``write_txn`` (plain SELECT, no writes).
+    """
+    row = conn.execute(
+        "SELECT COUNT(*) FROM task_events "
+        "WHERE task_id = ? AND kind = 'retriaged'",
+        (task_id,),
+    ).fetchone()
+    return int(row[0]) > 0
+
+
+# Appended to a task body when retriage-on-timeout sends it back to the
+# Triage column. Written for the decomposer LLM (kanban_decompose reads
+# title + body): states what happened and biases the decomposition
+# toward children that fit the runtime budget.
+_RETRIAGE_BODY_TEMPLATE = """
+
+---
+## Automated retriage after timeout
+
+{failures} consecutive attempt(s) at this task timed out ({error}).
+Instead of giving up, the dispatcher moved it back to Triage for
+decomposition.
+
+Decomposer: split the ORIGINAL task above into smaller child tasks that
+are each independently completable{budget_clause}. Preserve the original
+intent and acceptance criteria. Do NOT restate the task as a single
+child — the whole point is that one worker could not finish it within
+its runtime budget.
+"""
+
+
+def _retriage_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    body: Optional[str],
+    max_runtime_seconds: Optional[int],
+    failures: int,
+    effective_limit: int,
+    limit_source: str,
+    error: str,
+    event_payload_extra: Optional[dict] = None,
+) -> None:
+    """Send a repeatedly-timed-out task back to ``triage`` for decomposition.
+
+    Appends a failure-context block to the body (the decomposer LLM sees
+    it), resets the consecutive-failures counter so the decomposed root
+    gets a fresh breaker budget for its judge run, and emits a
+    ``retriaged`` event — which is also the once-only guard
+    ``_was_retriaged`` checks. Must be called inside the caller's
+    ``write_txn`` (this helper does NOT open its own).
+    """
+    if max_runtime_seconds:
+        budget_clause = (
+            f" well within {int(max_runtime_seconds)} seconds of work"
+        )
+    else:
+        budget_clause = ""
+    new_body = (body or "") + _RETRIAGE_BODY_TEMPLATE.format(
+        failures=failures,
+        error=error,
+        budget_clause=budget_clause,
+    )
+    conn.execute(
+        "UPDATE tasks SET status = 'triage', body = ?, "
+        "consecutive_failures = 0, last_failure_error = ?, "
+        "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+        "WHERE id = ? AND status IN ('ready', 'running')",
+        (new_body, error, task_id),
+    )
+    payload = {
+        "failures": failures,
+        "effective_limit": effective_limit,
+        "limit_source": limit_source,
+        "error": error,
+        "trigger_outcome": "timed_out",
+    }
+    if event_payload_extra:
+        payload.update(event_payload_extra)
+    _append_event(conn, task_id, "retriaged", payload)
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7030,6 +7144,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    retriage_on_timeout: bool = False,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -7073,13 +7188,29 @@ def _record_task_failure(
     ``detect_crashed_workers``, which resolves the per-task
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
+
+    ``retriage_on_timeout=True`` (config ``kanban.retriage_on_timeout``,
+    default off) changes what happens when the breaker trips with
+    ``outcome="timed_out"``: instead of parking the task in ``blocked``
+    with a ``gave_up`` event, the task is sent back to ``triage`` with a
+    failure-context block appended to its body and its failure counter
+    reset. The auto-decomposer (``kanban.auto_decompose``) then splits it
+    into smaller child tasks on its next tick. Rationale: a timeout is a
+    *deterministic* failure — a task that needs more than
+    ``max_runtime_seconds`` fails identically on every blind retry, so
+    the productive recovery is subdivision, not repetition. Each task is
+    retriaged at most ONCE (guarded by the ``retriaged`` event); a second
+    trip blocks normally, so subdivision cannot recurse unbounded.
+    Non-timeout outcomes (crash / spawn_failed — plausibly transient)
+    are never retriaged.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, body, "
+            "max_runtime_seconds "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
@@ -7100,6 +7231,30 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
+            # Retriage-on-timeout: opt-in alternative to giving up when
+            # the trip was caused by a runtime timeout. ``force_trip``
+            # callers already applied their own retry policy, so they
+            # keep the plain block semantics.
+            if (
+                retriage_on_timeout
+                and not force_trip
+                and outcome == "timed_out"
+                and not _was_retriaged(conn, task_id)
+            ):
+                _retriage_task(
+                    conn, task_id,
+                    body=row["body"],
+                    max_runtime_seconds=(
+                        row["max_runtime_seconds"]
+                        if "max_runtime_seconds" in row.keys() else None
+                    ),
+                    failures=failures,
+                    effective_limit=effective_limit,
+                    limit_source=limit_source,
+                    error=error[:500],
+                    event_payload_extra=event_payload_extra,
+                )
+                return False
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -7449,6 +7604,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    retriage_on_timeout: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7483,6 +7639,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            retriage_on_timeout=retriage_on_timeout,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7499,6 +7656,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            retriage_on_timeout=retriage_on_timeout,
         )
 
 
@@ -7515,6 +7673,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    retriage_on_timeout: bool = False,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7570,7 +7729,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(
+        conn, retriage_on_timeout=retriage_on_timeout,
+    )
+    # Tasks sent back to triage instead of blocked (retriage-on-timeout).
+    # Same side-channel pattern as detect_crashed_workers above.
+    result.retriaged = list(
+        getattr(enforce_max_runtime, "_last_retriaged", []) or []
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

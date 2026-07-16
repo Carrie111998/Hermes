@@ -2786,6 +2786,17 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # When true, a task whose circuit breaker trips on consecutive
+        # TIMEOUTS is sent back to Triage for decomposition (with a
+        # failure-context block appended to its body) instead of being
+        # auto-blocked. A timeout is deterministic — blind retries of a
+        # task that needs more than max_runtime_seconds fail identically
+        # — so subdivision is the productive recovery. At most one
+        # retriage per task; the second trip blocks normally. Works best
+        # with auto_decompose: true (otherwise the task waits in Triage
+        # for a manual `hermes kanban decompose`). Crashes and spawn
+        # failures never retriage. Default off — opt-in behavior change.
+        "retriage_on_timeout": False,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

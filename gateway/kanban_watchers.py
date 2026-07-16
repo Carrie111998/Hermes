@@ -874,6 +874,13 @@ class GatewayKanbanWatchersMixin:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
+        # Retriage-on-timeout: opt-in — a task whose breaker trips on
+        # consecutive timeouts goes back to Triage for decomposition
+        # instead of blocking (see kanban_db._record_task_failure).
+        retriage_on_timeout = bool(kanban_cfg.get("retriage_on_timeout", False))
+        if retriage_on_timeout:
+            logger.info("kanban dispatcher: retriage_on_timeout enabled")
+
         # Read stale_timeout_seconds — 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
         try:
@@ -1022,6 +1029,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    retriage_on_timeout=retriage_on_timeout,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

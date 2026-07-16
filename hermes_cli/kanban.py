@@ -2246,11 +2246,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        retriage_on_timeout = bool(_kanban_cfg.get("retriage_on_timeout", False))
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+        retriage_on_timeout = False
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
@@ -2260,12 +2262,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            retriage_on_timeout=retriage_on_timeout,
         )
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
             "crashed": res.crashed,
             "timed_out": res.timed_out,
+            "retriaged": res.retriaged,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
@@ -2289,6 +2293,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Timed out:    {len(res.timed_out)}")
     if res.timed_out:
         print(f"  {', '.join(res.timed_out)}")
+    if res.retriaged:
+        print(f"Retriaged:    {len(res.retriaged)}")
+        print(f"  {', '.join(res.retriaged)}")
     print(f"Stale:        {len(res.stale)}")
     if res.stale:
         print(f"  {', '.join(res.stale)}")

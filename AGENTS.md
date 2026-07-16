@@ -1122,6 +1122,10 @@ Isolation model:
 - After `kanban.failure_limit` consecutive non-success attempts on the
   same task (default: 2), the dispatcher auto-blocks it to prevent spin
   loops.
+- Opt-in exception: with `kanban.retriage_on_timeout: true`, a breaker
+  trip caused by consecutive **timeouts** sends the task back to Triage
+  for decomposition (once per task) instead of blocking it — timeouts
+  are deterministic, so splitting beats blind retries.
 
 Full user-facing docs: `website/docs/user-guide/features/kanban.md`.
 
