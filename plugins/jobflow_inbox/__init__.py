@@ -8,7 +8,10 @@ inbox-sweep applies to the canonical pipeline.json.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+
+from . import ingest
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +19,15 @@ _USAGE = "That doesn't look like a job URL. Usage: /job <url>"
 
 
 async def _handle_job(raw_args: str) -> str:
-    # Task 7 replaces this body with a call to ingest.ingest_job(...).
     text = (raw_args or "").strip()
     if not text:
         return _USAGE
-    return _USAGE
+    try:
+        result = await asyncio.to_thread(ingest.ingest_job, text)
+        return result.reply
+    except Exception:  # noqa: BLE001 — never raise to the gateway
+        logger.warning("jobflow_inbox: handler failed", exc_info=True)
+        return "Couldn't queue that job — please retry."
 
 
 def register(ctx) -> None:
