@@ -187,6 +187,8 @@ _SIDEBAR_REGISTRATION_CURSOR_VERSION = 1
 _SIDEBAR_REGISTRATION_QUERY_BUDGET = 4
 _SIDEBAR_REGISTRATION_EXAMINED_BUDGET = 40
 _SIDEBAR_REGISTRATION_PAGE_SIZE = 10
+_SIDEBAR_BACKFILL_QUERY_BUDGET = 100
+_SIDEBAR_BACKFILL_EXAMINED_BUDGET = 1000
 # Foreground cancellation recovery is intentionally short. Unfinished ownership
 # transfers to tracked background recovery, with the durable 300-second lease as
 # the final fallback if a synchronous worker never returns.
@@ -880,18 +882,30 @@ class SessionBridgeCoordinator:
             {durable_cursor} if durable_cursor is not None else set()
         )
         query_count = 0
+        query_budget = (
+            _SIDEBAR_REGISTRATION_QUERY_BUDGET
+            if persist_cursor
+            else _SIDEBAR_BACKFILL_QUERY_BUDGET
+        )
+        examined_budget = (
+            _SIDEBAR_REGISTRATION_EXAMINED_BUDGET
+            if persist_cursor
+            else _SIDEBAR_BACKFILL_EXAMINED_BUDGET
+        )
         while (
             queued < limit
-            and query_count < _SIDEBAR_REGISTRATION_QUERY_BUDGET
-            and examined < _SIDEBAR_REGISTRATION_EXAMINED_BUDGET
+            and query_count < query_budget
+            and examined < examined_budget
         ):
+            remaining_queue_capacity = (
+                limit - queued if persist_cursor else _SIDEBAR_REGISTRATION_PAGE_SIZE
+            )
             page_size = max(
                 1,
                 min(
-                    limit,
-                    limit - queued,
+                    remaining_queue_capacity,
                     _SIDEBAR_REGISTRATION_PAGE_SIZE,
-                    _SIDEBAR_REGISTRATION_EXAMINED_BUDGET - examined,
+                    examined_budget - examined,
                 ),
             )
             raw_page = await asyncio.to_thread(

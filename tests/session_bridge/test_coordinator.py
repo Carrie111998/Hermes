@@ -3258,6 +3258,50 @@ async def test_persisted_sidebar_exclusions_do_not_starve_older_valid_source(
     assert preview.excluded == 0
 
 
+@pytest.mark.asyncio
+async def test_backfill_paginates_past_ineligible_sources(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    for offset in range(40):
+        store.upsert_projection(_sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id=f"acknowledgement-{offset}",
+            content="ok",
+            last_active=now - offset,
+            cwd=str(tmp_path),
+        ))
+    valid = _exact_cwd_repo(tmp_path / "older-meaningful")
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="older-meaningful",
+        content="Reach the meaningful source after acknowledgements",
+        last_active=now - 100,
+        cwd=str(valid),
+    ))
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=1,
+        apply=False,
+    )
+
+    assert preview.examined == 41
+    assert preview.queued == 1
+    assert preview.failed == 0
+    assert preview.excluded == 0
+
+
 class _HeartbeatClaimStore:
     def __init__(self, *, fail_claim: bool = False) -> None:
         self.fail_claim = fail_claim
