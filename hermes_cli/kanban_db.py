@@ -985,14 +985,16 @@ class Task:
     # tasks created from the CLI, the dashboard, or any path that doesn't
     # set the env var. Lets clients render a per-session board without
     # relying on tenant + time-window heuristics.
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None,
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
     # blocks. Set by ``block_task``; preserved across unblock so a re-block for
     # the same kind is recognisable as an unblock↔re-block loop.
-    block_kind: Optional[str] = None
+    block_kind: Optional[str] = None,
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
-    block_recurrences: int = 0
+    block_recurrences: int = 0,
+    # Optional GitHub PR URL for merge-readiness gating in ``complete_task``.
+    pr_url: Optional[str] = None,
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1086,6 +1088,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            pr_url=(
+                row["pr_url"] if "pr_url" in keys and row["pr_url"] else None
             ),
         )
 
@@ -1274,7 +1279,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional GitHub PR URL attached to a coding task. When set,
+    -- ``complete_task`` checks merge readiness (state, mergeable, commits)
+    -- before allowing the task to transition to ``done``. NULL means no
+    -- PR gate.
+    pr_url               TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2474,6 +2484,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "pr_url" not in cols:
+        # Optional GitHub PR URL for the merge-readiness gate in complete_task.
+        # NULL means no PR gate.
+        _add_column_if_missing(conn, "tasks", "pr_url", "pr_url TEXT")
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2906,6 +2921,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    pr_url: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2967,6 +2983,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if pr_url is not None:
+        pr_url = str(pr_url).strip() or None
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3217,8 +3235,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, pr_url
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3244,6 +3262,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        pr_url,
                     ),
                 )
                 for pid in parents:
@@ -3268,6 +3287,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "pr_url": pr_url,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4833,6 +4853,123 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _check_pr_status(
+    conn: sqlite3.Connection, task_id: str, pr_url: str
+) -> tuple[Optional[str], bool, int]:
+    """Query GitHub for PR state, mergeability, and commit count.
+
+    Uses ``gh pr view <pr_url> --json state,mergeable,commits``. Returns
+    ``(state, mergeable, commit_count)``. On any failure (network, auth,
+    ``gh`` missing, non-zero exit, or malformed JSON) logs a warning,
+    emits a ``pr_gate_skipped`` event on the task, and returns
+    ``(None, False, 0)``. ``None`` state is the fail-open sentinel: the
+    caller must treat it as "gate could not run, allow completion".
+
+    ``state`` is normalised to uppercase for comparison.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "gh", "pr", "view", str(pr_url),
+                "--json", "state,mergeable,commits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"gh pr view exited {proc.returncode}: {proc.stderr.strip()}")
+        data = json.loads(proc.stdout)
+        state = str(data.get("state") or "").upper()
+        mergeable = bool(data.get("mergeable"))
+        commits = data.get("commits", [])
+        commit_count = len(commits) if isinstance(commits, list) else 0
+        return state, mergeable, commit_count
+    except Exception as exc:
+        _log.warning("PR gate skipped for %s: %s", pr_url, exc)
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "pr_gate_skipped",
+                    {
+                        "pr_url": pr_url,
+                        "error": str(exc)[:500],
+                    },
+                )
+        except Exception:
+            # Event emission is best-effort; never let logging failure wedge
+            # the completion path.
+            pass
+        return None, False, 0
+
+
+def _block_pr_not_ready(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pr_url: str,
+    pr_state: str,
+    mergeable: bool,
+    commit_count: int,
+    reason: str,
+) -> None:
+    """Emit a blocking event + comment and raise ``PRNotReadyError``.
+
+    Does not mutate task status — the caller is responsible for surfacing
+    the exception to the worker/tool layer, mirroring
+    ``HallucinatedCardsError`` handling.
+    """
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "completion_blocked_pr_not_ready",
+            {
+                "pr_url": pr_url,
+                "pr_state": pr_state,
+                "mergeable": mergeable,
+                "commit_count": commit_count,
+                "reason": reason,
+            },
+        )
+    body = (
+        f"PR merge-readiness gate blocked completion: {pr_url}\n\n"
+        f"State: {pr_state}\n"
+        f"Mergeable: {mergeable}\n"
+        f"Commits: {commit_count}\n"
+        f"Reason: {reason}\n\n"
+        "Fix the PR and retry kanban_complete."
+    )
+    add_comment(conn, task_id, "hermes-kanban", body)
+    raise PRNotReadyError(pr_url, pr_state, mergeable, commit_count, reason)
+
+
+class PRNotReadyError(ValueError):
+    """Raised by ``complete_task`` when the task's attached PR is not merge-ready.
+
+    Carries the PR URL, state, mergeability, commit count, and a human-readable
+    ``reason``. Kept as a ``ValueError`` subclass so existing tool-error
+    handlers treat it as a recoverable user error.
+    """
+
+    def __init__(
+        self,
+        pr_url: str,
+        pr_state: str,
+        mergeable: bool,
+        commit_count: int,
+        reason: str,
+    ):
+        self.pr_url = pr_url
+        self.pr_state = pr_state
+        self.mergeable = mergeable
+        self.commit_count = commit_count
+        self.reason = reason
+        super().__init__(f"PR not ready: {pr_url} — {reason}")
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4903,6 +5040,44 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+
+    # Gate: PR merge-readiness. If the task carries a ``pr_url``, check
+    # that the PR is merged or open + mergeable + has commits. Any error
+    # talking to GitHub fails open (we emit a ``pr_gate_skipped`` event)
+    # so a transient network/auth outage does not wedge task completion.
+    pr_row = conn.execute(
+        "SELECT pr_url FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    pr_url = pr_row["pr_url"] if pr_row else None
+    if pr_url:
+        pr_state, mergeable, commit_count = _check_pr_status(conn, task_id, pr_url)
+        if pr_state is not None:
+            if pr_state == "MERGED":
+                pass  # allow
+            elif pr_state == "OPEN" and mergeable and commit_count > 0:
+                pass  # allow
+            elif pr_state == "OPEN" and commit_count == 0:
+                _block_pr_not_ready(
+                    conn, task_id, pr_url, pr_state, mergeable, commit_count,
+                    "PR has zero commits — no work applied",
+                )
+            elif pr_state == "OPEN" and not mergeable:
+                _block_pr_not_ready(
+                    conn, task_id, pr_url, pr_state, mergeable, commit_count,
+                    "PR has merge conflicts",
+                )
+            elif pr_state == "CLOSED":
+                _block_pr_not_ready(
+                    conn, task_id, pr_url, pr_state, mergeable, commit_count,
+                    "PR closed without merging",
+                )
+            # Unknown states: treat as not-ready rather than silently allow.
+            else:
+                _block_pr_not_ready(
+                    conn, task_id, pr_url, pr_state, mergeable, commit_count,
+                    f"PR state {pr_state!r} is not merge-ready",
+                )
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -6683,6 +6858,17 @@ def set_branch_name(
         conn.execute(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
+        )
+
+
+def set_pr_url(
+    conn: sqlite3.Connection, task_id: str, pr_url: Optional[str]
+) -> None:
+    """Set or clear the PR URL for a task."""
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET pr_url = ? WHERE id = ?",
+            (str(pr_url).strip() if pr_url else None, task_id),
         )
 
 
