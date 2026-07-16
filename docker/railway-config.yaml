@@ -4,11 +4,12 @@
 # etc.) are injected by Railway and loaded from the container's .env file.
 
 model:
-  # Orchestrateur (profil défaut) : Claude Haiku 4.5 — modèle frontier discipliné en
-  # tool-calling (route via kanban_create, réponses courtes). GLM 5.2 fumblait (appelait
-  # kanban_show au lieu de kanban_create, ou générait le contenu en texte → tronqué) ;
-  # Qwen faisait le travail lui-même. Via OpenRouter (OPENROUTER_API_KEY).
-  default: "anthropic/claude-haiku-4.5"
+  # Orchestrateur (profil défaut) : Claude Opus 4.8 (upgrade depuis Haiku 4.5,
+  # 2026-07-16) — tool-calling discipliné (route via kanban_create, réponses
+  # courtes). Historique : GLM 5.2 fumblait (kanban_show au lieu de kanban_create,
+  # ou contenu en texte → tronqué) ; Qwen faisait le travail lui-même.
+  # Via OpenRouter (OPENROUTER_API_KEY).
+  default: "anthropic/claude-opus-4.8"
   provider: "openrouter"
 
 gateway:
