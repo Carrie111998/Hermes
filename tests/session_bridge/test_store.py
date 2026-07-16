@@ -8,7 +8,7 @@ from threading import Barrier, Event
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import SCHEMA_VERSION, SessionDB
 from session_bridge.mirror import (
     DiscoveryMode,
     EligibilityContext,
@@ -34,6 +34,7 @@ from session_bridge.sidebar import (
     sidebar_idempotency_key,
 )
 from session_bridge.store import (
+    SIDEBAR_EXCLUSION_REASONS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
 )
@@ -45,6 +46,17 @@ def db(tmp_path):
     database = SessionDB(tmp_path / "state.db")
     yield database
     database.close()
+
+
+def test_fresh_schema_has_current_version_and_sidebar_exclusions_table(db) -> None:
+    assert _rows(db, "SELECT version FROM schema_version") == [
+        {"version": SCHEMA_VERSION}
+    ]
+    assert _rows(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        ("session_sidebar_exclusions",),
+    ) == [{"name": "session_sidebar_exclusions"}]
 
 
 def test_mirror_worker_lock_serializes_independent_store_instances(db) -> None:
@@ -2916,6 +2928,106 @@ def _seed_sidebar_codex_target(
         origin_bridge_id=bridge_id or candidate.bridge_id,
     ))
     return f"codex:{thread_id}"
+
+
+def test_sidebar_exclusion_recording_is_idempotent_counted_and_bounded(db) -> None:
+    store = SessionBridgeStore(db)
+    candidate = _sidebar_candidate(db)
+
+    first = store.record_sidebar_exclusion(
+        candidate.source_session_id,
+        candidate.provider,
+        "source_cwd_missing",
+        now=125.0,
+    )
+    replay = store.record_sidebar_exclusion(
+        candidate.source_session_id,
+        candidate.provider,
+        "source_cwd_missing",
+        now=200.0,
+    )
+
+    expected_digest = hashlib.sha256(
+        (
+            candidate.source_session_id
+            + "\0"
+            + candidate.provider.value
+            + "\0source_cwd_missing"
+        ).encode("utf-8")
+    ).hexdigest()
+    assert first == {
+        "source_session_id": candidate.source_session_id,
+        "reason_code": "source_cwd_missing",
+        "created": True,
+    }
+    assert replay == {**first, "created": False}
+    assert _rows(db, "SELECT * FROM session_sidebar_exclusions") == [{
+        "source_session_id": candidate.source_session_id,
+        "provider": Provider.CLAUDE.value,
+        "reason_code": "source_cwd_missing",
+        "source_identity_digest": expected_digest,
+        "excluded_at": 125.0,
+        "updated_at": 125.0,
+    }]
+    assert SIDEBAR_EXCLUSION_REASONS == frozenset({"source_cwd_missing"})
+    assert store.sidebar_exclusion_counts() == {
+        "total": 1,
+        "by_reason": {"source_cwd_missing": 1},
+    }
+
+
+def test_sidebar_exclusion_replay_fails_closed_on_corrupted_digest(db) -> None:
+    store = SessionBridgeStore(db)
+    candidate = _sidebar_candidate(db, native_id="corrupt-exclusion")
+    store.record_sidebar_exclusion(
+        candidate.source_session_id,
+        candidate.provider,
+        "source_cwd_missing",
+        now=125.0,
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_exclusions SET source_identity_digest = ?",
+            ("0" * 64,),
+        )
+    )
+
+    with pytest.raises(ValueError, match="conflicting sidebar exclusion"):
+        store.record_sidebar_exclusion(
+            candidate.source_session_id,
+            candidate.provider,
+            "source_cwd_missing",
+            now=200.0,
+        )
+
+    assert _rows(
+        db,
+        "SELECT source_identity_digest, excluded_at, updated_at "
+        "FROM session_sidebar_exclusions",
+    ) == [{
+        "source_identity_digest": "0" * 64,
+        "excluded_at": 125.0,
+        "updated_at": 125.0,
+    }]
+
+
+def test_sidebar_candidates_exclude_persisted_rows_before_limit(db) -> None:
+    store = SessionBridgeStore(db)
+    older = _sidebar_candidate(db, native_id="older-valid", eligible_at=100.0)
+    newer = _sidebar_candidate(db, native_id="newer-excluded", eligible_at=200.0)
+    store.record_sidebar_exclusion(
+        newer.source_session_id,
+        newer.provider,
+        "source_cwd_missing",
+        now=250.0,
+    )
+
+    page = store.list_sidebar_candidates(after=0.0, limit=1)
+
+    assert [candidate.source_session_id for candidate in page] == [
+        older.source_session_id
+    ]
+    assert page.has_more is False
 
 
 def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> None:

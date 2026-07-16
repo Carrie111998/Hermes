@@ -142,6 +142,7 @@ SIDEBAR_FATAL_ERRORS = frozenset({
     "permission_preflight_failed",
     "retry_budget_exhausted",
 })
+SIDEBAR_EXCLUSION_REASONS = frozenset({"source_cwd_missing"})
 PUBLIC_SIDEBAR_STATE = {
     SidebarJobState.PENDING.value: "pending",
     SidebarJobState.LEASED.value: "pending",
@@ -783,6 +784,95 @@ class SessionBridgeStore:
                 )
         return frozenset(mappings)
 
+    def record_sidebar_exclusion(
+        self,
+        source_session_id: str,
+        provider: Provider,
+        reason_code: str,
+        now: float,
+    ) -> dict[str, Any]:
+        from .sidebar import sidebar_idempotency_key
+
+        sidebar_idempotency_key(source_session_id)
+        if not isinstance(provider, Provider) or provider not in (
+            Provider.CLAUDE,
+            Provider.HERMES,
+        ):
+            raise ValueError("sidebar exclusion provider must be Claude or Hermes")
+        expected_provider = (
+            Provider.CLAUDE
+            if source_session_id.startswith(f"{Provider.CLAUDE.value}:")
+            else Provider.HERMES
+        )
+        if provider is not expected_provider:
+            raise ValueError("sidebar exclusion provider does not match source")
+        if (
+            not isinstance(reason_code, str)
+            or reason_code not in SIDEBAR_EXCLUSION_REASONS
+        ):
+            raise ValueError("sidebar exclusion reason is not in the fixed allowlist")
+        excluded_at = _finite_number(now, "now")
+        identity_digest = _sidebar_exclusion_identity_digest(
+            source_session_id,
+            provider,
+            reason_code,
+        )
+
+        def _write(conn):
+            insert = conn.execute(
+                """INSERT OR IGNORE INTO session_sidebar_exclusions (
+                   source_session_id, provider, reason_code,
+                   source_identity_digest, excluded_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    source_session_id,
+                    provider.value,
+                    reason_code,
+                    identity_digest,
+                    excluded_at,
+                    excluded_at,
+                ),
+            )
+            row = conn.execute(
+                """SELECT source_session_id, provider, reason_code,
+                          source_identity_digest, excluded_at, updated_at
+                     FROM session_sidebar_exclusions
+                    WHERE source_session_id = ?""",
+                (source_session_id,),
+            ).fetchone()
+            if row is None or (
+                row["source_session_id"] != source_session_id
+                or row["provider"] != provider.value
+                or row["reason_code"] != reason_code
+                or row["source_identity_digest"] != identity_digest
+            ):
+                raise ValueError("conflicting sidebar exclusion")
+            return {
+                "source_session_id": row["source_session_id"],
+                "reason_code": row["reason_code"],
+                "created": insert.rowcount == 1,
+            }
+
+        return self.db._execute_write(_write)
+
+    def sidebar_exclusion_counts(self) -> dict[str, Any]:
+        by_reason = {reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS}
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            total = conn.execute(
+                "SELECT COUNT(*) AS count FROM session_sidebar_exclusions"
+            ).fetchone()["count"]
+            rows = conn.execute(
+                """SELECT reason_code, COUNT(*) AS count
+                     FROM session_sidebar_exclusions
+                    GROUP BY reason_code"""
+            ).fetchall()
+        for row in rows:
+            if row["reason_code"] in by_reason:
+                by_reason[row["reason_code"]] = row["count"]
+        return {"total": total, "by_reason": by_reason}
+
     def list_sidebar_candidates(
         self,
         after: float,
@@ -882,6 +972,11 @@ class SessionBridgeStore:
                               SELECT 1
                                 FROM session_sidebar_jobs AS sidebar_job
                                WHERE sidebar_job.source_session_id = s.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                                FROM session_sidebar_exclusions AS exclusion
+                               WHERE exclusion.source_session_id = s.id
                           )
                    ), candidate AS (
                        SELECT * FROM source_metadata
@@ -3161,6 +3256,15 @@ def _exact_nonempty_text(value: object, label: str) -> str:
 def _sidebar_lease_digest(lease_token: object) -> str:
     token = _exact_nonempty_text(lease_token, "sidebar lease token")
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _sidebar_exclusion_identity_digest(
+    source_session_id: str,
+    provider: Provider,
+    reason_code: str,
+) -> str:
+    identity = "\0".join((source_session_id, provider.value, reason_code))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def _ensure_sidebar_lineage_row(

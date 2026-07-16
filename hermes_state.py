@@ -139,7 +139,7 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -828,12 +828,23 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_sidebar_exclusions (
+    source_session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+    provider TEXT NOT NULL CHECK (provider IN ('claude', 'hermes')),
+    reason_code TEXT NOT NULL CHECK (reason_code IN ('source_cwd_missing')),
+    source_identity_digest TEXT NOT NULL,
+    excluded_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_session_sidebar_exclusions_reason
+    ON session_sidebar_exclusions(reason_code, excluded_at DESC);
 """
 
 BRIDGE_SCHEMA_SQL = """
