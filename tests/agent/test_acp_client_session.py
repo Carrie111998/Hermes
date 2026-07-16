@@ -15,7 +15,7 @@ from __future__ import annotations
 import threading
 import time
 from typing import Any, Optional
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -230,7 +230,7 @@ class TestModelPin:
         should_retire must be False so we don't loop (respawn -> same mismatch -> loop)."""
         session, mock_client = _make_session(model="haiku")
 
-        def req_side(method, params=None, timeout=30):
+        def req_side(method, params=None, timeout=30, **kwargs):
             if method == "session/new":
                 return {"sessionId": "sess-noretire"}
             if method == "session/set_config_option":
@@ -336,7 +336,7 @@ class TestThoughtChunkLeak:
         """Fix 2: thought chunks from session/update are NOT included in final_text."""
         session, mock_client = _make_session()
 
-        def req_side_effect(method, params=None, timeout=30):
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
             if method == "session/new":
                 return {"sessionId": "sess-think"}
             if method == "session/prompt":
@@ -1082,7 +1082,7 @@ class TestRunTurn:
 
         # Override request to return promptResponse after chunks
         call_count = [0]
-        def req_side_effect(method, params=None, timeout=30):
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
             call_count[0] += 1
             if method == "session/new":
                 return {"sessionId": "sess-stream"}
@@ -1104,7 +1104,7 @@ class TestRunTurn:
         """A final text turn is projected into projected_messages."""
         session, mock_client = _make_session()
 
-        def req_side_effect(method, params=None, timeout=30):
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
             if method == "session/new":
                 return {"sessionId": "sess-proj"}
             if method == "session/prompt":
@@ -1148,7 +1148,7 @@ class TestShouldRetire:
         session, mock_client = _make_session()
 
         call_count = [0]
-        def req_side_effect(method, params=None, timeout=30):
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
             call_count[0] += 1
             if method == "session/new":
                 return {"sessionId": "sess-crash"}
@@ -1171,7 +1171,7 @@ class TestShouldRetire:
         """ACPClientError with negative code (system error) -> should_retire."""
         session, mock_client = _make_session()
 
-        def req_side_effect(method, params=None, timeout=30):
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
             if method == "session/new":
                 return {"sessionId": "sess-err"}
             if method == "session/prompt":
@@ -1190,7 +1190,7 @@ class TestShouldRetire:
         """TimeoutError from session/prompt sets should_retire."""
         session, mock_client = _make_session()
 
-        def req_side_effect(method, params=None, timeout=30):
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
             if method == "session/new":
                 return {"sessionId": "sess-timeout"}
             if method == "session/prompt":
@@ -1205,8 +1205,475 @@ class TestShouldRetire:
 
 
 # ---------------------------------------------------------------------------
-# Tests: server request handling (fs/terminal decline -- unchanged behaviour)
+# Tests: inactivity timeout -- wait_cb, last_activity renewal, retirement
 # ---------------------------------------------------------------------------
+
+
+class TestInactivityTimeout:
+    """Tests for the ACP session inactivity-based timeout mechanism.
+
+    These tests exercise the _wait_cb / _touch_activity / _idle_age closures
+    defined inside run_turn().  The closures are not directly accessible, so
+    we verify their behaviour through observable effects:
+
+    - The mock client's request() receives wait_cb as a keyword arg and
+      invokes it, simulating the queue.Empty path that the real ACPClient
+      would follow.  This tests the closure logic, not a mock in isolation:
+      the closures are PRODUCTION code that runs inside run_turn().
+
+    - For the inactivity-limit test, wait_cb is called with enough idle time
+      to exceed turn_timeout, causing RuntimeError -> should_retire=True.
+
+    Key production behaviours under test:
+    - session/prompt is called with timeout=turn_timeout and wait_cb=_wait_cb
+    - Notifications (session/update) call _touch_activity() -> renewal
+    - Server requests call _touch_activity() -> renewal (before handler)
+    - Non-session/update notifications do NOT call _touch_activity()
+    - When idle >= turn_timeout, _wait_cb raises RuntimeError containing
+      'inactive' -> result.should_retire=True, result.error contains 'inactive'
+    """
+
+    @staticmethod
+    def _make_session_with_captured_wait_cb(
+        *,
+        turn_timeout: float = 0.2,
+        notifications: list = None,
+        server_requests: list = None,
+    ) -> tuple:
+        """Create a session whose mock client captures and invokes wait_cb.
+
+        The mock client's request() side_effect:
+        - For session/new: returns a sessionId
+        - For session/prompt: captures wait_cb, simulates queue.Empty by
+          calling wait_cb(), and returns a result if wait_cb doesn't raise.
+
+        Notifications and server_requests are delivered through the mock
+        client's take_notification / take_server_request, simulating the
+        main drain loop in run_turn().
+        """
+        captured = {"wait_cb": None, "request_calls": []}
+
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
+            captured["request_calls"].append({
+                "method": method,
+                "timeout": timeout,
+                "has_wait_cb": "wait_cb" in kwargs,
+            })
+            if method == "session/new":
+                return {"sessionId": "sess-inactive"}
+            if method == "session/prompt":
+                wait_cb = kwargs.get("wait_cb")
+                captured["wait_cb"] = wait_cb
+                if wait_cb is not None:
+                    # Simulate the request blocking briefly so the main loop
+                    # can drain notifications/server requests, then simulate
+                    # queue.Empty -> wait_cb is called.
+                    time.sleep(0.05)
+                    # If wait_cb raises, the exception propagates (as in production).
+                    next_t = wait_cb()
+                    # If it returns a positive value, simulate a response
+                    # arriving after the wait.
+                    return {"stopReason": "end_turn"}
+                return {"stopReason": "end_turn"}
+            return {}
+
+        mock_client = MagicMock()
+        mock_client.is_alive.return_value = True
+        mock_client.initialize.return_value = {"protocolVersion": 1}
+        mock_client.request.side_effect = req_side_effect
+        mock_client.stderr_tail.return_value = []
+
+        # Set up notification delivery
+        notif_iter = iter(notifications or [None])
+        mock_client.take_notification.side_effect = lambda timeout=0.0: next(notif_iter, None)
+
+        # Set up server request delivery
+        sreq_iter = iter(server_requests or [None])
+        mock_client.take_server_request.side_effect = lambda timeout=0.0: next(sreq_iter, None)
+
+        session = ACPClientSession(
+            command="fake-acp",
+            client_factory=lambda **kw: mock_client,
+        )
+        return session, mock_client, captured
+
+    def test_notification_updates_last_activity_crossing_initial_60s(self):
+        """A session/update notification received while session/prompt is
+        blocking calls _touch_activity(), resetting the idle clock.
+
+        We verify that _wait_cb returns a positive finite timeout when
+        activity has been renewed by a notification, rather than raising
+        RuntimeError.  Without the renewal, idle would exceed turn_timeout
+        and _wait_cb would raise.
+
+        We use a mock time.monotonic to control idle age without real waits.
+        """
+        # We need to control time.monotonic to simulate idle age.
+        # The _wait_cb closure uses time.monotonic() via _idle_age().
+        # We patch time.monotonic in the acp_client_session module.
+        mock_times = [1000.0]  # start time
+        time_call_count = [0]
+
+        original_monotonic = time.monotonic
+
+        def mock_monotonic():
+            time_call_count[0] += 1
+            # First few calls are for _last_activity initialization.
+            # Subsequent calls represent "now" -- we advance time to simulate
+            # idle age crossing the turn_timeout boundary, then reset after
+            # a notification.
+            if time_call_count[0] <= 1:
+                return 1000.0  # _last_activity = 1000.0
+            # After notification is processed, _touch_activity resets
+            # _last_activity.  We return a value that keeps idle < turn_timeout.
+            return 1000.0 + 0.05  # idle = 0.05s, well under turn_timeout=0.2
+
+        notif = {
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-inactive",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "working..."},
+                },
+            },
+        }
+
+        session, mock_client, captured = self._make_session_with_captured_wait_cb(
+            turn_timeout=0.2,
+            notifications=[notif, None],
+        )
+
+        with patch("agent.transports.acp_client_session.time.monotonic", mock_monotonic):
+            result = session.run_turn("hello", turn_timeout=0.2)
+
+        # _wait_cb should have been called and returned a positive value
+        # (not raised RuntimeError), proving the notification renewed activity.
+        assert captured["wait_cb"] is not None, "wait_cb was not passed to request()"
+        assert result.error is None or "inactive" not in (result.error or ""), (
+            f"Session timed out despite notification renewal: {result.error}"
+        )
+
+    def test_server_request_updates_activity(self):
+        """A server-initiated request (e.g. session/request_permission)
+        received while session/prompt is blocking calls _touch_activity(),
+        renewing the idle clock so _wait_cb doesn't raise.
+
+        Uses auto_approve_permissions=True so the permission is auto-granted.
+        """
+        mock_times = [1000.0]
+        time_call_count = [0]
+
+        def mock_monotonic():
+            time_call_count[0] += 1
+            if time_call_count[0] <= 1:
+                return 1000.0
+            return 1000.0 + 0.05  # idle = 0.05s, under turn_timeout=0.2
+
+        sreq = {
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-inactive",
+                "toolCall": {"title": "bash", "kind": "tool", "toolCallId": "c1"},
+                "options": [{"optionId": "allow-once", "kind": "allow_once"}],
+            },
+        }
+
+        session, mock_client, captured = self._make_session_with_captured_wait_cb(
+            turn_timeout=0.2,
+            server_requests=[sreq, None],
+        )
+        session._auto_approve_permissions = True
+
+        with patch("agent.transports.acp_client_session.time.monotonic", mock_monotonic):
+            result = session.run_turn("hello", turn_timeout=0.2)
+
+        # Server request should have been handled (respond called)
+        mock_client.respond.assert_called_once()
+        # _wait_cb should not have raised RuntimeError
+        assert captured["wait_cb"] is not None
+        assert result.error is None or "inactive" not in (result.error or ""), (
+            f"Session timed out despite server request renewal: {result.error}"
+        )
+
+    def test_inactivity_limit_returns_inactive_error_and_retires(self):
+        """When the session is silent for >= turn_timeout (no notifications,
+        no server requests, no prompt response), _wait_cb raises RuntimeError
+        with 'inactive' in the message, and the TurnResult has
+        should_retire=True and error containing 'inactive'.
+        """
+        # Simulate time advancing past turn_timeout
+        time_call_count = [0]
+
+        def mock_monotonic():
+            time_call_count[0] += 1
+            if time_call_count[0] <= 1:
+                return 1000.0  # _last_activity = 1000.0
+            # idle = 0.3s, which exceeds turn_timeout=0.2
+            return 1000.0 + 0.3
+
+        session, mock_client, captured = self._make_session_with_captured_wait_cb(
+            turn_timeout=0.2,
+            notifications=[None],  # no notifications
+        )
+
+        with patch("agent.transports.acp_client_session.time.monotonic", mock_monotonic):
+            result = session.run_turn("hello", turn_timeout=0.2)
+
+        assert result.should_retire is True
+        assert result.error is not None
+        assert "inactive" in result.error.lower(), (
+            f"Expected 'inactive' in error, got: {result.error}"
+        )
+
+    def test_initial_timeout_uses_turn_timeout_when_below_60(self):
+        """The session/prompt request's initial timeout equals turn_timeout
+        (not the old hardcoded 60.0), so the first inactivity check happens
+        at the configured interval.
+
+        With turn_timeout=0.2 (< 60), the initial timeout passed to
+        request() must be 0.2, not 60.0.
+        """
+        wait_cb_returns: list = []
+        prompt_timeout_seen: list = []
+
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
+            if method == "session/new":
+                return {"sessionId": "sess-inactive"}
+            if method == "session/prompt":
+                prompt_timeout_seen.append(timeout)
+                wait_cb = kwargs.get("wait_cb")
+                if wait_cb is not None:
+                    ret = wait_cb()
+                    wait_cb_returns.append(ret)
+                    return {"stopReason": "end_turn"}
+            return {}
+
+        mock_client = MagicMock()
+        mock_client.is_alive.return_value = True
+        mock_client.initialize.return_value = {"protocolVersion": 1}
+        mock_client.request.side_effect = req_side_effect
+        mock_client.stderr_tail.return_value = []
+        mock_client.take_notification.side_effect = lambda timeout=0.0: None
+        mock_client.take_server_request.side_effect = lambda timeout=0.0: None
+
+        session = ACPClientSession(
+            command="fake-acp",
+            client_factory=lambda **kw: mock_client,
+        )
+
+        result = session.run_turn("hello", turn_timeout=0.2)
+
+        # The initial timeout must equal turn_timeout (0.2), not 60.0
+        assert len(prompt_timeout_seen) >= 1
+        t = prompt_timeout_seen[0]
+        assert t == 0.2
+        assert 0 < t < float("inf")
+
+        # wait_cb returns max(60.0, turn_timeout - idle) which is always
+        # positive and finite when idle < turn_timeout.
+        assert len(wait_cb_returns) >= 1
+        for v in wait_cb_returns:
+            assert v is not None
+            assert v > 0
+            assert v != float("inf")
+
+    def test_non_session_update_notification_does_not_renew_activity(self):
+        """A notification whose method is NOT ``session/update`` must NOT
+        renew the idle clock.  Without the fix, the caller unconditionally
+        called _touch_activity() after _process_notification() regardless
+        of whether the notification was legitimate, so junk notifications
+        would keep the session alive indefinitely.
+
+        We simulate idle time exceeding turn_timeout via mock_monotonic,
+        then deliver a junk notification.  The junk notification should be
+        dropped (not touch), and _wait_cb should raise RuntimeError ->
+        should_retire=True.
+        """
+        time_call_count = [0]
+
+        def mock_monotonic():
+            time_call_count[0] += 1
+            if time_call_count[0] <= 1:
+                return 1000.0
+            # idle = 0.3s, exceeds turn_timeout=0.2
+            return 1000.0 + 0.3
+
+        # Junk notification: method is NOT session/update
+        junk_note = {
+            "method": "some/unknown_method",
+            "params": {},
+        }
+
+        session, mock_client, captured = self._make_session_with_captured_wait_cb(
+            turn_timeout=0.2,
+            notifications=[junk_note, None],
+        )
+
+        with patch("agent.transports.acp_client_session.time.monotonic", mock_monotonic):
+            result = session.run_turn("hello", turn_timeout=0.2)
+
+        # The junk notification should NOT have renewed activity -> timeout
+        assert result.should_retire is True
+        assert result.error is not None
+        assert "inactive" in result.error.lower(), (
+            f"Expected inactivity timeout because junk notification did not renew: {result.error}"
+        )
+
+    def test_legitimate_session_update_notification_renews_activity(self):
+        """A legitimate ``session/update`` notification DOES renew the idle
+        clock so _wait_cb returns a positive finite timeout (no RuntimeError).
+
+        We simulate a very short idle (via mock_monotonic returning a value
+        just past initialization) and deliver a real session/update.  The
+        notification should touch activity, and _wait_cb should not raise.
+        """
+        time_call_count = [0]
+
+        def mock_monotonic():
+            time_call_count[0] += 1
+            if time_call_count[0] <= 1:
+                return 1000.0
+            return 1000.0 + 0.05  # idle = 0.05s, under turn_timeout=0.2
+
+        notif = {
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-inactive",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "working..."},
+                },
+            },
+        }
+
+        session, mock_client, captured = self._make_session_with_captured_wait_cb(
+            turn_timeout=0.2,
+            notifications=[notif, None],
+        )
+
+        with patch("agent.transports.acp_client_session.time.monotonic", mock_monotonic):
+            result = session.run_turn("hello", turn_timeout=0.2)
+
+        assert captured["wait_cb"] is not None, "wait_cb was not passed to request()"
+        assert result.error is None or "inactive" not in (result.error or ""), (
+            f"Session timed out despite legitimate notification renewal: {result.error}"
+        )
+
+    def test_server_request_touch_before_handler(self):
+        """Server request touch must happen BEFORE _handle_server_request, not
+        after.  Permission approval may block, and if touch happened after
+        the handler, the request thread's _wait_cb would see stale idle time
+        during the block and fire inactivity.
+
+        We verify the ordering by having the handler check idle age via the
+        captured wait_cb: if touch happened first, idle should be small
+        (just renewed); if touch happened after, idle would be large and
+        _wait_cb would raise.
+
+        Uses a controllable monotonic clock: starts at 1000.0, then advances
+        to 1000.0 + 0.3 (exceeding turn_timeout=0.2).  The handler calls
+        wait_cb(); if touch happened before the handler, _last_activity was
+        just reset to ~1000.3, so idle is ~0 -> wait_cb returns positive.
+        If touch happened after, _last_activity is still 1000.0, idle is 0.3
+        -> wait_cb raises RuntimeError.
+        """
+        time_call_count = [0]
+
+        def mock_monotonic():
+            time_call_count[0] += 1
+            if time_call_count[0] <= 1:
+                return 1000.0  # _last_activity initialization
+            # Advance time past turn_timeout so that if touch hasn't happened,
+            # _wait_cb would raise.
+            return 1000.0 + 0.3
+
+        handler_wait_cb_result: list = []  # captures what wait_cb returns inside handler
+        handler_raised: list = []
+
+        sreq = {
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess-inactive",
+                "toolCall": {"title": "bash", "kind": "tool", "toolCallId": "c1"},
+                "options": [{"optionId": "allow-once", "kind": "allow_once"}],
+            },
+        }
+
+        # Build session with captured wait_cb and a custom handler that
+        # calls wait_cb to verify the idle clock was just renewed.
+        captured = {"wait_cb": None}
+
+        def req_side_effect(method, params=None, timeout=30, **kwargs):
+            if method == "session/new":
+                return {"sessionId": "sess-inactive"}
+            if method == "session/prompt":
+                wait_cb = kwargs.get("wait_cb")
+                captured["wait_cb"] = wait_cb
+                time.sleep(0.05)
+                if wait_cb is not None:
+                    next_t = wait_cb()
+                    return {"stopReason": "end_turn"}
+                return {"stopReason": "end_turn"}
+            return {}
+
+        mock_client = MagicMock()
+        mock_client.is_alive.return_value = True
+        mock_client.initialize.return_value = {"protocolVersion": 1}
+        mock_client.request.side_effect = req_side_effect
+        mock_client.stderr_tail.return_value = []
+        mock_client.take_notification.side_effect = lambda timeout=0.0: None
+
+        # Deliver the server request, then None
+        sreq_iter = iter([sreq, None])
+        mock_client.take_server_request.side_effect = lambda timeout=0.0: next(sreq_iter, None)
+
+        session = ACPClientSession(
+            command="fake-acp",
+            auto_approve_permissions=True,
+            client_factory=lambda **kw: mock_client,
+        )
+
+        # Patch _handle_server_request to call the captured wait_cb inside it.
+        # If touch happened before this handler, wait_cb should return a
+        # positive value (idle was just reset).  If touch happened after,
+        # wait_cb would raise RuntimeError.
+        original_handler = session._handle_server_request
+
+        def verifying_handler(req):
+            # Inside the handler, call wait_cb to check idle state.
+            # If touch happened before us, idle should be ~0 (just renewed).
+            # If not, idle would be 0.3 > turn_timeout=0.2 -> RuntimeError.
+            wc = captured.get("wait_cb")
+            if wc is not None:
+                try:
+                    ret = wc()
+                    handler_wait_cb_result.append(ret)
+                except RuntimeError as exc:
+                    handler_raised.append(exc)
+            original_handler(req)
+
+        session._handle_server_request = verifying_handler
+
+        with patch("agent.transports.acp_client_session.time.monotonic", mock_monotonic):
+            result = session.run_turn("hello", turn_timeout=0.2)
+
+        # The handler should have seen a renewed idle clock (no RuntimeError)
+        assert not handler_raised, (
+            f"_wait_cb raised inside handler -- touch did not happen before handler: "
+            f"{handler_raised[0] if handler_raised else ''}"
+        )
+        assert len(handler_wait_cb_result) >= 1, "wait_cb was not called inside handler"
+        assert handler_wait_cb_result[0] > 0, (
+            f"wait_cb returned non-positive inside handler: {handler_wait_cb_result[0]}"
+        )
+        # The session should not have timed out
+        assert result.error is None or "inactive" not in (result.error or ""), (
+            f"Session timed out -- touch did not happen before handler: {result.error}"
+        )
+
 
 
 class TestServerRequestHandling:

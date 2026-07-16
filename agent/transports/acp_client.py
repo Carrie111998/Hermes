@@ -28,7 +28,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from tools.environments.local import hermes_subprocess_env
 
@@ -192,26 +192,59 @@ class ACPClient:
         method: str,
         params: Optional[dict] = None,
         timeout: float = 30.0,
+        *,
+        wait_cb: Optional[Callable[[], float]] = None,
     ) -> dict:
         """Send a JSON-RPC request and block on the response.
 
         Returns the ``result`` dict on success.
         Raises ACPClientError on a JSON-RPC ``error`` response.
         Raises TimeoutError if no response arrives within ``timeout`` seconds.
+
+        When ``wait_cb`` is provided, the initial ``timeout`` is used for the
+        first ``queue.get`` call; on each ``queue.Empty`` the callback is
+        invoked to obtain the next positive finite timeout.  If the callback
+        raises ``RuntimeError``, the request is terminated immediately and the
+        RuntimeError propagates to the caller.  This enables an inactivity-
+        based wait without imposing a total wall-clock ceiling.
+
+        When ``wait_cb`` is ``None`` (the default), behaviour is unchanged: a
+        single fixed ``timeout`` is used for the one and only ``queue.get``.
         """
         rid = self._take_id()
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
         self._send({"id": rid, "method": method, "params": params or {}})
-        try:
-            msg = q.get(timeout=timeout)
-        except queue.Empty:
-            with self._pending_lock:
-                self._pending.pop(rid, None)
-            raise TimeoutError(
-                f"ACP method {method!r} timed out after {timeout}s"
-            )
+        current_timeout = timeout
+        while True:
+            try:
+                msg = q.get(timeout=current_timeout)
+            except queue.Empty:
+                if wait_cb is None:
+                    with self._pending_lock:
+                        self._pending.pop(rid, None)
+                    raise TimeoutError(
+                        f"ACP method {method!r} timed out after {timeout}s"
+                    )
+                # Dynamic wait: ask the callback for the next timeout.
+                # If wait_cb raises any exception, clean up the pending
+                # entry before re-raising to avoid a stale pending leak.
+                try:
+                    next_timeout = wait_cb()
+                except Exception:
+                    with self._pending_lock:
+                        self._pending.pop(rid, None)
+                    raise
+                if next_timeout is None or next_timeout <= 0:
+                    with self._pending_lock:
+                        self._pending.pop(rid, None)
+                    raise TimeoutError(
+                        f"ACP method {method!r} wait_cb returned non-positive timeout"
+                    )
+                current_timeout = next_timeout
+                continue
+            break
         if "error" in msg:
             err = msg["error"]
             raise ACPClientError(

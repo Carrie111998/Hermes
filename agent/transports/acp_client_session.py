@@ -432,11 +432,45 @@ class ACPClientSession:
             "prompt": [{"type": "text", "text": user_text}],
         }
 
+        # --- Inactivity tracking ---
+        # ``turn_timeout`` is a *continuous inactivity* limit, NOT a total
+        # wall-clock ceiling.  We track ``last_activity`` with time.monotonic()
+        # guarded by a lock.  The dynamic wait callback (``_wait_cb``) is
+        # invoked by ``ACPClient.request`` on each ``queue.Empty``; it checks
+        # the idle age and either returns a positive finite next-timeout or
+        # raises RuntimeError to terminate the request.
+        _activity_lock = threading.Lock()
+        _last_activity = time.monotonic()
+
+        def _touch_activity() -> None:
+            nonlocal _last_activity
+            with _activity_lock:
+                _last_activity = time.monotonic()
+
+        def _idle_age() -> float:
+            with _activity_lock:
+                return time.monotonic() - _last_activity
+
+        def _wait_cb() -> float:
+            idle = _idle_age()
+            if idle >= turn_timeout:
+                raise RuntimeError(
+                    f"ACP session inactive for {idle:.1f}s "
+                    f"(limit {turn_timeout}s) -- terminating session/prompt"
+                )
+            return max(60.0, turn_timeout - idle)
+
+        # The initial queue.get timeout for session/prompt.  Using turn_timeout
+        # (instead of a hardcoded 60.0) ensures the first inactivity check
+        # happens at the configured interval -- critical when turn_timeout < 60.
+        # Guard against non-positive or non-finite values for core-direct-call
+        # compatibility (config is validated 1..3600, but be defensive).
+        _initial_wait = turn_timeout if (turn_timeout and turn_timeout > 0 and turn_timeout != float("inf")) else 60.0
+
         # session/prompt is a request that blocks until the agent returns
         # PromptResponse. While waiting, the agent sends session/update
         # notifications which arrive in the _notifications queue.
         # We poll both in a deadline loop.
-        deadline = time.monotonic() + turn_timeout
         text_chunks: list[str] = []
 
         # Send session/prompt in a background thread so we can drain
@@ -449,24 +483,33 @@ class ACPClientSession:
                 r = self._client.request(
                     _METHOD_SESSION_PROMPT,
                     prompt_params,
-                    timeout=turn_timeout,
+                    timeout=_initial_wait,
+                    wait_cb=_wait_cb,
                 )
                 _response["result"] = r
+                # Final response counts as activity.
+                _touch_activity()
             except (ACPClientError, TimeoutError, RuntimeError) as exc:
                 _error.append(exc)
 
         req_thread = threading.Thread(target=_do_request, daemon=True)
         req_thread.start()
 
-        def _process_notification(note: dict) -> None:
+        def _process_notification(note: dict) -> bool:
             """Apply a single session/update notification to result + text_chunks.
+
+            Returns True if the notification was a legitimate ``session/update``
+            (and thus counts as activity for inactivity tracking), False
+            otherwise.  Non-session/update notifications are silently dropped
+            and must NOT renew the idle clock -- otherwise a junk notification
+            would keep the session alive indefinitely.
 
             Factored out so the same logic runs during the live drain loop and
             the post-join tail-drain (notifications that arrived between the
             last loop poll and req_thread completion would otherwise be lost).
             """
             if note.get("method") != _METHOD_SESSION_UPDATE:
-                return
+                return False
             params = note.get("params") or {}
             delta = _extract_text_from_update(params)
             if delta:
@@ -478,13 +521,18 @@ class ACPClientSession:
                         logger.debug("on_delta callback raised", exc_info=True)
             if _is_tool_iteration(params):
                 result.tool_iterations += 1
+            return True
 
         # Drain notifications while waiting for the prompt response.
         # session/prompt blocks for the entire turn; req_thread sends it while
         # this loop concurrently drains session/update chunks.
         # _send_lock on ACPClient ensures the two threads don't interleave
         # writes to the same BufferedWriter (see ACPClient._send).
-        while req_thread.is_alive() and time.monotonic() < deadline:
+        #
+        # No total wall-clock deadline: inactivity is tracked by _wait_cb
+        # inside the request thread.  This loop runs as long as req_thread
+        # is alive and the subprocess hasn't crashed.
+        while req_thread.is_alive():
             if not (self._client and self._client.is_alive()):
                 result.error = self._format_error("ACP agent subprocess exited unexpectedly")
                 result.should_retire = True
@@ -493,6 +541,11 @@ class ACPClientSession:
             # Handle server-initiated requests (fs/*, permission, terminal/*)
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
+                # Touch BEFORE handling: permission approval may block while
+                # waiting for user input, and the request thread's _wait_cb
+                # would otherwise see stale idle time and fire inactivity.
+                # The server request itself proves the agent is active.
+                _touch_activity()
                 self._handle_server_request(sreq)
                 continue
 
@@ -500,7 +553,12 @@ class ACPClientSession:
             note = self._client.take_notification(timeout=notification_poll_timeout)
             if note is None:
                 continue
-            _process_notification(note)
+            # Only legitimate session/update notifications renew the idle
+            # clock.  Junk/unknown notifications are dropped by
+            # _process_notification (returns False) and must NOT touch --
+            # otherwise they would keep the session alive indefinitely.
+            if _process_notification(note):
+                _touch_activity()
 
         req_thread.join(timeout=2.0)
 
@@ -518,15 +576,19 @@ class ACPClientSession:
         if _error:
             exc = _error[0]
             result.error = f"ACP session/prompt failed: {exc}"
-            if isinstance(exc, TimeoutError) or (
+            # RuntimeError = inactivity timeout from _wait_cb -> retire.
+            # TimeoutError or negative-code ACPClientError -> also retire.
+            if isinstance(exc, (TimeoutError, RuntimeError)) or (
                 isinstance(exc, ACPClientError) and exc.code < 0
             ):
                 result.should_retire = True
             return result
 
         if "result" not in _response and not result.should_retire:
-            # Deadline hit without response
-            result.error = f"ACP turn timed out after {turn_timeout}s"
+            # req_thread ended without response and without error -- only
+            # reachable if the subprocess died (caught by the break above)
+            # or an unexpected join timeout.
+            result.error = f"ACP session/prompt ended without response"
             result.should_retire = True
             result.interrupted = True
             return result

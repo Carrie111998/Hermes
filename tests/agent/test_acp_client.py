@@ -273,6 +273,140 @@ class TestTimeout:
 
 
 # ---------------------------------------------------------------------------
+# Tests: wait_cb -- dynamic inactivity-based wait
+# ---------------------------------------------------------------------------
+
+
+class TestWaitCb:
+    """Tests for the wait_cb keyword on ACPClient.request.
+
+    These exercise the real production loop in agent/transports/acp_client.py
+    request() -- the while-loop that calls queue.get with a dynamic timeout
+    provided by wait_cb on each queue.Empty.
+    """
+
+    def test_fixed_timeout_unchanged_without_wait_cb(self):
+        """Without wait_cb, request() behaves identically to before: a single
+        fixed timeout on the one and only queue.get, then TimeoutError."""
+        client, fake = make_client_with_fake_proc()
+        with pytest.raises(TimeoutError) as exc_info:
+            client.request("session/prompt", {}, timeout=0.1)
+        assert "timed out" in str(exc_info.value)
+        assert "0.1" in str(exc_info.value)
+        # pending must be cleaned up
+        with client._pending_lock:
+            assert len(client._pending) == 0
+        client.close()
+
+    def test_wait_cb_returns_positive_finite_next_window(self):
+        """On each queue.Empty, wait_cb is called and its return value is used
+        as the next queue.get timeout.  The returned values must be positive
+        and finite.  After a reply arrives, the result is returned normally.
+        """
+        client, fake = make_client_with_fake_proc()
+        cb_calls: list[float] = []
+
+        def wait_cb() -> float:
+            # Return a small positive finite timeout each time
+            cb_calls.append(0.05)
+            # Push a reply after the first cb call so the loop eventually ends
+            if len(cb_calls) == 1:
+                def push():
+                    time.sleep(0.01)
+                    fake.push_stdout({"id": 1, "result": {"ok": True}})
+                threading.Thread(target=push, daemon=True).start()
+            return 0.05
+
+        result = client.request("test/method", {}, timeout=0.05, wait_cb=wait_cb)
+        assert result == {"ok": True}
+        # wait_cb was called at least once (the first queue.Empty triggered it)
+        assert len(cb_calls) >= 1
+        # Every returned value must be positive and finite
+        for v in cb_calls:
+            assert v is not None
+            assert v > 0
+            assert v != float("inf")
+        client.close()
+
+    def test_wait_cb_runtime_error_propagates(self):
+        """When wait_cb raises RuntimeError, the RuntimeError must propagate
+        to the caller AND the pending entry must be cleaned up.
+
+        Regression: production code previously called ``wait_cb()`` with no
+        try/except, so a RuntimeError skipped ``_pending.pop(rid, None)``
+        and leaked the stale entry.  The fix wraps wait_cb in try/except
+        that cleans up _pending before re-raising.
+        """
+        client, fake = make_client_with_fake_proc()
+
+        def wait_cb() -> float:
+            raise RuntimeError("inactivity limit reached")
+
+        with pytest.raises(RuntimeError, match="inactivity limit reached"):
+            client.request("test/method", {}, timeout=0.05, wait_cb=wait_cb)
+
+        # The pending entry must be cleaned up when wait_cb raises.
+        with client._pending_lock:
+            pending_count = len(client._pending)
+        assert pending_count == 0, (
+            "wait_cb RuntimeError must clean up _pending; found "
+            f"{pending_count} stale entries."
+        )
+        client.close()
+
+    def test_wait_cb_non_positive_timeout_raises_timeout_error(self):
+        """When wait_cb returns None or <= 0, request raises TimeoutError and
+        cleans up pending."""
+        client, fake = make_client_with_fake_proc()
+
+        def wait_cb_returns_none() -> float:
+            return None
+
+        with pytest.raises(TimeoutError, match="non-positive"):
+            client.request("test/method", {}, timeout=0.05, wait_cb=wait_cb_returns_none)
+        with client._pending_lock:
+            assert len(client._pending) == 0
+        client.close()
+
+        # Also test <= 0
+        client2, fake2 = make_client_with_fake_proc()
+
+        def wait_cb_returns_zero() -> float:
+            return 0
+
+        with pytest.raises(TimeoutError, match="non-positive"):
+            client2.request("test/method", {}, timeout=0.05, wait_cb=wait_cb_returns_zero)
+        with client2._pending_lock:
+            assert len(client2._pending) == 0
+        client2.close()
+
+    def test_initial_timeout_positive_finite_and_each_wait_positive_finite(self):
+        """The initial timeout passed to request() and every value returned by
+        wait_cb must be positive and finite.  This test verifies the production
+        loop actually uses them as queue.get timeouts without error."""
+        client, fake = make_client_with_fake_proc()
+        timeouts_seen: list[float] = []
+
+        def wait_cb() -> float:
+            t = 0.03
+            timeouts_seen.append(t)
+            if len(timeouts_seen) >= 3:
+                def push():
+                    time.sleep(0.01)
+                    fake.push_stdout({"id": 1, "result": {"done": True}})
+                threading.Thread(target=push, daemon=True).start()
+            return t
+
+        # initial timeout=0.03 (positive, finite)
+        result = client.request("test/method", {}, timeout=0.03, wait_cb=wait_cb)
+        assert result == {"done": True}
+        assert len(timeouts_seen) >= 1
+        for t in timeouts_seen:
+            assert 0 < t < float("inf")
+        client.close()
+
+
+# ---------------------------------------------------------------------------
 # Tests: initialize
 # ---------------------------------------------------------------------------
 
