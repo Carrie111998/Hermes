@@ -66,6 +66,7 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    adapter._poll_task = None
     return adapter
 
 
@@ -694,6 +695,50 @@ class TestHttpSessionLifecycle:
 
         mock_task.cancel.assert_called_once()
         assert adapter._poll_task is None
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_poll_before_terminating_bridge(self):
+        """Shutdown must not let polling race a terminated bridge."""
+        adapter = _make_adapter()
+        adapter._running = True
+        adapter._http_session = MagicMock(closed=True)
+        adapter._session_lock_identity = None
+        order = []
+
+        async def poll_forever():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                order.append("poll-cancelled")
+                raise
+
+        adapter._poll_task = asyncio.create_task(poll_forever())
+        await asyncio.sleep(0)
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        adapter._bridge_process = mock_proc
+
+        async def fake_sleep(_delay):
+            order.append("post-terminate-sleep")
+
+        def fake_terminate(_proc, *, force=False):
+            order.append(f"terminate:{force}")
+
+        with (
+            patch(
+                "plugins.platforms.whatsapp.adapter._terminate_bridge_process",
+                side_effect=fake_terminate,
+            ),
+            patch(
+                "plugins.platforms.whatsapp.adapter.asyncio.sleep",
+                side_effect=fake_sleep,
+            ),
+        ):
+            await adapter.disconnect()
+
+        assert adapter._poll_task is None
+        assert order[:2] == ["poll-cancelled", "terminate:False"]
 
     @pytest.mark.asyncio
     async def test_disconnect_skips_done_poll_task(self):

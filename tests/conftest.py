@@ -360,6 +360,13 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # gateway.run snapshots HERMES_HOME at import time. Some test modules
+    # import it during collection, before this fixture runs, so update the
+    # already-loaded module without importing the heavyweight gateway here.
+    gateway_run = sys.modules.get("gateway.run")
+    if gateway_run is not None:
+        monkeypatch.setattr(gateway_run, "_hermes_home", fake_hermes_home)
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")

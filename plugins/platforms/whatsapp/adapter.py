@@ -791,6 +791,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
         self._shutting_down = True
+
+        # Stop inbound polling before terminating the local bridge. Killing
+        # the bridge first lets an in-flight /messages poll race shutdown and
+        # report an expected connection refusal as a runtime error.
+        if self._poll_task and not self._poll_task.done():
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._poll_task = None
+
         if self._bridge_process:
             try:
                 try:
@@ -814,15 +826,6 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             (self._session_path / "bridge.pid").unlink(missing_ok=True)
         except OSError:
             pass
-
-        # Cancel the poll task explicitly
-        if self._poll_task and not self._poll_task.done():
-            self._poll_task.cancel()
-            try:
-                await self._poll_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        self._poll_task = None
 
         # Close the persistent HTTP session
         if self._http_session and not self._http_session.closed:

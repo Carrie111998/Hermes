@@ -1,4 +1,4 @@
-name: Upstream Sync PR
+name: Stable Release Sync PR
 # Fork setup required for this workflow to create PRs:
 #   Settings → Actions → General → Workflow permissions:
 #     ✓ "Allow GitHub Actions to create and approve pull requests"
@@ -9,21 +9,22 @@ name: Upstream Sync PR
 
 on:
   schedule:
-    # Every 4 hours, offset from top-of-hour GitHub Actions congestion.
-    - cron: '17 */4 * * *'
+    # Daily is sufficient for the published stable-release channel.
+    - cron: '17 7 * * *'
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
 concurrency:
-  group: upstream-sync-pr
+  group: stable-release-sync-pr
   cancel-in-progress: true
 
 jobs:
   sync:
-    name: Create reviewed upstream sync PR
+    name: Create and auto-land stable release PR
     if: github.repository == 'pai-scaffolde/hermes-agent'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -65,10 +66,10 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token || github.token }}
 
-      - name: Create or update upstream sync PR
+      - name: Create or update stable release PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
-          BRANCH: automation/upstream-sync
+          BRANCH: automation/upstream-release-sync
           UPSTREAM_URL: https://github.com/NousResearch/hermes-agent.git
           TOKEN_SOURCE: ${{ steps.app-auth.outputs.token_source }}
         run: |
@@ -83,77 +84,63 @@ jobs:
 
           git remote add upstream "$UPSTREAM_URL"
           git fetch origin main
-          git fetch upstream main
+          LATEST_TAG="$(gh api repos/NousResearch/hermes-agent/releases/latest --jq '.tag_name')"
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            echo "::error::NousResearch/hermes-agent has no published stable release tag."
+            exit 1
+          fi
+          git fetch upstream "refs/tags/$LATEST_TAG:refs/tags/$LATEST_TAG"
+          LATEST_SHA="$(git rev-list -n 1 "$LATEST_TAG")"
+          echo "Latest stable release: $LATEST_TAG ($LATEST_SHA)"
 
-          if git merge-base --is-ancestor upstream/main origin/main; then
-            echo "Fork main already contains upstream/main; nothing to sync."
+          if git merge-base --is-ancestor "$LATEST_SHA" origin/main; then
+            echo "Fork main already contains stable release $LATEST_TAG; nothing to sync."
             exit 0
           fi
 
           git checkout -B "$BRANCH" origin/main
 
-          # Reviewed upstream-merge model: preserve the current Scaffolde fork
-          # contract and merge Nous upstream into a PR branch. The fork has a large
-          # accumulated patch-stack history, so replaying every historical fork
-          # commit on every sync is no longer a reliable maintenance path.
-          if ! git merge --no-ff --no-edit upstream/main; then
+          # Release-channel model: merge only a published stable tag. Unreleased
+          # upstream/main drift remains advisory until Nous cuts a release.
+          if ! git merge --no-ff --no-edit "$LATEST_SHA"; then
             git merge --abort || true
             {
-              echo "### Upstream sync needs manual merge resolution"
+              echo "### Stable release sync failed"
               echo ""
-              echo "Merging upstream/main into the Scaffolde fork hit conflicts."
+              echo "Merging $LATEST_TAG ($LATEST_SHA) into the Scaffolde fork hit conflicts."
               echo ""
-              echo "Resolve locally on a sync branch, preserving the Scaffolde fork contract, then open/update a reviewed PR:"
+              echo "Resolve locally on a release-sync branch while preserving the Scaffolde fork contract:"
               echo ""
               echo '```bash'
-              echo "git fetch origin upstream"
-              echo "git checkout -B sync/nous-upstream-$(date +%Y%m%d) origin/main"
-              echo "git merge upstream/main"
+              echo "git fetch origin upstream --tags"
+              echo "git checkout -B sync/nous-$LATEST_TAG origin/main"
+              echo "git merge $LATEST_TAG"
               echo "# resolve conflicts, then:"
               echo "git push -u origin HEAD"
               echo "gh pr create --base main --head <branch>"
               echo '```'
-              echo ""
-              echo "The existing $BRANCH branch was left untouched."
             } >> "$GITHUB_STEP_SUMMARY"
-
-            if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
-              echo "::warning::Merging upstream/main into the Scaffolde fork hit conflicts. Scheduled runs report this as manual sync required without failing repeatedly."
-              exit 0
-            fi
-
-            echo "::error::Merging upstream/main into the Scaffolde fork hit conflicts."
-            echo "Resolve locally on a sync branch, preserving the Scaffolde fork contract, then open/update a reviewed PR:"
-            echo "  git fetch origin upstream"
-            echo "  git checkout -B sync/nous-upstream-$(date +%Y%m%d) origin/main"
-            echo "  git merge upstream/main"
-            echo "  # resolve conflicts, then:"
-            echo "  git push -u origin HEAD"
-            echo "Left the existing $BRANCH untouched for manual resolution."
+            echo "::error::Merging stable release $LATEST_TAG into the Scaffolde fork hit conflicts."
             exit 1
           fi
 
           git push --force-with-lease origin "HEAD:$BRANCH"
 
-          cat > /tmp/upstream-sync-pr-body.md <<'EOF'
-          Automated upstream sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
+          cat > /tmp/upstream-sync-pr-body.md <<EOF
+          Automated stable-release sync from NousResearch/hermes-agent into pai-scaffolde/hermes-agent.
 
-          This branch merges `upstream/main` into the current Scaffolde fork main while
+          This branch merges \`$LATEST_TAG\` (\`$LATEST_SHA\`) into the current Scaffolde fork main while
           preserving the fork contract. Review the diff and let CI run here.
 
           Policy:
-          - This PR is review-gated. Do not auto-merge blindly.
+          - Published stable tags are the automatic intake boundary; unreleased upstream main is advisory.
           - Existing CI/checks must pass before landing.
-          - Land with a normal reviewed merge commit. Do not squash; squashing hides
+          - Land with a normal merge commit. Do not squash; squashing hides
             the upstream merge boundary and makes the next sync harder to inspect.
-          - If the workflow used the GITHUB_TOKEN fallback, PR checks may need a
-            manual rerun because workflow-created pushes do not always trigger
-            downstream workflows.
-          - If the merge conflicted, this PR was not updated; resolve locally per the
-            failed job log and open/update a reviewed sync PR.
+          - Auto-merge is enabled only after the required CI gate passes.
 
           Source:
-          - upstream: NousResearch/hermes-agent main
+          - upstream release: NousResearch/hermes-agent $LATEST_TAG ($LATEST_SHA)
           - fork base: pai-scaffolde/hermes-agent main (PAI patch stack)
           EOF
 
@@ -168,13 +155,27 @@ jobs:
           if [ -n "$PR_NUMBER" ]; then
             gh pr edit "$PR_NUMBER" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "chore: sync from NousResearch/hermes-agent upstream" \
+              --title "chore: sync Nous Hermes $LATEST_TAG stable release" \
               --body-file /tmp/upstream-sync-pr-body.md
           else
-            gh pr create \
+            PR_URL="$(gh pr create \
               --repo "$GITHUB_REPOSITORY" \
               --base main \
               --head "$BRANCH" \
-              --title "chore: sync from NousResearch/hermes-agent upstream" \
-              --body-file /tmp/upstream-sync-pr-body.md
+              --title "chore: sync Nous Hermes $LATEST_TAG stable release" \
+              --body-file /tmp/upstream-sync-pr-body.md)"
+            PR_NUMBER="${PR_URL##*/}"
           fi
+
+          # Pushes made by GITHUB_TOKEN do not emit pull_request workflows.
+          # workflow_dispatch is an explicit recursion-safe exception, so run
+          # CI against the exact PR head when App credentials are unavailable.
+          if [ "$TOKEN_SOURCE" = "github-token" ]; then
+            gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          fi
+
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --auto \
+            --merge \
+            --delete-branch
