@@ -53,7 +53,7 @@ compression:
 tts:
   provider: "elevenlabs"
   elevenlabs:
-    voice_id: "pNInz6obpgDQGcFmaJgB"   # Adam
+    voice_id: "gP52hjM48hyNoVCbizxO"   # voix perso Gilles (bibliothèque ElevenLabs)
     model_id: "eleven_multilingual_v2"
 
 stt:
