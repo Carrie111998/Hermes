@@ -439,15 +439,26 @@ class CanonicalMemstore:
         True if there was any daily activity to report.
         """
         files = self._daily_files(ascending=True)  # oldest → newest
-        corpus, day_count = self.load_daily_corpus()
         doc = MarkdownDoc(self.path_for("HEARTBEAT.md"))
 
         last_day = files[-1].stem if files else "—"
+        # Count unique facts directly — no SeedFact construction or entity
+        # extraction. refresh_heartbeat runs on every seed/roll-up, so this
+        # stays cheap as the daily history grows.
+        unique_facts: set[str] = set()
+        for path in files:
+            day_doc = MarkdownDoc(path)
+            for _, section in _DAILY_SECTIONS:
+                for bullet in day_doc.bullets_in(section):
+                    norm = _normalize(bullet)
+                    if norm:
+                        unique_facts.add(norm)
+
         doc.set_bullets("Pulse", [
             f"Updated: {now or now_iso()}",
             f"Last activity: {last_day}",
-            f"Daily digests on record: {day_count}",
-            f"Facts across the daily tree: {len(corpus)}",
+            f"Daily digests on record: {len(files)}",
+            f"Facts across the daily tree: {len(unique_facts)}",
         ])
 
         # Recent focus: the most-recent day's decisions, notes, and prefs.

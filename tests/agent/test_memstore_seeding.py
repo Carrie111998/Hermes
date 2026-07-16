@@ -179,6 +179,13 @@ class TestPersonaParsing:
         facts = parse_persona_doc(doc)
         assert facts[0].category == CATEGORY_TOOL
 
+    def test_setup_heading_routes_to_bootstrap(self):
+        # "## Setup" must reach BOOTSTRAP.md (whose section is named "Setup"),
+        # not TOOLS.md.
+        doc = "## Setup\n- Run the install script before anything else.\n"
+        facts = parse_persona_doc(doc)
+        assert facts[0].category == CATEGORY_BOOTSTRAP
+
     def test_short_lines_skipped(self):
         facts = parse_persona_doc("# H\n- ok\n- a\n")
         assert facts == []

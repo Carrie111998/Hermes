@@ -291,13 +291,15 @@ _USER_HEADING_HINTS = (
     "who i am", "bio", "communication", "my style",
 )
 _PROJECT_HEADING_HINTS = ("project", "codebase", "repo", "stack", "architecture", "build", "operating")
-_TOOL_HEADING_HINTS = ("tool", "environment", "setup", "workflow", "command")
-# Checked before tools so "Getting started" / "Onboarding" route to bootstrap
-# rather than being caught by the tool "setup"/"environment" hints.
+_TOOL_HEADING_HINTS = ("tool", "environment", "workflow", "command")
+# Checked before tools so "Setup" / "Getting started" / "Onboarding" route to
+# bootstrap rather than being caught by the tool "environment" hint. "setup"
+# lives here (not in tool hints) so a "## Setup" section reaches BOOTSTRAP.md,
+# whose section is literally named "Setup".
 _BOOTSTRAP_HEADING_HINTS = (
-    "bootstrap", "first run", "first-run", "getting started", "getting-started",
-    "onboarding", "installation", "how to start", "prerequisite", "quickstart",
-    "quick start",
+    "bootstrap", "setup", "first run", "first-run", "getting started",
+    "getting-started", "onboarding", "installation", "how to start",
+    "prerequisite", "quickstart", "quick start",
 )
 
 
