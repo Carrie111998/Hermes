@@ -3302,6 +3302,49 @@ async def test_backfill_paginates_past_ineligible_sources(
     assert preview.excluded == 0
 
 
+@pytest.mark.asyncio
+async def test_backfill_preview_never_exceeds_its_queue_limit(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="newest-acknowledgement",
+        content="ok",
+        last_active=now,
+        cwd=str(tmp_path),
+    ))
+    valid = _exact_cwd_repo(tmp_path / "bounded-preview")
+    for offset in range(11):
+        store.upsert_projection(_sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id=f"bounded-{offset}",
+            content=f"Queue bounded meaningful request {offset}",
+            last_active=now - offset - 1,
+            cwd=str(valid),
+        ))
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=10,
+        apply=False,
+    )
+
+    assert preview.examined == 11
+    assert preview.queued == 10
+    assert preview.by_provider == {"claude": 10, "hermes": 0}
+
+
 class _HeartbeatClaimStore:
     def __init__(self, *, fail_claim: bool = False) -> None:
         self.fail_claim = fail_claim

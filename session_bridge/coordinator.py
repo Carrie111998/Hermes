@@ -1060,23 +1060,26 @@ class SessionBridgeCoordinator:
                     if not apply:
                         queued += 1
                         by_provider[projection.provider.value] += 1
-                        continue
-                    assert callable(enqueue_method)
-                    if worktree_snapshot is not None:
-                        result = await asyncio.to_thread(
-                            enqueue_method,
-                            candidate,
-                            worktree_snapshot=worktree_snapshot,
-                        )
                     else:
-                        result = await asyncio.to_thread(enqueue_method, candidate)
-                    if not isinstance(result, Mapping) or type(
-                        result.get("created")
-                    ) is not bool:
-                        raise ValueError("sidebar enqueue result is malformed")
-                    if result["created"]:
-                        queued += 1
-                        by_provider[projection.provider.value] += 1
+                        assert callable(enqueue_method)
+                        if worktree_snapshot is not None:
+                            result = await asyncio.to_thread(
+                                enqueue_method,
+                                candidate,
+                                worktree_snapshot=worktree_snapshot,
+                            )
+                        else:
+                            result = await asyncio.to_thread(
+                                enqueue_method,
+                                candidate,
+                            )
+                        if not isinstance(result, Mapping) or type(
+                            result.get("created")
+                        ) is not bool:
+                            raise ValueError("sidebar enqueue result is malformed")
+                        if result["created"]:
+                            queued += 1
+                            by_provider[projection.provider.value] += 1
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     raise
                 except Exception:
