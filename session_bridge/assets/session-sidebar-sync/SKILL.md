@@ -13,7 +13,8 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
 
 | Situation | Required action |
 |---|---|
-| No leased jobs | End with no user-facing message. |
+| No actionable pending or retry jobs | End with no user-facing message. |
+| Bridge or native project preflight is unhealthy | End without leasing; no job attempt is consumed. |
 | Exact source cwd is a saved project | Use that project. |
 | Otherwise, exact git root is a saved project | Use that project. |
 | Neither path is a saved project | Use the saved `Session Inbox` project rooted at the canonical local `.hermes` path. |
@@ -23,8 +24,8 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
 
 ## Procedure
 
-1. Call `session_sidebar_pending(limit=1)` exactly once. Never create a task without a lease from this batch; this batch contains at most one. If `jobs` is empty, end immediately with no user-facing message. Do not increase the limit: native create, indexing, and rename latency can outlive a multi-job lease batch.
-2. Call the native tool `list_projects({})` exactly once. Read every returned saved project's canonical local path, and index that canonical path to its returned `projectId` as (`projectId`, original returned `hostId`, normalized host). Normalize a missing or null `hostId` and the explicit string `local` to the current-local sentinel `local`. Reject every other explicit host value from this local-sidebar run; never infer or coerce an arbitrary host string. Do not call the tool again for another job. If the call or canonical lookup definitively fails, fail/release every unfinished lease with `project_lookup_failed`, then end.
+1. Call `session_status` exactly once before any native project call or lease. Require `health.running` and the watcher to be running, require every reported provider `degraded_reason` to be null, and read `sidebar.counts` without broadening the request. If status is unavailable or malformed, a health requirement fails, or both `sidebar_pending` and `sidebar_retry` are zero, end immediately with no user-facing message. Do not call `session_sidebar_pending`, and no job attempt is consumed.
+2. Call the native tool `list_projects({})` exactly once before leasing. Read every returned saved project's canonical local path, and index that canonical path to its returned `projectId` as (`projectId`, original returned `hostId`, normalized host). Normalize a missing or null `hostId` and the explicit string `local` to the current-local sentinel `local`. Reject every other explicit host value from this local-sidebar run; never infer or coerce an arbitrary host string. Do not call the tool again for another job. If the call or project-map construction fails, do not call `session_sidebar_pending`; end without a lease, do not call `session_sidebar_fail`, and no job attempt is consumed. Only after the native project map is valid, call `session_sidebar_pending(limit=1)` exactly once. Never create a task without a lease from this batch; this batch contains at most one. If `jobs` is empty, end immediately with no user-facing message. Do not increase the limit: native create, indexing, and rename latency can outlive a multi-job lease batch.
 3. For each leased job, choose its sidebar project in this exact order:
    1. the saved project whose canonical path equals the job's exact cwd;
    2. the saved project whose canonical path equals the job's exact git root;
@@ -71,7 +72,7 @@ Classify failures without copying exception text. Apply the first matching rule:
 - Unavailable native tool -> `codex_tool_unavailable`.
 - Desktop explicitly offline -> `desktop_offline`.
 - Bridge call temporarily unavailable -> `bridge_temporarily_unavailable`; an explicit SQLite busy result -> `sqlite_busy`.
-- Project list or path-to-project mapping failure -> `project_lookup_failed`.
+- Project listing or project-map construction fails before leasing -> end without calling `session_sidebar_pending`; no job attempt is consumed. A source-to-project mapping failure discovered only after a lease -> `project_lookup_failed`.
 - Definite or ambiguous create failure -> `native_task_not_indexed`. Never retry create after any ambiguous create outcome; try fail/release once and continue with the next leased job.
 - Failed or ambiguous reconciliation -> `native_task_not_indexed`. Multiple authenticated matches or a recovered-ID mismatch remain `marker_conflict`.
 - Failed rename -> `rename_failed`; never commit or create a replacement.
@@ -93,4 +94,4 @@ The registration task waits. On its first substantive continuation, call `sessio
 
 ## Verification
 
-Before ending, verify that pending was called once, projects were listed at most once, every created task used `registration_prompt` verbatim, every newly created task became readable and idle before rename, every known native task was renamed as required, every completed lease was committed, and every noncommitted lease had exactly one fail/release attempt with a fixed code, whether successful, failed, or ambiguous.
+Before ending, verify that status was called once, projects were listed at most once and only before pending, pending was called at most once and only after both preflights passed, every created task used `registration_prompt` verbatim, every newly created task became readable and idle before rename, every known native task was renamed as required, every completed lease was committed, and every noncommitted lease had exactly one fail/release attempt with a fixed code, whether successful, failed, or ambiguous.

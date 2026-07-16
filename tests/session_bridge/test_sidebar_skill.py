@@ -164,6 +164,17 @@ def test_sidebar_skill_encodes_the_single_batch_native_delivery_protocol() -> No
     assert "every unfinished lease" in skill
 
 
+def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert skill.index("session_status") < skill.index("list_projects({})")
+    assert skill.index("list_projects({})") < skill.index(
+        "session_sidebar_pending(limit=1)"
+    )
+    assert "do not call `session_sidebar_pending`" in skill
+    assert "no job attempt is consumed" in skill
+
+
 def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     folded = skill.casefold()
@@ -385,6 +396,7 @@ def test_sidebar_skill_names_only_the_allowed_session_tools() -> None:
     named = set(re.findall(r"\bsession_[a-z_]+\b", skill))
 
     assert named == {
+        "session_status",
         "session_sidebar_pending",
         "session_sidebar_commit",
         "session_sidebar_fail",
