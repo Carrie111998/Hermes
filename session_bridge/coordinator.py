@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import inspect
 import math
@@ -48,7 +48,12 @@ from .sidebar import (
     sidebar_bridge_id,
     sidebar_title,
 )
-from .store import SessionBridgeStore, SidebarSource, SidebarSourcePage
+from .store import (
+    SIDEBAR_EXCLUSION_REASONS,
+    SessionBridgeStore,
+    SidebarSource,
+    SidebarSourcePage,
+)
 from .worktree import (
     WorktreeSnapshot,
     WorktreeSnapshotError,
@@ -89,6 +94,8 @@ class SidebarRegistrationSummary:
     queued: int
     by_provider: Mapping[str, int]
     failed: int
+    excluded: int = 0
+    excluded_by_reason: Mapping[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -288,6 +295,10 @@ class SessionBridgeCoordinator:
             Provider.CLAUDE.value: 0,
             Provider.HERMES.value: 0,
             "failed": 0,
+            "excluded": 0,
+            "excluded_by_reason": {
+                reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
+            },
         }
 
     @asynccontextmanager
@@ -437,6 +448,10 @@ class SessionBridgeCoordinator:
                 queued=0,
                 by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
                 failed=0,
+                excluded=0,
+                excluded_by_reason={
+                    reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
+                },
             )
             self._set_sidebar_registration_counts(summary)
             return summary
@@ -471,6 +486,10 @@ class SessionBridgeCoordinator:
                 queued=0,
                 by_provider={Provider.CLAUDE.value: 0, Provider.HERMES.value: 0},
                 failed=0,
+                excluded=0,
+                excluded_by_reason={
+                    reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
+                },
             )
         async with self._sidebar_registration_lock:
             return await self._register_sidebar_jobs_locked(
@@ -846,6 +865,10 @@ class SessionBridgeCoordinator:
         by_provider = {Provider.CLAUDE.value: 0, Provider.HERMES.value: 0}
         queued = 0
         failed = 0
+        excluded = 0
+        excluded_by_reason = {
+            reason: 0 for reason in SIDEBAR_EXCLUSION_REASONS
+        }
         examined = 0
         seen: set[str] = set()
         durable_cursor = (
@@ -923,28 +946,6 @@ class SessionBridgeCoordinator:
                     )
                     if canonical_source != source.source_session_id:
                         raise ValueError("sidebar source identity is inconsistent")
-                    first_request = _first_sidebar_request(projection)
-                    if (
-                        not isinstance(projection.cwd, str)
-                        or not projection.cwd.strip()
-                    ):
-                        raise ValueError("sidebar source cwd is unavailable")
-                    candidate = SidebarCandidate(
-                        source_session_id=canonical_source,
-                        provider=projection.provider,
-                        bridge_id=sidebar_bridge_id(canonical_source),
-                        title=sidebar_title(
-                            projection.provider,
-                            projection.title,
-                            first_request,
-                        ),
-                        cwd=projection.cwd,
-                        git_root=source.git_root,
-                        git_branch=projection.git_branch,
-                        git_head=source.git_head,
-                        worktree_id=source.worktree_id,
-                        eligible_at=projection.last_active,
-                    )
                     getter = getattr(self._store, "get_sidebar_job_for_source", None)
                     existing = (
                         await asyncio.to_thread(getter, canonical_source)
@@ -956,40 +957,98 @@ class SessionBridgeCoordinator:
                     enqueue_method = getattr(self._store, "enqueue_sidebar_job", None)
                     if apply and not callable(enqueue_method):
                         raise RuntimeError("sidebar enqueue is unavailable")
+                    snapshot_aware = callable(enqueue_method) and (
+                        "worktree_snapshot"
+                        in inspect.signature(enqueue_method).parameters
+                    )
+                    try:
+                        first_request = _first_sidebar_request(projection)
+                        if (
+                            not isinstance(projection.cwd, str)
+                            or not projection.cwd.strip()
+                        ):
+                            raise WorktreeSnapshotError("source_cwd_missing")
+                        candidate = SidebarCandidate(
+                            source_session_id=canonical_source,
+                            provider=projection.provider,
+                            bridge_id=sidebar_bridge_id(canonical_source),
+                            title=sidebar_title(
+                                projection.provider,
+                                projection.title,
+                                first_request,
+                            ),
+                            cwd=projection.cwd,
+                            git_root=source.git_root,
+                            git_branch=projection.git_branch,
+                            git_head=source.git_head,
+                            worktree_id=source.worktree_id,
+                            eligible_at=projection.last_active,
+                        )
+                        worktree_snapshot: WorktreeSnapshot | None = None
+                        if snapshot_aware:
+                            indexed_git_metadata = any(
+                                value is not None
+                                for value in (
+                                    candidate.git_root,
+                                    candidate.git_branch,
+                                    candidate.git_head,
+                                )
+                            )
+                            worktree_snapshot = await asyncio.to_thread(
+                                capture_worktree_snapshot,
+                                candidate.cwd,
+                            )
+                            if (
+                                indexed_git_metadata
+                                and worktree_snapshot.git_root is None
+                            ):
+                                raise WorktreeSnapshotError(
+                                    "source_identity_mismatch"
+                                )
+                            candidate = replace(
+                                candidate,
+                                cwd=worktree_snapshot.cwd,
+                                git_root=worktree_snapshot.git_root,
+                                git_branch=worktree_snapshot.branch,
+                                git_head=worktree_snapshot.head,
+                                worktree_id=worktree_snapshot.worktree_id,
+                            )
+                    except WorktreeSnapshotError as exc:
+                        if exc.code != "source_cwd_missing":
+                            raise
+                        if apply:
+                            recorder = getattr(
+                                self._store,
+                                "record_sidebar_exclusion",
+                                None,
+                            )
+                            if not callable(recorder):
+                                raise RuntimeError(
+                                    "sidebar exclusion persistence is unavailable"
+                                )
+                            persisted = await asyncio.to_thread(
+                                recorder,
+                                source_session_id=canonical_source,
+                                provider=projection.provider,
+                                reason_code=exc.code,
+                                now=registration_time,
+                            )
+                            if (
+                                not isinstance(persisted, Mapping)
+                                or type(persisted.get("created")) is not bool
+                            ):
+                                raise ValueError(
+                                    "sidebar exclusion result is malformed"
+                                )
+                        excluded += 1
+                        excluded_by_reason[exc.code] += 1
+                        continue
                     if not apply:
                         queued += 1
                         by_provider[projection.provider.value] += 1
                         continue
                     assert callable(enqueue_method)
-                    parameters = inspect.signature(enqueue_method).parameters
-                    if "worktree_snapshot" in parameters:
-                        indexed_git_metadata = any(
-                            value is not None
-                            for value in (
-                                candidate.git_root,
-                                candidate.git_branch,
-                                candidate.git_head,
-                            )
-                        )
-                        worktree_snapshot = await asyncio.to_thread(
-                            capture_worktree_snapshot,
-                            candidate.cwd,
-                        )
-                        if (
-                            indexed_git_metadata
-                            and worktree_snapshot.git_root is None
-                        ):
-                            raise WorktreeSnapshotError(
-                                "source_identity_mismatch"
-                            )
-                        candidate = replace(
-                            candidate,
-                            cwd=worktree_snapshot.cwd,
-                            git_root=worktree_snapshot.git_root,
-                            git_branch=worktree_snapshot.branch,
-                            git_head=worktree_snapshot.head,
-                            worktree_id=worktree_snapshot.worktree_id,
-                        )
+                    if worktree_snapshot is not None:
                         result = await asyncio.to_thread(
                             enqueue_method,
                             candidate,
@@ -1042,6 +1101,8 @@ class SessionBridgeCoordinator:
             queued=queued,
             by_provider=by_provider,
             failed=failed,
+            excluded=excluded,
+            excluded_by_reason=excluded_by_reason,
         )
         if record_summary:
             self._set_sidebar_registration_counts(summary)
@@ -1869,6 +1930,11 @@ class SessionBridgeCoordinator:
                 summary.by_provider.get(Provider.HERMES.value, 0)
             ),
             "failed": summary.failed,
+            "excluded": summary.excluded,
+            "excluded_by_reason": {
+                reason: int(summary.excluded_by_reason.get(reason, 0))
+                for reason in SIDEBAR_EXCLUSION_REASONS
+            },
         }
 
     async def _register_sidebar_after_successful_scan(self) -> None:

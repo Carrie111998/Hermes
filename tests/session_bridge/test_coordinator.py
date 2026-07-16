@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import stat
 import subprocess
 from threading import Barrier, Event, Lock, get_ident
 import time
@@ -54,7 +56,7 @@ from session_bridge.sidebar import (
     sidebar_bridge_id,
 )
 from session_bridge.store import SessionBridgeStore, SidebarSource, SidebarSourcePage
-from session_bridge.worktree import capture_worktree_snapshot
+from session_bridge.worktree import WorktreeSnapshotError, capture_worktree_snapshot
 
 
 _CLAUDE_PENDING_KEY = "session-bridge:scan:claude:pending"
@@ -1229,6 +1231,14 @@ def _exact_cwd_repo(path: Path) -> Path:
         [*git, "commit", "-m", "initial"], check=True, capture_output=True
     )
     return path
+
+
+def _remove_tree(path: Path) -> None:
+    def _make_writable(function, value, _error) -> None:
+        os.chmod(value, stat.S_IWRITE)
+        function(value)
+
+    shutil.rmtree(path, onexc=_make_writable)
 
 
 def _directory_alias(alias: Path, target: Path) -> str:
@@ -2977,6 +2987,8 @@ async def test_sidebar_registration_enqueues_only_native_meaningful_sources_once
         "claude": 0,
         "hermes": 0,
         "failed": 0,
+        "excluded": 0,
+        "excluded_by_reason": {"source_cwd_missing": 0},
     }
     serialized = json.dumps(health, sort_keys=True)
     assert "meaningful-claude" not in serialized
@@ -3022,6 +3034,8 @@ async def test_sidebar_backfill_preview_is_side_effect_free_and_apply_is_bounded
         "claude": 0,
         "hermes": 0,
         "failed": 0,
+        "excluded": 0,
+        "excluded_by_reason": {"source_cwd_missing": 0},
     }
 
     applied = await coordinator.backfill_sidebar_jobs_once(
@@ -3035,6 +3049,213 @@ async def test_sidebar_backfill_preview_is_side_effect_free_and_apply_is_bounded
     assert store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 2
     assert store.get_state("session-bridge:sidebar:registration-cursor") is None
     assert config.sidebar.continuous is False
+
+
+@pytest.mark.asyncio
+async def test_sidebar_backfill_preview_matches_apply_exclusions(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    valid = _exact_cwd_repo(tmp_path / "valid")
+    deleted = _exact_cwd_repo(tmp_path / "deleted")
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="valid-preview",
+        content="Keep this exact worktree",
+        last_active=now,
+        cwd=str(valid),
+    ))
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="deleted-preview",
+        content="This historical worktree is gone",
+        last_active=now - 1,
+        cwd=str(deleted),
+    ))
+    _remove_tree(deleted)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=10,
+        apply=False,
+    )
+
+    assert preview.queued == 1
+    assert preview.failed == 0
+    assert preview.excluded == 1
+    assert preview.excluded_by_reason == {"source_cwd_missing": 1}
+    assert store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 0
+    assert store.sidebar_exclusion_counts()["total"] == 0
+
+    applied = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=10,
+        apply=True,
+    )
+
+    assert asdict(applied) == asdict(preview)
+    assert store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 1
+    assert store.sidebar_exclusion_counts() == {
+        "total": 1,
+        "by_reason": {"source_cwd_missing": 1},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    ["permission_preflight_failed", "source_identity_mismatch"],
+)
+async def test_sidebar_backfill_nonmissing_preflight_error_is_not_excluded(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    now = 3_000_000.0
+    source = _exact_cwd_repo(tmp_path / "source")
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id=f"preflight-{error_code}",
+        content="Preserve unknown preflight failures",
+        last_active=now,
+        cwd=str(source),
+    ))
+
+    def _raise_preflight(_cwd: str) -> None:
+        raise WorktreeSnapshotError(error_code)
+
+    monkeypatch.setattr(
+        "session_bridge.coordinator.capture_worktree_snapshot",
+        _raise_preflight,
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=10,
+        apply=False,
+    )
+
+    assert preview.queued == 0
+    assert preview.failed == 1
+    assert preview.excluded == 0
+    assert preview.excluded_by_reason == {"source_cwd_missing": 0}
+    assert store.sidebar_exclusion_counts()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_sidebar_backfill_existing_job_wins_after_cwd_disappears(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    source = _exact_cwd_repo(tmp_path / "source")
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="existing-job",
+        content="Keep the existing delivery job",
+        last_active=now,
+        cwd=str(source),
+    ))
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+    applied = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=1,
+        apply=True,
+    )
+    assert applied.queued == 1
+    _remove_tree(source)
+
+    replay = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=1,
+        apply=False,
+    )
+
+    assert replay.queued == 0
+    assert replay.failed == 0
+    assert replay.excluded == 0
+    assert store.sidebar_exclusion_counts()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_persisted_sidebar_exclusions_do_not_starve_older_valid_source(
+    sidebar_db: SessionDB,
+    tmp_path: Path,
+) -> None:
+    now = 3_000_000.0
+    store = SessionBridgeStore(sidebar_db, clock=lambda: now)
+    for offset in range(41):
+        native_id = f"excluded-{offset}"
+        store.upsert_projection(_sidebar_projection(
+            provider=Provider.CLAUDE,
+            native_id=native_id,
+            content="Historical deleted worktree",
+            last_active=now - offset,
+            cwd=str(tmp_path / native_id),
+        ))
+        store.record_sidebar_exclusion(
+            source_session_id=f"claude:{native_id}",
+            provider=Provider.CLAUDE,
+            reason_code="source_cwd_missing",
+            now=now,
+        )
+    valid = _exact_cwd_repo(tmp_path / "older-valid")
+    store.upsert_projection(_sidebar_projection(
+        provider=Provider.CLAUDE,
+        native_id="older-valid",
+        content="Reach the valid source after exclusions",
+        last_active=now - 100,
+        cwd=str(valid),
+    ))
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=30,
+        limit=1,
+        apply=False,
+    )
+
+    assert preview.examined == 1
+    assert preview.queued == 1
+    assert preview.failed == 0
+    assert preview.excluded == 0
 
 
 class _HeartbeatClaimStore:
@@ -3127,7 +3348,9 @@ async def test_sidebar_registration_isolates_malformed_claude_from_hermes(
 
     assert summary.queued == 1
     assert summary.by_provider == {"claude": 0, "hermes": 1}
-    assert summary.failed == 1
+    assert summary.failed == 0
+    assert summary.excluded == 1
+    assert summary.excluded_by_reason == {"source_cwd_missing": 1}
     assert store.get_sidebar_job_for_source("healthy-hermes") is not None
     assert store.get_sidebar_job_for_source("claude:bad-cwd") is None
 
