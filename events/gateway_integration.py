@@ -743,8 +743,9 @@ def _subscriber_poll_loop() -> None:
                 last_health_check = now
 
             # Resource-pressure sampling every 60 seconds — commit charge,
-            # pagefile allocation, and C: free. Emits RESOURCE_PRESSURE on the
-            # rising edge of any trigger (2026-06-11 pagefile-burst remediation).
+            # physical RAM, pagefile allocation, and C: free. Emits
+            # RESOURCE_PRESSURE on the rising edge of any trigger (2026-06-11
+            # pagefile-burst + 2026-07-16 paging-storm remediation).
             if _resource_monitor and now - last_resource_check >= 60:
                 try:
                     _resource_monitor.check()
