@@ -1,11 +1,18 @@
-import { $queuedPromptsBySession, QUEUE_STORAGE_KEY, QUEUE_TOMBSTONES_STORAGE_KEY } from './composer-queue'
+import {
+  $queuedPromptsBySession,
+  clearQueuedPrompts,
+  enqueueQueuedPrompt,
+  QUEUE_STORAGE_KEY,
+  QUEUE_TOMBSTONES_STORAGE_KEY
+} from './composer-queue'
 import type { QueuedPromptEntry } from './composer-queue'
 
 /**
  * Shared helpers for the composer-queue suites (store + hook). The fake lock
  * manager encodes real Web Locks semantics — exclusivity, FIFO waiting,
- * `ifAvailable` null grants, abort-signal rejection, release-on-settle — so
- * both suites model cross-window contention against the SAME behavior.
+ * `ifAvailable` null grants, abort-signal rejection, release-on-settle, and a
+ * `query()` snapshot of held locks — so both suites model cross-window
+ * contention against the SAME behavior.
  */
 
 interface FakeLockOptions {
@@ -15,7 +22,7 @@ interface FakeLockOptions {
 
 type FakeLockCallback = (lock: null | { name: string }) => Promise<unknown> | unknown
 
-export function installFakeLocks() {
+export function installFakeLocks({ failWaits = false }: { failWaits?: boolean } = {}) {
   // name → FIFO of waiters. A key existing (even with an empty array) means
   // the lock is currently held.
   const queues = new Map<string, Array<() => void>>()
@@ -35,6 +42,14 @@ export function installFakeLocks() {
     if (queues.has(name)) {
       if (options.ifAvailable) {
         return callback(null)
+      }
+
+      // failWaits simulates a wait that outlives its AbortSignal budget
+      // without spending real wall-clock time on it. Only signal-carrying
+      // requests can time out — unbounded waits (no signal) keep waiting,
+      // exactly like the real API.
+      if (failWaits && options.signal) {
+        throw new DOMException('Fake lock wait timed out', 'TimeoutError')
       }
 
       await new Promise<void>((resolve, reject) => {
@@ -77,15 +92,28 @@ export function installFakeLocks() {
     }
   }
 
-  Object.defineProperty(window.navigator, 'locks', { configurable: true, value: { request } })
+  const query = async () => ({
+    held: [...queues.keys()].map(name => ({ name })),
+    pending: [] as { name: string }[]
+  })
+
+  Object.defineProperty(window.navigator, 'locks', { configurable: true, value: { query, request } })
 
   return () => {
     delete (window.navigator as { locks?: unknown }).locks
   }
 }
 
-/** Reset every storage surface the queue store uses, plus the atom. */
+/**
+ * Reset every storage surface the queue store uses, plus the atom — and heal
+ * the store's module state through its public API: one successful save clears
+ * the persist-failure flag and one successful tombstone write flushes the
+ * in-memory tombstone overlay, both of which would otherwise leak across
+ * tests (they are module-level, not storage-level).
+ */
 export function resetQueueStorage() {
+  enqueueQueuedPrompt('__queue-test-reset__', { attachments: [], text: 'reset' })
+  clearQueuedPrompts('__queue-test-reset__')
   window.localStorage.removeItem(QUEUE_STORAGE_KEY)
   window.localStorage.removeItem(QUEUE_TOMBSTONES_STORAGE_KEY)
   $queuedPromptsBySession.set({})

@@ -1688,7 +1688,7 @@ export const zh: Translations = {
     queueStuckTitle: '排队消息未发送',
     queueStuckBody: '排队的对话多次发送失败。它仍在队列中，请重试发送。',
     queueBusyElsewhereTitle: '排队消息尚未发送',
-    queueBusyElsewhereBody: '另一个窗口正在从此会话的队列中发送消息。您的消息仍在队列中，请稍后重试。',
+    queueBusyElsewhereBody: '队列正在发送另一条消息。您的消息仍在队列中，请稍后重试。',
     previewUnavailable: '预览不可用',
     previewLabel: label => `预览 ${label}`,
     couldNotPreview: label => `无法预览 ${label}`,

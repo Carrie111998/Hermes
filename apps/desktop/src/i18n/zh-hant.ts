@@ -1565,7 +1565,7 @@ export const zhHant = defineLocale({
     queueStuckTitle: '佇列訊息未送出',
     queueStuckBody: '佇列中的對話多次傳送失敗。它仍在佇列中，請重試傳送。',
     queueBusyElsewhereTitle: '佇列訊息尚未送出',
-    queueBusyElsewhereBody: '另一個視窗正在從此工作階段的佇列傳送訊息。您的訊息仍在佇列中，請稍後再試。',
+    queueBusyElsewhereBody: '佇列正在傳送另一則訊息。您的訊息仍在佇列中，請稍後再試。',
     previewUnavailable: '預覽不可用',
     previewLabel: label => `預覽 ${label}`,
     couldNotPreview: label => `無法預覽 ${label}`,

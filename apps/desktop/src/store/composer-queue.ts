@@ -33,6 +33,39 @@ let cachedQueueRaw: null | string = null
 let cachedQueueState: null | QueueState = null
 
 // null = storage unreadable (disabled/corrupt access), distinct from empty.
+// Storage content is attacker-adjacent input (another app version, manual
+// edits, corruption): sanitize per session and per entry, or a non-array
+// session value would make the very first filterState throw during module
+// evaluation and brick every window.
+const sanitizeState = (parsed: unknown): QueueState => {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {}
+  }
+
+  const state: QueueState = {}
+
+  for (const [sid, queue] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!Array.isArray(queue)) {
+      continue
+    }
+
+    const entries = queue.filter(
+      (e): e is QueuedPromptEntry =>
+        !!e &&
+        typeof e === 'object' &&
+        typeof (e as { id?: unknown }).id === 'string' &&
+        typeof (e as { text?: unknown }).text === 'string' &&
+        Array.isArray((e as { attachments?: unknown }).attachments)
+    )
+
+    if (entries.length > 0) {
+      state[sid] = entries
+    }
+  }
+
+  return state
+}
+
 const readStorage = (): null | QueueState => {
   if (typeof window === 'undefined') {
     return null
@@ -49,10 +82,7 @@ const readStorage = (): null | QueueState => {
       return cachedQueueState
     }
 
-    const parsed = JSON.parse(raw) as unknown
-
-    const state =
-      parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as QueueState) : {}
+    const state = sanitizeState(JSON.parse(raw) as unknown)
 
     cachedQueueRaw = raw
     cachedQueueState = state
@@ -99,49 +129,76 @@ const save = (state: QueueState) => {
 // mutators cannot take async Web Locks, so instead every removal records the
 // entry id here FIRST, and every queue read/write filters tombstoned ids — a
 // resurrected entry can reappear in the raw map, but never in a drainable or
-// visible state, and the next write purges it. The sidecar lives under its own
+// visible state; the storage listener writes the purged map back so the ghost
+// leaves storage within one event round trip. The sidecar lives under its own
 // key so queue-map writes can never clobber it wholesale; concurrent sidecar
 // writers can at worst lose one id to each other (falling back to today's
-// behavior, never worse). TTL + cap bound its size: a tombstone only needs to
-// outlive the seconds-wide stale-save window it defends against.
+// behavior, never worse). The cap bounds its size; the TTL exists only to shed
+// abandoned ids and is deliberately long — a resurrected ghost must never
+// outlive the tombstone that hides it, and ghosts are purged within one
+// storage event or the next write, both far inside the TTL.
 // ---------------------------------------------------------------------------
 
 type RemovalTombstones = Record<string, number>
 
-const TOMBSTONE_TTL_MS = 5 * 60_000
+const TOMBSTONE_TTL_MS = 24 * 60 * 60_000
 const TOMBSTONE_CAP = 64
 
 let cachedTombstonesRaw: null | string = null
 let cachedTombstones: null | RemovalTombstones = null
+
+// Removals recorded while the sidecar was unwritable (quota). Merged into
+// every read so THIS window keeps filtering its own removals even when it
+// cannot tell the other windows about them; bounded by the same prune+cap.
+let unpersistedTombstones: RemovalTombstones = {}
+
+const sanitizeTombstones = (parsed: unknown): RemovalTombstones => {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return {}
+  }
+
+  const tombstones: RemovalTombstones = {}
+
+  for (const [id, at] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof at === 'number' && Number.isFinite(at)) {
+      tombstones[id] = at
+    }
+  }
+
+  return tombstones
+}
 
 const readTombstones = (): RemovalTombstones => {
   if (typeof window === 'undefined') {
     return {}
   }
 
+  const overlay = unpersistedTombstones
+
   try {
     const raw = window.localStorage.getItem(QUEUE_TOMBSTONES_STORAGE_KEY)
 
     if (raw === null) {
-      return {}
+      return overlay
     }
 
-    if (cachedTombstonesRaw === raw && cachedTombstones) {
-      return cachedTombstones
+    if (cachedTombstonesRaw !== raw || !cachedTombstones) {
+      cachedTombstonesRaw = raw
+      cachedTombstones = sanitizeTombstones(JSON.parse(raw) as unknown)
     }
 
-    const parsed = JSON.parse(raw) as unknown
-
-    const tombstones =
-      parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as RemovalTombstones) : {}
-
-    cachedTombstonesRaw = raw
-    cachedTombstones = tombstones
-
-    return tombstones
+    return Object.keys(overlay).length === 0 ? cachedTombstones : { ...cachedTombstones, ...overlay }
   } catch {
-    return {}
+    return overlay
   }
+}
+
+const pruneTombstones = (tombstones: RemovalTombstones): RemovalTombstones => {
+  const cutoff = Date.now() - TOMBSTONE_TTL_MS
+  const alive = Object.entries(tombstones).filter(([, at]) => at > cutoff)
+  alive.sort((a, b) => a[1] - b[1])
+
+  return Object.fromEntries(alive.slice(-TOMBSTONE_CAP))
 }
 
 const recordTombstones = (ids: string[]) => {
@@ -149,24 +206,23 @@ const recordTombstones = (ids: string[]) => {
     return
   }
 
+  const next = pruneTombstones(readTombstones())
+  const now = Date.now()
+
+  for (const id of ids) {
+    next[id] = now
+  }
+
   try {
-    const cutoff = Date.now() - TOMBSTONE_TTL_MS
-    const alive = Object.entries(readTombstones()).filter(([, at]) => at > cutoff)
-    alive.sort((a, b) => a[1] - b[1])
-
-    const next: RemovalTombstones = Object.fromEntries(alive.slice(-TOMBSTONE_CAP))
-    const now = Date.now()
-
-    for (const id of ids) {
-      next[id] = now
-    }
-
     const raw = JSON.stringify(next)
     window.localStorage.setItem(QUEUE_TOMBSTONES_STORAGE_KEY, raw)
     cachedTombstonesRaw = raw
     cachedTombstones = next
+    unpersistedTombstones = {}
   } catch {
-    // Best-effort: without the tombstone we degrade to pre-tombstone behavior.
+    // Sidecar unwritable: keep the merged set in memory so this window still
+    // filters its own removals; other windows degrade to pre-tombstone behavior.
+    unpersistedTombstones = next
   }
 }
 
@@ -210,11 +266,34 @@ export const $queuedPromptsBySession = atom<QueueState>(filterState(readStorage(
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', event => {
     if (
-      event.key === QUEUE_STORAGE_KEY ||
-      event.key === QUEUE_TOMBSTONES_STORAGE_KEY ||
-      event.key === null
+      event.key !== QUEUE_STORAGE_KEY &&
+      event.key !== QUEUE_TOMBSTONES_STORAGE_KEY &&
+      event.key !== null
     ) {
-      $queuedPromptsBySession.set(filterState(readStorage() ?? $queuedPromptsBySession.get()))
+      return
+    }
+
+    // While persistence is broken, this window's atom is its only truth:
+    // adopting another window's map would delete every in-memory-only entry.
+    if (persistFailed) {
+      return
+    }
+
+    const stored = readStorage()
+
+    if (stored === null) {
+      return
+    }
+
+    const filtered = filterState(stored)
+    $queuedPromptsBySession.set(filtered)
+
+    // A stale save resurrected a tombstoned entry into the raw map: write the
+    // purged map back so the ghost leaves storage now, not "on the next
+    // write" — an idle queue might not see one before the tombstone expires.
+    // Idempotent across windows: whoever writes last writes the same content.
+    if (filtered !== stored) {
+      save(filtered)
     }
   })
 }
@@ -424,7 +503,14 @@ export const updateQueuedPrompt = (
 
       const attachments = update.attachments ? cloneAttachments(update.attachments) : entry.attachments
 
-      if (entry.text === update.text && !update.attachments) {
+      // Structural comparison, not presence: edit flows always pass an
+      // attachments array (usually an identical one), and treating "passed"
+      // as "changed" made every arrow-step through the edit stack a full
+      // stringify + storage write + cross-window event for nothing.
+      const sameAttachments =
+        !update.attachments || JSON.stringify(update.attachments) === JSON.stringify(entry.attachments)
+
+      if (entry.text === update.text && sameAttachments) {
         return entry
       }
 
@@ -466,6 +552,11 @@ export const clearQueuedPrompts = (key: string | null | undefined) => {
  * before the remainder moves, or the moved copy would be picked up under the
  * new key's (different) claim while the original submit is still in flight and
  * be submitted twice.
+ *
+ * Accepted limit: the write to the TARGET key races concurrent unlocked
+ * mutations on it like any same-instant same-session write (milliseconds,
+ * lost-update only) — holding the target's drain claim would not help, since
+ * mutations never take claims.
  */
 export const migrateQueuedPrompts = async (
   fromKey: string | null | undefined,
@@ -567,26 +658,75 @@ export const withSessionDrainClaim = async <T>(
  * releasing it). Losers of an `ifAvailable` attempt use this as their wake-up:
  * a winner whose submit is rejected — or whose window dies mid-submit — never
  * writes storage, so no storage event will re-trigger them, but the browser
- * always releases a dead window's locks. Resolves immediately when Web Locks
- * are unavailable (single-window environments have no winner to wait on).
+ * always releases a dead window's locks.
+ *
+ * Resolves `true` only after a genuine wait-and-release. `false` means no
+ * wait happened (no usable key, no Web Locks, or the request failed) — the
+ * caller must NOT treat that as a wake-up, or an environment whose lock
+ * requests reject would spin arm→fail→re-arm forever.
  */
-export const whenSessionDrainClaimReleased = async (key: string | null | undefined): Promise<void> => {
+export const whenSessionDrainClaimReleased = async (key: string | null | undefined): Promise<boolean> => {
   const sid = sidOf(key)
 
   if (!sid) {
-    return
+    return false
   }
 
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
+
+  if (!locks) {
+    return false
+  }
+
+  try {
+    await locks.request(`${QUEUE_STORAGE_KEY}.drain.${sid}`, {}, async () => undefined)
+
+    return true
+  } catch {
+    return false
+  }
+}
+
+const sentLockName = (id: string) => `${QUEUE_STORAGE_KEY}.sent.${id}`
+
+/**
+ * Hold a browser-arbitrated "already sent" claim on this entry id for the rest
+ * of this window's lifetime. This is the storage-independent second layer
+ * under the tombstones: when THIS window's removals cannot reach storage
+ * (quota exhausted — the persistFailed mode), a healthy sibling window would
+ * otherwise re-drain and re-submit every entry this window sends, because
+ * storage still lists them. The held lock is visible to every window via
+ * {@link isQueuedPromptSentElsewhere} and needs no storage at all. It releases
+ * when this window closes, degrading to the accepted crash race — never worse
+ * than the storage layer alone.
+ */
+export const markQueuedPromptSent = (id: string) => {
   const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
 
   if (!locks) {
     return
   }
 
+  void locks
+    .request(sentLockName(id), { ifAvailable: true }, grant => (grant ? new Promise<never>(() => {}) : undefined))
+    .catch(() => undefined)
+}
+
+/** Whether any window (this one included) holds the sent claim for this id. */
+export const isQueuedPromptSentElsewhere = async (id: string): Promise<boolean> => {
+  const locks = typeof navigator === 'undefined' ? undefined : navigator.locks
+
+  if (!locks?.query) {
+    return false
+  }
+
   try {
-    await locks.request(`${QUEUE_STORAGE_KEY}.drain.${sid}`, {}, async () => undefined)
+    const { held } = await locks.query()
+    const name = sentLockName(id)
+
+    return (held ?? []).some(lock => lock?.name === name)
   } catch {
-    // A failed wait must never break the caller's drain loop.
+    return false
   }
 }
 

@@ -387,10 +387,22 @@ describe('storage-failure in-memory fallback', () => {
     resetQueueStorage()
   })
 
-  it('keeps queueing, reading, and removing in-memory while saves fail, and recovers', () => {
-    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+  const breakStorage = () => {
+    const quota = () => {
       throw new DOMException('quota exceeded', 'QuotaExceededError')
-    })
+    }
+
+    const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(quota)
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(quota)
+
+    return () => {
+      setItem.mockRestore()
+      removeItem.mockRestore()
+    }
+  }
+
+  it('keeps queueing, reading, and removing in-memory while saves fail', () => {
+    const restore = breakStorage()
 
     try {
       const a = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'first (unsaved)' })
@@ -404,7 +416,8 @@ describe('storage-failure in-memory fallback', () => {
       expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['first (unsaved)', 'second (unsaved)'])
       expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['first (unsaved)', 'second (unsaved)'])
 
-      // In-memory entries stay mutable: remove works without storage.
+      // In-memory entries stay mutable: remove works without storage — even
+      // its tombstone lives in the in-memory overlay.
       expect(removeQueuedPrompt(SESSION_KEY, a!.id)).toBe(true)
       expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['second (unsaved)'])
 
@@ -412,14 +425,155 @@ describe('storage-failure in-memory fallback', () => {
       clearQueuedPrompts(SESSION_KEY)
       expect(getQueuedPrompts(SESSION_KEY)).toEqual([])
     } finally {
-      setItem.mockRestore()
+      restore()
+    }
+  })
+
+  it('recovers exactly on the first successful save — not before, not never', () => {
+    const restore = breakStorage()
+    const survivorText = 'survivor (unsaved)'
+
+    try {
+      enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: survivorText })
+    } finally {
+      restore()
     }
 
-    // Recovery: the first successful save re-persists and re-enables storage
-    // as the fresh source.
+    // Storage works again, but no successful save has happened yet: fresh
+    // reads must STILL serve the atom, or the in-memory survivor would vanish.
+    // (Pins that persistFailed stays set until an actual save succeeds.)
+    otherWindowWrites({ [SESSION_KEY]: [remoteEntry('q-b', 'from healthy window')] })
+    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual([survivorText])
+
+    // The first mutation persists the atom-derived state (this window's truth
+    // reconciles over storage) and clears the flag…
     enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'persisted again' })
-    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['persisted again'])
-    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['persisted again'])
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual([survivorText, 'persisted again'])
+
+    // …after which fresh reads follow STORAGE again. (Pins that the
+    // persistFailed reset in save()'s success path actually runs.)
+    otherWindowWrites({ [SESSION_KEY]: [remoteEntry('q-c', 'storage truth')] })
+    expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['storage truth'])
+  })
+
+  it('ignores cross-window storage events while persistence is broken', () => {
+    const restore = breakStorage()
+
+    try {
+      enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'memory only' })
+
+      // Another window's write lands as a storage event; adopting it would
+      // delete the in-memory-only entry.
+      window.dispatchEvent(new StorageEvent('storage', { key: QUEUE_STORAGE_KEY, newValue: '{}' }))
+
+      expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['memory only'])
+      expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['memory only'])
+    } finally {
+      restore()
+    }
+  })
+})
+
+describe('corrupt storage sanitization', () => {
+  beforeEach(() => {
+    resetQueueStorage()
+  })
+
+  it('drops malformed session values and entries instead of throwing', () => {
+    window.localStorage.setItem(
+      QUEUE_STORAGE_KEY,
+      JSON.stringify({
+        'session-bad': 'not an array',
+        'session-mixed': [remoteEntry('q-ok', 'ok'), 'garbage', { id: 42 }, null, 7],
+        'session-num': 12
+      })
+    )
+    window.dispatchEvent(new StorageEvent('storage', { key: QUEUE_STORAGE_KEY, newValue: 'x' }))
+
+    expect(getQueuedPrompts('session-mixed').map(e => e.text)).toEqual(['ok'])
+    expect(getQueuedPrompts('session-bad')).toEqual([])
+    expect(readFreshQueuedPrompts('session-num')).toEqual([])
+
+    // Mutations over the corrupt map still work and persist a clean shape.
+    enqueueQueuedPrompt('session-bad', { attachments: [], text: 'recovered' })
+    expect(persistedQueueTexts('session-bad')).toEqual(['recovered'])
+  })
+
+  it('treats unparseable storage as unreadable, not as a crash', () => {
+    window.localStorage.setItem(QUEUE_STORAGE_KEY, '{"truncated": ')
+    window.dispatchEvent(new StorageEvent('storage', { key: QUEUE_STORAGE_KEY, newValue: 'x' }))
+
+    expect(readFreshQueuedPrompts(SESSION_KEY)).toEqual([])
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'fresh start' })
+    expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['fresh start'])
+  })
+})
+
+describe('tombstone lifetime', () => {
+  beforeEach(() => {
+    resetQueueStorage()
+  })
+
+  it('purges a resurrected ghost from storage on the next storage event', () => {
+    const sent = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'sent already' })
+    removeQueuedPrompt(SESSION_KEY, sent!.id)
+
+    // The stale save resurrects it — with the event, as another window's
+    // write would. The ghost must leave STORAGE, not just be filtered.
+    otherWindowWrites({ [SESSION_KEY]: [sent!, remoteEntry('q-b', 'B entry')] }, { fireEvent: true })
+
+    expect(persistedQueueTexts(SESSION_KEY)).toEqual(['B entry'])
+    expect(getQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['B entry'])
+  })
+
+  it('keeps a tombstone effective throughout the TTL and sheds it after', () => {
+    vi.useFakeTimers({ now: new Date('2026-07-16T00:00:00Z'), toFake: ['Date'] })
+
+    try {
+      const sent = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'sent once' })
+      removeQueuedPrompt(SESSION_KEY, sent!.id)
+
+      otherWindowWrites({ [SESSION_KEY]: [sent!] }) // resurrected, no event
+
+      expect(readFreshQueuedPrompts(SESSION_KEY)).toEqual([])
+
+      vi.setSystemTime(new Date('2026-07-16T12:00:00Z')) // 12h — inside the 24h TTL
+      expect(readFreshQueuedPrompts(SESSION_KEY)).toEqual([])
+
+      vi.setSystemTime(new Date('2026-07-17T00:00:01Z')) // past the TTL
+      // Documented shedding behavior: after the (deliberately long) TTL an
+      // un-purged raw copy becomes visible again. Ghosts are normally purged
+      // within one storage event (test above), far inside the TTL.
+      expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['sent once'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('evicts the oldest tombstones beyond the cap, keeping the newest effective', () => {
+    vi.useFakeTimers({ now: new Date('2026-07-16T00:00:00Z'), toFake: ['Date'] })
+
+    try {
+      const first = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'oldest removal' })
+      removeQueuedPrompt(SESSION_KEY, first!.id)
+
+      let last = first
+
+      for (let i = 0; i < 70; i++) {
+        vi.setSystemTime(new Date(Date.parse('2026-07-16T00:00:00Z') + (i + 1) * 1_000))
+        const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: `filler ${i}` })
+        removeQueuedPrompt(SESSION_KEY, entry!.id)
+        last = entry
+      }
+
+      // The oldest tombstone fell off the cap: its entry resurrects. The
+      // newest is still effective.
+      otherWindowWrites({ [SESSION_KEY]: [first!, last!] })
+
+      expect(readFreshQueuedPrompts(SESSION_KEY).map(e => e.text)).toEqual(['oldest removal'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 
@@ -526,13 +680,13 @@ describe('whenSessionDrainClaimReleased', () => {
     resetQueueStorage()
   })
 
-  it('resolves immediately when the claim is free or Web Locks are unavailable', async () => {
-    await expect(whenSessionDrainClaimReleased('session-x')).resolves.toBeUndefined()
+  it('reports false without Web Locks (no wait happened) and true for a free claim', async () => {
+    await expect(whenSessionDrainClaimReleased('session-x')).resolves.toBe(false)
 
     const restore = installFakeLocks()
 
     try {
-      await expect(whenSessionDrainClaimReleased('session-x')).resolves.toBeUndefined()
+      await expect(whenSessionDrainClaimReleased('session-x')).resolves.toBe(true)
     } finally {
       restore()
     }
