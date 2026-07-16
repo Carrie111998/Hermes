@@ -172,6 +172,35 @@ class TestDeferToGatewayGuard:
         assert len(defer_lines) == 1, "deferring must be logged exactly once per transition"
         assert len(active_lines) == 1, "activation must be logged exactly once per transition"
 
+    def test_tick_baseexception_does_not_kill_active_loop(self):
+        """Mirrors InProcessCronScheduler.start (#32612): a SystemExit raised
+        by tick() inside the guarded loop logs, records success=False, and
+        keeps looping — it must not silently kill the desktop ticker thread."""
+        _write_gateway_heartbeat(age_seconds=600)  # stale → active
+        beats = []
+        calls = []
+
+        def _boom(*a, **k):
+            calls.append(1)
+            if len(calls) == 1:
+                raise SystemExit("provider SDK called sys.exit")
+            return 0
+
+        stop = threading.Event()
+        with patch("cron.scheduler.tick", side_effect=_boom), \
+             patch("cron.jobs.record_ticker_heartbeat",
+                   side_effect=lambda success=False: beats.append(success)):
+            t = _run_ticker(stop)
+            assert _wait_until(lambda: len(calls) >= 2), (
+                "guarded ticker died on BaseException instead of surviving"
+            )
+            stop.set()
+            t.join(timeout=5)
+
+        assert not t.is_alive()
+        assert beats[0] is False, "failed tick wrongly bumped the success marker"
+        assert True in beats, "recovered tick did not record success"
+
 
 class TestEnvOverrides:
     def test_hermes_desktop_cron_0_never_ticks(self, monkeypatch):
