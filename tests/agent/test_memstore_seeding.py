@@ -6,8 +6,10 @@ import pytest
 
 from agent.memory_manager import MemoryManager
 from agent.memstore_seeding import (
+    CATEGORY_BOOTSTRAP,
     CATEGORY_INSIGHT,
     CATEGORY_PROJECT,
+    CATEGORY_TOOL,
     CATEGORY_USER,
     DreamConsolidator,
     FactCorpus,
@@ -159,6 +161,23 @@ class TestPersonaParsing:
         contents = [f.content for f in facts]
         assert any("Python 3.11" in c for c in contents)
         assert any("pytest" in c for c in contents)
+
+    def test_bootstrap_heading_routes_to_bootstrap(self):
+        doc = "## Getting Started\n- Activate the virtualenv before commands.\n"
+        facts = parse_persona_doc(doc)
+        assert facts[0].category == CATEGORY_BOOTSTRAP
+
+    def test_bootstrap_wins_over_tool_setup_hint(self):
+        # "Onboarding" mentions setup-like content but must land in bootstrap,
+        # not be swallowed by the tool "setup"/"environment" hints.
+        doc = "## Onboarding\n- Install prerequisites first.\n"
+        facts = parse_persona_doc(doc)
+        assert facts[0].category == CATEGORY_BOOTSTRAP
+
+    def test_plain_tools_heading_still_tool(self):
+        doc = "## Tools\n- Uses ripgrep and fd.\n"
+        facts = parse_persona_doc(doc)
+        assert facts[0].category == CATEGORY_TOOL
 
     def test_short_lines_skipped(self):
         facts = parse_persona_doc("# H\n- ok\n- a\n")

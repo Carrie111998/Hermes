@@ -50,7 +50,8 @@ CATEGORY_PROJECT = "project"
 CATEGORY_TOOL = "tool"
 CATEGORY_GENERAL = "general"
 CATEGORY_INSIGHT = "insight"
-CATEGORY_IDENTITY = "identity"  # agent persona/identity (SOUL.md / IDENTITY.md)
+CATEGORY_IDENTITY = "identity"    # agent persona/identity (SOUL.md / IDENTITY.md)
+CATEGORY_BOOTSTRAP = "bootstrap"  # first-run / setup steps (BOOTSTRAP.md)
 
 _USER_TARGET_CATEGORIES = {CATEGORY_USER}
 
@@ -291,6 +292,13 @@ _USER_HEADING_HINTS = (
 )
 _PROJECT_HEADING_HINTS = ("project", "codebase", "repo", "stack", "architecture", "build", "operating")
 _TOOL_HEADING_HINTS = ("tool", "environment", "setup", "workflow", "command")
+# Checked before tools so "Getting started" / "Onboarding" route to bootstrap
+# rather than being caught by the tool "setup"/"environment" hints.
+_BOOTSTRAP_HEADING_HINTS = (
+    "bootstrap", "first run", "first-run", "getting started", "getting-started",
+    "onboarding", "installation", "how to start", "prerequisite", "quickstart",
+    "quick start",
+)
 
 
 def _category_for_heading(heading: str) -> str:
@@ -299,6 +307,8 @@ def _category_for_heading(heading: str) -> str:
         return CATEGORY_IDENTITY
     if any(h in low for h in _USER_HEADING_HINTS):
         return CATEGORY_USER
+    if any(h in low for h in _BOOTSTRAP_HEADING_HINTS):
+        return CATEGORY_BOOTSTRAP
     if any(h in low for h in _PROJECT_HEADING_HINTS):
         return CATEGORY_PROJECT
     if any(h in low for h in _TOOL_HEADING_HINTS):

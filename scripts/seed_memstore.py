@@ -121,6 +121,8 @@ def main(argv: list[str] | None = None) -> int:
         if msgs:
             written = store.write_daily_digests(msgs, default_date=args.date)
             print(f"Daily: {len(written)} digest(s) → {', '.join(sorted(written))}")
+            if store.refresh_heartbeat():
+                print("Heartbeat: refreshed")
 
     # 3. Optional provider mirror.
     if args.mirror:
