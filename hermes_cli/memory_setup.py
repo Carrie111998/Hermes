@@ -545,6 +545,9 @@ def cmd_seed(args) -> None:
             written = store.write_daily_digests(all_msgs, default_date=getattr(args, "date", None))
             days = ", ".join(f"{d}({n})" for d, n in sorted(written.items()))
             print(f"  Daily: {len(written)} digest(s) → {days}")
+            # New activity landed — refresh the heartbeat snapshot.
+            if store.refresh_heartbeat():
+                print("  Heartbeat: refreshed")
 
     # 3. Mirror into the active external provider (optional).
     if do_mirror:

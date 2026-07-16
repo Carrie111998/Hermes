@@ -11,6 +11,7 @@ from agent.memstore_files import (
     _parse_date,
 )
 from agent.memstore_seeding import (
+    CATEGORY_BOOTSTRAP,
     CATEGORY_IDENTITY,
     CATEGORY_PROJECT,
     CATEGORY_TOOL,
@@ -287,6 +288,97 @@ class TestBundledSamples:
         assert "Hermes" in (tmp_path / "memories" / "IDENTITY.md").read_text()
         # User profile to USER.md.
         assert "Ade" in (tmp_path / "memories" / "USER.md").read_text()
+        # Bootstrap routed to BOOTSTRAP.md.
+        assert (tmp_path / "memories" / "BOOTSTRAP.md").exists()
+        assert "virtualenv" in (tmp_path / "memories" / "BOOTSTRAP.md").read_text()
         # Two days of digests from the dated transcript.
         daily = list((tmp_path / "memories" / "daily").glob("*.md"))
         assert len(daily) == 2
+
+
+# ---------------------------------------------------------------------------
+# set_bullets — overwrite semantics
+# ---------------------------------------------------------------------------
+
+
+class TestSetBullets:
+    def test_overwrites_block(self, tmp_path):
+        p = tmp_path / "HEARTBEAT.md"
+        d = MarkdownDoc(p)
+        d.set_bullets("Pulse", ["a", "b"])
+        d.save()
+        d2 = MarkdownDoc(p)
+        d2.set_bullets("Pulse", ["c"])
+        d2.save()
+        assert MarkdownDoc(p).bullets_in("Pulse") == ["c"]
+
+    def test_dedupes_input(self, tmp_path):
+        d = MarkdownDoc(tmp_path / "x.md")
+        n = d.set_bullets("S", ["a", "a", "b"])
+        assert n == 2
+
+
+# ---------------------------------------------------------------------------
+# BOOTSTRAP routing + HEARTBEAT refresh
+# ---------------------------------------------------------------------------
+
+
+class TestBootstrapRouting:
+    def test_bootstrap_facts_go_to_bootstrap_md(self, tmp_path):
+        store = CanonicalMemstore(root=tmp_path)
+        report = store.seed_facts(FactCorpus([
+            SeedFact("run the setup script first", category=CATEGORY_BOOTSTRAP),
+        ]))
+        assert report.files_touched.get("BOOTSTRAP.md") == 1
+        assert "setup script" in (tmp_path / "memories" / "BOOTSTRAP.md").read_text()
+
+
+class TestHeartbeat:
+    MESSAGES = [
+        {"role": "user", "content": "We decided to use PostgreSQL for the service.",
+         "timestamp": "2026-07-15T09:00:00Z"},
+        {"role": "user", "content": "I always run pytest before pushing.",
+         "timestamp": "2026-07-16T10:00:00Z"},
+    ]
+
+    def test_refresh_creates_heartbeat(self, tmp_path):
+        store = CanonicalMemstore(root=tmp_path)
+        store.write_daily_digests(self.MESSAGES)
+        assert store.refresh_heartbeat(now="2026-07-16T12:00:00+00:00") is True
+        hb = tmp_path / "memories" / "HEARTBEAT.md"
+        assert hb.exists()
+        text = hb.read_text()
+        assert "## Pulse" in text
+        assert "Updated: 2026-07-16T12:00:00+00:00" in text
+        assert "Last activity: 2026-07-16" in text
+        assert "Daily digests on record: 2" in text
+
+    def test_recent_focus_from_latest_day(self, tmp_path):
+        store = CanonicalMemstore(root=tmp_path)
+        store.write_daily_digests(self.MESSAGES)
+        store.refresh_heartbeat(now="2026-07-16T12:00:00+00:00")
+        text = (tmp_path / "memories" / "HEARTBEAT.md").read_text()
+        # Latest day (07-16) focus, not the older PostgreSQL decision.
+        assert "pytest" in text
+        assert "PostgreSQL" not in text.split("## Recent Focus")[1]
+
+    def test_refresh_is_overwrite_not_append(self, tmp_path):
+        store = CanonicalMemstore(root=tmp_path)
+        store.write_daily_digests(self.MESSAGES)
+        store.refresh_heartbeat(now="2026-07-16T12:00:00+00:00")
+        store.refresh_heartbeat(now="2026-07-17T12:00:00+00:00")
+        text = (tmp_path / "memories" / "HEARTBEAT.md").read_text()
+        assert text.count("Updated:") == 1
+        assert "2026-07-17T12:00:00+00:00" in text
+        assert "2026-07-16T12:00:00+00:00" not in text
+
+    def test_refresh_empty_tree_returns_false(self, tmp_path):
+        store = CanonicalMemstore(root=tmp_path)
+        assert store.refresh_heartbeat(now="2026-07-16T12:00:00+00:00") is False
+
+    def test_roll_up_refreshes_heartbeat(self, tmp_path):
+        store = CanonicalMemstore(root=tmp_path)
+        store.write_daily_digests(self.MESSAGES)
+        report = store.roll_up()
+        assert report.heartbeat is True
+        assert (tmp_path / "memories" / "HEARTBEAT.md").exists()

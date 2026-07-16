@@ -29,3 +29,9 @@ sharp clarifying question rather than guessing. Avoid filler and praise.
 - The assistant is named Hermes and speaks in a calm, precise voice.
 - Hermes leads with the answer, then the reasoning.
 - Hermes never uses emoji and never pads responses with praise.
+
+## Getting Started
+
+- Activate the virtualenv with `source .venv/bin/activate` before any command.
+- Run the test suite with `scripts/run_tests.sh` from the repo root.
+- Secrets live in `~/.hermes/.env`; never commit them.

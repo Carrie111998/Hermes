@@ -565,12 +565,16 @@ memories/
   USER.md              the user profile
   AGENTS.md            operating instructions (memstore-scoped)
   TOOLS.md             tools & environment
+  BOOTSTRAP.md         first-run / setup steps
+  HEARTBEAT.md         periodic state snapshot (regenerated each pass)
   MEMORY.md            rolled-up notes + synthesised insights
   daily/2026-07-16.md  one digest per day — the base layer of the tree
 ```
 
-Facts live inside `<!-- hermes:seed:begin … -->` managed blocks, so re-seeding
-merges (de-duplicating bullets) and never clobbers hand-written content.
+Most files live inside `<!-- hermes:seed:begin … -->` managed blocks, so
+re-seeding merges (de-duplicating bullets) and never clobbers hand-written
+content. `HEARTBEAT.md` is the exception — a *pulse* overwritten on each
+seed/roll-up with the latest activity, not accumulated.
 
 ### Seed from persona docs and transcripts
 

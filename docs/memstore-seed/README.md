@@ -20,20 +20,25 @@ memories/
   AGENTS.md                 operating instructions (memstore-scoped —
                             does NOT touch a project's own AGENTS.md)
   TOOLS.md                  tools & environment
+  BOOTSTRAP.md              first-run / setup steps
+  HEARTBEAT.md              periodic state snapshot (regenerated, not appended)
   MEMORY.md                 rolled-up notes + synthesised insights
   daily/
     2026-07-15.md           one digest per day, built from that day's
     2026-07-16.md           transcript — the base layer of the tree
 ```
 
-Facts live inside `<!-- hermes:seed:begin … -->` managed blocks, so re-seeding
-merges (de-duplicating bullets) and never clobbers hand-written content.
+Most files live inside `<!-- hermes:seed:begin … -->` managed blocks, so
+re-seeding merges (de-duplicating bullets) and never clobbers hand-written
+content. **HEARTBEAT.md is the exception** — it's a *pulse*, overwritten on each
+seed/roll-up with the latest activity (last update, digests on record, most
+recent day's focus) rather than accumulated.
 
 ## What's here
 
 | File | Purpose |
 |------|---------|
-| `persona.md` | An "about the user / project / agent" doc. Headings route to files: *About the User* → USER.md, *About the Agent* → IDENTITY.md + SOUL.md, *Project* → AGENTS.md, *Tools* → TOOLS.md. |
+| `persona.md` | An "about the user / project / agent" doc. Headings route to files: *About the User* → USER.md, *About the Agent* → IDENTITY.md + SOUL.md, *Project* → AGENTS.md, *Tools* → TOOLS.md, *Getting Started / Onboarding* → BOOTSTRAP.md. |
 | `transcript.json` | A dated two-day conversation. Split into `memories/daily/*.md` and mined for preferences, identity, decisions, and explicit `remember …` cues. |
 
 ## Seed via the CLI

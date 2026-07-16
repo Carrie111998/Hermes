@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from agent.memstore_seeding import (
+    CATEGORY_BOOTSTRAP,
     CATEGORY_GENERAL,
     CATEGORY_IDENTITY,
     CATEGORY_INSIGHT,
@@ -56,6 +57,7 @@ from agent.memstore_seeding import (
     FactCorpus,
     SeedFact,
     _normalize,
+    now_iso,
     parse_transcript,
 )
 
@@ -74,6 +76,7 @@ _ROUTE: dict[str, tuple[str, str]] = {
     CATEGORY_USER: ("USER.md", "Preferences"),
     CATEGORY_PROJECT: ("AGENTS.md", "Operating Notes"),
     CATEGORY_TOOL: ("TOOLS.md", "Tools & Environment"),
+    CATEGORY_BOOTSTRAP: ("BOOTSTRAP.md", "Setup"),
     CATEGORY_INSIGHT: ("MEMORY.md", "Insights"),
     CATEGORY_GENERAL: ("MEMORY.md", "Notes"),
 }
@@ -148,14 +151,39 @@ class MarkdownDoc:
         if not added and self._has_block(slug):
             return 0
 
-        merged = existing + added
-        block_body = "\n".join(f"- {b}" for b in merged)
+        self._put_block(section, existing + added)
+        return len(added)
+
+    def set_bullets(self, section: str, bullets: Iterable[str]) -> int:
+        """Replace ``section``'s managed block entirely with ``bullets``.
+
+        Unlike :meth:`upsert_bullets`, this overwrites the block body — used
+        for snapshot sections (e.g. HEARTBEAT.md) that reflect current state
+        rather than an accumulating log. Returns the number of bullets written.
+        """
+        slug = _slug(section)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for b in bullets:
+            b = (b or "").strip()
+            key = _normalize(b)
+            if b and key and key not in seen:
+                seen.add(key)
+                deduped.append(b)
+        if not deduped and not self._has_block(slug):
+            return 0
+        self._put_block(section, deduped)
+        return len(deduped)
+
+    def _put_block(self, section: str, bullets: list[str]) -> None:
+        """Write (create or replace) ``section``'s managed block with ``bullets``."""
+        slug = _slug(section)
+        block_body = "\n".join(f"- {b}" for b in bullets)
         block = (
             f"<!-- hermes:seed:begin {slug} -->\n"
             f"{block_body}\n"
             f"<!-- hermes:seed:end {slug} -->"
         )
-
         pattern = _BLOCK_RE_TMPL.format(slug=re.escape(slug))
         if self._has_block(slug):
             self.text = re.sub(pattern, lambda _m: block, self.text, count=1, flags=re.DOTALL)
@@ -170,7 +198,6 @@ class MarkdownDoc:
                 self.text = f"# {title}\n\n{heading}\n{block}\n"
             else:
                 self.text = f"{self.text}{prefix}{heading}\n{block}\n"
-        return len(added)
 
     def _has_block(self, slug: str) -> bool:
         return re.search(_BLOCK_RE_TMPL.format(slug=re.escape(slug)), self.text, re.DOTALL) is not None
@@ -224,11 +251,13 @@ class RollUpReport:
     facts_in: int = 0
     dream_summary: str = ""
     seed: FileSeedReport = field(default_factory=FileSeedReport)
+    heartbeat: bool = False
 
     def summary(self) -> str:
+        beat = ", heartbeat refreshed" if self.heartbeat else ""
         return (
             f"rolled up {self.days_read} day(s) / {self.facts_in} fact(s) → "
-            f"{self.seed.summary()}"
+            f"{self.seed.summary()}{beat}"
         )
 
 
@@ -341,6 +370,15 @@ class CanonicalMemstore:
         doc.save()
         return len(facts)
 
+    def _daily_files(self, ascending: bool = False) -> list[Path]:
+        """Return the dated daily digest files, newest-first by default."""
+        if not self.daily.is_dir():
+            return []
+        return sorted(
+            (p for p in self.daily.glob("*.md") if _DATE_RE.match(p.stem)),
+            reverse=not ascending,
+        )
+
     def load_daily_corpus(self, days: int | None = None) -> tuple[FactCorpus, int]:
         """Read recent daily files back into a corpus for consolidation.
 
@@ -348,12 +386,7 @@ class CanonicalMemstore:
         dated files (by filename); ``None`` reads all.
         """
         corpus = FactCorpus()
-        if not self.daily.is_dir():
-            return corpus, 0
-        files = sorted(
-            (p for p in self.daily.glob("*.md") if _DATE_RE.match(p.stem)),
-            reverse=True,
-        )
+        files = self._daily_files()  # newest-first
         if days is not None:
             files = files[:days]
         for path in files:
@@ -391,7 +424,52 @@ class CanonicalMemstore:
         refined, dream = consolidator.consolidate(corpus)
         report.dream_summary = dream.summary()
         report.seed = self.seed_facts(refined)
+        # The roll-up is the periodic pass, so refresh the heartbeat snapshot.
+        report.heartbeat = self.refresh_heartbeat()
         return report
+
+    # -- Heartbeat (periodic state snapshot) ---------------------------------
+
+    def refresh_heartbeat(self, *, now: str | None = None) -> bool:
+        """Overwrite HEARTBEAT.md with a fresh snapshot of current state.
+
+        Unlike the accumulating files, HEARTBEAT.md is a *pulse* — regenerated
+        each time to show the latest activity: when it was last updated, how
+        much is on record, and what the most recent day focused on. Returns
+        True if there was any daily activity to report.
+        """
+        files = self._daily_files(ascending=True)  # oldest → newest
+        doc = MarkdownDoc(self.path_for("HEARTBEAT.md"))
+
+        last_day = files[-1].stem if files else "—"
+        # Count unique facts directly — no SeedFact construction or entity
+        # extraction. refresh_heartbeat runs on every seed/roll-up, so this
+        # stays cheap as the daily history grows.
+        unique_facts: set[str] = set()
+        for path in files:
+            day_doc = MarkdownDoc(path)
+            for _, section in _DAILY_SECTIONS:
+                for bullet in day_doc.bullets_in(section):
+                    norm = _normalize(bullet)
+                    if norm:
+                        unique_facts.add(norm)
+
+        doc.set_bullets("Pulse", [
+            f"Updated: {now or now_iso()}",
+            f"Last activity: {last_day}",
+            f"Daily digests on record: {len(files)}",
+            f"Facts across the daily tree: {len(unique_facts)}",
+        ])
+
+        # Recent focus: the most-recent day's decisions, notes, and prefs.
+        focus: list[str] = []
+        if files:
+            latest = MarkdownDoc(files[-1])
+            for section in ("Decisions", "Notes", "Preferences & Profile", "Identity"):
+                focus.extend(latest.bullets_in(section))
+        doc.set_bullets("Recent Focus", focus[:8])
+        doc.save()
+        return bool(files)
 
     # -- Scaffolding / status ------------------------------------------------
 
