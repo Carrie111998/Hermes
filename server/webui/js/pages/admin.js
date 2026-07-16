@@ -203,9 +203,87 @@ export async function mountLogs(root, ctx) {
 }
 
 export async function mountDataSources(root, ctx) {
-  const res = await call('dataSources.list');
-  withAdmin(root, ctx, 'Data Sources', 'Lead discovery source toggles and test actions.', '/admin/data-sources',
-    card({ flush: true, body: dataSourcesTable(res.items) }));
+  const res = await call('dataSources.catalog');
+  const rows = res.items || res;
+  withAdmin(root, ctx, 'Data Sources',
+    'Provider catalog, access state, health, licensing and tenant evidence lifecycle.', '/admin/data-sources',
+    el('div', { class: 'ifz-research-stack' },
+      card({ body: el('div', { class: 'ifz-grid cols-3' },
+        statCard({ label: 'Cataloged sources', value: String(rows.length), delta: 'global catalog', deltaDir: 'flat' }),
+        statCard({ label: 'Available', value: String(rows.filter(source => source.available).length), delta: 'tenant-ready', deltaDir: 'up' }),
+        statCard({ label: 'Needs access', value: String(rows.filter(source => !source.available && source.health !== 'retired').length), delta: 'explicitly gated', deltaDir: 'flat' })) }),
+      card({ flush: true, body: researchSourcesTable(rows, ctx) }),
+      card({ title: 'Lifecycle semantics', body: el('div', { class: 'ifz-grid cols-3' },
+        el('div', {}, el('strong', {}, 'Disable'), el('p', { class: 'ifz-hint' }, 'Stops future collection. Existing evidence remains active.')),
+        el('div', {}, el('strong', {}, 'Uninstall'), el('p', { class: 'ifz-hint' }, 'Removes the adapter. Historical evidence and source metadata remain.')),
+        el('div', {}, el('strong', {}, 'Purge evidence'), el('p', { class: 'ifz-hint' }, 'Deletes this tenant’s raw and normalized evidence, then recalculates affected leads and scores.'))) })),
+  );
+}
+
+function researchSourcesTable(rows, ctx) {
+  return dataTable({
+    columns: [
+      { key: 'display_name', label: 'Source', render: source => recordTitle(source.display_name, source.publisher) },
+      { key: 'categories', label: 'Capabilities', render: source => (source.categories || []).join(', ') },
+      { key: 'jurisdiction', label: 'Jurisdiction', render: source => (source.jurisdiction || []).join(', ') || 'Global' },
+      { key: 'access_tier', label: 'Access', render: source => source.access_tier.replace(/_/g, ' ') },
+      { key: 'health', label: 'Health', render: source => badge(source.health) },
+      { key: 'state', label: 'State', render: source => source.enabled ? badge('active', 'enabled') : source.installed ? badge('pending', 'disabled') : badge('neutral', 'not installed') },
+      { key: 'actions', label: 'Actions', width: '260px', render: source => el('div', { class: 'ifz-row' },
+        source.installed
+          ? button(source.enabled ? 'Disable' : 'Enable', { size: 'sm', onClick: async () => {
+              await call(source.enabled ? 'dataSources.disable' : 'dataSources.enable', { params: { sourceId: source.source_id } });
+              toast(source.enabled ? 'Future collection stopped; historical evidence remains active.' : 'Source enabled for tenant campaigns.', 'success');
+              ctx.navigate('/admin/data-sources');
+            } })
+          : button('Install', { size: 'sm', disabled: source.health === 'retired', onClick: async () => {
+              await call('dataSources.install', { params: { sourceId: source.source_id } });
+              toast('Adapter installed; enable it when access is ready.', 'success');
+              ctx.navigate('/admin/data-sources');
+            } }),
+        source.installed ? button('Uninstall', { kind: 'ghost', size: 'sm', onClick: async () => {
+          await call('dataSources.uninstall', { params: { sourceId: source.source_id } });
+          toast('Adapter removed. Historical evidence and source metadata remain.', 'success');
+          ctx.navigate('/admin/data-sources');
+        } }) : null,
+        button('Purge', { kind: 'danger', size: 'sm', onClick: () => openPurgeSource(source, () => ctx.navigate('/admin/data-sources')) })) },
+    ],
+    rows,
+    empty: emptyState({ icon: 'database', title: 'No provider definitions are installed' }),
+  });
+}
+
+async function openPurgeSource(source, afterPurge) {
+  const impact = await call('dataSources.impact', { params: { sourceId: source.source_id } });
+  const confirmation = input({ placeholder: source.display_name, autocomplete: 'off' });
+  const purge = button('Purge evidence', { kind: 'danger', disabled: true });
+  confirmation.addEventListener('input', () => { purge.disabled = confirmation.value !== source.display_name; });
+  const m = modal({
+    title: `Purge ${source.display_name}`,
+    wide: true,
+    body: el('div', { class: 'ifz-research-stack' },
+      el('div', { class: 'ifz-policy-lock' }, 'This deletes this tenant’s raw and normalized evidence, then recalculates affected leads and scores.'),
+      el('div', { class: 'ifz-grid cols-4' },
+        statCard({ label: 'Campaigns', value: String(impact.campaigns) }),
+        statCard({ label: 'Organizations', value: String(impact.organizations) }),
+        statCard({ label: 'Claims', value: String(impact.claims) }),
+        statCard({ label: 'Leads at risk', value: String(impact.leads_may_lose_qualification) })),
+      field(`Type “${source.display_name}” to confirm`, confirmation, { required: true,
+        hint: `${(impact.storage_bytes / 1024 / 1024).toFixed(2)} MB of local snapshots are included in this impact preview.` })),
+    actions: [button('Cancel', { kind: 'ghost', onClick: () => m.close() }), purge],
+  });
+  purge.addEventListener('click', async () => {
+    setBusy(purge, true, 'Purging…');
+    try {
+      await call('dataSources.purge', { params: { sourceId: source.source_id }, body: { confirmation: confirmation.value } });
+      m.close();
+      toast('Evidence purged. Affected leads require recalculation.', 'success');
+      afterPurge?.();
+    } catch (error) {
+      toast(error.message, 'error');
+      setBusy(purge, false);
+    }
+  });
 }
 
 function companiesTable(rows, ctx, actions) {

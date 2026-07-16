@@ -22,6 +22,9 @@ import * as agentRuns from './pages/agent-runs.js';
 import * as integrations from './pages/integrations.js';
 import * as settings from './pages/settings.js';
 import * as admin from './pages/admin.js';
+import * as research from './pages/research.js';
+import * as researchEditor from './pages/research-editor.js';
+import * as researchDetail from './pages/research-detail.js';
 
 // Bearer auth for every real-backend request (api.js reads this per call).
 config.authHeader = () => {
@@ -98,6 +101,10 @@ const routes = [
   { path: '/app/onboarding',      mount: appPage('Onboarding', onboarding.mount) },
   { path: '/app/company-brain',   mount: appPage('Company Brain', companyBrain.mount) },
   { path: '/app/lead-map',        mount: appPage('Lead Map', leadMap.mount) },
+  { path: '/app/research',        mount: appPage('Research', research.mount) },
+  { path: '/app/research/new',    mount: appPage('New research campaign', researchEditor.mount) },
+  { path: '/app/research/:campaignId/edit', mount: appPage('Edit research campaign', researchEditor.mount) },
+  { path: '/app/research/:campaignId', mount: appPage('Research campaign', researchDetail.mount) },
   { path: '/app/leads',           mount: appPage('Leads', leads.mountList) },
   { path: '/app/leads/:leadId',   mount: appPage('Lead', leads.mountDetail) },
   { path: '/app/contacts',        mount: appPage('Contacts', contacts.mountList) },

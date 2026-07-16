@@ -12,6 +12,7 @@ const NAV_GROUPS = [
   ]},
   { label: 'Market', items: [
     { path: '/app/lead-map', label: 'Lead Map', icon: 'map' },
+    { path: '/app/research', label: 'Research', icon: 'search' },
     { path: '/app/leads', label: 'Leads', icon: 'leads' },
     { path: '/app/contacts', label: 'Contacts', icon: 'contact' },
   ]},

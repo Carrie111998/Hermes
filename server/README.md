@@ -52,7 +52,8 @@ reprocessed until their source files are uploaded again.
 ## Production / Supabase
 
 Apply `server/supabase/migrations/001_initial.sql` for a fresh database. Existing
-installations also apply `server/supabase/migrations/002_chat_sessions.sql`.
+installations also apply `server/supabase/migrations/002_chat_sessions.sql` and
+`server/supabase/migrations/003_lead_research.sql`.
 Then configure:
 
 ```text
@@ -76,6 +77,10 @@ admin in the product database. Documents use the private
   retries, output contracts, and deterministic domain persistence.
 - `chat_bridge.py` — tenant-scoped WebUI sessions, restricted one-turn agents,
   and single-use SSE stream capabilities.
+- `lead_research/` — canonical sectors/evidence, provider registry, immutable
+  tenant snapshots, identity/eligibility, fit/confidence scoring, metrics, and
+  deterministic fixture acquisition. Cataloged external sources stay gated by
+  their real access mode instead of falling back to unsupported scraping.
 - `outreach_service.py` — immutable approval revisions, preflight QA,
   provider idempotency, send windows/caps, reply polling, and bounce circuit.
 - `email_providers/` — Gmail, Microsoft Graph, and test adapter.

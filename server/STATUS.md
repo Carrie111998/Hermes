@@ -1,6 +1,6 @@
 # Sales Agent backend status
 
-Status as of 2026-07-12.
+Status as of 2026-07-16.
 
 ## Code-complete surfaces
 
@@ -10,6 +10,11 @@ Status as of 2026-07-12.
 - Admin-managed companies and users with tenant-scoped customer access.
 - Onboarding, documents, products, versioned Company Brain snapshots.
 - Lead map, scans, leads, research, scoring, and contact discovery.
+- Evidence-first Research workspace with tenant campaign drafts, source catalog,
+  immutable local snapshots, canonical claims, separate fit/confidence scoring,
+  ordered funnel metrics, evidence inspection, CSV export, and source lifecycle
+  impact/purge handling. The offline fixture provider qualifies the full path;
+  public/credentialed source entries remain access-gated until adapters are configured.
 - Campaigns, custom outreach, revision-bound approvals, deterministic QA,
   draft/send modes, market CC rules, send limits/windows, and delivery
   idempotency.
@@ -48,6 +53,8 @@ Status as of 2026-07-12.
 - `tests/server/test_webui.py`: 16 serving, security, connection, core-flow,
   chat-isolation, and long-tail checks.
 - `tests/server/test_demo_seed.py`: 2 tenant seed and local draft-flow checks.
+- `tests/server/lead_research/` and `tests/server/test_research_webui.py`: 10
+  evidence-contract, tenant-isolation, refresh, source-removal, API, and WebUI checks.
 - Full `tests/server` qualification: 40 passed.
 - PRODUCT route comparison: 216/216.
 - Python compile pass for `server/` and `tests/server/`.
@@ -69,3 +76,5 @@ credential-free checkout:
    chain with the production model and record its fixtures.
 5. Refresh `uv.lock`; this workspace could not access uv's cache because its
    approval/credit gate rejected the operation.
+6. Record and qualify live official-source adapters independently; catalog-only,
+   manual-import, credentialed, and retired entries do not claim live acquisition.

@@ -107,7 +107,11 @@ export async function mount(root, ctx) {
   /* -- toolbar: left cluster + pinned CTA -- */
   const chipsHost = el('div', { class: 'ifz-map-chips' });
   const counter = el('span', { class: 'ifz-map-counter', 'aria-live': 'polite' });
-  const scanBtn = button('Configure scan', { kind: 'primary', icon: 'bolt', onClick: openScanModal, disabled: true });
+  const scanBtn = button('Configure research', {
+    kind: 'primary', icon: 'search',
+    onClick: () => ctx.navigate(`/app/research/new?countries=${encodeURIComponent([...selected].join(','))}`),
+    disabled: true,
+  });
   const toolbar = el('div', { class: 'ifz-map-toolbar' },
     el('div', { class: 'ifz-map-toolbar-main' },
       el('span', { class: 'ifz-overline' }, 'Target markets'),

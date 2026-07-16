@@ -8,6 +8,7 @@ import { call } from '../api.js';
 import { db, subscribe } from '../mocks/db.js';
 import { COUNTRY_NAMES, BUYER_INDUSTRIES } from '../catalog.js';
 import { exportCsv, waitForRun } from './_page-utils.js';
+import { openLeadEvidence } from './research-evidence.js';
 
 const STATUSES = ['new', 'researched', 'contacted', 'replied', 'interested', 'do_not_contact', 'archived'];
 
@@ -206,9 +207,19 @@ export async function mountDetail(root, ctx) {
     } });
 
     /* --- score explanation --- */
+    const hasEvidenceScore = Number.isFinite(Number(lead.fit_score)) && Number.isFinite(Number(lead.evidence_confidence));
     const scorePanel = card({
-      title: 'Lead score',
+      title: 'Fit & evidence',
       body: el('div', {},
+        hasEvidenceScore ? el('div', { class: 'ifz-grid cols-2 ifz-mb-4' },
+          el('div', { class: 'ifz-evidence-score-block' },
+            el('span', { class: 'ifz-overline' }, 'Fit score'),
+            el('strong', {}, `${lead.fit_score} / 100`),
+            el('span', { class: 'ifz-hint' }, `Priority ${lead.priority_band} · business relevance`)),
+          el('div', { class: 'ifz-evidence-score-block' },
+            el('span', { class: 'ifz-overline' }, 'Evidence confidence'),
+            el('strong', {}, Number(lead.evidence_confidence).toFixed(2)),
+            el('span', { class: 'ifz-hint' }, 'Authority, corroboration, freshness, conflicts and estimate share'))) : null,
         el('div', { class: 'ifz-row', style: { gap: '12px', marginBottom: '12px' } },
           el('span', { class: 'ifz-stat-value', style: { fontSize: '34px' } }, String(lead.score.value)),
           el('div', {},
@@ -220,6 +231,7 @@ export async function mountDetail(root, ctx) {
             el('div', { class: 'ifz-hbar-track', title: f.note },
               el('div', { class: 'ifz-hbar-fill', style: { width: `${f.weight * 2.4}%` } })),
             el('span', { class: 'ifz-hbar-val' }, `${f.weight}%`))),
+        hasEvidenceScore ? button('Inspect claim evidence', { size: 'sm', icon: 'search', onClick: () => openLeadEvidence(lead) }) : null,
         button('Recalculate', { size: 'sm', icon: 'refresh', onClick: async () => {
           await call('leads.scoreRecalculate', { params: { leadId } });
           toast('Score recalculated', 'success');

@@ -20,7 +20,8 @@ from .postgres import create_database
 from .storage import create_storage
 from .agent_service import AgentRunService, StubRunExecutor
 from .chat_bridge import ChatBridge
-from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, sales_intelligence
+from .lead_research import LeadResearchService
+from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, research_campaigns, sales_intelligence
 
 
 def create_app(settings: Settings | None = None, db: Database | None = None,
@@ -57,6 +58,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.state.cipher = CredentialCipher(settings.credential_key)
     app.state.outreach = OutreachService(database, app.state.cipher)
     app.state.storage = create_storage(settings)
+    app.state.lead_research = LeadResearchService(database)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
@@ -89,6 +91,10 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     app.include_router(onboarding.router, prefix=api_prefix)
     app.include_router(agent_runs.router, prefix=api_prefix)
     app.include_router(knowledge.router, prefix=api_prefix)
+    # research_campaigns must precede sales_intelligence: its static /research/*
+    # collection routes (configuration, sectors, model-profiles, ...) would
+    # otherwise be shadowed by sales_intelligence's catch-all /research/{id}.
+    app.include_router(research_campaigns.router, prefix=api_prefix)
     app.include_router(sales_intelligence.router, prefix=api_prefix)
     app.include_router(integrations.router, prefix=api_prefix)
     app.include_router(outreach.router, prefix=api_prefix)

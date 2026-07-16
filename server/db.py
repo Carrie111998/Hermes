@@ -165,6 +165,13 @@ CREATE INDEX IF NOT EXISTS ix_activity_company ON activity_log(company_id, creat
 CREATE INDEX IF NOT EXISTS ix_chat_sessions_tenant ON chat_sessions(company_id, user_id, updated_at DESC);
 """
 
+# Lead research is an application capability, not a model tool. Keeping its SQL
+# in a focused module avoids growing this already-dense product schema while
+# ensuring a fresh SQLite database is fully usable in one initialization pass.
+from .lead_research.schema import SCHEMA as LEAD_RESEARCH_SCHEMA
+
+SCHEMA = SCHEMA + "\n" + LEAD_RESEARCH_SCHEMA
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:20]}"

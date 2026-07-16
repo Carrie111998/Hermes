@@ -523,6 +523,26 @@ def test_data_source(source_id: str, request: Request,
 
 def _source_enabled(source_id: str, enabled: bool, request: Request,
                     principal: Principal, company_header: str | None):
+    # The provider catalog reuses the established enable/disable endpoints.
+    # Catalog lifecycle is admin-only and retains historical evidence; legacy
+    # tenant-created data sources keep their original behavior below.
+    if source_id in request.app.state.lead_research.registry.definitions:
+        if not principal.is_admin:
+            raise HTTPException(403, "Administrator role required")
+        definition = request.app.state.lead_research.registry.definitions[source_id]
+        if enabled and definition.health == "retired":
+            raise HTTPException(409, "Retired sources cannot be enabled for new campaigns")
+        company_id = _scope(principal, company_header)
+        request.app.state.lead_research.ensure_catalog(company_id)
+        request.app.state.db.execute(
+            "UPDATE dataset_definitions SET installed=1,enabled=?,updated_at=? "
+            "WHERE company_id=? AND source_id=?",
+            (int(enabled), now(), company_id, source_id),
+        )
+        return next(
+            item for item in request.app.state.lead_research.catalog(company_id)
+            if item["source_id"] == source_id
+        )
     get_data_source(source_id, request, principal, company_header)
     request.app.state.db.execute("UPDATE data_sources SET enabled=?,updated_at=? WHERE id=?",
                                  (int(enabled), now(), source_id))

@@ -150,6 +150,29 @@ export const routes = {
   'leadScans.retry':            ['POST',   '/lead-scans/:scanId/retry'],
   'leadScans.results':          ['GET',    '/lead-scans/:scanId/results'],
 
+  // Evidence-first research campaigns
+  'researchCampaigns.list':     ['GET',    '/research-campaigns'],
+  'researchCampaigns.create':   ['POST',   '/research-campaigns'],
+  'researchCampaigns.get':      ['GET',    '/research-campaigns/:campaignId'],
+  'researchCampaigns.patch':    ['PATCH',  '/research-campaigns/:campaignId'],
+  'researchCampaigns.delete':   ['DELETE', '/research-campaigns/:campaignId'],
+  'researchCampaigns.estimate': ['POST',   '/research-campaigns/:campaignId/estimate'],
+  'researchCampaigns.start':    ['POST',   '/research-campaigns/:campaignId/start'],
+  'researchCampaigns.cancel':   ['POST',   '/research-campaigns/:campaignId/cancel'],
+  'researchCampaigns.retry':    ['POST',   '/research-campaigns/:campaignId/retry'],
+  'researchCampaigns.clone':    ['POST',   '/research-campaigns/:campaignId/clone'],
+  'researchCampaigns.metrics':  ['GET',    '/research-campaigns/:campaignId/metrics'],
+  'researchCampaigns.sources':  ['GET',    '/research-campaigns/:campaignId/source-runs'],
+  'researchCampaigns.issues':   ['GET',    '/research-campaigns/:campaignId/issues'],
+  'researchCampaigns.leads':    ['GET',    '/research-campaigns/:campaignId/leads'],
+  'researchCampaigns.export':   ['POST',   '/research-campaigns/:campaignId/export'],
+  'research.configuration':     ['GET',    '/research/configuration'],
+  'research.sectors':           ['GET',    '/research/sectors'],
+  'research.scoringProfiles':   ['GET',    '/research/scoring-profiles'],
+  'research.enrichmentProfiles':['GET',    '/research/enrichment-profiles'],
+  'research.modelProfiles':     ['GET',    '/research/model-profiles'],
+  'research.leadClaims':        ['GET',    '/research/leads/:leadId/claims'],
+
   // 7.11 Leads
   'leads.list':                 ['GET',    '/leads'],
   'leads.create':               ['POST',   '/leads'],
@@ -301,6 +324,11 @@ export const routes = {
   'dataSources.test':           ['POST',   '/data-sources/:sourceId/test'],
   'dataSources.enable':         ['POST',   '/data-sources/:sourceId/enable'],
   'dataSources.disable':        ['POST',   '/data-sources/:sourceId/disable'],
+  'dataSources.catalog':        ['GET',    '/data-sources/catalog'],
+  'dataSources.impact':         ['GET',    '/data-sources/:sourceId/impact'],
+  'dataSources.install':        ['POST',   '/data-sources/:sourceId/install'],
+  'dataSources.uninstall':      ['POST',   '/data-sources/:sourceId/uninstall'],
+  'dataSources.purge':          ['POST',   '/data-sources/:sourceId/purge'],
 
   // 7.28 Activity
   'activity.list':              ['GET',    '/activity'],
