@@ -99,6 +99,44 @@ _DISCORD_NONCONVERSATIONAL_METADATA_KEYS = frozenset({
 })
 _DISCORD_IMAGE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 _DISCORD_IMAGE_MAX_REDIRECTS = 10
+_DISCORD_PATH_ONLY_TEXT_BASENAMES = frozenset({
+    ".env",
+    ".envrc",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+})
+_DISCORD_PATH_ONLY_TEXT_EXTENSIONS = frozenset({
+    ".jks",
+    ".kdbx",
+    ".key",
+    ".keystore",
+    ".p12",
+    ".pem",
+    ".pfx",
+    ".ppk",
+})
+_DISCORD_PATH_ONLY_TEXT_TOKENS = frozenset({
+    "apikey",
+    "auth",
+    "credential",
+    "credentials",
+    "key",
+    "oauth",
+    "passwd",
+    "password",
+    "passwords",
+    "privatekey",
+    "secret",
+    "secrets",
+    "token",
+    "tokens",
+})
 # Upgrade-bridge fallback only. The primary mechanism is the persisted
 # non-conversational message-ID set populated from explicitly marked sends
 # (metadata["non_conversational"]). These regexes exist solely to recognize
@@ -275,6 +313,27 @@ def _abort_discord_websocket_transport(websocket: Any) -> bool:
         return False
     abort()
     return True
+
+
+def _discord_attachment_name_requires_path_only(filename: str | None) -> bool:
+    """Return whether filename metadata strongly indicates credentials.
+
+    This does not inspect file contents and is not secret detection. Matching
+    text files are still cached, but their bodies must not be copied into the
+    model-visible user turn automatically.
+    """
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = name.strip().lower()
+    if not name:
+        return False
+    if (
+        name in _DISCORD_PATH_ONLY_TEXT_BASENAMES
+        or name.startswith(".env.")
+        or os.path.splitext(name)[1] in _DISCORD_PATH_ONLY_TEXT_EXTENSIONS
+    ):
+        return True
+    tokens = {part for part in re.split(r"[^a-z0-9]+", name) if part}
+    return bool(tokens & _DISCORD_PATH_ONLY_TEXT_TOKENS)
 
 
 async def _wait_for_ready_or_bot_exit(
@@ -8400,6 +8459,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # vision tool can access them reliably (Discord CDN URLs can expire).
         media_urls = []
         media_types = []
+        path_only_attachment_paths = []
         pending_text_injection: Optional[str] = None
         for att in all_attachments:
             content_type = att.content_type or "unknown"
@@ -8489,7 +8549,16 @@ class DiscordAdapter(BasePlatformAdapter):
                             ext in _TEXT_INJECT_EXTENSIONS
                             or (content_type or "").startswith("text/")
                         )
-                        if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        requires_path_only = (
+                            _discord_attachment_name_requires_path_only(att.filename)
+                        )
+                        if requires_path_only:
+                            path_only_attachment_paths.append(cached_path)
+                        if (
+                            _is_text
+                            and not requires_path_only
+                            and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES
+                        ):
                             try:
                                 text_content = raw_bytes.decode("utf-8")
                                 display_name = att.filename or f"document{ext or '.txt'}"
@@ -8641,6 +8710,11 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata=(
+                {"discord_path_only_attachment_paths": path_only_attachment_paths}
+                if path_only_attachment_paths
+                else {}
+            ),
         )
 
         # Track thread participation so the bot won't require @mention for

@@ -2876,6 +2876,38 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _merge_pending_media_metadata(
+    existing: MessageEvent,
+    incoming: MessageEvent,
+) -> None:
+    """Preserve per-file metadata that must follow merged pending media.
+
+    Message metadata is generally event-scoped and must not be merged blindly:
+    routing, thread, and authorization fields may describe only one source
+    event. This allowlist carries only list-valued attachment identities whose
+    meaning remains valid after ``media_urls`` are concatenated.
+    """
+    merge_list_keys = ("discord_path_only_attachment_paths",)
+    incoming_metadata = (
+        incoming.metadata if isinstance(incoming.metadata, dict) else {}
+    )
+    if not incoming_metadata:
+        return
+    if not isinstance(existing.metadata, dict):
+        existing.metadata = {}
+    for key in merge_list_keys:
+        values = incoming_metadata.get(key)
+        if not isinstance(values, list) or not values:
+            continue
+        current = existing.metadata.setdefault(key, [])
+        if not isinstance(current, list):
+            current = []
+            existing.metadata[key] = current
+        for value in values:
+            if value not in current:
+                current.append(value)
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2916,6 +2948,7 @@ def merge_pending_message_event(
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             existing.media_text_inlined.extend(incoming_inline_flags)
+            _merge_pending_media_metadata(existing, event)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             _invalidate_pending_stt_cache(existing)
@@ -2926,6 +2959,7 @@ def merge_pending_message_event(
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
                 existing.media_text_inlined.extend(incoming_inline_flags)
+                _merge_pending_media_metadata(existing, event)
             if event.text:
                 if existing.text:
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
